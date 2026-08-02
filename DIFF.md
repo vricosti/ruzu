@@ -8417,7 +8417,6 @@
 - Rust stores the signal state in `AtomicBool` and wraps readable events in `Arc<Mutex<_>>` at service/kernel ownership boundaries; upstream stores `bool m_is_signaled` in the `KSynchronizationObject`-derived object. This is host ownership glue; the event state transition now matches upstream.
 
 ### Intentional differences
-- Added env-gated diagnostics `RUZU_TRACE_DRAW_METHODS`, `RUZU_TRACE_MACRO_CALL`, and `RUZU_TRACE_DRAW_DEFERRED` in the Rust `Maxwell3D` owner file. Upstream has no equivalent diagnostics in `maxwell_3d.cpp`; behavior is unchanged when the env vars are absent.
 - Rust keeps shadow RAM as a raw register array rather than upstream's generated `Regs` struct/union, so `ShadowRamControl::from_raw` is required when reading `shadow_state[SHADOW_RAM_CONTROL]`.
 
 ### Intentional differences
@@ -28492,6 +28491,9 @@ Rust files: `externals/rdynarmic/src/frontend/a32/{decoder.rs, decoder_thumb32.r
   registers.
 
 ### Unintentional differences (to fix)
+- Fixed: A32 `SetRegister` and immediate `BXWritePC` required the value to fit
+  a signed 32-bit immediate even though their host stores are dword-sized.
+  Both paths now accept every immediate U32, matching upstream.
 - Fixed: A32 SVC and exception callbacks wrote their user arguments to
   `RSI`/`RDX`; under MSVC the fixed callback context occupies `RCX`, so the
   user arguments belong in `RDX`/`R8`.
@@ -28519,6 +28521,9 @@ Rust files: `externals/rdynarmic/src/frontend/a32/{decoder.rs, decoder_thumb32.r
   callback setup closure through rdynarmic's object-safe callback trait.
 
 ### Unintentional differences (to fix)
+- Fixed: `EmitA64SetW` obtained its non-immediate source with read-only
+  `UseGpr` before zero-extending it in place. It now uses `UseScratchGpr`,
+  matching upstream's register-allocation ownership contract.
 - Fixed: A64 SVC and exception callbacks used `RSI`/`RDX` directly instead of
   upstream's callback-provided parameter list, corrupting both values under
   the MSVC ABI.
@@ -28791,6 +28796,10 @@ Rust files: `externals/rdynarmic/src/frontend/a32/{decoder.rs, decoder_thumb32.r
   existing mechanical representation of upstream's host-location state.
 
 ### Unintentional differences (to fix)
+- Fixed: `FitsInImmediateS32` and `GetImmediateS32` sign-extended immediates
+  according to their IR type. Both now inspect and return the raw
+  `GetImmediateAsU64` bit pattern, and the getter asserts the fit predicate,
+  matching upstream.
 - Fixed: register allocation exposed 192 spill locations instead of the 64
   locations owned by upstream `StackLayout`.
 - Fixed: spill addresses omitted `ABI_SHADOW_SPACE`; they now use
@@ -29124,6 +29133,9 @@ Rust files: `externals/rdynarmic/src/frontend/a32/{decoder.rs, decoder_thumb32.r
   have no observable state effect.
 
 ### Unintentional differences (to fix)
+- Fixed: the x64 TPIDR_UPRW dword store rejected U32 immediates whose high bit
+  was set. It now accepts every immediate U32, consistent with the store
+  encoding and the other A32 immediate state writes.
 - Unsupported CP15 operations are silently ignored or return zero instead of
   emitting upstream's critical diagnostic. This predates the audited barrier
   slice and requires the missing generic coprocessor error path.
@@ -30134,3 +30146,271 @@ Rust files: `externals/rdynarmic/src/frontend/a32/{decoder.rs, decoder_thumb32.r
 - `cargo test -p shader_recompiler` passes: 355 passed, 0 failed. Six SPIR-V
   modules generated during the runtime comparison also pass Vulkan 1.3 scalar
   block-layout validation.
+
+## 2026-08-01 — shader_recompiler/src/ir_opt/collect_info.rs vs src/shader_recompiler/ir_opt/collect_shader_info_pass.cpp
+
+### Intentional differences
+- Rust decodes the raw instruction flags through `FpControl::from_u32`; upstream
+  obtains the same control fields through `inst.Flags<IR::FpControl>()`.
+
+### Unintentional differences (fixed)
+- Shader-info collection previously ignored `VisitFpModifiers`. It now records
+  the upstream FP16 and FP32 denormal preserve/flush requirements for the same
+  opcode families and FMZ modes.
+
+### Missing items
+- The broader collect-info pass still contains independently ported opcode
+  groups outside this FP-modifier slice; they remain subject to their own
+  parity review.
+
+### Binary layout verification
+- N/A: the change records shader metadata and does not serialize a guest ABI
+  structure.
+
+### Behavioral verification
+- Re-read `VisitFpModifiers` and its call from upstream `Visit` after the Rust
+  implementation. `collect_info_records_fp_denorm_modes_like_upstream` passes.
+
+## 2026-08-01 — video_core/src/buffer_cache/buffer_cache.rs vs src/video_core/buffer_cache/buffer_cache.{h,cpp}
+
+### Intentional differences
+- Rust collects callback-produced intervals into temporary vectors before
+  mutating adjacent cache state. This is a borrow-checking adaptation; the
+  upstream range traversal and mutation order are preserved.
+- `DeviceGuestMemoryScoped<UnsafeReadWrite>` is expressed as an unsafe source
+  read followed by an unsafe destination write through `DeviceMemoryAccess`.
+
+### Unintentional differences (fixed)
+- `DMACopy` now cancels destination downloads before synchronizing buffers and
+  mirrors the copied guest bytes in device memory after recording the host
+  buffer copy, matching upstream ordering.
+- `HasUncommittedFlushes` now remains true while either the current range set or
+  an accumulated committed range set still awaits fence submission.
+- `CommitAsyncFlushesHigh` now intersects committed ranges first with
+  `MemoryTracker::ForEachDownloadRange(..., false)` and then with
+  `gpu_modified_ranges`, preventing stale ranges from being staged for a later
+  guest-memory writeback.
+
+### Missing items
+- Backend `Buffer::MarkUsage` ownership is not yet represented by `BufferBase`;
+  Vulkan currently disables upload reordering conservatively, so this omission
+  does not permit the reordered upload path but remains structural parity debt.
+
+### Binary layout verification
+- N/A: cache ranges and staging copies are host-side state; no guest payload
+  layout changed.
+
+### Behavioral verification
+- Re-read `ClearDownload`, `DMACopy`, `HasUncommittedFlushes`,
+  `AccumulateFlushes`, and `CommitAsyncFlushesHigh` after implementation.
+- The focused DMA cancellation, device-memory mirror, and accumulated-flush
+  tests pass.
+
+## 2026-08-01 — video_core/src/engines/maxwell_dma.rs vs src/video_core/engines/maxwell_dma.{h,cpp}
+
+### Intentional differences
+- Rust obtains the owned memory manager through its existing mutex and returns
+  a boolean from the pitch-to-pitch helper so the launch dispatcher can retain
+  the same early-return control flow as upstream.
+
+### Unintentional differences (fixed)
+- Multi-line pitch-to-pitch launches now flush cached mappings once, copy each
+  line with independent input/output pitches through `MemoryManager::CopyBlock`,
+  release the semaphore, and return immediately as upstream does.
+
+### Missing items
+- Other unsupported MaxwellDMA launch combinations remain guarded by the
+  existing fail-fast state capture and require separate upstream-owned ports.
+
+### Binary layout verification
+- PASS: register indices and launch bitfields are unchanged; this slice only
+  changes command execution.
+
+### Behavioral verification
+- Re-read upstream `MaxwellDMA::Launch` after implementation. All 32 focused
+  MaxwellDMA tests pass, including the pitch-to-pitch line and semaphore cases.
+
+## 2026-08-01 — video_core/src/memory_manager.rs vs src/video_core/memory_manager.{h,cpp}
+
+### Intentional differences
+- Rust uses a temporary byte vector in place of
+  `GpuGuestMemoryScoped<SafeReadWrite>`; it preserves the scoped object's read,
+  retarget, writeback, and destination-flush effects explicitly.
+
+### Unintentional differences (fixed)
+- `copy_block` now reads the complete source before flushing the destination and
+  writing it, matching the lifetime and destructor ordering of upstream's
+  scoped guest-memory object for overlapping mappings.
+
+### Missing items
+- The generic scoped guest-memory wrapper is not shared directly with this
+  video-core owner; only the exact `CopyBlock` lifecycle is implemented here.
+
+### Binary layout verification
+- N/A: the copied bytes are preserved verbatim and no structured payload is
+  introduced.
+
+### Behavioral verification
+- Re-read upstream `MemoryManager::CopyBlock` after implementation. The focused
+  copy-order regression test passes.
+
+## 2026-08-01 — video_core/src/renderer_vulkan/vk_rasterizer.rs vs src/video_core/renderer_vulkan/vk_rasterizer.{h,cpp}
+
+### Intentional differences
+- Rust implements upstream's `AccelerateDMA` owned helper through
+  `RasterizerInterface` methods on `RasterizerVulkan`; cache ownership and the
+  two-cache lock scope remain equivalent to the C++ member object.
+
+### Unintentional differences (fixed)
+- Vulkan now exposes accelerated buffer copy and clear operations through the
+  buffer cache instead of falling back to software DMA.
+
+### Missing items
+- A dedicated Rust `AccelerateDMA` type corresponding structurally to the C++
+  class is not yet present; behavior currently remains attached to the
+  rasterizer trait implementation.
+
+### Binary layout verification
+- N/A: the methods record Vulkan copies and modify cache state without exposing
+  a guest ABI structure.
+
+### Behavioral verification
+- Re-read the upstream `AccelerateDMA` constructor, buffer operations, and
+  templated image-copy method after implementation. The added buffer methods
+  compile in release and use the same lock and operation ordering; the existing
+  image methods were also checked and already follow the upstream direction and
+  synchronized acquisition path.
+
+## 2026-08-01 — video_core/src/renderer_vulkan/texture_cache.rs vs src/video_core/renderer_vulkan/vk_texture_cache.{h,cpp}
+
+### Intentional differences
+- Rust applies the flags when its lazily materialized Vulkan `Image` is created,
+  rather than in a C++ backend-image constructor; the capability checks,
+  setting reads, flag ordering, and resulting upload path are unchanged.
+- The capability-dependent classification is a parameterized same-file helper
+  so unit tests do not mutate process-global graphics settings.
+
+### Unintentional differences (fixed)
+- Non-native ASTC images now receive upstream's `ACCELERATED_UPLOAD` or
+  `ASYNCHRONOUS_DECODE` policy, followed by `CONVERTED | COSTLY_LOAD`. Previously
+  they could upload compressed ASTC blocks directly into an uncompressed RGBA
+  Vulkan image.
+- Image refresh now classifies its local `ImageBase` before materialization and
+  upload selection. Previously `ensure_image` updated only the cache slot while
+  the first upload continued with a stale, unclassified clone.
+- `AstcDecoderPass` is now created only when ASTC decoding is configured for the
+  GPU, matching `TextureCacheRuntime` construction upstream.
+
+### Missing items
+- Vulkan debug-tool object naming remains part of the broader device-debugging
+  parity slice and is not changed by this image-upload correction.
+
+### Binary layout verification
+- PASS: `ImageFlagBits` values and `AstcPushConstants` layout are unchanged; the
+  corrected flags select the existing upstream-equivalent compute upload path.
+
+### Behavioral verification
+- Re-read upstream `TextureCacheRuntime::TextureCacheRuntime` and
+  `Vulkan::Image::Image` after implementation.
+- The focused ASTC backend-policy test passes for GPU decode, asynchronous CPU
+  decode, depth greater than one, and native ASTC support.
+- The refresh-order regression test verifies classification precedes backend
+  image materialization and accelerated-upload selection.
+
+## 2026-08-02 — externals/rdynarmic/src/frontend/a64/translate/simd_three_same.rs vs externals/dynarmic/src/dynarmic/frontend/A64/translate/impl/simd_three_same.cpp
+
+### Intentional differences
+- Rust selects the paired FP min/max IR operation with a same-file enum instead
+  of upstream's member-function pointer. Operand order, element traversal and
+  FP operation selection are unchanged.
+
+### Unintentional differences (fixed)
+- Added the missing `MLA_vec` and `MLS_vec` translations.
+- Added the missing `ADDHN`, `RADDHN`, `SUBHN` and `RSUBHN` high-narrowing
+  family, including upper/lower destination-part selection.
+- Added the missing vector `FMAXNMP`, `FMAXP`, `FMINNMP` and `FMINP` paired
+  floating-point translations.
+
+### Missing items
+- Other A64 SIMD decoder variants outside these instruction families remain
+  subject to their own parity review.
+
+### Binary layout verification
+- N/A: this slice emits IR and does not define a guest-visible structure.
+
+### Behavioral verification
+- Re-read the upstream helper bodies and public translators after the Rust
+  implementation. The focused MLA/MLS, high-narrowing and paired-min/max tests
+  pass.
+
+## 2026-08-02 — externals/rdynarmic/src/frontend/a64/translate/simd_three_different.rs vs externals/dynarmic/src/dynarmic/frontend/A64/translate/impl/simd_three_different.cpp
+
+### Intentional differences
+- Rust represents upstream `Signedness` and `MultiplyLongBehavior` as local
+  enums and decodes instruction fields from `DecodedInst`; helper ownership and
+  control flow remain in the matching file.
+
+### Unintentional differences (fixed)
+- Added the missing `SMLAL`, `SMLSL`, `SMULL`, `UMLAL`, `UMLSL` and `UMULL`
+  vector translations with upstream's widening, accumulation and subtraction
+  ordering.
+
+### Missing items
+- Other A64 SIMD three-different families are outside this focused parity
+  slice.
+
+### Binary layout verification
+- N/A: this slice emits IR and does not define a guest-visible structure.
+
+### Behavioral verification
+- Re-read upstream `MultiplyLong` and all six public translators after the Rust
+  implementation. `multiply_long_family_uses_matching_ir_opcodes` passes.
+
+## 2026-08-02 — audio_core/src/device/device_session.rs vs src/audio_core/device/device_session.{h,cpp}
+
+### Intentional differences
+- Rust stores guest-memory access behind `GuestMemoryProvider` so the existing
+  device-session owner can be tested without constructing a complete process.
+- The active emulator `System` is passed through `SystemRef`; this is the Rust
+  ownership form of upstream's `Core::System&`.
+
+### Unintentional differences (fixed)
+- Audio device timing now uses the active emulator system instead of a duplicate
+  `System`, so scheduled sample events advance on the same `CoreTiming` clock.
+- Audio input/output sessions now receive the opening process memory and use it
+  for guest sample reads and writes.
+
+### Missing items
+- `ProcessMemoryProvider` still calls synchronized `Memory::read_block` and
+  `Memory::write_block`. Upstream uses `ReadBlockUnsafe`/`WriteBlockUnsafe` for
+  these sample transfers; the matching Rust memory APIs are not yet exposed.
+
+### Binary layout verification
+- PASS: `AudioBuffer` layout and sample element width are unchanged; the new
+  provider transfers the same byte ranges.
+
+### Behavioral verification
+- Re-read upstream `DeviceSession::Start`, `AppendBuffers` and `ReleaseBuffer`.
+  The five focused device-session tests pass, and both release frontends build.
+
+## 2026-08-02 — hid_core/src/resources/npad/npad.rs vs src/hid_core/resources/npad/npad.{h,cpp}
+
+### Intentional differences
+- Upstream applies controller callbacks synchronously. Rust queues callback
+  bits until `on_update`; when disconnect and reconnect coalesce, it explicitly
+  replays the disconnect before applying the final connected style.
+
+### Unintentional differences (fixed)
+- A coalesced disconnect/type/connect sequence no longer leaves shared memory
+  initialized for the previous controller style.
+
+### Missing items
+- The queued callback adapter remains a Rust frontend ownership difference; the
+  final shared-memory transition now matches upstream for this sequence.
+
+### Binary layout verification
+- PASS: no NPad shared-memory structure or field layout changed.
+
+### Behavioral verification
+- Re-read upstream `ControllerUpdate` and `OnUpdate` after implementation.
+  `coalesced_reconnect_reinitializes_shared_memory_for_final_style` passes.
