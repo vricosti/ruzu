@@ -31054,11 +31054,13 @@ Rust files: `externals/rdynarmic/src/frontend/a32/{decoder.rs, decoder_thumb32.r
 ## 2026-08-03 — audio_core/src/audio_core.rs vs audio_core/audio_core.{h,cpp}
 
 ### Intentional differences
-- Rust explicitly shuts down ADSP and closes both sinks from `AudioCore::shutdown`.
-  Upstream obtains the same ordering from reverse destruction of its uniquely
-  owned `adsp`, `input_sink`, and `output_sink` fields after the destructor body.
-  The explicit calls are required because Rust service sessions can retain
-  shared `SinkHandle` owners after `System::audio_core` is cleared.
+- Rust explicitly stops its owned `AudioRenderManager`, then ADSP, then closes
+  both sinks from `AudioCore::shutdown`. Upstream's renderer manager is owned by
+  the audio service and is destroyed before `AudioCore`; reverse destruction of
+  `AudioCore` then destroys ADSP before its sinks. Rust stores the shared
+  renderer manager in `AudioCore`, so the equivalent owner order must be named
+  explicitly. Service sessions can also retain `SinkHandle` owners after
+  `System::audio_core` is cleared, requiring explicit stream closure.
 
 ### Unintentional differences (to fix)
 - None in the AudioCore teardown ordering after this pass.
@@ -31070,10 +31072,11 @@ Rust files: `externals/rdynarmic/src/frontend/a32/{decoder.rs, decoder_thumb32.r
 - PASS: only host-side destruction ordering changed.
 
 ### Behavioral verification
-- Re-read `AudioCore::~AudioCore`, `AudioCore::Shutdown`, the ADSP-owned app
-  destructors, and `CubebSinkStream::Finalize`. Rust now stops ADSP first and
-  synchronously destroys every backend stream before `Core::System` can be
-  released, including streams retained indirectly by deferred service owners.
+- Re-read `AudioCore::~AudioCore`, `AudioCore::Shutdown`,
+  `Renderer::SystemManager::~SystemManager`, the ADSP-owned app destructors,
+  and `CubebSinkStream::Finalize`. Rust now stops the renderer producer before
+  ADSP and synchronously destroys every backend stream before `Core::System`
+  can be released.
 
 ## 2026-08-03 — audio_core/src/adsp/adsp.rs vs audio_core/adsp/adsp.{h,cpp}
 
@@ -31091,3 +31094,84 @@ Rust files: `externals/rdynarmic/src/frontend/a32/{decoder.rs, decoder_thumb32.r
 
 ### Binary layout verification
 - PASS: no guest-visible or serialized structure changed.
+
+## 2026-08-03 — core/src/core.rs vs core/core.cpp
+
+### Intentional differences
+- Upstream destroys its service owners synchronously before `audio_core.reset()`.
+  Rust cooperative service fibers require `CpuManager::shutdown` before
+  `KernelCore::finalize_services_after_cpu_shutdown` can release those owners,
+  so `audio_core` remains alive until immediately after that deferred
+  finalization. The effective owner order remains services before AudioCore.
+
+### Unintentional differences (to fix)
+- None in the service/AudioCore teardown order after this pass.
+
+### Missing items
+- None for this teardown slice.
+
+### Binary layout verification
+- PASS: only host-side owner destruction order changed.
+
+### Behavioral verification
+- A macOS process sample of the regression showed `ruzu-boot` blocked acquiring
+  `AudioRenderer` in `ADSP::shutdown` while `AudioRenderSystemManager` retained
+  the same lock in `AudioRenderer::wait`. Deferring AudioCore destruction until
+  after service finalization preserves upstream's effective owner order; the
+  interruptible renderer-manager wait documented below removes the lock cycle.
+
+## 2026-08-03 — audio_core/src/renderer/system_manager.rs vs audio_core/renderer/system_manager.{h,cpp}
+
+### Intentional differences
+- Rust's `AudioRenderer` is shared behind a mutex, so the manager holds that
+  mutex while waiting for a mailbox response. `wait_with_stop` makes this wait
+  observe the manager's `active` stop flag, the Rust equivalent of upstream's
+  `std::jthread` stop token, and releases the mutex before `Stop` joins.
+- Upstream stores direct references whose lifetimes guarantee that its ADSP
+  worker remains available. Rust's shared owners can be finalized separately;
+  the interruptible wait also permits teardown when that worker has exited.
+
+### Unintentional differences (to fix)
+- None in the stop/join ordering after this pass.
+
+### Missing items
+- None for this teardown slice.
+
+### Binary layout verification
+- PASS: only host-thread synchronization changed.
+
+### Behavioral verification
+- Re-read `SystemManager::Stop` and `SystemManager::ThreadFunc`. The Rust path
+  still sets `active` false, joins the manager thread, then stops the ADSP
+  renderer; the blocking wait now observes the same stop request.
+- `stop_completes_when_dsp_worker_has_already_exited` reproduces the missing-DSP
+  response and completes without hanging.
+
+## 2026-08-03 — audio_core/src/adsp/apps/audio_renderer/audio_renderer.rs vs audio_core/adsp/apps/audio_renderer/audio_renderer.{h,cpp}
+
+### Intentional differences
+- Rust sets an atomic stop request to interrupt DSP-side mailbox and sink-space
+  waits. `Stop` therefore joins the DSP worker before draining and validating
+  its shutdown response. Upstream receives the response before requesting the
+  `std::jthread` stop because its DSP thread has no separately shared Rust
+  cancellation atomic. Both healthy paths send Shutdown, validate the response,
+  join the worker, close all streams, and clear the running state.
+- `wait_with_stop` is the mutex-safe Rust counterpart used by
+  `Renderer::SystemManager` to apply its host-thread stop token while blocked in
+  `Wait`.
+
+### Unintentional differences (to fix)
+- None in the renderer shutdown lifecycle after this pass.
+
+### Missing items
+- None for this teardown slice.
+
+### Binary layout verification
+- PASS: no guest-visible or serialized structure changed.
+
+### Behavioral verification
+- Re-read `AudioRenderer::Stop`, `Wait`, and `Main`. Mailbox queue order still
+  gives a queued Shutdown priority over the cancellation flag; joining first
+  guarantees that any response has been produced before it is validated.
+- `stop_wakes_wait_free_space_and_joins_renderer_thread` and the system-manager
+  missing-worker regression both terminate after this change.

@@ -81,7 +81,9 @@ impl SystemManager {
                             renderer.signal();
                             t_signal = t_s.elapsed().as_micros();
                             let t_w = std::time::Instant::now();
-                            renderer.wait();
+                            if !renderer.wait_with_stop(&active) {
+                                break;
+                            }
                             t_wait = t_w.elapsed().as_micros();
                         }
                         if profile {
@@ -177,5 +179,38 @@ impl SystemManager {
 impl Drop for SystemManager {
     fn drop(&mut self) {
         self.stop();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::adsp::apps::audio_renderer::audio_renderer::{AudioRenderer, Message};
+    use crate::adsp::mailbox::Direction;
+    use crate::sink::null_sink::NullSink;
+    use crate::sink::sink::new_sink_handle;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn stop_completes_when_dsp_worker_has_already_exited() {
+        let core = crate::make_test_system();
+        let renderer = Arc::new(Mutex::new(AudioRenderer::new(
+            core.clone(),
+            new_sink_handle(Box::new(NullSink::new("test"))),
+        )));
+        let mut manager = SystemManager::new(core, renderer.clone());
+        manager.initialize_unsafe();
+
+        // Model a DSP worker that exits before the render manager is stopped.
+        // The manager can consume this shutdown response as a render response
+        // and then block waiting for a worker that no longer exists.
+        renderer
+            .lock()
+            .send(Direction::Dsp, Message::Shutdown as u32);
+        std::thread::sleep(Duration::from_millis(20));
+
+        let start = Instant::now();
+        manager.stop();
+        assert!(start.elapsed() < Duration::from_secs(1));
     }
 }

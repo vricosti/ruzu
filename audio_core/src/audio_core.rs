@@ -62,11 +62,14 @@ impl AudioCore {
     pub fn shutdown(&mut self) {
         self.audio_manager.shutdown();
 
-        // Upstream destroys ADSP before its sinks, which stops every renderer
-        // stream before Core::System can be released. Rust service sessions
-        // can retain SinkHandle Arcs beyond AudioCore, so explicitly close all
-        // backend streams instead of relying on the final Arc owner to do it.
+        // Upstream destroys Renderer::SystemManager before ADSP. Rust owns the
+        // render manager here, so reproduce that order explicitly: otherwise
+        // its worker can remain in AudioRenderer::Wait while ADSP is stopping.
+        self.audio_render_manager.lock().stop();
         self.adsp.shutdown();
+
+        // Rust service sessions can retain SinkHandle Arcs beyond AudioCore,
+        // so explicitly close streams before Core::System can be released.
         self.input_sink.lock().close_streams();
         self.output_sink.lock().close_streams();
     }

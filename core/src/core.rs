@@ -1800,8 +1800,6 @@ impl System {
 
         // Upstream: app_loader.reset();
         self.app_loader = None;
-        // Upstream: audio_core.reset();
-        self.audio_core = None;
         // Upstream: gpu_core.reset();
         self.gpu_core = None;
         // Upstream: host1x_core.reset();
@@ -1812,6 +1810,10 @@ impl System {
         if let Some(ref kernel) = self.kernel {
             kernel.finalize_services_after_cpu_shutdown();
         }
+        // Upstream destroys services before AudioCore. Rust service managers
+        // retain their owners until CPU fibers have stopped, so AudioCore must
+        // remain alive through the deferred service finalization above.
+        self.audio_core = None;
         self.current_process_arc = None;
         self.current_process = None;
         if let Some(ref mut kernel) = self.kernel {

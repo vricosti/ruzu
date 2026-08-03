@@ -123,18 +123,21 @@ impl AudioRenderer {
 
         self.mailbox.send(Direction::Dsp, Message::Shutdown as u32);
         self.stop_requested.store(true, Ordering::SeqCst);
-        let message = self.mailbox.receive(Direction::Host);
-        if message != Message::Shutdown as u32 {
-            error!(
-                "Host Audio Renderer -- failed to receive shutdown response from ADSP: expected {}, got {}",
-                Message::Shutdown as u32,
-                message
-            );
-        }
-        self.mailbox.reset();
         if let Some(thread) = self.main_thread.take() {
             let _ = thread.join();
         }
+
+        let mut received_shutdown = false;
+        while let Some(message) = self.mailbox.try_receive(Direction::Host) {
+            received_shutdown |= message == Message::Shutdown as u32;
+        }
+        if !received_shutdown {
+            error!(
+                "Host Audio Renderer -- failed to receive shutdown response from ADSP: expected {}",
+                Message::Shutdown as u32
+            );
+        }
+        self.mailbox.reset();
 
         self.close_sink_streams();
         self.running = false;
@@ -166,6 +169,27 @@ impl AudioRenderer {
             );
         }
         self.post_dsp_clear_command_buffer();
+    }
+
+    /// Rust's system manager can be stopped from another host thread. Make
+    /// that blocking receive interruptible so teardown does not depend on a
+    /// DSP response after the DSP worker has already exited.
+    pub fn wait_with_stop(&mut self, stop_requested: &AtomicBool) -> bool {
+        let Some(message) = self
+            .mailbox
+            .receive_with_stop(Direction::Host, stop_requested)
+        else {
+            return false;
+        };
+        if message != Message::RenderResponse as u32 {
+            error!(
+                "Did not receive the expected render response from the AudioRenderer: expected {}, got {}",
+                Message::RenderResponse as u32,
+                message
+            );
+        }
+        self.post_dsp_clear_command_buffer();
+        true
     }
 
     /// Wait for ADSP response with a timeout. Returns true if response received.
