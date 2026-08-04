@@ -4,13 +4,6 @@
 //! Port of `input_common/drivers/sdl_driver.h` and `input_common/drivers/sdl_driver.cpp`.
 //!
 //! SDL-based input driver for joysticks and game controllers.
-//!
-//! Note: The C++ implementation is tightly coupled to SDL2's C API
-//! (SDL_GameController, SDL_Joystick, SDL_Event, etc.). This port provides
-//! the full structural layout and implements all logic that does not require
-//! direct SDL FFI calls. The SDL-dependent operations (device enumeration,
-//! event handling, controller binding queries, vibration) would require
-//! an SDL2 Rust binding crate (e.g., sdl2-rs) to be wired in.
 
 use std::collections::{HashMap, VecDeque};
 use std::ffi::c_void;
@@ -26,7 +19,7 @@ use common::param_package::ParamPackage;
 use common::settings_input::{native_analog, native_button, native_motion};
 use common::uuid::UUID;
 
-use crate::drivers::sdl_joystick::{get_guid, SdlJoystick};
+use crate::drivers::sdl_joystick::{get_guid, SdlJoystick, SdlJoystickHandles};
 use crate::input_engine::{
     InputEngine, InputEngineMetadata, InputEngineOutput, PadIdentifier, VibrationRequest,
 };
@@ -81,6 +74,17 @@ fn bind_axis(controller: *mut sdl::SDL_GameController, axis: sdl::SDL_GameContro
     unsafe { bind_axis_raw(controller, axis).value.axis }
 }
 
+fn are_stick_axes_inverted(
+    axis_x: i32,
+    axis_y: i32,
+    left_x: i32,
+    right_x: i32,
+    left_y: i32,
+    right_y: i32,
+) -> bool {
+    (axis_x == left_y || axis_x == right_y) && (axis_y == left_x || axis_y == right_x)
+}
+
 /// Upstream `SDLDriver::IsButtonOnLeftSide` — which half of a dual Joy-Con
 /// pair owns a given Switch button.
 fn is_button_on_left_side(button: i32) -> bool {
@@ -125,6 +129,23 @@ impl SdlState {
             ))));
         }
         Arc::clone(&joysticks[identifier.port])
+    }
+
+    /// Execute an SDL operation using a pointer snapshot after releasing the
+    /// Rust joystick mutex. Upstream stores these pointers directly in the
+    /// shared `SDLJoystick`; this helper only adapts that access to Rust's
+    /// reconnect-state mutex without extending its lifetime across SDL calls.
+    fn with_joystick_handles<R>(
+        &self,
+        identifier: &PadIdentifier,
+        operation: impl FnOnce(SdlJoystickHandles) -> R,
+    ) -> R {
+        let joystick = self.joystick_by_identifier(identifier);
+        let handles = {
+            let guard = joystick.lock();
+            guard.handles()
+        };
+        operation(handles)
     }
 
     /// Upstream `SDLDriver::GetSDLJoystickBySDLID`.
@@ -330,9 +351,9 @@ impl SdlState {
             }
         }
         for request in filtered {
-            self.joystick_by_identifier(&request.identifier)
-                .lock()
-                .rumble_play(&request.vibration);
+            self.with_joystick_handles(&request.identifier, |handles| {
+                handles.rumble_play(&request.vibration)
+            });
         }
     }
 
@@ -341,8 +362,7 @@ impl SdlState {
         identifier: &PadIdentifier,
         vibration: &VibrationStatus,
     ) -> DriverResult {
-        let joystick = self.joystick_by_identifier(identifier);
-        let factor = if joystick.lock().has_hd_rumble() {
+        let factor = if self.with_joystick_handles(identifier, |handles| handles.has_hd_rumble()) {
             1.0
         } else if vibration.amplification_type == common::input::VibrationAmplificationType::Linear
         {
@@ -382,9 +402,10 @@ impl SdlState {
         zero_vibration.low_amplitude = 0.0;
         zero_vibration.high_amplitude = 0.0;
 
-        joystick.lock().rumble_play(&test_vibration);
+        self.with_joystick_handles(identifier, |handles| handles.rumble_play(&test_vibration));
         std::thread::sleep(std::time::Duration::from_millis(15));
-        let enabled = joystick.lock().rumble_play(&zero_vibration);
+        let enabled =
+            self.with_joystick_handles(identifier, |handles| handles.rumble_play(&zero_vibration));
         joystick.lock().enable_vibration(enabled);
         enabled
     }
@@ -1051,10 +1072,41 @@ impl SDLDriver {
         if !params.has("guid") || !params.has("port") {
             return false;
         }
-        // Full implementation requires SDL_GameControllerGetBindForAxis to check
-        // if axis_x maps to a Y-axis binding and axis_y maps to an X-axis binding.
-        // Without SDL FFI we return false.
-        false
+        let Some(joystick) =
+            self.joystick_by_guid(&params.get_str("guid", ""), params.get_int("port", 0))
+        else {
+            return false;
+        };
+        let controller = {
+            let guard = joystick.lock();
+            guard.sdl_game_controller()
+        };
+        if controller.is_null() {
+            return false;
+        }
+
+        let axis_x = params.get_int("axis_x", 0);
+        let axis_y = params.get_int("axis_y", 0);
+        are_stick_axes_inverted(
+            axis_x,
+            axis_y,
+            bind_axis(
+                controller,
+                sdl::SDL_GameControllerAxis::SDL_CONTROLLER_AXIS_LEFTX,
+            ),
+            bind_axis(
+                controller,
+                sdl::SDL_GameControllerAxis::SDL_CONTROLLER_AXIS_RIGHTX,
+            ),
+            bind_axis(
+                controller,
+                sdl::SDL_GameControllerAxis::SDL_CONTROLLER_AXIS_LEFTY,
+            ),
+            bind_axis(
+                controller,
+                sdl::SDL_GameControllerAxis::SDL_CONTROLLER_AXIS_RIGHTY,
+            ),
+        )
     }
 
     /// Port of SDLDriver::SetVibration (override)
@@ -1248,5 +1300,27 @@ mod tests {
             queued.vibration.amplification_type,
             VibrationAmplificationType::Exponential
         );
+    }
+
+    #[test]
+    fn sdl_operation_does_not_hold_joystick_mutex() {
+        let state = test_state();
+        let identifier = PadIdentifier::default();
+        let joystick = state.joystick_by_identifier(&identifier);
+
+        state.with_joystick_handles(&identifier, |_| {
+            assert!(
+                joystick.try_lock().is_some(),
+                "SDL calls must run after releasing the Rust joystick mutex"
+            );
+        });
+    }
+
+    #[test]
+    fn inverted_stick_requires_crossed_x_and_y_bindings() {
+        assert!(are_stick_axes_inverted(3, 1, 1, 2, 3, 4));
+        assert!(are_stick_axes_inverted(4, 2, 1, 2, 3, 4));
+        assert!(!are_stick_axes_inverted(1, 3, 1, 2, 3, 4));
+        assert!(!are_stick_axes_inverted(3, 8, 1, 2, 3, 4));
     }
 }

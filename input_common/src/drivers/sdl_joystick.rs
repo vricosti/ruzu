@@ -64,9 +64,70 @@ pub struct SdlJoystick {
     is_vibration_tested: bool,
 }
 
-// SAFETY: the raw SDL handles are only touched while the owning driver holds
-// its joystick-map mutex, and SDL's joystick API is safe to call from the
-// thread that opened the subsystem plus its event watcher.
+/// Copy of upstream's two non-owning SDL pointers.
+///
+/// Rust keeps `SdlJoystick` behind a mutex for mutable reconnect state. SDL
+/// calls must use this snapshot after that mutex is released: SDL invokes the
+/// event watcher while holding its own joystick lock, so calling back into SDL
+/// while holding the Rust mutex creates the opposite lock order.
+#[derive(Clone, Copy)]
+pub(crate) struct SdlJoystickHandles {
+    joystick: *mut sdl::SDL_Joystick,
+    controller: *mut sdl::SDL_GameController,
+}
+
+impl SdlJoystickHandles {
+    /// Upstream `SDLJoystick::RumblePlay`.
+    pub(crate) fn rumble_play(self, vibration: &VibrationStatus) -> bool {
+        let low_scale = if vibration.low_frequency > LOW_START_SENSITIVITY_LIMIT {
+            (1.0 - (vibration.low_frequency - LOW_START_SENSITIVITY_LIMIT)
+                / LOW_WIDTH_SENSITIVITY_LIMIT)
+                .max(0.3)
+        } else {
+            1.0
+        };
+        let high_scale = if vibration.high_frequency > HIGH_START_SENSITIVITY_LIMIT {
+            (1.0 - (vibration.high_frequency - HIGH_START_SENSITIVITY_LIMIT)
+                / HIGH_WIDTH_SENSITIVITY_LIMIT)
+                .max(0.3)
+        } else {
+            1.0
+        };
+        let low = (vibration.low_amplitude * low_scale) as u16;
+        let high = (vibration.high_amplitude * high_scale) as u16;
+
+        unsafe {
+            if !self.controller.is_null() {
+                sdl::SDL_GameControllerRumble(self.controller, low, high, RUMBLE_MAX_DURATION_MS)
+                    != -1
+            } else if !self.joystick.is_null() {
+                sdl::SDL_JoystickRumble(self.joystick, low, high, RUMBLE_MAX_DURATION_MS) != -1
+            } else {
+                false
+            }
+        }
+    }
+
+    /// Upstream `SDLJoystick::HasHDRumble`.
+    pub(crate) fn has_hd_rumble(self) -> bool {
+        if self.controller.is_null() {
+            return false;
+        }
+        let controller_type = unsafe { sdl::SDL_GameControllerGetType(self.controller) };
+        matches!(
+            controller_type,
+            sdl::SDL_GameControllerType::SDL_CONTROLLER_TYPE_NINTENDO_SWITCH_PRO
+                | sdl::SDL_GameControllerType::SDL_CONTROLLER_TYPE_NINTENDO_SWITCH_JOYCON_LEFT
+                | sdl::SDL_GameControllerType::SDL_CONTROLLER_TYPE_NINTENDO_SWITCH_JOYCON_RIGHT
+                | sdl::SDL_GameControllerType::SDL_CONTROLLER_TYPE_PS5
+        )
+    }
+}
+
+// SAFETY: mutable handle replacement is serialized by the owning driver's
+// joystick mutex. Calls into SDL use pointer snapshots after releasing that
+// mutex, matching upstream's shared `SDLJoystick` access across its event and
+// vibration threads.
 unsafe impl Send for SdlJoystick {}
 
 impl SdlJoystick {
@@ -209,52 +270,19 @@ impl SdlJoystick {
     /// SDL exposes only amplitude, so upstream fakes a frequency response by
     /// attenuating the amplitude as the requested frequency rises.
     pub fn rumble_play(&self, vibration: &VibrationStatus) -> bool {
-        let low_scale = if vibration.low_frequency > LOW_START_SENSITIVITY_LIMIT {
-            (1.0 - (vibration.low_frequency - LOW_START_SENSITIVITY_LIMIT)
-                / LOW_WIDTH_SENSITIVITY_LIMIT)
-                .max(0.3)
-        } else {
-            1.0
-        };
-        let high_scale = if vibration.high_frequency > HIGH_START_SENSITIVITY_LIMIT {
-            (1.0 - (vibration.high_frequency - HIGH_START_SENSITIVITY_LIMIT)
-                / HIGH_WIDTH_SENSITIVITY_LIMIT)
-                .max(0.3)
-        } else {
-            1.0
-        };
-        let low = (vibration.low_amplitude * low_scale) as u16;
-        let high = (vibration.high_amplitude * high_scale) as u16;
-
-        unsafe {
-            if !self.sdl_controller.is_null() {
-                sdl::SDL_GameControllerRumble(
-                    self.sdl_controller,
-                    low,
-                    high,
-                    RUMBLE_MAX_DURATION_MS,
-                ) != -1
-            } else if !self.sdl_joystick.is_null() {
-                sdl::SDL_JoystickRumble(self.sdl_joystick, low, high, RUMBLE_MAX_DURATION_MS) != -1
-            } else {
-                false
-            }
-        }
+        self.handles().rumble_play(vibration)
     }
 
     /// Upstream `SDLJoystick::HasHDRumble`.
     pub fn has_hd_rumble(&self) -> bool {
-        if self.sdl_controller.is_null() {
-            return false;
+        self.handles().has_hd_rumble()
+    }
+
+    pub(crate) fn handles(&self) -> SdlJoystickHandles {
+        SdlJoystickHandles {
+            joystick: self.sdl_joystick,
+            controller: self.sdl_controller,
         }
-        let controller_type = unsafe { sdl::SDL_GameControllerGetType(self.sdl_controller) };
-        matches!(
-            controller_type,
-            sdl::SDL_GameControllerType::SDL_CONTROLLER_TYPE_NINTENDO_SWITCH_PRO
-                | sdl::SDL_GameControllerType::SDL_CONTROLLER_TYPE_NINTENDO_SWITCH_JOYCON_LEFT
-                | sdl::SDL_GameControllerType::SDL_CONTROLLER_TYPE_NINTENDO_SWITCH_JOYCON_RIGHT
-                | sdl::SDL_GameControllerType::SDL_CONTROLLER_TYPE_PS5
-        )
     }
 
     /// Upstream `SDLJoystick::EnableVibration`.
@@ -340,12 +368,12 @@ impl SdlJoystick {
     pub fn battery_level(power_level: sdl::SDL_JoystickPowerLevel) -> BatteryLevel {
         match power_level {
             sdl::SDL_JoystickPowerLevel::SDL_JOYSTICK_POWER_EMPTY => BatteryLevel::Empty,
-            sdl::SDL_JoystickPowerLevel::SDL_JOYSTICK_POWER_LOW => BatteryLevel::Critical,
-            sdl::SDL_JoystickPowerLevel::SDL_JOYSTICK_POWER_MEDIUM => BatteryLevel::Low,
-            sdl::SDL_JoystickPowerLevel::SDL_JOYSTICK_POWER_FULL => BatteryLevel::Full,
-            sdl::SDL_JoystickPowerLevel::SDL_JOYSTICK_POWER_MAX => BatteryLevel::Charging,
-            // SDL_JOYSTICK_POWER_WIRED and SDL_JOYSTICK_POWER_UNKNOWN
-            _ => BatteryLevel::Charging,
+            sdl::SDL_JoystickPowerLevel::SDL_JOYSTICK_POWER_LOW => BatteryLevel::Low,
+            sdl::SDL_JoystickPowerLevel::SDL_JOYSTICK_POWER_MEDIUM => BatteryLevel::Medium,
+            sdl::SDL_JoystickPowerLevel::SDL_JOYSTICK_POWER_FULL
+            | sdl::SDL_JoystickPowerLevel::SDL_JOYSTICK_POWER_MAX => BatteryLevel::Full,
+            sdl::SDL_JoystickPowerLevel::SDL_JOYSTICK_POWER_WIRED => BatteryLevel::Charging,
+            sdl::SDL_JoystickPowerLevel::SDL_JOYSTICK_POWER_UNKNOWN => BatteryLevel::None,
         }
     }
 
@@ -443,20 +471,27 @@ mod tests {
         );
         assert_eq!(
             SdlJoystick::battery_level(P::SDL_JOYSTICK_POWER_LOW),
-            BatteryLevel::Critical
+            BatteryLevel::Low
         );
         assert_eq!(
             SdlJoystick::battery_level(P::SDL_JOYSTICK_POWER_MEDIUM),
-            BatteryLevel::Low
+            BatteryLevel::Medium
         );
         assert_eq!(
             SdlJoystick::battery_level(P::SDL_JOYSTICK_POWER_FULL),
             BatteryLevel::Full
         );
-        // A wired pad reports UNKNOWN/WIRED; upstream treats both as charging.
+        assert_eq!(
+            SdlJoystick::battery_level(P::SDL_JOYSTICK_POWER_MAX),
+            BatteryLevel::Full
+        );
         assert_eq!(
             SdlJoystick::battery_level(P::SDL_JOYSTICK_POWER_WIRED),
             BatteryLevel::Charging
+        );
+        assert_eq!(
+            SdlJoystick::battery_level(P::SDL_JOYSTICK_POWER_UNKNOWN),
+            BatteryLevel::None
         );
     }
 }

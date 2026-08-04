@@ -31903,3 +31903,38 @@ Rust files: `externals/rdynarmic/src/frontend/a32/{decoder.rs, decoder_thumb32.r
   both boundary failures, and preservation of hidden provider entries.
 - All six focused `game_list::tests` pass, and `cargo check -p ruzu --bin
   ruzu` passes.
+
+## 2026-08-04 — input_common/src/drivers/{sdl_driver.rs,sdl_joystick.rs} vs input_common/drivers/sdl_driver.{h,cpp}
+
+### Intentional differences
+- Rust retains a mutex around mutable `SdlJoystick` reconnect state. SDL handle
+  snapshots are copied while holding it, then SDL is called after releasing it;
+  upstream's `shared_ptr<SDLJoystick>` exposes the same handles directly.
+
+### Unintentional differences (fixed)
+- `SendVibrations`, `SetVibration`, and `IsVibrationEnabled` called SDL while
+  holding the Rust joystick mutex. SDL invokes its event watcher while holding
+  its internal joystick mutex, creating the observed lock inversion between
+  `SDL_Vibration`, GTK's event pump, and the guest CPU. No SDL vibration or
+  controller-type call now retains the Rust mutex.
+- `IsStickInverted` always returned false even though the SDL binding FFI was
+  already wired. It now compares the configured axes with both upstream X/Y
+  controller bindings.
+- SDL LOW, MEDIUM, MAX, and UNKNOWN battery states mapped to different frontend
+  levels than upstream. Every SDL power state now follows the upstream switch.
+
+### Missing items
+- No missing item was introduced or identified in this verified slice.
+
+### Binary layout verification
+- PASS: no guest-visible or serialized structure changed. The handle snapshot
+  contains only the two existing non-owning SDL pointers.
+
+### Behavioral verification
+- Re-read `SDLJoystick::RumblePlay`, `HasHDRumble`, `GetBatteryLevel`, and
+  `SDLDriver::{SetVibration,IsVibrationEnabled,SendVibrations,IsStickInverted}`
+  after implementation.
+- `sdl_operation_does_not_hold_joystick_mutex` proves the SDL callback begins
+  after the Rust mutex is released. Axis inversion and every SDL battery state
+  have focused parity tests.
+- `cargo test -p input_common --lib`: 12 passed.
