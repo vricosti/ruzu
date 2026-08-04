@@ -31175,3 +31175,59 @@ Rust files: `externals/rdynarmic/src/frontend/a32/{decoder.rs, decoder_thumb32.r
   guarantees that any response has been produced before it is validated.
 - `stop_wakes_wait_free_space_and_joins_renderer_thread` and the system-manager
   missing-worker regression both terminate after this change.
+
+## 2026-08-04 — ruzu/src/{game_list.rs,gtk_compat.rs} vs yuzu/game_list.{h,cpp}, yuzu/game_list_worker.cpp and yuzu/main.cpp
+
+### Intentional differences
+- GTK attaches a secondary-click gesture to each recycled `ColumnView` cell
+  and resolves its `TreeListRow`; Qt obtains the same row through
+  `QTreeView::indexAt` and opens a `QMenu`.
+- Directory launching and the two title-location actions call GIO directly
+  from the GTK owner instead of crossing Qt signals into `GMainWindow`.
+- Newly added ruzu directories enable `deep_scan` by default, as requested;
+  upstream initializes a custom directory with recursive scanning disabled.
+- The existing GTK toolbar still owns Add Game Directory and refresh, whereas
+  upstream represents Add New Game Directory as a synthetic tree row.
+
+### Unintentional differences (fixed)
+- `Scan Subfolders` and `Remove Directory` were global toolbar controls whose
+  target depended on the current selection. They now belong to the clicked
+  directory's context menu as `Scan Subfolders` and `Remove Game Directory`.
+- Directory rows lacked upstream's Move Up, Move Down, and Open Directory
+  Location actions. Their ordering, boundary enablement, persistence, and
+  refresh behavior now match `AddPermDirPopup`.
+- Game rows did not retain `ReadProgramId` output and had no context menu. The
+  id now travels with the row and drives Start Game, Open Mod Data Location,
+  Open Transferable Pipeline Cache, and Copy Title ID to Clipboard with the
+  same zero-id visibility rule and path formatting as upstream.
+- The first GTK popover implementation detached itself synchronously from its
+  action hierarchy when closing, so choosing an entry could close the menu
+  without activating anything. Actions now belong directly to the popover and
+  detachment is deferred until GTK finishes dispatching the selection.
+- Errors opening mod-data or pipeline-cache paths used an informational dialog;
+  they now use the warning message type emitted by the corresponding upstream
+  handlers.
+
+### Missing items
+- The title menu still lacks Favorite, Start Game without Custom
+  Configuration, Open Save Data Location, Remove, Dump RomFS, Verify
+  Integrity, GameDB, shortcut, and Properties actions because their owning
+  GTK frontend behavior is not ported. Inert menu entries are not displayed.
+- Favorites and the SDMC/UserNAND/SysNAND directory rows remain pre-existing
+  game-list parity work.
+- Multi-program NSP/XCI rows and the asynchronous worker/watcher lifecycle
+  remain as documented in earlier game-list entries.
+
+### Binary layout verification
+- PASS: no guest ABI or raw serialized structure changed. `program_id` is
+  frontend row metadata populated through the loader interface.
+
+### Behavioral verification
+- Re-read `PopupContextMenu`, `AddGamePopup`, `AddCustomDirPopup`,
+  `AddPermDirPopup`, `GameListWorker::ScanFileSystem`,
+  `OnGameListOpenFolder`, and `OnTransferableShaderCacheOpenFile` after the
+  implementation.
+- `directory_context_move_preserves_non_filesystem_entries` covers ordering,
+  both boundary failures, and preservation of hidden provider entries.
+- All six focused `game_list::tests` pass, and `cargo check -p ruzu --bin
+  ruzu` passes.

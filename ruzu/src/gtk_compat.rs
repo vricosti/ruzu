@@ -11,9 +11,23 @@ use gtk::{gio, ButtonsType, FileChooserAction, MessageType, ResponseType};
 
 /// Show a modal informational message using the GTK 4.0 MessageDialog API.
 pub fn show_message<P: IsA<gtk::Window>>(parent: Option<&P>, message: &str, detail: &str) {
+    show_message_with_type(parent, message, detail, MessageType::Info);
+}
+
+/// Show a modal warning using the GTK 4.0 MessageDialog API.
+pub fn show_warning<P: IsA<gtk::Window>>(parent: Option<&P>, message: &str, detail: &str) {
+    show_message_with_type(parent, message, detail, MessageType::Warning);
+}
+
+fn show_message_with_type<P: IsA<gtk::Window>>(
+    parent: Option<&P>,
+    message: &str,
+    detail: &str,
+    message_type: MessageType,
+) {
     let dialog = gtk::MessageDialog::builder()
         .modal(true)
-        .message_type(MessageType::Info)
+        .message_type(message_type)
         .buttons(ButtonsType::Ok)
         .text(message)
         .secondary_text(detail)

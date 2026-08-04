@@ -9,12 +9,13 @@
 // Divergence from upstream, deliberate: yuzu exposes "add a game directory" as
 // a fake row appended *inside* the tree, which reads as an item belonging to
 // the scanned folder. Here that action lives in a toolbar above the list, so
-// the tree contains only real directories and real games. Per-directory actions
-// (remove, toggle deep scan) hang off a right-click menu on the directory row,
-// which is where upstream puts them too (`GameList::PopupContextMenu`).
+// the tree contains only real directories and real games. Directory and game
+// actions otherwise live in per-row context menus, matching
+// `GameList::PopupContextMenu`.
 
+use std::cell::RefCell;
 use std::path::{Path, PathBuf};
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
 use std::sync::{Arc, Mutex};
 
 use gtk::prelude::*;
@@ -36,6 +37,9 @@ const ICON_SIZE: i32 = 48;
 /// Pixel size of the folder icon on a directory row.
 const FOLDER_ICON_SIZE: i32 = 24;
 
+/// Ruzu-specific default requested for newly added filesystem directories.
+const NEW_DIRECTORY_DEEP_SCAN: bool = true;
+
 /// Switch executable extensions listed in the game view. Mirrors
 /// `GameList::supported_file_extensions`.
 const SUPPORTED_EXTENSIONS: &[&str] = &["nsp", "xci", "nca", "nro", "nso", "kip"];
@@ -56,6 +60,8 @@ mod imp {
         pub size: RefCell<String>,
         pub path: RefCell<String>,
         pub icon: RefCell<Option<gtk::gdk::Texture>>,
+        /// Application program id. Zero for homebrew without a title id.
+        pub program_id: Cell<u64>,
         /// Directory rows group the games found beneath them.
         pub is_folder: Cell<bool>,
         /// Whether this directory is scanned recursively (directory rows only).
@@ -85,6 +91,7 @@ impl GameEntry {
         size: &str,
         path: &str,
         icon: Option<gdk::Texture>,
+        program_id: u64,
     ) -> Self {
         let obj: Self = glib::Object::new();
         let imp = obj.imp();
@@ -93,6 +100,7 @@ impl GameEntry {
         *imp.size.borrow_mut() = size.to_owned();
         *imp.path.borrow_mut() = path.to_owned();
         *imp.icon.borrow_mut() = icon;
+        imp.program_id.set(program_id);
         imp.is_folder.set(false);
         obj
     }
@@ -124,6 +132,9 @@ impl GameEntry {
     fn icon(&self) -> Option<gdk::Texture> {
         self.imp().icon.borrow().clone()
     }
+    fn program_id(&self) -> u64 {
+        self.imp().program_id.get()
+    }
     fn is_folder(&self) -> bool {
         self.imp().is_folder.get()
     }
@@ -148,6 +159,8 @@ struct GameListView {
     /// per-directory toolbar actions after every single use of them.
     selection: gtk::SingleSelection,
 }
+
+type ContextMenuHandler = Rc<dyn Fn(GameEntry, gtk::Widget, u32, f64, f64)>;
 
 /// Stack page names.
 const PAGE_LIST: &str = "list";
@@ -197,11 +210,27 @@ pub fn build<F: Fn(String) + 'static>(on_activate: F) -> (gtk::Widget, GameListH
     column_view.set_show_row_separators(false);
     column_view.set_show_column_separators(false);
 
-    column_view.append_column(&make_name_column());
-    column_view.append_column(&make_text_column("File type", GameEntry::kind));
-    column_view.append_column(&make_text_column("Size", GameEntry::size));
-
     let on_activate: Rc<dyn Fn(String)> = Rc::new(on_activate);
+    let context_view: Rc<RefCell<Weak<GameListView>>> = Rc::new(RefCell::new(Weak::new()));
+    let on_context_menu: ContextMenuHandler = {
+        let context_view = Rc::clone(&context_view);
+        let on_activate = Rc::clone(&on_activate);
+        Rc::new(move |entry, anchor, position, x, y| {
+            let Some(view) = context_view.borrow().upgrade() else {
+                return;
+            };
+            view.selection.set_selected(position);
+            view.popup_context_menu(&entry, &anchor, x, y, Rc::clone(&on_activate));
+        })
+    };
+
+    column_view.append_column(&make_name_column(Rc::clone(&on_context_menu)));
+    column_view.append_column(&make_text_column(
+        "File type",
+        GameEntry::kind,
+        Rc::clone(&on_context_menu),
+    ));
+    column_view.append_column(&make_text_column("Size", GameEntry::size, on_context_menu));
 
     // Activate (double-click / Enter) → boot a game; on a directory row, toggle
     // it open instead, which is what a tree row activation should do.
@@ -258,26 +287,12 @@ pub fn build<F: Fn(String) + 'static>(on_activate: F) -> (gtk::Widget, GameListH
         .icon_name("view-refresh-symbolic")
         .tooltip_text("Rescan game directories")
         .build();
-    // Per-directory actions act on the selected directory row. They live in the
-    // toolbar rather than a right-click menu because GTK4's ColumnView offers
-    // no reliable hit-test from a click back to the row under it, and a menu
-    // that silently fails to open is worse than a visible disabled button.
-    let deep_scan_toggle = gtk::ToggleButton::builder()
-        .label("Scan Subfolders")
-        .tooltip_text("Scan the selected directory recursively")
-        .sensitive(false)
-        .build();
-    let remove_button = icon_label_button("list-remove-symbolic", "Remove Directory");
-    remove_button.set_sensitive(false);
-
     let spacer = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     spacer.set_hexpand(true);
 
     toolbar.append(&add_button);
     toolbar.append(&refresh_button);
     toolbar.append(&spacer);
-    toolbar.append(&deep_scan_toggle);
-    toolbar.append(&remove_button);
 
     let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
     root.append(&toolbar);
@@ -289,6 +304,7 @@ pub fn build<F: Fn(String) + 'static>(on_activate: F) -> (gtk::Widget, GameListH
         store,
         selection: selection.clone(),
     });
+    *context_view.borrow_mut() = Rc::downgrade(&view);
 
     // Toolbar + empty-state actions.
     for button in [&add_button, &empty.add_button] {
@@ -300,64 +316,7 @@ pub fn build<F: Fn(String) + 'static>(on_activate: F) -> (gtk::Widget, GameListH
         refresh_button.connect_clicked(move |_| view.reload());
     }
 
-    // Set while the toggle is being synced to the selection, so the resulting
-    // `toggled` signal is not mistaken for a user action and written back.
-    let syncing = Rc::new(std::cell::Cell::new(false));
-
-    // Enable the per-directory actions only while a directory row is selected,
-    // and reflect that directory's deep-scan state on the toggle.
-    {
-        let deep_scan_toggle = deep_scan_toggle.clone();
-        let remove_button = remove_button.clone();
-        let syncing = Rc::clone(&syncing);
-        selection.connect_selected_item_notify(move |selection| {
-            let entry = selection
-                .selected_item()
-                .and_downcast::<gtk::TreeListRow>()
-                .and_then(|row| row.item())
-                .and_downcast::<GameEntry>()
-                .filter(|entry| entry.is_folder());
-
-            let is_directory = entry.is_some();
-            deep_scan_toggle.set_sensitive(is_directory);
-            remove_button.set_sensitive(is_directory);
-            if let Some(entry) = entry {
-                syncing.set(true);
-                deep_scan_toggle.set_active(entry.deep_scan());
-                syncing.set(false);
-            }
-        });
-    }
-
-    {
-        let view = Rc::clone(&view);
-        let selection = selection.clone();
-        let syncing = Rc::clone(&syncing);
-        deep_scan_toggle.connect_toggled(move |toggle| {
-            if syncing.get() {
-                return;
-            }
-            let Some(path) = selected_directory_path(&selection) else {
-                return;
-            };
-            view.set_deep_scan(&path, toggle.is_active());
-        });
-    }
-
-    {
-        let view = Rc::clone(&view);
-        let selection = selection.clone();
-        remove_button.connect_clicked(move |_| {
-            let Some(path) = selected_directory_path(&selection) else {
-                return;
-            };
-            view.remove_directory(&path);
-        });
-    }
-
-    // Populate only after the selection handlers are connected. When there is
-    // exactly one configured filesystem directory, `reload` selects it so the
-    // per-directory actions are immediately usable.
+    // Populate after all row actions are connected.
     view.reload();
 
     (root.upcast(), GameListHandle(view))
@@ -411,6 +370,234 @@ fn build_empty_state() -> EmptyState {
 }
 
 impl GameListView {
+    /// `GameList::PopupContextMenu`: show the menu owned by the clicked row.
+    fn popup_context_menu(
+        self: &Rc<Self>,
+        entry: &GameEntry,
+        anchor: &gtk::Widget,
+        x: f64,
+        y: f64,
+        on_activate: Rc<dyn Fn(String)>,
+    ) {
+        if entry.is_folder() {
+            self.popup_directory_context_menu(entry, anchor, x, y);
+        } else {
+            self.popup_game_context_menu(entry, anchor, x, y, on_activate);
+        }
+    }
+
+    /// `GameList::AddPermDirPopup` followed by `AddCustomDirPopup`.
+    fn popup_directory_context_menu(
+        self: &Rc<Self>,
+        entry: &GameEntry,
+        anchor: &gtk::Widget,
+        x: f64,
+        y: f64,
+    ) {
+        let path = entry.path();
+        let (position, count) = filesystem_directory_position(&path);
+
+        let menu = gio::Menu::new();
+        menu.append(Some("▲ Move Up"), Some("game-list.move-up"));
+        menu.append(Some("▼ Move Down"), Some("game-list.move-down"));
+        menu.append(
+            Some("Open Directory Location"),
+            Some("game-list.open-directory"),
+        );
+        menu.append(Some("Scan Subfolders"), Some("game-list.scan-subfolders"));
+        menu.append(
+            Some("Remove Game Directory"),
+            Some("game-list.remove-directory"),
+        );
+
+        let actions = gio::SimpleActionGroup::new();
+
+        let move_up = gio::SimpleAction::new("move-up", None);
+        move_up.set_enabled(position.is_some_and(|index| index > 0));
+        {
+            let view = Rc::downgrade(self);
+            let path = path.clone();
+            move_up.connect_activate(move |_, _| {
+                if let Some(view) = view.upgrade() {
+                    view.move_directory(&path, -1);
+                }
+            });
+        }
+        actions.add_action(&move_up);
+
+        let move_down = gio::SimpleAction::new("move-down", None);
+        move_down.set_enabled(position.is_some_and(|index| index + 1 < count));
+        {
+            let view = Rc::downgrade(self);
+            let path = path.clone();
+            move_down.connect_activate(move |_, _| {
+                if let Some(view) = view.upgrade() {
+                    view.move_directory(&path, 1);
+                }
+            });
+        }
+        actions.add_action(&move_down);
+
+        let open_directory = gio::SimpleAction::new("open-directory", None);
+        {
+            let path = path.clone();
+            open_directory.connect_activate(move |_, _| open_directory_location(Path::new(&path)));
+        }
+        actions.add_action(&open_directory);
+
+        let deep_scan = gio::SimpleAction::new_stateful(
+            "scan-subfolders",
+            None,
+            &entry.deep_scan().to_variant(),
+        );
+        {
+            let view = Rc::downgrade(self);
+            let path = path.clone();
+            deep_scan.connect_activate(move |action, _| {
+                let enabled = !action
+                    .state()
+                    .and_then(|state| state.get::<bool>())
+                    .unwrap_or(false);
+                action.set_state(&enabled.to_variant());
+                if let Some(view) = view.upgrade() {
+                    view.set_deep_scan(&path, enabled);
+                }
+            });
+        }
+        actions.add_action(&deep_scan);
+
+        let remove_directory = gio::SimpleAction::new("remove-directory", None);
+        {
+            let view = Rc::downgrade(self);
+            remove_directory.connect_activate(move |_, _| {
+                if let Some(view) = view.upgrade() {
+                    view.remove_directory(&path);
+                }
+            });
+        }
+        actions.add_action(&remove_directory);
+
+        show_context_menu(anchor, &menu, &actions, x, y);
+    }
+
+    /// Supported subset of upstream `GameList::AddGamePopup`.
+    ///
+    /// Actions whose owning frontend behavior is not ported yet are omitted;
+    /// displaying inert entries would not match upstream behavior.
+    fn popup_game_context_menu(
+        self: &Rc<Self>,
+        entry: &GameEntry,
+        anchor: &gtk::Widget,
+        x: f64,
+        y: f64,
+        on_activate: Rc<dyn Fn(String)>,
+    ) {
+        let path = entry.path();
+        let program_id = entry.program_id();
+
+        let menu = gio::Menu::new();
+        let start_section = gio::Menu::new();
+        start_section.append(Some("Start Game"), Some("game-list.start-game"));
+        menu.append_section(None, &start_section);
+
+        if program_id != 0 {
+            let locations = gio::Menu::new();
+            locations.append(
+                Some("Open Mod Data Location"),
+                Some("game-list.open-mod-data"),
+            );
+            locations.append(
+                Some("Open Transferable Pipeline Cache"),
+                Some("game-list.open-pipeline-cache"),
+            );
+            menu.append_section(None, &locations);
+
+            let title = gio::Menu::new();
+            title.append(
+                Some("Copy Title ID to Clipboard"),
+                Some("game-list.copy-title-id"),
+            );
+            menu.append_section(None, &title);
+        }
+
+        let actions = gio::SimpleActionGroup::new();
+        let start_game = gio::SimpleAction::new("start-game", None);
+        start_game.connect_activate(move |_, _| on_activate(path.clone()));
+        actions.add_action(&start_game);
+
+        if program_id != 0 {
+            let open_mod_data = gio::SimpleAction::new("open-mod-data", None);
+            {
+                let view = Rc::downgrade(self);
+                open_mod_data.connect_activate(move |_, _| {
+                    if let Some(view) = view.upgrade() {
+                        view.open_mod_data_location(program_id);
+                    }
+                });
+            }
+            actions.add_action(&open_mod_data);
+
+            let open_pipeline_cache = gio::SimpleAction::new("open-pipeline-cache", None);
+            {
+                let view = Rc::downgrade(self);
+                open_pipeline_cache.connect_activate(move |_, _| {
+                    if let Some(view) = view.upgrade() {
+                        view.open_pipeline_cache_location(program_id);
+                    }
+                });
+            }
+            actions.add_action(&open_pipeline_cache);
+
+            let copy_title_id = gio::SimpleAction::new("copy-title-id", None);
+            copy_title_id.connect_activate(move |_, _| {
+                if let Some(display) = gdk::Display::default() {
+                    display.clipboard().set_text(&format!("{program_id:016X}"));
+                }
+            });
+            actions.add_action(&copy_title_id);
+        }
+
+        show_context_menu(anchor, &menu, &actions, x, y);
+    }
+
+    /// `GMainWindow::OnGameListOpenFolder`, `GameListOpenTarget::ModData`.
+    fn open_mod_data_location(&self, program_id: u64) {
+        let path = common::fs::path_util::get_ruzu_path(common::fs::path_util::RuzuPath::LoadDir)
+            .join(format!("{program_id:016X}"));
+        if !path.is_dir() {
+            crate::gtk_compat::show_warning(
+                self.parent_window().as_ref(),
+                "Error Opening Mod Data Folder",
+                "Folder does not exist!",
+            );
+            return;
+        }
+        open_directory_location(&path);
+    }
+
+    /// `GMainWindow::OnTransferableShaderCacheOpenFile`.
+    fn open_pipeline_cache_location(&self, program_id: u64) {
+        let path = common::fs::path_util::get_ruzu_path(common::fs::path_util::RuzuPath::ShaderDir)
+            .join(format!("{program_id:016x}"));
+        if let Err(error) = std::fs::create_dir_all(&path) {
+            log::error!(
+                "Failed to create pipeline cache directory {}: {error}",
+                path.display()
+            );
+            crate::gtk_compat::show_warning(
+                self.parent_window().as_ref(),
+                "Error Opening Transferable Pipeline Cache",
+                "Failed to create the pipeline cache directory for this title.",
+            );
+            return;
+        }
+        open_directory_location(&path);
+    }
+
+    fn parent_window(&self) -> Option<gtk::Window> {
+        self.root.root().and_downcast::<gtk::Window>()
+    }
+
     /// Rescan every configured directory and rebuild the tree — upstream
     /// re-runs `GameListWorker` after the directory list changes.
     fn reload(&self) {
@@ -446,6 +633,7 @@ impl GameListView {
                     &human_size(game.size),
                     &game.path.to_string_lossy(),
                     icon,
+                    game.program_id,
                 ));
             }
             self.store
@@ -511,9 +699,10 @@ impl GameListView {
         uisettings::with_mut(|v| {
             v.game_dirs.push(GameDir {
                 path: path.to_string(),
-                // Upstream's "Add New Game Directory" defaults deep scan off;
-                // it is offered per-directory afterwards.
-                deep_scan: false,
+                // User-facing ruzu default: discover titles in nested folders
+                // immediately. The context-menu action can still disable it
+                // per directory.
+                deep_scan: NEW_DIRECTORY_DEEP_SCAN,
                 expanded: true,
             })
         });
@@ -527,6 +716,20 @@ impl GameListView {
         uisettings::with_mut(|v| v.game_dirs.retain(|d| d.path != path));
         self.persist();
         self.reload();
+    }
+
+    /// Move a custom directory by one visible row, matching
+    /// `GameList::AddPermDirPopup`.
+    fn move_directory(&self, path: &str, direction: isize) {
+        let moved = uisettings::with_mut(|values| {
+            move_filesystem_directory(&mut values.game_dirs, path, direction)
+        });
+        if !moved {
+            return;
+        }
+        self.persist();
+        self.reload();
+        self.select_directory(path);
     }
 
     /// Toggle recursive scanning for `path` — upstream's "Scan Subfolders".
@@ -644,9 +847,10 @@ const ALTERNATE_ROW_SHADE: f32 = 0.97;
 /// The "Name" column: expander, icon, and label, so a directory row can be
 /// collapsed and its games are indented under it. Upstream likewise puts the
 /// icon inside the Name column rather than in a column of its own.
-fn make_name_column() -> gtk::ColumnViewColumn {
+fn make_name_column(on_context_menu: ContextMenuHandler) -> gtk::ColumnViewColumn {
     let factory = gtk::SignalListItemFactory::new();
-    factory.connect_setup(|_, item| {
+    factory.connect_setup(move |_, item| {
+        let item = item.downcast_ref::<gtk::ListItem>().unwrap();
         let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
         let picture = gtk::Picture::new();
         // GTK 4.8 renamed this pair to ContentFit::Contain.
@@ -658,10 +862,9 @@ fn make_name_column() -> gtk::ColumnViewColumn {
 
         let expander = gtk::TreeExpander::new();
         expander.set_child(Some(&row));
+        install_context_menu_gesture(&expander, item, Rc::clone(&on_context_menu));
 
-        item.downcast_ref::<gtk::ListItem>()
-            .unwrap()
-            .set_child(Some(&expander));
+        item.set_child(Some(&expander));
     });
     factory.connect_bind(|_, item| {
         let item = item.downcast_ref::<gtk::ListItem>().unwrap();
@@ -723,11 +926,16 @@ fn folder_paintable() -> Option<gdk::Paintable> {
 }
 
 /// Build one plain-text column bound to a `GameEntry` string getter.
-fn make_text_column(title: &str, getter: fn(&GameEntry) -> String) -> gtk::ColumnViewColumn {
+fn make_text_column(
+    title: &str,
+    getter: fn(&GameEntry) -> String,
+    on_context_menu: ContextMenuHandler,
+) -> gtk::ColumnViewColumn {
     let factory = gtk::SignalListItemFactory::new();
-    factory.connect_setup(|_, item| {
+    factory.connect_setup(move |_, item| {
         let item = item.downcast_ref::<gtk::ListItem>().unwrap();
         let label = gtk::Label::builder().xalign(0.0).build();
+        install_context_menu_gesture(&label, item, Rc::clone(&on_context_menu));
         item.set_child(Some(&label));
     });
     factory.connect_bind(move |_, item| {
@@ -750,6 +958,101 @@ fn make_text_column(title: &str, getter: fn(&GameEntry) -> String) -> gtk::Colum
     column
 }
 
+/// Attach upstream's custom-context-menu behavior directly to one recycled
+/// `ColumnView` cell. The `TreeListRow` held by the `ListItem` is the reliable
+/// GTK4 equivalent of Qt's `QTreeView::indexAt(menu_location)`.
+fn install_context_menu_gesture(
+    anchor: &impl IsA<gtk::Widget>,
+    item: &gtk::ListItem,
+    on_context_menu: ContextMenuHandler,
+) {
+    let gesture = gtk::GestureClick::new();
+    gesture.set_button(gdk::BUTTON_SECONDARY);
+    let item = item.downgrade();
+    let anchor = anchor.clone().upcast::<gtk::Widget>();
+    let menu_anchor = anchor.clone();
+    gesture.connect_pressed(move |gesture, _, x, y| {
+        let Some(item) = item.upgrade() else { return };
+        let Some(tree_row) = item.item().and_downcast::<gtk::TreeListRow>() else {
+            return;
+        };
+        let Some(entry) = tree_row.item().and_downcast::<GameEntry>() else {
+            return;
+        };
+        on_context_menu(entry, menu_anchor.clone(), tree_row.position(), x, y);
+        gesture.set_state(gtk::EventSequenceState::Claimed);
+    });
+    anchor.add_controller(gesture);
+}
+
+/// Present a GTK menu at the click point. The action group is installed on the
+/// clicked cell so `game-list.*` resolves exactly for this popup.
+fn show_context_menu(
+    anchor: &gtk::Widget,
+    menu: &gio::Menu,
+    actions: &gio::SimpleActionGroup,
+    x: f64,
+    y: f64,
+) {
+    let popover = gtk::PopoverMenu::from_model(Some(menu));
+    popover.insert_action_group("game-list", Some(actions));
+    popover.set_parent(anchor);
+    popover.set_pointing_to(Some(&gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
+    popover.connect_closed(|popover| {
+        let popover = popover.clone();
+        glib::idle_add_local_once(move || popover.unparent());
+    });
+    popover.popup();
+}
+
+/// `GMainWindow::OnGameListOpenDirectory` using GTK/GIO's desktop launcher.
+fn open_directory_location(path: &Path) {
+    let directory = gio::File::for_path(path);
+    if let Err(error) =
+        gio::AppInfo::launch_default_for_uri(&directory.uri(), gio::AppLaunchContext::NONE)
+    {
+        log::error!("Failed to open directory {}: {error}", path.display());
+    }
+}
+
+/// Visible index and visible directory count for `path`.
+fn filesystem_directory_position(path: &str) -> (Option<usize>, usize) {
+    uisettings::with(|values| {
+        let paths: Vec<&str> = values
+            .game_dirs
+            .iter()
+            .filter(|directory| directory.is_filesystem_path())
+            .map(|directory| directory.path.as_str())
+            .collect();
+        (
+            paths.iter().position(|candidate| *candidate == path),
+            paths.len(),
+        )
+    })
+}
+
+/// Swap one custom directory with the adjacent visible custom directory.
+fn move_filesystem_directory(directories: &mut [GameDir], path: &str, direction: isize) -> bool {
+    let visible: Vec<usize> = directories
+        .iter()
+        .enumerate()
+        .filter(|(_, directory)| directory.is_filesystem_path())
+        .map(|(index, _)| index)
+        .collect();
+    let Some(visible_index) = visible
+        .iter()
+        .position(|index| directories[*index].path == path)
+    else {
+        return false;
+    };
+    let target = visible_index as isize + direction;
+    if !(0..visible.len() as isize).contains(&target) {
+        return false;
+    }
+    directories.swap(visible[visible_index], visible[target as usize]);
+    true
+}
+
 // ---------------------------------------------------------------------------
 // Scanning
 // ---------------------------------------------------------------------------
@@ -762,6 +1065,7 @@ struct GameFile {
     kind: String,
     size: u64,
     path: PathBuf,
+    program_id: u64,
     /// Icon JPEG bytes from the control data, if any.
     icon: Option<Vec<u8>>,
 }
@@ -802,6 +1106,7 @@ fn scan_dir_games(dir: &Path, deep_scan: bool) -> Vec<GameFile> {
             game.name = title;
         }
         game.icon = metadata.icon;
+        game.program_id = metadata.program_id;
         games.push(game);
     }
 
@@ -843,6 +1148,7 @@ fn collect_candidates(dir: &Path, deep_scan: bool, games: &mut Vec<GameFile>) {
             kind: ext_lower.to_uppercase(),
             size: metadata.len(),
             path,
+            program_id: 0,
             icon: None,
         });
     }
@@ -899,7 +1205,16 @@ impl MetadataReader {
             None
         };
 
-        Some(GameMetadata { title, icon })
+        let mut program_id = 0;
+        if loader.read_program_id(&mut program_id) != ResultStatus::Success {
+            program_id = 0;
+        }
+
+        Some(GameMetadata {
+            title,
+            icon,
+            program_id,
+        })
     }
 }
 
@@ -907,6 +1222,7 @@ impl MetadataReader {
 struct GameMetadata {
     title: Option<String>,
     icon: Option<Vec<u8>>,
+    program_id: u64,
 }
 
 /// Human-readable byte size (KiB / MiB / GiB), matching yuzu's display style.
@@ -958,6 +1274,11 @@ mod tests {
     }
 
     #[test]
+    fn newly_added_directories_scan_subfolders_by_default() {
+        assert!(NEW_DIRECTORY_DEEP_SCAN);
+    }
+
+    #[test]
     fn deep_scan_matches_upstream_unbounded_recursion() {
         let root = make_temp_dir();
         let nested = root.join("one/two/three/four/five/six");
@@ -984,7 +1305,7 @@ mod tests {
     }
 
     #[test]
-    fn sole_directory_is_selected_for_toolbar_actions() {
+    fn sole_directory_is_selected_after_reload() {
         let directory = GameDir {
             path: String::from(r"D:\Games\Switch"),
             deep_scan: false,
@@ -1000,5 +1321,47 @@ mod tests {
             Some(directory.path)
         );
         assert_eq!(preferred_directory_path(Some("removed"), &[]), None);
+    }
+
+    #[test]
+    fn directory_context_move_preserves_non_filesystem_entries() {
+        let mut directories = vec![
+            GameDir {
+                path: "SDMC".to_string(),
+                deep_scan: false,
+                expanded: true,
+            },
+            GameDir {
+                path: "/games/one".to_string(),
+                deep_scan: false,
+                expanded: true,
+            },
+            GameDir {
+                path: "UserNAND".to_string(),
+                deep_scan: false,
+                expanded: true,
+            },
+            GameDir {
+                path: "/games/two".to_string(),
+                deep_scan: true,
+                expanded: false,
+            },
+        ];
+
+        assert!(move_filesystem_directory(
+            &mut directories,
+            "/games/two",
+            -1
+        ));
+        assert_eq!(directories[0].path, "SDMC");
+        assert_eq!(directories[1].path, "/games/two");
+        assert_eq!(directories[2].path, "UserNAND");
+        assert_eq!(directories[3].path, "/games/one");
+        assert!(!move_filesystem_directory(
+            &mut directories,
+            "/games/two",
+            -1
+        ));
+        assert!(!move_filesystem_directory(&mut directories, "/missing", 1));
     }
 }
