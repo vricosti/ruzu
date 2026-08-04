@@ -243,15 +243,19 @@ impl EffectInfoBase {
         if !self.owns_raw_state {
             return;
         }
-        if self.type_ == EffectType::Delay {
-            crate::renderer::command::effect::delay::drop_delay_state_if_initialized(
-                self.state.buffer.as_ptr() as CpuAddr,
-            );
-            if self.state_address != self.state.buffer.as_ptr() as CpuAddr {
-                crate::renderer::command::effect::delay::drop_delay_state_if_initialized(
-                    self.state_address,
-                );
+        let state_buffer_address = self.state.buffer.as_ptr() as CpuAddr;
+        let drop_state = |address| match self.type_ {
+            EffectType::Delay => {
+                crate::renderer::command::effect::delay::drop_delay_state_if_initialized(address)
             }
+            EffectType::I3dl2Reverb => {
+                crate::renderer::effect::i3dl2::drop_i3dl2_reverb_state_if_initialized(address)
+            }
+            _ => {}
+        };
+        drop_state(state_buffer_address);
+        if self.state_address != state_buffer_address {
+            drop_state(self.state_address);
         }
     }
 

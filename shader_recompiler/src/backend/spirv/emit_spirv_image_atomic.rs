@@ -55,7 +55,7 @@ fn image_atomic_u32(
     value: Word,
     operation: ImageAtomicOp,
 ) -> Word {
-    if !index.is_immediate() || index.imm_u32() != 0 {
+    if !index.is_void() && (!index.is_immediate() || index.imm_u32() != 0) {
         panic!("SPIR-V: image indexing is not implemented");
     }
     assert_ne!(

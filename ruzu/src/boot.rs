@@ -20,7 +20,7 @@
 // concurrently-modified `ruzu_cmd`/`frontend_common` trees; unifying the two is
 // deferred tech debt.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, SyncSender};
 use std::sync::{Arc, OnceLock, RwLock};
 use std::thread::JoinHandle;
@@ -69,6 +69,7 @@ pub struct EmulationSession {
     stop_tx: Option<Sender<()>>,
     join: Option<JoinHandle<()>>,
     perf_results: Arc<RwLock<PerfStatsResults>>,
+    shaders_building: Arc<AtomicI32>,
     running: Arc<AtomicBool>,
     exit_locked: Arc<AtomicBool>,
     frontend_stop_requested: Arc<AtomicBool>,
@@ -90,6 +91,13 @@ impl EmulationSession {
                 .read()
                 .unwrap_or_else(|poisoned| poisoned.into_inner()),
         )
+    }
+
+    /// Return the latest `GPU::ShaderNotify().ShadersBuilding()` sample.
+    pub fn shaders_building(&self) -> Option<i32> {
+        self.running
+            .load(Ordering::Acquire)
+            .then(|| self.shaders_building.load(Ordering::Acquire))
     }
 
     /// Whether the running application requested that frontend exits be
@@ -141,10 +149,12 @@ pub fn boot_game(
 ) -> EmulationSession {
     let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
     let perf_results = Arc::new(RwLock::new(PerfStatsResults::default()));
+    let shaders_building = Arc::new(AtomicI32::new(0));
     let running = Arc::new(AtomicBool::new(false));
     let frontend_stop_requested = Arc::new(AtomicBool::new(false));
     let (exit_locked_tx, exit_locked_rx) = std::sync::mpsc::sync_channel(1);
     let boot_perf_results = Arc::clone(&perf_results);
+    let boot_shaders_building = Arc::clone(&shaders_building);
     let boot_running = Arc::clone(&running);
     let boot_frontend_stop_requested = Arc::clone(&frontend_stop_requested);
 
@@ -161,6 +171,7 @@ pub fn boot_game(
                 loading_event,
                 stop_rx,
                 boot_perf_results,
+                boot_shaders_building,
                 boot_running,
                 exit_locked_tx,
                 boot_frontend_stop_requested,
@@ -176,6 +187,7 @@ pub fn boot_game(
         stop_tx: Some(stop_tx),
         join: Some(join),
         perf_results,
+        shaders_building,
         running,
         exit_locked,
         frontend_stop_requested,
@@ -193,6 +205,7 @@ fn run_boot(
     loading_event: LoadingEventFn,
     stop_rx: Receiver<()>,
     perf_results: Arc<RwLock<PerfStatsResults>>,
+    shaders_building: Arc<AtomicI32>,
     running: Arc<AtomicBool>,
     exit_locked_tx: SyncSender<Arc<AtomicBool>>,
     frontend_stop_requested: Arc<AtomicBool>,
@@ -299,6 +312,9 @@ fn run_boot(
         let renderer: Box<dyn video_core::renderer_base::RendererBase> = Box::new(
             video_core::renderer_vulkan::renderer_vulkan::RendererVulkan::new(
                 system.telemetry_session_mut(),
+                // SAFETY: this renderer is immediately bound to `gpu` below;
+                // `Gpu` drops the renderer before its shader notifier.
+                unsafe { gpu.shader_notify_handle() },
                 &window_info,
                 drawable_size,
                 Arc::clone(&shown_state),
@@ -481,18 +497,9 @@ fn run_boot(
     }
 
     system.get_cpu_manager().on_gpu_ready();
-    let exit_loading_event = Arc::clone(&loading_event);
-    let exit_first_frame_displayed = Arc::clone(&first_frame_displayed);
     let exit_requested = Arc::clone(&guest_exit_requested);
-    let callback_frontend_stop_requested = Arc::clone(&frontend_stop_requested);
     system.register_exit_callback(Box::new(move || {
-        if !exit_requested.swap(true, Ordering::AcqRel)
-            && !callback_frontend_stop_requested.load(Ordering::Acquire)
-        {
-            exit_loading_event(LoadingEvent::Stopped {
-                before_first_frame: !exit_first_frame_displayed.load(Ordering::Acquire),
-            });
-        }
+        exit_requested.store(true, Ordering::Release);
     }));
 
     // Run the guest (upstream `system.Run()`): starts CPU threads in background.
@@ -515,11 +522,18 @@ fn run_boot(
                 *perf_results
                     .write()
                     .unwrap_or_else(|poisoned| poisoned.into_inner()) = sample;
+                let building = system
+                    .gpu_core()
+                    .and_then(|gpu| gpu.as_any().downcast_ref::<video_core::gpu::Gpu>())
+                    .map(|gpu| gpu.shader_notify().shaders_building())
+                    .unwrap_or(0);
+                shaders_building.store(building, Ordering::Release);
                 running.store(true, Ordering::Release);
             }
         }
     };
     running.store(false, Ordering::Release);
+    shaders_building.store(0, Ordering::Release);
 
     if stopped_by_frontend {
         // Upstream `RequestGameExit`: let the application process its normal
@@ -544,8 +558,25 @@ fn run_boot(
     log::info!("Emulation stopping: pause + shutdown");
     system.pause();
     system.shutdown_main_process();
-    if stopped_by_frontend {
-        loading_event(LoadingEvent::StopComplete);
+    loading_event(terminal_event_after_shutdown(
+        frontend_stop_requested.load(Ordering::Acquire),
+        first_frame_displayed.load(Ordering::Acquire),
+    ));
+}
+
+/// Select the terminal frontend event after the emulation thread has completed
+/// `ShutdownMainProcess`. Upstream emits `QThread::finished` only after that
+/// teardown; publishing earlier makes GTK join the still-running boot thread.
+fn terminal_event_after_shutdown(
+    frontend_stop_requested: bool,
+    first_frame_displayed: bool,
+) -> LoadingEvent {
+    if frontend_stop_requested {
+        LoadingEvent::StopComplete
+    } else {
+        LoadingEvent::Stopped {
+            before_first_frame: !first_frame_displayed,
+        }
     }
 }
 
@@ -577,6 +608,7 @@ mod tests {
             stop_tx: Some(stop_tx),
             join: None,
             perf_results: Arc::new(RwLock::new(PerfStatsResults::default())),
+            shaders_building: Arc::new(AtomicI32::new(0)),
             running: Arc::new(AtomicBool::new(false)),
             exit_locked: Arc::new(AtomicBool::new(false)),
             frontend_stop_requested: Arc::clone(&frontend_stop_requested),
@@ -586,6 +618,26 @@ mod tests {
         assert!(frontend_stop_requested.load(Ordering::Acquire));
         assert_eq!(stop_rx.recv(), Ok(()));
         assert!(!session.request_stop());
+    }
+
+    #[test]
+    fn terminal_event_is_selected_only_after_shutdown_completes() {
+        assert!(matches!(
+            terminal_event_after_shutdown(false, true),
+            LoadingEvent::Stopped {
+                before_first_frame: false
+            }
+        ));
+        assert!(matches!(
+            terminal_event_after_shutdown(false, false),
+            LoadingEvent::Stopped {
+                before_first_frame: true
+            }
+        ));
+        assert!(matches!(
+            terminal_event_after_shutdown(true, true),
+            LoadingEvent::StopComplete
+        ));
     }
 
     #[test]

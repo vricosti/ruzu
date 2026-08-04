@@ -50,6 +50,7 @@ use crate::texture_cache::texture_cache_base::{DescriptorSyncRegs, ImageViewInOu
 use crate::texture_cache::types::{NULL_IMAGE_ID, NULL_IMAGE_VIEW_ID};
 use crate::textures::texture::texture_pair;
 use crate::vulkan_common::vulkan_memory_allocator::MemoryAllocator;
+use shader_recompiler::host_translate_info::HostTranslateInfo;
 use shader_recompiler::shader_info::Info as ShaderInfo;
 use shader_recompiler::{PipelineCache as ShaderPipelineCache, Profile};
 
@@ -122,6 +123,17 @@ fn vulkan_draw_trace_enabled() -> bool {
 
 fn parse_vulkan_sync_draw_interval(value: Option<&str>) -> Option<u32> {
     value?.parse::<u32>().ok().filter(|interval| *interval != 0)
+}
+
+fn needs_gather_subpixel_offset(driver_id: vk::DriverId) -> bool {
+    matches!(
+        driver_id,
+        vk::DriverId::AMD_PROPRIETARY
+            | vk::DriverId::AMD_OPEN_SOURCE
+            | vk::DriverId::MESA_RADV
+            | vk::DriverId::INTEL_PROPRIETARY_WINDOWS
+            | vk::DriverId::INTEL_OPEN_SOURCE_MESA
+    )
 }
 
 fn vulkan_sync_draw_interval() -> Option<u32> {
@@ -252,7 +264,7 @@ fn make_draw_params(draw: &DrawCall) -> DrawParams {
             params.is_indexed = true;
         }
         PrimitiveTopology::QuadStrip => {
-            params.num_vertices = params.num_vertices.saturating_sub(2) / 2 * 6;
+            params.num_vertices = params.num_vertices.wrapping_sub(2) / 2 * 6;
             params.base_vertex = 0;
             params.is_indexed = true;
         }
@@ -343,7 +355,12 @@ fn get_viewport_state(
     }
 }
 
-fn viewport_state(draw: &DrawCall, index: usize) -> vk::Viewport {
+fn viewport_state(
+    draw: &DrawCall,
+    index: usize,
+    depth_range_unrestricted: bool,
+    nv_viewport_swizzle: bool,
+) -> vk::Viewport {
     let src = draw.viewport_transforms[index];
     get_viewport_state(
         src.translate_x,
@@ -355,9 +372,9 @@ fn viewport_state(draw: &DrawCall, index: usize) -> vk::Viewport {
         1.0,
         draw.depth_stencil.depth_mode == crate::engines::maxwell_3d::DepthMode::MinusOneToOne,
         draw.window_origin_lower_left,
-        ((src.swizzle >> 4) & 0x7) == 3,
+        !nv_viewport_swizzle && ((src.swizzle >> 4) & 0x7) == 3,
         draw.surface_clip.height as f32,
-        true,
+        !depth_range_unrestricted,
     )
 }
 
@@ -583,6 +600,9 @@ pub struct RasterizerVulkan {
     extended_dynamic_state3_enables_supported: bool,
     vertex_input_dynamic_state_supported: bool,
     must_emulate_scaled_formats: bool,
+    depth_bounds_supported: bool,
+    depth_range_unrestricted: bool,
+    nv_viewport_swizzle: bool,
     extended_dynamic_state2: Option<ash::extensions::ext::ExtendedDynamicState2>,
     extended_dynamic_state3: Option<ash::extensions::ext::ExtendedDynamicState3>,
     vertex_input_dynamic_state: Option<vk::ExtVertexInputDynamicStateFn>,
@@ -659,17 +679,24 @@ impl RasterizerVulkan {
     /// Takes Vulkan handles from the VulkanPresenter so they share the same
     /// device and queue.
     pub fn new(
+        shader_notify: crate::shader_notify::ShaderNotifyHandle,
         instance: ash::Instance,
         physical_device: vk::PhysicalDevice,
         device: ash::Device,
+        driver_id: vk::DriverId,
         width: u32,
         height: u32,
         supported_spirv_version: u32,
+        host_info: HostTranslateInfo,
         descriptor_aliasing_supported: bool,
         shader_float_controls_supported: bool,
         float_controls_properties: vk::PhysicalDeviceFloatControlsProperties,
         shader_demote_to_helper_invocation_supported: bool,
         depth_clip_control_supported: bool,
+        depth_bounds_supported: bool,
+        depth_range_unrestricted: bool,
+        nv_viewport_swizzle: bool,
+        index_type_uint8_supported: bool,
         has_null_descriptor: bool,
         extended_dynamic_state_supported: bool,
         extended_dynamic_state2_supported: bool,
@@ -680,10 +707,13 @@ impl RasterizerVulkan {
         topology_list_primitive_restart_supported: bool,
         patch_list_primitive_restart_supported: bool,
         must_emulate_scaled_formats: bool,
+        must_emulate_bgr565: bool,
+        ext_4444_formats_supported: bool,
         shader_stencil_export_supported: bool,
         image_format_list_supported: bool,
         optimal_astc_supported: bool,
         custom_border_color_supported: bool,
+        sampler_filter_minmax_supported: bool,
         max_viewports: u32,
         max_vertex_input_bindings: u32,
         vertex_attribute_divisor_supported: bool,
@@ -714,8 +744,8 @@ impl RasterizerVulkan {
         let mut descriptor_pool = Box::new(DescriptorPool::new(device.clone(), 64));
 
         // Create descriptor update queue
-        let mut desc_queue = Box::new(UpdateDescriptorQueue::new());
-        let mut compute_pass_desc_queue = Box::new(UpdateDescriptorQueue::new());
+        let mut desc_queue = Box::new(UpdateDescriptorQueue::new(scheduler));
+        let mut compute_pass_desc_queue = Box::new(UpdateDescriptorQueue::new(scheduler));
         let mut blit_image = Box::new(BlitImageHelper::new(
             device.clone(),
             scheduler,
@@ -751,6 +781,8 @@ impl RasterizerVulkan {
             supported_spirv: supported_spirv_version,
             unified_descriptor_binding: true,
             support_descriptor_aliasing: descriptor_aliasing_supported,
+            support_int64: host_info.support_int64,
+            min_ssbo_alignment: u64::from(host_info.min_ssbo_alignment),
             support_float_controls: shader_float_controls_supported,
             support_separate_denorm_behavior: float_control.denorm_behavior_independence
                 == vk::ShaderFloatControlsIndependence::ALL,
@@ -771,6 +803,7 @@ impl RasterizerVulkan {
                 != 0,
             support_demote_to_helper_invocation: shader_demote_to_helper_invocation_supported,
             support_native_ndc: depth_clip_control_supported,
+            need_gather_subpixel_offset: needs_gather_subpixel_offset(driver_id),
             ..Profile::default()
         };
         let shader_cache = ShaderPipelineCache::new(profile.clone());
@@ -787,10 +820,12 @@ impl RasterizerVulkan {
         let pipeline_cache = VulkanPipelineCache::new(
             device.clone(),
             descriptor_pool.as_mut(),
+            shader_notify,
             use_asynchronous_shaders,
             use_vulkan_pipeline_cache,
             shader_cache,
             profile,
+            host_info,
             render_pass_cache.as_mut(),
             extended_dynamic_state_supported,
             extended_dynamic_state2_supported,
@@ -823,10 +858,15 @@ impl RasterizerVulkan {
             scheduler,
             staging_pool.as_mut(),
             desc_queue.as_mut(),
+            compute_pass_desc_queue.as_mut(),
+            descriptor_pool.as_ref(),
+            driver_id,
+            index_type_uint8_supported,
             has_null_descriptor,
             extended_dynamic_state_supported,
             max_vertex_input_bindings,
-        );
+        )
+        .map_err(|e| RendererError::InitFailed(format!("buffer cache runtime: {:?}", e)))?;
         common_buffer_cache.set_runtime(Box::new(buffer_runtime));
         common_buffer_cache.set_device_memory(Box::new(DeviceMemoryAccessAdapter {
             device_memory: Arc::clone(&device_memory),
@@ -849,7 +889,10 @@ impl RasterizerVulkan {
             compute_pass_desc_queue.as_mut(),
             image_format_list_supported,
             optimal_astc_supported,
+            must_emulate_bgr565,
+            ext_4444_formats_supported,
             custom_border_color_supported,
+            sampler_filter_minmax_supported,
             has_null_descriptor,
         )
         .map_err(|e| RendererError::InitFailed(format!("texture cache: {:?}", e)))?;
@@ -959,6 +1002,9 @@ impl RasterizerVulkan {
             extended_dynamic_state3_enables_supported,
             vertex_input_dynamic_state_supported,
             must_emulate_scaled_formats,
+            depth_bounds_supported,
+            depth_range_unrestricted,
+            nv_viewport_swizzle,
             extended_dynamic_state2,
             extended_dynamic_state3,
             vertex_input_dynamic_state,
@@ -1104,6 +1150,7 @@ impl RasterizerVulkan {
                 return;
             }
         };
+        let trace_draw = vulkan_draw_trace_enabled();
         // 4. Ensure we're inside a render pass
         let (framebuffer, extent, rp_images, rp_image_ranges) = if let Some(target) = target_fb {
             self.texture_cache
@@ -1179,12 +1226,6 @@ impl RasterizerVulkan {
         );
         // Upstream `GraphicsPipeline::ConfigureImpl` updates all buffer
         // bindings once, then binds geometry before the per-stage buffers.
-        // Keep the legacy path only for topologies whose Vulkan conversion
-        // passes are not yet available in the common runtime.
-        let use_common_geometry = !matches!(
-            draw.topology,
-            PrimitiveTopology::Quads | PrimitiveTopology::QuadStrip
-        );
         let descriptor_set = self.bind_graphics_descriptors(
             pipeline_layout,
             descriptor_set_layout,
@@ -1194,12 +1235,12 @@ impl RasterizerVulkan {
             &enabled_uniform_buffer_masks,
             &uniform_buffer_sizes,
             draw,
-            use_common_geometry,
-            draw_params.is_indexed,
+            draw.indexed,
             unique_hashes,
             &fixed_state,
             read_gpu,
             read_gpu_unsafe,
+            trace_draw,
         );
         if required_descriptor_set_missing(
             descriptor_set_layout,
@@ -1210,22 +1251,13 @@ impl RasterizerVulkan {
             return;
         }
         // 5. The common geometry path was bound by
-        // `bind_graphics_descriptors` in upstream ConfigureImpl order. Keep
-        // legacy quad assembly until BufferCacheRuntime ports the upstream
-        // conversion passes.
-        if use_common_geometry {
-            dirty_flags[crate::dirty_flags::flags::INDEX_BUFFER as usize] = false;
-            dirty_flags[crate::dirty_flags::flags::VERTEX_BUFFERS as usize] = false;
-            for index in crate::dirty_flags::flags::VERTEX_BUFFER0
-                ..=crate::dirty_flags::flags::VERTEX_BUFFER31
-            {
-                dirty_flags[index as usize] = false;
-            }
-        } else {
-            self.bind_vertex_buffers(draw, read_gpu);
-            if draw_params.is_indexed {
-                self.bind_index_buffer(draw, draw_params, read_gpu);
-            }
+        // `bind_graphics_descriptors` in upstream ConfigureImpl order.
+        dirty_flags[crate::dirty_flags::flags::INDEX_BUFFER as usize] = false;
+        dirty_flags[crate::dirty_flags::flags::VERTEX_BUFFERS as usize] = false;
+        for index in
+            crate::dirty_flags::flags::VERTEX_BUFFER0..=crate::dirty_flags::flags::VERTEX_BUFFER31
+        {
+            dirty_flags[index as usize] = false;
         }
         let indirect_binding = indirect_params.map(|params| {
             let (buffer_id, offset) = self.common_buffer_cache.get_draw_indirect_buffer();
@@ -1312,7 +1344,7 @@ impl RasterizerVulkan {
         self.update_dynamic_states(draw, dirty_flags, engine_dirty_flags);
 
         // 7. Issue draw call
-        if vulkan_draw_trace_enabled() {
+        if trace_draw {
             info!(
                 "{}",
                 format_vulkan_draw_trace(
@@ -1992,7 +2024,11 @@ impl RasterizerVulkan {
         if !self.state_tracker.touch_depth_bounds_test_enable() {
             return;
         }
-        let enabled = draw.depth_bounds_enable;
+        let mut enabled = draw.depth_bounds_enable;
+        if enabled && !self.depth_bounds_supported {
+            warn!("Depth bounds is enabled but not supported");
+            enabled = false;
+        }
         let device = self.device.clone();
         self.scheduler.record(move |cmdbuf| unsafe {
             device.cmd_set_depth_bounds_test_enable(cmdbuf, enabled);
@@ -2152,11 +2188,22 @@ impl RasterizerVulkan {
                 max_depth: 1.0,
             }
         } else {
-            viewport_state(draw, 0)
+            viewport_state(
+                draw,
+                0,
+                self.depth_range_unrestricted,
+                self.nv_viewport_swizzle,
+            )
         };
         let viewports = if draw.viewport_scale_offset_enabled {
-            std::array::from_fn::<_, { NUM_VIEWPORTS }, _>(|index| viewport_state(draw, index))
-                [..self.max_viewports as usize]
+            std::array::from_fn::<_, { NUM_VIEWPORTS }, _>(|index| {
+                viewport_state(
+                    draw,
+                    index,
+                    self.depth_range_unrestricted,
+                    self.nv_viewport_swizzle,
+                )
+            })[..self.max_viewports as usize]
                 .to_vec()
         } else {
             vec![viewport]
@@ -2370,105 +2417,6 @@ impl RasterizerVulkan {
         });
     }
 
-    // ── Buffer binding ────────────────────────────────────────────────────
-
-    fn bind_vertex_buffers(&mut self, draw: &DrawCall, read_gpu: &dyn Fn(u64, &mut [u8])) {
-        for (index, stream) in draw.vertex_streams.iter().enumerate() {
-            if !stream.enabled || stream.address == 0 {
-                continue;
-            }
-            let limit = draw
-                .vertex_stream_limits
-                .get(index)
-                .map(|limit| limit.address)
-                .unwrap_or(0);
-            let fallback_count = draw.vertex_first.saturating_add(draw.vertex_count).max(
-                draw.index_buffer_first
-                    .saturating_add(draw.index_buffer_count),
-            );
-            let fallback_size = (stream.stride as u64).saturating_mul(fallback_count as u64);
-            let size = if limit >= stream.address {
-                limit.saturating_sub(stream.address).saturating_add(1)
-            } else {
-                fallback_size
-            };
-            if size == 0 {
-                continue;
-            }
-            self.buffer_cache.bind_vertex_buffer(
-                index as u32,
-                stream.address,
-                size,
-                stream.stride as vk::DeviceSize,
-                self.extended_dynamic_state_supported,
-                read_gpu,
-                &mut self.staging_pool,
-                &mut self.scheduler,
-            );
-        }
-    }
-
-    fn bind_index_buffer(
-        &mut self,
-        draw: &DrawCall,
-        draw_params: DrawParams,
-        read_gpu: &dyn Fn(u64, &mut [u8]),
-    ) {
-        if matches!(
-            draw.topology,
-            PrimitiveTopology::Quads | PrimitiveTopology::QuadStrip
-        ) {
-            if draw.indexed {
-                self.buffer_cache.bind_quad_indexed_buffer(
-                    draw.topology,
-                    draw.index_format,
-                    draw.base_vertex,
-                    draw.index_buffer_first,
-                    draw.index_buffer_count,
-                    draw.index_buffer_addr,
-                    read_gpu,
-                    &mut self.staging_pool,
-                    &mut self.scheduler,
-                );
-            } else {
-                self.buffer_cache.bind_quad_index_buffer(
-                    draw.topology,
-                    draw.vertex_first,
-                    draw.vertex_count,
-                    &mut self.staging_pool,
-                    &mut self.scheduler,
-                );
-            }
-            return;
-        }
-
-        if draw.index_buffer_addr == 0 {
-            return;
-        }
-        let index_size = match draw.index_format {
-            crate::engines::maxwell_3d::IndexFormat::UnsignedByte => 1,
-            crate::engines::maxwell_3d::IndexFormat::UnsignedShort => 2,
-            crate::engines::maxwell_3d::IndexFormat::UnsignedInt => 4,
-        };
-        let size = (index_size
-            * draw_params
-                .first_index
-                .saturating_add(draw_params.num_vertices)) as u64;
-        let index_type = match draw.index_format {
-            crate::engines::maxwell_3d::IndexFormat::UnsignedByte => vk::IndexType::UINT8_EXT,
-            crate::engines::maxwell_3d::IndexFormat::UnsignedShort => vk::IndexType::UINT16,
-            crate::engines::maxwell_3d::IndexFormat::UnsignedInt => vk::IndexType::UINT32,
-        };
-        self.buffer_cache.bind_index_buffer(
-            draw.index_buffer_addr,
-            size,
-            index_type,
-            read_gpu,
-            &mut self.staging_pool,
-            &mut self.scheduler,
-        );
-    }
-
     fn bind_graphics_descriptors(
         &mut self,
         _pipeline_layout: vk::PipelineLayout,
@@ -2480,21 +2428,19 @@ impl RasterizerVulkan {
              as usize],
         uniform_buffer_sizes: &crate::buffer_cache::buffer_cache_base::UniformBufferSizes,
         draw: &DrawCall,
-        use_common_geometry: bool,
         is_indexed: bool,
         unique_hashes: [u64; crate::shader_cache::NUM_PROGRAMS],
         _fixed_state: &FixedPipelineState,
         read_gpu: &dyn Fn(u64, &mut [u8]),
         read_gpu_unsafe: &dyn Fn(u64, &mut [u8]) -> bool,
+        trace_draw: bool,
     ) -> Option<vk::DescriptorSet> {
         if descriptor_set_layout == vk::DescriptorSetLayout::null()
             || descriptor_bindings.is_empty()
         {
-            if use_common_geometry {
-                self.common_buffer_cache.update_graphics_buffers(is_indexed);
-                self.common_buffer_cache
-                    .bind_host_geometry_buffers(is_indexed);
-            }
+            self.common_buffer_cache.update_graphics_buffers(is_indexed);
+            self.common_buffer_cache
+                .bind_host_geometry_buffers(is_indexed);
             return None;
         }
 
@@ -2847,24 +2793,15 @@ impl RasterizerVulkan {
             }
         }
 
-        if use_common_geometry
-            || has_uniform_buffer_descriptors
-            || has_storage_buffer_descriptors
-            || has_texel_buffer_descriptors
-        {
-            self.desc_queue.acquire();
-            self.common_buffer_cache
-                .update_graphics_buffers(use_common_geometry && is_indexed);
-            if use_common_geometry {
-                self.common_buffer_cache
-                    .bind_host_geometry_buffers(is_indexed);
-            }
-        }
+        self.common_buffer_cache.update_graphics_buffers(is_indexed);
+        self.common_buffer_cache
+            .bind_host_geometry_buffers(is_indexed);
 
         if has_uniform_buffer_descriptors
             || has_storage_buffer_descriptors
             || has_texel_buffer_descriptors
         {
+            self.desc_queue.acquire();
             for stage in 0..enabled_uniform_buffer_masks.len() {
                 self.common_buffer_cache.bind_host_stage_buffers(stage);
             }
@@ -3097,7 +3034,7 @@ impl RasterizerVulkan {
                                 .unwrap_or_else(|| {
                                     self.texture_cache.null_image_view_handle(texture_type)
                                 });
-                            if vulkan_draw_trace_enabled() {
+                            if trace_draw {
                                 sampled_image_traces.push(
                                     self.texture_cache
                                         .sampled_image_view_trace(view_id, image_view),
@@ -3155,7 +3092,7 @@ impl RasterizerVulkan {
         unsafe {
             self.device.update_descriptor_sets(&writes, &[]);
         }
-        if vulkan_draw_trace_enabled() {
+        if trace_draw {
             info!(
                 "[VK_DESCRIPTOR_TRACE] tick={} draw={} shaders={:X?} set=0x{:X} bindings={:?} buffers=[{}] images=[{}] image_meta=[{}] texel_views={:X?}",
                 self.scheduler.pending_tick(),
@@ -4919,6 +4856,22 @@ mod tests {
     }
 
     #[test]
+    fn gather_subpixel_offset_matches_upstream_driver_list() {
+        for driver in [
+            vk::DriverId::AMD_PROPRIETARY,
+            vk::DriverId::AMD_OPEN_SOURCE,
+            vk::DriverId::MESA_RADV,
+            vk::DriverId::INTEL_PROPRIETARY_WINDOWS,
+            vk::DriverId::INTEL_OPEN_SOURCE_MESA,
+        ] {
+            assert!(needs_gather_subpixel_offset(driver));
+        }
+        assert!(!needs_gather_subpixel_offset(
+            vk::DriverId::NVIDIA_PROPRIETARY
+        ));
+    }
+
+    #[test]
     fn incomplete_required_descriptor_set_skips_draw() {
         let layout = vk::DescriptorSetLayout::from_raw(0x1234);
         let set = vk::DescriptorSet::from_raw(0x5678);
@@ -4995,6 +4948,21 @@ mod tests {
         assert_eq!(viewport.width, 640.0);
         assert_eq!(viewport.y, 0.0);
         assert_eq!(viewport.height, 480.0);
+    }
+
+    #[test]
+    fn viewport_depth_range_matches_extension_support() {
+        let clamped = get_viewport_state(
+            0.0, 1.0, 0.0, 1.0, 2.0, 2.0, 1.0, false, false, false, 1.0, true,
+        );
+        assert_eq!(clamped.min_depth, 1.0);
+        assert_eq!(clamped.max_depth, 1.0);
+
+        let unrestricted = get_viewport_state(
+            0.0, 1.0, 0.0, 1.0, 2.0, 2.0, 1.0, false, false, false, 1.0, false,
+        );
+        assert_eq!(unrestricted.min_depth, 2.0);
+        assert_eq!(unrestricted.max_depth, 4.0);
     }
 
     #[test]

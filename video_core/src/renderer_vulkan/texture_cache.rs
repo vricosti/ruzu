@@ -42,7 +42,9 @@ use crate::texture_cache::util::{
     convert_image, full_download_copies, full_upload_swizzles, make_shrink_image_copies,
     map_size_bytes, unswizzle_image,
 };
-use crate::textures::texture::{TextureFilter, TextureMipmapFilter, TscEntry, WrapMode};
+use crate::textures::texture::{
+    SamplerReduction, TextureFilter, TextureMipmapFilter, TscEntry, WrapMode,
+};
 use crate::textures::workers::ThreadWorker;
 use shader_recompiler::shader_info::{ImageFormat, TextureType};
 
@@ -106,6 +108,15 @@ fn convert_border_color(color: [f32; 4]) -> vk::BorderColor {
         vk::BorderColor::FLOAT_OPAQUE_BLACK
     } else {
         vk::BorderColor::FLOAT_TRANSPARENT_BLACK
+    }
+}
+
+fn sampler_reduction_from_raw(value: u32) -> SamplerReduction {
+    match value {
+        0 => SamplerReduction::WeightedAverage,
+        1 => SamplerReduction::Min,
+        2 => SamplerReduction::Max,
+        value => panic!("invalid Maxwell sampler reduction mode {value}"),
     }
 }
 
@@ -1087,7 +1098,10 @@ pub struct TextureCacheRuntime {
     optimal_bcn_supported: bool,
     optimal_astc_supported: bool,
     image_format_list_supported: bool,
+    must_emulate_bgr565: bool,
+    ext_4444_formats_supported: bool,
     custom_border_color_supported: bool,
+    sampler_filter_minmax_supported: bool,
     has_null_descriptor: bool,
 }
 
@@ -1107,7 +1121,10 @@ impl TextureCacheRuntime {
         compute_pass_descriptor_queue: &mut ComputePassDescriptorQueue,
         image_format_list_supported: bool,
         optimal_astc_supported: bool,
+        must_emulate_bgr565: bool,
+        ext_4444_formats_supported: bool,
         custom_border_color_supported: bool,
+        sampler_filter_minmax_supported: bool,
         has_null_descriptor: bool,
     ) -> Self {
         let device_memory_info = query_device_memory_info(&instance, physical_device);
@@ -1177,7 +1194,10 @@ impl TextureCacheRuntime {
             optimal_bcn_supported,
             optimal_astc_supported,
             image_format_list_supported,
+            must_emulate_bgr565,
+            ext_4444_formats_supported,
             custom_border_color_supported,
+            sampler_filter_minmax_supported,
             has_null_descriptor,
         };
         runtime.initialize_view_formats();
@@ -2506,7 +2526,12 @@ impl TextureCacheRuntime {
         let format_info = self.surface_format_info(view_base.format, true);
         let format = format_info.format;
         let aspect_mask = image_view_aspect_mask(view_base);
-        let components = image_view_components(view_base);
+        let components = image_view_components(
+            view_base,
+            aspect_mask,
+            self.must_emulate_bgr565,
+            self.ext_4444_formats_supported,
+        );
         let base_range = make_subresource_range(aspect_mask, view_base.range, view_base.flags);
         let image_format_info = self.surface_format_info(image.base.info.format, false);
         let usage = image_view_usage_flags(
@@ -2920,7 +2945,10 @@ impl TextureCache {
         compute_pass_descriptor_queue: &mut ComputePassDescriptorQueue,
         image_format_list_supported: bool,
         optimal_astc_supported: bool,
+        must_emulate_bgr565: bool,
+        ext_4444_formats_supported: bool,
         custom_border_color_supported: bool,
+        sampler_filter_minmax_supported: bool,
         has_null_descriptor: bool,
     ) -> Result<Self, vk::Result> {
         let mut base = CommonTextureCache::new(device_memory);
@@ -2938,7 +2966,10 @@ impl TextureCache {
             compute_pass_descriptor_queue,
             image_format_list_supported,
             optimal_astc_supported,
+            must_emulate_bgr565,
+            ext_4444_formats_supported,
             custom_border_color_supported,
+            sampler_filter_minmax_supported,
             has_null_descriptor,
         );
         base.configure_device_memory_budget(runtime.get_device_local_memory());
@@ -6237,6 +6268,11 @@ impl TextureCache {
             })
             .format(vk::Format::UNDEFINED)
             .build();
+        let reduction = sampler_reduction_from_raw(tsc.reduction_filter());
+        let reduction_mode = maxwell_to_vk::sampler_reduction(reduction);
+        let mut reduction_info = vk::SamplerReductionModeCreateInfo::builder()
+            .reduction_mode(reduction_mode)
+            .build();
         let mut sampler_info = vk::SamplerCreateInfo::builder()
             .mag_filter(maxwell_to_vk::sampler::filter(mag_filter))
             .min_filter(maxwell_to_vk::sampler::filter(min_filter))
@@ -6266,6 +6302,11 @@ impl TextureCache {
             sampler_info = sampler_info
                 .push_next(&mut custom_border_color)
                 .border_color(vk::BorderColor::FLOAT_CUSTOM_EXT);
+        }
+        if self.runtime.sampler_filter_minmax_supported {
+            sampler_info = sampler_info.push_next(&mut reduction_info);
+        } else if reduction_mode != vk::SamplerReductionMode::WEIGHTED_AVERAGE {
+            log::warn!("VK_EXT_sampler_filter_minmax is required");
         }
         let sampler_info = sampler_info.build();
         unsafe { self.runtime.device().create_sampler(&sampler_info, None) }
@@ -6642,8 +6683,102 @@ fn make_copy_image_barriers(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::texture_cache::image_view_info::SwizzleSource;
     use crate::texture_cache::types::{Extent3D, Offset3D, SubresourceExtent, SubresourceLayers};
     use ash::vk::Handle;
+
+    fn rgba_swizzle() -> [u8; 4] {
+        [
+            SwizzleSource::R as u8,
+            SwizzleSource::G as u8,
+            SwizzleSource::B as u8,
+            SwizzleSource::A as u8,
+        ]
+    }
+
+    #[test]
+    fn image_view_swizzle_transforms_16_bit_formats_like_upstream() {
+        let mut swizzle = rgba_swizzle();
+        try_transform_swizzle_if_needed(PixelFormat::A1B5G5R5Unorm, &mut swizzle, false, false);
+        assert_eq!(
+            swizzle,
+            [
+                SwizzleSource::B as u8,
+                SwizzleSource::G as u8,
+                SwizzleSource::R as u8,
+                SwizzleSource::A as u8,
+            ]
+        );
+
+        let mut swizzle = rgba_swizzle();
+        try_transform_swizzle_if_needed(PixelFormat::B5G6R5Unorm, &mut swizzle, false, false);
+        assert_eq!(swizzle, rgba_swizzle());
+        try_transform_swizzle_if_needed(PixelFormat::B5G6R5Unorm, &mut swizzle, true, false);
+        assert_eq!(
+            swizzle,
+            [
+                SwizzleSource::B as u8,
+                SwizzleSource::G as u8,
+                SwizzleSource::R as u8,
+                SwizzleSource::A as u8,
+            ]
+        );
+
+        let mut swizzle = rgba_swizzle();
+        try_transform_swizzle_if_needed(PixelFormat::A5B5G5R1Unorm, &mut swizzle, false, false);
+        assert_eq!(
+            swizzle,
+            [
+                SwizzleSource::A as u8,
+                SwizzleSource::B as u8,
+                SwizzleSource::G as u8,
+                SwizzleSource::R as u8,
+            ]
+        );
+
+        let mut swizzle = rgba_swizzle();
+        try_transform_swizzle_if_needed(PixelFormat::G4R4Unorm, &mut swizzle, false, false);
+        assert_eq!(
+            swizzle,
+            [
+                SwizzleSource::G as u8,
+                SwizzleSource::R as u8,
+                SwizzleSource::B as u8,
+                SwizzleSource::A as u8,
+            ]
+        );
+
+        let mut swizzle = rgba_swizzle();
+        try_transform_swizzle_if_needed(PixelFormat::A4B4G4R4Unorm, &mut swizzle, false, false);
+        assert_eq!(swizzle, rgba_swizzle());
+        try_transform_swizzle_if_needed(PixelFormat::A4B4G4R4Unorm, &mut swizzle, false, true);
+        assert_eq!(
+            swizzle,
+            [
+                SwizzleSource::A as u8,
+                SwizzleSource::B as u8,
+                SwizzleSource::G as u8,
+                SwizzleSource::R as u8,
+            ]
+        );
+    }
+
+    #[test]
+    fn depth_stencil_view_swizzle_converts_green_to_red_like_upstream() {
+        let mut swizzle = rgba_swizzle();
+        swizzle
+            .iter_mut()
+            .for_each(|source| *source = convert_green_red(*source));
+        assert_eq!(
+            swizzle,
+            [
+                SwizzleSource::R as u8,
+                SwizzleSource::R as u8,
+                SwizzleSource::B as u8,
+                SwizzleSource::A as u8,
+            ]
+        );
+    }
 
     #[test]
     fn null_image_matches_upstream_fallback_create_info() {
@@ -6943,6 +7078,28 @@ mod tests {
             convert_border_color([0.1, 0.2, 0.3, 0.4]),
             vk::BorderColor::FLOAT_TRANSPARENT_BLACK
         );
+    }
+
+    #[test]
+    fn sampler_reduction_field_maps_to_upstream_vulkan_modes() {
+        assert_eq!(
+            maxwell_to_vk::sampler_reduction(sampler_reduction_from_raw(0)),
+            vk::SamplerReductionMode::WEIGHTED_AVERAGE
+        );
+        assert_eq!(
+            maxwell_to_vk::sampler_reduction(sampler_reduction_from_raw(1)),
+            vk::SamplerReductionMode::MIN
+        );
+        assert_eq!(
+            maxwell_to_vk::sampler_reduction(sampler_reduction_from_raw(2)),
+            vk::SamplerReductionMode::MAX
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "invalid Maxwell sampler reduction mode 3")]
+    fn sampler_reduction_rejects_reserved_value() {
+        let _ = sampler_reduction_from_raw(3);
     }
 
     #[test]
@@ -7820,10 +7977,74 @@ fn image_view_aspect_mask(
     }
 }
 
+fn convert_green_red(value: u8) -> u8 {
+    use crate::texture_cache::image_view_info::SwizzleSource;
+
+    if value == SwizzleSource::G as u8 {
+        SwizzleSource::R as u8
+    } else {
+        value
+    }
+}
+
+fn swap_blue_red(value: u8) -> u8 {
+    use crate::texture_cache::image_view_info::SwizzleSource;
+
+    match value {
+        value if value == SwizzleSource::R as u8 => SwizzleSource::B as u8,
+        value if value == SwizzleSource::B as u8 => SwizzleSource::R as u8,
+        _ => value,
+    }
+}
+
+fn swap_green_red(value: u8) -> u8 {
+    use crate::texture_cache::image_view_info::SwizzleSource;
+
+    match value {
+        value if value == SwizzleSource::R as u8 => SwizzleSource::G as u8,
+        value if value == SwizzleSource::G as u8 => SwizzleSource::R as u8,
+        _ => value,
+    }
+}
+
+fn swap_special(value: u8) -> u8 {
+    use crate::texture_cache::image_view_info::SwizzleSource;
+
+    match value {
+        value if value == SwizzleSource::A as u8 => SwizzleSource::R as u8,
+        value if value == SwizzleSource::R as u8 => SwizzleSource::A as u8,
+        value if value == SwizzleSource::G as u8 => SwizzleSource::B as u8,
+        value if value == SwizzleSource::B as u8 => SwizzleSource::G as u8,
+        _ => value,
+    }
+}
+
+/// Port of upstream `TryTransformSwizzleIfNeeded`.
+fn try_transform_swizzle_if_needed(
+    format: PixelFormat,
+    swizzle: &mut [u8; 4],
+    emulate_bgr565: bool,
+    emulate_a4b4g4r4: bool,
+) {
+    match format {
+        PixelFormat::A1B5G5R5Unorm => swizzle.iter_mut().for_each(|x| *x = swap_blue_red(*x)),
+        PixelFormat::B5G6R5Unorm if emulate_bgr565 => {
+            swizzle.iter_mut().for_each(|x| *x = swap_blue_red(*x));
+        }
+        PixelFormat::A5B5G5R1Unorm => swizzle.iter_mut().for_each(|x| *x = swap_special(*x)),
+        PixelFormat::G4R4Unorm => swizzle.iter_mut().for_each(|x| *x = swap_green_red(*x)),
+        PixelFormat::A4B4G4R4Unorm if emulate_a4b4g4r4 => swizzle.reverse(),
+        _ => {}
+    }
+}
+
 fn image_view_components(
     view: &crate::texture_cache::image_view_base::ImageViewBase,
+    aspect_mask: vk::ImageAspectFlags,
+    emulate_bgr565: bool,
+    ext_4444_formats_supported: bool,
 ) -> vk::ComponentMapping {
-    let swizzle = if view.is_render_target() {
+    let mut swizzle = if view.is_render_target() {
         [
             crate::texture_cache::image_view_info::SwizzleSource::R as u8,
             crate::texture_cache::image_view_info::SwizzleSource::G as u8,
@@ -7833,6 +8054,19 @@ fn image_view_components(
     } else {
         view.swizzle
     };
+    if !view.is_render_target() {
+        try_transform_swizzle_if_needed(
+            view.format,
+            &mut swizzle,
+            emulate_bgr565,
+            !ext_4444_formats_supported,
+        );
+        if aspect_mask.intersects(vk::ImageAspectFlags::DEPTH | vk::ImageAspectFlags::STENCIL) {
+            swizzle
+                .iter_mut()
+                .for_each(|source| *source = convert_green_red(*source));
+        }
+    }
     vk::ComponentMapping {
         r: component_swizzle(swizzle[0]),
         g: component_swizzle(swizzle[1]),

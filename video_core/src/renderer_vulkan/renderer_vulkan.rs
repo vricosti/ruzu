@@ -27,6 +27,7 @@ use crate::vulkan_common::vulkan_wrapper::{Instance, VulkanError};
 use common::telemetry::{FieldType, FieldValue};
 use ruzu_core::frontend::framebuffer_layout::{default_frame_layout, FramebufferLayout, Rectangle};
 use ruzu_core::telemetry_session::TelemetrySession;
+use shader_recompiler::host_translate_info::HostTranslateInfo;
 
 use super::blit_screen::{BlitFrame, BlitScreen};
 use super::present::util::{create_wrapped_image, create_wrapped_image_view, download_color_image};
@@ -285,6 +286,7 @@ impl RendererVulkan {
     /// rasterizer, and optionally turbo_mode.
     pub fn new(
         telemetry_session: Option<&mut TelemetrySession>,
+        shader_notify: crate::shader_notify::ShaderNotifyHandle,
         window_info: &ruzu_core::frontend::emu_window::WindowSystemInfo,
         drawable_size: (u32, u32),
         window_shown: Arc<AtomicBool>,
@@ -399,18 +401,43 @@ impl RendererVulkan {
             &PRESENT_FILTERS_FOR_APPLET_CAPTURE,
             supports_float16,
         );
+        let driver_id = device.get_driver_id();
+        let host_info = HostTranslateInfo {
+            support_float64: device.is_float64_supported(),
+            support_float16: device.is_float16_supported(),
+            support_int64: device.is_shader_int64_supported(),
+            needs_demote_reorder: matches!(
+                driver_id,
+                vk::DriverId::AMD_PROPRIETARY
+                    | vk::DriverId::AMD_OPEN_SOURCE
+                    | vk::DriverId::SAMSUNG_PROPRIETARY
+            ),
+            support_snorm_render_buffer: true,
+            support_viewport_index_layer: device.is_ext_shader_viewport_index_layer_supported(),
+            min_ssbo_alignment: device.get_storage_buffer_alignment() as u32,
+            support_geometry_shader_passthrough: device
+                .is_nv_geometry_shader_passthrough_supported(),
+            support_conditional_barrier: device.supports_conditional_barriers(),
+        };
         let rasterizer = super::RasterizerVulkan::new(
+            shader_notify,
             instance.instance.clone(),
             device.get_physical(),
             device.get_logical().clone(),
+            driver_id,
             CAPTURE_IMAGE_WIDTH,
             CAPTURE_IMAGE_HEIGHT,
             device.supported_spirv_version(),
+            host_info,
             device.is_descriptor_aliasing_supported(),
             device.is_khr_shader_float_controls_supported(),
             device.float_controls_properties,
             device.is_ext_shader_demote_to_helper_invocation_supported(),
             device.is_ext_depth_clip_control_supported(),
+            device.is_depth_bounds_supported(),
+            device.is_ext_depth_range_unrestricted_supported(),
+            device.is_nv_viewport_swizzle_supported(),
+            device.is_ext_index_type_uint8_supported(),
             device.has_null_descriptor(),
             device.is_ext_extended_dynamic_state_supported(),
             device.is_ext_extended_dynamic_state2_supported(),
@@ -421,10 +448,13 @@ impl RendererVulkan {
             device.is_topology_list_primitive_restart_supported(),
             device.is_patch_list_primitive_restart_supported(),
             device.must_emulate_scaled_formats(),
+            device.must_emulate_bgr565(),
+            device.is_ext_4444_formats_supported(),
             device.is_ext_shader_stencil_export_supported(),
             device.is_khr_image_format_list_supported(),
             device.is_optimal_astc_supported(),
             device.is_ext_custom_border_color_supported(),
+            device.is_ext_sampler_filter_minmax_supported(),
             device.get_max_viewports(),
             device.get_max_vertex_input_bindings(),
             device.is_ext_vertex_attribute_divisor_supported(),

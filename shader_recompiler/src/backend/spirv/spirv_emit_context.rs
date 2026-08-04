@@ -5107,7 +5107,9 @@ impl SpirvEmitContext {
                 super::emit_spirv_image::emit_image_query(self, inst, block_idx, inst_idx);
             }
             Opcode::ImageGather | Opcode::ImageGatherDref => {
-                super::emit_spirv_image::emit_image_gather_inst(self, inst, block_idx, inst_idx);
+                super::emit_spirv_image::emit_image_gather_inst(
+                    self, program, inst, block_idx, inst_idx,
+                );
             }
             Opcode::ImageRead => {
                 super::emit_spirv_image::emit_image_read_inst(self, inst, block_idx, inst_idx);

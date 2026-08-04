@@ -14,9 +14,11 @@ use ash::vk::Handle;
 use log::{debug, trace};
 use smallvec::SmallVec;
 
+use super::compute_pass::{QuadIndexedPass, Uint8Pass};
+use super::descriptor_pool::DescriptorPool;
 use super::scheduler::Scheduler;
 use super::staging_buffer_pool::StagingBufferPool;
-use super::update_descriptor::UpdateDescriptorQueue;
+use super::update_descriptor::{ComputePassDescriptorQueue, UpdateDescriptorQueue};
 use crate::buffer_cache::buffer_base::BufferBase;
 use crate::buffer_cache::buffer_cache::BufferCache as CommonBufferCache;
 use crate::buffer_cache::buffer_cache_base::{
@@ -54,6 +56,92 @@ pub struct CachedBuffer {
 struct SentencedBuffer {
     retire_tick: u64,
     buffer: CachedBuffer,
+}
+
+/// Port of upstream's anonymous `QuadIndexBuffer` hierarchy state.
+struct QuadIndexBuffer {
+    gpu_handle: u32,
+    index_type: vk::IndexType,
+    num_indices: u32,
+}
+
+impl Default for QuadIndexBuffer {
+    fn default() -> Self {
+        Self {
+            gpu_handle: 0,
+            index_type: vk::IndexType::UINT16,
+            num_indices: 0,
+        }
+    }
+}
+
+fn index_type_from_num_elements(
+    num_elements: u32,
+    index_type_uint8_supported: bool,
+) -> vk::IndexType {
+    if num_elements <= 0xff && index_type_uint8_supported {
+        vk::IndexType::UINT8_EXT
+    } else if num_elements <= 0xffff {
+        vk::IndexType::UINT16
+    } else {
+        vk::IndexType::UINT32
+    }
+}
+
+fn bytes_per_index(index_type: vk::IndexType) -> usize {
+    match index_type {
+        vk::IndexType::UINT8_EXT => 1,
+        vk::IndexType::UINT16 => 2,
+        vk::IndexType::UINT32 => 4,
+        _ => unreachable!("invalid Vulkan index type"),
+    }
+}
+
+fn quad_count_for_topology(topology: PrimitiveTopology, num_indices: u32) -> u32 {
+    match topology {
+        PrimitiveTopology::Quads => num_indices / 4,
+        PrimitiveTopology::QuadStrip => {
+            if num_indices >= 4 {
+                (num_indices - 2) / 2
+            } else {
+                0
+            }
+        }
+        _ => unreachable!("invalid quad topology"),
+    }
+}
+
+fn append_quad_index(bytes: &mut Vec<u8>, index_type: vk::IndexType, index: u32) {
+    match index_type {
+        vk::IndexType::UINT8_EXT => bytes.push(index as u8),
+        vk::IndexType::UINT16 => bytes.extend_from_slice(&(index as u16).to_le_bytes()),
+        vk::IndexType::UINT32 => bytes.extend_from_slice(&index.to_le_bytes()),
+        _ => unreachable!("invalid Vulkan index type"),
+    }
+}
+
+fn make_quad_lut(
+    topology: PrimitiveTopology,
+    num_indices: u32,
+    index_type: vk::IndexType,
+) -> Vec<u8> {
+    let num_quads = quad_count_for_topology(topology, num_indices);
+    let mut bytes = Vec::with_capacity(num_quads as usize * 6 * 4 * bytes_per_index(index_type));
+    for first in 0u32..4 {
+        for quad in 0..num_quads {
+            let offsets = match topology {
+                PrimitiveTopology::Quads => [0, 1, 2, 0, 2, 3]
+                    .map(|index| first.wrapping_add(index).wrapping_add(quad.wrapping_mul(4))),
+                PrimitiveTopology::QuadStrip => [0, 3, 1, 0, 2, 3]
+                    .map(|index| first.wrapping_add(index).wrapping_add(quad.wrapping_mul(2))),
+                _ => unreachable!("invalid quad topology"),
+            };
+            for index in offsets {
+                append_quad_index(&mut bytes, index_type, index);
+            }
+        }
+    }
+    bytes
 }
 
 /// Buffer cache parameters matching upstream `Vulkan::BufferCacheParams`.
@@ -116,6 +204,11 @@ pub struct BufferCacheRuntime {
     scheduler: NonNull<Scheduler>,
     staging_pool: NonNull<StagingBufferPool>,
     guest_descriptor_queue: NonNull<UpdateDescriptorQueue>,
+    uint8_pass: Option<Uint8Pass>,
+    quad_index_pass: QuadIndexedPass,
+    quad_array_index_buffer: QuadIndexBuffer,
+    quad_strip_index_buffer: QuadIndexBuffer,
+    index_type_uint8_supported: bool,
     buffers: HashMap<u32, CachedBuffer>,
     staging_refs: HashMap<usize, super::staging_buffer_pool::StagingBuffer>,
     next_handle: u32,
@@ -135,17 +228,44 @@ impl BufferCacheRuntime {
         scheduler: &mut Scheduler,
         staging_pool: &mut StagingBufferPool,
         guest_descriptor_queue: &mut UpdateDescriptorQueue,
+        compute_pass_descriptor_queue: &mut ComputePassDescriptorQueue,
+        descriptor_pool: &DescriptorPool,
+        driver_id: vk::DriverId,
+        index_type_uint8_supported: bool,
         has_null_descriptor: bool,
         extended_dynamic_state_supported: bool,
         max_vertex_input_bindings: u32,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, vk::Result> {
+        let quad_index_pass = QuadIndexedPass::new(
+            &device,
+            scheduler,
+            descriptor_pool,
+            staging_pool,
+            compute_pass_descriptor_queue,
+        )?;
+        let uint8_pass = if driver_id != vk::DriverId::QUALCOMM_PROPRIETARY {
+            Some(Uint8Pass::new(
+                &device,
+                scheduler,
+                descriptor_pool,
+                staging_pool,
+                compute_pass_descriptor_queue,
+            )?)
+        } else {
+            None
+        };
+        Ok(Self {
             device,
             instance,
             physical_device,
             scheduler: NonNull::from(scheduler),
             staging_pool: NonNull::from(staging_pool),
             guest_descriptor_queue: NonNull::from(guest_descriptor_queue),
+            uint8_pass,
+            quad_index_pass,
+            quad_array_index_buffer: QuadIndexBuffer::default(),
+            quad_strip_index_buffer: QuadIndexBuffer::default(),
+            index_type_uint8_supported,
             buffers: HashMap::new(),
             staging_refs: HashMap::new(),
             next_handle: 1,
@@ -155,7 +275,7 @@ impl BufferCacheRuntime {
             has_null_descriptor,
             extended_dynamic_state_supported,
             max_vertex_input_bindings,
-        }
+        })
     }
 
     fn scheduler(&mut self) -> &mut Scheduler {
@@ -172,6 +292,96 @@ impl BufferCacheRuntime {
     fn guest_descriptor_queue(&mut self) -> &mut UpdateDescriptorQueue {
         // SAFETY: see `scheduler`.
         unsafe { self.guest_descriptor_queue.as_mut() }
+    }
+
+    fn update_quad_index_buffer(&mut self, topology: PrimitiveTopology, num_indices: u32) {
+        let (current_num_indices, old_handle) = match topology {
+            PrimitiveTopology::Quads => (
+                self.quad_array_index_buffer.num_indices,
+                self.quad_array_index_buffer.gpu_handle,
+            ),
+            PrimitiveTopology::QuadStrip => (
+                self.quad_strip_index_buffer.num_indices,
+                self.quad_strip_index_buffer.gpu_handle,
+            ),
+            _ => unreachable!("invalid quad topology"),
+        };
+        if num_indices <= current_num_indices {
+            return;
+        }
+
+        self.scheduler().finish();
+        if old_handle != 0 {
+            if let Some(old) = self.buffers.remove(&old_handle) {
+                unsafe {
+                    for view in old.views {
+                        self.device.destroy_buffer_view(view.view, None);
+                    }
+                    self.device.destroy_buffer(old.buffer, None);
+                    self.device.free_memory(old.memory, None);
+                }
+            }
+        }
+
+        let index_type = index_type_from_num_elements(num_indices, self.index_type_uint8_supported);
+        let data = make_quad_lut(topology, num_indices, index_type);
+        let size = data.len() as vk::DeviceSize;
+        let cached = self
+            .create_gpu_buffer(
+                size,
+                vk::BufferUsageFlags::INDEX_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
+            )
+            .expect("quad index buffer allocation failed");
+        let staging = self
+            .staging_pool()
+            .request_upload_buffer(size)
+            .expect("quad index upload staging allocation failed");
+        unsafe {
+            std::slice::from_raw_parts_mut(staging.mapped, data.len()).copy_from_slice(&data);
+        }
+
+        let device = self.device.clone();
+        let src_buffer = staging.buffer;
+        let src_offset = staging.offset;
+        let dst_buffer = cached.buffer;
+        self.scheduler().request_outside_renderpass();
+        self.scheduler().record(move |cmdbuf| unsafe {
+            let copy = vk::BufferCopy {
+                src_offset,
+                dst_offset: 0,
+                size,
+            };
+            let barrier = vk::BufferMemoryBarrier::builder()
+                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                .dst_access_mask(vk::AccessFlags::INDEX_READ)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .buffer(dst_buffer)
+                .offset(0)
+                .size(size)
+                .build();
+            device.cmd_copy_buffer(cmdbuf, src_buffer, dst_buffer, &[copy]);
+            device.cmd_pipeline_barrier(
+                cmdbuf,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::VERTEX_INPUT,
+                vk::DependencyFlags::empty(),
+                &[],
+                std::slice::from_ref(&barrier),
+                &[],
+            );
+        });
+
+        let gpu_handle = self.allocate_handle();
+        self.buffers.insert(gpu_handle, cached);
+        let state = match topology {
+            PrimitiveTopology::Quads => &mut self.quad_array_index_buffer,
+            PrimitiveTopology::QuadStrip => &mut self.quad_strip_index_buffer,
+            _ => unreachable!("invalid quad topology"),
+        };
+        state.gpu_handle = gpu_handle;
+        state.index_type = index_type;
+        state.num_indices = num_indices;
     }
 
     /// Port of upstream `BufferCacheRuntime::ReserveNullBuffer`.
@@ -644,30 +854,76 @@ impl base::BufferCacheRuntime for BufferCacheRuntime {
         &mut self,
         topology: PrimitiveTopology,
         index_format: IndexFormat,
-        _base_vertex: u32,
-        _num_indices: u32,
+        base_vertex: u32,
+        num_indices: u32,
         _buffer: BufferId,
         gpu_handle: u32,
         offset: u32,
         _size: u32,
     ) {
-        debug_assert!(!matches!(
-            topology,
-            PrimitiveTopology::Quads | PrimitiveTopology::QuadStrip
-        ));
         let mut buffer = self.resolve_buffer(gpu_handle);
-        if buffer == vk::Buffer::null() {
-            self.reserve_null_buffer();
-            buffer = self.null_buffer;
-        }
-        let index_type = match index_format {
+        let mut vk_offset = u64::from(offset);
+        let mut index_type = match index_format {
             IndexFormat::UnsignedByte => vk::IndexType::UINT8_EXT,
             IndexFormat::UnsignedShort => vk::IndexType::UINT16,
             IndexFormat::UnsignedInt => vk::IndexType::UINT32,
         };
+        if matches!(
+            topology,
+            PrimitiveTopology::Quads | PrimitiveTopology::QuadStrip
+        ) {
+            index_type = vk::IndexType::UINT32;
+            (buffer, vk_offset) = self.quad_index_pass.assemble(
+                index_format,
+                num_indices,
+                base_vertex,
+                buffer,
+                offset,
+                topology == PrimitiveTopology::QuadStrip,
+            );
+        } else if index_type == vk::IndexType::UINT8_EXT && !self.index_type_uint8_supported {
+            index_type = vk::IndexType::UINT16;
+            if let Some(uint8_pass) = &mut self.uint8_pass {
+                (buffer, vk_offset) = uint8_pass.assemble(num_indices, buffer, offset);
+            }
+        }
+        if buffer == vk::Buffer::null() {
+            self.reserve_null_buffer();
+            buffer = self.null_buffer;
+        }
         let device = self.device.clone();
         self.scheduler().record(move |cmdbuf| unsafe {
-            device.cmd_bind_index_buffer(cmdbuf, buffer, offset as u64, index_type);
+            device.cmd_bind_index_buffer(cmdbuf, buffer, vk_offset, index_type);
+        });
+    }
+
+    fn bind_quad_index_buffer(&mut self, topology: PrimitiveTopology, first: u32, count: u32) {
+        if count == 0 {
+            self.reserve_null_buffer();
+            let buffer = self.null_buffer;
+            let device = self.device.clone();
+            self.scheduler().record(move |cmdbuf| unsafe {
+                device.cmd_bind_index_buffer(cmdbuf, buffer, 0, vk::IndexType::UINT32);
+            });
+            return;
+        }
+
+        self.update_quad_index_buffer(topology, first.wrapping_add(count));
+        let state = match topology {
+            PrimitiveTopology::Quads => &self.quad_array_index_buffer,
+            PrimitiveTopology::QuadStrip => &self.quad_strip_index_buffer,
+            _ => return,
+        };
+        let sub_first_offset =
+            u64::from(first % 4) * u64::from(quad_count_for_topology(topology, state.num_indices));
+        let offset = (sub_first_offset + u64::from(quad_count_for_topology(topology, first)))
+            * 6
+            * bytes_per_index(state.index_type) as u64;
+        let buffer = self.resolve_buffer(state.gpu_handle);
+        let index_type = state.index_type;
+        let device = self.device.clone();
+        self.scheduler().record(move |cmdbuf| unsafe {
+            device.cmd_bind_index_buffer(cmdbuf, buffer, offset, index_type);
         });
     }
 
@@ -1188,195 +1444,6 @@ impl BufferCache {
         Some((staging.buffer, staging.offset))
     }
 
-    fn get_or_upload_bytes(
-        &mut self,
-        cache_key: u64,
-        data: &[u8],
-        staging_pool: &mut StagingBufferPool,
-        scheduler: &mut Scheduler,
-    ) -> (vk::Buffer, vk::DeviceSize) {
-        let size = data.len() as vk::DeviceSize;
-        if size == 0 {
-            return (self.null_buffer, 0);
-        }
-        if let Some(cached) = self.cache.get(&cache_key) {
-            if cached.size >= size {
-                return (cached.buffer, 0);
-            }
-        }
-
-        let buf_info = vk::BufferCreateInfo::builder()
-            .size(size)
-            .usage(vk::BufferUsageFlags::INDEX_BUFFER | vk::BufferUsageFlags::TRANSFER_DST)
-            .sharing_mode(vk::SharingMode::EXCLUSIVE)
-            .build();
-        let buffer = match unsafe { self.device.create_buffer(&buf_info, None) } {
-            Ok(buffer) => buffer,
-            Err(_) => return (self.null_buffer, 0),
-        };
-
-        let mem_reqs = unsafe { self.device.get_buffer_memory_requirements(buffer) };
-        let mem_type = find_device_local_memory(
-            &self.instance,
-            self.physical_device,
-            mem_reqs.memory_type_bits,
-        )
-        .unwrap_or(0);
-        let alloc_info = vk::MemoryAllocateInfo::builder()
-            .allocation_size(mem_reqs.size)
-            .memory_type_index(mem_type)
-            .build();
-        let memory = match unsafe { self.device.allocate_memory(&alloc_info, None) } {
-            Ok(memory) => memory,
-            Err(_) => {
-                unsafe { self.device.destroy_buffer(buffer, None) };
-                return (self.null_buffer, 0);
-            }
-        };
-        unsafe {
-            if self.device.bind_buffer_memory(buffer, memory, 0).is_err() {
-                self.device.destroy_buffer(buffer, None);
-                self.device.free_memory(memory, None);
-                return (self.null_buffer, 0);
-            }
-        }
-
-        if let Some(staging) = staging_pool.request_upload_buffer(size) {
-            unsafe {
-                std::ptr::copy_nonoverlapping(data.as_ptr(), staging.mapped, data.len());
-            }
-            let copy_region = vk::BufferCopy {
-                src_offset: staging.offset,
-                dst_offset: 0,
-                size,
-            };
-            let device = self.device.clone();
-            scheduler.request_outside_renderpass();
-            scheduler.record_with_upload(move |_cmdbuf, upload_cmdbuf| unsafe {
-                device.cmd_copy_buffer(upload_cmdbuf, staging.buffer, buffer, &[copy_region]);
-            });
-        }
-
-        if let Some(old) = self.cache.remove(&cache_key) {
-            self.sentence(old);
-        }
-        self.cache.insert(
-            cache_key,
-            CachedBuffer {
-                buffer,
-                memory,
-                size,
-                views: Vec::new(),
-            },
-        );
-
-        (buffer, 0)
-    }
-
-    /// Bind a vertex buffer at the given binding index.
-    pub fn bind_vertex_buffer(
-        &mut self,
-        binding: u32,
-        gpu_va: u64,
-        size: vk::DeviceSize,
-        stride: vk::DeviceSize,
-        use_dynamic_stride: bool,
-        read_gpu: &dyn Fn(u64, &mut [u8]),
-        staging_pool: &mut StagingBufferPool,
-        scheduler: &mut Scheduler,
-    ) {
-        let (buffer, offset) = self.get_or_upload(gpu_va, size, read_gpu, staging_pool, scheduler);
-        let device = self.device.clone();
-        scheduler.record(move |cmdbuf| unsafe {
-            if use_dynamic_stride {
-                device.cmd_bind_vertex_buffers2(
-                    cmdbuf,
-                    binding,
-                    &[buffer],
-                    &[offset],
-                    Some(&[size]),
-                    Some(&[stride]),
-                );
-            } else {
-                device.cmd_bind_vertex_buffers(cmdbuf, binding, &[buffer], &[offset]);
-            }
-        });
-    }
-
-    /// Bind an index buffer.
-    pub fn bind_index_buffer(
-        &mut self,
-        gpu_va: u64,
-        size: vk::DeviceSize,
-        index_type: vk::IndexType,
-        read_gpu: &dyn Fn(u64, &mut [u8]),
-        staging_pool: &mut StagingBufferPool,
-        scheduler: &mut Scheduler,
-    ) {
-        let (buffer, offset) = self.get_or_upload(gpu_va, size, read_gpu, staging_pool, scheduler);
-        let device = self.device.clone();
-        scheduler.record(move |cmdbuf| unsafe {
-            device.cmd_bind_index_buffer(cmdbuf, buffer, offset, index_type);
-        });
-    }
-
-    /// Port-facing equivalent of `BufferCacheRuntime::BindQuadIndexBuffer`.
-    pub fn bind_quad_index_buffer(
-        &mut self,
-        topology: PrimitiveTopology,
-        first: u32,
-        count: u32,
-        staging_pool: &mut StagingBufferPool,
-        scheduler: &mut Scheduler,
-    ) {
-        let indices = make_quad_array_indices(topology, first, count);
-        let cache_key = quad_index_cache_key(topology, first, count, 0, 0, false);
-        let data = indices_as_bytes(&indices);
-        let (buffer, offset) = self.get_or_upload_bytes(cache_key, data, staging_pool, scheduler);
-        let device = self.device.clone();
-        scheduler.record(move |cmdbuf| unsafe {
-            device.cmd_bind_index_buffer(cmdbuf, buffer, offset, vk::IndexType::UINT32);
-        });
-    }
-
-    /// Port-facing equivalent of `BufferCacheRuntime::BindIndexBuffer` for quad topologies.
-    pub fn bind_quad_indexed_buffer(
-        &mut self,
-        topology: PrimitiveTopology,
-        index_format: IndexFormat,
-        base_vertex: i32,
-        first_index: u32,
-        count: u32,
-        gpu_va: u64,
-        read_gpu: &dyn Fn(u64, &mut [u8]),
-        staging_pool: &mut StagingBufferPool,
-        scheduler: &mut Scheduler,
-    ) {
-        let indices = make_quad_indexed_indices(
-            topology,
-            index_format,
-            base_vertex,
-            first_index,
-            count,
-            gpu_va,
-            read_gpu,
-        );
-        let cache_key = quad_index_cache_key(
-            topology,
-            first_index,
-            count,
-            gpu_va,
-            base_vertex as u32,
-            true,
-        );
-        let data = indices_as_bytes(&indices);
-        let (buffer, offset) = self.get_or_upload_bytes(cache_key, data, staging_pool, scheduler);
-        let device = self.device.clone();
-        scheduler.record(move |cmdbuf| unsafe {
-            device.cmd_bind_index_buffer(cmdbuf, buffer, offset, vk::IndexType::UINT32);
-        });
-    }
-
     /// Invalidate a cached buffer range (mark as stale).
     ///
     /// The buffer may still be bound or targeted by copies in the pending
@@ -1438,147 +1505,6 @@ impl Drop for BufferCache {
             self.device.free_memory(self.null_memory, None);
         }
     }
-}
-
-fn quad_count(topology: PrimitiveTopology, count: u32) -> u32 {
-    match topology {
-        PrimitiveTopology::Quads => count / 4,
-        PrimitiveTopology::QuadStrip => count.saturating_sub(2) / 2,
-        _ => 0,
-    }
-}
-
-fn make_quad_array_indices(topology: PrimitiveTopology, first: u32, count: u32) -> Vec<u32> {
-    let quads = quad_count(topology, count);
-    let mut indices = Vec::with_capacity((quads * 6) as usize);
-    for quad in 0..quads {
-        match topology {
-            PrimitiveTopology::Quads => {
-                let base = first.wrapping_add(quad * 4);
-                indices.extend_from_slice(&[
-                    base,
-                    base.wrapping_add(1),
-                    base.wrapping_add(2),
-                    base,
-                    base.wrapping_add(2),
-                    base.wrapping_add(3),
-                ]);
-            }
-            PrimitiveTopology::QuadStrip => {
-                let base = first.wrapping_add(quad * 2);
-                indices.extend_from_slice(&[
-                    base,
-                    base.wrapping_add(3),
-                    base.wrapping_add(1),
-                    base,
-                    base.wrapping_add(2),
-                    base.wrapping_add(3),
-                ]);
-            }
-            _ => {}
-        }
-    }
-    indices
-}
-
-fn make_quad_indexed_indices(
-    topology: PrimitiveTopology,
-    index_format: IndexFormat,
-    base_vertex: i32,
-    first_index: u32,
-    count: u32,
-    gpu_va: u64,
-    read_gpu: &dyn Fn(u64, &mut [u8]),
-) -> Vec<u32> {
-    let index_size = index_size(index_format);
-    let mut source = vec![0u8; (first_index.saturating_add(count) as usize) * index_size];
-    read_gpu(gpu_va, &mut source);
-
-    let quads = quad_count(topology, count);
-    let mut indices = Vec::with_capacity((quads * 6) as usize);
-    for quad in 0..quads {
-        let offsets = match topology {
-            PrimitiveTopology::Quads => [
-                first_index + quad * 4,
-                first_index + quad * 4 + 1,
-                first_index + quad * 4 + 2,
-                first_index + quad * 4,
-                first_index + quad * 4 + 2,
-                first_index + quad * 4 + 3,
-            ],
-            PrimitiveTopology::QuadStrip => [
-                first_index + quad * 2,
-                first_index + quad * 2 + 3,
-                first_index + quad * 2 + 1,
-                first_index + quad * 2,
-                first_index + quad * 2 + 2,
-                first_index + quad * 2 + 3,
-            ],
-            _ => [0; 6],
-        };
-        for offset in offsets {
-            indices
-                .push(read_index(&source, index_format, offset).wrapping_add(base_vertex as u32));
-        }
-    }
-    indices
-}
-
-fn index_size(index_format: IndexFormat) -> usize {
-    match index_format {
-        IndexFormat::UnsignedByte => 1,
-        IndexFormat::UnsignedShort => 2,
-        IndexFormat::UnsignedInt => 4,
-    }
-}
-
-fn read_index(source: &[u8], index_format: IndexFormat, index: u32) -> u32 {
-    let offset = index as usize * index_size(index_format);
-    match index_format {
-        IndexFormat::UnsignedByte => source.get(offset).copied().unwrap_or(0) as u32,
-        IndexFormat::UnsignedShort => {
-            let bytes = [
-                source.get(offset).copied().unwrap_or(0),
-                source.get(offset + 1).copied().unwrap_or(0),
-            ];
-            u16::from_le_bytes(bytes) as u32
-        }
-        IndexFormat::UnsignedInt => {
-            let bytes = [
-                source.get(offset).copied().unwrap_or(0),
-                source.get(offset + 1).copied().unwrap_or(0),
-                source.get(offset + 2).copied().unwrap_or(0),
-                source.get(offset + 3).copied().unwrap_or(0),
-            ];
-            u32::from_le_bytes(bytes)
-        }
-    }
-}
-
-fn indices_as_bytes(indices: &[u32]) -> &[u8] {
-    unsafe {
-        std::slice::from_raw_parts(
-            indices.as_ptr().cast::<u8>(),
-            std::mem::size_of_val(indices),
-        )
-    }
-}
-
-fn quad_index_cache_key(
-    topology: PrimitiveTopology,
-    first: u32,
-    count: u32,
-    gpu_va: u64,
-    base_vertex: u32,
-    indexed: bool,
-) -> u64 {
-    let mut key = 0xC0DE_0000_0000_0000u64;
-    key ^= (topology as u64) << 56;
-    key ^= (first as u64) << 32;
-    key ^= count as u64;
-    key ^= gpu_va.rotate_left(17);
-    key ^= (base_vertex as u64).rotate_left(7);
-    key ^ if indexed { 1u64 << 55 } else { 0 }
 }
 
 fn vertex_binding_count(min_index: u32, max_index: u32, device_max: u32) -> u32 {
@@ -1681,6 +1607,41 @@ mod tests {
         let usage = common_buffer_usage_flags();
         assert!(usage.contains(vk::BufferUsageFlags::UNIFORM_TEXEL_BUFFER));
         assert!(usage.contains(vk::BufferUsageFlags::STORAGE_TEXEL_BUFFER));
+    }
+
+    #[test]
+    fn quad_lut_matches_upstream_swizzles() {
+        let quads = make_quad_lut(PrimitiveTopology::Quads, 4, vk::IndexType::UINT8_EXT);
+        assert_eq!(&quads[..6], &[0, 1, 2, 0, 2, 3]);
+        assert_eq!(&quads[6..12], &[1, 2, 3, 1, 3, 4]);
+
+        let strip = make_quad_lut(PrimitiveTopology::QuadStrip, 4, vk::IndexType::UINT8_EXT);
+        assert_eq!(&strip[..6], &[0, 3, 1, 0, 2, 3]);
+        assert_eq!(&strip[6..12], &[1, 4, 2, 1, 3, 4]);
+    }
+
+    #[test]
+    fn quad_lut_index_type_uses_upstream_boundaries() {
+        assert_eq!(
+            index_type_from_num_elements(0xff, true),
+            vk::IndexType::UINT8_EXT
+        );
+        assert_eq!(
+            index_type_from_num_elements(0x100, true),
+            vk::IndexType::UINT16
+        );
+        assert_eq!(
+            index_type_from_num_elements(0xff, false),
+            vk::IndexType::UINT16
+        );
+        assert_eq!(
+            index_type_from_num_elements(0xffff, true),
+            vk::IndexType::UINT16
+        );
+        assert_eq!(
+            index_type_from_num_elements(0x1_0000, true),
+            vk::IndexType::UINT32
+        );
     }
 
     #[test]

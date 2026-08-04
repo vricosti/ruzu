@@ -661,6 +661,14 @@ pub trait BufferCacheRuntime {
         size: u32,
     );
 
+    /// Bind the generated index buffer used to emulate non-indexed quads.
+    ///
+    /// Upstream: `Runtime::BindQuadIndexBuffer(topology, first, count)` when
+    /// `HAS_FULL_INDEX_AND_PRIMITIVE_SUPPORT` is false.
+    fn bind_quad_index_buffer(&mut self, _topology: PrimitiveTopology, _first: u32, _count: u32) {
+        unreachable!("quad index emulation is unavailable for this backend")
+    }
+
     /// Return the backend index offset consumed by the rasterizer draw call.
     ///
     /// Upstream OpenGL exposes this as `BufferCacheRuntime::IndexOffset()`.

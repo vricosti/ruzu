@@ -7,6 +7,9 @@
 //! that is partitioned into per-frame slices.
 
 use ash::vk;
+use std::ptr::NonNull;
+
+use super::scheduler::Scheduler;
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -67,6 +70,12 @@ impl Default for DescriptorUpdateEntry {
 /// retrieve the entries written since the last `acquire()` call, then uses
 /// those entries to build `vkUpdateDescriptorSets` write descriptors.
 pub struct UpdateDescriptorQueue {
+    /// Scheduler worker owning commands that consume entries from `payload`.
+    ///
+    /// Upstream stores `Scheduler&` and drains its worker before recycling a
+    /// frame slice on overflow.
+    scheduler: NonNull<Scheduler>,
+
     /// Current frame index in the ring buffer.
     frame_index: usize,
 
@@ -85,8 +94,9 @@ pub struct UpdateDescriptorQueue {
 
 impl UpdateDescriptorQueue {
     /// Port of `UpdateDescriptorQueue::UpdateDescriptorQueue`.
-    pub fn new() -> Self {
+    pub fn new(scheduler: &mut Scheduler) -> Self {
         Self {
+            scheduler: NonNull::from(scheduler),
             frame_index: 0,
             cursor: 0,
             frame_start: 0,
@@ -112,11 +122,18 @@ impl UpdateDescriptorQueue {
     /// Port of `UpdateDescriptorQueue::Acquire`.
     ///
     /// If the remaining space in the current frame is insufficient,
-    /// resets the cursor to the start of the frame (the caller is expected
-    /// to have waited for the scheduler's worker thread first).
+    /// waits for the scheduler worker before recycling the frame slice.
     pub fn acquire(&mut self) {
+        let mut scheduler = self.scheduler;
+        self.acquire_with_wait(|| unsafe {
+            scheduler.as_mut().wait_worker();
+        });
+    }
+
+    fn acquire_with_wait(&mut self, wait_worker: impl FnOnce()) {
         if (self.cursor - self.frame_start) + MIN_ENTRIES >= FRAME_PAYLOAD_SIZE {
-            log::warn!("UpdateDescriptorQueue: payload overflow, resetting cursor");
+            log::warn!("UpdateDescriptorQueue: payload overflow, waiting for worker thread");
+            wait_worker();
             self.cursor = self.frame_start;
         }
         self.upload_start = self.cursor;
@@ -189,6 +206,17 @@ pub type ComputePassDescriptorQueue = UpdateDescriptorQueue;
 mod tests {
     use super::*;
 
+    fn test_queue() -> UpdateDescriptorQueue {
+        UpdateDescriptorQueue {
+            scheduler: NonNull::dangling(),
+            frame_index: 0,
+            cursor: 0,
+            frame_start: 0,
+            upload_start: 0,
+            payload: vec![DescriptorUpdateEntry::Empty; PAYLOAD_SIZE],
+        }
+    }
+
     #[test]
     fn constants_match_upstream() {
         assert_eq!(FRAMES_IN_FLIGHT, 8);
@@ -199,8 +227,8 @@ mod tests {
 
     #[test]
     fn basic_acquire_and_add() {
-        let mut queue = UpdateDescriptorQueue::new();
-        queue.acquire();
+        let mut queue = test_queue();
+        queue.acquire_with_wait(|| panic!("worker wait is not needed"));
 
         queue.add_buffer(vk::Buffer::null(), 0, 256);
         queue.add_sampled_image(vk::ImageView::null(), vk::Sampler::null());
@@ -214,7 +242,7 @@ mod tests {
 
     #[test]
     fn tick_frame_advances_ring() {
-        let mut queue = UpdateDescriptorQueue::new();
+        let mut queue = test_queue();
         assert_eq!(queue.frame_start, 0);
 
         queue.tick_frame();
@@ -226,5 +254,18 @@ mod tests {
             queue.tick_frame();
         }
         assert_eq!(queue.frame_start, FRAME_PAYLOAD_SIZE); // wrapped back to 1
+    }
+
+    #[test]
+    fn acquire_waits_for_worker_before_recycling_overflowed_frame_slice() {
+        let mut queue = test_queue();
+        queue.cursor = FRAME_PAYLOAD_SIZE - MIN_ENTRIES;
+        let mut waits = 0;
+
+        queue.acquire_with_wait(|| waits += 1);
+
+        assert_eq!(waits, 1);
+        assert_eq!(queue.cursor, queue.frame_start);
+        assert_eq!(queue.upload_start, queue.frame_start);
     }
 }

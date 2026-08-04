@@ -1762,7 +1762,6 @@ impl KProcess {
         resource_limit: Option<Arc<Mutex<KResourceLimit>>>,
         pool: k_memory_manager::Pool,
         aslr_space_start: u64,
-        mm: Option<&mut k_memory_manager::KMemoryManager>,
     ) -> u32 {
         use super::k_scoped_resource_reservation::KScopedResourceReservation;
 
@@ -1786,27 +1785,19 @@ impl KProcess {
         }
 
         // System resource setup (upstream lines 374-400).
-        // Upstream creates a KSecureSystemResource for system_resource_num_pages != 0,
-        // or uses the kernel's global system resource. We store None for now —
-        // secure system resource initialization depends on KSystemControl and physical
-        // memory allocation that is not yet ported. The slab managers it provides are
-        // needed for advanced page table operations (MapPageGroup, etc.), not for the
-        // basic MapPages/SetHeapSize path.
         if system_resource_num_pages != 0 {
             let system_resource_size = (system_resource_num_pages as usize) * PAGE_SIZE;
             let mut secure_resource = KSecureSystemResource::new();
-            if let Some(mm) = mm {
-                if secure_resource
-                    .initialize(system_resource_size, pool, mm)
-                    .is_err()
-                {
-                    return svc_results::RESULT_OUT_OF_MEMORY.get_inner_value();
-                }
-            } else {
-                log::warn!(
-                    "initialize_for_user: system_resource_num_pages={} but no KMemoryManager provided",
-                    system_resource_num_pages
-                );
+            let Some(kernel) = super::kernel::get_kernel_mut() else {
+                return RESULT_INVALID_STATE.get_inner_value();
+            };
+            if let Err(result) = secure_resource.initialize(
+                system_resource_size,
+                resource_limit.clone(),
+                pool,
+                kernel.memory_manager_mut(),
+            ) {
+                return result.get_inner_value();
             }
             self.system_resource = Some(Arc::new(Mutex::new(secure_resource)));
         } else {
@@ -2126,7 +2117,6 @@ impl KProcess {
             Some(res_limit),
             pool,
             aslr_space_start,
-            None, // KMemoryManager — passed by caller when available
         );
         if result != RESULT_SUCCESS.get_inner_value() {
             return result;
@@ -3484,6 +3474,38 @@ mod tests {
         assert_eq!(process.get_main_stack_size(), 0);
         assert!(!process.is_64bit());
         assert!(process.is_application());
+    }
+
+    #[test]
+    fn load_from_metadata_initializes_declared_secure_system_resource() {
+        let _kernel = kernel_with_application_pool_for_test(0x8000);
+        let mut metadata = ProgramMetadata::new();
+        metadata.load_manual(
+            true,
+            ProgramAddressSpaceType::Is39Bit,
+            0x2c,
+            0,
+            0x100000,
+            0x0100_0000_0000_1000,
+            0,
+            0x0100_0000,
+            vec![],
+        );
+
+        let mut process = KProcess::new();
+        let result = process.load_from_metadata(&metadata, 0x120000, 0, false);
+
+        assert_eq!(result, RESULT_SUCCESS.get_inner_value());
+        let system_resource = process
+            .system_resource
+            .as_ref()
+            .expect("a non-zero NPDM system resource size must create a secure resource")
+            .lock()
+            .unwrap();
+        assert!(system_resource.is_initialized());
+        assert_eq!(system_resource.get_size(), 0x0100_0000);
+        drop(system_resource);
+        assert_eq!(process.get_total_system_resource_size(), 0x0100_0000);
     }
 
     #[test]

@@ -211,11 +211,20 @@ fn global_to_storage(opcode: Opcode) -> Option<Opcode> {
     })
 }
 
-fn inst_from_value(program: &Program, value: Value) -> Option<(InstRef, &Inst)> {
-    let Value::Inst(inst_ref) = value else {
+fn inst_recursive_from_value(program: &Program, value: Value) -> Option<(InstRef, &Inst)> {
+    let Value::Inst(mut inst_ref) = value else {
         return None;
     };
-    Some((inst_ref, program.block(inst_ref.block).inst(inst_ref.inst)))
+    loop {
+        let inst = program.block(inst_ref.block).inst(inst_ref.inst);
+        if inst.opcode != Opcode::Identity {
+            return Some((inst_ref, inst));
+        }
+        let Some(Value::Inst(next)) = inst.args.first().copied() else {
+            return Some((inst_ref, inst));
+        };
+        inst_ref = next;
+    }
 }
 
 fn track_low_address(program: &Program, global_inst: &Inst) -> Option<LowAddrInfo> {
@@ -224,7 +233,7 @@ fn track_low_address(program: &Program, global_inst: &Inst) -> Option<LowAddrInf
         return None;
     }
 
-    let (_, mut addr_inst) = inst_from_value(program, addr)?;
+    let (_, mut addr_inst) = inst_recursive_from_value(program, addr)?;
     let mut imm_offset = 0;
     if addr_inst.opcode == Opcode::IAdd64 {
         let offset = addr_inst.args.get(1)?;
@@ -236,7 +245,7 @@ fn track_low_address(program: &Program, global_inst: &Inst) -> Option<LowAddrInf
         if base.is_immediate() {
             return None;
         }
-        addr_inst = inst_from_value(program, base)?.1;
+        addr_inst = inst_recursive_from_value(program, base)?.1;
     }
 
     if addr_inst.opcode == Opcode::PackUint2x32 {
@@ -244,14 +253,11 @@ fn track_low_address(program: &Program, global_inst: &Inst) -> Option<LowAddrInf
         if vector.is_immediate() {
             return None;
         }
-        addr_inst = inst_from_value(program, vector)?.1;
+        addr_inst = inst_recursive_from_value(program, vector)?.1;
     }
 
     if addr_inst.opcode != Opcode::CompositeConstructU32x2 {
-        return Some(LowAddrInfo {
-            value: addr,
-            imm_offset,
-        });
+        return None;
     }
 
     Some(LowAddrInfo {
@@ -579,11 +585,28 @@ mod tests {
                 Value::ImmU32(0x20),
             ],
         ));
+        let address_vector = program.block_mut(0).append_inst(Inst::new(
+            Opcode::CompositeConstructU32x2,
+            vec![
+                Value::Inst(InstRef {
+                    block: 0,
+                    inst: addr,
+                }),
+                Value::ImmU32(0),
+            ],
+        ));
+        let packed_address = program.block_mut(0).append_inst(Inst::new(
+            Opcode::PackUint2x32,
+            vec![Value::Inst(InstRef {
+                block: 0,
+                inst: address_vector,
+            })],
+        ));
         let load = program.block_mut(0).append_inst(Inst::new(
             Opcode::LoadGlobal32,
             vec![Value::Inst(InstRef {
                 block: 0,
-                inst: addr,
+                inst: packed_address,
             })],
         ));
         program.block_mut(0).append_inst(Inst::new(
@@ -620,6 +643,56 @@ mod tests {
             .block(0)
             .iter()
             .any(|inst| inst.opcode == Opcode::LoadGlobal32));
+        assert!(program.block(0).iter().any(|inst| {
+            inst.opcode == Opcode::BitwiseAnd32
+                && inst.args.get(1) == Some(&Value::ImmU32(0xffff_ff00))
+        }));
+    }
+
+    #[test]
+    fn global_load_with_noncanonical_address_keeps_global_fallback() {
+        let mut program = Program::new(ShaderStage::VertexB);
+        program.blocks.push(Block::new());
+        program.post_order_blocks = vec![0];
+        let cbuf = program.block_mut(0).append_inst(Inst::new(
+            Opcode::GetCbufU32,
+            vec![Value::ImmU32(0), Value::ImmU32(0x110)],
+        ));
+        let addr = program.block_mut(0).append_inst(Inst::new(
+            Opcode::IAdd32,
+            vec![
+                Value::Inst(InstRef {
+                    block: 0,
+                    inst: cbuf,
+                }),
+                Value::ImmU32(0x20),
+            ],
+        ));
+        program.block_mut(0).append_inst(Inst::new(
+            Opcode::LoadGlobal32,
+            vec![Value::Inst(InstRef {
+                block: 0,
+                inst: addr,
+            })],
+        ));
+
+        global_memory_to_storage_buffer_pass(
+            &mut program,
+            &HostTranslateInfo {
+                min_ssbo_alignment: 0x100,
+                ..Default::default()
+            },
+        );
+
+        assert!(program.info.storage_buffers_descriptors.is_empty());
+        assert!(program
+            .block(0)
+            .iter()
+            .any(|inst| inst.opcode == Opcode::LoadGlobal32));
+        assert!(!program
+            .block(0)
+            .iter()
+            .any(|inst| inst.opcode == Opcode::LoadStorage32));
     }
 
     #[test]
@@ -641,12 +714,29 @@ mod tests {
                 Value::ImmU32(0x20),
             ],
         ));
+        let address_vector = program.block_mut(0).append_inst(Inst::new(
+            Opcode::CompositeConstructU32x2,
+            vec![
+                Value::Inst(InstRef {
+                    block: 0,
+                    inst: address,
+                }),
+                Value::ImmU32(0),
+            ],
+        ));
+        let packed_address = program.block_mut(0).append_inst(Inst::new(
+            Opcode::PackUint2x32,
+            vec![Value::Inst(InstRef {
+                block: 0,
+                inst: address_vector,
+            })],
+        ));
         let atomic = program.block_mut(0).append_inst(Inst::new(
             Opcode::GlobalAtomicIAdd32,
             vec![
                 Value::Inst(InstRef {
                     block: 0,
-                    inst: address,
+                    inst: packed_address,
                 }),
                 Value::ImmU32(7),
             ],

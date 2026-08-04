@@ -86,6 +86,21 @@ impl IAddOnContentManager {
                 "GetAddOnContentListChangedEventWithProcessId",
             ),
             (
+                commands::NOTIFY_MOUNT_ADD_ON_CONTENT,
+                Some(Self::notify_mount_add_on_content_handler),
+                "NotifyMountAddOnContent",
+            ),
+            (
+                commands::NOTIFY_UNMOUNT_ADD_ON_CONTENT,
+                Some(Self::notify_unmount_add_on_content_handler),
+                "NotifyUnmountAddOnContent",
+            ),
+            (
+                commands::CHECK_ADD_ON_CONTENT_MOUNT_STATUS,
+                Some(Self::check_add_on_content_mount_status_handler),
+                "CheckAddOnContentMountStatus",
+            ),
+            (
                 commands::CREATE_EC_PURCHASED_EVENT_MANAGER,
                 Some(Self::create_ec_purchased_event_manager_handler),
                 "CreateEcPurchasedEventManager",
@@ -332,6 +347,42 @@ impl IAddOnContentManager {
         }
     }
 
+    fn notify_mount_add_on_content_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        let service =
+            unsafe { &*(this as *const dyn ServiceFramework as *const IAddOnContentManager) };
+        service.notify_mount_add_on_content();
+
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+    }
+
+    fn notify_unmount_add_on_content_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        let service =
+            unsafe { &*(this as *const dyn ServiceFramework as *const IAddOnContentManager) };
+        service.notify_unmount_add_on_content();
+
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+    }
+
+    fn check_add_on_content_mount_status_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        let service =
+            unsafe { &*(this as *const dyn ServiceFramework as *const IAddOnContentManager) };
+        service.check_add_on_content_mount_status();
+
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+    }
+
     fn create_ec_purchased_event_manager_handler(
         this: &dyn ServiceFramework,
         ctx: &mut HLERequestContext,
@@ -399,5 +450,31 @@ impl ServiceFramework for IAddOnContentManager {
 
     fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
         &self.handlers_tipc
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mount_status_handlers_match_upstream_function_table() {
+        let system = crate::core::System::new();
+        let service = IAddOnContentManager::new(crate::core::SystemRef::from_ref(&system));
+
+        for command in [
+            commands::NOTIFY_MOUNT_ADD_ON_CONTENT,
+            commands::NOTIFY_UNMOUNT_ADD_ON_CONTENT,
+            commands::CHECK_ADD_ON_CONTENT_MOUNT_STATUS,
+        ] {
+            assert!(
+                service
+                    .handlers()
+                    .get(&command)
+                    .and_then(|info| info.handler_callback)
+                    .is_some(),
+                "command {command} must be dispatched"
+            );
+        }
     }
 }

@@ -3840,7 +3840,10 @@ impl KPageTableBase {
                         pg_remaining = pg_blocks[pg_idx].1;
                     }
                     let chunk = needed.min(pg_remaining);
-                    if cur_pg.add_block(pg_phys, chunk).is_err() {
+                    // Upstream consumes each KPageGroup block from its tail:
+                    // `pg_phys_addr + ((pg_pages - cur_pages) * PageSize)`.
+                    let chunk_phys = pg_phys + ((pg_remaining - chunk) * PAGE_SIZE) as u64;
+                    if cur_pg.add_block(chunk_phys, chunk).is_err() {
                         self.rollback_partial_map_physical(addr, range_va, &mut *updater_page_list);
                         Self::release_unowned_physical_pages_from(
                             &pg_blocks,
@@ -3850,7 +3853,6 @@ impl KPageTableBase {
                         );
                         return svc_results::RESULT_OUT_OF_MEMORY.get_inner_value();
                     }
-                    pg_phys += (chunk * PAGE_SIZE) as u64;
                     pg_remaining -= chunk;
                     needed -= chunk;
                 }

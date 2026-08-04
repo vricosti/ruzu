@@ -32,6 +32,7 @@ pub struct StatusBar {
     filter: gtk::Button,
     aa: gtk::Button,
     volume: gtk::Button,
+    shader_building: gtk::Label,
     res_scale: gtk::Label,
     game_fps: gtk::Label,
     frame_time: gtk::Label,
@@ -68,13 +69,14 @@ impl StatusBar {
         message.set_hexpand(true);
         root.append(&message);
 
+        let shader_building = performance_label("The amount of shaders currently being built");
         let res_scale = performance_label("The current selected resolution scaling multiplier.");
         let game_fps =
             performance_label("How many frames per second the game is currently displaying.");
         let frame_time = performance_label(
             "Time taken to emulate a Switch frame, excluding frame limiting and v-sync.",
         );
-        for label in [&res_scale, &game_fps, &frame_time] {
+        for label in [&shader_building, &res_scale, &game_fps, &frame_time] {
             root.append(label);
         }
 
@@ -86,6 +88,7 @@ impl StatusBar {
             filter,
             aa,
             volume,
+            shader_building,
             res_scale,
             game_fps,
             frame_time,
@@ -285,13 +288,30 @@ impl StatusBar {
     /// Update the permanent performance labels from the latest engine sample.
     ///
     /// This is the GTK counterpart of `GMainWindow::UpdateStatusBar`.
-    pub fn update_performance(&self, results: Option<PerfStatsResults>) {
+    pub fn update_performance(
+        &self,
+        results: Option<PerfStatsResults>,
+        shaders_building: Option<i32>,
+    ) {
         let Some(results) = results else {
-            for label in [&self.res_scale, &self.game_fps, &self.frame_time] {
+            for label in [
+                &self.shader_building,
+                &self.res_scale,
+                &self.game_fps,
+                &self.frame_time,
+            ] {
                 label.set_visible(false);
             }
             return;
         };
+
+        if let Some(count) = shaders_building.filter(|count| *count > 0) {
+            self.shader_building
+                .set_label(&format_shaders_building(count));
+            self.shader_building.set_visible(true);
+        } else {
+            self.shader_building.set_visible(false);
+        }
 
         let values = settings::values();
         self.res_scale
@@ -319,6 +339,11 @@ fn format_resolution_scale(up_factor: f32) -> String {
             .to_string()
     };
     format!("Scale: {scale}x")
+}
+
+fn format_shaders_building(count: i32) -> String {
+    let suffix = if count == 1 { "shader" } else { "shaders" };
+    format!("Building: {count} {suffix}")
 }
 
 fn format_game_fps(average_game_fps: f64, unlocked: bool) -> String {
@@ -491,6 +516,8 @@ mod tests {
 
     #[test]
     fn performance_text_matches_upstream_status_bar() {
+        assert_eq!(format_shaders_building(1), "Building: 1 shader");
+        assert_eq!(format_shaders_building(3), "Building: 3 shaders");
         assert_eq!(format_resolution_scale(1.0), "Scale: 1x");
         assert_eq!(format_resolution_scale(1.5), "Scale: 1.5x");
         assert_eq!(format_game_fps(59.4, false), "Game: 59 FPS");

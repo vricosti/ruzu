@@ -2240,7 +2240,7 @@ impl GMainWindow {
 
         self.loading_screen.clear();
         self.show_game_list();
-        self.status_bar.update_performance(None);
+        self.status_bar.update_performance(None, None);
         if let Some(app) = self.window.application() {
             update_menu_state(&app, false, true);
         }
@@ -2298,12 +2298,13 @@ impl GMainWindow {
                 #[upgrade_or]
                 glib::ControlFlow::Break,
                 move || {
-                    let results = this
-                        .session
-                        .borrow()
+                    let session = this.session.borrow();
+                    let results = session.as_ref().and_then(EmulationSession::perf_stats);
+                    let shaders_building = session
                         .as_ref()
-                        .and_then(EmulationSession::perf_stats);
-                    this.status_bar.update_performance(results);
+                        .and_then(EmulationSession::shaders_building);
+                    this.status_bar
+                        .update_performance(results, shaders_building);
                     glib::ControlFlow::Continue
                 }
             ),

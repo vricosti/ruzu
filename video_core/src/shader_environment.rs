@@ -22,6 +22,7 @@ use crate::textures::texture::{texture_pair, TextureType as TegraTextureType, Ti
 use common::fs::fs_util::path_to_utf8_string;
 use common::fs::path_util::{get_ruzu_path, RuzuPath};
 use parking_lot::Mutex as ParkingLotMutex;
+use shader_recompiler::exception::LogicError;
 use shader_recompiler::program_header::ProgramHeader;
 
 /// GPU virtual address type.
@@ -1424,7 +1425,7 @@ impl FileEnvironment {
 
     pub fn read_instruction(&self, address: u32) -> u64 {
         if address < self.read_lowest || address > self.read_highest {
-            panic!("Out of bounds address {}", address);
+            std::panic::panic_any(LogicError::new(format!("Out of bounds address {address}")));
         }
         self.code[((address - self.read_lowest) / 8) as usize]
     }
@@ -1434,21 +1435,23 @@ impl FileEnvironment {
         self.cbuf_values
             .get(&key)
             .copied()
-            .unwrap_or_else(|| panic!("Uncached read cbuf value {cbuf_index}:{cbuf_offset:#x}"))
+            .unwrap_or_else(|| std::panic::panic_any(LogicError::new("Uncached read texture type")))
     }
 
     pub fn read_texture_type(&self, handle: u32) -> TextureType {
         self.texture_types
             .get(&handle)
             .copied()
-            .unwrap_or_else(|| panic!("Uncached read texture type {handle:#x}"))
+            .unwrap_or_else(|| std::panic::panic_any(LogicError::new("Uncached read texture type")))
     }
 
     pub fn read_texture_pixel_format(&self, handle: u32) -> TexturePixelFormat {
         self.texture_pixel_formats
             .get(&handle)
             .copied()
-            .unwrap_or_else(|| panic!("Uncached read texture pixel format {handle:#x}"))
+            .unwrap_or_else(|| {
+                std::panic::panic_any(LogicError::new("Uncached read texture pixel format"))
+            })
     }
 
     pub fn is_texture_pixel_format_integer(&self, handle: u32) -> bool {
@@ -1500,6 +1503,10 @@ impl Default for FileEnvironment {
 }
 
 impl shader_recompiler::environment::Environment for FileEnvironment {
+    fn is_file_environment(&self) -> bool {
+        true
+    }
+
     fn read_instruction(&mut self, address: u32) -> u64 {
         FileEnvironment::read_instruction(self, address)
     }

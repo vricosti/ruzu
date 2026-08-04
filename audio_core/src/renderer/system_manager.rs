@@ -14,6 +14,7 @@ pub struct SystemManager {
     systems: Arc<Mutex<Vec<Arc<Mutex<System>>>>>,
     thread: Option<JoinHandle<()>>,
     active: Arc<AtomicBool>,
+    stop_requested: Arc<AtomicBool>,
     audio_renderer: AudioRendererHandle,
 }
 
@@ -24,6 +25,7 @@ impl SystemManager {
             systems: Arc::new(Mutex::new(Vec::new())),
             thread: None,
             active: Arc::new(AtomicBool::new(false)),
+            stop_requested: Arc::new(AtomicBool::new(false)),
             audio_renderer,
         }
     }
@@ -33,10 +35,12 @@ impl SystemManager {
             return;
         }
 
+        self.stop_requested.store(false, Ordering::SeqCst);
         log::info!("AudioRenderSystemManager::initialize_unsafe start");
         self.audio_renderer.lock().start();
         let systems = Arc::clone(&self.systems);
         let active = Arc::clone(&self.active);
+        let stop_requested = Arc::clone(&self.stop_requested);
         let audio_renderer = self.audio_renderer.clone();
         self.thread = Some(
             thread::Builder::new()
@@ -59,7 +63,9 @@ impl SystemManager {
                     let mut rate_signal_us: u64 = 0;
                     let mut rate_wait_us: u64 = 0;
                     let mut rate_last_dump = std::time::Instant::now();
-                    while active.load(Ordering::SeqCst) {
+                    while active.load(Ordering::SeqCst)
+                        && !stop_requested.load(Ordering::SeqCst)
+                    {
                         let t_iter = std::time::Instant::now();
                         let t = std::time::Instant::now();
                         {
@@ -81,7 +87,7 @@ impl SystemManager {
                             renderer.signal();
                             t_signal = t_s.elapsed().as_micros();
                             let t_w = std::time::Instant::now();
-                            if !renderer.wait_with_stop(&active) {
+                            if !renderer.wait_with_stop(&stop_requested) {
                                 break;
                             }
                             t_wait = t_w.elapsed().as_micros();
@@ -131,6 +137,7 @@ impl SystemManager {
             return;
         }
         log::info!("AudioRenderSystemManager::stop");
+        self.stop_requested.store(true, Ordering::SeqCst);
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
@@ -212,5 +219,26 @@ mod tests {
         let start = Instant::now();
         manager.stop();
         assert!(start.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn initialize_keeps_worker_running_until_stop() {
+        let core = crate::make_test_system();
+        let renderer = Arc::new(Mutex::new(AudioRenderer::new(
+            core.clone(),
+            new_sink_handle(Box::new(NullSink::new("test"))),
+        )));
+        let mut manager = SystemManager::new(core, renderer);
+
+        manager.initialize_unsafe();
+        std::thread::sleep(Duration::from_millis(20));
+
+        assert!(manager.active.load(Ordering::SeqCst));
+        assert!(!manager.stop_requested.load(Ordering::SeqCst));
+        assert!(!manager.thread.as_ref().unwrap().is_finished());
+
+        manager.stop();
+        assert!(!manager.active.load(Ordering::SeqCst));
+        assert!(manager.stop_requested.load(Ordering::SeqCst));
     }
 }

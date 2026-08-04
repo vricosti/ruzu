@@ -11,10 +11,29 @@ use crate::ir::value::Value;
 
 pub fn ffma(tv: &mut TranslatorVisitor, insn: u64, opcode: MaxwellOpcode) {
     let (src_b, src_c) = match opcode {
-        MaxwellOpcode::FFMA_reg => (tv.get_float_reg20(insn), tv.get_float_reg39(insn)),
-        MaxwellOpcode::FFMA_rc => (tv.get_float_reg39(insn), tv.get_float_cbuf(insn)),
-        MaxwellOpcode::FFMA_cr => (tv.get_float_cbuf(insn), tv.get_float_reg39(insn)),
-        MaxwellOpcode::FFMA_imm => (tv.get_float_imm20(insn), tv.get_float_reg39(insn)),
+        // Upstream's supported C++ toolchains evaluate the FFMA helper's
+        // arguments from right to left. Keep that emission order explicit so
+        // independent operand reads appear in the same order in the IR.
+        MaxwellOpcode::FFMA_reg => {
+            let src_c = tv.get_float_reg39(insn);
+            let src_b = tv.get_float_reg20(insn);
+            (src_b, src_c)
+        }
+        MaxwellOpcode::FFMA_rc => {
+            let src_c = tv.get_float_cbuf(insn);
+            let src_b = tv.get_float_reg39(insn);
+            (src_b, src_c)
+        }
+        MaxwellOpcode::FFMA_cr => {
+            let src_c = tv.get_float_reg39(insn);
+            let src_b = tv.get_float_cbuf(insn);
+            (src_b, src_c)
+        }
+        MaxwellOpcode::FFMA_imm => {
+            let src_c = tv.get_float_reg39(insn);
+            let src_b = tv.get_float_imm20(insn);
+            (src_b, src_c)
+        }
         _ => unreachable!("invalid opcode for FFMA: {:?}", opcode),
     };
 
@@ -136,5 +155,21 @@ mod tests {
         assert!(opcodes.contains(&Opcode::FPOrdEqual32));
         assert!(opcodes.contains(&Opcode::LogicalOr));
         assert!(opcodes.contains(&Opcode::SelectF32));
+    }
+
+    #[test]
+    fn ffma_rc_emits_cbuf_before_register_operand_like_upstream() {
+        let mut program = Program::new(ShaderStage::VertexB);
+        program.blocks.push(Block::new());
+        let mut tv = TranslatorVisitor::new(&mut program, 0);
+        let insn = 10u64 | (6u64 << 8) | (134u64 << 20) | (3u64 << 34) | (8u64 << 39);
+
+        ffma(&mut tv, insn, MaxwellOpcode::FFMA_rc);
+
+        let instructions: Vec<_> = tv.ir.program.blocks[0].iter().collect();
+        assert_eq!(instructions[0].opcode, Opcode::GetCbufF32);
+        assert_eq!(instructions[0].args[0], Value::ImmU32(3));
+        assert_eq!(instructions[0].args[1], Value::ImmU32(536));
+        assert_eq!(instructions[1].opcode, Opcode::GetRegister);
     }
 }

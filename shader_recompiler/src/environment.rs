@@ -15,6 +15,11 @@ use super::stage::Stage;
 /// Provides access to shader instructions, constant buffer values,
 /// texture types, and other GPU state needed during translation.
 pub trait Environment {
+    /// Diagnostic discriminator for cache-file shader environments.
+    fn is_file_environment(&self) -> bool {
+        false
+    }
+
     /// Read a 64-bit instruction at the given byte address.
     fn read_instruction(&mut self, address: u32) -> u64;
 

@@ -1,6 +1,6 @@
 //! Port of zuyu/src/core/hle/kernel/k_system_resource.h and k_system_resource.cpp
-//! Status: Stubbed
-//! Derniere synchro: 2026-03-11
+//! Status: Partial
+//! Derniere synchro: 2026-08-04
 //!
 //! KSystemResource is a base class for kernel objects that own memory management
 //! infrastructure (slab managers, page table managers). KSecureSystemResource
@@ -11,7 +11,11 @@ use super::k_dynamic_resource_manager::{KBlockInfoManager, KMemoryBlockSlabManag
 use super::k_memory_block::PAGE_SIZE;
 use super::k_memory_manager;
 use super::k_page_table_manager::KPageTableManager;
-use super::k_page_table_slab_heap::KPageTableSlabHeap;
+use super::k_page_table_slab_heap::{KPageTableSlabHeap, RefCount};
+use super::k_resource_limit::{KResourceLimit, LimitableResource};
+use super::k_scoped_resource_reservation::KScopedResourceReservation;
+use crate::hle::result::ResultCode;
+use std::sync::{Arc, Mutex};
 
 /// Port of Kernel::KSystemResource.
 ///
@@ -102,6 +106,7 @@ pub struct KSecureSystemResource {
     block_info_manager: KBlockInfoManager,
     page_table_manager: KPageTableManager,
     page_table_heap: KPageTableSlabHeap,
+    resource_limit: Option<Arc<Mutex<KResourceLimit>>>,
     resource_address: u64,
     resource_size: usize,
 }
@@ -125,6 +130,7 @@ impl KSecureSystemResource {
                 KPageTableSlabHeap::new(),
             )),
             page_table_heap: KPageTableSlabHeap::new(),
+            resource_limit: None,
             resource_address: 0,
             resource_size: 0,
         }
@@ -158,23 +164,39 @@ impl KSecureSystemResource {
     pub fn initialize(
         &mut self,
         size: usize,
+        resource_limit: Option<Arc<Mutex<KResourceLimit>>>,
         pool: k_memory_manager::Pool,
         mm: &mut k_memory_manager::KMemoryManager,
-    ) -> Result<(), ()> {
+    ) -> Result<(), ResultCode> {
         use super::k_memory_block::PAGE_SIZE;
 
+        // Set members (k_system_resource.cpp:12-14).
+        self.resource_limit = resource_limit.clone();
         self.resource_size = size;
+        self.resource_pool = pool;
+
+        // Reserve the physical memory consumed by the secure resource before
+        // allocating it (k_system_resource.cpp:16-21).
+        let secure_size = self.calculate_required_secure_memory_size_self();
+        let mut memory_reservation = KScopedResourceReservation::new(
+            resource_limit,
+            LimitableResource::PhysicalMemoryMax,
+            secure_size as i64,
+        );
+        if !memory_reservation.succeeded() {
+            return Err(super::svc::svc_results::RESULT_LIMIT_REACHED);
+        }
 
         // Allocate secure memory via KSystemControl.
         let resource_address =
             super::board::k_system_control::allocate_secure_memory(mm, size, pool as u32)
-                .map_err(|_| ())?;
+                .map_err(|result| result)?;
 
         self.resource_address = resource_address;
 
         // Calculate reference count size.
         let rc_size = common::alignment::align_up(
-            (size / PAGE_SIZE * std::mem::size_of::<u32>()) as u64,
+            (size / PAGE_SIZE * std::mem::size_of::<RefCount>()) as u64,
             PAGE_SIZE as u64,
         ) as usize;
         if size <= rc_size {
@@ -185,7 +207,7 @@ impl KSecureSystemResource {
                 size,
                 pool as u32,
             );
-            return Err(());
+            return Err(super::svc::svc_results::RESULT_OUT_OF_MEMORY);
         }
 
         // Initialize the dynamic page manager with the remaining memory.
@@ -200,9 +222,10 @@ impl KSecureSystemResource {
                 size,
                 pool as u32,
             );
-            return Err(());
+            return Err(super::svc::svc_results::RESULT_OUT_OF_MEMORY);
         }
 
+        memory_reservation.commit();
         self.is_initialized = true;
         Ok(())
     }
@@ -223,17 +246,24 @@ impl KSecureSystemResource {
                 mm,
                 self.resource_address,
                 self.resource_size,
-                0, // Pool
+                self.resource_pool as u32,
             );
         }
+
+        if let Some(resource_limit) = self.resource_limit.take() {
+            resource_limit.lock().unwrap().release(
+                LimitableResource::PhysicalMemoryMax,
+                self.calculate_required_secure_memory_size_self() as i64,
+            );
+        }
+        self.is_initialized = false;
     }
 
     pub fn calculate_required_secure_memory_size(
-        _size: usize,
-        _pool: k_memory_manager::Pool,
+        size: usize,
+        pool: k_memory_manager::Pool,
     ) -> usize {
-        // Stubbed: depends on KSystemControl::CalculateRequiredSecureMemorySize.
-        0
+        super::board::k_system_control::calculate_required_secure_memory_size(size, pool as u32)
     }
 
     pub fn base(&self) -> &KSystemResource {

@@ -562,9 +562,7 @@ fn call32(system: &System, imm: u32, args: &mut SvcArgs) {
         // Process management
         // =====================================================================
         Some(SvcId::ExitProcess) => {
-            // IN: (none); OUT: (none)
-            svc_exception::break_execution(system, 0, 0, 0);
-            log::info!("  ExitProcess called");
+            svc_process::exit_process(system);
         }
         Some(SvcId::GetProcessId) => {
             // IN: process_handle=arg32[1]; OUT: ret=arg32[0], pid=scatter64[1,2]
@@ -1729,6 +1727,29 @@ fn call64(system: &System, imm: u32, args: &mut SvcArgs) {
             let address = get_arg64(args, 0);
             let size = get_arg64(args, 1);
             let result = svc_physical_memory::map_physical_memory(system, address, size);
+            set_arg64(args, 0, result.get_inner_value() as u64);
+        }
+        Some(SvcId::UnmapPhysicalMemory) => {
+            let address = get_arg64(args, 0);
+            let size = get_arg64(args, 1);
+            let result = svc_physical_memory::unmap_physical_memory(system, address, size);
+            set_arg64(args, 0, result.get_inner_value() as u64);
+        }
+        Some(SvcId::MapPhysicalMemoryUnsafe) => {
+            let address = get_arg64(args, 0);
+            let size = get_arg64(args, 1);
+            let result = svc_physical_memory::map_physical_memory_unsafe(address, size);
+            set_arg64(args, 0, result.get_inner_value() as u64);
+        }
+        Some(SvcId::UnmapPhysicalMemoryUnsafe) => {
+            let address = get_arg64(args, 0);
+            let size = get_arg64(args, 1);
+            let result = svc_physical_memory::unmap_physical_memory_unsafe(address, size);
+            set_arg64(args, 0, result.get_inner_value() as u64);
+        }
+        Some(SvcId::SetUnsafeLimit) => {
+            let limit = get_arg64(args, 0);
+            let result = svc_physical_memory::set_unsafe_limit(limit);
             set_arg64(args, 0, result.get_inner_value() as u64);
         }
         // ====================================================================
@@ -3321,6 +3342,8 @@ mod tests {
             .unwrap()
             .register_thread_object(current_thread.clone());
         process.lock().unwrap().push_back_to_priority_queue(1);
+        process.lock().unwrap().state =
+            crate::hle::kernel::k_process::ProcessState::Running;
         scheduler.lock().unwrap().initialize(1, 0, 0);
 
         let shared_memory = process.lock().unwrap().get_shared_memory();
@@ -3389,6 +3412,37 @@ mod tests {
                 "{svc:?} must be dispatched instead of returning stub success"
             );
         }
+    }
+
+    #[test]
+    fn call64_routes_unmap_physical_memory() {
+        let system = test_system();
+        let mut args: SvcArgs = [0; 8];
+        args[0] = 1;
+        args[1] = 0x1000;
+
+        call64(&system, SvcId::UnmapPhysicalMemory as u32, &mut args);
+
+        assert_eq!(
+            args[0],
+            crate::hle::kernel::svc::svc_results::RESULT_INVALID_ADDRESS.get_inner_value() as u64,
+            "UnmapPhysicalMemory must reach its AArch64 handler instead of returning stub success"
+        );
+    }
+
+    #[test]
+    fn call32_exit_process_notifies_the_frontend() {
+        let mut system = test_system();
+        let exited = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let callback_exited = Arc::clone(&exited);
+        system.register_exit_callback(Box::new(move || {
+            callback_exited.store(true, std::sync::atomic::Ordering::SeqCst);
+        }));
+
+        let mut args: SvcArgs = [0; 8];
+        call32(&system, SvcId::ExitProcess as u32, &mut args);
+
+        assert!(exited.load(std::sync::atomic::Ordering::SeqCst));
     }
 
     #[test]

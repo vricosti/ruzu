@@ -12,7 +12,6 @@ use common::cityhash::city_hash64;
 use common::thread_worker::ThreadWorker;
 use log::{debug, warn};
 use std::collections::BTreeMap;
-use std::panic::{catch_unwind, take_hook, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 
@@ -25,6 +24,7 @@ use crate::engines::maxwell_3d::{
 };
 use crate::shader;
 use crate::shader_cache::{GraphicsEnvironments, NUM_PROGRAMS};
+use crate::shader_notify::ShaderNotifyHandle;
 use crate::surface::{
     is_pixel_format_integer, is_pixel_format_signed_integer, pixel_format_from_render_target_format,
 };
@@ -45,16 +45,6 @@ use super::pipeline_helper::{
 };
 
 const NUM_VK_GRAPHICS_STAGES: usize = 5;
-
-/// One-time installation of the shader-compile panic-hook filter used by
-/// `catch_shader_exception`. See that function for the rationale.
-static SHADER_EXCEPTION_HOOK_INSTALL: std::sync::Once = std::sync::Once::new();
-
-thread_local! {
-    /// True while the current thread is inside `catch_shader_exception`.
-    /// The process-wide panic hook stays silent for such threads.
-    static IN_SHADER_EXCEPTION_SCOPE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
 
 #[derive(Debug, Clone, Copy)]
 pub struct GraphicsDescriptorBinding {
@@ -350,6 +340,7 @@ impl GraphicsPipelineCache {
         device: ash::Device,
         shader_cache: PipelineCache,
         profile: Profile,
+        host_info: HostTranslateInfo,
         extended_dynamic_state_supported: bool,
         extended_dynamic_state2_supported: bool,
         extended_dynamic_state2_extra_supported: bool,
@@ -368,7 +359,7 @@ impl GraphicsPipelineCache {
             device,
             shader_cache,
             profile,
-            host_info: HostTranslateInfo::default(),
+            host_info,
             extended_dynamic_state_supported,
             extended_dynamic_state2_supported,
             extended_dynamic_state2_extra_supported,
@@ -506,6 +497,7 @@ impl GraphicsPipelineCache {
         draw: &DrawCall,
         render_pass: vk::RenderPass,
         pipeline_cache: vk::PipelineCache,
+        shader_notify: ShaderNotifyHandle,
         read_gpu: &dyn Fn(u64, &mut [u8]),
         key: &GraphicsPipelineKey,
         fixed_state: &FixedPipelineState,
@@ -519,7 +511,11 @@ impl GraphicsPipelineCache {
 
         // Create pipeline layout and pipeline
         let shader_modules = self.create_shader_modules(&compiled_stages)?;
-        let descriptor_layout = self.create_pipeline_layout(&compiled_stages)?;
+        shader_notify.mark_shader_building();
+        let Some(descriptor_layout) = self.create_pipeline_layout(&compiled_stages) else {
+            shader_notify.mark_shader_complete();
+            return None;
+        };
         let vs_compiled = compiled_stages[0]
             .as_ref()
             .expect("vertex stage was compiled before module creation");
@@ -530,7 +526,9 @@ impl GraphicsPipelineCache {
             pipeline_cache,
             fixed_state,
             vs_compiled,
-        )?;
+        );
+        shader_notify.mark_shader_complete();
+        let pipeline = pipeline?;
 
         debug!(
             "GraphicsPipelineCache: compiled new pipeline (vs_hash=0x{:016X}, fs_hash=0x{:016X})",
@@ -556,7 +554,6 @@ impl GraphicsPipelineCache {
             .iter()
             .flatten()
             .any(|info| info.uses_rescaling_uniform);
-
         Some(GraphicsPipeline {
             device: self.device.clone(),
             key: key.clone(),
@@ -585,6 +582,7 @@ impl GraphicsPipelineCache {
         draw: &DrawCall,
         render_pass: vk::RenderPass,
         pipeline_cache: vk::PipelineCache,
+        shader_notify: ShaderNotifyHandle,
         environments: &mut GraphicsEnvironments,
         key: &GraphicsPipelineKey,
         fixed_state: &FixedPipelineState,
@@ -592,7 +590,11 @@ impl GraphicsPipelineCache {
         let compiled_stages = self.compile_graphics_stages_from_environments(key, environments)?;
 
         let shader_modules = self.create_shader_modules(&compiled_stages)?;
-        let descriptor_layout = self.create_pipeline_layout(&compiled_stages)?;
+        shader_notify.mark_shader_building();
+        let Some(descriptor_layout) = self.create_pipeline_layout(&compiled_stages) else {
+            shader_notify.mark_shader_complete();
+            return None;
+        };
         let vs_compiled = compiled_stages[0]
             .as_ref()
             .expect("vertex stage was compiled before module creation");
@@ -603,7 +605,9 @@ impl GraphicsPipelineCache {
             pipeline_cache,
             fixed_state,
             vs_compiled,
-        )?;
+        );
+        shader_notify.mark_shader_complete();
+        let pipeline = pipeline?;
 
         debug!("GraphicsPipelineCache: compiled runtime environment pipeline");
 
@@ -659,6 +663,7 @@ impl GraphicsPipelineCache {
         draw: &DrawCall,
         render_pass: vk::RenderPass,
         pipeline_cache: vk::PipelineCache,
+        shader_notify: ShaderNotifyHandle,
         environments: &mut GraphicsEnvironments,
         key: &GraphicsPipelineKey,
         fixed_state: &FixedPipelineState,
@@ -667,7 +672,11 @@ impl GraphicsPipelineCache {
         let compiled_stages = self.compile_graphics_stages_from_environments(key, environments)?;
 
         let shader_modules = self.create_shader_modules(&compiled_stages)?;
-        let descriptor_layout = self.create_pipeline_layout(&compiled_stages)?;
+        shader_notify.mark_shader_building();
+        let Some(descriptor_layout) = self.create_pipeline_layout(&compiled_stages) else {
+            shader_notify.mark_shader_complete();
+            return None;
+        };
         let vs_compiled = compiled_stages[0]
             .as_ref()
             .expect("vertex stage was compiled before module creation")
@@ -692,7 +701,6 @@ impl GraphicsPipelineCache {
             .iter()
             .flatten()
             .any(|info| info.uses_rescaling_uniform);
-
         let pipeline = Arc::new(Mutex::new(vk::Pipeline::null()));
         let build_condvar = Arc::new(Condvar::new());
         let build_mutex = Arc::new(Mutex::new(()));
@@ -722,6 +730,7 @@ impl GraphicsPipelineCache {
                 is_built_for_worker.store(true, Ordering::Release);
             }
             build_condvar_for_worker.notify_one();
+            shader_notify.mark_shader_complete();
         });
 
         Some(GraphicsPipeline {
@@ -848,24 +857,21 @@ impl GraphicsPipelineCache {
         &mut self,
         render_pass: vk::RenderPass,
         pipeline_cache: vk::PipelineCache,
+        shader_notify: ShaderNotifyHandle,
         environments: &mut [crate::shader_environment::FileEnvironment],
         key: &GraphicsPipelineKey,
     ) -> Option<GraphicsPipeline> {
-        match catch_shader_exception(|| {
+        match super::pipeline_cache::catch_shader_exception(|| {
             self.build_pipeline_keyed_from_file_environments_impl(
                 render_pass,
                 pipeline_cache,
+                shader_notify,
                 environments,
                 key,
             )
         }) {
             Ok(pipeline) => pipeline,
-            Err(payload) => {
-                let reason = payload
-                    .downcast_ref::<&str>()
-                    .copied()
-                    .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
-                    .unwrap_or("unknown shader compiler panic");
+            Err(reason) => {
                 log::error!(
                     "Skipping cached graphics pipeline 0x{:016X}: {} (stage unique_hashes: {}; environments: {})",
                     graphics_pipeline_key_cache_hash(key),
@@ -896,6 +902,7 @@ impl GraphicsPipelineCache {
         &mut self,
         render_pass: vk::RenderPass,
         pipeline_cache: vk::PipelineCache,
+        shader_notify: ShaderNotifyHandle,
         environments: &mut [crate::shader_environment::FileEnvironment],
         key: &GraphicsPipelineKey,
     ) -> Option<GraphicsPipeline> {
@@ -972,7 +979,11 @@ impl GraphicsPipelineCache {
 
         let vs_compiled = compiled_stages[0].as_ref()?;
         let shader_modules = self.create_shader_modules(&compiled_stages)?;
-        let descriptor_layout = self.create_pipeline_layout(&compiled_stages)?;
+        shader_notify.mark_shader_building();
+        let Some(descriptor_layout) = self.create_pipeline_layout(&compiled_stages) else {
+            shader_notify.mark_shader_complete();
+            return None;
+        };
         let pipeline = self.create_graphics_pipeline(
             &shader_modules,
             descriptor_layout.pipeline_layout,
@@ -980,7 +991,9 @@ impl GraphicsPipelineCache {
             pipeline_cache,
             &key.fixed_state,
             vs_compiled,
-        )?;
+        );
+        shader_notify.mark_shader_complete();
+        let pipeline = pipeline?;
 
         let stage_infos = {
             let mut infos: [Option<ShaderInfo>; 5] = Default::default();
@@ -1001,7 +1014,6 @@ impl GraphicsPipelineCache {
             .iter()
             .flatten()
             .any(|info| info.uses_rescaling_uniform);
-
         Some(GraphicsPipeline {
             device: self.device.clone(),
             key: key.clone(),
@@ -1921,35 +1933,6 @@ fn two_mut<T>(slice: &mut [T], lhs: usize, rhs: usize) -> Option<(&mut T, &mut T
 
 fn graphics_pipeline_key_cache_hash(key: &GraphicsPipelineKey) -> u64 {
     city_hash64(&key.to_cache_bytes())
-}
-
-/// Run a shader compilation, converting shader-recompiler panics into an
-/// `Err` like upstream's `catch (const Shader::Exception&)` in
-/// `vk_pipeline_cache.cpp`.
-///
-/// Upstream catches per-thread C++ exceptions with no global state. The Rust
-/// port surfaces those failures as panics; to suppress the default
-/// panic-hook backtrace spam we install — once — a wrapper around the
-/// previous hook that stays silent only for threads currently inside this
-/// function. An earlier version swapped the process-wide hook under a global
-/// mutex held for the entire compilation, which serialized the disk-cache
-/// workers ~96% blocked on that mutex, 79s preload).
-fn catch_shader_exception<F, T>(f: F) -> std::thread::Result<T>
-where
-    F: FnOnce() -> T,
-{
-    SHADER_EXCEPTION_HOOK_INSTALL.call_once(|| {
-        let previous = take_hook();
-        std::panic::set_hook(Box::new(move |info| {
-            if !IN_SHADER_EXCEPTION_SCOPE.with(std::cell::Cell::get) {
-                previous(info);
-            }
-        }));
-    });
-    IN_SHADER_EXCEPTION_SCOPE.with(|flag| flag.set(true));
-    let result = catch_unwind(AssertUnwindSafe(f));
-    IN_SHADER_EXCEPTION_SCOPE.with(|flag| flag.set(false));
-    result
 }
 
 /// Port of `CastAttributeType` in `vk_pipeline_cache.cpp`.

@@ -18,7 +18,7 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use hid_core::frontend::emulated_controller::set_simple_npad_button;
-use hid_core::hid_types::{KeyboardKeyIndex, NpadButton};
+use hid_core::hid_types::NpadButton;
 use input_common::drivers::mouse::MouseButton;
 use input_common::InputSubsystem;
 use ruzu_core::core::SystemRef;
@@ -33,8 +33,8 @@ const SDL_TOUCH_MOUSEID: u32 = u32::MAX;
 
 /// Schedule an environment-gated L+R press for frontend diagnostics.
 ///
-/// This uses the same simple Player1 NPad bridge as keyboard events, avoiding
-/// host accessibility/automation permissions while testing title-screen input.
+/// This uses the diagnostic Player1 NPad bridge, avoiding host
+/// accessibility/automation permissions while testing title-screen input.
 pub fn schedule_auto_lr_if_requested() {
     let Some(delay_ms) = std::env::var("RUZU_AUTO_LR_DELAY_MS")
         .ok()
@@ -487,35 +487,13 @@ impl EmuWindowSdl2 {
     /// Called when a key is pressed or released.
     ///
     /// Maps to C++ `EmuWindow_SDL2::OnKeyEvent`.
-    /// Note: full InputSubsystem button mapping is not wired yet. Until then,
-    /// a small command-line frontend mapping forwards common keyboard keys to
-    /// Player1's NPad button state.
     pub(crate) fn on_key_event(&mut self, key: i32, state: u8) {
-        let pressed = state == sdl::SDL_PRESSED as u8;
-        let released = state == sdl::SDL_RELEASED as u8;
-        if !pressed && !released {
-            return;
-        }
         if let Some(keyboard) = self.input_subsystem.get_keyboard_mut() {
-            if pressed {
+            if state == sdl::SDL_PRESSED as u8 {
                 keyboard.press_key(key);
-            } else {
+            } else if state == sdl::SDL_RELEASED as u8 {
                 keyboard.release_key(key);
             }
-        }
-
-        let Some(button) = keyboard_key_to_npad_button(key) else {
-            log::trace!("on_key_event: unmapped key={} state={}", key, state);
-            return;
-        };
-        set_simple_npad_button(button, pressed);
-        if std::env::var_os("RUZU_TRACE_SIMPLE_INPUT").is_some() {
-            log::info!(
-                "[SIMPLE_INPUT] key={} button=0x{:X} pressed={}",
-                key,
-                button.bits(),
-                pressed
-            );
         }
     }
 
@@ -684,28 +662,6 @@ impl EmuWindowSdl2 {
     }
 }
 
-fn keyboard_key_to_npad_button(key: i32) -> Option<NpadButton> {
-    use KeyboardKeyIndex as Key;
-
-    match key {
-        x if x == Key::Z as i32 || x == Key::Space as i32 => Some(NpadButton::A),
-        x if x == Key::X as i32 => Some(NpadButton::B),
-        x if x == Key::S as i32 => Some(NpadButton::X),
-        x if x == Key::A as i32 => Some(NpadButton::Y),
-        x if x == Key::Q as i32 => Some(NpadButton::L),
-        x if x == Key::W as i32 => Some(NpadButton::R),
-        x if x == Key::E as i32 => Some(NpadButton::ZL),
-        x if x == Key::R as i32 => Some(NpadButton::ZR),
-        x if x == Key::Return as i32 => Some(NpadButton::PLUS),
-        x if x == Key::Backspace as i32 => Some(NpadButton::MINUS),
-        x if x == Key::LeftArrow as i32 => Some(NpadButton::LEFT),
-        x if x == Key::RightArrow as i32 => Some(NpadButton::RIGHT),
-        x if x == Key::UpArrow as i32 => Some(NpadButton::UP),
-        x if x == Key::DownArrow as i32 => Some(NpadButton::DOWN),
-        _ => None,
-    }
-}
-
 impl Drop for EmuWindowSdl2 {
     /// Shuts down the input subsystem and SDL2.
     ///
@@ -713,5 +669,37 @@ impl Drop for EmuWindowSdl2 {
     fn drop(&mut self) {
         self.input_subsystem.shutdown();
         unsafe { sdl::SDL_Quit() };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hid_core::frontend::emulated_controller::get_simple_npad_button_state;
+
+    #[test]
+    fn key_events_do_not_update_the_diagnostic_npad_bridge() {
+        set_simple_npad_button(NpadButton::ALL, false);
+
+        let mut window = std::mem::ManuallyDrop::new(EmuWindowSdl2 {
+            input_subsystem: InputSubsystem::new(),
+            is_open: true,
+            is_shown: true,
+            shown_state: Arc::new(AtomicBool::new(true)),
+            framebuffer_layout: Arc::new(RwLock::new(default_frame_layout(
+                ScreenUndocked::WIDTH,
+                ScreenUndocked::HEIGHT,
+            ))),
+            last_time: 0,
+            system: SystemRef::null(),
+            render_window: std::ptr::null_mut(),
+        });
+
+        window.on_key_event(4, sdl::SDL_PRESSED as u8);
+        assert_eq!(
+            get_simple_npad_button_state().raw,
+            NpadButton::NONE,
+            "SDL keyboard events must only use the configured keyboard engine"
+        );
     }
 }

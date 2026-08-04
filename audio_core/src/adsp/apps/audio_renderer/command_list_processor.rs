@@ -471,14 +471,13 @@ mod tests {
     };
     use crate::renderer::command::effect::compressor::CompressorState;
     use crate::renderer::command::effect::delay::DelayState;
-    use crate::renderer::command::effect::i3dl2_reverb::I3dl2ReverbState;
     use crate::renderer::command::effect::light_limiter::LightLimiterState;
     use crate::renderer::command::effect::reverb::ReverbState;
     use crate::renderer::effect::aux_::AuxInfoDsp;
     use crate::renderer::effect::compressor;
     use crate::renderer::effect::delay;
     use crate::renderer::effect::effect_info_base::ParameterState;
-    use crate::renderer::effect::i3dl2;
+    use crate::renderer::effect::i3dl2::{self, I3dl2ReverbState};
     use crate::renderer::effect::light_limiter::{self, ProcessingMode};
     use crate::renderer::effect::reverb;
     use crate::renderer::performance::{PerformanceEntryAddresses, PerformanceState};
@@ -1979,7 +1978,6 @@ mod tests {
             0, 0, 0, 0, // output
         ];
         let mut state = I3dl2ReverbState::default();
-        let mut workbuffer = vec![0.0f32; 70_000];
         let parameter = i3dl2::ParameterVersion2 {
             inputs: [0, 0, 0, 0, 0, 0],
             outputs: [1, 1, 1, 1, 1, 1],
@@ -2010,7 +2008,7 @@ mod tests {
                 outputs: [1, 1, 1, 1, 1, 1],
                 parameter,
                 state: (&mut state as *mut I3dl2ReverbState) as CpuAddr,
-                workbuffer: workbuffer.as_mut_ptr() as CpuAddr,
+                workbuffer: 0,
                 effect_enabled: false,
             })],
             1,
@@ -2043,7 +2041,6 @@ mod tests {
             0, 0, 0, 0, // output R
         ];
         let mut state = I3dl2ReverbState::default();
-        let mut workbuffer = vec![0.0f32; 70_000];
         let parameter = i3dl2::ParameterVersion2 {
             inputs: [0, 2, 0, 0, 0, 0],
             outputs: [1, 3, 0, 0, 0, 0],
@@ -2077,7 +2074,7 @@ mod tests {
                     outputs: [1, 3, 0, 0, 0, 0],
                     parameter,
                     state: (&mut state as *mut I3dl2ReverbState) as CpuAddr,
-                    workbuffer: workbuffer.as_mut_ptr() as CpuAddr,
+                    workbuffer: 0,
                     effect_enabled: true,
                 }),
                 Command::I3dl2Reverb(I3dl2ReverbCommand {
@@ -2085,7 +2082,7 @@ mod tests {
                     outputs: [1, 3, 0, 0, 0, 0],
                     parameter: parameter_updated,
                     state: (&mut state as *mut I3dl2ReverbState) as CpuAddr,
-                    workbuffer: workbuffer.as_mut_ptr() as CpuAddr,
+                    workbuffer: 0,
                     effect_enabled: true,
                 }),
             ],
@@ -2106,9 +2103,9 @@ mod tests {
         processor.set_process_time_max(u64::MAX);
         let _ = processor.process(0);
 
-        assert!(state.early_delay_len > 0);
-        assert!(state.fdn_delay_samples.iter().all(|&v| v > 0));
-        assert!(state.early_delay_pos > 0);
-        assert!(state.fdn_positions.iter().any(|&v| v > 0));
+        assert!(state.early_delay_line.max_delay > 0);
+        assert!(state.fdn_delay_lines.iter().all(|line| line.max_delay > 0));
+        assert!(state.early_delay_line.output > 0);
+        assert!(state.fdn_delay_lines.iter().any(|line| line.output > 0));
     }
 }

@@ -13,6 +13,8 @@ use ash::vk;
 use common::thread_worker::ThreadWorker;
 use shader_recompiler::shader_info::Info as ShaderInfo;
 
+use crate::shader_notify::ShaderNotifyHandle;
+
 use super::descriptor_pool::{DescriptorAllocator, DescriptorBankInfo, DescriptorPool};
 use super::pipeline_helper::{RESCALING_LAYOUT_SIZE, RESCALING_LAYOUT_WORDS_OFFSET};
 
@@ -92,8 +94,16 @@ impl ComputePipeline {
         info: ShaderInfo,
         spv_module: vk::ShaderModule,
         pipeline_cache: vk::PipelineCache,
+        shader_notify: ShaderNotifyHandle,
     ) -> Option<Self> {
-        Self::new_with_worker(device, info, spv_module, pipeline_cache, None)
+        Self::new_with_worker(
+            device,
+            info,
+            spv_module,
+            pipeline_cache,
+            shader_notify,
+            None,
+        )
     }
 
     /// Port of `ComputePipeline::ComputePipeline` with an optional upstream
@@ -103,13 +113,16 @@ impl ComputePipeline {
         info: ShaderInfo,
         spv_module: vk::ShaderModule,
         pipeline_cache: vk::PipelineCache,
+        shader_notify: ShaderNotifyHandle,
         worker: Option<&ThreadWorker>,
     ) -> Option<Self> {
+        shader_notify.mark_shader_building();
         let Some(descriptor_set_layout) = create_compute_descriptor_set_layout(&device, &info)
         else {
             unsafe {
                 device.destroy_shader_module(spv_module, None);
             }
+            shader_notify.mark_shader_complete();
             return None;
         };
         let Some(pipeline_layout) = create_compute_pipeline_layout(&device, descriptor_set_layout)
@@ -118,6 +131,7 @@ impl ComputePipeline {
                 device.destroy_descriptor_set_layout(descriptor_set_layout, None);
                 device.destroy_shader_module(spv_module, None);
             }
+            shader_notify.mark_shader_complete();
             return None;
         };
         let descriptor_update_template = vk::DescriptorUpdateTemplate::null();
@@ -161,6 +175,7 @@ impl ComputePipeline {
                     is_built.store(true, Ordering::Release);
                 }
                 build_condvar.notify_one();
+                shader_notify.mark_shader_complete();
             }
         };
         let build_in_parallel = worker.is_some();

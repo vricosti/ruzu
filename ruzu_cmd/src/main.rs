@@ -1044,6 +1044,9 @@ fn main() {
                     Box::new(
                         video_core::renderer_vulkan::renderer_vulkan::RendererVulkan::new(
                             system.telemetry_session_mut(),
+                            // SAFETY: this renderer is immediately bound to `gpu` below;
+                            // `Gpu` drops the renderer before its shader notifier.
+                            unsafe { gpu.shader_notify_handle() },
                             window_info,
                             *drawable_size,
                             Arc::clone(shown_state),

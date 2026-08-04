@@ -151,6 +151,8 @@ fn compile_vulkan_present_shaders(manifest_dir: &std::path::Path) {
             "convert_non_msaa_to_msaa.comp",
         ),
         ("ASTC_DECODER_COMP_SPV", "astc_decoder.comp"),
+        ("VULKAN_QUAD_INDEXED_COMP_SPV", "vulkan_quad_indexed.comp"),
+        ("VULKAN_UINT8_COMP_SPV", "vulkan_uint8.comp"),
         (
             "VULKAN_FIDELITYFX_FSR_VERT_SPV",
             "vulkan_fidelityfx_fsr.vert",

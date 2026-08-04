@@ -203,7 +203,10 @@ fn should_trace_core_dispatch(core_index: usize) -> bool {
 
 #[cfg(test)]
 mod diagnostic_config_tests {
-    use super::parse_core_dispatch_filter;
+    use std::sync::Arc;
+
+    use super::{parse_core_dispatch_filter, CpuManager};
+    use crate::hle::kernel::k_thread::{KThread, KThreadLock};
 
     #[test]
     fn core_dispatch_filter_preserves_allow_list_indices() {
@@ -218,6 +221,20 @@ mod diagnostic_config_tests {
         for value in ["", "1", "all", "ALL"] {
             assert_eq!(parse_core_dispatch_filter(value), (true, Vec::new()));
         }
+    }
+
+    #[test]
+    fn resumed_guest_fiber_restores_current_thread_tls() {
+        let stale_thread = Arc::new(KThreadLock::new(KThread::new()));
+        let resumed_thread = Arc::new(KThreadLock::new(KThread::new()));
+        crate::hle::kernel::kernel::set_current_emu_thread(Some(&stale_thread));
+
+        CpuManager::restore_current_emu_thread(&resumed_thread);
+
+        let current = crate::hle::kernel::kernel::get_current_emu_thread()
+            .expect("resumed guest fiber must restore the current-thread TLS");
+        assert!(Arc::ptr_eq(&current, &resumed_thread));
+        crate::hle::kernel::kernel::set_current_emu_thread(None);
     }
 }
 
@@ -786,6 +803,11 @@ impl CpuManager {
             }
             trace_core_dispatch(physical_core.core_index(), "exit_inner_loop", &thread_arc);
 
+            // A resumed guest fiber shares the host core's TLS with every
+            // other guest fiber. Restore the identity of the fiber that just
+            // left the JIT before KInterruptManager reads its TLS disable
+            // count and decides whether the thread must be pinned.
+            Self::restore_current_emu_thread(&thread_arc);
             Self::handle_interrupt(kernel);
             trace_core_dispatch(
                 physical_core.core_index(),

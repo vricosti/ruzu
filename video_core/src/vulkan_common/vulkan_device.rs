@@ -437,6 +437,7 @@ impl Device {
         let has_vertex_input_dynamic_state =
             supported_extensions.contains("VK_EXT_vertex_input_dynamic_state");
         let has_depth_clip_control = supported_extensions.contains("VK_EXT_depth_clip_control");
+        let has_4444_formats = supported_extensions.contains("VK_EXT_4444_formats");
         let has_index_type_uint8 = supported_extensions.contains("VK_EXT_index_type_uint8");
         let has_vertex_attribute_divisor =
             supported_extensions.contains("VK_EXT_vertex_attribute_divisor");
@@ -478,6 +479,7 @@ impl Device {
             vk::PhysicalDeviceVertexInputDynamicStateFeaturesEXT::default();
         let mut depth_clip_control_features =
             vk::PhysicalDeviceDepthClipControlFeaturesEXT::default();
+        let mut formats_4444_features = vk::PhysicalDevice4444FormatsFeaturesEXT::default();
         let mut index_type_uint8_features = vk::PhysicalDeviceIndexTypeUint8FeaturesEXT::default();
         let mut vertex_attribute_divisor_features =
             vk::PhysicalDeviceVertexAttributeDivisorFeaturesEXT::default();
@@ -523,6 +525,9 @@ impl Device {
             }
             if has_depth_clip_control {
                 features2_builder = features2_builder.push_next(&mut depth_clip_control_features);
+            }
+            if has_4444_formats {
+                features2_builder = features2_builder.push_next(&mut formats_4444_features);
             }
             if has_index_type_uint8 {
                 features2_builder = features2_builder.push_next(&mut index_type_uint8_features);
@@ -652,6 +657,7 @@ impl Device {
         }
         let supports_depth_clip_control =
             has_depth_clip_control && depth_clip_control_features.depth_clip_control != 0;
+        let supports_4444_formats = has_4444_formats && formats_4444_features.format_a4b4g4r4 != 0;
         let supports_index_type_uint8 =
             has_index_type_uint8 && index_type_uint8_features.index_type_uint8 != 0;
         let supports_vertex_attribute_divisor = has_vertex_attribute_divisor
@@ -695,7 +701,6 @@ impl Device {
             "VK_KHR_shader_float16_int8",
             "VK_EXT_primitive_topology_list_restart",
             "VK_EXT_depth_clip_control",
-            "VK_EXT_index_type_uint8",
             "VK_EXT_vertex_attribute_divisor",
             "VK_EXT_robustness2",
             "VK_EXT_shader_stencil_export",
@@ -704,6 +709,12 @@ impl Device {
             if supported_extensions.contains(name) {
                 enabled_extensions.push(CString::new(name).unwrap());
             }
+        }
+        if supports_4444_formats {
+            enabled_extensions.push(CString::new("VK_EXT_4444_formats").unwrap());
+        }
+        if supports_index_type_uint8 {
+            enabled_extensions.push(CString::new("VK_EXT_index_type_uint8").unwrap());
         }
         if supports_shader_demote_to_helper_invocation {
             enabled_extensions
@@ -806,6 +817,7 @@ impl Device {
                 extended_dynamic_state2: supports_extended_dynamic_state2,
                 extended_dynamic_state2_extra: supports_extended_dynamic_state2_extra,
                 extended_dynamic_state3: dynamic_state3_blending || dynamic_state3_enables,
+                format_a4b4g4r4: supports_4444_formats,
                 vertex_input_dynamic_state: supports_vertex_input_dynamic_state,
                 depth_clip_control: supports_depth_clip_control,
                 index_type_uint8: supports_index_type_uint8,
@@ -851,7 +863,10 @@ impl Device {
             supports_d24_depth: false,
             cant_blit_msaa: false,
             must_emulate_scaled_formats: false,
-            must_emulate_bgr565: false,
+            must_emulate_bgr565: must_emulate_bgr565_for_driver(
+                driver_id,
+                device_properties.device_id,
+            ),
             dynamic_state3_blending,
             dynamic_state3_enables,
             supports_conditional_barriers: false,
@@ -1424,6 +1439,13 @@ impl Device {
     pub fn must_emulate_bgr565(&self) -> bool {
         self.must_emulate_bgr565
     }
+
+    /// Returns true if the device supports `VK_EXT_4444_formats`.
+    ///
+    /// Port of upstream `Device::IsExt4444FormatsSupported`.
+    pub fn is_ext_4444_formats_supported(&self) -> bool {
+        self.extensions.format_a4b4g4r4
+    }
 }
 
 fn physical_memory_properties(
@@ -1587,6 +1609,11 @@ fn driver_name_from_id(driver_id: vk::DriverId) -> Option<&'static str> {
     }
 }
 
+fn must_emulate_bgr565_for_driver(driver_id: vk::DriverId, device_id: u32) -> bool {
+    driver_id == vk::DriverId::INTEL_OPEN_SOURCE_MESA
+        || (driver_id == vk::DriverId::QUALCOMM_PROPRIETARY && device_id != 0x4305_0a01)
+}
+
 fn cap_moltenvk_vertex_input_limits(limits: &mut vk::PhysicalDeviceLimits) {
     limits.max_vertex_input_attributes = limits.max_vertex_input_attributes.min(16);
     limits.max_vertex_input_bindings = limits.max_vertex_input_bindings.min(16);
@@ -1595,6 +1622,23 @@ fn cap_moltenvk_vertex_input_limits(limits: &mut vk::PhysicalDeviceLimits) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bgr565_emulation_matches_upstream_driver_exceptions() {
+        assert!(must_emulate_bgr565_for_driver(
+            vk::DriverId::INTEL_OPEN_SOURCE_MESA,
+            0,
+        ));
+        assert!(must_emulate_bgr565_for_driver(
+            vk::DriverId::QUALCOMM_PROPRIETARY,
+            0,
+        ));
+        assert!(!must_emulate_bgr565_for_driver(
+            vk::DriverId::QUALCOMM_PROPRIETARY,
+            0x4305_0a01,
+        ));
+        assert!(!must_emulate_bgr565_for_driver(vk::DriverId::MESA_RADV, 0,));
+    }
 
     #[test]
     fn collect_physical_memory_info_sums_device_local_heaps_for_discrete_gpus() {

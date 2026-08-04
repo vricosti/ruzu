@@ -12,12 +12,16 @@ use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 
 /// Exits the current process.
 pub fn exit_process(system: &System) {
-    let process_id = system
-        .current_process_arc()
-        .lock()
-        .unwrap()
-        .get_process_id();
+    let current_process = system.current_process_arc();
+    let process = current_process.lock().unwrap();
+    let process_id = process.get_process_id();
     log::info!("svc::ExitProcess called for process {}", process_id);
+    assert_eq!(
+        process.get_state(),
+        crate::hle::kernel::k_process::ProcessState::Running,
+        "process has already exited"
+    );
+    drop(process);
 
     system.exit();
 }

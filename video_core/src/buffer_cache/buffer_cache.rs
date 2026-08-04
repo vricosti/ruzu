@@ -703,10 +703,28 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
     ///
     /// Upstream: `BufferCache<P>::BindHostGeometryBuffers`
     ///
-    /// NOTE: draw state (maxwell3d, current_draw_indirect) not yet available.
     pub fn bind_host_geometry_buffers(&mut self, is_indexed: bool) {
         if is_indexed {
             self.bind_host_index_buffer();
+        } else if !P::HAS_FULL_INDEX_AND_PRIMITIVE_SUPPORT {
+            let quad_draw = self.maxwell3d().and_then(|maxwell| {
+                let draw_state = maxwell.draw_manager_state();
+                matches!(
+                    draw_state.topology,
+                    crate::engines::maxwell_3d::PrimitiveTopology::Quads
+                        | crate::engines::maxwell_3d::PrimitiveTopology::QuadStrip
+                )
+                .then_some((
+                    draw_state.topology,
+                    draw_state.vertex_buffer.first,
+                    draw_state.vertex_buffer.count,
+                ))
+            });
+            if let (Some((topology, first, count)), Some(runtime)) =
+                (quad_draw, self.runtime.as_mut())
+            {
+                runtime.bind_quad_index_buffer(topology, first, count);
+            }
         }
         self.bind_host_vertex_buffers();
         self.bind_host_transform_feedback_buffers();

@@ -13,7 +13,7 @@ use log::trace;
 
 use super::scheduler::Scheduler;
 
-/// A staging buffer allocation (host-visible, for CPU↔GPU transfers).
+/// A staging buffer allocation.
 #[derive(Clone, Copy)]
 pub struct StagingBuffer {
     pub buffer: vk::Buffer,
@@ -33,6 +33,7 @@ unsafe impl Send for StagingBuffer {}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum StagingBufferUsage {
+    DeviceLocal,
     Upload,
     Download,
 }
@@ -104,6 +105,11 @@ impl StagingBufferPool {
     /// Request a staging buffer for CPU→GPU upload.
     pub fn request_upload_buffer(&mut self, size: vk::DeviceSize) -> Option<StagingBuffer> {
         self.request_buffer(size, StagingBufferUsage::Upload, false)
+    }
+
+    /// Request device-local scratch storage for GPU-side conversion passes.
+    pub fn request_device_local_buffer(&mut self, size: vk::DeviceSize) -> Option<StagingBuffer> {
+        self.request_buffer(size, StagingBufferUsage::DeviceLocal, false)
     }
 
     /// Request a staging buffer for GPU→CPU readback.
@@ -182,7 +188,7 @@ impl StagingBufferPool {
     fn try_stream_allocate(&mut self, size: vk::DeviceSize) -> Option<StagingBuffer> {
         // Initialize stream buffer if needed
         if self.stream_buffer.is_none() {
-            let buf = self.allocate_buffer(self.stream_capacity)?;
+            let buf = self.allocate_buffer(self.stream_capacity, StagingBufferUsage::Upload)?;
             self.stream_buffer = Some(buf);
             self.stream_iterator = 0;
             self.stream_used_iterator = 0;
@@ -284,8 +290,7 @@ impl StagingBufferPool {
     ) -> Option<StagingBuffer> {
         let log2_level = log2_ceil(size.max(1));
         let allocation_size = 1u64.checked_shl(log2_level).unwrap_or(size.max(1));
-        let mut buffer = self.allocate_buffer(allocation_size)?;
-        buffer.usage = usage;
+        let mut buffer = self.allocate_buffer(allocation_size, usage)?;
         buffer.index = self.unique_ids;
         buffer.log2_level = log2_level;
         buffer.tick = if deferred {
@@ -313,7 +318,9 @@ impl StagingBufferPool {
             {
                 let entry = self.buffers.swap_remove(index);
                 unsafe {
-                    self.device.unmap_memory(entry.memory);
+                    if !entry.mapped.is_null() {
+                        self.device.unmap_memory(entry.memory);
+                    }
                     self.device.destroy_buffer(entry.buffer, None);
                     self.device.free_memory(entry.memory, None);
                 }
@@ -324,7 +331,11 @@ impl StagingBufferPool {
         }
     }
 
-    fn allocate_buffer(&self, size: vk::DeviceSize) -> Option<StagingBuffer> {
+    fn allocate_buffer(
+        &self,
+        size: vk::DeviceSize,
+        usage: StagingBufferUsage,
+    ) -> Option<StagingBuffer> {
         let buf_info = vk::BufferCreateInfo::builder()
             .size(size)
             .usage(
@@ -341,10 +352,11 @@ impl StagingBufferPool {
         let buffer = unsafe { self.device.create_buffer(&buf_info, None).ok()? };
 
         let mem_reqs = unsafe { self.device.get_buffer_memory_requirements(buffer) };
-        let mem_type = find_host_visible_memory(
+        let mem_type = find_memory(
             &self.instance,
             self.physical_device,
             mem_reqs.memory_type_bits,
+            memory_properties_for_usage(usage),
         )?;
 
         let alloc_info = vk::MemoryAllocateInfo::builder()
@@ -356,10 +368,14 @@ impl StagingBufferPool {
             self.device.bind_buffer_memory(buffer, memory, 0).ok()?;
         }
 
-        let mapped = unsafe {
-            self.device
-                .map_memory(memory, 0, size, vk::MemoryMapFlags::empty())
-                .ok()? as *mut u8
+        let mapped = if usage == StagingBufferUsage::DeviceLocal {
+            std::ptr::null_mut()
+        } else {
+            unsafe {
+                self.device
+                    .map_memory(memory, 0, size, vk::MemoryMapFlags::empty())
+                    .ok()? as *mut u8
+            }
         };
 
         trace!("StagingBufferPool: allocated {} bytes", size);
@@ -370,7 +386,7 @@ impl StagingBufferPool {
             mapped,
             offset: 0,
             size,
-            usage: StagingBufferUsage::Upload,
+            usage,
             index: 0,
             log2_level: log2_ceil(size.max(1)),
             tick: self.scheduler().pending_tick(),
@@ -384,12 +400,16 @@ impl Drop for StagingBufferPool {
         unsafe {
             // Free stream buffer
             if let Some(buf) = self.stream_buffer.take() {
-                self.device.unmap_memory(buf.memory);
+                if !buf.mapped.is_null() {
+                    self.device.unmap_memory(buf.memory);
+                }
                 self.device.destroy_buffer(buf.buffer, None);
                 self.device.free_memory(buf.memory, None);
             }
             for buf in self.buffers.drain(..) {
-                self.device.unmap_memory(buf.memory);
+                if !buf.mapped.is_null() {
+                    self.device.unmap_memory(buf.memory);
+                }
                 self.device.destroy_buffer(buf.buffer, None);
                 self.device.free_memory(buf.memory, None);
             }
@@ -405,13 +425,27 @@ fn log2_ceil(value: vk::DeviceSize) -> u32 {
     }
 }
 
-fn find_host_visible_memory(
+fn memory_properties_for_usage(usage: StagingBufferUsage) -> vk::MemoryPropertyFlags {
+    match usage {
+        StagingBufferUsage::DeviceLocal => vk::MemoryPropertyFlags::DEVICE_LOCAL,
+        StagingBufferUsage::Upload => {
+            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT
+        }
+        StagingBufferUsage::Download => {
+            vk::MemoryPropertyFlags::HOST_VISIBLE
+                | vk::MemoryPropertyFlags::HOST_COHERENT
+                | vk::MemoryPropertyFlags::HOST_CACHED
+        }
+    }
+}
+
+fn find_memory(
     instance: &ash::Instance,
     physical_device: vk::PhysicalDevice,
     type_filter: u32,
+    required: vk::MemoryPropertyFlags,
 ) -> Option<u32> {
     let mem_props = unsafe { instance.get_physical_device_memory_properties(physical_device) };
-    let required = vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
     for i in 0..mem_props.memory_type_count {
         if (type_filter & (1 << i)) != 0
             && mem_props.memory_types[i as usize]
@@ -444,5 +478,20 @@ mod tests {
         assert_eq!(log2_ceil(5), 3);
         assert_eq!(log2_ceil(1024), 10);
         assert_eq!(log2_ceil(1025), 11);
+    }
+
+    #[test]
+    fn memory_usage_properties_match_upstream_allocator_contract() {
+        assert_eq!(
+            memory_properties_for_usage(StagingBufferUsage::DeviceLocal),
+            vk::MemoryPropertyFlags::DEVICE_LOCAL
+        );
+        let upload = memory_properties_for_usage(StagingBufferUsage::Upload);
+        assert!(upload.contains(vk::MemoryPropertyFlags::HOST_VISIBLE));
+        assert!(upload.contains(vk::MemoryPropertyFlags::HOST_COHERENT));
+        let download = memory_properties_for_usage(StagingBufferUsage::Download);
+        assert!(download.contains(vk::MemoryPropertyFlags::HOST_VISIBLE));
+        assert!(download.contains(vk::MemoryPropertyFlags::HOST_COHERENT));
+        assert!(download.contains(vk::MemoryPropertyFlags::HOST_CACHED));
     }
 }

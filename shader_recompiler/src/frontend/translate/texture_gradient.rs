@@ -75,7 +75,9 @@ fn impl_txd(v: &mut TranslatorVisitor, insn: u64, is_bindless: bool) {
     let aoffi = field(insn, 35, 1) != 0;
     let has_lod_clamp = field(insn, 50, 1) != 0;
     if has_lod_clamp {
-        panic!("TXD.LC - CLAMP is not implemented");
+        std::panic::panic_any(crate::exception::NotImplementedException::new(
+            "TXD.LC - CLAMP is not implemented",
+        ));
     }
 
     let dest_reg = field(insn, 0, 8);

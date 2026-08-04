@@ -14,6 +14,7 @@ use crate::framebuffer_config::FramebufferConfig;
 use crate::rasterizer_download_area::RasterizerDownloadArea;
 use crate::rasterizer_interface::RasterizerHandle;
 use crate::renderer_base::RendererBase;
+use crate::shader_notify::{ShaderNotify, ShaderNotifyHandle};
 use common::settings;
 use ruzu_core::core::SystemRef;
 use ruzu_core::gpu_core::{
@@ -140,6 +141,11 @@ pub struct Gpu {
     /// Upstream: `std::unique_ptr<VideoCore::RendererBase> renderer` in GPU::Impl.
     renderer: Mutex<Option<Box<dyn RendererBase>>>,
 
+    /// Shader-build progress reported by renderer pipeline workers.
+    /// Upstream: `std::unique_ptr<VideoCore::ShaderNotify> shader_notify`.
+    /// Declared after `renderer` so renderer-owned workers are dropped first.
+    shader_notify: ShaderNotify,
+
     /// Rasterizer extracted from renderer.
     /// Upstream: `VideoCore::RasterizerInterface* rasterizer` in GPU::Impl.
     rasterizer: Mutex<Option<RasterizerHandle>>,
@@ -188,6 +194,7 @@ impl Gpu {
             new_channel_id: Mutex::new(1),
             bound_channel: Mutex::new(-1),
             renderer: Mutex::new(None),
+            shader_notify: ShaderNotify::new(),
             rasterizer: Mutex::new(None),
             scheduler: Mutex::new(None),
             gpu_thread: Mutex::new(crate::gpu_thread::ThreadManager::new(
@@ -468,6 +475,21 @@ impl Gpu {
     /// Returns a reference to the renderer, if bound.
     pub fn renderer(&self) -> std::sync::MutexGuard<'_, Option<Box<dyn RendererBase>>> {
         self.renderer.lock().unwrap()
+    }
+
+    /// Port of `GPU::ShaderNotify()`.
+    pub fn shader_notify(&self) -> &ShaderNotify {
+        &self.shader_notify
+    }
+
+    /// Rust representation of the non-owning pointer passed into renderer
+    /// pipeline caches upstream.
+    ///
+    /// # Safety
+    /// The handle must only be stored by a renderer that is immediately bound
+    /// to this `Gpu`; `Gpu` drops that renderer before `shader_notify`.
+    pub unsafe fn shader_notify_handle(&self) -> ShaderNotifyHandle {
+        unsafe { ShaderNotifyHandle::new(&self.shader_notify) }
     }
 
     /// Flush all current written commands into the host GPU for execution.

@@ -175,7 +175,7 @@ fn impl_tex(
     cbuf_offset: Option<u32>,
 ) {
     if lc {
-        panic!("LC");
+        std::panic::panic_any(crate::exception::NotImplementedException::new("LC"));
     }
 
     let ndv = bit(insn, 35);
@@ -266,4 +266,26 @@ pub fn tex_b(tv: &mut TranslatorVisitor, insn: u64, _opcode: MaxwellOpcode) {
     let blod = Blod::from_u32(field(insn, 37, 3));
     let lc = bit(insn, 40);
     impl_tex(tv, insn, aoffi, blod, lc, None);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lod_clamp_uses_typed_upstream_not_implemented_exception() {
+        let mut program = crate::ir::program::Program::new(crate::ir::types::ShaderStage::Fragment);
+        let block = program.add_block();
+        let mut visitor = TranslatorVisitor::new(&mut program, block);
+
+        let payload = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            impl_tex(&mut visitor, 0, false, Blod::None, true, None);
+        }))
+        .expect_err("LC must follow upstream's not-implemented path");
+
+        let exception = payload
+            .downcast_ref::<crate::exception::NotImplementedException>()
+            .expect("LC must preserve the shader exception type");
+        assert_eq!(exception.to_string(), "LC is not implemented");
+    }
 }

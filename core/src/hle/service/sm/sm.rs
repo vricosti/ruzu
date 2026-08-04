@@ -676,7 +676,17 @@ impl Sm {
 
                     let server_session = process
                         .get_server_session_by_object_id(session_object_id)
-                        .expect("created server session must be registered");
+                        .unwrap_or_else(|| {
+                            log::error!(
+                                "[SESSION_REG] missing after create session={:#x} client={:#x} sessions={} clients={} session_keys={:?}",
+                                session_object_id,
+                                client_session_object_id,
+                                process.session_objects.len(),
+                                process.client_session_objects.len(),
+                                process.session_objects.keys().copied().collect::<Vec<_>>(),
+                            );
+                            panic!("created server session must be registered");
+                        });
                     let enqueue_result = port_guard.enqueue_session(session_object_id);
                     if enqueue_result.is_error() {
                         process.unregister_client_session_object_by_object_id(

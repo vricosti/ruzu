@@ -11,10 +11,12 @@ use std::ptr::NonNull;
 
 use super::descriptor_pool::{DescriptorAllocator, DescriptorBankInfo, DescriptorPool};
 use super::scheduler::Scheduler;
+use super::staging_buffer_pool::StagingBufferPool;
 use super::update_descriptor::ComputePassDescriptorQueue;
-use crate::host_shaders::spirv_shaders::ASTC_DECODER_COMP_SPV;
+use crate::engines::maxwell_3d::IndexFormat;
 use crate::host_shaders::spirv_shaders::{
-    CONVERT_MSAA_TO_NON_MSAA_COMP_SPV, CONVERT_NON_MSAA_TO_MSAA_COMP_SPV,
+    ASTC_DECODER_COMP_SPV, CONVERT_MSAA_TO_NON_MSAA_COMP_SPV, CONVERT_NON_MSAA_TO_MSAA_COMP_SPV,
+    VULKAN_QUAD_INDEXED_COMP_SPV, VULKAN_UINT8_COMP_SPV,
 };
 use crate::texture_cache::accelerated_swizzle::make_block_linear_swizzle_2d_params;
 use crate::texture_cache::image_info::ImageInfo;
@@ -87,6 +89,27 @@ const INPUT_OUTPUT_BANK_INFO: DescriptorBankInfo = DescriptorBankInfo {
     score: 2,
 };
 
+fn input_output_bindings() -> [vk::DescriptorSetLayoutBinding; 2] {
+    [0, 1].map(|binding| vk::DescriptorSetLayoutBinding {
+        binding,
+        descriptor_type: vk::DescriptorType::STORAGE_BUFFER,
+        descriptor_count: 1,
+        stage_flags: vk::ShaderStageFlags::COMPUTE,
+        p_immutable_samplers: std::ptr::null(),
+    })
+}
+
+fn input_output_descriptor_template() -> [vk::DescriptorUpdateTemplateEntry; 1] {
+    [vk::DescriptorUpdateTemplateEntry {
+        dst_binding: 0,
+        dst_array_element: 0,
+        descriptor_count: 2,
+        descriptor_type: vk::DescriptorType::STORAGE_BUFFER,
+        offset: 0,
+        stride: std::mem::size_of::<vk::DescriptorBufferInfo>(),
+    }]
+}
+
 /// Bank info for queries scan pass (3 storage buffers).
 const QUERIES_SCAN_BANK_INFO: DescriptorBankInfo = DescriptorBankInfo {
     uniform_buffers: 0,
@@ -129,6 +152,7 @@ const MSAA_BANK_INFO: DescriptorBankInfo = DescriptorBankInfo {
 /// Owns the shader module, pipeline, pipeline layout, and descriptor
 /// allocation for a single reusable compute pass.
 pub struct ComputePass {
+    device: ash::Device,
     pub descriptor_template: vk::DescriptorUpdateTemplate,
     pub layout: vk::PipelineLayout,
     pub pipeline: vk::Pipeline,
@@ -217,6 +241,7 @@ impl ComputePass {
         };
 
         Ok(ComputePass {
+            device: device.clone(),
             descriptor_template,
             layout,
             pipeline,
@@ -224,6 +249,22 @@ impl ComputePass {
             descriptor_allocator,
             module,
         })
+    }
+}
+
+impl Drop for ComputePass {
+    fn drop(&mut self) {
+        unsafe {
+            self.device.destroy_pipeline(self.pipeline, None);
+            self.device.destroy_shader_module(self.module, None);
+            if self.descriptor_template != vk::DescriptorUpdateTemplate::null() {
+                self.device
+                    .destroy_descriptor_update_template(self.descriptor_template, None);
+            }
+            self.device.destroy_pipeline_layout(self.layout, None);
+            self.device
+                .destroy_descriptor_set_layout(self.descriptor_set_layout, None);
+        }
     }
 }
 
@@ -236,25 +277,100 @@ impl ComputePass {
 /// Assembles uint8 indices into a uint16 index buffer using a compute shader.
 pub struct Uint8Pass {
     base: ComputePass,
+    scheduler: NonNull<Scheduler>,
+    staging_buffer_pool: NonNull<StagingBufferPool>,
+    compute_pass_descriptor_queue: NonNull<ComputePassDescriptorQueue>,
 }
 
 impl Uint8Pass {
     /// Port of `Uint8Pass::Uint8Pass`.
-    pub fn new_with_pass(base: ComputePass) -> Self {
-        Uint8Pass { base }
+    pub fn new(
+        device: &ash::Device,
+        scheduler: &mut Scheduler,
+        descriptor_pool: &DescriptorPool,
+        staging_buffer_pool: &mut StagingBufferPool,
+        compute_pass_descriptor_queue: &mut ComputePassDescriptorQueue,
+    ) -> Result<Self, vk::Result> {
+        let bindings = input_output_bindings();
+        let templates = input_output_descriptor_template();
+        let base = ComputePass::new(
+            device,
+            descriptor_pool,
+            &bindings,
+            &templates,
+            &INPUT_OUTPUT_BANK_INFO,
+            &[],
+            VULKAN_UINT8_COMP_SPV,
+            None,
+        )?;
+        Ok(Self {
+            base,
+            scheduler: NonNull::from(scheduler),
+            staging_buffer_pool: NonNull::from(staging_buffer_pool),
+            compute_pass_descriptor_queue: NonNull::from(compute_pass_descriptor_queue),
+        })
     }
 
     /// Port of `Uint8Pass::Assemble`.
     ///
     /// Dispatches the uint8-to-uint16 conversion compute shader.
     /// Returns `(buffer, offset)` pair for the assembled index buffer.
-    pub fn assemble(&self, device: &ash::Device, cmdbuf: vk::CommandBuffer, num_vertices: u32) {
-        let num_workgroups = (num_vertices + DISPATCH_SIZE - 1) / DISPATCH_SIZE;
-
+    pub fn assemble(
+        &mut self,
+        num_vertices: u32,
+        src_buffer: vk::Buffer,
+        src_offset: u32,
+    ) -> (vk::Buffer, vk::DeviceSize) {
+        let staging_size = u64::from(num_vertices.wrapping_mul(std::mem::size_of::<u16>() as u32));
+        let staging = unsafe { self.staging_buffer_pool.as_mut() }
+            .request_device_local_buffer(staging_size)
+            .expect("Uint8Pass device-local staging allocation failed");
+        let descriptor_buffers = [
+            vk::DescriptorBufferInfo {
+                buffer: src_buffer,
+                offset: u64::from(src_offset),
+                range: u64::from(num_vertices),
+            },
+            vk::DescriptorBufferInfo {
+                buffer: staging.buffer,
+                offset: staging.offset,
+                range: staging_size,
+            },
+        ];
         unsafe {
-            device.cmd_bind_pipeline(cmdbuf, vk::PipelineBindPoint::COMPUTE, self.base.pipeline);
+            let queue = self.compute_pass_descriptor_queue.as_mut();
+            queue.acquire();
+            queue.add_buffer(src_buffer, u64::from(src_offset), u64::from(num_vertices));
+            queue.add_buffer(staging.buffer, staging.offset, staging_size);
+        }
+        let num_workgroups = (num_vertices + DISPATCH_SIZE - 1) / DISPATCH_SIZE;
+        let scheduler = unsafe { self.scheduler.as_mut() };
+        let descriptor_set = self
+            .base
+            .descriptor_allocator
+            .commit(scheduler.known_gpu_tick(), scheduler.pending_tick())
+            .expect("Uint8Pass descriptor allocation failed");
+        scheduler.request_outside_renderpass();
+        let device = self.base.device.clone();
+        let descriptor_template = self.base.descriptor_template;
+        let pipeline = self.base.pipeline;
+        let layout = self.base.layout;
+        scheduler.record(move |cmdbuf| unsafe {
+            device.update_descriptor_set_with_template(
+                descriptor_set,
+                descriptor_template,
+                descriptor_buffers.as_ptr().cast(),
+            );
+            device.cmd_bind_pipeline(cmdbuf, vk::PipelineBindPoint::COMPUTE, pipeline);
+            device.cmd_bind_descriptor_sets(
+                cmdbuf,
+                vk::PipelineBindPoint::COMPUTE,
+                layout,
+                0,
+                &[descriptor_set],
+                &[],
+            );
             device.cmd_dispatch(cmdbuf, num_workgroups, 1, 1);
-
             let barrier = write_barrier_vertex();
             device.cmd_pipeline_barrier(
                 cmdbuf,
@@ -265,7 +381,8 @@ impl Uint8Pass {
                 &[],
                 &[],
             );
-        }
+        });
+        (staging.buffer, staging.offset)
     }
 }
 
@@ -278,12 +395,43 @@ impl Uint8Pass {
 /// Assembles quad-indexed geometry into triangle indices.
 pub struct QuadIndexedPass {
     base: ComputePass,
+    scheduler: NonNull<Scheduler>,
+    staging_buffer_pool: NonNull<StagingBufferPool>,
+    compute_pass_descriptor_queue: NonNull<ComputePassDescriptorQueue>,
 }
 
 impl QuadIndexedPass {
     /// Port of `QuadIndexedPass::QuadIndexedPass`.
-    pub fn new_with_pass(base: ComputePass) -> Self {
-        QuadIndexedPass { base }
+    pub fn new(
+        device: &ash::Device,
+        scheduler: &mut Scheduler,
+        descriptor_pool: &DescriptorPool,
+        staging_buffer_pool: &mut StagingBufferPool,
+        compute_pass_descriptor_queue: &mut ComputePassDescriptorQueue,
+    ) -> Result<Self, vk::Result> {
+        let bindings = input_output_bindings();
+        let templates = input_output_descriptor_template();
+        let push_constants = [vk::PushConstantRange {
+            stage_flags: vk::ShaderStageFlags::COMPUTE,
+            offset: 0,
+            size: (std::mem::size_of::<u32>() * 3) as u32,
+        }];
+        let base = ComputePass::new(
+            device,
+            descriptor_pool,
+            &bindings,
+            &templates,
+            &INPUT_OUTPUT_BANK_INFO,
+            &push_constants,
+            VULKAN_QUAD_INDEXED_COMP_SPV,
+            None,
+        )?;
+        Ok(Self {
+            base,
+            scheduler: NonNull::from(scheduler),
+            staging_buffer_pool: NonNull::from(staging_buffer_pool),
+            compute_pass_descriptor_queue: NonNull::from(compute_pass_descriptor_queue),
+        })
     }
 
     /// Port of `QuadIndexedPass::Assemble`.
@@ -291,22 +439,75 @@ impl QuadIndexedPass {
     /// Converts quad indices to triangle indices via compute dispatch.
     pub fn assemble(
         &mut self,
-        device: &ash::Device,
-        cmdbuf: vk::CommandBuffer,
-        num_tri_vertices: u32,
+        index_format: IndexFormat,
+        num_vertices: u32,
         base_vertex: u32,
-        index_shift: u32,
+        src_buffer: vk::Buffer,
+        src_offset: u32,
         is_strip: bool,
-    ) {
-        let push_constants: [u32; 3] = [base_vertex, index_shift, if is_strip { 1 } else { 0 }];
-
-        let num_workgroups = (num_tri_vertices + DISPATCH_SIZE - 1) / DISPATCH_SIZE;
-
+    ) -> (vk::Buffer, vk::DeviceSize) {
+        let index_shift = Self::index_shift_for_format(index_format);
+        let input_size = num_vertices << index_shift;
+        let num_tri_vertices = (if is_strip {
+            num_vertices.wrapping_sub(2) / 2
+        } else {
+            num_vertices / 4
+        })
+        .wrapping_mul(6);
+        let staging_size =
+            u64::from(num_tri_vertices.wrapping_mul(std::mem::size_of::<u32>() as u32));
+        let staging = unsafe { self.staging_buffer_pool.as_mut() }
+            .request_device_local_buffer(staging_size)
+            .expect("QuadIndexedPass device-local staging allocation failed");
+        let descriptor_buffers = [
+            vk::DescriptorBufferInfo {
+                buffer: src_buffer,
+                offset: u64::from(src_offset),
+                range: u64::from(input_size),
+            },
+            vk::DescriptorBufferInfo {
+                buffer: staging.buffer,
+                offset: staging.offset,
+                range: staging_size,
+            },
+        ];
         unsafe {
-            device.cmd_bind_pipeline(cmdbuf, vk::PipelineBindPoint::COMPUTE, self.base.pipeline);
+            let queue = self.compute_pass_descriptor_queue.as_mut();
+            queue.acquire();
+            queue.add_buffer(src_buffer, u64::from(src_offset), u64::from(input_size));
+            queue.add_buffer(staging.buffer, staging.offset, staging_size);
+        }
+        let push_constants: [u32; 3] = [base_vertex, index_shift, if is_strip { 1 } else { 0 }];
+        let num_workgroups = (num_tri_vertices + DISPATCH_SIZE - 1) / DISPATCH_SIZE;
+        let scheduler = unsafe { self.scheduler.as_mut() };
+        let descriptor_set = self
+            .base
+            .descriptor_allocator
+            .commit(scheduler.known_gpu_tick(), scheduler.pending_tick())
+            .expect("QuadIndexedPass descriptor allocation failed");
+        scheduler.request_outside_renderpass();
+        let device = self.base.device.clone();
+        let descriptor_template = self.base.descriptor_template;
+        let pipeline = self.base.pipeline;
+        let layout = self.base.layout;
+        scheduler.record(move |cmdbuf| unsafe {
+            device.update_descriptor_set_with_template(
+                descriptor_set,
+                descriptor_template,
+                descriptor_buffers.as_ptr().cast(),
+            );
+            device.cmd_bind_pipeline(cmdbuf, vk::PipelineBindPoint::COMPUTE, pipeline);
+            device.cmd_bind_descriptor_sets(
+                cmdbuf,
+                vk::PipelineBindPoint::COMPUTE,
+                layout,
+                0,
+                &[descriptor_set],
+                &[],
+            );
             device.cmd_push_constants(
                 cmdbuf,
-                self.base.layout,
+                layout,
                 vk::ShaderStageFlags::COMPUTE,
                 0,
                 bytemuck::bytes_of(&push_constants),
@@ -323,16 +524,16 @@ impl QuadIndexedPass {
                 &[],
                 &[],
             );
-        }
+        });
+        (staging.buffer, staging.offset)
     }
 
     /// Port of index_shift calculation from QuadIndexedPass::Assemble.
-    pub fn index_shift_for_format(index_format: u32) -> u32 {
+    pub fn index_shift_for_format(index_format: IndexFormat) -> u32 {
         match index_format {
-            0 => 0, // UnsignedByte
-            1 => 1, // UnsignedShort
-            2 => 2, // UnsignedInt
-            _ => 2,
+            IndexFormat::UnsignedByte => 0,
+            IndexFormat::UnsignedShort => 1,
+            IndexFormat::UnsignedInt => 2,
         }
     }
 }
@@ -1054,5 +1255,34 @@ mod tests {
         assert_eq!(QUERIES_SCAN_BANK_INFO.storage_buffers, 3);
         assert_eq!(ASTC_BANK_INFO.images, 1);
         assert_eq!(MSAA_BANK_INFO.images, 2);
+    }
+
+    #[test]
+    fn indexed_conversion_layout_matches_upstream() {
+        assert_eq!(
+            QuadIndexedPass::index_shift_for_format(IndexFormat::UnsignedByte),
+            0
+        );
+        assert_eq!(
+            QuadIndexedPass::index_shift_for_format(IndexFormat::UnsignedShort),
+            1
+        );
+        assert_eq!(
+            QuadIndexedPass::index_shift_for_format(IndexFormat::UnsignedInt),
+            2
+        );
+
+        let bindings = input_output_bindings();
+        assert_eq!(bindings.len(), 2);
+        assert!(bindings
+            .iter()
+            .all(|binding| binding.descriptor_type == vk::DescriptorType::STORAGE_BUFFER));
+        let templates = input_output_descriptor_template();
+        assert_eq!(templates[0].dst_binding, 0);
+        assert_eq!(templates[0].descriptor_count, 2);
+        assert_eq!(
+            templates[0].stride,
+            std::mem::size_of::<vk::DescriptorBufferInfo>()
+        );
     }
 }

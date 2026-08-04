@@ -8,6 +8,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
+use std::panic::{catch_unwind, resume_unwind, take_hook, AssertUnwindSafe};
 use std::path::PathBuf;
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -35,6 +36,92 @@ use super::fixed_pipeline_state::FixedPipelineState;
 use super::graphics_pipeline::{GraphicsPipeline, GraphicsPipelineCache, GraphicsPipelineKey};
 
 use super::render_pass_cache::RenderPassCache;
+
+/// One-time installation of the shader-exception panic-hook filter. The hook
+/// remains process-wide, but only typed shader exceptions inside this
+/// thread-local scope are silenced; independent panics retain normal output.
+static SHADER_EXCEPTION_HOOK_INSTALL: std::sync::Once = std::sync::Once::new();
+
+thread_local! {
+    /// True while the current thread is inside the Rust equivalent of an
+    /// upstream `catch (const Shader::Exception&)` scope.
+    static IN_SHADER_EXCEPTION_SCOPE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn shader_exception_message(payload: &(dyn std::any::Any + Send)) -> Option<String> {
+    use shader_recompiler::exception::{
+        InvalidArgument, LogicError, NotImplementedException, RuntimeError, ShaderException,
+    };
+
+    if let Some(error) = payload.downcast_ref::<ShaderException>() {
+        Some(error.to_string())
+    } else if let Some(error) = payload.downcast_ref::<LogicError>() {
+        Some(error.to_string())
+    } else if let Some(error) = payload.downcast_ref::<RuntimeError>() {
+        Some(error.to_string())
+    } else if let Some(error) = payload.downcast_ref::<NotImplementedException>() {
+        Some(error.to_string())
+    } else {
+        payload
+            .downcast_ref::<InvalidArgument>()
+            .map(ToString::to_string)
+    }
+}
+
+/// Rust equivalent of the typed shader-exception catches in
+/// `vk_pipeline_cache.cpp`. Non-shader panics are resumed unchanged.
+pub(super) fn catch_shader_exception<F, T>(f: F) -> Result<T, String>
+where
+    F: FnOnce() -> T,
+{
+    SHADER_EXCEPTION_HOOK_INSTALL.call_once(|| {
+        let previous = take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            let is_shader_exception = shader_exception_message(info.payload()).is_some();
+            if !IN_SHADER_EXCEPTION_SCOPE.with(std::cell::Cell::get) || !is_shader_exception {
+                previous(info);
+            }
+        }));
+    });
+
+    IN_SHADER_EXCEPTION_SCOPE.with(|flag| flag.set(true));
+    let result = catch_unwind(AssertUnwindSafe(f));
+    IN_SHADER_EXCEPTION_SCOPE.with(|flag| flag.set(false));
+    match result {
+        Ok(value) => Ok(value),
+        Err(payload) => match shader_exception_message(payload.as_ref()) {
+            Some(message) => Err(message),
+            None => resume_unwind(payload),
+        },
+    }
+}
+
+/// Error-path half of upstream `PipelineCache::CreateGraphicsPipeline`.
+///
+/// Upstream dumps every active environment after a `Shader::Exception`, even
+/// when normal shader dumping is disabled. `GraphicsEnvironments::envs` is
+/// indexed by the Maxwell program slot, so the direct stage/hash association
+/// is preserved here.
+fn dump_failed_graphics_environments(
+    environments: &mut GraphicsEnvironments,
+    key: &GraphicsPipelineKey,
+    pipeline_hash: u64,
+) {
+    for (stage, shader_hash) in key.unique_hashes.iter().copied().enumerate() {
+        if shader_hash == 0
+            || environments
+                .env_ptrs
+                .iter()
+                .flatten()
+                .all(|&index| index != stage)
+        {
+            continue;
+        }
+        environments.envs[stage]
+            .generic_environment_mut()
+            .dump(pipeline_hash, shader_hash);
+    }
+}
 
 // ---------------------------------------------------------------------------
 // ComputePipelineCacheKey
@@ -256,6 +343,7 @@ fn build_compute_pipeline_from_file_environment(
     profile: Profile,
     host_info: HostTranslateInfo,
     vulkan_pipeline_cache: vk::PipelineCache,
+    shader_notify: crate::shader_notify::ShaderNotifyHandle,
     key: &ComputePipelineCacheKey,
     env: &mut FileEnvironment,
 ) -> Option<ComputePipeline> {
@@ -264,17 +352,25 @@ fn build_compute_pipeline_from_file_environment(
     if code.is_empty() {
         return None;
     }
-    let mut bindings = Bindings::default();
-    let runtime_info = RuntimeInfo::default();
-    let compiled = shader_recompiler::compile_shader_from_env_with_bindings_and_host_info(
-        &code,
-        base_offset,
-        env,
-        &profile,
-        &runtime_info,
-        &mut bindings,
-        &host_info,
-    );
+    let compiled = match catch_shader_exception(|| {
+        let mut bindings = Bindings::default();
+        let runtime_info = RuntimeInfo::default();
+        shader_recompiler::compile_shader_from_env_with_bindings_and_host_info(
+            &code,
+            base_offset,
+            env,
+            &profile,
+            &runtime_info,
+            &mut bindings,
+            &host_info,
+        )
+    }) {
+        Ok(compiled) => compiled,
+        Err(reason) => {
+            log::error!("{reason}");
+            return None;
+        }
+    };
     let create_info = vk::ShaderModuleCreateInfo::builder()
         .code(&compiled.spirv_words)
         .build();
@@ -284,6 +380,7 @@ fn build_compute_pipeline_from_file_environment(
         compiled.info,
         spv_module,
         vulkan_pipeline_cache,
+        shader_notify,
     )
     .or_else(|| {
         log::warn!(
@@ -324,6 +421,7 @@ fn get_total_pipeline_workers() -> usize {
 pub struct PipelineCache {
     device: ash::Device,
     descriptor_pool: NonNull<DescriptorPool>,
+    shader_notify: crate::shader_notify::ShaderNotifyHandle,
     use_asynchronous_shaders: bool,
     use_vulkan_pipeline_cache: bool,
     channel_caches: ChannelSetupCaches<ChannelInfo>,
@@ -345,10 +443,8 @@ pub struct PipelineCache {
     compute_cache: HashMap<ComputePipelineCacheKey, ComputePipeline>,
     /// Upstream `Common::ThreadWorker workers`, owned by `PipelineCache`.
     ///
-    /// This is the required owner for disk-cache rebuild jobs and async
-    /// `GraphicsPipeline` / `ComputePipeline` creation. Current Rust pipeline
-    /// constructors are still synchronous, so queuing actual builds is enabled
-    /// only after the constructors are split to match upstream.
+    /// This is the required owner for disk-cache rebuild jobs and asynchronous
+    /// `GraphicsPipeline` / `ComputePipeline` creation.
     workers: ThreadWorker,
     /// Upstream `Common::ThreadWorker serialization_thread`.
     serialization_thread: ThreadWorker,
@@ -374,10 +470,12 @@ impl PipelineCache {
     pub fn new(
         device: ash::Device,
         descriptor_pool: &mut DescriptorPool,
+        shader_notify: crate::shader_notify::ShaderNotifyHandle,
         use_asynchronous_shaders: bool,
         use_vulkan_pipeline_cache: bool,
         shader_cache: shader_recompiler::PipelineCache,
         profile: Profile,
+        host_info: HostTranslateInfo,
         render_pass_cache: &mut RenderPassCache,
         extended_dynamic_state_supported: bool,
         extended_dynamic_state2_supported: bool,
@@ -396,16 +494,18 @@ impl PipelineCache {
         let mut pipeline_cache = PipelineCache {
             device: device.clone(),
             descriptor_pool: NonNull::from(descriptor_pool),
+            shader_notify,
             use_asynchronous_shaders,
             use_vulkan_pipeline_cache,
             channel_caches: ChannelSetupCaches::new(),
             render_pass_cache: NonNull::from(render_pass_cache),
             profile: profile.clone(),
-            host_info: HostTranslateInfo::default(),
+            host_info: host_info.clone(),
             graphics_pipeline_cache: GraphicsPipelineCache::new(
                 device,
                 shader_cache,
                 profile,
+                host_info,
                 extended_dynamic_state_supported,
                 extended_dynamic_state2_supported,
                 extended_dynamic_state2_extra_supported,
@@ -610,17 +710,25 @@ impl PipelineCache {
     where
         E: shader_recompiler::environment::Environment,
     {
-        let mut bindings = Bindings::default();
-        let runtime_info = RuntimeInfo::default();
-        let compiled = shader_recompiler::compile_shader_from_env_with_bindings_and_host_info(
-            code,
-            base_offset,
-            env,
-            &self.profile,
-            &runtime_info,
-            &mut bindings,
-            &self.host_info,
-        );
+        let compiled = match catch_shader_exception(|| {
+            let mut bindings = Bindings::default();
+            let runtime_info = RuntimeInfo::default();
+            shader_recompiler::compile_shader_from_env_with_bindings_and_host_info(
+                code,
+                base_offset,
+                env,
+                &self.profile,
+                &runtime_info,
+                &mut bindings,
+                &self.host_info,
+            )
+        }) {
+            Ok(compiled) => compiled,
+            Err(reason) => {
+                log::error!("{reason}");
+                return None;
+            }
+        };
         let create_info = vk::ShaderModuleCreateInfo::builder()
             .code(&compiled.spirv_words)
             .build();
@@ -630,6 +738,7 @@ impl PipelineCache {
             compiled.info,
             spv_module,
             self.vulkan_pipeline_cache,
+            self.shader_notify,
             self.use_asynchronous_shaders.then_some(&self.workers),
         )
         .or_else(|| {
@@ -766,14 +875,24 @@ impl PipelineCache {
         self.main_pools.release_contents();
         let render_pass = self.render_pass_for_state(fixed_state)?;
         let pipeline_cache = self.vulkan_pipeline_cache;
-        let mut pipeline = self.graphics_pipeline_cache.build_pipeline_keyed(
-            draw,
-            render_pass,
-            pipeline_cache,
-            read_gpu,
-            key,
-            fixed_state,
-        )?;
+        let mut pipeline = match catch_shader_exception(|| {
+            self.graphics_pipeline_cache.build_pipeline_keyed(
+                draw,
+                render_pass,
+                pipeline_cache,
+                self.shader_notify,
+                read_gpu,
+                key,
+                fixed_state,
+            )
+        }) {
+            Ok(Some(pipeline)) => pipeline,
+            Ok(None) => return None,
+            Err(reason) => {
+                log::error!("{reason}");
+                return None;
+            }
+        };
         if let Err(error) =
             pipeline.initialize_descriptor_allocator(unsafe { self.descriptor_pool.as_ref() })
         {
@@ -795,27 +914,40 @@ impl PipelineCache {
         let pipeline_cache = self.vulkan_pipeline_cache;
         let mut environments = GraphicsEnvironments::default();
         shared_cache.get_graphics_environments(&mut environments, &key.unique_hashes);
-        let mut pipeline = if self.use_asynchronous_shaders {
-            self.graphics_pipeline_cache
-                .build_pipeline_keyed_from_environments_async(
-                    draw,
-                    render_pass,
-                    pipeline_cache,
-                    &mut environments,
-                    key,
-                    fixed_state,
-                    &self.workers,
-                )?
-        } else {
-            self.graphics_pipeline_cache
-                .build_pipeline_keyed_from_environments(
-                    draw,
-                    render_pass,
-                    pipeline_cache,
-                    &mut environments,
-                    key,
-                    fixed_state,
-                )?
+        let mut pipeline = match catch_shader_exception(|| {
+            if self.use_asynchronous_shaders {
+                self.graphics_pipeline_cache
+                    .build_pipeline_keyed_from_environments_async(
+                        draw,
+                        render_pass,
+                        pipeline_cache,
+                        self.shader_notify,
+                        &mut environments,
+                        key,
+                        fixed_state,
+                        &self.workers,
+                    )
+            } else {
+                self.graphics_pipeline_cache
+                    .build_pipeline_keyed_from_environments(
+                        draw,
+                        render_pass,
+                        pipeline_cache,
+                        self.shader_notify,
+                        &mut environments,
+                        key,
+                        fixed_state,
+                    )
+            }
+        }) {
+            Ok(Some(pipeline)) => pipeline,
+            Ok(None) => return None,
+            Err(reason) => {
+                let pipeline_hash = graphics_key_cache_hash(key);
+                dump_failed_graphics_environments(&mut environments, key, pipeline_hash);
+                log::error!("{reason}");
+                return None;
+            }
         };
         if let Err(error) =
             pipeline.initialize_descriptor_allocator(unsafe { self.descriptor_pool.as_ref() })
@@ -968,6 +1100,7 @@ impl PipelineCache {
             let profile = self.profile.clone();
             let host_info = self.host_info.clone();
             let vulkan_pipeline_cache = self.vulkan_pipeline_cache;
+            let shader_notify = self.shader_notify;
             let results = build_results.clone();
             let skipped_jobs = job_skipped.clone();
             let state = Arc::clone(&load_state);
@@ -979,6 +1112,7 @@ impl PipelineCache {
                     profile,
                     host_info,
                     vulkan_pipeline_cache,
+                    shader_notify,
                     &key,
                     &mut env,
                 ) {
@@ -1020,6 +1154,7 @@ impl PipelineCache {
             };
             let mut builder = self.graphics_pipeline_cache.clone_for_disk_worker();
             let vulkan_pipeline_cache = self.vulkan_pipeline_cache;
+            let shader_notify = self.shader_notify;
             let results = build_results.clone();
             let skipped_jobs = job_skipped.clone();
             let state = Arc::clone(&load_state);
@@ -1029,6 +1164,7 @@ impl PipelineCache {
                 match builder.build_pipeline_keyed_from_file_environments(
                     render_pass,
                     vulkan_pipeline_cache,
+                    shader_notify,
                     &mut envs,
                     &key,
                 ) {
@@ -1211,6 +1347,29 @@ mod tests {
         RtControlInfo, SamplerBinding, ScissorInfo, ShaderStageInfo, StencilFaceInfo, ViewportInfo,
         ZetaInfo,
     };
+
+    #[test]
+    fn shader_exception_scope_catches_only_shader_exceptions() {
+        let shader_result = catch_shader_exception(|| {
+            std::panic::panic_any(shader_recompiler::exception::NotImplementedException::new(
+                "LC",
+            ));
+        });
+        assert_eq!(shader_result.unwrap_err(), "LC is not implemented");
+
+        let ordinary = std::panic::catch_unwind(|| {
+            let _: Result<(), String> = catch_shader_exception(|| panic!("ordinary panic"));
+        });
+        assert!(ordinary.is_err(), "non-shader panics must not be swallowed");
+    }
+
+    #[test]
+    fn missing_file_environment_data_is_a_caught_shader_error() {
+        let env = FileEnvironment::new();
+        let result = catch_shader_exception(|| env.read_cbuf_value(2, 0x20));
+
+        assert_eq!(result.unwrap_err(), "Uncached read texture type");
+    }
 
     fn make_test_draw_call() -> DrawCall {
         DrawCall {

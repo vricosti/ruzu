@@ -49,8 +49,10 @@ pub fn loop_process(service_manager: &Arc<Mutex<ServiceManager>>, system: crate:
         register_stub(&mut server_manager, "bgtc:t");
         register_stub(&mut server_manager, "bgtc:sc");
 
-        // Error Context — stub
-        register_stub(&mut server_manager, "ectx:aw");
+        // Error Context
+        use crate::hle::service::glue::ectx::EctxAW;
+        let factory: SessionRequestHandlerFactory = Box::new(|| Arc::new(EctxAW::new()));
+        server_manager.register_named_service("ectx:aw", factory, 64);
 
         // Notification Services — stub
         register_stub(&mut server_manager, "notif:a");

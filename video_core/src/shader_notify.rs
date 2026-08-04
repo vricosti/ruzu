@@ -5,7 +5,9 @@
 //!
 //! Shader compilation notification system for reporting build progress to the UI.
 
+use std::ptr::NonNull;
 use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 /// Duration after which we stop reporting "shaders building".
@@ -15,6 +17,10 @@ const TIME_TO_STOP_REPORTING: Duration = Duration::from_secs(2);
 pub struct ShaderNotify {
     num_building: AtomicI32,
     num_complete: AtomicI32,
+    report: Mutex<ReportState>,
+}
+
+struct ReportState {
     report_base: i32,
     completed: bool,
     num_when_completed: i32,
@@ -26,37 +32,43 @@ impl ShaderNotify {
         Self {
             num_building: AtomicI32::new(0),
             num_complete: AtomicI32::new(0),
-            report_base: 0,
-            completed: false,
-            num_when_completed: 0,
-            complete_time: None,
+            report: Mutex::new(ReportState {
+                report_base: 0,
+                completed: false,
+                num_when_completed: 0,
+                complete_time: None,
+            }),
         }
     }
 
     /// Returns the number of shaders currently being built (relative to report base).
     ///
     /// After all shaders complete and a timeout passes, the report resets to zero.
-    pub fn shaders_building(&mut self) -> i32 {
+    pub fn shaders_building(&self) -> i32 {
         let now_complete = self.num_complete.load(Ordering::Relaxed);
         let now_building = self.num_building.load(Ordering::Relaxed);
+        let mut report = self
+            .report
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
 
         if now_complete == now_building {
             let now = Instant::now();
-            if self.completed && now_complete == self.num_when_completed {
-                if let Some(complete_time) = self.complete_time {
+            if report.completed && now_complete == report.num_when_completed {
+                if let Some(complete_time) = report.complete_time {
                     if now.duration_since(complete_time) > TIME_TO_STOP_REPORTING {
-                        self.report_base = now_complete;
-                        self.completed = false;
+                        report.report_base = now_complete;
+                        report.completed = false;
                     }
                 }
             } else {
-                self.completed = true;
-                self.num_when_completed = now_complete;
-                self.complete_time = Some(now);
+                report.completed = true;
+                report.num_when_completed = now_complete;
+                report.complete_time = Some(now);
             }
         }
 
-        now_building - self.report_base
+        now_building - report.report_base
     }
 
     /// Mark a shader as completed.
@@ -70,8 +82,65 @@ impl ShaderNotify {
     }
 }
 
+/// Non-owning counterpart of upstream's `VideoCore::ShaderNotify*`.
+///
+/// `Gpu` owns the pointee and drops its renderer before the notification
+/// object. Pipeline workers are owned and joined by that renderer, so handles
+/// cannot outlive the pointee.
+#[derive(Clone, Copy)]
+pub struct ShaderNotifyHandle(NonNull<ShaderNotify>);
+
+impl ShaderNotifyHandle {
+    /// The caller must ensure the pointee outlives every copied handle and all
+    /// worker closures containing one.
+    pub(crate) unsafe fn new(shader_notify: &ShaderNotify) -> Self {
+        Self(NonNull::from(shader_notify))
+    }
+
+    pub fn mark_shader_complete(self) {
+        unsafe { self.0.as_ref() }.mark_shader_complete();
+    }
+
+    pub fn mark_shader_building(self) {
+        unsafe { self.0.as_ref() }.mark_shader_building();
+    }
+}
+
+// SAFETY: `ShaderNotify` is thread-safe and `Gpu` keeps it alive until all
+// renderer-owned pipeline workers have been joined.
+unsafe impl Send for ShaderNotifyHandle {}
+unsafe impl Sync for ShaderNotifyHandle {}
+
 impl Default for ShaderNotify {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reports_started_builds_until_the_completion_timeout() {
+        let notify = ShaderNotify::new();
+        let handle = unsafe { ShaderNotifyHandle::new(&notify) };
+
+        assert_eq!(notify.shaders_building(), 0);
+        handle.mark_shader_building();
+        handle.mark_shader_building();
+        assert_eq!(notify.shaders_building(), 2);
+
+        handle.mark_shader_complete();
+        assert_eq!(notify.shaders_building(), 2);
+        handle.mark_shader_complete();
+        assert_eq!(notify.shaders_building(), 2);
+
+        notify
+            .report
+            .lock()
+            .unwrap()
+            .complete_time = Some(Instant::now() - TIME_TO_STOP_REPORTING - Duration::from_millis(1));
+        assert_eq!(notify.shaders_building(), 0);
     }
 }
