@@ -32330,3 +32330,69 @@ Rust files: `externals/rdynarmic/src/frontend/a32/{decoder.rs, decoder_thumb32.r
   `SDLDriver::{SetVibration,SendVibrations}` after implementation. A focused
   regression verifies that the hot-path query consumes the snapshot cache
   without requiring a live SDL controller handle.
+
+## 2026-08-05 — externals/rdynarmic/src/ir/emitter.rs vs externals/dynarmic/src/dynarmic/ir/ir_emitter.{h,cpp}
+
+### Intentional differences
+- Rust reports an unsupported element size with `panic!`; upstream terminates
+  through `UNREACHABLE()`. The accepted element-size sets are identical.
+
+### Unintentional differences (fixed)
+- Added the missing `VectorPairedAdd{Signed,Unsigned}Widen`,
+  `VectorSignedSaturated{Abs,Neg,AccumulateUnsigned}`, and
+  `VectorUnsignedSaturatedAccumulateSigned` emitter methods. Each method maps
+  the same accepted widths to the same existing IR opcodes and preserves
+  upstream argument ordering.
+
+### Missing items
+- The emitter surface required by the audited two-register miscellaneous SIMD
+  instruction set is complete.
+
+### Binary layout verification
+- PASS: these methods only construct existing IR instructions; no IR value,
+  guest-state, or serialized layout changed.
+
+### Behavioral verification
+- Re-read the corresponding declarations and switch bodies in upstream
+  `ir_emitter.h` and `ir_emitter.cpp` after implementation. Frontend coverage
+  exercises every newly exposed opcode family through its owning instruction.
+
+## 2026-08-05 — externals/rdynarmic/src/frontend/a64/translate/{simd_two_register_misc.rs,visitor.rs} vs externals/dynarmic/src/dynarmic/frontend/A64/translate/impl/{impl.h,simd_two_register_misc.cpp}
+
+### Intentional differences
+- Rust extracts generated decoder fields from `DecodedInst` inside each method;
+  upstream passes the same fields as typed visitor arguments.
+- Rust passes the existing explicit `fpcr_controlled` IR flag and represents
+  upstream `Signedness` and `PairedAddLongExtraBehavior` as file-local enums.
+- Rust `v_write` and `vpart_write_64` provide upstream `V` and `Vpart`
+  writeback semantics, including upper-half clearing for 64-bit destinations.
+
+### Unintentional differences (fixed)
+- `SHLL` was decoded but absent from the visitor and owner file. The runtime
+  encoding `0x2E613800` therefore suspended two guest threads as unimplemented.
+  Its zero-extension, selected-half read, full-element shift, and 128-bit
+  writeback now match upstream `SHLL`/`SHLL2`.
+- Completed the remaining decoded-but-undispatched owner methods: `FABS_1`,
+  `FNEG_1`, all eight `FCVT{N,M,A,P}{S,U}_4` variants, `FCVTXN_2`,
+  `RBIT_asimd`, `SADALP`, `SADDLP`, `UADALP`, `UADDLP`, `SQABS_2`,
+  `SQNEG_2`, `SUQADD_2`, `USQADD_2`, `URECPE`, and `URSQRTE`.
+- `XTN` and `FCVTN` now use the shared `Vpart`-equivalent writeback instead of
+  manually rebuilding the destination. `FNEG_2` now follows upstream's
+  explicit sign-mask XOR sequence instead of a dedicated FP-negate opcode.
+
+### Missing items
+- The Rust owner now contains and dispatches every `TranslatorVisitor` method
+  declared by upstream `simd_two_register_misc.cpp`; earlier partial-port
+  entries in this audit are superseded by this verification.
+
+### Binary layout verification
+- PASS: instruction decoding and A64 vector-state layout are unchanged. The
+  implementation only emits existing IR values and writes existing registers.
+
+### Behavioral verification
+- Re-read the complete upstream owner and its interface after implementation;
+  automated method-set and dispatch comparisons report no missing methods.
+- Fourteen owner tests pass. A dispatch table covers all 23 former gaps, and an
+  x64 JIT regression verifies exact `SHLL` and `SHLL2` low/high 64-bit results.
+- The complete release `rdynarmic` library suite passes: 780 passed, 0 failed,
+  4 ignored.
