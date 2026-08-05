@@ -29,7 +29,6 @@ use crate::surface::{
     is_pixel_format_integer, is_pixel_format_signed_integer, pixel_format_from_render_target_format,
 };
 use shader_recompiler::backend::bindings::Bindings;
-use shader_recompiler::environment::Environment;
 use shader_recompiler::host_translate_info::HostTranslateInfo;
 use shader_recompiler::runtime_info::{
     AttributeType, CompareFunction, InputTopology, TessPrimitive, TessSpacing,
@@ -40,11 +39,10 @@ use shader_recompiler::{CompiledShader, PipelineCache, Profile, RuntimeInfo, Sha
 use super::descriptor_pool::{DescriptorAllocator, DescriptorBankInfo, DescriptorPool};
 use super::fixed_pipeline_state::{pack_logic_op, DynamicFeatures, FixedPipelineState};
 use super::maxwell_to_vk;
-use super::pipeline_helper::{
-    RENDERAREA_LAYOUT_SIZE, RESCALING_LAYOUT_SIZE, RESCALING_LAYOUT_WORDS_OFFSET,
-};
+use super::pipeline_helper::DescriptorLayoutBuilder;
 
 const NUM_VK_GRAPHICS_STAGES: usize = 5;
+pub const MAX_IMAGE_ELEMENTS: usize = 64;
 
 #[derive(Debug, Clone, Copy)]
 pub struct GraphicsDescriptorBinding {
@@ -139,6 +137,8 @@ pub struct GraphicsPipeline {
     pipeline: Arc<Mutex<vk::Pipeline>>,
     pub pipeline_layout: vk::PipelineLayout,
     pub descriptor_set_layout: vk::DescriptorSetLayout,
+    pub descriptor_update_template: vk::DescriptorUpdateTemplate,
+    pub uses_push_descriptor: bool,
     pub descriptor_bindings: Arc<Vec<GraphicsDescriptorBinding>>,
     pub descriptor_bank_info: DescriptorBankInfo,
     descriptor_allocator: Option<DescriptorAllocator>,
@@ -196,6 +196,10 @@ impl Drop for GraphicsPipeline {
             let pipeline = *self.pipeline.lock().unwrap();
             if pipeline != vk::Pipeline::null() {
                 self.device.destroy_pipeline(pipeline, None);
+            }
+            if self.descriptor_update_template != vk::DescriptorUpdateTemplate::null() {
+                self.device
+                    .destroy_descriptor_update_template(self.descriptor_update_template, None);
             }
             self.device
                 .destroy_pipeline_layout(self.pipeline_layout, None);
@@ -259,7 +263,8 @@ impl GraphicsPipeline {
         &mut self,
         descriptor_pool: &DescriptorPool,
     ) -> Result<(), vk::Result> {
-        if self.descriptor_set_layout == vk::DescriptorSetLayout::null()
+        if self.uses_push_descriptor
+            || self.descriptor_set_layout == vk::DescriptorSetLayout::null()
             || self.descriptor_bindings.is_empty()
         {
             return Ok(());
@@ -333,6 +338,8 @@ pub struct GraphicsPipelineCache {
     max_vertex_input_bindings: u32,
     vertex_attribute_divisor_supported: bool,
     provoking_vertex_supported: bool,
+    push_descriptor_supported: bool,
+    max_push_descriptors: u32,
 }
 
 impl GraphicsPipelineCache {
@@ -354,6 +361,8 @@ impl GraphicsPipelineCache {
         max_vertex_input_bindings: u32,
         vertex_attribute_divisor_supported: bool,
         provoking_vertex_supported: bool,
+        push_descriptor_supported: bool,
+        max_push_descriptors: u32,
     ) -> Self {
         Self {
             device,
@@ -374,6 +383,8 @@ impl GraphicsPipelineCache {
                 .min(crate::engines::maxwell_3d::NUM_VERTEX_ARRAYS),
             vertex_attribute_divisor_supported,
             provoking_vertex_supported,
+            push_descriptor_supported,
+            max_push_descriptors,
         }
     }
 
@@ -453,6 +464,8 @@ impl GraphicsPipelineCache {
             max_vertex_input_bindings: self.max_vertex_input_bindings,
             vertex_attribute_divisor_supported: self.vertex_attribute_divisor_supported,
             provoking_vertex_supported: self.provoking_vertex_supported,
+            push_descriptor_supported: self.push_descriptor_supported,
+            max_push_descriptors: self.max_push_descriptors,
         }
     }
 
@@ -561,6 +574,8 @@ impl GraphicsPipelineCache {
             pipeline: Arc::new(Mutex::new(pipeline)),
             pipeline_layout: descriptor_layout.pipeline_layout,
             descriptor_set_layout: descriptor_layout.descriptor_set_layout,
+            descriptor_update_template: descriptor_layout.descriptor_update_template,
+            uses_push_descriptor: descriptor_layout.uses_push_descriptor,
             descriptor_bindings: Arc::new(descriptor_layout.bindings),
             descriptor_bank_info: descriptor_layout.bank_info,
             descriptor_allocator: None,
@@ -638,6 +653,8 @@ impl GraphicsPipelineCache {
             pipeline: Arc::new(Mutex::new(pipeline)),
             pipeline_layout: descriptor_layout.pipeline_layout,
             descriptor_set_layout: descriptor_layout.descriptor_set_layout,
+            descriptor_update_template: descriptor_layout.descriptor_update_template,
+            uses_push_descriptor: descriptor_layout.uses_push_descriptor,
             descriptor_bindings: Arc::new(descriptor_layout.bindings),
             descriptor_bank_info: descriptor_layout.bank_info,
             descriptor_allocator: None,
@@ -740,6 +757,8 @@ impl GraphicsPipelineCache {
             pipeline,
             pipeline_layout: descriptor_layout.pipeline_layout,
             descriptor_set_layout: descriptor_layout.descriptor_set_layout,
+            descriptor_update_template: descriptor_layout.descriptor_update_template,
+            uses_push_descriptor: descriptor_layout.uses_push_descriptor,
             descriptor_bindings: Arc::new(descriptor_layout.bindings),
             descriptor_bank_info: descriptor_layout.bank_info,
             descriptor_allocator: None,
@@ -1021,6 +1040,8 @@ impl GraphicsPipelineCache {
             pipeline: Arc::new(Mutex::new(pipeline)),
             pipeline_layout: descriptor_layout.pipeline_layout,
             descriptor_set_layout: descriptor_layout.descriptor_set_layout,
+            descriptor_update_template: descriptor_layout.descriptor_update_template,
+            uses_push_descriptor: descriptor_layout.uses_push_descriptor,
             descriptor_bindings: Arc::new(descriptor_layout.bindings),
             descriptor_bank_info: descriptor_layout.bank_info,
             descriptor_allocator: None,
@@ -1160,18 +1181,21 @@ impl GraphicsPipelineCache {
         compiled_stages: &[Option<CompiledShader>; NUM_VK_GRAPHICS_STAGES],
     ) -> Option<GraphicsDescriptorLayout> {
         let mut bindings = BTreeMap::new();
+        let mut layout_builder = DescriptorLayoutBuilder::new();
         let mut binding = 0u32;
         for (stage_index, compiled) in compiled_stages.iter().enumerate() {
             let Some(compiled) = compiled else {
                 continue;
             };
+            let stage_flags = graphics_stage_flags(stage_index);
             add_shader_descriptor_bindings(
                 &mut bindings,
                 compiled,
-                graphics_stage_flags(stage_index),
+                stage_flags,
                 stage_index as u32,
                 &mut binding,
             );
+            layout_builder.add(&compiled.info, stage_flags);
         }
         let descriptor_bindings: Vec<_> = bindings
             .into_iter()
@@ -1199,46 +1223,59 @@ impl GraphicsPipelineCache {
                 },
             )
             .collect();
+        if !descriptor_layouts_match(layout_builder.bindings(), &descriptor_bindings)
+            || layout_builder.num_descriptors()
+                != descriptor_bindings
+                    .iter()
+                    .map(|binding| binding.descriptor_count)
+                    .sum::<u32>()
+        {
+            log::error!(
+                "graphics descriptor metadata diverges from DescriptorLayoutBuilder output"
+            );
+            return None;
+        }
         let bank_info = descriptor_bank_info(&descriptor_bindings);
-        let layout_bindings: Vec<_> = descriptor_bindings
-            .iter()
-            .map(|binding| {
-                vk::DescriptorSetLayoutBinding::builder()
-                    .binding(binding.binding)
-                    .descriptor_type(binding.descriptor_type)
-                    .descriptor_count(binding.descriptor_count)
-                    .stage_flags(binding.stage_flags)
-                    .build()
-            })
-            .collect();
-        let layout_info = vk::DescriptorSetLayoutCreateInfo::builder()
-            .bindings(&layout_bindings)
-            .build();
-        let desc_layout = unsafe {
-            self.device
-                .create_descriptor_set_layout(&layout_info, None)
-                .ok()?
+        let uses_push_descriptor = layout_builder
+            .can_use_push_descriptor(self.max_push_descriptors, self.push_descriptor_supported);
+        let desc_layout = layout_builder
+            .create_descriptor_set_layout(&self.device, uses_push_descriptor)
+            .ok()?;
+        let pipeline_layout = match layout_builder.create_pipeline_layout(&self.device, desc_layout)
+        {
+            Ok(layout) => layout,
+            Err(_) => {
+                unsafe {
+                    if desc_layout != vk::DescriptorSetLayout::null() {
+                        self.device.destroy_descriptor_set_layout(desc_layout, None);
+                    }
+                }
+                return None;
+            }
         };
-
-        let push_constant_range = vk::PushConstantRange {
-            stage_flags: vk::ShaderStageFlags::ALL_GRAPHICS,
-            offset: RESCALING_LAYOUT_WORDS_OFFSET,
-            size: RESCALING_LAYOUT_SIZE + RENDERAREA_LAYOUT_SIZE,
-        };
-        let layouts = [desc_layout];
-        let pipeline_layout_info = vk::PipelineLayoutCreateInfo::builder()
-            .set_layouts(&layouts)
-            .push_constant_ranges(std::slice::from_ref(&push_constant_range))
-            .build();
-        let pipeline_layout = unsafe {
-            self.device
-                .create_pipeline_layout(&pipeline_layout_info, None)
-                .ok()?
+        let descriptor_update_template = match layout_builder.create_template(
+            &self.device,
+            desc_layout,
+            pipeline_layout,
+            uses_push_descriptor,
+        ) {
+            Ok(template) => template,
+            Err(_) => {
+                unsafe {
+                    self.device.destroy_pipeline_layout(pipeline_layout, None);
+                    if desc_layout != vk::DescriptorSetLayout::null() {
+                        self.device.destroy_descriptor_set_layout(desc_layout, None);
+                    }
+                }
+                return None;
+            }
         };
 
         Some(GraphicsDescriptorLayout {
             pipeline_layout,
             descriptor_set_layout: desc_layout,
+            descriptor_update_template,
+            uses_push_descriptor,
             bindings: descriptor_bindings,
             bank_info,
         })
@@ -1678,6 +1715,22 @@ fn add_shader_descriptor_bindings(
     }
 }
 
+fn descriptor_layouts_match(
+    layout_bindings: &[vk::DescriptorSetLayoutBinding],
+    descriptor_bindings: &[GraphicsDescriptorBinding],
+) -> bool {
+    layout_bindings.len() == descriptor_bindings.len()
+        && layout_bindings
+            .iter()
+            .zip(descriptor_bindings)
+            .all(|(layout, metadata)| {
+                layout.binding == metadata.binding
+                    && layout.descriptor_type == metadata.descriptor_type
+                    && layout.descriptor_count == metadata.descriptor_count
+                    && layout.stage_flags == metadata.stage_flags
+            })
+}
+
 fn merge_descriptor_binding(
     bindings: &mut BTreeMap<u32, DescriptorBindingRecord>,
     binding: u32,
@@ -1737,6 +1790,8 @@ fn merge_descriptor_binding(
 struct GraphicsDescriptorLayout {
     pipeline_layout: vk::PipelineLayout,
     descriptor_set_layout: vk::DescriptorSetLayout,
+    descriptor_update_template: vk::DescriptorUpdateTemplate,
+    uses_push_descriptor: bool,
     bindings: Vec<GraphicsDescriptorBinding>,
     bank_info: DescriptorBankInfo,
 }
@@ -2151,6 +2206,8 @@ mod tests {
             pipeline: Arc::new(Mutex::new(vk::Pipeline::null())),
             pipeline_layout: vk::PipelineLayout::null(),
             descriptor_set_layout: vk::DescriptorSetLayout::null(),
+            descriptor_update_template: vk::DescriptorUpdateTemplate::null(),
+            uses_push_descriptor: false,
             descriptor_bindings: Arc::new(Vec::new()),
             descriptor_bank_info: DescriptorBankInfo::default(),
             descriptor_allocator: None,
@@ -2270,6 +2327,44 @@ mod tests {
                 vk::DescriptorType::STORAGE_IMAGE,
             ]
         );
+
+        let descriptor_bindings = bindings
+            .into_iter()
+            .map(
+                |(
+                    binding,
+                    (
+                        descriptor_type,
+                        descriptor_count,
+                        stage_flags,
+                        uniform_stage,
+                        uniform_index,
+                        texture,
+                    ),
+                )| GraphicsDescriptorBinding {
+                    binding,
+                    descriptor_type,
+                    descriptor_count,
+                    stage_flags,
+                    uniform_stage,
+                    uniform_index,
+                    texture,
+                },
+            )
+            .collect::<Vec<_>>();
+        let mut layout_builder = DescriptorLayoutBuilder::new();
+        layout_builder.add(&shader.info, vk::ShaderStageFlags::FRAGMENT);
+        assert!(descriptor_layouts_match(
+            layout_builder.bindings(),
+            &descriptor_bindings
+        ));
+
+        let mut mismatched = descriptor_bindings;
+        mismatched[0].descriptor_count += 1;
+        assert!(!descriptor_layouts_match(
+            layout_builder.bindings(),
+            &mismatched
+        ));
     }
 
     #[test]

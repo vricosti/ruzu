@@ -27,7 +27,7 @@ use std::sync::{Arc, OnceLock};
 
 use ash::vk;
 use ash::vk::Handle;
-use log::{debug, info, trace, warn};
+use log::{debug, info, warn};
 use thiserror::Error;
 
 use crate::buffer_cache::buffer_cache_base::{
@@ -47,18 +47,18 @@ use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
 use crate::host1x::syncpoint_manager::SyncpointManager;
 use crate::rasterizer_interface::{RasterizerDownloadArea, RasterizerInterface};
 use crate::texture_cache::texture_cache_base::{DescriptorSyncRegs, ImageViewInOut};
-use crate::texture_cache::types::{NULL_IMAGE_ID, NULL_IMAGE_VIEW_ID};
+use crate::texture_cache::types::{SamplerId, NULL_IMAGE_ID, NULL_IMAGE_VIEW_ID};
 use crate::textures::texture::texture_pair;
 use crate::vulkan_common::vulkan_memory_allocator::MemoryAllocator;
 use shader_recompiler::host_translate_info::HostTranslateInfo;
-use shader_recompiler::shader_info::Info as ShaderInfo;
+use shader_recompiler::shader_info::{num_descriptors, Info as ShaderInfo};
 use shader_recompiler::{PipelineCache as ShaderPipelineCache, Profile};
 
 use super::{blit_image, blit_screen, maxwell_to_vk};
 
 use super::pipeline_helper::{
-    RescalingPushConstant, RENDERAREA_LAYOUT_OFFSET, RESCALING_LAYOUT_DOWN_FACTOR_OFFSET,
-    RESCALING_LAYOUT_WORDS_OFFSET,
+    RescalingPushConstant, NUM_TEXTURE_AND_IMAGE_SCALING_WORDS, RENDERAREA_LAYOUT_OFFSET,
+    RESCALING_LAYOUT_DOWN_FACTOR_OFFSET, RESCALING_LAYOUT_WORDS_OFFSET,
 };
 
 // Rust counterpart of upstream `std::scoped_lock{buffer_cache.mutex,
@@ -114,6 +114,35 @@ struct DrawParams {
     num_vertices: u32,
     first_index: u32,
     is_indexed: bool,
+}
+
+struct PreparedGraphicsDescriptors {
+    views: [ImageViewInOut; super::graphics_pipeline::MAX_IMAGE_ELEMENTS],
+    samplers: [SamplerId; super::graphics_pipeline::MAX_IMAGE_ELEMENTS],
+    view_count: usize,
+    descriptor_data: Option<DescriptorData>,
+    rescaling_data: [u32; NUM_TEXTURE_AND_IMAGE_SCALING_WORDS],
+}
+
+#[derive(Clone, Copy)]
+struct DescriptorData(*const DescriptorUpdateEntry);
+
+// The queue owns one fixed allocation for its whole lifetime. Its eight-frame
+// ring and `Acquire` worker wait prevent a payload slice from being recycled
+// while a recorded Vulkan command still consumes it, matching upstream's raw
+// `const DescriptorUpdateEntry*` capture in `ConfigureDraw`.
+unsafe impl Send for DescriptorData {}
+
+impl Default for PreparedGraphicsDescriptors {
+    fn default() -> Self {
+        Self {
+            views: [ImageViewInOut::default(); super::graphics_pipeline::MAX_IMAGE_ELEMENTS],
+            samplers: [SamplerId::default(); super::graphics_pipeline::MAX_IMAGE_ELEMENTS],
+            view_count: 0,
+            descriptor_data: None,
+            rescaling_data: [0; NUM_TEXTURE_AND_IMAGE_SCALING_WORDS],
+        }
+    }
 }
 
 fn vulkan_draw_trace_enabled() -> bool {
@@ -420,7 +449,6 @@ use super::buffer_cache::{
     BufferCache as DirectBufferCache, BufferCacheRuntime, VulkanCommonBufferCache,
 };
 use super::descriptor_pool::DescriptorPool;
-use super::fixed_pipeline_state::FixedPipelineState;
 use super::graphics_pipeline::GraphicsDescriptorBinding;
 use super::pipeline_cache::PipelineCache as VulkanPipelineCache;
 use super::query_cache::QueryCache as VulkanQueryCache;
@@ -607,6 +635,7 @@ pub struct RasterizerVulkan {
     extended_dynamic_state3: Option<ash::extensions::ext::ExtendedDynamicState3>,
     vertex_input_dynamic_state: Option<vk::ExtVertexInputDynamicStateFn>,
     draw_indirect_count: Option<ash::extensions::khr::DrawIndirectCount>,
+    push_descriptor: Option<ash::extensions::khr::PushDescriptor>,
     max_viewports: u32,
 
     // Channel-bound GPU memory manager, matching upstream rasterizer access to
@@ -719,6 +748,8 @@ impl RasterizerVulkan {
         vertex_attribute_divisor_supported: bool,
         provoking_vertex_supported: bool,
         draw_indirect_count_supported: bool,
+        push_descriptor_supported: bool,
+        max_push_descriptors: u32,
         syncpoints: Arc<SyncpointManager>,
         device_memory: Arc<MaxwellDeviceMemoryManager>,
         memory_allocator: &mut MemoryAllocator,
@@ -840,6 +871,8 @@ impl RasterizerVulkan {
             max_vertex_input_bindings,
             vertex_attribute_divisor_supported,
             provoking_vertex_supported,
+            push_descriptor_supported,
+            max_push_descriptors,
         );
 
         // Create buffer cache
@@ -936,6 +969,8 @@ impl RasterizerVulkan {
         )?;
         let draw_indirect_count = draw_indirect_count_supported
             .then(|| ash::extensions::khr::DrawIndirectCount::new(&instance, &device));
+        let push_descriptor = push_descriptor_supported
+            .then(|| ash::extensions::khr::PushDescriptor::new(&instance, &device));
         let extended_dynamic_state2 = extended_dynamic_state2_extra_supported
             .then(|| ash::extensions::ext::ExtendedDynamicState2::new(&instance, &device));
         let extended_dynamic_state3 = (extended_dynamic_state3_blending_supported
@@ -1009,6 +1044,7 @@ impl RasterizerVulkan {
             extended_dynamic_state3,
             vertex_input_dynamic_state,
             draw_indirect_count,
+            push_descriptor,
             max_viewports: max_viewports.min(NUM_VIEWPORTS as u32).max(1),
             channel_memory_manager: None,
             gpu_tick_callback: None,
@@ -1067,30 +1103,37 @@ impl RasterizerVulkan {
             pipeline_waiter,
             pipeline_layout,
             descriptor_set_layout,
+            descriptor_update_template,
+            uses_push_descriptor,
             descriptor_set,
             descriptor_bindings,
             stage_infos,
             enabled_uniform_buffer_masks,
             uniform_buffer_sizes,
             uses_render_area,
-            uses_rescaling_uniform,
-            fixed_state,
+            _uses_rescaling_uniform,
             unique_hashes,
         ) = match pipeline_result {
-            Some((gp, fixed_state)) => {
-                let descriptor_set = match gp.commit_descriptor_set(known_gpu_tick, pending_tick) {
-                    Ok(set) => set,
-                    Err(error) => {
-                        warn!(
-                            "RasterizerVulkan: failed to commit graphics descriptor set: {error:?}"
-                        );
-                        return;
+            Some((gp, _fixed_state)) => {
+                let descriptor_set = if gp.uses_push_descriptor {
+                    None
+                } else {
+                    match gp.commit_descriptor_set(known_gpu_tick, pending_tick) {
+                        Ok(set) => set,
+                        Err(error) => {
+                            warn!(
+                                "RasterizerVulkan: failed to commit graphics descriptor set: {error:?}"
+                            );
+                            return;
+                        }
                     }
                 };
                 (
                     gp.build_waiter(),
                     gp.pipeline_layout,
                     gp.descriptor_set_layout,
+                    gp.descriptor_update_template,
+                    gp.uses_push_descriptor,
                     descriptor_set,
                     Arc::clone(&gp.descriptor_bindings),
                     Arc::clone(&gp.stage_infos),
@@ -1098,7 +1141,6 @@ impl RasterizerVulkan {
                     gp.uniform_buffer_sizes,
                     gp.uses_render_area,
                     gp.uses_rescaling_uniform,
-                    fixed_state,
                     gp.key().unique_hashes,
                 )
             }
@@ -1157,27 +1199,28 @@ impl RasterizerVulkan {
         );
         // Upstream `GraphicsPipeline::ConfigureImpl` updates all buffer
         // bindings once, then binds geometry before the per-stage buffers.
-        let (descriptor_set, graphics_views) = self.bind_graphics_descriptors(
-            pipeline_layout,
+        let prepared_descriptors = self.bind_graphics_descriptors(
             descriptor_set_layout,
-            descriptor_set,
             descriptor_bindings.as_slice(),
             stage_infos.as_ref(),
             &enabled_uniform_buffer_masks,
             &uniform_buffer_sizes,
             draw,
             draw.indexed,
-            unique_hashes,
-            &fixed_state,
             read_gpu,
             read_gpu_unsafe,
-            trace_draw,
         );
-        if required_descriptor_set_missing(
-            descriptor_set_layout,
-            descriptor_bindings.len(),
-            descriptor_set,
-        ) {
+        let Some(prepared_descriptors) = prepared_descriptors else {
+            warn!("RasterizerVulkan: draw skipped because descriptor preparation failed");
+            return;
+        };
+        if !uses_push_descriptor
+            && required_descriptor_set_missing(
+                descriptor_set_layout,
+                descriptor_bindings.len(),
+                descriptor_set,
+            )
+        {
             warn!("RasterizerVulkan: draw skipped because required descriptors are incomplete");
             return;
         }
@@ -1201,7 +1244,11 @@ impl RasterizerVulkan {
                 false,
                 None,
             );
-        if self.texture_cache.base.check_feedback_loop(&graphics_views) {
+        if self
+            .texture_cache
+            .base
+            .check_feedback_loop(&prepared_descriptors.views)
+        {
             self.texture_cache.barrier_feedback_loop();
         }
         let target_has_depth = target_fb.as_ref().is_some_and(|target| target.has_depth);
@@ -1330,10 +1377,14 @@ impl RasterizerVulkan {
         self.push_graphics_push_constants(
             pipeline,
             pipeline_layout,
+            descriptor_set_layout,
+            descriptor_update_template,
+            uses_push_descriptor,
             descriptor_set,
+            prepared_descriptors.descriptor_data,
+            prepared_descriptors.rescaling_data,
             draw,
             uses_render_area,
-            uses_rescaling_uniform,
         );
 
         // 6. Update dynamic states via dirty flags. Upstream requests the
@@ -1457,21 +1508,31 @@ impl RasterizerVulkan {
         &mut self,
         pipeline: vk::Pipeline,
         pipeline_layout: vk::PipelineLayout,
+        descriptor_set_layout: vk::DescriptorSetLayout,
+        descriptor_update_template: vk::DescriptorUpdateTemplate,
+        uses_push_descriptor: bool,
         descriptor_set: Option<vk::DescriptorSet>,
+        descriptor_data: Option<DescriptorData>,
+        rescaling_data: [u32; NUM_TEXTURE_AND_IMAGE_SCALING_WORDS],
         draw: &DrawCall,
         uses_render_area: bool,
-        uses_rescaling_uniform: bool,
     ) {
-        let rescaling = RescalingPushConstant::new();
-        let rescaling_data = *rescaling.data();
         let render_area = [
             draw.surface_clip.width as f32,
             draw.surface_clip.height as f32,
             0.0,
             0.0,
         ];
+        let is_rescaling = self.texture_cache.base.is_rescaling;
+        let update_rescaling = self.scheduler.update_rescaling(is_rescaling);
+        let scale_down_factor = if is_rescaling {
+            common::settings::values().resolution_info.down_factor
+        } else {
+            1.0
+        };
         let bind_pipeline = self.scheduler.update_graphics_pipeline(pipeline);
         let device = self.device.clone();
+        let push_descriptor = self.push_descriptor.clone();
         self.scheduler.record(move |cmdbuf| unsafe {
             if bind_pipeline {
                 device.cmd_bind_pipeline(cmdbuf, vk::PipelineBindPoint::GRAPHICS, pipeline);
@@ -1484,8 +1545,7 @@ impl RasterizerVulkan {
                 bytes_of(&rescaling_data),
             );
 
-            if uses_rescaling_uniform {
-                let scale_down_factor = 1.0f32;
+            if update_rescaling {
                 device.cmd_push_constants(
                     cmdbuf,
                     pipeline_layout,
@@ -1504,7 +1564,30 @@ impl RasterizerVulkan {
                     bytes_of(&render_area),
                 );
             }
-            if let Some(descriptor_set) = descriptor_set {
+            if descriptor_set_layout == vk::DescriptorSetLayout::null() {
+                return;
+            }
+            let descriptor_data = descriptor_data
+                .expect("graphics descriptor layout requires descriptor update payload")
+                .0
+                .cast::<std::ffi::c_void>();
+            if uses_push_descriptor {
+                push_descriptor
+                    .as_ref()
+                    .expect("push-descriptor pipeline requires VK_KHR_push_descriptor")
+                    .cmd_push_descriptor_set_with_template(
+                        cmdbuf,
+                        descriptor_update_template,
+                        pipeline_layout,
+                        0,
+                        descriptor_data,
+                    );
+            } else if let Some(descriptor_set) = descriptor_set {
+                device.update_descriptor_set_with_template(
+                    descriptor_set,
+                    descriptor_update_template,
+                    descriptor_data,
+                );
                 device.cmd_bind_descriptor_sets(
                     cmdbuf,
                     vk::PipelineBindPoint::GRAPHICS,
@@ -2415,11 +2498,32 @@ impl RasterizerVulkan {
         });
     }
 
+    fn bind_graphics_texture_buffer_view(
+        &mut self,
+        stage: usize,
+        index: usize,
+        view: ImageViewInOut,
+        is_written: bool,
+        is_image: bool,
+    ) {
+        let (gpu_addr, size, format) = if view.id.is_valid() && view.id != NULL_IMAGE_VIEW_ID {
+            let base = &self.texture_cache.base.slot_image_views[view.id];
+            (
+                base.gpu_addr,
+                crate::surface::bytes_per_block(base.format).saturating_mul(base.size.width),
+                base.format as u32,
+            )
+        } else {
+            (0, 0, crate::surface::PixelFormat::Invalid as u32)
+        };
+        self.common_buffer_cache.bind_graphics_texture_buffer(
+            stage, index, gpu_addr, size, format, is_written, is_image,
+        );
+    }
+
     fn bind_graphics_descriptors(
         &mut self,
-        _pipeline_layout: vk::PipelineLayout,
         descriptor_set_layout: vk::DescriptorSetLayout,
-        descriptor_set: Option<vk::DescriptorSet>,
         descriptor_bindings: &[GraphicsDescriptorBinding],
         stage_infos: &[Option<ShaderInfo>; 5],
         enabled_uniform_buffer_masks: &[u32; crate::buffer_cache::buffer_cache_base::NUM_STAGES
@@ -2427,51 +2531,35 @@ impl RasterizerVulkan {
         uniform_buffer_sizes: &crate::buffer_cache::buffer_cache_base::UniformBufferSizes,
         draw: &DrawCall,
         is_indexed: bool,
-        unique_hashes: [u64; crate::shader_cache::NUM_PROGRAMS],
-        _fixed_state: &FixedPipelineState,
         read_gpu: &dyn Fn(u64, &mut [u8]),
         read_gpu_unsafe: &dyn Fn(u64, &mut [u8]) -> bool,
-        trace_draw: bool,
-    ) -> (Option<vk::DescriptorSet>, Vec<ImageViewInOut>) {
+    ) -> Option<PreparedGraphicsDescriptors> {
+        let mut prepared = PreparedGraphicsDescriptors::default();
+        self.common_buffer_cache
+            .set_uniform_buffers_state(enabled_uniform_buffer_masks, uniform_buffer_sizes);
+
         if descriptor_set_layout == vk::DescriptorSetLayout::null()
             || descriptor_bindings.is_empty()
         {
             self.common_buffer_cache.update_graphics_buffers(is_indexed);
             self.common_buffer_cache
                 .bind_host_geometry_buffers(is_indexed);
-            return (None, Vec::new());
+            return Some(prepared);
         }
 
-        let texture_cache: *mut TextureCache = &mut self.texture_cache;
-        unsafe {
-            let _texture_lock = (*texture_cache).base.mutex.lock();
-            (*texture_cache)
-                .base
-                .synchronize_graphics_descriptors(DescriptorSyncRegs {
-                    sampler_binding_via_header: matches!(
-                        draw.sampler_binding,
-                        crate::engines::maxwell_3d::SamplerBinding::ViaHeaderBinding
-                    ),
-                    tex_header_addr: draw.tex_header_pool_addr,
-                    tex_header_limit: draw.tex_header_pool_limit,
-                    tex_sampler_addr: draw.tex_sampler_pool_addr,
-                    tex_sampler_limit: draw.tex_sampler_pool_limit,
-                });
-        }
+        self.texture_cache
+            .base
+            .synchronize_graphics_descriptors(DescriptorSyncRegs {
+                sampler_binding_via_header: matches!(
+                    draw.sampler_binding,
+                    crate::engines::maxwell_3d::SamplerBinding::ViaHeaderBinding
+                ),
+                tex_header_addr: draw.tex_header_pool_addr,
+                tex_header_limit: draw.tex_header_pool_limit,
+                tex_sampler_addr: draw.tex_sampler_pool_addr,
+                tex_sampler_limit: draw.tex_sampler_pool_limit,
+            });
 
-        self.desc_queue.acquire();
-        let Some(descriptor_set) = descriptor_set else {
-            warn!("RasterizerVulkan: graphics pipeline has descriptors but no allocator");
-            return (None, Vec::new());
-        };
-
-        let descriptor_count = descriptor_bindings
-            .iter()
-            .map(|binding| binding.descriptor_count as usize)
-            .sum();
-        let mut buffer_infos = Vec::with_capacity(descriptor_count);
-        let mut image_infos = Vec::with_capacity(descriptor_count);
-        let mut writes = Vec::with_capacity(descriptor_bindings.len());
         let via_header_index = matches!(
             draw.sampler_binding,
             crate::engines::maxwell_3d::SamplerBinding::ViaHeaderBinding
@@ -2491,81 +2579,103 @@ impl RasterizerVulkan {
                                  secondary_cbuf_index: u32,
                                  secondary_cbuf_offset: u32,
                                  secondary_shift_left: u32|
-         -> Option<u32> {
-            let index_offset = element.checked_shl(size_shift.min(31))?;
-            let cbuf = draw
-                .cb_bindings
-                .get(stage)
-                .and_then(|stage| stage.get(cbuf_index as usize))?;
-            if !cbuf.enabled || cbuf.address == 0 {
+         -> Option<(u32, u32)> {
+            let index_offset = element.checked_shl(size_shift)?;
+            let cbuf = draw.cb_bindings[stage].get(cbuf_index as usize)?;
+            if !cbuf.enabled {
+                log::error!(
+                    "shader descriptor references disabled CBUF {} in stage {}",
+                    cbuf_index,
+                    stage
+                );
                 return None;
             }
-            let offset = cbuf_offset.checked_add(index_offset)?;
-            if cbuf.size as u32 <= offset {
-                return None;
-            }
-            let addr = cbuf.address.wrapping_add(offset as u64);
+            let addr = cbuf
+                .address
+                .wrapping_add(cbuf_offset.checked_add(index_offset)? as u64);
             if !has_secondary {
-                return Some(read_u32(addr));
+                return Some(texture_pair(read_u32(addr), via_header_index));
             }
-            let secondary_cbuf = draw
-                .cb_bindings
-                .get(stage)
-                .and_then(|stage| stage.get(secondary_cbuf_index as usize))?;
-            if !secondary_cbuf.enabled || secondary_cbuf.address == 0 {
+            let secondary = draw.cb_bindings[stage].get(secondary_cbuf_index as usize)?;
+            if !secondary.enabled {
+                log::error!(
+                    "shader descriptor references disabled secondary CBUF {} in stage {}",
+                    secondary_cbuf_index,
+                    stage
+                );
                 return None;
             }
-            let secondary_offset = secondary_cbuf_offset.checked_add(index_offset)?;
-            if secondary_cbuf.size as u32 <= secondary_offset {
-                return None;
-            }
-            let secondary_addr = secondary_cbuf.address.wrapping_add(secondary_offset as u64);
-            Some(
+            let secondary_addr = secondary
+                .address
+                .wrapping_add(secondary_cbuf_offset.checked_add(index_offset)? as u64);
+            Some(texture_pair(
                 (read_u32(addr) << shift_left) | (read_u32(secondary_addr) << secondary_shift_left),
-            )
+                via_header_index,
+            ))
         };
-        #[derive(Clone, Copy)]
-        enum GraphicsViewUse {
-            TextureBuffer {
-                stage: usize,
-                index: usize,
-                is_written: bool,
-                is_image: bool,
-            },
-            Sampled,
-            Storage {
-                texture_type: shader_recompiler::shader_info::TextureType,
-                format: shader_recompiler::shader_info::ImageFormat,
-                is_written: bool,
-            },
+
+        let required_views = stage_infos
+            .iter()
+            .flatten()
+            .map(|info| {
+                num_descriptors(&info.texture_buffer_descriptors)
+                    + num_descriptors(&info.image_buffer_descriptors)
+                    + num_descriptors(&info.texture_descriptors)
+                    + num_descriptors(&info.image_descriptors)
+            })
+            .sum::<u32>() as usize;
+        let required_samplers = stage_infos
+            .iter()
+            .flatten()
+            .map(|info| num_descriptors(&info.texture_descriptors))
+            .sum::<u32>() as usize;
+        if required_views > super::graphics_pipeline::MAX_IMAGE_ELEMENTS
+            || required_samplers > super::graphics_pipeline::MAX_IMAGE_ELEMENTS
+        {
+            log::error!(
+                "graphics pipeline descriptor arrays exceed MAX_IMAGE_ELEMENTS: views={} samplers={} max={}",
+                required_views,
+                required_samplers,
+                super::graphics_pipeline::MAX_IMAGE_ELEMENTS
+            );
+            return None;
         }
 
-        let mut graphics_views = Vec::new();
-        let mut graphics_view_uses = Vec::new();
-        let mut sampled_samplers = Vec::new();
-        let has_uniform_buffer_descriptors = descriptor_bindings
-            .iter()
-            .any(|binding| binding.descriptor_type == vk::DescriptorType::UNIFORM_BUFFER);
-        let has_storage_buffer_descriptors = descriptor_bindings
-            .iter()
-            .any(|binding| binding.descriptor_type == vk::DescriptorType::STORAGE_BUFFER);
-        let has_texel_buffer_descriptors = descriptor_bindings.iter().any(|binding| {
-            matches!(
-                binding.descriptor_type,
-                vk::DescriptorType::UNIFORM_TEXEL_BUFFER | vk::DescriptorType::STORAGE_TEXEL_BUFFER
-            )
-        });
-        let has_storage_image_descriptors = descriptor_bindings
-            .iter()
-            .any(|binding| binding.descriptor_type == vk::DescriptorType::STORAGE_IMAGE);
+        let mut sampler_count = 0usize;
+        let mut view_count = 0usize;
         for (stage, info) in stage_infos.iter().enumerate() {
             let Some(info) = info else {
                 continue;
             };
-            let mut texture_buffer_index = 0usize;
+            self.common_buffer_cache
+                .unbind_graphics_storage_buffers(stage);
+            for (ssbo_index, desc) in info.storage_buffers_descriptors.iter().enumerate() {
+                if desc.count != 1 {
+                    log::error!(
+                        "storage buffer descriptor count is {}, expected 1",
+                        desc.count
+                    );
+                }
+                self.common_buffer_cache.bind_graphics_storage_buffer(
+                    stage,
+                    ssbo_index,
+                    desc.cbuf_index,
+                    desc.cbuf_offset,
+                    desc.is_written,
+                );
+            }
+
+            let mut add_view = |tic_id: u32, blacklist: bool| {
+                prepared.views[view_count] = ImageViewInOut {
+                    index: tic_id,
+                    blacklist,
+                    id: NULL_IMAGE_VIEW_ID,
+                };
+                view_count += 1;
+            };
             for desc in &info.texture_buffer_descriptors {
                 for element in 0..desc.count {
-                    let raw = read_stage_handle(
+                    let (tic_id, _) = read_stage_handle(
                         stage,
                         desc.cbuf_index,
                         desc.cbuf_offset,
@@ -2577,25 +2687,13 @@ impl RasterizerVulkan {
                         desc.secondary_cbuf_offset,
                         desc.secondary_shift_left,
                     )
-                    .unwrap_or(0);
-                    let (tic_id, _) = texture_pair(raw, via_header_index);
-                    graphics_views.push(ImageViewInOut {
-                        index: tic_id,
-                        blacklist: false,
-                        id: NULL_IMAGE_VIEW_ID,
-                    });
-                    graphics_view_uses.push(GraphicsViewUse::TextureBuffer {
-                        stage,
-                        index: texture_buffer_index,
-                        is_written: false,
-                        is_image: false,
-                    });
-                    texture_buffer_index += 1;
+                    .unwrap_or_default();
+                    add_view(tic_id, false);
                 }
             }
             for desc in &info.image_buffer_descriptors {
                 for element in 0..desc.count {
-                    let raw = read_stage_handle(
+                    let (tic_id, _) = read_stage_handle(
                         stage,
                         desc.cbuf_index,
                         desc.cbuf_offset,
@@ -2607,25 +2705,13 @@ impl RasterizerVulkan {
                         0,
                         0,
                     )
-                    .unwrap_or(0);
-                    let (tic_id, _) = texture_pair(raw, via_header_index);
-                    graphics_views.push(ImageViewInOut {
-                        index: tic_id,
-                        blacklist: false,
-                        id: NULL_IMAGE_VIEW_ID,
-                    });
-                    graphics_view_uses.push(GraphicsViewUse::TextureBuffer {
-                        stage,
-                        index: texture_buffer_index,
-                        is_written: desc.is_written,
-                        is_image: true,
-                    });
-                    texture_buffer_index += 1;
+                    .unwrap_or_default();
+                    add_view(tic_id, false);
                 }
             }
             for desc in &info.texture_descriptors {
                 for element in 0..desc.count {
-                    let raw = read_stage_handle(
+                    let (tic_id, tsc_id) = read_stage_handle(
                         stage,
                         desc.cbuf_index,
                         desc.cbuf_offset,
@@ -2637,24 +2723,16 @@ impl RasterizerVulkan {
                         desc.secondary_cbuf_offset,
                         desc.secondary_shift_left,
                     )
-                    .unwrap_or(0);
-                    let (tic_id, tsc_id) = texture_pair(raw, via_header_index);
-                    let sampler_id = unsafe {
-                        let _texture_lock = (*texture_cache).base.mutex.lock();
-                        (*texture_cache).base.get_graphics_sampler_id(tsc_id)
-                    };
-                    graphics_views.push(ImageViewInOut {
-                        index: tic_id,
-                        blacklist: false,
-                        id: NULL_IMAGE_VIEW_ID,
-                    });
-                    graphics_view_uses.push(GraphicsViewUse::Sampled);
-                    sampled_samplers.push(sampler_id);
+                    .unwrap_or_default();
+                    add_view(tic_id, false);
+                    prepared.samplers[sampler_count] =
+                        self.texture_cache.base.get_graphics_sampler_id(tsc_id);
+                    sampler_count += 1;
                 }
             }
             for desc in &info.image_descriptors {
                 for element in 0..desc.count {
-                    let raw = read_stage_handle(
+                    let (tic_id, _) = read_stage_handle(
                         stage,
                         desc.cbuf_index,
                         desc.cbuf_offset,
@@ -2666,438 +2744,175 @@ impl RasterizerVulkan {
                         0,
                         0,
                     )
-                    .unwrap_or(0);
-                    let (tic_id, _) = texture_pair(raw, via_header_index);
-                    graphics_views.push(ImageViewInOut {
-                        index: tic_id,
-                        blacklist: desc.is_written,
-                        id: NULL_IMAGE_VIEW_ID,
-                    });
-                    graphics_view_uses.push(GraphicsViewUse::Storage {
-                        texture_type: desc.texture_type,
-                        format: desc.format,
-                        is_written: desc.is_written,
-                    });
+                    .unwrap_or_default();
+                    add_view(tic_id, desc.is_written);
                 }
             }
         }
-        unsafe {
-            let _texture_lock = (*texture_cache).base.mutex.lock();
-            (*texture_cache)
-                .fill_graphics_image_views(&mut graphics_views, has_storage_image_descriptors);
-        }
-        let sampled_views = graphics_views
+        prepared.view_count = view_count;
+        let has_images = stage_infos
             .iter()
-            .zip(&graphics_view_uses)
-            .filter_map(|(view, usage)| matches!(usage, GraphicsViewUse::Sampled).then_some(*view))
-            .collect::<Vec<_>>();
-        for stage in 0..stage_infos.len() {
-            self.common_buffer_cache
-                .unbind_graphics_texture_buffers(stage);
-        }
-        for (view, usage) in graphics_views.iter().zip(&graphics_view_uses) {
-            let GraphicsViewUse::TextureBuffer {
-                stage,
-                index,
-                is_written,
-                is_image,
-            } = *usage
-            else {
+            .flatten()
+            .any(|info| !info.image_descriptors.is_empty());
+        self.texture_cache
+            .fill_graphics_image_views(&mut prepared.views[..view_count], has_images);
+
+        let mut view_cursor = 0usize;
+        for (stage, info) in stage_infos.iter().enumerate() {
+            let Some(info) = info else {
                 continue;
             };
-            let (gpu_addr, size, format) = if view.id.is_valid() && view.id != NULL_IMAGE_VIEW_ID {
-                let base = unsafe {
-                    let _texture_lock = (*texture_cache).base.mutex.lock();
-                    (&(*texture_cache).base.slot_image_views)[view.id].clone()
-                };
-                (
-                    base.gpu_addr,
-                    crate::surface::bytes_per_block(base.format).saturating_mul(base.size.width),
-                    base.format as u32,
-                )
-            } else {
-                (0, 0, crate::surface::PixelFormat::Invalid as u32)
-            };
-            self.common_buffer_cache.bind_graphics_texture_buffer(
-                stage, index, gpu_addr, size, format, is_written, is_image,
-            );
-        }
-        let mut common_uniform_buffer_infos = Vec::new();
-        let mut common_storage_buffer_infos = Vec::new();
-        let mut common_texel_buffer_views = Vec::new();
-        if has_uniform_buffer_descriptors
-            || has_storage_buffer_descriptors
-            || has_texel_buffer_descriptors
-        {
             self.common_buffer_cache
-                .set_uniform_buffers_state(enabled_uniform_buffer_masks, uniform_buffer_sizes);
-            for stage in 0..enabled_uniform_buffer_masks.len() {
-                if stage < draw.cb_bindings.len() {
-                    let mut bits = enabled_uniform_buffer_masks[stage];
-                    let mut index = 0u32;
-                    while bits != 0 {
-                        let skip = bits.trailing_zeros();
-                        index += skip;
-                        bits >>= skip;
-
-                        let binding = draw.cb_bindings[stage][index as usize];
-                        if binding.enabled && binding.address != 0 && binding.size != 0 {
-                            self.common_buffer_cache.bind_graphics_uniform_buffer(
-                                stage,
-                                index,
-                                binding.address,
-                                binding.size,
-                            );
-                        } else {
-                            self.common_buffer_cache
-                                .disable_graphics_uniform_buffer(stage, index);
-                        }
-
-                        index += 1;
-                        bits >>= 1;
-                    }
+                .unbind_graphics_texture_buffers(stage);
+            let mut binding_index = 0usize;
+            for desc in &info.texture_buffer_descriptors {
+                for _ in 0..desc.count {
+                    self.bind_graphics_texture_buffer_view(
+                        stage,
+                        binding_index,
+                        prepared.views[view_cursor],
+                        false,
+                        false,
+                    );
+                    binding_index += 1;
+                    view_cursor += 1;
                 }
-
-                // Upstream `GraphicsPipeline::ConfigureImpl::config_stage`
-                // resets and repopulates the compact SSBO bindings for every
-                // active stage before `UpdateGraphicsBuffers`.
-                self.common_buffer_cache
-                    .unbind_graphics_storage_buffers(stage);
-                if let Some(info) = stage_infos.get(stage).and_then(Option::as_ref) {
-                    for (ssbo_index, desc) in info.storage_buffers_descriptors.iter().enumerate() {
-                        assert_eq!(
-                            desc.count, 1,
-                            "graphics storage descriptor count must match upstream ASSERT"
-                        );
-                        self.common_buffer_cache.bind_graphics_storage_buffer(
-                            stage,
-                            ssbo_index,
-                            desc.cbuf_index,
-                            desc.cbuf_offset,
-                            desc.is_written,
-                        );
-                    }
+            }
+            for desc in &info.image_buffer_descriptors {
+                for _ in 0..desc.count {
+                    self.bind_graphics_texture_buffer_view(
+                        stage,
+                        binding_index,
+                        prepared.views[view_cursor],
+                        desc.is_written,
+                        true,
+                    );
+                    binding_index += 1;
+                    view_cursor += 1;
                 }
+            }
+            view_cursor += num_descriptors(&info.texture_descriptors) as usize;
+            view_cursor += num_descriptors(&info.image_descriptors) as usize;
+        }
+
+        for stage in 0..enabled_uniform_buffer_masks.len() {
+            let mut bits = enabled_uniform_buffer_masks[stage];
+            let mut index = 0u32;
+            while bits != 0 {
+                let skip = bits.trailing_zeros();
+                index += skip;
+                bits >>= skip;
+                let binding = draw.cb_bindings[stage][index as usize];
+                if binding.enabled && binding.address != 0 && binding.size != 0 {
+                    self.common_buffer_cache.bind_graphics_uniform_buffer(
+                        stage,
+                        index,
+                        binding.address,
+                        binding.size,
+                    );
+                } else {
+                    self.common_buffer_cache
+                        .disable_graphics_uniform_buffer(stage, index);
+                }
+                index += 1;
+                bits >>= 1;
             }
         }
 
         self.common_buffer_cache.update_graphics_buffers(is_indexed);
         self.common_buffer_cache
             .bind_host_geometry_buffers(is_indexed);
+        self.desc_queue.acquire();
 
-        if has_uniform_buffer_descriptors
-            || has_storage_buffer_descriptors
-            || has_texel_buffer_descriptors
-        {
-            self.desc_queue.acquire();
-            for stage in 0..enabled_uniform_buffer_masks.len() {
-                self.common_buffer_cache.bind_host_stage_buffers(stage);
-            }
-            // `BindHostStageBuffers` appends descriptors in the same per-stage
-            // order as upstream's descriptor update template: uniform buffers
-            // followed by storage buffers. Split that single ordered stream so
-            // the explicit Rust `vkUpdateDescriptorSets` path can populate the
-            // corresponding layout bindings without losing the SSBO entries.
-            let queued_data = self.desc_queue.update_data();
-            let mut queued_buffers = queued_data.iter().filter_map(|entry| match entry {
-                DescriptorUpdateEntry::Buffer(info) => Some(*info),
-                _ => None,
-            });
-            for info in stage_infos.iter().flatten() {
-                for desc in &info.constant_buffer_descriptors {
-                    for _ in 0..desc.count {
-                        if let Some(buffer) = queued_buffers.next() {
-                            common_uniform_buffer_infos.push(buffer);
-                        }
-                    }
-                }
-                for desc in &info.storage_buffers_descriptors {
-                    for _ in 0..desc.count {
-                        if let Some(buffer) = queued_buffers.next() {
-                            common_storage_buffer_infos.push(buffer);
-                        }
-                    }
-                }
-            }
-            debug_assert!(
-                queued_buffers.next().is_none(),
-                "buffer-cache descriptor stream contains entries not consumed by the pipeline layout"
-            );
-            common_texel_buffer_views.extend(queued_data.iter().filter_map(|entry| match entry {
-                DescriptorUpdateEntry::TexelBuffer(view) => Some(*view),
-                _ => None,
-            }));
-        }
-        let mut storage_image_infos = Vec::new();
-        for (view, usage) in graphics_views.iter().zip(&graphics_view_uses) {
-            let GraphicsViewUse::Storage {
-                texture_type,
-                format,
-                is_written,
-            } = *usage
-            else {
+        let mut rescaling = RescalingPushConstant::new();
+        let mut sampler_cursor = 0usize;
+        view_cursor = 0;
+        for (stage, info) in stage_infos.iter().enumerate() {
+            let Some(info) = info else {
                 continue;
             };
-            let image_view = if view.id.is_valid() && view.id != NULL_IMAGE_VIEW_ID {
-                let _ = self.texture_cache.materialize_sampled_image_view(
-                    view.id,
-                    texture_type,
-                    read_gpu_unsafe,
-                );
-                if is_written {
-                    unsafe {
-                        // SAFETY: `texture_cache` points to `self.texture_cache`; the
-                        // base mutex serializes this mutation with CPU invalidation.
-                        let _texture_lock = (*texture_cache).base.mutex.lock();
-                        let image_id = (&(*texture_cache).base.slot_image_views)[view.id].image_id;
-                        if image_id.is_valid()
-                            && image_id != crate::texture_cache::types::NULL_IMAGE_ID
-                        {
-                            (*texture_cache).base.mark_modification_by_id(image_id);
-                        }
-                    }
-                }
-                self.texture_cache
-                    .image_view_storage_view(view.id, texture_type, format)
-                    .or_else(|| {
-                        self.texture_cache
-                            .null_storage_image_view(texture_type, format)
-                    })
-                    .unwrap_or(vk::ImageView::null())
-            } else {
-                self.texture_cache
-                    .null_storage_image_view(texture_type, format)
-                    .unwrap_or(vk::ImageView::null())
-            };
-            storage_image_infos.push(vk::DescriptorImageInfo {
-                sampler: vk::Sampler::null(),
-                image_view,
-                image_layout: vk::ImageLayout::GENERAL,
-            });
-        }
-        let mut sampled_cursor = 0usize;
-        let mut common_uniform_cursor = 0usize;
-        let mut common_storage_cursor = 0usize;
-        let mut common_texel_cursor = 0usize;
-        let mut storage_image_cursor = 0usize;
-        let mut sampled_image_traces = Vec::new();
-
-        for binding in descriptor_bindings {
-            match binding.descriptor_type {
-                vk::DescriptorType::UNIFORM_BUFFER | vk::DescriptorType::STORAGE_BUFFER => {
-                    let start = buffer_infos.len();
-                    for element in 0..binding.descriptor_count {
-                        if binding.descriptor_type == vk::DescriptorType::STORAGE_BUFFER {
-                            if let Some(info) = common_storage_buffer_infos
-                                .get(common_storage_cursor)
-                                .copied()
-                            {
-                                common_storage_cursor += 1;
-                                buffer_infos.push(info);
-                                continue;
-                            }
-                        }
-                        if binding.descriptor_type == vk::DescriptorType::UNIFORM_BUFFER {
-                            if let Some(info) = common_uniform_buffer_infos
-                                .get(common_uniform_cursor)
-                                .copied()
-                            {
-                                common_uniform_cursor += 1;
-                                buffer_infos.push(info);
-                                continue;
-                            }
-                        }
-                        let descriptor_info = binding
-                            .uniform_stage
-                            .zip(binding.uniform_index)
-                            .and_then(|(stage, index)| {
-                                let stage = stage as usize;
-                                let index = index.saturating_add(element) as usize;
-                                draw.cb_bindings
-                                    .get(stage)
-                                    .and_then(|stage_bindings| stage_bindings.get(index))
-                            })
-                            .and_then(|cbuf| {
-                                if cbuf.enabled && cbuf.address != 0 && cbuf.size != 0 {
-                                    Some((cbuf.address, cbuf.size as vk::DeviceSize))
-                                } else {
-                                    None
-                                }
-                            });
-                        let (buffer, offset, range) = if let Some((gpu_va, size)) = descriptor_info
-                        {
-                            let size = size.min(0x10000).max(4);
-                            let (buffer, offset) =
-                                if binding.descriptor_type == vk::DescriptorType::UNIFORM_BUFFER {
-                                    self.buffer_cache
-                                        .bind_mapped_uniform_buffer(
-                                            gpu_va,
-                                            size,
-                                            read_gpu,
-                                            &mut self.staging_pool,
-                                        )
-                                        .unwrap_or_else(|| {
-                                            self.buffer_cache.get_or_upload_fresh(
-                                                gpu_va,
-                                                size,
-                                                read_gpu,
-                                                &mut self.staging_pool,
-                                                &mut self.scheduler,
-                                            )
-                                        })
-                                } else {
-                                    self.buffer_cache.get_or_upload(
-                                        gpu_va,
-                                        size,
-                                        read_gpu,
-                                        &mut self.staging_pool,
-                                        &mut self.scheduler,
-                                    )
-                                };
-                            (buffer, offset, size)
-                        } else {
-                            null_buffer_descriptor(
-                                self.has_null_descriptor,
-                                self.fallback_uniform_buffer,
-                            )
-                        };
-                        buffer_infos.push(vk::DescriptorBufferInfo {
-                            buffer,
-                            offset,
-                            range,
+            self.common_buffer_cache.bind_host_stage_buffers(stage);
+            view_cursor += num_descriptors(&info.texture_buffer_descriptors) as usize;
+            view_cursor += num_descriptors(&info.image_buffer_descriptors) as usize;
+            for desc in &info.texture_descriptors {
+                for _ in 0..desc.count {
+                    let view_id = prepared.views[view_cursor].id;
+                    let image_view = self
+                        .texture_cache
+                        .materialize_sampled_image_view(view_id, desc.texture_type, read_gpu_unsafe)
+                        .unwrap_or_else(|| {
+                            self.texture_cache.null_image_view_handle(desc.texture_type)
                         });
-                    }
-                    writes.push(
-                        vk::WriteDescriptorSet::builder()
-                            .dst_set(descriptor_set)
-                            .dst_binding(binding.binding)
-                            .descriptor_type(binding.descriptor_type)
-                            .buffer_info(&buffer_infos[start..])
-                            .build(),
-                    );
-                }
-                vk::DescriptorType::UNIFORM_TEXEL_BUFFER
-                | vk::DescriptorType::STORAGE_TEXEL_BUFFER => {
-                    let start = common_texel_cursor;
-                    let end = start.saturating_add(binding.descriptor_count as usize);
-                    let views = if end <= common_texel_buffer_views.len() {
-                        &common_texel_buffer_views[start..end]
-                    } else {
-                        warn!(
-                            "RasterizerVulkan: missing texel-buffer descriptors for binding {}",
-                            binding.binding
-                        );
-                        return (None, Vec::new());
-                    };
-                    common_texel_cursor = end.min(common_texel_buffer_views.len());
-                    writes.push(
-                        vk::WriteDescriptorSet::builder()
-                            .dst_set(descriptor_set)
-                            .dst_binding(binding.binding)
-                            .descriptor_type(binding.descriptor_type)
-                            .texel_buffer_view(views)
-                            .build(),
-                    );
-                }
-                vk::DescriptorType::COMBINED_IMAGE_SAMPLER | vk::DescriptorType::STORAGE_IMAGE => {
-                    let start = image_infos.len();
-                    if binding.descriptor_type == vk::DescriptorType::COMBINED_IMAGE_SAMPLER {
-                        for element in 0..binding.descriptor_count as usize {
-                            let sampled_index = sampled_cursor + element;
-                            let view_id = sampled_views
-                                .get(sampled_index)
-                                .map(|view| view.id)
-                                .unwrap_or(NULL_IMAGE_VIEW_ID);
-                            let texture_type = binding
-                                .texture
-                                .map(|texture| texture.texture_type)
-                                .unwrap_or(shader_recompiler::shader_info::TextureType::Color2D);
-                            let image_view = self
-                                .texture_cache
-                                .materialize_sampled_image_view(
-                                    view_id,
-                                    texture_type,
-                                    read_gpu_unsafe,
-                                )
-                                .unwrap_or_else(|| {
-                                    self.texture_cache.null_image_view_handle(texture_type)
-                                });
-                            if trace_draw {
-                                sampled_image_traces.push(
-                                    self.texture_cache
-                                        .sampled_image_view_trace(view_id, image_view),
-                                );
+                    let supports_anisotropy = view_id.is_valid()
+                        && view_id != NULL_IMAGE_VIEW_ID
+                        && self.texture_cache.base.slot_image_views[view_id].supports_anisotropy();
+                    let sampler = self
+                        .texture_cache
+                        .sampler(prepared.samplers[sampler_cursor])
+                        .map(|sampler| {
+                            if sampler.has_added_anisotropy() && !supports_anisotropy {
+                                sampler.handle_with_default_anisotropy()
+                            } else {
+                                sampler.handle()
                             }
-                            let sampler_id = sampled_samplers
-                                .get(sampled_index)
-                                .copied()
-                                .unwrap_or_default();
-                            let sampler = self
-                                .texture_cache
-                                .sampler_handle(sampler_id)
-                                .unwrap_or(self.fallback_sampler);
-                            image_infos.push(vk::DescriptorImageInfo {
-                                sampler,
-                                image_view,
-                                image_layout: vk::ImageLayout::GENERAL,
-                            });
-                        }
-                        sampled_cursor =
-                            sampled_cursor.saturating_add(binding.descriptor_count as usize);
-                    } else {
-                        let end =
-                            storage_image_cursor.saturating_add(binding.descriptor_count as usize);
-                        if end <= storage_image_infos.len() {
-                            image_infos
-                                .extend_from_slice(&storage_image_infos[storage_image_cursor..end]);
-                        } else {
-                            warn!(
-                                "RasterizerVulkan: missing storage-image descriptors for binding {}",
-                                binding.binding
-                            );
-                            return (None, Vec::new());
-                        }
-                        storage_image_cursor = end.min(storage_image_infos.len());
-                    }
-                    writes.push(
-                        vk::WriteDescriptorSet::builder()
-                            .dst_set(descriptor_set)
-                            .dst_binding(binding.binding)
-                            .descriptor_type(binding.descriptor_type)
-                            .image_info(&image_infos[start..])
-                            .build(),
-                    );
+                        })
+                        .unwrap_or(self.fallback_sampler);
+                    self.desc_queue.add_sampled_image(image_view, sampler);
+                    rescaling
+                        .push_texture(self.texture_cache.base.is_rescaling_image_view(view_id));
+                    view_cursor += 1;
+                    sampler_cursor += 1;
                 }
-                _ => {
-                    warn!(
-                        "RasterizerVulkan: unsupported graphics descriptor type {:?}",
-                        binding.descriptor_type
-                    );
+            }
+            for desc in &info.image_descriptors {
+                for _ in 0..desc.count {
+                    let view_id = prepared.views[view_cursor].id;
+                    let image_view = if view_id.is_valid() && view_id != NULL_IMAGE_VIEW_ID {
+                        let _ = self.texture_cache.materialize_sampled_image_view(
+                            view_id,
+                            desc.texture_type,
+                            read_gpu_unsafe,
+                        );
+                        if desc.is_written {
+                            let image_id =
+                                self.texture_cache.base.slot_image_views[view_id].image_id;
+                            if image_id.is_valid() && image_id != NULL_IMAGE_ID {
+                                self.texture_cache.base.mark_modification_by_id(image_id);
+                            }
+                        }
+                        self.texture_cache
+                            .image_view_storage_view(view_id, desc.texture_type, desc.format)
+                            .or_else(|| {
+                                self.texture_cache
+                                    .null_storage_image_view(desc.texture_type, desc.format)
+                            })
+                            .unwrap_or(vk::ImageView::null())
+                    } else {
+                        self.texture_cache
+                            .null_storage_image_view(desc.texture_type, desc.format)
+                            .unwrap_or(vk::ImageView::null())
+                    };
+                    self.desc_queue.add_image(image_view);
+                    rescaling.push_image(self.texture_cache.base.is_rescaling_image_view(view_id));
+                    view_cursor += 1;
                 }
             }
         }
-
-        unsafe {
-            self.device.update_descriptor_sets(&writes, &[]);
-        }
-        if trace_draw {
-            info!(
-                "[VK_DESCRIPTOR_TRACE] tick={} draw={} shaders={:X?} set=0x{:X} bindings={:?} buffers=[{}] images=[{}] image_meta=[{}] texel_views={:X?}",
-                self.scheduler.pending_tick(),
-                self.draw_counter,
-                unique_hashes,
-                descriptor_set.as_raw(),
-                descriptor_bindings,
-                format_descriptor_buffer_infos(&buffer_infos),
-                format_descriptor_image_infos(&image_infos),
-                sampled_image_traces.join(";"),
-                common_texel_buffer_views
-                    .iter()
-                    .map(|view| view.as_raw())
-                    .collect::<Vec<_>>(),
+        let expected_descriptor_count = descriptor_bindings
+            .iter()
+            .map(|binding| binding.descriptor_count as usize)
+            .sum::<usize>();
+        if self.desc_queue.pending_count() != expected_descriptor_count {
+            log::error!(
+                "descriptor payload/layout mismatch: queued={} expected={}",
+                self.desc_queue.pending_count(),
+                expected_descriptor_count
             );
+            return None;
         }
-        (Some(descriptor_set), graphics_views)
+        prepared.descriptor_data = Some(DescriptorData(self.desc_queue.update_data()));
+        prepared.rescaling_data = *rescaling.data();
+        Some(prepared)
     }
 
     // ── Framebuffer resize ────────────────────────────────────────────────
@@ -4884,9 +4699,9 @@ mod tests {
             .next()
             .expect("bind_graphics_descriptors boundary must exist");
 
-        assert!(function.contains("(*texture_cache)\n                .fill_graphics_image_views"));
+        assert!(function.contains("self.texture_cache\n            .fill_graphics_image_views"));
         assert!(!function.contains(
-            "(*texture_cache)\n                .base\n                .fill_graphics_image_views"
+            "self.texture_cache\n            .base\n            .fill_graphics_image_views"
         ));
         assert!(function.contains("null_image_view_handle"));
         assert!(function.contains("null_storage_image_view"));
@@ -4913,7 +4728,7 @@ mod tests {
             .find(".update_render_targets_and_get_rt0_framebuffer")
             .expect("render targets must be updated");
         let feedback = function
-            .find(".check_feedback_loop(&graphics_views)")
+            .find(".check_feedback_loop(&prepared_descriptors.views)")
             .expect("feedback loops must be checked");
 
         assert!(

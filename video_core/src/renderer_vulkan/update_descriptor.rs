@@ -39,21 +39,31 @@ const MIN_ENTRIES: usize = 0x400;
 // DescriptorUpdateEntry
 // ---------------------------------------------------------------------------
 
-/// A single descriptor update entry, holding one of the possible descriptor
-/// info types.
+/// A single descriptor update entry.
 ///
-/// Port of `DescriptorUpdateEntry` union.
+/// Upstream deliberately uses a C union because Vulkan descriptor update
+/// templates consume this payload as raw bytes with
+/// `sizeof(DescriptorUpdateEntry)` stride. A tagged Rust enum changes both the
+/// size and field offsets and therefore cannot back the template path.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct DescriptorUpdateEmpty;
+
+#[repr(C)]
 #[derive(Clone, Copy)]
-pub enum DescriptorUpdateEntry {
-    Image(vk::DescriptorImageInfo),
-    Buffer(vk::DescriptorBufferInfo),
-    TexelBuffer(vk::BufferView),
-    Empty,
+pub union DescriptorUpdateEntry {
+    pub empty: DescriptorUpdateEmpty,
+    pub image: vk::DescriptorImageInfo,
+    pub buffer: vk::DescriptorBufferInfo,
+    pub texel_buffer: vk::BufferView,
 }
 
 impl Default for DescriptorUpdateEntry {
     fn default() -> Self {
-        DescriptorUpdateEntry::Empty
+        // Upstream initializes the union's `Empty empty{}` member. Zero the
+        // complete storage as well so padding remains deterministic when the
+        // payload is consumed as raw template data.
+        unsafe { std::mem::zeroed() }
     }
 }
 
@@ -67,8 +77,8 @@ impl Default for DescriptorUpdateEntry {
 ///
 /// Accumulates descriptor payload entries via `add_sampled_image`, `add_image`,
 /// `add_buffer`, and `add_texel_buffer`. The caller uses `update_data()` to
-/// retrieve the entries written since the last `acquire()` call, then uses
-/// those entries to build `vkUpdateDescriptorSets` write descriptors.
+/// retrieve the entries written since the last `acquire()` call. Vulkan
+/// consumes that raw payload through a descriptor update template.
 pub struct UpdateDescriptorQueue {
     /// Scheduler worker owning commands that consume entries from `payload`.
     ///
@@ -101,7 +111,7 @@ impl UpdateDescriptorQueue {
             cursor: 0,
             frame_start: 0,
             upload_start: 0,
-            payload: vec![DescriptorUpdateEntry::Empty; PAYLOAD_SIZE],
+            payload: vec![DescriptorUpdateEntry::default(); PAYLOAD_SIZE],
         }
     }
 
@@ -139,22 +149,24 @@ impl UpdateDescriptorQueue {
         self.upload_start = self.cursor;
     }
 
-    /// Returns a slice of entries written since the last `acquire()`.
+    /// Returns the first entry written since the last `acquire()`.
     ///
     /// Port of `UpdateDescriptorQueue::UpdateData`.
-    pub fn update_data(&self) -> &[DescriptorUpdateEntry] {
-        &self.payload[self.upload_start..self.cursor]
+    pub fn update_data(&self) -> *const DescriptorUpdateEntry {
+        unsafe { self.payload.as_ptr().add(self.upload_start) }
     }
 
     /// Queue a combined image sampler descriptor entry.
     ///
     /// Port of `UpdateDescriptorQueue::AddSampledImage`.
     pub fn add_sampled_image(&mut self, image_view: vk::ImageView, sampler: vk::Sampler) {
-        self.payload[self.cursor] = DescriptorUpdateEntry::Image(vk::DescriptorImageInfo {
-            sampler,
-            image_view,
-            image_layout: vk::ImageLayout::GENERAL,
-        });
+        self.payload[self.cursor] = DescriptorUpdateEntry {
+            image: vk::DescriptorImageInfo {
+                sampler,
+                image_view,
+                image_layout: vk::ImageLayout::GENERAL,
+            },
+        };
         self.cursor += 1;
     }
 
@@ -162,11 +174,13 @@ impl UpdateDescriptorQueue {
     ///
     /// Port of `UpdateDescriptorQueue::AddImage`.
     pub fn add_image(&mut self, image_view: vk::ImageView) {
-        self.payload[self.cursor] = DescriptorUpdateEntry::Image(vk::DescriptorImageInfo {
-            sampler: vk::Sampler::null(),
-            image_view,
-            image_layout: vk::ImageLayout::GENERAL,
-        });
+        self.payload[self.cursor] = DescriptorUpdateEntry {
+            image: vk::DescriptorImageInfo {
+                sampler: vk::Sampler::null(),
+                image_view,
+                image_layout: vk::ImageLayout::GENERAL,
+            },
+        };
         self.cursor += 1;
     }
 
@@ -174,11 +188,13 @@ impl UpdateDescriptorQueue {
     ///
     /// Port of `UpdateDescriptorQueue::AddBuffer`.
     pub fn add_buffer(&mut self, buffer: vk::Buffer, offset: vk::DeviceSize, size: vk::DeviceSize) {
-        self.payload[self.cursor] = DescriptorUpdateEntry::Buffer(vk::DescriptorBufferInfo {
-            buffer,
-            offset,
-            range: size,
-        });
+        self.payload[self.cursor] = DescriptorUpdateEntry {
+            buffer: vk::DescriptorBufferInfo {
+                buffer,
+                offset,
+                range: size,
+            },
+        };
         self.cursor += 1;
     }
 
@@ -186,7 +202,7 @@ impl UpdateDescriptorQueue {
     ///
     /// Port of `UpdateDescriptorQueue::AddTexelBuffer`.
     pub fn add_texel_buffer(&mut self, texel_buffer: vk::BufferView) {
-        self.payload[self.cursor] = DescriptorUpdateEntry::TexelBuffer(texel_buffer);
+        self.payload[self.cursor] = DescriptorUpdateEntry { texel_buffer };
         self.cursor += 1;
     }
 
@@ -213,7 +229,7 @@ mod tests {
             cursor: 0,
             frame_start: 0,
             upload_start: 0,
-            payload: vec![DescriptorUpdateEntry::Empty; PAYLOAD_SIZE],
+            payload: vec![DescriptorUpdateEntry::default(); PAYLOAD_SIZE],
         }
     }
 
@@ -223,6 +239,14 @@ mod tests {
         assert_eq!(FRAME_PAYLOAD_SIZE, 0x20000);
         assert_eq!(PAYLOAD_SIZE, FRAME_PAYLOAD_SIZE * FRAMES_IN_FLIGHT);
         assert_eq!(MIN_ENTRIES, 0x400);
+        let largest_member = std::mem::size_of::<vk::DescriptorImageInfo>()
+            .max(std::mem::size_of::<vk::DescriptorBufferInfo>())
+            .max(std::mem::size_of::<vk::BufferView>());
+        assert_eq!(std::mem::size_of::<DescriptorUpdateEntry>(), largest_member);
+        assert_eq!(
+            std::mem::align_of::<DescriptorUpdateEntry>(),
+            std::mem::align_of::<vk::DescriptorBufferInfo>()
+        );
     }
 
     #[test]
@@ -235,9 +259,10 @@ mod tests {
 
         assert_eq!(queue.pending_count(), 2);
         let data = queue.update_data();
-        assert_eq!(data.len(), 2);
-        assert!(matches!(data[0], DescriptorUpdateEntry::Buffer(_)));
-        assert!(matches!(data[1], DescriptorUpdateEntry::Image(_)));
+        unsafe {
+            assert_eq!((*data).buffer.range, 256);
+            assert_eq!((*data.add(1)).image.image_layout, vk::ImageLayout::GENERAL);
+        }
     }
 
     #[test]

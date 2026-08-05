@@ -32767,3 +32767,103 @@ Rust files: `externals/rdynarmic/src/frontend/a32/{decoder.rs, decoder_thumb32.r
 - Re-read upstream declaration and implementation line by line. The focused
   test verifies that a GPU-modified, non-CPU-modified MSAA image is rejected
   without panicking.
+
+## 2026-08-05 — video_core/src/renderer_vulkan/{graphics_pipeline.rs,pipeline_helper.rs,update_descriptor.rs,vk_rasterizer.rs,scheduler.rs} vs video_core/renderer_vulkan/{vk_graphics_pipeline.cpp,pipeline_helper.h,vk_update_descriptor.h,vk_update_descriptor.cpp,vk_scheduler.cpp}
+
+### Intentional differences
+- Rust keeps `ConfigureImpl` orchestration in the active rasterizer while the
+  split port still owns channel snapshots and both common caches there. The
+  descriptor preparation order now matches upstream: synchronize descriptors,
+  configure stage handles and buffers, resolve image views, bind texture
+  buffers, update/bind geometry, acquire the payload queue, bind stage buffers,
+  push image descriptors, update render targets, then check feedback loops.
+- Upstream release `ASSERT` calls log and continue. Rust logs disabled CBUF and
+  unexpected SSBO-count conditions and substitutes null handles; an impossible
+  static-array overflow skips the draw rather than risking memory corruption.
+- Rust retains a second descriptor-binding metadata list for buffer-bank
+  population. Pipeline creation now verifies its binding, type, count, stage,
+  and total descriptor count against `DescriptorLayoutBuilder` in release
+  builds, and descriptor preparation verifies the emitted payload count.
+
+### Unintentional differences (to fix)
+- Async pipeline construction is still waited by the producer after resource
+  preparation. Upstream records that wait on the scheduler worker before the
+  bind closure.
+- The non-push-descriptor fallback commits its descriptor set before resource
+  preparation. Upstream commits inside the recorded configure closure. The
+  push-descriptor path used by MoltenVK follows upstream ordering.
+
+### Missing items
+- Move the async build wait and non-push descriptor allocation into scheduler
+  records once scheduler pipeline identity no longer requires a ready
+  `VkPipeline` handle.
+- Port the corresponding compute-pipeline descriptor-template configure path;
+  this entry covers graphics configuration only.
+
+### Binary layout verification
+- PASS: `DescriptorUpdateEntry` is a `repr(C)` union whose size is the maximum
+  of `VkDescriptorImageInfo`, `VkDescriptorBufferInfo`, and `VkBufferView`.
+  Default construction zeroes the complete union storage while representing
+  upstream's `Empty empty{}` state.
+- PASS: descriptor template entries use `sizeof(DescriptorUpdateEntry)` for
+  stride and advance offset once per descriptor record, matching upstream.
+
+### Behavioral verification
+- Re-read upstream `GraphicsPipeline::ConfigureImpl`, `ConfigureDraw`,
+  `DescriptorLayoutBuilder`, `PushImageDescriptors`, and
+  `UpdateDescriptorQueue` line by line.
+- GPU descriptor handles are again read through the channel `MemoryManager`,
+  which translates GPU virtual addresses before device-memory access, matching
+  upstream `gpu_memory->Read<u32>`.
+- Feedback-loop detection receives the complete value-initialized 64-entry
+  image-view array, matching upstream rather than relying on the null-filtered
+  used prefix being behaviorally equivalent.
+- Focused update-descriptor, descriptor-order/layout, and scheduler tests pass.
+- The full `video_core` lib suite remains unsuitable as a completion gate: it
+  has known unrelated failures and does not terminate. The tests owned by this
+  descriptor slice are run individually instead.
+
+## 2026-08-05 — video_core/src/renderer_vulkan/texture_cache.rs vs video_core/renderer_vulkan/vk_texture_cache.{h,cpp}
+
+### Intentional differences
+- Rust materializes backend samplers lazily by `SamplerId`; upstream's generic
+  texture cache constructs its backend `Sampler` when the slot is inserted.
+
+### Unintentional differences (to fix)
+- None for the dual-sampler anisotropy selection slice.
+
+### Missing items
+- None for `Sampler::Handle`, `HandleWithDefaultAnisotropy`,
+  `HasAddedAnisotropy`, and graphics sampled-image descriptor selection.
+
+### Binary layout verification
+- N/A: Vulkan sampler handles and cache maps are host-only state.
+
+### Behavioral verification
+- Re-read upstream Vulkan sampler construction/destruction and
+  `PushImageDescriptors`. Rust now creates and destroys the optional default-
+  anisotropy sampler and selects it when the sampled image view does not
+  support anisotropy.
+
+## 2026-08-05 — video_core/src/textures/texture.rs vs video_core/textures/texture.{h,cpp}
+
+### Intentional differences
+- Rust reads the synchronized global settings through an `RwLock`; upstream
+  reads `Settings::values` directly.
+
+### Unintentional differences (to fix)
+- None for `TSCEntry::MaxAnisotropy`.
+
+### Missing items
+- None for this method.
+
+### Binary layout verification
+- PASS: `TscEntry` remains `repr(C)`, 0x20 bytes, with unchanged raw words.
+
+### Behavioral verification
+- Re-read upstream `TSCEntry::MaxAnisotropy` line by line. Rust now preserves
+  the suitability checks, automatic resolution-derived increment, explicit
+  anisotropy-mode increment, and raw exponent behavior.
+- Two focused anisotropy tests pass. The configured-mode case forces `X4` and
+  checks the fixed upstream-derived result `16.0`, rather than reproducing the
+  implementation formula in the assertion.

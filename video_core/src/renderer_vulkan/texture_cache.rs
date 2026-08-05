@@ -822,7 +822,25 @@ pub struct Framebuffer {
 
 /// Backend-owned sampler corresponding to an upstream `TSCEntry`.
 pub struct CachedSampler {
-    pub sampler: vk::Sampler,
+    sampler: vk::Sampler,
+    sampler_default_anisotropy: vk::Sampler,
+}
+
+impl CachedSampler {
+    /// Port of `Vulkan::Sampler::Handle`.
+    pub fn handle(&self) -> vk::Sampler {
+        self.sampler
+    }
+
+    /// Port of `Vulkan::Sampler::HandleWithDefaultAnisotropy`.
+    pub fn handle_with_default_anisotropy(&self) -> vk::Sampler {
+        self.sampler_default_anisotropy
+    }
+
+    /// Port of `Vulkan::Sampler::HasAddedAnisotropy`.
+    pub fn has_added_anisotropy(&self) -> bool {
+        self.sampler_default_anisotropy != vk::Sampler::null()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -2820,6 +2838,10 @@ impl TextureCacheRuntime {
     fn destroy_sampler(&self, sampler: CachedSampler) {
         unsafe {
             self.device.destroy_sampler(sampler.sampler, None);
+            if sampler.sampler_default_anisotropy != vk::Sampler::null() {
+                self.device
+                    .destroy_sampler(sampler.sampler_default_anisotropy, None);
+            }
         }
     }
 
@@ -6081,17 +6103,21 @@ impl TextureCache {
 
     /// Port-facing subset of upstream `TextureCache::GetSampler(id).Handle()`.
     pub fn sampler_handle(&mut self, sampler_id: SamplerId) -> Option<vk::Sampler> {
+        self.sampler(sampler_id).map(CachedSampler::handle)
+    }
+
+    /// Port-facing equivalent of upstream `TextureCache::GetSampler`.
+    pub fn sampler(&mut self, sampler_id: SamplerId) -> Option<&CachedSampler> {
         self.finish_pending_backend_deletions();
         if !sampler_id.is_valid() {
             return None;
         }
-        if let Some(sampler) = self.samplers.get(&sampler_id) {
-            return Some(sampler.sampler);
+        if !self.samplers.contains_key(&sampler_id) {
+            let tsc = *self.base.slot_samplers.get(sampler_id);
+            let sampler = self.create_sampler_from_tsc(&tsc).ok()?;
+            self.samplers.insert(sampler_id, sampler);
         }
-        let tsc = *self.base.slot_samplers.get(sampler_id);
-        let sampler = self.create_sampler_from_tsc(&tsc).ok()?;
-        self.samplers.insert(sampler_id, CachedSampler { sampler });
-        Some(sampler)
+        self.samplers.get(&sampler_id)
     }
 
     /// Vulkan-backed wrapper for `TextureCache<P>::FillGraphicsImageViews`.
@@ -6253,7 +6279,7 @@ impl TextureCache {
         self.image_view_handle(view_id, texture_type)
     }
 
-    fn create_sampler_from_tsc(&self, tsc: &TscEntry) -> Result<vk::Sampler, vk::Result> {
+    fn create_sampler_from_tsc(&self, tsc: &TscEntry) -> Result<CachedSampler, vk::Result> {
         let mag_filter = texture_filter_from_raw(tsc.mag_filter());
         let min_filter = texture_filter_from_raw(tsc.min_filter());
         let mipmap_filter = texture_mipmap_filter_from_raw(tsc.mipmap_filter());
@@ -6262,54 +6288,79 @@ impl TextureCache {
         let wrap_p = wrap_mode_from_raw(tsc.wrap_p());
         let max_anisotropy = tsc.computed_max_anisotropy().clamp(1.0, 16.0);
         let border_color = tsc.computed_border_color();
-        let mut custom_border_color = vk::SamplerCustomBorderColorCreateInfoEXT::builder()
-            .custom_border_color(vk::ClearColorValue {
-                float32: border_color,
-            })
-            .format(vk::Format::UNDEFINED)
-            .build();
         let reduction = sampler_reduction_from_raw(tsc.reduction_filter());
         let reduction_mode = maxwell_to_vk::sampler_reduction(reduction);
-        let mut reduction_info = vk::SamplerReductionModeCreateInfo::builder()
-            .reduction_mode(reduction_mode)
-            .build();
-        let mut sampler_info = vk::SamplerCreateInfo::builder()
-            .mag_filter(maxwell_to_vk::sampler::filter(mag_filter))
-            .min_filter(maxwell_to_vk::sampler::filter(min_filter))
-            .mipmap_mode(maxwell_to_vk::sampler::mipmap_mode(mipmap_filter))
-            .address_mode_u(maxwell_to_vk::sampler::wrap_mode(false, wrap_u, mag_filter))
-            .address_mode_v(maxwell_to_vk::sampler::wrap_mode(false, wrap_v, mag_filter))
-            .address_mode_w(maxwell_to_vk::sampler::wrap_mode(false, wrap_p, mag_filter))
-            .mip_lod_bias(tsc.lod_bias())
-            .anisotropy_enable(max_anisotropy > 1.0)
-            .max_anisotropy(max_anisotropy)
-            .compare_enable(tsc.depth_compare_enabled() != 0)
-            .compare_op(maxwell_to_vk::sampler::depth_compare_function(
-                crate::textures::texture::DepthCompareFunc::from_raw(tsc.depth_compare_func()),
-            ))
-            .min_lod(if mipmap_filter == TextureMipmapFilter::None {
-                0.0
-            } else {
-                tsc.min_lod()
-            })
-            .max_lod(if mipmap_filter == TextureMipmapFilter::None {
-                0.25
-            } else {
-                tsc.max_lod()
-            })
-            .border_color(convert_border_color(border_color));
-        if self.runtime.custom_border_color_supported {
-            sampler_info = sampler_info
-                .push_next(&mut custom_border_color)
-                .border_color(vk::BorderColor::FLOAT_CUSTOM_EXT);
-        }
-        if self.runtime.sampler_filter_minmax_supported {
-            sampler_info = sampler_info.push_next(&mut reduction_info);
-        } else if reduction_mode != vk::SamplerReductionMode::WEIGHTED_AVERAGE {
-            log::warn!("VK_EXT_sampler_filter_minmax is required");
-        }
-        let sampler_info = sampler_info.build();
-        unsafe { self.runtime.device().create_sampler(&sampler_info, None) }
+        let create_sampler = |anisotropy: f32| {
+            let mut custom_border_color = vk::SamplerCustomBorderColorCreateInfoEXT::builder()
+                .custom_border_color(vk::ClearColorValue {
+                    float32: border_color,
+                })
+                .format(vk::Format::UNDEFINED)
+                .build();
+            let mut reduction_info = vk::SamplerReductionModeCreateInfo::builder()
+                .reduction_mode(reduction_mode)
+                .build();
+            let mut sampler_info = vk::SamplerCreateInfo::builder()
+                .mag_filter(maxwell_to_vk::sampler::filter(mag_filter))
+                .min_filter(maxwell_to_vk::sampler::filter(min_filter))
+                .mipmap_mode(maxwell_to_vk::sampler::mipmap_mode(mipmap_filter))
+                .address_mode_u(maxwell_to_vk::sampler::wrap_mode(false, wrap_u, mag_filter))
+                .address_mode_v(maxwell_to_vk::sampler::wrap_mode(false, wrap_v, mag_filter))
+                .address_mode_w(maxwell_to_vk::sampler::wrap_mode(false, wrap_p, mag_filter))
+                .mip_lod_bias(tsc.lod_bias())
+                .anisotropy_enable(anisotropy > 1.0)
+                .max_anisotropy(anisotropy)
+                .compare_enable(tsc.depth_compare_enabled() != 0)
+                .compare_op(maxwell_to_vk::sampler::depth_compare_function(
+                    crate::textures::texture::DepthCompareFunc::from_raw(tsc.depth_compare_func()),
+                ))
+                .min_lod(if mipmap_filter == TextureMipmapFilter::None {
+                    0.0
+                } else {
+                    tsc.min_lod()
+                })
+                .max_lod(if mipmap_filter == TextureMipmapFilter::None {
+                    0.25
+                } else {
+                    tsc.max_lod()
+                })
+                .border_color(convert_border_color(border_color));
+            if self.runtime.custom_border_color_supported {
+                sampler_info = sampler_info
+                    .push_next(&mut custom_border_color)
+                    .border_color(vk::BorderColor::FLOAT_CUSTOM_EXT);
+            }
+            if self.runtime.sampler_filter_minmax_supported {
+                sampler_info = sampler_info.push_next(&mut reduction_info);
+            } else if reduction_mode != vk::SamplerReductionMode::WEIGHTED_AVERAGE {
+                log::warn!("VK_EXT_sampler_filter_minmax is required");
+            }
+            unsafe {
+                self.runtime
+                    .device()
+                    .create_sampler(&sampler_info.build(), None)
+            }
+        };
+
+        let sampler = create_sampler(max_anisotropy)?;
+        let max_anisotropy_default = (1u32 << tsc.max_anisotropy_raw()) as f32;
+        let sampler_default_anisotropy = if max_anisotropy > max_anisotropy_default {
+            match create_sampler(max_anisotropy_default) {
+                Ok(handle) => handle,
+                Err(error) => {
+                    unsafe {
+                        self.runtime.device().destroy_sampler(sampler, None);
+                    }
+                    return Err(error);
+                }
+            }
+        } else {
+            vk::Sampler::null()
+        };
+        Ok(CachedSampler {
+            sampler,
+            sampler_default_anisotropy,
+        })
     }
 
     /// Get or create a framebuffer for the given render target configuration.

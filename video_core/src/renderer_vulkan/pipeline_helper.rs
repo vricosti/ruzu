@@ -8,6 +8,9 @@
 //! rescaling and render area data.
 
 use ash::vk;
+use shader_recompiler::shader_info::Info as ShaderInfo;
+
+use super::update_descriptor::DescriptorUpdateEntry;
 
 /// Number of u32 words used for texture and image scaling bit flags.
 /// Port of `NUM_TEXTURE_AND_IMAGE_SCALING_WORDS` from shader recompiler.
@@ -25,7 +28,7 @@ pub const RENDERAREA_LAYOUT_SIZE: u32 = 16;
 
 /// Size of a single descriptor update entry (buffer info / image info).
 /// Port of `sizeof(DescriptorUpdateEntry)` used as stride.
-const DESCRIPTOR_UPDATE_ENTRY_SIZE: usize = std::mem::size_of::<vk::DescriptorBufferInfo>();
+const DESCRIPTOR_UPDATE_ENTRY_SIZE: usize = std::mem::size_of::<DescriptorUpdateEntry>();
 
 // ---------------------------------------------------------------------------
 // DescriptorLayoutBuilder
@@ -66,6 +69,17 @@ impl DescriptorLayoutBuilder {
     /// Port of `DescriptorLayoutBuilder::CanUsePushDescriptor`.
     pub fn can_use_push_descriptor(&self, max_push_descriptors: u32, is_supported: bool) -> bool {
         is_supported && self.num_descriptors <= max_push_descriptors
+    }
+
+    /// Exposes the generated layout for the Rust split-architecture parity
+    /// check. Upstream has only this description; ruzu also retains binding
+    /// metadata for buffer-bank population.
+    pub fn bindings(&self) -> &[vk::DescriptorSetLayoutBinding] {
+        &self.bindings
+    }
+
+    pub fn num_descriptors(&self) -> u32 {
+        self.num_descriptors
     }
 
     /// Port of `DescriptorLayoutBuilder::CreateDescriptorSetLayout`.
@@ -201,6 +215,76 @@ impl DescriptorLayoutBuilder {
             self.offset += DESCRIPTOR_UPDATE_ENTRY_SIZE;
         }
     }
+
+    /// Port of `DescriptorLayoutBuilder::Add(const Shader::Info&, ...)`.
+    pub fn add(&mut self, info: &ShaderInfo, stage: vk::ShaderStageFlags) {
+        let descriptors = |counts: Vec<u32>| {
+            counts
+                .into_iter()
+                .map(|count| DescriptorInfo { count })
+                .collect::<Vec<_>>()
+        };
+        self.add_descriptors(
+            vk::DescriptorType::UNIFORM_BUFFER,
+            stage,
+            &descriptors(
+                info.constant_buffer_descriptors
+                    .iter()
+                    .map(|desc| desc.count)
+                    .collect(),
+            ),
+        );
+        self.add_descriptors(
+            vk::DescriptorType::STORAGE_BUFFER,
+            stage,
+            &descriptors(
+                info.storage_buffers_descriptors
+                    .iter()
+                    .map(|desc| desc.count)
+                    .collect(),
+            ),
+        );
+        self.add_descriptors(
+            vk::DescriptorType::UNIFORM_TEXEL_BUFFER,
+            stage,
+            &descriptors(
+                info.texture_buffer_descriptors
+                    .iter()
+                    .map(|desc| desc.count)
+                    .collect(),
+            ),
+        );
+        self.add_descriptors(
+            vk::DescriptorType::STORAGE_TEXEL_BUFFER,
+            stage,
+            &descriptors(
+                info.image_buffer_descriptors
+                    .iter()
+                    .map(|desc| desc.count)
+                    .collect(),
+            ),
+        );
+        self.add_descriptors(
+            vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
+            stage,
+            &descriptors(
+                info.texture_descriptors
+                    .iter()
+                    .map(|desc| desc.count)
+                    .collect(),
+            ),
+        );
+        self.add_descriptors(
+            vk::DescriptorType::STORAGE_IMAGE,
+            stage,
+            &descriptors(
+                info.image_descriptors
+                    .iter()
+                    .map(|desc| desc.count)
+                    .collect(),
+            ),
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -312,5 +396,22 @@ mod tests {
     fn descriptor_layout_builder_empty() {
         let builder = DescriptorLayoutBuilder::new();
         assert!(builder.can_use_push_descriptor(32, true));
+    }
+
+    #[test]
+    fn descriptor_layout_builder_matches_upstream_template_stride() {
+        let mut builder = DescriptorLayoutBuilder::new();
+        builder.add_descriptors(
+            vk::DescriptorType::UNIFORM_BUFFER,
+            vk::ShaderStageFlags::VERTEX,
+            &[DescriptorInfo { count: 2 }, DescriptorInfo { count: 1 }],
+        );
+
+        assert_eq!(builder.bindings.len(), 2);
+        assert_eq!(builder.entries.len(), 2);
+        assert_eq!(builder.entries[0].offset, 0);
+        assert_eq!(builder.entries[0].stride, DESCRIPTOR_UPDATE_ENTRY_SIZE);
+        assert_eq!(builder.entries[1].offset, DESCRIPTOR_UPDATE_ENTRY_SIZE);
+        assert_eq!(builder.num_descriptors, 3);
     }
 }

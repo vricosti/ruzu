@@ -955,15 +955,30 @@ impl TscEntry {
     }
 
     /// Port of `TSCEntry::MaxAnisotropy()`.
-    ///
-    /// Depends on settings; stubbed to return the hardware value for now.
     pub fn computed_max_anisotropy(&self) -> f32 {
-        // Simplified — full implementation requires Settings integration.
-        let max_aniso = self.max_anisotropy_raw();
-        if max_aniso == 0 {
+        let is_suitable_mipmap_filter = self.mipmap_filter() != TextureMipmapFilter::None as u32;
+        let has_regular_lods = self.min_lod_clamp() == 0 && self.max_lod_clamp() >= 256;
+        let is_bilinear_filter = self.min_filter() == TextureFilter::Linear as u32
+            && self.reduction_filter() == SamplerReduction::WeightedAverage as u32;
+        let max_anisotropy = self.max_anisotropy_raw();
+        if max_anisotropy == 0
+            && (!is_suitable_mipmap_filter
+                || !has_regular_lods
+                || !is_bilinear_filter
+                || self.depth_compare_enabled() != 0)
+        {
             return 1.0;
         }
-        (1u32 << max_aniso) as f32
+        let settings = common::settings::values();
+        let anisotropy_mode = *settings.max_anisotropy.get_value();
+        let added_anisotropy =
+            if anisotropy_mode == common::settings_enums::AnisotropyMode::Automatic {
+                (settings.resolution_info.up_scale >> settings.resolution_info.down_shift)
+                    .saturating_sub(1)
+            } else {
+                (anisotropy_mode as u32).wrapping_sub(1)
+            };
+        (1u32 << (max_anisotropy + added_anisotropy)) as f32
     }
 
     /// Port of `TSCEntry::MinLod()`.
@@ -1085,5 +1100,38 @@ mod tests {
         entry.raw[0] |= (word1 as u64) << 32;
         let bias = entry.lod_bias();
         assert!(bias < 0.0, "Expected negative bias, got {}", bias);
+    }
+
+    #[test]
+    fn tsc_max_anisotropy_rejects_unsuitable_zero_descriptor() {
+        let entry = TscEntry::default();
+        assert_eq!(entry.computed_max_anisotropy(), 1.0);
+    }
+
+    #[test]
+    fn tsc_max_anisotropy_combines_guest_and_configured_values() {
+        let mut entry = TscEntry::default();
+        let word0 = 2u32 << 20;
+        let word1 =
+            ((TextureFilter::Linear as u32) << 4) | ((TextureMipmapFilter::Nearest as u32) << 6);
+        let word2 = 256u32 << 12;
+        entry.raw[0] = word0 as u64 | ((word1 as u64) << 32);
+        entry.raw[1] = word2 as u64;
+
+        let previous_mode = {
+            let mut settings = common::settings::values_mut();
+            let previous = *settings.max_anisotropy.get_value();
+            settings
+                .max_anisotropy
+                .set_value(common::settings_enums::AnisotropyMode::X4);
+            previous
+        };
+        let result = entry.computed_max_anisotropy();
+        common::settings::values_mut()
+            .max_anisotropy
+            .set_value(previous_mode);
+
+        // Guest exponent 2 plus forced X4 exponent 2 gives 2^(2 + 2).
+        assert_eq!(result, 16.0);
     }
 }

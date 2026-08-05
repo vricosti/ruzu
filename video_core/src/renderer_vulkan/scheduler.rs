@@ -917,6 +917,16 @@ impl Scheduler {
         true
     }
 
+    /// Port of upstream `Scheduler::UpdateRescaling`.
+    pub fn update_rescaling(&mut self, is_rescaling: bool) -> bool {
+        if self.state.rescaling_defined && self.state.is_rescaling == is_rescaling {
+            return false;
+        }
+        self.state.rescaling_defined = true;
+        self.state.is_rescaling = is_rescaling;
+        true
+    }
+
     /// Port of upstream `Scheduler::InvalidateState`.
     pub fn invalidate_state(&mut self) {
         self.state.graphics_pipeline = vk::Pipeline::null();

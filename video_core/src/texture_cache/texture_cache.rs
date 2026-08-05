@@ -2764,6 +2764,22 @@ impl TextureCacheBase {
         self.is_rescaling
     }
 
+    /// Port of `TextureCache<P>::IsRescaling(const ImageViewBase&)`.
+    pub fn is_rescaling_image_view(&self, image_view_id: ImageViewId) -> bool {
+        if !image_view_id.is_valid() || image_view_id == NULL_IMAGE_VIEW_ID {
+            return false;
+        }
+        let image_view = &self.slot_image_views[image_view_id];
+        if image_view.view_type == ImageViewType::Buffer {
+            return false;
+        }
+        image_view.image_id.is_valid()
+            && image_view.image_id != NULL_IMAGE_ID
+            && self.slot_images[image_view.image_id]
+                .flags
+                .contains(ImageFlagBits::RESCALED)
+    }
+
     // ── Prepare / refresh ──────────────────────────────────────────────
 
     /// Port of `TextureCache<P>::PrepareImage`.

@@ -490,6 +490,8 @@ impl PipelineCache {
         max_vertex_input_bindings: u32,
         vertex_attribute_divisor_supported: bool,
         provoking_vertex_supported: bool,
+        push_descriptor_supported: bool,
+        max_push_descriptors: u32,
     ) -> Self {
         let mut pipeline_cache = PipelineCache {
             device: device.clone(),
@@ -519,6 +521,8 @@ impl PipelineCache {
                 max_vertex_input_bindings,
                 vertex_attribute_divisor_supported,
                 provoking_vertex_supported,
+                push_descriptor_supported,
+                max_push_descriptors,
             ),
             graphics_cache: HashMap::new(),
             failed_graphics_cache: HashSet::new(),
