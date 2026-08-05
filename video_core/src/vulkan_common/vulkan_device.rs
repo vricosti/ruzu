@@ -12,7 +12,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::ffi::{CStr, CString};
 
 use super::nsight_aftermath_tracker::NsightAftermathTracker;
-use super::vulkan_wrapper::{LogicalDevice, VulkanError};
+use super::vulkan_wrapper::{get_physical_device_tool_properties, LogicalDevice, VulkanError};
 
 // ---------------------------------------------------------------------------
 // Constants — port of constants from vulkan_device.h
@@ -2561,11 +2561,7 @@ fn collect_tooling_info(
     if !tooling_info_enabled {
         return (false, false);
     }
-    let loader = ash::extensions::ext::ToolingInfo::new(entry, instance);
-    let tools = unsafe { loader.get_physical_device_tool_properties(physical) };
-    let Ok(tools) = tools else {
-        return (false, false);
-    };
+    let tools = get_physical_device_tool_properties(entry, instance, physical);
     let mut has_renderdoc = false;
     let mut has_nsight_graphics = false;
     for tool in tools {

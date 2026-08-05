@@ -239,56 +239,10 @@ impl ImageBase {
             return false;
         }
         if self.info.num_samples > 1 {
-            self.stop_unimplemented_msaa_download();
+            log::warn!("MSAA image downloads are not implemented");
+            return false;
         }
         true
-    }
-
-    fn stop_unimplemented_msaa_download(&self) -> ! {
-        self.record_unimplemented_msaa_download();
-        panic!(
-            "ImageBase::IsSafeDownload MSAA download is unimplemented: gpu=0x{:X} samples={}",
-            self.gpu_addr, self.info.num_samples
-        );
-    }
-
-    fn record_unimplemented_msaa_download(&self) {
-        #[cfg(not(test))]
-        {
-            let path = std::path::Path::new(".agents/texture_cache_unimplemented_state.md");
-            if let Some(parent) = path.parent() {
-                let _ = std::fs::create_dir_all(parent);
-            }
-            let entry = format!(
-                "\n## ImageBase::IsSafeDownload unsupported MSAA download\n\
-                 - upstream: video_core/texture_cache/image_base.cpp ImageBase::IsSafeDownload logs \"MSAA image downloads are not implemented\" and returns false\n\
-                 - local policy: stop instead of silently skipping the missing download path\n\
-                 - gpu_addr: 0x{:X}\n\
-                 - cpu_addr: 0x{:X}\n\
-                 - format: {:?}\n\
-                 - samples: {}\n\
-                 - size: {}x{}x{}\n\
-                 - guest_size: {}\n\
-                 - flags: 0x{:X}\n",
-                self.gpu_addr,
-                self.cpu_addr,
-                self.info.format,
-                self.info.num_samples,
-                self.info.size.width,
-                self.info.size.height,
-                self.info.size.depth,
-                self.guest_size_bytes,
-                self.flags.bits(),
-            );
-            let _ = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(path)
-                .and_then(|mut file| {
-                    use std::io::Write;
-                    file.write_all(entry.as_bytes())
-                });
-        }
     }
 
     /// Whether this image overlaps a CPU address range.
@@ -571,8 +525,7 @@ mod tests {
     use crate::texture_cache::format_lookup_table::PixelFormat;
 
     #[test]
-    #[should_panic(expected = "ImageBase::IsSafeDownload MSAA download is unimplemented")]
-    fn msaa_download_stops_instead_of_silently_skipping() {
+    fn msaa_download_is_not_safe() {
         let info = ImageInfo {
             format: PixelFormat::A8B8G8R8Unorm,
             image_type: ImageType::E2D,
@@ -588,6 +541,6 @@ mod tests {
         image.flags.remove(ImageFlagBits::CPU_MODIFIED);
         image.flags.insert(ImageFlagBits::GPU_MODIFIED);
 
-        let _ = image.is_safe_download();
+        assert!(!image.is_safe_download());
     }
 }

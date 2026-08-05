@@ -403,11 +403,10 @@
 - Exact upstream member ownership remains incomplete until `GraphicsPipeline` stores or receives one upstream-shaped configure context for `TextureCache`, `BufferCache`, `Tegra::MemoryManager`, `Maxwell3D`, `ProgramManager`, and `StateTracker`.
 
 ### Intentional differences
-- Upstream logs and returns/skips for unsupported MSAA image download/upload paths. Rust now records `.agents/texture_cache_unimplemented_state.md` and stops, following the local no-hidden-debt rule that unsupported texture paths must not continue as if implemented.
 - The OpenGL upload guard stops before `mark_refresh_contents_consumed(...)` and `runtime.transition_image_layout(...)`; upstream clears `CpuModified`, tracks the image, transitions layout, and returns after warning. This is intentional local policy to avoid losing the dirty image state when `CanUploadMSAA()` support is missing.
 
 ### Unintentional differences (to fix)
-- Fixed: `ImageBase::is_safe_download()` no longer only logs and returns `false` for `info.num_samples > 1`; it records the MSAA download dependency and panics.
+- Fixed on 2026-08-05: `ImageBase::is_safe_download()` again logs and returns `false` for `info.num_samples > 1`, matching upstream. The former panic killed the Rust GPU thread and left the compositor waiting indefinitely.
 - Fixed: `OpenGL::TextureCache::refresh_contents_with_gpu_reader(...)` no longer consumes `CPU_MODIFIED` / transitions layout after an unsupported MSAA upload; it records the image state and panics before treating the missing upload as complete.
 
 ### Missing items
@@ -32709,3 +32708,62 @@ Rust files: `externals/rdynarmic/src/frontend/a32/{decoder.rs, decoder_thumb32.r
 - Re-read upstream `Renderer::Stop`, `System::Stop`, and `System::Finalize`.
   `stop_releases_system_mutex_while_waiting_for_auto_mode` covers the lock and
   wait ordering.
+
+## 2026-08-05 — video_core/src/vulkan_common/{vulkan_wrapper.rs,vulkan_device.rs} vs video_core/vulkan_common/{vulkan_wrapper,vulkan_device}.{h,cpp}
+
+### Intentional differences
+- Upstream stores the optional core command in `InstanceDispatch`; Rust resolves
+  it through ash's instance proc-address entry point when collecting tooling
+  information. Both use the core `vkGetPhysicalDeviceToolProperties` name and
+  treat a missing command as optional.
+- Rust returns an empty list if either enumeration call reports a Vulkan error;
+  upstream ignores those return values. This preserves upstream behavior for
+  supported drivers while avoiding partially initialized tool descriptions.
+
+### Unintentional differences (fixed)
+- `collect_tooling_info` previously constructed ash's `VK_EXT_tooling_info`
+  loader and called the suffixed `vkGetPhysicalDeviceToolPropertiesEXT`
+  command. MoltenVK advertises the extension but does not export that symbol,
+  causing ash's generated fallback to panic. The wrapper now loads the promoted
+  core command optionally and returns no tools when it is absent, matching
+  `PhysicalDevice::GetPhysicalDeviceToolProperties` upstream.
+
+### Missing items
+- None for this tooling-info ownership and dispatch slice.
+
+### Binary layout verification
+- PASS: Vulkan's generated `VkPhysicalDeviceToolProperties` ABI type and PFN
+  signature are used directly; no guest-visible or serialized layout changed.
+
+### Behavioral verification
+- Re-read upstream optional instance dispatch loading,
+  `PhysicalDevice::GetPhysicalDeviceToolProperties`, and
+  `Device::CollectToolingInfo` line by line.
+- All eight focused `vulkan_wrapper` tests pass. A 30-second Harbinger run
+  reached Vulkan disk-pipeline-cache loading and ended only at the imposed
+  timeout; the previous tooling-info panic did not recur.
+
+## 2026-08-05 — video_core/src/texture_cache/image_base.rs vs video_core/texture_cache/image_base.{h,cpp}
+
+### Intentional differences
+- Rust uses `log::warn!` in place of upstream's `LOG_WARNING(HW_GPU, ...)`.
+
+### Unintentional differences (fixed)
+- The MSAA branch of `ImageBase::is_safe_download()` previously wrote a
+  project-state file and panicked. Upstream logs that MSAA image downloads are
+  unsupported and returns `false`. The Rust method now follows that exact
+  control flow, preventing garbage collection from terminating the GPU thread
+  and leaving composition blocked forever.
+
+### Missing items
+- None relative to upstream `ImageBase::IsSafeDownload`; upstream itself does
+  not implement MSAA image downloads.
+
+### Binary layout verification
+- PASS: only method control flow and its regression test changed; `ImageBase`
+  fields and layout are unchanged.
+
+### Behavioral verification
+- Re-read upstream declaration and implementation line by line. The focused
+  test verifies that a GPU-modified, non-CPU-modified MSAA image is rejected
+  without panicking.

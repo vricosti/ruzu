@@ -132,6 +132,58 @@ pub fn sort_physical_devices(devices: &mut Vec<vk::PhysicalDevice>, instance: &a
     });
 }
 
+fn enumerate_physical_device_tool_properties(
+    get_properties: Option<vk::PFN_vkGetPhysicalDeviceToolProperties>,
+    physical_device: vk::PhysicalDevice,
+) -> Vec<vk::PhysicalDeviceToolProperties> {
+    let Some(get_properties) = get_properties else {
+        return Vec::new();
+    };
+
+    let mut count = 0;
+    let result = unsafe { get_properties(physical_device, &mut count, std::ptr::null_mut()) };
+    if result != vk::Result::SUCCESS || count == 0 {
+        return Vec::new();
+    }
+
+    loop {
+        let mut properties = vec![vk::PhysicalDeviceToolProperties::default(); count as usize];
+        let result =
+            unsafe { get_properties(physical_device, &mut count, properties.as_mut_ptr()) };
+        match result {
+            vk::Result::SUCCESS => {
+                properties.truncate(count as usize);
+                return properties;
+            }
+            vk::Result::INCOMPLETE => continue,
+            _ => return Vec::new(),
+        }
+    }
+}
+
+/// Port of `PhysicalDevice::GetPhysicalDeviceToolProperties`.
+///
+/// Upstream deliberately loads the promoted core symbol as optional. Some
+/// drivers advertise `VK_EXT_tooling_info` without exporting the suffixed EXT
+/// command, so using ash's extension loader would install a panicking fallback.
+pub fn get_physical_device_tool_properties(
+    entry: &ash::Entry,
+    instance: &ash::Instance,
+    physical_device: vk::PhysicalDevice,
+) -> Vec<vk::PhysicalDeviceToolProperties> {
+    let name =
+        unsafe { CStr::from_bytes_with_nul_unchecked(b"vkGetPhysicalDeviceToolProperties\0") };
+    let function = unsafe { entry.get_instance_proc_addr(instance.handle(), name.as_ptr()) }.map(
+        |function| unsafe {
+            std::mem::transmute::<
+                unsafe extern "system" fn(),
+                vk::PFN_vkGetPhysicalDeviceToolProperties,
+            >(function)
+        },
+    );
+    enumerate_physical_device_tool_properties(function, physical_device)
+}
+
 // ---------------------------------------------------------------------------
 // Instance wrapper — thin wrapper around ash::Instance
 // ---------------------------------------------------------------------------
@@ -308,6 +360,28 @@ pub type Span<'a, T> = &'a [T];
 mod tests {
     use super::*;
 
+    unsafe extern "system" fn one_tool(
+        _physical_device: vk::PhysicalDevice,
+        count: *mut u32,
+        properties: *mut vk::PhysicalDeviceToolProperties,
+    ) -> vk::Result {
+        if properties.is_null() {
+            unsafe { *count = 1 };
+            return vk::Result::SUCCESS;
+        }
+        unsafe {
+            *count = 1;
+            (&mut (*properties).name)[..5].copy_from_slice(&[
+                b't' as std::os::raw::c_char,
+                b'o' as std::os::raw::c_char,
+                b'o' as std::os::raw::c_char,
+                b'l' as std::os::raw::c_char,
+                0,
+            ]);
+        }
+        vk::Result::SUCCESS
+    }
+
     #[test]
     fn test_vulkan_error_display() {
         let err = VulkanError::new(vk::Result::ERROR_INITIALIZATION_FAILED);
@@ -339,5 +413,23 @@ mod tests {
     #[test]
     fn test_filter_error() {
         assert!(filter(vk::Result::ERROR_DEVICE_LOST).is_err());
+    }
+
+    #[test]
+    fn missing_tooling_info_symbol_returns_no_tools() {
+        assert!(
+            enumerate_physical_device_tool_properties(None, vk::PhysicalDevice::null()).is_empty()
+        );
+    }
+
+    #[test]
+    fn tooling_info_uses_optional_core_dispatch() {
+        let tools =
+            enumerate_physical_device_tool_properties(Some(one_tool), vk::PhysicalDevice::null());
+        assert_eq!(tools.len(), 1);
+        assert_eq!(
+            unsafe { CStr::from_ptr(tools[0].name.as_ptr()) }.to_bytes(),
+            b"tool"
+        );
     }
 }
