@@ -43,7 +43,7 @@ pub fn pages(
             )
         })
         .collect();
-    pages.push(configure_input_advanced::page());
+    pages.push(configure_input_advanced::page(Rc::clone(&input_subsystem)));
     pages
 }
 

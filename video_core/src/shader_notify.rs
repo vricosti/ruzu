@@ -136,11 +136,8 @@ mod tests {
         handle.mark_shader_complete();
         assert_eq!(notify.shaders_building(), 2);
 
-        notify
-            .report
-            .lock()
-            .unwrap()
-            .complete_time = Some(Instant::now() - TIME_TO_STOP_REPORTING - Duration::from_millis(1));
+        notify.report.lock().unwrap().complete_time =
+            Some(Instant::now() - TIME_TO_STOP_REPORTING - Duration::from_millis(1));
         assert_eq!(notify.shaders_building(), 0);
     }
 }

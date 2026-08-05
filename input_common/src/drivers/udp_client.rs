@@ -5,16 +5,20 @@
 //!
 //! UDP client driver for Cemuhook protocol (e.g., DS4Windows, BetterJoy).
 
+use std::net::{Ipv4Addr, SocketAddrV4, UdpSocket};
+use std::sync::atomic::{AtomicBool, AtomicI8, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use common::input::{BatteryLevel, ButtonNames, DriverResult};
+use common::input::{BatteryLevel, ButtonNames};
 use common::param_package::ParamPackage;
 use common::settings_input::{native_analog, native_button, native_motion};
 use common::uuid::UUID;
 use parking_lot::Mutex as EngineMutex;
 
-use crate::input_engine::{InputEngine, PadIdentifier};
+use crate::helpers::udp_protocol::{self, response, MessageType, MAX_PACKET_SIZE};
+use crate::input_engine::{BasicMotion, InputEngine, PadIdentifier};
 use crate::main_common::{AnalogMapping, ButtonMapping, MotionMapping};
 
 /// Port of CemuhookUDP namespace types
@@ -154,8 +158,9 @@ struct ClientConnection {
     uuid: UUID,
     host: String,
     port: u16,
-    active: i8,
-    // socket and thread would be here for actual networking
+    active: Arc<AtomicI8>,
+    stop: Arc<AtomicBool>,
+    thread: Option<JoinHandle<()>>,
 }
 
 impl Default for ClientConnection {
@@ -164,7 +169,9 @@ impl Default for ClientConnection {
             uuid: UUID::from_string("00000000-0000-0000-0000-00007F000001"),
             host: "127.0.0.1".to_string(),
             port: 26760,
-            active: -1,
+            active: Arc::new(AtomicI8::new(-1)),
+            stop: Arc::new(AtomicBool::new(false)),
+            thread: None,
         }
     }
 }
@@ -172,7 +179,7 @@ impl Default for ClientConnection {
 /// Port of `UDPClient` class from udp_client.h / udp_client.cpp
 pub struct UdpClient {
     engine: Arc<EngineMutex<InputEngine>>,
-    pads: Vec<PadData>,
+    pads: Arc<Mutex<Vec<PadData>>>,
     clients: Vec<ClientConnection>,
 }
 
@@ -182,9 +189,11 @@ impl UdpClient {
         log::info!("Udp Initialization started");
         let mut client = Self {
             engine: Arc::new(EngineMutex::new(InputEngine::new(input_engine))),
-            pads: (0..MAX_UDP_CLIENTS * PADS_PER_CLIENT)
-                .map(|_| PadData::default())
-                .collect(),
+            pads: Arc::new(Mutex::new(
+                (0..MAX_UDP_CLIENTS * PADS_PER_CLIENT)
+                    .map(|_| PadData::default())
+                    .collect(),
+            )),
             clients: (0..MAX_UDP_CLIENTS)
                 .map(|_| ClientConnection::default())
                 .collect(),
@@ -205,23 +214,42 @@ impl UdpClient {
     pub fn reload_sockets(&mut self) {
         self.reset();
 
-        // In C++: parses Settings::values.udp_input_servers, splits by comma,
-        // then by colon to get host:port pairs, and starts communication.
-        // Without Settings integration we just initialize empty.
-        log::debug!("UDPClient::reload_sockets called");
+        let servers = common::settings::values()
+            .udp_input_servers
+            .get_value()
+            .clone();
+        let mut client = 0;
+        for server in servers.split(',').filter(|server| !server.is_empty()) {
+            if client == MAX_UDP_CLIENTS {
+                break;
+            }
+            let Some((host, port)) = parse_server(server) else {
+                log::error!("Invalid UDP input server {server}");
+                continue;
+            };
+            if self.get_client_number(host, port) != MAX_UDP_CLIENTS {
+                log::error!("Duplicated UDP servers found");
+                continue;
+            }
+            self.start_communication(client, host, port);
+            client += 1;
+        }
     }
 
     /// Port of UDPClient::GetInputDevices (override)
     pub fn get_input_devices(&self) -> Vec<ParamPackage> {
         let mut devices = Vec::new();
-        // In C++: checks Settings::values.enable_udp_controller first
+        if !*common::settings::values().enable_udp_controller.get_value() {
+            return devices;
+        }
+        let pads = self.pads.lock().unwrap();
         for client in 0..self.clients.len() {
-            if self.clients[client].active != 1 {
+            if self.clients[client].active.load(Ordering::Acquire) != 1 {
                 continue;
             }
             for index in 0..PADS_PER_CLIENT {
                 let pad_index = client * PADS_PER_CLIENT + index;
-                if !self.pads[pad_index].connected {
+                if !pads[pad_index].connected {
                     continue;
                 }
                 let pad_identifier = self.get_pad_identifier(pad_index);
@@ -375,9 +403,10 @@ impl UdpClient {
     /// Port of UDPClient::Reset
     fn reset(&mut self) {
         for client in &mut self.clients {
-            if client.active != -1 {
-                client.active = -1;
-                // In C++: stops socket and joins thread
+            if let Some(handle) = client.thread.take() {
+                client.active.store(-1, Ordering::Release);
+                client.stop.store(true, Ordering::Release);
+                let _ = handle.join();
             }
         }
     }
@@ -385,7 +414,7 @@ impl UdpClient {
     /// Port of UDPClient::GetClientNumber
     fn get_client_number(&self, host: &str, port: u16) -> usize {
         for (client, conn) in self.clients.iter().enumerate() {
-            if conn.active == -1 {
+            if conn.active.load(Ordering::Acquire) == -1 {
                 continue;
             }
             if conn.host == host && conn.port == port {
@@ -396,16 +425,14 @@ impl UdpClient {
     }
 
     /// Port of UDPClient::GetBatteryLevel
-    fn get_battery_level(&self, battery: u8) -> BatteryLevel {
-        // Maps UDP battery enum values to input engine battery levels
-        // C++ Response::Battery enum: Dying=0, Low=1, Medium=2, High=3, Full=4, Charged=5, Charging=6
+    fn get_battery_level(battery: response::Battery) -> BatteryLevel {
         match battery {
-            0 => BatteryLevel::Empty,    // Dying
-            1 => BatteryLevel::Critical, // Low
-            2 => BatteryLevel::Low,      // Medium
-            3 => BatteryLevel::Medium,   // High
-            4 | 5 => BatteryLevel::Full, // Full | Charged
-            _ => BatteryLevel::Charging, // Charging or unknown
+            response::Battery::Dying => BatteryLevel::Empty,
+            response::Battery::Low => BatteryLevel::Critical,
+            response::Battery::Medium => BatteryLevel::Low,
+            response::Battery::High => BatteryLevel::Medium,
+            response::Battery::Full | response::Battery::Charged => BatteryLevel::Full,
+            response::Battery::None | response::Battery::Charging => BatteryLevel::Charging,
         }
     }
 
@@ -465,6 +492,294 @@ impl UdpClient {
             _ => ButtonNames::Undefined,
         }
     }
+
+    /// Port of `UDPClient::StartCommunication`.
+    fn start_communication(&mut self, client: usize, host: &str, port: u16) {
+        log::info!("Starting communication with UDP input server on {host}:{port}");
+        let uuid = self.get_host_uuid(host);
+        let connection = &mut self.clients[client];
+        connection.uuid = uuid;
+        connection.host = host.to_string();
+        connection.port = port;
+        connection.active.store(0, Ordering::Release);
+        connection.stop = Arc::new(AtomicBool::new(false));
+
+        for index in 0..PADS_PER_CLIENT {
+            let identifier = PadIdentifier {
+                guid: uuid,
+                port: port as usize,
+                pad: client * PADS_PER_CLIENT + index,
+            };
+            let mut engine = self.engine.lock();
+            engine.pre_set_controller(&identifier);
+            engine.pre_set_motion(&identifier, 0);
+        }
+
+        let engine = Arc::clone(&self.engine);
+        let pads = Arc::clone(&self.pads);
+        let active = Arc::clone(&connection.active);
+        let stop = Arc::clone(&connection.stop);
+        let host = host.to_string();
+        connection.thread = Some(thread::spawn(move || {
+            socket_loop(&host, port, Arc::clone(&stop), move |data| {
+                on_pad_data(&engine, &pads, &active, uuid, port, client, data);
+            });
+        }));
+    }
+}
+
+fn parse_server(server: &str) -> Option<(&str, u16)> {
+    let (host, port) = server.split_once(':')?;
+    let port = if port.is_empty() {
+        0
+    } else if let Some(port) = port.strip_prefix("0x").or_else(|| port.strip_prefix("0X")) {
+        u64::from_str_radix(port, 16).ok()? as u16
+    } else if port.len() > 1 && port.starts_with('0') {
+        u64::from_str_radix(&port[1..], 8).ok()? as u16
+    } else {
+        port.parse::<u64>().ok()? as u16
+    };
+    Some((host, port))
+}
+
+fn generate_client_id() -> u32 {
+    let time = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .subsec_nanos();
+    time ^ std::process::id()
+}
+
+/// Rust socket owner corresponding to upstream `CemuhookUDP::Socket` and
+/// `SocketLoop`. A short read timeout makes `Stop` observable without sending a
+/// synthetic packet to the socket.
+fn socket_loop(
+    host: &str,
+    port: u16,
+    stop: Arc<AtomicBool>,
+    mut on_pad_data: impl FnMut(response::PadData),
+) {
+    socket_loop_until(host, port, stop, None, &mut on_pad_data);
+}
+
+fn socket_loop_until(
+    host: &str,
+    port: u16,
+    stop: Arc<AtomicBool>,
+    deadline: Option<Instant>,
+    on_pad_data: &mut impl FnMut(response::PadData),
+) {
+    let host = host.parse::<Ipv4Addr>().unwrap_or_else(|_| {
+        log::error!("Invalid IPv4 address \"{host}\" provided to socket");
+        Ipv4Addr::UNSPECIFIED
+    });
+    let endpoint = SocketAddrV4::new(host, port);
+    let Ok(socket) = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)) else {
+        log::error!("Failed to bind UDP input socket");
+        return;
+    };
+    if let Err(error) = socket.set_read_timeout(Some(Duration::from_millis(100))) {
+        log::error!("Failed to configure UDP input socket: {error}");
+        return;
+    }
+
+    let client_id = generate_client_id();
+    let port_request = udp_protocol::create_port_info_request(client_id);
+    let pad_request = udp_protocol::create_pad_data_request(client_id);
+    let mut next_send = Instant::now();
+    let mut receive_buffer = [0u8; MAX_PACKET_SIZE];
+
+    while !stop.load(Ordering::Acquire) && deadline.is_none_or(|deadline| Instant::now() < deadline)
+    {
+        let now = Instant::now();
+        if now >= next_send {
+            let _ = socket.send_to(&port_request, endpoint);
+            let _ = socket.send_to(&pad_request, endpoint);
+            next_send = now + Duration::from_secs(3);
+        }
+
+        match socket.recv_from(&mut receive_buffer) {
+            Ok((size, _)) => {
+                let packet = &mut receive_buffer[..size];
+                match udp_protocol::response::validate(packet) {
+                    Some(MessageType::Version) => {
+                        if let Some(data) = udp_protocol::response::decode_version(packet) {
+                            log::trace!("Version packet received: {}", data.version);
+                        }
+                    }
+                    Some(MessageType::PortInfo) => {
+                        if let Some(data) = udp_protocol::response::decode_port_info(packet) {
+                            log::trace!("PortInfo packet received: {:?}", data.model);
+                        }
+                    }
+                    Some(MessageType::PadData) => {
+                        if let Some(data) = udp_protocol::response::decode_pad_data(packet) {
+                            on_pad_data(data);
+                        }
+                    }
+                    None => {}
+                }
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) => {}
+            Err(error) => {
+                log::error!("UDP input receive failed: {error}");
+                break;
+            }
+        }
+    }
+}
+
+fn on_pad_data(
+    engine: &Arc<EngineMutex<InputEngine>>,
+    pads: &Arc<Mutex<Vec<PadData>>>,
+    active: &Arc<AtomicI8>,
+    uuid: UUID,
+    port: u16,
+    client: usize,
+    data: response::PadData,
+) {
+    let pad_index = client * PADS_PER_CLIENT + data.info.id as usize;
+    if pad_index >= MAX_UDP_CLIENTS * PADS_PER_CLIENT {
+        log::error!("Invalid pad id {}", data.info.id);
+        return;
+    }
+
+    let time_difference = {
+        let mut pads = pads.lock().unwrap();
+        let pad = &mut pads[pad_index];
+        if data.packet_counter as u64 == pad.packet_sequence {
+            log::warn!(
+                "PadData packet dropped because its stale info. Current count: {} Packet count: {}",
+                pad.packet_sequence,
+                data.packet_counter
+            );
+            pad.connected = false;
+            return;
+        }
+        active.store(1, Ordering::Release);
+        pad.connected = true;
+        pad.pad_index = pad_index;
+        pad.packet_sequence = data.packet_counter as u64;
+        let now = Instant::now();
+        let elapsed = now.duration_since(pad.last_update).as_micros() as u64;
+        pad.last_update = now;
+        elapsed
+    };
+
+    let identifier = PadIdentifier {
+        guid: uuid,
+        port: port as usize,
+        pad: pad_index,
+    };
+    let gyro_scale = 1.0 / 312.0;
+    let motion = BasicMotion {
+        gyro_x: data.gyro.pitch * gyro_scale,
+        gyro_y: data.gyro.roll * gyro_scale,
+        gyro_z: -data.gyro.yaw * gyro_scale,
+        accel_x: data.accel.x,
+        accel_y: -data.accel.z,
+        accel_z: data.accel.y,
+        delta_timestamp: time_difference,
+    };
+    let callbacks = engine.lock().set_motion(&identifier, 0, &motion);
+    callbacks.dispatch();
+
+    let touch_param = common::param_package::ParamPackage::from_serialized(
+        common::settings::values().touch_device.get_value(),
+    );
+    let min_x = touch_param.get_int("min_x", 100) as u16;
+    let min_y = touch_param.get_int("min_y", 50) as u16;
+    let max_x = touch_param.get_int("max_x", 1800) as u16;
+    let max_y = touch_param.get_int("max_y", 850) as u16;
+    for (id, touch) in data.touch.iter().enumerate() {
+        let (axis_x, axis_y, button) = if id == 0 {
+            (PadAxes::Touch1X, PadAxes::Touch1Y, PadButton::Touch1)
+        } else {
+            (PadAxes::Touch2X, PadAxes::Touch2Y, PadButton::Touch2)
+        };
+        let x = (touch.x.clamp(min_x, max_x) - min_x) as f32 / (max_x - min_x) as f32;
+        let y = (touch.y.clamp(min_y, max_y) - min_y) as f32 / (max_y - min_y) as f32;
+        let is_active = touch.is_active != 0;
+        let callbacks =
+            engine
+                .lock()
+                .set_axis(&identifier, axis_x as i32, if is_active { x } else { 0.0 });
+        callbacks.dispatch();
+        let callbacks =
+            engine
+                .lock()
+                .set_axis(&identifier, axis_y as i32, if is_active { y } else { 0.0 });
+        callbacks.dispatch();
+        let callbacks = engine
+            .lock()
+            .set_button(&identifier, button as i32, is_active);
+        callbacks.dispatch();
+    }
+
+    for (axis, value) in [
+        (
+            PadAxes::LeftStickX,
+            (data.left_stick_x as f32 - 127.0) / 127.0,
+        ),
+        (
+            PadAxes::LeftStickY,
+            (data.left_stick_y as f32 - 127.0) / 127.0,
+        ),
+        (
+            PadAxes::RightStickX,
+            (data.right_stick_x as f32 - 127.0) / 127.0,
+        ),
+        (
+            PadAxes::RightStickY,
+            (data.right_stick_y as f32 - 127.0) / 127.0,
+        ),
+    ] {
+        let callbacks = engine.lock().set_axis(&identifier, axis as i32, value);
+        callbacks.dispatch();
+    }
+
+    const BUTTONS: [PadButton; 16] = [
+        PadButton::Share,
+        PadButton::L3,
+        PadButton::R3,
+        PadButton::Options,
+        PadButton::Up,
+        PadButton::Right,
+        PadButton::Down,
+        PadButton::Left,
+        PadButton::L2,
+        PadButton::R2,
+        PadButton::L1,
+        PadButton::R1,
+        PadButton::Triangle,
+        PadButton::Circle,
+        PadButton::Cross,
+        PadButton::Square,
+    ];
+    for (bit, button) in BUTTONS.into_iter().enumerate() {
+        let callbacks = engine.lock().set_button(
+            &identifier,
+            button as i32,
+            data.digital_button & (1 << bit) != 0,
+        );
+        callbacks.dispatch();
+    }
+    for (button, pressed) in [
+        (PadButton::Home, data.home != 0),
+        (PadButton::TouchHardPress, data.touch_hard_press != 0),
+    ] {
+        let callbacks = engine
+            .lock()
+            .set_button(&identifier, button as i32, pressed);
+        callbacks.dispatch();
+    }
+    let battery = UdpClient::get_battery_level(data.info.battery);
+    let callbacks = engine.lock().set_battery(&identifier, battery);
+    callbacks.dispatch();
 }
 
 impl Drop for UdpClient {
@@ -475,8 +790,8 @@ impl Drop for UdpClient {
 
 /// Port of `CalibrationConfigurationJob` class from udp_client.h
 pub struct CalibrationConfigurationJob {
-    // In C++: holds a Common::Event for completion signaling
-    completed: bool,
+    stop: Arc<AtomicBool>,
+    thread: Option<JoinHandle<()>>,
 }
 
 /// Port of CalibrationConfigurationJob::Status enum from udp_client.h
@@ -495,20 +810,58 @@ impl CalibrationConfigurationJob {
     /// computes min/max calibration values, and calls status/data callbacks.
     /// This requires the UDP Socket implementation (boost::asio).
     pub fn new(
-        _host: &str,
-        _port: u16,
-        _status_callback: Box<dyn Fn(CalibrationStatus)>,
-        _data_callback: Box<dyn Fn(u16, u16, u16, u16)>,
+        host: &str,
+        port: u16,
+        status_callback: Box<dyn Fn(CalibrationStatus) + Send + 'static>,
+        data_callback: Box<dyn Fn(u16, u16, u16, u16) + Send + 'static>,
     ) -> Self {
-        // The full implementation would create a UDP socket connection
-        // and spawn a calibration thread. Without boost::asio/tokio,
-        // we mark as immediately completed.
-        Self { completed: false }
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread_stop = Arc::clone(&stop);
+        let host = host.to_string();
+        let thread = thread::spawn(move || {
+            let mut min_x = u16::MAX;
+            let mut min_y = u16::MAX;
+            let mut current_status = CalibrationStatus::Initialized;
+            let callback_stop = Arc::clone(&thread_stop);
+            socket_loop(&host, port, Arc::clone(&thread_stop), move |data| {
+                const CALIBRATION_THRESHOLD: u16 = 100;
+                if current_status == CalibrationStatus::Initialized {
+                    current_status = CalibrationStatus::Ready;
+                    status_callback(current_status);
+                }
+                let touch = data.touch[0].clone();
+                if touch.is_active == 0 {
+                    return;
+                }
+                log::debug!("Current touch: {} {}", touch.x, touch.y);
+                min_x = min_x.min(touch.x);
+                min_y = min_y.min(touch.y);
+                if current_status == CalibrationStatus::Ready {
+                    current_status = CalibrationStatus::Stage1Completed;
+                    status_callback(current_status);
+                }
+                if touch.x.saturating_sub(min_x) > CALIBRATION_THRESHOLD
+                    && touch.y.saturating_sub(min_y) > CALIBRATION_THRESHOLD
+                {
+                    current_status = CalibrationStatus::Completed;
+                    data_callback(min_x, min_y, touch.x, touch.y);
+                    status_callback(current_status);
+                    callback_stop.store(true, Ordering::Release);
+                }
+            });
+        });
+        Self {
+            stop,
+            thread: Some(thread),
+        }
     }
 
     /// Port of CalibrationConfigurationJob::Stop
     pub fn stop(&mut self) {
-        self.completed = true;
+        self.stop.store(true, Ordering::Release);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
     }
 }
 
@@ -524,11 +877,93 @@ impl Drop for CalibrationConfigurationJob {
 /// and calls success/failure callbacks based on whether data arrives
 /// within 10 seconds. Requires UDP socket implementation.
 pub fn test_communication(
-    _host: &str,
-    _port: u16,
-    _success_callback: Box<dyn Fn()>,
-    _failure_callback: Box<dyn Fn()>,
+    host: &str,
+    port: u16,
+    success_callback: Box<dyn Fn() + Send + 'static>,
+    failure_callback: Box<dyn Fn() + Send + 'static>,
 ) {
-    // Without async networking, call failure callback immediately
-    _failure_callback();
+    let host = host.to_string();
+    thread::spawn(move || {
+        let stop = Arc::new(AtomicBool::new(false));
+        let success = Arc::new(AtomicBool::new(false));
+        let callback_stop = Arc::clone(&stop);
+        let callback_success = Arc::clone(&success);
+        socket_loop_until(
+            &host,
+            port,
+            Arc::clone(&stop),
+            Some(Instant::now() + Duration::from_secs(10)),
+            &mut move |_| {
+                callback_success.store(true, Ordering::Release);
+                callback_stop.store(true, Ordering::Release);
+            },
+        );
+        if success.load(Ordering::Acquire) {
+            success_callback();
+        } else {
+            failure_callback();
+        }
+    });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::mpsc;
+
+    fn crc32(data: &[u8]) -> u32 {
+        let mut crc = u32::MAX;
+        for &byte in data {
+            crc ^= byte as u32;
+            for _ in 0..8 {
+                crc = if crc & 1 != 0 {
+                    (crc >> 1) ^ 0xEDB_88320
+                } else {
+                    crc >> 1
+                };
+            }
+        }
+        !crc
+    }
+
+    fn pad_response() -> Vec<u8> {
+        let mut packet = vec![0u8; std::mem::size_of::<udp_protocol::Header>() + 80];
+        packet[0..4].copy_from_slice(&udp_protocol::SERVER_MAGIC.to_le_bytes());
+        packet[4..6].copy_from_slice(&udp_protocol::PROTOCOL_VERSION.to_le_bytes());
+        packet[6..8].copy_from_slice(&84u16.to_le_bytes());
+        packet[16..20].copy_from_slice(&(MessageType::PadData as u32).to_le_bytes());
+        packet[21] = response::State::Connected as u8;
+        packet[22] = response::Model::FullGyro as u8;
+        packet[23] = response::ConnectionType::Usb as u8;
+        packet[30] = response::Battery::Full as u8;
+        packet[32..36].copy_from_slice(&1u32.to_le_bytes());
+        let checksum = crc32(&packet);
+        packet[8..12].copy_from_slice(&checksum.to_le_bytes());
+        packet
+    }
+
+    #[test]
+    fn communication_test_reports_a_valid_pad_packet() {
+        let server = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        server
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let port = server.local_addr().unwrap().port();
+        let responder = thread::spawn(move || {
+            let mut request = [0u8; MAX_PACKET_SIZE];
+            let (_, peer) = server.recv_from(&mut request).unwrap();
+            server.send_to(&pad_response(), peer).unwrap();
+        });
+
+        let (sender, receiver) = mpsc::channel();
+        let success = sender.clone();
+        test_communication(
+            "127.0.0.1",
+            port,
+            Box::new(move || success.send(true).unwrap()),
+            Box::new(move || sender.send(false).unwrap()),
+        );
+        assert_eq!(receiver.recv_timeout(Duration::from_secs(3)).unwrap(), true);
+        responder.join().unwrap();
+    }
 }

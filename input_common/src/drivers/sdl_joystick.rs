@@ -62,18 +62,36 @@ pub struct SdlJoystick {
 
     has_vibration: bool,
     is_vibration_tested: bool,
+    has_hd_rumble: bool,
 }
 
-/// Copy of upstream's two non-owning SDL pointers.
+fn controller_has_hd_rumble(controller: *mut sdl::SDL_GameController) -> bool {
+    if controller.is_null() {
+        return false;
+    }
+    let controller_type = unsafe { sdl::SDL_GameControllerGetType(controller) };
+    matches!(
+        controller_type,
+        sdl::SDL_GameControllerType::SDL_CONTROLLER_TYPE_NINTENDO_SWITCH_PRO
+            | sdl::SDL_GameControllerType::SDL_CONTROLLER_TYPE_NINTENDO_SWITCH_JOYCON_LEFT
+            | sdl::SDL_GameControllerType::SDL_CONTROLLER_TYPE_NINTENDO_SWITCH_JOYCON_RIGHT
+            | sdl::SDL_GameControllerType::SDL_CONTROLLER_TYPE_PS5
+    )
+}
+
+/// Snapshot of upstream's two non-owning SDL pointers and their controller type.
 ///
 /// Rust keeps `SdlJoystick` behind a mutex for mutable reconnect state. SDL
 /// calls must use this snapshot after that mutex is released: SDL invokes the
 /// event watcher while holding its own joystick lock, so calling back into SDL
-/// while holding the Rust mutex creates the opposite lock order.
+/// while holding the Rust mutex creates the opposite lock order. The HD-rumble
+/// classification is immutable for the lifetime of these handles and keeps
+/// `SetVibration` out of SDL's event-pump lock.
 #[derive(Clone, Copy)]
 pub(crate) struct SdlJoystickHandles {
     joystick: *mut sdl::SDL_Joystick,
     controller: *mut sdl::SDL_GameController,
+    has_hd_rumble: bool,
 }
 
 impl SdlJoystickHandles {
@@ -110,17 +128,7 @@ impl SdlJoystickHandles {
 
     /// Upstream `SDLJoystick::HasHDRumble`.
     pub(crate) fn has_hd_rumble(self) -> bool {
-        if self.controller.is_null() {
-            return false;
-        }
-        let controller_type = unsafe { sdl::SDL_GameControllerGetType(self.controller) };
-        matches!(
-            controller_type,
-            sdl::SDL_GameControllerType::SDL_CONTROLLER_TYPE_NINTENDO_SWITCH_PRO
-                | sdl::SDL_GameControllerType::SDL_CONTROLLER_TYPE_NINTENDO_SWITCH_JOYCON_LEFT
-                | sdl::SDL_GameControllerType::SDL_CONTROLLER_TYPE_NINTENDO_SWITCH_JOYCON_RIGHT
-                | sdl::SDL_GameControllerType::SDL_CONTROLLER_TYPE_PS5
-        )
+        self.has_hd_rumble
     }
 }
 
@@ -150,6 +158,7 @@ impl SdlJoystick {
             has_accel: false,
             has_vibration: false,
             is_vibration_tested: false,
+            has_hd_rumble: controller_has_hd_rumble(sdl_controller),
         };
         joystick.enable_motion();
         joystick
@@ -282,6 +291,7 @@ impl SdlJoystick {
         SdlJoystickHandles {
             joystick: self.sdl_joystick,
             controller: self.sdl_controller,
+            has_hd_rumble: self.has_hd_rumble,
         }
     }
 
@@ -334,6 +344,7 @@ impl SdlJoystick {
         self.close_handles();
         self.sdl_joystick = joystick;
         self.sdl_controller = controller;
+        self.has_hd_rumble = controller_has_hd_rumble(controller);
     }
 
     /// Upstream `SDLJoystick::GetControllerName`.
@@ -388,6 +399,7 @@ impl SdlJoystick {
                 self.sdl_joystick = std::ptr::null_mut();
             }
         }
+        self.has_hd_rumble = false;
     }
 }
 
@@ -493,5 +505,16 @@ mod tests {
             SdlJoystick::battery_level(P::SDL_JOYSTICK_POWER_UNKNOWN),
             BatteryLevel::None
         );
+    }
+
+    #[test]
+    fn hd_rumble_query_uses_the_handle_snapshot_cache() {
+        let handles = SdlJoystickHandles {
+            joystick: std::ptr::null_mut(),
+            controller: std::ptr::null_mut(),
+            has_hd_rumble: true,
+        };
+
+        assert!(handles.has_hd_rumble());
     }
 }

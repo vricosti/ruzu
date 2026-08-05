@@ -890,9 +890,8 @@ impl<'a> TranslatorVisitor<'a> {
             }
 
             // texture_fetch.cpp
-            MaxwellOpcode::TEX | MaxwellOpcode::TEX_b => {
-                self::texture_fetch::tex(self, insn, opcode);
-            }
+            MaxwellOpcode::TEX => self::texture_fetch::tex(self, insn, opcode),
+            MaxwellOpcode::TEX_b => self::texture_fetch::tex_b(self, insn, opcode),
 
             // texture_fetch_swizzled.cpp
             MaxwellOpcode::TEXS => {
@@ -900,9 +899,8 @@ impl<'a> TranslatorVisitor<'a> {
             }
 
             // texture_load.cpp
-            MaxwellOpcode::TLD | MaxwellOpcode::TLD_b => {
-                self::texture_load::tld(self, insn, opcode);
-            }
+            MaxwellOpcode::TLD => self::texture_load::tld(self, insn, opcode),
+            MaxwellOpcode::TLD_b => self::texture_load::tld_b(self, insn, opcode),
 
             // texture_load_swizzled.cpp
             MaxwellOpcode::TLDS => {
@@ -927,9 +925,8 @@ impl<'a> TranslatorVisitor<'a> {
             MaxwellOpcode::TMML_b => self::texture_mipmap_level::tmml_b(self, insn),
 
             // texture_query.cpp
-            MaxwellOpcode::TXQ | MaxwellOpcode::TXQ_b => {
-                self::texture_query::txq(self, insn, opcode);
-            }
+            MaxwellOpcode::TXQ => self::texture_query::txq(self, insn, opcode),
+            MaxwellOpcode::TXQ_b => self::texture_query::txq_b(self, insn, opcode),
 
             // load_store_attribute.cpp
             MaxwellOpcode::ALD => {
@@ -1201,6 +1198,71 @@ mod tests {
             .find(|inst| inst.opcode == Opcode::CompositeConstructU32x2)
             .expect("GetDoubleCbuf must construct a pair");
         assert_eq!(construct.args[0], Value::ImmU32(0));
+    }
+
+    #[test]
+    fn tex_b_dispatch_uses_bindless_field_layout() {
+        let mut program = Program::new(ShaderStage::Fragment);
+        program.blocks.push(Block::new());
+        let mut tv = TranslatorVisitor::new(&mut program, 0);
+
+        // Bit 58 is set while bit 40 is clear. TEX would interpret this as
+        // unsupported LC, whereas TEX_b reads LC from bit 40 like upstream.
+        tv.translate_instruction(0xDEBA_0000_A0E7_0807);
+
+        let opcodes: Vec<_> = tv.ir.program.blocks[0]
+            .iter()
+            .map(|inst| inst.opcode)
+            .collect();
+        assert!(opcodes.iter().any(|opcode| matches!(
+            opcode,
+            Opcode::BindlessImageSampleImplicitLod
+                | Opcode::BindlessImageSampleExplicitLod
+                | Opcode::BindlessImageSampleDrefImplicitLod
+                | Opcode::BindlessImageSampleDrefExplicitLod
+        )));
+        assert!(!opcodes.iter().any(|opcode| matches!(
+            opcode,
+            Opcode::BoundImageSampleImplicitLod
+                | Opcode::BoundImageSampleExplicitLod
+                | Opcode::BoundImageSampleDrefImplicitLod
+                | Opcode::BoundImageSampleDrefExplicitLod
+        )));
+    }
+
+    #[test]
+    fn tld_b_dispatch_emits_bindless_fetch() {
+        let mut program = Program::new(ShaderStage::Fragment);
+        program.blocks.push(Block::new());
+        let mut tv = TranslatorVisitor::new(&mut program, 0);
+        let insn =
+            0xDD00_0000_0000_0000 | 1 | (8u64 << 8) | (20u64 << 20) | (2u64 << 28) | (1u64 << 31);
+
+        tv.translate_instruction(insn);
+
+        let opcodes: Vec<_> = tv.ir.program.blocks[0]
+            .iter()
+            .map(|inst| inst.opcode)
+            .collect();
+        assert!(opcodes.contains(&Opcode::BindlessImageFetch));
+        assert!(!opcodes.contains(&Opcode::BoundImageFetch));
+    }
+
+    #[test]
+    fn txq_b_dispatch_emits_bindless_query() {
+        let mut program = Program::new(ShaderStage::Fragment);
+        program.blocks.push(Block::new());
+        let mut tv = TranslatorVisitor::new(&mut program, 0);
+        let insn = 0xDF50_0000_0000_0000 | 4 | (8u64 << 8) | (1u64 << 22) | (8u64 << 31);
+
+        tv.translate_instruction(insn);
+
+        let opcodes: Vec<_> = tv.ir.program.blocks[0]
+            .iter()
+            .map(|inst| inst.opcode)
+            .collect();
+        assert!(opcodes.contains(&Opcode::BindlessImageQueryDimensions));
+        assert!(!opcodes.contains(&Opcode::BoundImageQueryDimensions));
     }
 
     #[test]

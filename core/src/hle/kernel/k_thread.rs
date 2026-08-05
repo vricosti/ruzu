@@ -54,6 +54,19 @@ pub(crate) const CONTEXT_GUARD_UNOWNED: i32 = -1;
 // ProcessLock swap: `pub type ProcessLock = SyncCell<KProcess>`.
 pub type KThreadLock = super::sync_cell::KThreadCell;
 
+/// Upstream anonymous `ThreadLocalRegion` in `k_thread.cpp`.
+#[repr(C)]
+struct ThreadLocalRegion {
+    message_buffer: [u32; 0x100 / std::mem::size_of::<u32>()],
+    disable_count: AtomicU16,
+    interrupt_flag: AtomicU16,
+}
+
+const THREAD_LOCAL_DISABLE_COUNT_OFFSET: u64 =
+    std::mem::offset_of!(ThreadLocalRegion, disable_count) as u64;
+const THREAD_LOCAL_INTERRUPT_FLAG_OFFSET: u64 =
+    std::mem::offset_of!(ThreadLocalRegion, interrupt_flag) as u64;
+
 fn should_trace_wait_debug() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| std::env::var_os("RUZU_TRACE_WAIT_SYNC").is_some())
@@ -942,15 +955,13 @@ impl KThread {
         if tls_addr == 0 {
             return 0;
         }
-        // ThreadLocalRegion::disable_count is at offset 0x100.
-        const DISABLE_COUNT_OFFSET: u64 = 0x100;
-        let addr = tls_addr + DISABLE_COUNT_OFFSET;
+        let addr = tls_addr + THREAD_LOCAL_DISABLE_COUNT_OFFSET;
 
         if let Some(parent) = self.parent.as_ref().and_then(|w| w.upgrade()) {
-            let process = parent.lock().unwrap();
-            let memory = process.get_shared_memory();
-            let mem = memory.read().unwrap();
-            mem.read_16(addr)
+            let memory = parent.lock().unwrap().get_memory();
+            memory
+                .map(|memory| memory.lock().unwrap().read_16(addr))
+                .unwrap_or(0)
         } else {
             0
         }
@@ -967,15 +978,12 @@ impl KThread {
         if tls_addr == 0 {
             return;
         }
-        // ThreadLocalRegion::interrupt_flag is at offset 0x102.
-        const INTERRUPT_FLAG_OFFSET: u64 = 0x102;
-        let addr = tls_addr + INTERRUPT_FLAG_OFFSET;
+        let addr = tls_addr + THREAD_LOCAL_INTERRUPT_FLAG_OFFSET;
 
         if let Some(parent) = self.parent.as_ref().and_then(|w| w.upgrade()) {
-            let mut process = parent.lock().unwrap();
-            let memory = process.get_shared_memory();
-            let mut mem = memory.write().unwrap();
-            mem.write_16(addr, 1);
+            if let Some(memory) = parent.lock().unwrap().get_memory() {
+                memory.lock().unwrap().write_16(addr, 1);
+            }
         }
     }
 
@@ -990,14 +998,12 @@ impl KThread {
         if tls_addr == 0 {
             return;
         }
-        const INTERRUPT_FLAG_OFFSET: u64 = 0x102;
-        let addr = tls_addr + INTERRUPT_FLAG_OFFSET;
+        let addr = tls_addr + THREAD_LOCAL_INTERRUPT_FLAG_OFFSET;
 
         if let Some(parent) = self.parent.as_ref().and_then(|w| w.upgrade()) {
-            let mut process = parent.lock().unwrap();
-            let memory = process.get_shared_memory();
-            let mut mem = memory.write().unwrap();
-            mem.write_16(addr, 0);
+            if let Some(memory) = parent.lock().unwrap().get_memory() {
+                memory.lock().unwrap().write_16(addr, 0);
+            }
         }
     }
 
@@ -4166,6 +4172,7 @@ mod tests {
     use super::*;
     use crate::core::SystemRef;
     use crate::hle::kernel::global_scheduler_context::GlobalSchedulerContext;
+    use crate::hle::kernel::k_memory_block::PAGE_SIZE;
     use crate::hle::kernel::k_process::KProcess;
     use crate::hle::kernel::k_scheduler::KScheduler;
     use crate::hle::kernel::k_scheduler_lock;
@@ -4230,6 +4237,121 @@ mod tests {
         assert_eq!(thread.get_thread_id(), 0);
         assert!(!thread.is_initialized());
         assert!(!thread.is_dummy_thread());
+    }
+
+    #[test]
+    fn user_preemption_state_uses_process_memory_bridge() {
+        assert_eq!(std::mem::size_of::<ThreadLocalRegion>(), 0x104);
+        assert_eq!(THREAD_LOCAL_DISABLE_COUNT_OFFSET, 0x100);
+        assert_eq!(THREAD_LOCAL_INTERRUPT_FLAG_OFFSET, 0x102);
+
+        let mut system = crate::core::System::new_for_test();
+        system.initialize();
+        {
+            let kernel = system
+                .kernel_mut()
+                .expect("test system must own an initialized kernel");
+            kernel.initialize();
+            kernel.initialize_memory_block_slab_manager(4096);
+            kernel.memory_manager_mut().initialize_pool(
+                crate::hle::kernel::k_memory_manager::Pool::Application,
+                0x1_0000_0000,
+                0x80000 * PAGE_SIZE,
+            );
+        }
+        let mut process = KProcess::new();
+        process.process_id = 100;
+        process.capabilities.core_mask = 0xF;
+        process.capabilities.priority_mask = u64::MAX;
+        process.initialize_handle_table();
+        process.resource_limit = Some(Arc::new(Mutex::new(
+            crate::hle::kernel::k_resource_limit::create_resource_limit_for_process(0x4000_0000),
+        )));
+        process.create_memory(&system);
+        process.allocate_code_memory(0x20_0000, 0x40_000);
+        process
+            .page_table
+            .set_heap_region(KProcessAddress::new(0x40_0000), 0x20_0000);
+        let (result, tls_address) = process.set_heap_size(PAGE_SIZE);
+        assert_eq!(result, RESULT_SUCCESS.get_inner_value());
+
+        {
+            let page_table = process.page_table.get_base_mut();
+            let memory = page_table
+                .m_memory
+                .as_ref()
+                .expect("test page table memory must be attached")
+                .clone();
+            let impl_page_table = page_table
+                .m_impl
+                .as_mut()
+                .expect("test page table backend must be initialized");
+            memory
+                .lock()
+                .unwrap()
+                .set_current_page_table(impl_page_table.as_mut() as *mut _);
+        }
+
+        let tls_address = tls_address.get();
+        let memory = process
+            .get_memory()
+            .expect("test process must own upstream-shaped Memory");
+        memory
+            .lock()
+            .unwrap()
+            .write_16(tls_address + THREAD_LOCAL_DISABLE_COUNT_OFFSET, 3);
+        memory
+            .lock()
+            .unwrap()
+            .write_16(tls_address + THREAD_LOCAL_INTERRUPT_FLAG_OFFSET, 0);
+
+        // Keep contradictory values in the retired compatibility store. The
+        // upstream KThread methods use KProcess::GetMemory(), never this store.
+        process
+            .process_memory
+            .write()
+            .unwrap()
+            .write_16(tls_address + THREAD_LOCAL_DISABLE_COUNT_OFFSET, 0);
+        process
+            .process_memory
+            .write()
+            .unwrap()
+            .write_16(tls_address + THREAD_LOCAL_INTERRUPT_FLAG_OFFSET, 0xBEEF);
+
+        let process = Arc::new(ProcessLock::from_value(process));
+        let mut thread = KThread::new();
+        thread.parent = Some(Arc::downgrade(&process));
+        thread.tls_address = KProcessAddress::new(tls_address);
+
+        assert_eq!(thread.get_user_disable_count(), 3);
+
+        thread.set_interrupt_flag();
+        assert_eq!(
+            memory
+                .lock()
+                .unwrap()
+                .read_16(tls_address + THREAD_LOCAL_INTERRUPT_FLAG_OFFSET),
+            1
+        );
+        assert_eq!(
+            process
+                .lock()
+                .unwrap()
+                .process_memory
+                .read()
+                .unwrap()
+                .read_16(tls_address + THREAD_LOCAL_INTERRUPT_FLAG_OFFSET),
+            0xBEEF
+        );
+
+        thread.clear_interrupt_flag();
+        assert_eq!(
+            memory
+                .lock()
+                .unwrap()
+                .read_16(tls_address + THREAD_LOCAL_INTERRUPT_FLAG_OFFSET),
+            0
+        );
     }
 
     #[test]

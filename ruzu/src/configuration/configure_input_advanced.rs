@@ -8,6 +8,9 @@
 // Two columns: "Joycon Colors" on the left (a 2x4 grid of per-player body /
 // button colour swatches) and, on the right, "Emulated Devices" over "Other".
 
+use std::cell::RefCell;
+use std::rc::Rc;
+
 use gtk::prelude::*;
 
 use common::settings_input::PlayerInput;
@@ -20,7 +23,7 @@ const SWATCH_WIDTH: i32 = 70;
 const SWATCH_HEIGHT: i32 = 26;
 
 /// Build the Controls "Advanced" tab — upstream `ConfigureInputAdvanced`.
-pub fn page() -> Page {
+pub fn page(input_subsystem: Rc<RefCell<input_common::InputSubsystem>>) -> Page {
     let (scroller, column) = w::page();
 
     let split = gtk::Box::new(gtk::Orientation::Horizontal, 10);
@@ -147,9 +150,8 @@ pub fn page() -> Page {
 
     column.append(&split);
 
-    // The per-device Configure dialogs (`ConfigureDebugController`,
-    // `ConfigureRingController`, `ConfigureTouchscreenAdvanced`,
-    // `ConfigureMotionTouch`) are separate upstream widgets; log until ported.
+    // The remaining per-device Configure dialogs are separate upstream
+    // widgets; log until their matching owners are ported.
     for (button, name) in [
         (&touchscreen.configure, "Touchscreen advanced"),
         (&debug_controller.configure, "Debug controller"),
@@ -162,8 +164,8 @@ pub fn page() -> Page {
             log::info!("Controls: {name} configuration not yet ported");
         });
     }
-    configure_motion_touch.connect_clicked(|_| {
-        log::info!("Controls: Motion / Touch configuration not yet ported");
+    configure_motion_touch.connect_clicked(move |button| {
+        super::configure_motion_touch::present(button, Rc::clone(&input_subsystem));
     });
 
     Page::new("Advanced", scroller, move || {

@@ -575,12 +575,15 @@ impl GMainWindow {
         this.start_status_bar_updates();
 
         // Game list page: activating a row boots that game in-process.
-        let (game_list, game_list_handle) = crate::game_list::build(glib::clone!(
-            #[weak(rename_to = w)]
-            this,
-            #[upgrade_or_default]
-            move |path: String| w.boot_game(path)
-        ));
+        let (game_list, game_list_handle) = crate::game_list::build(
+            &this.hid_core,
+            glib::clone!(
+                #[weak(rename_to = w)]
+                this,
+                #[upgrade_or_default]
+                move |path: String| w.boot_game(path)
+            ),
+        );
         this.stack.add_named(&game_list, Some(PAGE_GAME_LIST));
         this.stack.set_visible_child_name(PAGE_GAME_LIST);
         *this.game_list.borrow_mut() = Some(game_list_handle);
@@ -893,6 +896,17 @@ impl GMainWindow {
                     }
                 }
 
+                // Upstream sends launcher keys to `QTreeView`, not through
+                // `GRenderWindow::keyPressEvent`. Let the GTK game list own
+                // these keys too; otherwise a mapped keyboard direction also
+                // reaches ControllerNavigation and moves two rows.
+                if this.session.borrow().is_none()
+                    && this.stack.visible_child_name().as_deref() == Some(PAGE_GAME_LIST)
+                    && crate::game_list::navigation_key_for_gdk(keyval).is_some()
+                {
+                    return glib::Propagation::Proceed;
+                }
+
                 this.on_key_event(keyval, state, true);
                 // Upstream delivers gameplay keys to the focused
                 // GRenderWindow, whose keyPressEvent does not forward them to
@@ -912,6 +926,12 @@ impl GMainWindow {
             move |_, keyval, _keycode, state| {
                 if this.session.borrow().is_some()
                     && (keyval == gtk::gdk::Key::F5 || fullscreen_hotkey(keyval).is_some())
+                {
+                    return;
+                }
+                if this.session.borrow().is_none()
+                    && this.stack.visible_child_name().as_deref() == Some(PAGE_GAME_LIST)
+                    && crate::game_list::navigation_key_for_gdk(keyval).is_some()
                 {
                     return;
                 }
@@ -2130,6 +2150,9 @@ impl GMainWindow {
     /// Switch the central stack back to the game list.
     pub fn show_game_list(&self) {
         self.stack.set_visible_child_name(PAGE_GAME_LIST);
+        if let Some(game_list) = self.game_list.borrow().as_ref() {
+            game_list.focus();
+        }
     }
 
     /// Upstream `GMainWindow::OnStopGame` and `ConfirmShutdownGame`.

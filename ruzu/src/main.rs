@@ -31,6 +31,7 @@ mod render_window_windows;
 mod render_window_x11;
 mod status_bar;
 mod uisettings;
+mod util;
 
 use main_window::GMainWindow;
 
@@ -46,6 +47,16 @@ thread_local! {
 /// Store the main window, dropping any previous one.
 fn set_main_window(window: Rc<GMainWindow>) {
     MAIN_WINDOW.with(|slot| *slot.borrow_mut() = Some(window));
+}
+
+/// Return the process-wide main window, if it has already been created.
+///
+/// `gio::Application` forwards later launches to the existing process and
+/// emits `activate` or `open` again. Reusing the window preserves upstream's
+/// single `GMainWindow` lifetime and, critically, its single input subsystem
+/// and emulation `System`.
+fn main_window() -> Option<Rc<GMainWindow>> {
+    MAIN_WINDOW.with(|slot| slot.borrow().as_ref().cloned())
 }
 
 #[cfg(target_os = "linux")]
@@ -129,6 +140,11 @@ fn main() -> glib::ExitCode {
     // tree, but our wrapper owns the session, loading screen, and the `Weak`
     // captured by the menu actions. Keep it in a thread-local.
     app.connect_activate(|app| {
+        if let Some(window) = main_window() {
+            window.present();
+            return;
+        }
+
         let window = GMainWindow::new(app);
         window.present();
         set_main_window(window);
@@ -138,12 +154,17 @@ fn main() -> glib::ExitCode {
     // `activate`. Boot the first file directly (like `yuzu <game>`); the window
     // defers the boot until its render surface is realized.
     app.connect_open(|app, files, _hint| {
-        let window = GMainWindow::new_for_direct_game(app);
+        let existing_window = main_window();
+        let window = existing_window
+            .clone()
+            .unwrap_or_else(|| GMainWindow::new_for_direct_game(app));
         window.present();
         if let Some(path) = files.first().and_then(|f| f.path()) {
             window.boot_game(path.to_string_lossy().into_owned());
         }
-        set_main_window(window);
+        if existing_window.is_none() {
+            set_main_window(window);
+        }
     });
 
     app.run()

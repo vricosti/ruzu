@@ -30,6 +30,7 @@ use ruzu_core::loader::loader::{get_loader, FileType, ResultStatus, System as Lo
 
 use crate::configuration::qt_config;
 use crate::uisettings::{self, GameDir};
+use crate::util::controller_navigation::{ControllerNavigation, NavigationKey};
 
 /// Pixel size of the game icon shown in the list.
 const ICON_SIZE: i32 = 48;
@@ -153,11 +154,14 @@ impl GameEntry {
 struct GameListView {
     root: gtk::Box,
     stack: gtk::Stack,
+    column_view: gtk::ColumnView,
     store: gio::ListStore,
     /// Kept so a rescan can restore the selected directory: rebuilding the
     /// store clears the selection, which would otherwise disable the
     /// per-directory toolbar actions after every single use of them.
     selection: gtk::SingleSelection,
+    controller_navigation: ControllerNavigation,
+    on_activate: Rc<dyn Fn(String)>,
 }
 
 type ContextMenuHandler = Rc<dyn Fn(GameEntry, gtk::Widget, u32, f64, f64)>;
@@ -178,11 +182,19 @@ impl GameListHandle {
     pub fn reload(&self) {
         self.0.reload();
     }
+
+    /// Give keyboard navigation back to the list after returning from a game.
+    pub fn focus(&self) {
+        self.0.column_view.grab_focus();
+    }
 }
 
 /// Build the game list widget. `on_activate` is invoked with the game's path
 /// when a game row is activated (double-click / Enter).
-pub fn build<F: Fn(String) + 'static>(on_activate: F) -> (gtk::Widget, GameListHandle) {
+pub fn build<F: Fn(String) + 'static>(
+    hid_core: &Arc<parking_lot::Mutex<hid_core::hid_core::HIDCore>>,
+    on_activate: F,
+) -> (gtk::Widget, GameListHandle) {
     install_list_css();
 
     let store = gio::ListStore::new::<GameEntry>();
@@ -209,6 +221,9 @@ pub fn build<F: Fn(String) + 'static>(on_activate: F) -> (gtk::Widget, GameListH
     // The banding comes from the CSS below, not from GTK's separators.
     column_view.set_show_row_separators(false);
     column_view.set_show_column_separators(false);
+    column_view.connect_map(|view| {
+        view.grab_focus();
+    });
 
     let on_activate: Rc<dyn Fn(String)> = Rc::new(on_activate);
     let context_view: Rc<RefCell<Weak<GameListView>>> = Rc::new(RefCell::new(Weak::new()));
@@ -231,29 +246,6 @@ pub fn build<F: Fn(String) + 'static>(on_activate: F) -> (gtk::Widget, GameListH
         Rc::clone(&on_context_menu),
     ));
     column_view.append_column(&make_text_column("Size", GameEntry::size, on_context_menu));
-
-    // Activate (double-click / Enter) → boot a game; on a directory row, toggle
-    // it open instead, which is what a tree row activation should do.
-    {
-        let on_activate = Rc::clone(&on_activate);
-        column_view.connect_activate(move |view, position| {
-            let Some(row) = view
-                .model()
-                .and_then(|model| model.item(position))
-                .and_downcast::<gtk::TreeListRow>()
-            else {
-                return;
-            };
-            let Some(entry) = row.item().and_downcast::<GameEntry>() else {
-                return;
-            };
-            if entry.is_folder() {
-                row.set_expanded(!row.is_expanded());
-            } else {
-                on_activate(entry.path());
-            }
-        });
-    }
 
     let scroller = gtk::ScrolledWindow::builder()
         .hexpand(true)
@@ -301,10 +293,68 @@ pub fn build<F: Fn(String) + 'static>(on_activate: F) -> (gtk::Widget, GameListH
     let view = Rc::new(GameListView {
         root: root.clone(),
         stack,
+        column_view: column_view.clone(),
         store,
         selection: selection.clone(),
+        controller_navigation: ControllerNavigation::new(hid_core),
+        on_activate,
     });
     *context_view.borrow_mut() = Rc::downgrade(&view);
+
+    // Activate (double-click / Enter) → boot a game; on a directory row, toggle
+    // it open instead, which is what a tree row activation should do.
+    column_view.connect_activate({
+        let view = Rc::downgrade(&view);
+        move |_, position| {
+            if let Some(view) = view.upgrade() {
+                view.activate_position(position);
+            }
+        }
+    });
+
+    let keys = gtk::EventControllerKey::new();
+    keys.set_propagation_phase(gtk::PropagationPhase::Capture);
+    keys.connect_key_pressed({
+        let view = Rc::downgrade(&view);
+        move |_, keyval, _, _| {
+            let Some(key) = navigation_key_for_gdk(keyval) else {
+                return glib::Propagation::Proceed;
+            };
+            if view
+                .upgrade()
+                .is_some_and(|view| view.handle_navigation(key))
+            {
+                glib::Propagation::Stop
+            } else {
+                glib::Propagation::Proceed
+            }
+        }
+    });
+    column_view.add_controller(keys);
+
+    // HID callbacks can run outside GTK's main context. Drain their actions on
+    // the UI thread and discard presses while the game list is not active,
+    // matching upstream's `IsPoweredOn` / `isActiveWindow` guards.
+    glib::timeout_add_local(std::time::Duration::from_millis(1), {
+        let view = Rc::downgrade(&view);
+        move || {
+            let Some(view) = view.upgrade() else {
+                return glib::ControlFlow::Break;
+            };
+            let list_is_active = view.root.is_mapped()
+                && view
+                    .parent_window()
+                    .is_some_and(|window| window.is_active());
+            if list_is_active {
+                for key in view.controller_navigation.take_pending_keys() {
+                    view.handle_navigation(key);
+                }
+            } else {
+                view.controller_navigation.discard_pending_keys();
+            }
+            glib::ControlFlow::Continue
+        }
+    });
 
     // Toolbar + empty-state actions.
     for button in [&add_button, &empty.add_button] {
@@ -370,6 +420,89 @@ fn build_empty_state() -> EmptyState {
 }
 
 impl GameListView {
+    fn activate_position(&self, position: u32) {
+        let Some(row) = self
+            .selection
+            .model()
+            .and_then(|model| model.item(position))
+            .and_downcast::<gtk::TreeListRow>()
+        else {
+            return;
+        };
+        let Some(entry) = row.item().and_downcast::<GameEntry>() else {
+            return;
+        };
+        if entry.is_folder() {
+            row.set_expanded(!row.is_expanded());
+        } else {
+            (self.on_activate)(entry.path());
+        }
+    }
+
+    fn handle_navigation(&self, key: NavigationKey) -> bool {
+        let Some(model) = self.selection.model() else {
+            return false;
+        };
+        let count = model.n_items();
+        if count == 0 {
+            return false;
+        }
+
+        let selected = self.selection.selected();
+        match key {
+            NavigationKey::Down => {
+                let next = if selected == gtk::INVALID_LIST_POSITION {
+                    0
+                } else {
+                    (selected + 1).min(count - 1)
+                };
+                self.select_position(next);
+            }
+            NavigationKey::Up => {
+                let next = if selected == gtk::INVALID_LIST_POSITION {
+                    0
+                } else {
+                    selected.saturating_sub(1)
+                };
+                self.select_position(next);
+            }
+            NavigationKey::Left | NavigationKey::Right => {
+                if selected == gtk::INVALID_LIST_POSITION {
+                    self.select_position(0);
+                    return true;
+                }
+                let Some(row) = model.item(selected).and_downcast::<gtk::TreeListRow>() else {
+                    return false;
+                };
+                if key == NavigationKey::Right {
+                    if row.is_expandable() && !row.is_expanded() {
+                        row.set_expanded(true);
+                    } else if let Some(child) = row.child_row(0) {
+                        self.select_position(child.position());
+                    }
+                } else if row.is_expanded() {
+                    row.set_expanded(false);
+                } else if let Some(parent) = row.parent() {
+                    self.select_position(parent.position());
+                }
+            }
+            NavigationKey::Enter => {
+                if selected == gtk::INVALID_LIST_POSITION {
+                    self.select_position(0);
+                } else {
+                    self.activate_position(selected);
+                }
+            }
+            NavigationKey::Escape => return false,
+        }
+        true
+    }
+
+    fn select_position(&self, position: u32) {
+        self.selection.set_selected(position);
+        self.column_view.grab_focus();
+    }
+
     /// `GameList::PopupContextMenu`: show the menu owned by the clicked row.
     fn popup_context_menu(
         self: &Rc<Self>,
@@ -749,6 +882,18 @@ impl GameListView {
         if let Err(e) = qt_config::save_game_dirs(&dirs) {
             log::error!("Failed to save game directories: {e}");
         }
+    }
+}
+
+pub(crate) fn navigation_key_for_gdk(keyval: gdk::Key) -> Option<NavigationKey> {
+    match keyval {
+        gdk::Key::Return | gdk::Key::KP_Enter => Some(NavigationKey::Enter),
+        gdk::Key::Escape => Some(NavigationKey::Escape),
+        gdk::Key::Down => Some(NavigationKey::Down),
+        gdk::Key::Left => Some(NavigationKey::Left),
+        gdk::Key::Right => Some(NavigationKey::Right),
+        gdk::Key::Up => Some(NavigationKey::Up),
+        _ => None,
     }
 }
 
@@ -1276,6 +1421,35 @@ mod tests {
     #[test]
     fn newly_added_directories_scan_subfolders_by_default() {
         assert!(NEW_DIRECTORY_DEEP_SCAN);
+    }
+
+    #[test]
+    fn keyboard_navigation_matches_controller_actions() {
+        assert_eq!(
+            navigation_key_for_gdk(gdk::Key::Return),
+            Some(NavigationKey::Enter)
+        );
+        assert_eq!(
+            navigation_key_for_gdk(gdk::Key::KP_Enter),
+            Some(NavigationKey::Enter)
+        );
+        assert_eq!(
+            navigation_key_for_gdk(gdk::Key::Down),
+            Some(NavigationKey::Down)
+        );
+        assert_eq!(
+            navigation_key_for_gdk(gdk::Key::Left),
+            Some(NavigationKey::Left)
+        );
+        assert_eq!(
+            navigation_key_for_gdk(gdk::Key::Right),
+            Some(NavigationKey::Right)
+        );
+        assert_eq!(
+            navigation_key_for_gdk(gdk::Key::Up),
+            Some(NavigationKey::Up)
+        );
+        assert_eq!(navigation_key_for_gdk(gdk::Key::F1), None);
     }
 
     #[test]

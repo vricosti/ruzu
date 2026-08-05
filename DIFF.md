@@ -31938,3 +31938,395 @@ Rust files: `externals/rdynarmic/src/frontend/a32/{decoder.rs, decoder_thumb32.r
   after the Rust mutex is released. Axis inversion and every SDL battery state
   have focused parity tests.
 - `cargo test -p input_common --lib`: 12 passed.
+
+## 2026-08-04 — ruzu/src/util/controller_navigation.rs and ruzu/src/game_list.rs vs yuzu/util/controller_navigation.{h,cpp} and yuzu/game_list.cpp
+
+### Intentional differences
+- Qt emits synthetic key events directly to `QTreeView`. GTK objects are
+  main-thread-only, so HID callbacks enqueue their trigger type; `GameListView`
+  resolves it to the same Enter, Escape, and directional actions on the GTK
+  main loop. This also avoids re-entering Rust's outer `EmulatedController`
+  mutex from inside its input callback, a mutex layer absent upstream.
+- `ColumnView` receives the same actions through its selection model because
+  GTK does not expose Qt's `postEvent` equivalent for constructing trusted key
+  events. Folder expansion, parent/child traversal, and row activation remain
+  owned by the game-list module.
+
+### Unintentional differences (fixed)
+- The `controller_navigation` setting existed but no frontend object consumed
+  Player 1 or Handheld callbacks. The game list now owns the upstream callback
+  lifecycle and applies its Fullkey, Joy-Con, Handheld, and GameCube mappings.
+- The GTK game list did not take focus when first shown or after emulation
+  stopped, leaving arrow-key navigation dependent on the previously focused
+  toolbar control. `ColumnView` now regains focus whenever its stack page maps.
+- Launcher navigation keys were also forwarded through the emulated keyboard
+  binding path, unlike upstream where `GRenderWindow::keyPressEvent` owns that
+  path. A mapped direction could therefore move twice; game-list keys now stay
+  with `ColumnView` while no title is running.
+
+### Binary layout verification
+- PASS: this is frontend-only state; no guest-visible or serialized structure
+  changed.
+
+### Behavioral verification
+- Re-read upstream `ControllerNavigation::{ControllerUpdateEvent,
+  ControllerUpdateButton,ControllerUpdateStick,TriggerButton,UnloadController}`
+  and the `GameList` signal connection after implementation.
+- Focused tests cover one-shot button fronts, upstream stick priority, rotated
+  single-Joy-Con navigation, non-reentrant callback delivery, and GTK key
+  translation.
+
+## 2026-08-04 — shader_recompiler/src/frontend/translate/mod.rs vs shader_recompiler/frontend/maxwell/translate/translate.cpp and maxwell.inc
+
+### Intentional differences
+- Rust dispatches decoded opcodes with an explicit `match`; upstream generates
+  its switch from `maxwell.inc` and invokes the same-named visitor method.
+
+### Unintentional differences (fixed)
+- `TEX_b`, `TLD_b`, and `TXQ_b` were grouped with their bound variants and
+  called `tex`, `tld`, and `txq`. They now call the distinct bindless methods
+  owned by the corresponding texture implementation files, matching the three
+  separate upstream visitor entries and their different instruction layouts.
+- The wrong `TEX_b` route read AOFFI/BLOD/LC from bits 54/55/58 instead of
+  36/37/40. A runtime instruction with bit 58 set was consequently rejected as
+  unsupported `LC`, even though its bindless LC bit was clear.
+
+### Missing items
+- The Rust dispatcher remains manually duplicated from `maxwell.inc`; unlike
+  upstream, adding an opcode method does not mechanically add its dispatch
+  entry. Replacing the complete dispatcher with generated data is a broader
+  structural parity slice.
+
+### Binary layout verification
+- PASS: instruction words are still decoded as unchanged `u64` values; this
+  change only selects the upstream-owned visitor method for each opcode.
+
+### Behavioral verification
+- Re-read upstream `translate.cpp`, `maxwell.inc`, `impl.h`, and the bound and
+  bindless methods in `texture_fetch.cpp`, `texture_load.cpp`, and
+  `texture_query.cpp` after implementation.
+- Dispatcher-level tests verify bindless sample, fetch, and query IR. The TEX
+  regression uses a runtime word whose bound LC bit is set and bindless LC bit
+  is clear.
+## 2026-08-04 — externals/rdynarmic/src/ir/emitter.rs vs externals/dynarmic/src/dynarmic/ir/ir_emitter.{h,cpp}
+
+### Intentional differences
+- Rust reports an unsupported element size with `panic!`; upstream uses
+  `UNREACHABLE()`. Both reject every size other than 8, 16, and 32 bits.
+
+### Unintentional differences (fixed)
+- Ported the missing `IREmitter::VectorCountLeadingZeros` owner method. It
+  selects `VectorCountLeadingZeros{8,16,32}` exactly as upstream.
+
+### Missing items
+- None for this method.
+
+### Binary layout verification
+- PASS: the change only exposes existing IR opcodes and changes no layout.
+
+### Behavioral verification
+- The focused emitter test verifies the upstream opcode mapping for all three
+  accepted element sizes.
+
+## 2026-08-04 — externals/rdynarmic/src/frontend/a64/translate/{simd_two_register_misc.rs,visitor.rs} vs externals/dynarmic/src/dynarmic/frontend/A64/translate/impl/{impl.h,simd_two_register_misc.cpp}
+
+### Intentional differences
+- Rust decodes `Q`, `size`, `Vn`, and `Vd` from `DecodedInst` inside each
+  method; upstream's generated decoder passes the same fields as arguments.
+- The shared Rust `v_write(64, ...)` helper emits `VectorZeroUpper` before
+  `SetD`, matching the explicit `VectorZeroUpper` in both upstream methods.
+
+### Unintentional differences (fixed)
+- `CLS_asimd` and `CLZ_asimd` no longer fall through to interpretation. Their
+  validation, element sizing, IR operations, and 64-bit upper-zero behavior
+  now match upstream.
+- Added both generated instruction IDs to the manual Rust visitor dispatch.
+
+### Missing items
+- None for `CLS_asimd` or `CLZ_asimd`.
+
+### Binary layout verification
+- PASS: no decoded instruction or guest-state layout changed.
+
+### Behavioral verification
+- Re-read upstream `impl.h` and both method bodies after implementation.
+- Frontend tests cover the exact runtime `CLZ V0.2S, V0.2S` encoding and the
+  complete upstream `CLS` IR sequence. An x64 JIT regression verifies lane
+  results and upper-half clearing for that runtime encoding.
+
+## 2026-08-04 — externals/rdynarmic/src/frontend/a64/translate/{simd_three_same.rs,visitor.rs} vs externals/dynarmic/src/dynarmic/frontend/A64/translate/impl/{impl.h,simd_three_same.cpp}
+
+### Intentional differences
+- Rust decodes `Q`, `size`, `Vm`, `Vn`, and `Vd` from `DecodedInst` inside each
+  method; upstream's generated decoder passes the same fields as arguments.
+- Rust represents upstream `Operation` and `Signedness` with the existing
+  file-local `Operation` and `Sign` enums.
+
+### Unintentional differences (fixed)
+- `SQADD_2`, `SQSUB_2`, `UQADD_2`, and `UQSUB_2` were decoded but fell through
+  to interpretation. They now share the upstream-owned saturating arithmetic
+  helper, including the `Q=0,size=3` reserved-value rule.
+- `SHSUB` and `UHSUB` were also decoded without visitor implementations. Their
+  signed and unsigned halving-subtract paths now match upstream.
+- Added all six generated instruction IDs to the manual Rust visitor dispatch.
+
+### Missing items
+- None for these six vector methods.
+
+### Binary layout verification
+- PASS: no decoded instruction, IR, or guest-state layout changed.
+
+### Behavioral verification
+- Re-read upstream `impl.h`, `SaturatingArithmeticOperation`, and all six
+  method bodies after implementation.
+- Frontend tests cover every operation, the reserved encoding, and the exact
+  runtime `SQADD V1.8H, V7.8H, V1.8H` word. A JIT test verifies per-lane signed
+  saturation and the sticky `FPSR.QC` update.
+
+## 2026-08-04 — ruzu/src/main.rs vs zuyu/src/yuzu/main.cpp
+
+### Intentional differences
+- GTK uses a process-unique `gio::Application`, so later executable launches
+  are delivered to the existing process through repeated `activate` or `open`
+  signals. Upstream Qt constructs one stack-owned `GMainWindow` and does not
+  receive this GTK lifecycle.
+
+### Unintentional differences (fixed)
+- Repeated GTK activation previously constructed another `GMainWindow`, input
+  subsystem, and potentially another emulation `System` in the same process.
+  Both signals now reuse and present the process-wide window, preserving
+  upstream's single-window and single-system ownership.
+
+### Missing items
+- None for process-level main-window ownership.
+
+### Binary layout verification
+- PASS: this frontend lifecycle correction changes no serialized or guest ABI
+  layout.
+
+### Behavioral verification
+- Re-read upstream `main()` after implementation; its one `GMainWindow`
+  remains alive across the complete `QApplication::exec()` lifetime.
+
+## 2026-08-05 — ruzu/src/configuration/configure_vibration.rs vs zuyu/src/yuzu/configuration/configure_vibration.{h,cpp,ui}
+
+### Intentional differences
+- GTK widgets replace the Qt-generated widget tree while retaining the same
+  eight player controls, accurate-vibration option, modal lifetime, and
+  accept/cancel behavior.
+- The callback temporarily releases Rust's global settings lock before calling
+  `EmulatedController::set_vibration`, because that method reads the same
+  settings lock internally. The enabled/strength values are restored
+  immediately afterward, preserving upstream's observable ordering.
+
+### Unintentional differences (fixed)
+- The Vibration `Configure` button previously only logged that its upstream
+  dialog was missing. It now opens the dialog, persists all eight players'
+  enable/strength values, and applies accurate-vibration mode.
+- The surrounding Vibration checkbox previously read and wrote a per-player
+  enable flag. It now owns the global `vibration_enabled` setting as
+  `ConfigureInput::LoadConfiguration` and `ApplyConfiguration` do upstream,
+  so accepting the parent dialog cannot overwrite per-player dialog values.
+- Controller button callbacks now test the selected strength while the dialog
+  is open. Closing the dialog stops both motors and unregisters every callback,
+  matching the upstream destructor.
+- Disabling a player's vibration row now disables its strength control, which
+  matches the child-widget behavior of upstream's checkable group boxes.
+
+### Binary layout verification
+- PASS: this frontend-only dialog changes no serialized or guest ABI layout;
+  it writes the existing `PlayerInput` and vibration settings fields.
+
+### Behavioral verification
+- Re-read `configure_vibration.h`, `configure_vibration.cpp`, and
+  `configure_vibration.ui` after implementation. Constructor setup, callback
+  registration, apply behavior, test amplitudes/frequencies, stop ordering,
+  and callback removal match upstream.
+
+## 2026-08-05 — video_core/src/renderer_vulkan/vk_rasterizer.rs vs zuyu/src/video_core/renderer_vulkan/{vk_graphics_pipeline.cpp,vk_rasterizer.cpp}
+
+### Unintentional differences (fixed)
+- Ruzu previously called `UpdateRenderTargets` before resolving graphics image
+  views. Upstream resolves every stage image view first because that operation
+  may join or delete cached images and dirty render-target bindings; only then
+  does `GraphicsPipeline::ConfigureImpl` update render targets and check for a
+  feedback loop. The Rust draw path now preserves that ordering and obtains its
+  framebuffer from the post-resolution render-target state.
+
+### Binary layout verification
+- PASS: the change only reorders existing cache operations and changes no
+  guest, descriptor, or serialized structure layout.
+
+### Behavioral verification
+- Re-read upstream `RasterizerVulkan::PrepareDraw`,
+  `GraphicsPipeline::ConfigureImpl`, and `GraphicsPipeline::ConfigureDraw` after
+  implementation. The focused regression test enforces image-view resolution,
+  render-target update, then feedback-loop checking.
+
+## 2026-08-05 — input_common/src/helpers/udp_protocol.rs vs zuyu/src/input_common/helpers/udp_protocol.{h,cpp}
+
+### Intentional differences
+- Rust serializes and decodes each little-endian wire field explicitly instead
+  of copying packed C++ objects. The byte offsets, payload lengths, message
+  types, and CRC input remain identical, while decoding cannot create an enum
+  with an invalid Rust discriminant.
+
+### Unintentional differences (fixed)
+- The Rust protocol could validate responses but had no counterpart for
+  `Request::Create`; it now creates the upstream PortInfo and AllPads PadData
+  requests with the same 20-byte header, packed eight-byte payload, and CRC.
+- Pad responses are now decoded from the upstream packed 80-byte payload.
+  Version and PortInfo responses are decoded at their upstream offsets as well.
+
+### Binary layout verification
+- PASS: focused tests verify both 28-byte request layouts, header fields, CRC,
+  and representative fields at the packed PadData offsets.
+
+## 2026-08-05 — input_common/src/drivers/udp_client.rs vs zuyu/src/input_common/drivers/udp_client.{h,cpp}
+
+### Intentional differences
+- `std::net::UdpSocket` with a 100 ms receive timeout replaces Boost.Asio. A
+  stop atomic supplies the same cancellation boundary; owned Rust threads are
+  joined during reset/drop instead of relying on an Asio service stop.
+- Callback-visible pad state and connection activity use `Arc<Mutex<_>>` and
+  atomics because the socket worker cannot capture a movable Rust owner by raw
+  pointer. Method ownership and update ordering remain in `udp_client.rs`.
+
+### Unintentional differences (fixed)
+- `ReloadSockets`, socket startup/reset, pad-data delivery,
+  `TestCommunication`, and `CalibrationConfigurationJob` were stubs. They now
+  follow the upstream three-second request cadence, ten-second test timeout,
+  calibration stages, stale-packet handling, motion/touch/axis/button/battery
+  update order, and settings-backed server list.
+- Battery values had been treated as consecutive zero-based integers even
+  though the DSU wire enum uses `Dying=0x01` through `Full=0x05` and
+  `Charging/Charged=0xEE/0xEF`. Mapping now uses the protocol enum exactly.
+- Input-device enumeration now honors `enable_udp_controller`, matching
+  upstream; motion delivery remains available without exposing UDP pads as
+  full controllers.
+
+### Binary layout verification
+- PASS: the driver consumes only the explicitly decoded protocol values and
+  changes no guest-visible structure.
+
+### Behavioral verification
+- Re-read the complete upstream socket, client, test, and calibration methods
+  after implementation. A local UDP server regression verifies that a valid
+  DSU PadData response completes `TestCommunication` successfully.
+
+## 2026-08-05 — ruzu/src/configuration/{configure_motion_touch.rs,configure_touch_from_button.rs} vs zuyu/src/yuzu/configuration/{configure_motion_touch,configure_touch_from_button}.{h,cpp,ui}
+
+### Intentional differences
+- GTK widgets and main-loop channel polling replace Qt models, signals, and
+  `QMetaObject::invokeMethod`. Worker callbacks carry plain values only; GTK
+  objects remain on the main thread.
+- The touch-map editor exposes the same binding, X, and Y data in editable rows
+  and captures buttons through `InputSubsystem`. It uses coordinate spin boxes
+  rather than upstream's draggable `TouchScreenPreview`; this preserves the
+  serialized mapping behavior without adding a second custom drawing widget.
+
+### Unintentional differences (fixed)
+- The Vibration and Motion Configure buttons previously only logged missing
+  implementations. Vibration opens `ConfigureVibration`; Motion now opens the
+  same global Motion/Touch owner from both the Player footer and Advanced tab.
+- Motion/Touch now loads and applies calibration, UDP servers, selected touch
+  map, and map contents in upstream order, then reloads input devices.
+- UDP add/remove/test validation, calibration status transitions, profile
+  create/delete/rename, binding capture/deletion, and coordinate editing are
+  functional. Closing a test, calibration, or binding capture preserves the
+  upstream no-background-work lifecycle.
+
+### Binary layout verification
+- PASS: the dialogs write the existing serialized `ParamPackage` strings and
+  `TouchFromButtonMap` values; no guest ABI structure changes.
+
+### Behavioral verification
+- Re-read both upstream headers, implementations, and UI files after the GTK
+  implementation. Focused tests cover calibration display ordering and the
+  1280x720 handheld coordinate bounds used by touch mappings.
+
+## 2026-08-05 — core/src/hle/kernel/k_thread.rs vs zuyu/src/core/hle/kernel/k_thread.{h,cpp}
+
+### Intentional differences
+- Rust upgrades the process `Weak` reference and handles an absent memory bridge
+  by returning zero or leaving the flag unchanged. Valid user threads always own
+  both objects upstream; the Rust guards only cover partially initialized or
+  tearing-down objects.
+
+### Unintentional differences (fixed)
+- `GetUserDisableCount`, `SetInterruptFlag`, and `ClearInterruptFlag` accessed
+  the retired `ProcessMemoryData` compatibility store. Guest JIT writes use the
+  process `Core::Memory::Memory`, so interrupt handling always observed a stale
+  zero disable count and failed to pin a thread inside an SDK critical section.
+  All three methods now use `KProcess::get_memory()`, matching upstream
+  `KProcess::GetMemory()` ownership and ordering.
+- The TLS offsets were duplicated as integer literals. The Rust file now owns a
+  `repr(C)` counterpart of upstream's anonymous `ThreadLocalRegion` and derives
+  both offsets with `offset_of!`.
+
+### Missing items
+- Retiring the remaining `ProcessMemoryData` compatibility users is a broader
+  memory-ownership parity slice; these three upstream methods no longer depend
+  on that mirror.
+
+### Binary layout verification
+- PASS: the focused regression asserts `ThreadLocalRegion` size `0x104`,
+  `disable_count` offset `0x100`, and `interrupt_flag` offset `0x102` before
+  exercising both flag writes through the process memory bridge.
+
+### Behavioral verification
+- Re-read the upstream declarations and all three implementations after the
+  change. A targeted AArch64 runtime run observed `disable_count=1`, pinned the
+  owning thread on its core, and no longer entered the previously reproduced
+  waiter spin during the validation window.
+
+## 2026-08-05 — core/src/hle/kernel/{svc_dispatch.rs,svc/svc_synchronization.rs} vs zuyu/src/core/hle/kernel/{svc.cpp,svc/svc_synchronization.cpp}
+
+### Intentional differences
+- Rust keeps the ABI switch arms in the manually maintained `svc_dispatch.rs`;
+  upstream generates `SvcWrap_SynchronizePreemptionState64` and
+  `SvcWrap_SynchronizePreemptionState64From32` in `svc.cpp`. Both Rust arms
+  forward to the method owner in `svc_synchronization.rs`.
+
+### Unintentional differences (fixed)
+- The AArch32 arm discarded `SynchronizePreemptionState` and the AArch64 arm
+  fell through to stub success. Both now invoke
+  `synchronize_preemption_state`, matching the two upstream wrappers. This
+  clears the TLS interrupt flag and unpins the current thread under the
+  scheduler lock so a waiting pinned thread cannot suppress every other
+  runnable thread in its process.
+
+### Behavioral verification
+- Re-read the upstream common implementation, both ABI wrappers, and both SVC
+  table entries after the change. The focused regression pins the current
+  thread and verifies that dispatch through each ABI removes the process's
+  pinned-thread slot.
+
+## 2026-08-05 — input_common/src/drivers/sdl_joystick.rs vs zuyu/src/input_common/drivers/sdl_driver.cpp
+
+### Intentional differences
+- Upstream queries `SDL_GameControllerGetType` from `SetVibration`. Rust caches
+  the resulting HD-rumble classification when controller handles are installed
+  or replaced. The controller type is immutable for the lifetime of those
+  handles, so the amplitude curve is unchanged. This prevents the guest HID
+  call from entering SDL while it owns `EmulatedController`; SDL's event pump
+  can hold its joystick mutex while dispatching a callback back to that same
+  controller.
+
+### Unintentional differences (fixed)
+- The earlier handle-snapshot correction released the Rust joystick mutex but
+  still called `SDL_GameControllerGetType` synchronously for every vibration.
+  A live freeze showed `CPUCore_1` waiting in that SDL call while handling
+  `SendVibrationValues`, with the timing loop waiting on HID. `HasHDRumble` now
+  reads the handle-generation cache and the physical rumble command remains on
+  the dedicated vibration thread.
+
+### Binary layout verification
+- PASS: only the host-side `SdlJoystick` and transient handle snapshot gain a
+  boolean cache; no guest-visible or serialized structure changes.
+
+### Behavioral verification
+- Re-read upstream `SDLJoystick::{SDLJoystick,SetSDLJoystick,HasHDRumble}` and
+  `SDLDriver::{SetVibration,SendVibrations}` after implementation. A focused
+  regression verifies that the hot-path query consumes the snapshot cache
+  without requiring a live SDL controller handle.

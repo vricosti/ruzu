@@ -518,6 +518,45 @@ mod tests {
     }
 
     #[test]
+    fn synchronize_preemption_state_is_dispatched_for_both_abis() {
+        let _guard = svc_synchronization_test_guard();
+        let system = test_system();
+        let current_thread = crate::hle::kernel::kernel::get_current_thread_pointer()
+            .expect("test current thread must be installed");
+        let core_id = system
+            .kernel()
+            .expect("test kernel must be initialized")
+            .current_physical_core_index() as i32;
+
+        for is_64bit in [false, true] {
+            system
+                .current_process_arc()
+                .lock()
+                .unwrap()
+                .pin_current_thread(core_id, 1, false);
+            current_thread.lock().unwrap().pin(core_id);
+
+            let mut args = [0; 8];
+            crate::hle::kernel::svc_dispatch::call(
+                &system,
+                crate::hle::kernel::svc_dispatch::SvcId::SynchronizePreemptionState as u32,
+                is_64bit,
+                &mut args,
+            );
+
+            assert_eq!(
+                system
+                    .current_process_arc()
+                    .lock()
+                    .unwrap()
+                    .get_pinned_thread(core_id),
+                None,
+                "SynchronizePreemptionState must unpin through the {is_64bit}-bit dispatcher"
+            );
+        }
+    }
+
+    #[test]
     fn reset_signal_resets_readable_event() {
         let _guard = svc_synchronization_test_guard();
         let system = test_system();

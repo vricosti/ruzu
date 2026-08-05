@@ -899,7 +899,7 @@ fn call32(system: &System, imm: u32, args: &mut SvcArgs) {
             set_arg32(args, 0, result.get_inner_value());
         }
         Some(SvcId::SynchronizePreemptionState) => {
-            // No return value
+            svc_synchronization::synchronize_preemption_state(system);
         }
         Some(SvcId::CreateEvent) => {
             // OUT: ret=arg32[0], write_handle=arg32[1], read_handle=arg32[2]
@@ -1846,6 +1846,9 @@ fn call64(system: &System, imm: u32, args: &mut SvcArgs) {
                 get_arg64(args, 3),
             );
             set_arg64(args, 0, result.get_inner_value() as u64);
+        }
+        Some(SvcId::SynchronizePreemptionState) => {
+            svc_synchronization::synchronize_preemption_state(system);
         }
         Some(SvcId::GetResourceLimitLimitValue) => {
             set_arg64(args, 0, STUB_SUCCESS as u64);
@@ -3342,8 +3345,7 @@ mod tests {
             .unwrap()
             .register_thread_object(current_thread.clone());
         process.lock().unwrap().push_back_to_priority_queue(1);
-        process.lock().unwrap().state =
-            crate::hle::kernel::k_process::ProcessState::Running;
+        process.lock().unwrap().state = crate::hle::kernel::k_process::ProcessState::Running;
         scheduler.lock().unwrap().initialize(1, 0, 0);
 
         let shared_memory = process.lock().unwrap().get_shared_memory();

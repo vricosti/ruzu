@@ -1057,36 +1057,7 @@ impl RasterizerVulkan {
         // 1. Periodic flush
         self.flush_work();
 
-        // 2. Update render targets before compiling the pipeline. Upstream
-        // requests the render pass from the framebuffer selected by
-        // TextureCache::UpdateRenderTargets, so the pipeline must be built
-        // against that same render pass.
-        let target_fb = self
-            .texture_cache
-            .update_render_targets_and_get_rt0_framebuffer(
-                &crate::engines::draw_manager::Maxwell3DRenderTargets {
-                    rt_control: draw.rt_control,
-                    render_targets: draw.render_targets,
-                    zeta: draw.zeta,
-                    anti_alias_samples_mode: 0,
-                    surface_clip: draw.surface_clip,
-                },
-                dirty_flags,
-                read_gpu_unsafe,
-                false,
-                None,
-            );
-        let target_has_depth = target_fb.as_ref().is_some_and(|target| target.has_depth);
-        let target_num_color = target_fb
-            .as_ref()
-            .map(|target| target.num_color)
-            .unwrap_or(1);
-        let render_pass = target_fb
-            .as_ref()
-            .map(|target| target.render_pass)
-            .unwrap_or(self.default_render_pass);
-
-        // 3. Compile or lookup cached pipeline
+        // 2. Compile or lookup cached pipeline
         let known_gpu_tick = self.scheduler.known_gpu_tick();
         let pending_tick = self.scheduler.pending_tick();
         let pipeline_result = self
@@ -1151,41 +1122,6 @@ impl RasterizerVulkan {
             }
         };
         let trace_draw = vulkan_draw_trace_enabled();
-        // 4. Ensure we're inside a render pass
-        let (framebuffer, extent, rp_images, rp_image_ranges) = if let Some(target) = target_fb {
-            self.texture_cache
-                .prepare_render_targets_for_render(&target.image_ids);
-            (
-                target.framebuffer,
-                target.extent,
-                target.images,
-                target.image_ranges,
-            )
-        } else {
-            self.draw_offscreen_fallback = self.draw_offscreen_fallback.wrapping_add(1);
-            // The draw executes but lands in the internal offscreen
-            // framebuffer instead of the guest render target — the guest RT
-            // keeps its stale contents, which reads as a lost draw.
-            if self.draw_offscreen_fallback <= 16 || self.draw_offscreen_fallback.is_power_of_two()
-            {
-                log::warn!(
-                    "[DRAW_OFFSCREEN] #{} no guest framebuffer resolved (draw={} rt0=0x{:X} fmt={})",
-                    self.draw_offscreen_fallback,
-                    self.draw_counter,
-                    draw.render_targets[0].address,
-                    draw.render_targets[0].format,
-                );
-            }
-            (
-                self.offscreen_fb,
-                vk::Extent2D {
-                    width: self.fb_width,
-                    height: self.fb_height,
-                },
-                Vec::new(),
-                Vec::new(),
-            )
-        };
         let clear_values = [
             vk::ClearValue {
                 color: vk::ClearColorValue {
@@ -1199,11 +1135,6 @@ impl RasterizerVulkan {
                 },
             },
         ];
-        let render_area = vk::Rect2D {
-            offset: vk::Offset2D { x: 0, y: 0 },
-            extent,
-        };
-
         let draw_params = make_draw_params(draw);
         // Serialize every common-buffer-cache access on this draw
         // (uniform/storage descriptor binding AND the geometry binding below)
@@ -1226,7 +1157,7 @@ impl RasterizerVulkan {
         );
         // Upstream `GraphicsPipeline::ConfigureImpl` updates all buffer
         // bindings once, then binds geometry before the per-stage buffers.
-        let descriptor_set = self.bind_graphics_descriptors(
+        let (descriptor_set, graphics_views) = self.bind_graphics_descriptors(
             pipeline_layout,
             descriptor_set_layout,
             descriptor_set,
@@ -1250,6 +1181,73 @@ impl RasterizerVulkan {
             warn!("RasterizerVulkan: draw skipped because required descriptors are incomplete");
             return;
         }
+
+        // Upstream GraphicsPipeline::ConfigureImpl resolves image views before
+        // UpdateRenderTargets. Resolving a view may join/delete cached images
+        // and dirty the render-target bindings, so taking the framebuffer
+        // snapshot any earlier can leave this draw targeting a stale image.
+        let target_fb = self
+            .texture_cache
+            .update_render_targets_and_get_rt0_framebuffer(
+                &crate::engines::draw_manager::Maxwell3DRenderTargets {
+                    rt_control: draw.rt_control,
+                    render_targets: draw.render_targets,
+                    zeta: draw.zeta,
+                    anti_alias_samples_mode: 0,
+                    surface_clip: draw.surface_clip,
+                },
+                dirty_flags,
+                read_gpu_unsafe,
+                false,
+                None,
+            );
+        if self.texture_cache.base.check_feedback_loop(&graphics_views) {
+            self.texture_cache.barrier_feedback_loop();
+        }
+        let target_has_depth = target_fb.as_ref().is_some_and(|target| target.has_depth);
+        let target_num_color = target_fb
+            .as_ref()
+            .map(|target| target.num_color)
+            .unwrap_or(1);
+        let render_pass = target_fb
+            .as_ref()
+            .map(|target| target.render_pass)
+            .unwrap_or(self.default_render_pass);
+        let (framebuffer, extent, rp_images, rp_image_ranges) = if let Some(target) = target_fb {
+            self.texture_cache
+                .prepare_render_targets_for_render(&target.image_ids);
+            (
+                target.framebuffer,
+                target.extent,
+                target.images,
+                target.image_ranges,
+            )
+        } else {
+            self.draw_offscreen_fallback = self.draw_offscreen_fallback.wrapping_add(1);
+            if self.draw_offscreen_fallback <= 16 || self.draw_offscreen_fallback.is_power_of_two()
+            {
+                log::warn!(
+                    "[DRAW_OFFSCREEN] #{} no guest framebuffer resolved (draw={} rt0=0x{:X} fmt={})",
+                    self.draw_offscreen_fallback,
+                    self.draw_counter,
+                    draw.render_targets[0].address,
+                    draw.render_targets[0].format,
+                );
+            }
+            (
+                self.offscreen_fb,
+                vk::Extent2D {
+                    width: self.fb_width,
+                    height: self.fb_height,
+                },
+                Vec::new(),
+                Vec::new(),
+            )
+        };
+        let render_area = vk::Rect2D {
+            offset: vk::Offset2D { x: 0, y: 0 },
+            extent,
+        };
         // 5. The common geometry path was bound by
         // `bind_graphics_descriptors` in upstream ConfigureImpl order.
         dirty_flags[crate::dirty_flags::flags::INDEX_BUFFER as usize] = false;
@@ -2434,14 +2432,14 @@ impl RasterizerVulkan {
         read_gpu: &dyn Fn(u64, &mut [u8]),
         read_gpu_unsafe: &dyn Fn(u64, &mut [u8]) -> bool,
         trace_draw: bool,
-    ) -> Option<vk::DescriptorSet> {
+    ) -> (Option<vk::DescriptorSet>, Vec<ImageViewInOut>) {
         if descriptor_set_layout == vk::DescriptorSetLayout::null()
             || descriptor_bindings.is_empty()
         {
             self.common_buffer_cache.update_graphics_buffers(is_indexed);
             self.common_buffer_cache
                 .bind_host_geometry_buffers(is_indexed);
-            return None;
+            return (None, Vec::new());
         }
 
         let texture_cache: *mut TextureCache = &mut self.texture_cache;
@@ -2464,7 +2462,7 @@ impl RasterizerVulkan {
         self.desc_queue.acquire();
         let Some(descriptor_set) = descriptor_set else {
             warn!("RasterizerVulkan: graphics pipeline has descriptors but no allocator");
-            return None;
+            return (None, Vec::new());
         };
 
         let descriptor_count = descriptor_bindings
@@ -2693,16 +2691,6 @@ impl RasterizerVulkan {
             .zip(&graphics_view_uses)
             .filter_map(|(view, usage)| matches!(usage, GraphicsViewUse::Sampled).then_some(*view))
             .collect::<Vec<_>>();
-        let requires_feedback_barrier = unsafe {
-            let _texture_lock = (*texture_cache).base.mutex.lock();
-            (*texture_cache).base.check_feedback_loop(&graphics_views)
-        };
-        if requires_feedback_barrier {
-            unsafe {
-                (*texture_cache).barrier_feedback_loop();
-            }
-        }
-
         for stage in 0..stage_infos.len() {
             self.common_buffer_cache
                 .unbind_graphics_texture_buffers(stage);
@@ -2999,7 +2987,7 @@ impl RasterizerVulkan {
                             "RasterizerVulkan: missing texel-buffer descriptors for binding {}",
                             binding.binding
                         );
-                        return None;
+                        return (None, Vec::new());
                     };
                     common_texel_cursor = end.min(common_texel_buffer_views.len());
                     writes.push(
@@ -3067,7 +3055,7 @@ impl RasterizerVulkan {
                                 "RasterizerVulkan: missing storage-image descriptors for binding {}",
                                 binding.binding
                             );
-                            return None;
+                            return (None, Vec::new());
                         }
                         storage_image_cursor = end.min(storage_image_infos.len());
                     }
@@ -3109,7 +3097,7 @@ impl RasterizerVulkan {
                     .collect::<Vec<_>>(),
             );
         }
-        Some(descriptor_set)
+        (Some(descriptor_set), graphics_views)
     }
 
     // ── Framebuffer resize ────────────────────────────────────────────────
@@ -4905,6 +4893,36 @@ mod tests {
         assert!(
             !function.contains("self.offscreen_view"),
             "the framebuffer attachment is not a legal sampled/storage fallback"
+        );
+    }
+
+    #[test]
+    fn graphics_views_are_resolved_before_render_targets() {
+        let source = include_str!("vk_rasterizer.rs");
+        let function = source
+            .split("fn draw_prepared")
+            .nth(1)
+            .expect("draw_prepared must exist")
+            .split("pub fn read_framebuffer")
+            .next()
+            .expect("draw_prepared boundary must exist");
+        let bind = function
+            .find("self.bind_graphics_descriptors")
+            .expect("graphics views must be resolved");
+        let update = function
+            .find(".update_render_targets_and_get_rt0_framebuffer")
+            .expect("render targets must be updated");
+        let feedback = function
+            .find(".check_feedback_loop(&graphics_views)")
+            .expect("feedback loops must be checked");
+
+        assert!(
+            bind < update,
+            "image views must be resolved before render targets"
+        );
+        assert!(
+            update < feedback,
+            "feedback loops require current render targets"
         );
     }
 

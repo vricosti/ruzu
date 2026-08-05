@@ -45,8 +45,41 @@ pub type MacAddress = [u8; 6];
 /// Empty MAC address constant.
 pub const EMPTY_MAC_ADDRESS: MacAddress = [0, 0, 0, 0, 0, 0];
 
+const HEADER_SIZE: usize = std::mem::size_of::<Header>();
+
+/// Port of `Request::Create(PortInfo, client_id)`.
+pub fn create_port_info_request(client_id: u32) -> Vec<u8> {
+    let mut data = Vec::with_capacity(8);
+    data.extend_from_slice(&request::MAX_PORTS.to_le_bytes());
+    data.extend_from_slice(&[0, 1, 2, 3]);
+    create_request(MessageType::PortInfo, client_id, &data)
+}
+
+/// Port of `Request::Create(PadData, client_id)` for `AllPads`.
+pub fn create_pad_data_request(client_id: u32) -> Vec<u8> {
+    let mut data = Vec::with_capacity(8);
+    data.push(request::RegisterFlags::AllPads as u8);
+    data.push(0);
+    data.extend_from_slice(&EMPTY_MAC_ADDRESS);
+    create_request(MessageType::PadData, client_id, &data)
+}
+
+fn create_request(message_type: MessageType, client_id: u32, data: &[u8]) -> Vec<u8> {
+    let mut message = Vec::with_capacity(HEADER_SIZE + data.len());
+    message.extend_from_slice(&CLIENT_MAGIC.to_le_bytes());
+    message.extend_from_slice(&PROTOCOL_VERSION.to_le_bytes());
+    message.extend_from_slice(&((data.len() + std::mem::size_of::<u32>()) as u16).to_le_bytes());
+    message.extend_from_slice(&0u32.to_le_bytes());
+    message.extend_from_slice(&client_id.to_le_bytes());
+    message.extend_from_slice(&(message_type as u32).to_le_bytes());
+    message.extend_from_slice(data);
+    let crc = crc32_compute(&message);
+    message[8..12].copy_from_slice(&crc.to_le_bytes());
+    message
+}
+
 /// Port of `Message<T>` struct from udp_protocol.h
-#[repr(C)]
+#[repr(C, packed)]
 pub struct Message<T> {
     pub header: Header,
     pub data: T,
@@ -224,6 +257,135 @@ pub mod response {
         pub gyro: Gyroscope,
     }
 
+    pub fn decode_version(data: &[u8]) -> Option<Version> {
+        let payload = data.get(super::HEADER_SIZE..super::HEADER_SIZE + 2)?;
+        Some(Version {
+            version: u16::from_le_bytes(payload.try_into().ok()?),
+        })
+    }
+
+    pub fn decode_port_info(data: &[u8]) -> Option<PortInfo> {
+        let payload = data.get(super::HEADER_SIZE..super::HEADER_SIZE + 12)?;
+        Some(PortInfo {
+            id: payload[0],
+            state: state(payload[1])?,
+            model: model(payload[2])?,
+            connection_type: connection_type(payload[3])?,
+            mac: payload[4..10].try_into().ok()?,
+            battery: battery(payload[10])?,
+            is_pad_active: payload[11],
+        })
+    }
+
+    /// Decodes a validated DSU pad-data payload without relying on host struct
+    /// alignment. Upstream can `memcpy` because its protocol structs are
+    /// explicitly packed; parsing fields keeps the same wire layout in Rust.
+    pub fn decode_pad_data(data: &[u8]) -> Option<PadData> {
+        const PAD_DATA_SIZE: usize = 80;
+        let payload = data.get(super::HEADER_SIZE..super::HEADER_SIZE + PAD_DATA_SIZE)?;
+        let connection_type = connection_type(payload[3])?;
+        let state = state(payload[1])?;
+        let model = model(payload[2])?;
+        let battery = battery(payload[10])?;
+        let info = PortInfo {
+            id: payload[0],
+            state,
+            model,
+            connection_type,
+            mac: payload[4..10].try_into().ok()?,
+            battery,
+            is_pad_active: payload[11],
+        };
+        Some(PadData {
+            info,
+            packet_counter: u32::from_le_bytes(payload[12..16].try_into().ok()?),
+            digital_button: u16::from_le_bytes(payload[16..18].try_into().ok()?),
+            home: payload[18],
+            touch_hard_press: payload[19],
+            left_stick_x: payload[20],
+            left_stick_y: payload[21],
+            right_stick_x: payload[22],
+            right_stick_y: payload[23],
+            analog_button: AnalogButton {
+                button_dpad_left_analog: payload[24],
+                button_dpad_down_analog: payload[25],
+                button_dpad_right_analog: payload[26],
+                button_dpad_up_analog: payload[27],
+                button_square_analog: payload[28],
+                button_cross_analog: payload[29],
+                button_circle_analog: payload[30],
+                button_triangle_analog: payload[31],
+                button_r1_analog: payload[32],
+                button_l1_analog: payload[33],
+                trigger_r2: payload[34],
+                trigger_l2: payload[35],
+            },
+            touch: [decode_touch(payload, 36)?, decode_touch(payload, 42)?],
+            motion_timestamp: u64::from_le_bytes(payload[48..56].try_into().ok()?),
+            accel: Accelerometer {
+                x: f32::from_le_bytes(payload[56..60].try_into().ok()?),
+                y: f32::from_le_bytes(payload[60..64].try_into().ok()?),
+                z: f32::from_le_bytes(payload[64..68].try_into().ok()?),
+            },
+            gyro: Gyroscope {
+                pitch: f32::from_le_bytes(payload[68..72].try_into().ok()?),
+                yaw: f32::from_le_bytes(payload[72..76].try_into().ok()?),
+                roll: f32::from_le_bytes(payload[76..80].try_into().ok()?),
+            },
+        })
+    }
+
+    fn decode_touch(payload: &[u8], offset: usize) -> Option<TouchPad> {
+        Some(TouchPad {
+            is_active: *payload.get(offset)?,
+            id: *payload.get(offset + 1)?,
+            x: u16::from_le_bytes(payload.get(offset + 2..offset + 4)?.try_into().ok()?),
+            y: u16::from_le_bytes(payload.get(offset + 4..offset + 6)?.try_into().ok()?),
+        })
+    }
+
+    fn connection_type(value: u8) -> Option<ConnectionType> {
+        match value {
+            0 => Some(ConnectionType::None),
+            1 => Some(ConnectionType::Usb),
+            2 => Some(ConnectionType::Bluetooth),
+            _ => None,
+        }
+    }
+
+    fn state(value: u8) -> Option<State> {
+        match value {
+            0 => Some(State::Disconnected),
+            1 => Some(State::Reserved),
+            2 => Some(State::Connected),
+            _ => None,
+        }
+    }
+
+    fn model(value: u8) -> Option<Model> {
+        match value {
+            0 => Some(Model::None),
+            1 => Some(Model::PartialGyro),
+            2 => Some(Model::FullGyro),
+            3 => Some(Model::Generic),
+            _ => None,
+        }
+    }
+
+    fn battery(value: u8) -> Option<Battery> {
+        match value {
+            0x00 => Some(Battery::None),
+            0x01 => Some(Battery::Dying),
+            0x02 => Some(Battery::Low),
+            0x03 => Some(Battery::Medium),
+            0x04 => Some(Battery::High),
+            0x05 => Some(Battery::Full),
+            0xEE => Some(Battery::Charging),
+            0xEF => Some(Battery::Charged),
+            _ => None,
+        }
+    }
+
     /// Returns the expected size of the response data for a given message type.
     fn get_size_of_response_type(t: super::MessageType) -> usize {
         match t {
@@ -289,7 +451,7 @@ pub mod response {
     }
 
     /// Simple CRC-32 implementation (ISO 3309 / ITU-T V.42, same as boost::crc_32_type).
-    fn crc32_compute(data: &[u8]) -> u32 {
+    pub(super) fn crc32_compute(data: &[u8]) -> u32 {
         let mut crc: u32 = 0xFFFFFFFF;
         for &byte in data {
             crc ^= byte as u32;
@@ -302,5 +464,58 @@ pub mod response {
             }
         }
         !crc
+    }
+}
+
+fn crc32_compute(data: &[u8]) -> u32 {
+    response::crc32_compute(data)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::response::{Battery, ConnectionType, Model, State};
+    use super::*;
+
+    #[test]
+    fn request_packets_match_upstream_wire_layout() {
+        let port_info = create_port_info_request(0x1234_5678);
+        assert_eq!(port_info.len(), 28);
+        assert_eq!(&port_info[0..4], &CLIENT_MAGIC.to_le_bytes());
+        assert_eq!(&port_info[6..8], &12u16.to_le_bytes());
+        assert_eq!(&port_info[12..16], &0x1234_5678u32.to_le_bytes());
+        assert_eq!(
+            &port_info[16..20],
+            &(MessageType::PortInfo as u32).to_le_bytes()
+        );
+        assert_eq!(&port_info[20..28], &[4, 0, 0, 0, 0, 1, 2, 3]);
+
+        let mut crc_input = port_info.clone();
+        let crc = u32::from_le_bytes(crc_input[8..12].try_into().unwrap());
+        crc_input[8..12].fill(0);
+        assert_eq!(crc, crc32_compute(&crc_input));
+
+        let pad_data = create_pad_data_request(7);
+        assert_eq!(pad_data.len(), 28);
+        assert_eq!(&pad_data[20..28], &[0; 8]);
+    }
+
+    #[test]
+    fn decode_pad_data_uses_packed_protocol_offsets() {
+        let mut packet = vec![0u8; HEADER_SIZE + 80];
+        packet[HEADER_SIZE + 1] = State::Connected as u8;
+        packet[HEADER_SIZE + 2] = Model::FullGyro as u8;
+        packet[HEADER_SIZE + 3] = ConnectionType::Usb as u8;
+        packet[HEADER_SIZE + 10] = Battery::Full as u8;
+        packet[HEADER_SIZE + 12..HEADER_SIZE + 16].copy_from_slice(&42u32.to_le_bytes());
+        packet[HEADER_SIZE + 36] = 1;
+        packet[HEADER_SIZE + 38..HEADER_SIZE + 40].copy_from_slice(&321u16.to_le_bytes());
+        packet[HEADER_SIZE + 40..HEADER_SIZE + 42].copy_from_slice(&654u16.to_le_bytes());
+        packet[HEADER_SIZE + 68..HEADER_SIZE + 72].copy_from_slice(&1.5f32.to_le_bytes());
+
+        let decoded = response::decode_pad_data(&packet).unwrap();
+        assert_eq!(decoded.packet_counter, 42);
+        assert_eq!(decoded.touch[0].x, 321);
+        assert_eq!(decoded.touch[0].y, 654);
+        assert_eq!(decoded.gyro.pitch, 1.5);
     }
 }

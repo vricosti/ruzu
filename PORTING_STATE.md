@@ -1,5 +1,26 @@
 # Porting State
 
+## 2026-08-05 — Controls Motion / Touch configuration
+
+- Status: completed and verified.
+- Interrupted slice: `ruzu/src/configuration/configure_motion_touch.rs`, the GTK
+  counterpart of `yuzu/configuration/configure_motion_touch.{h,cpp,ui}`.
+- Confirmed behavior: the button currently only logs a message. Its upstream
+  dialog owns Cemuhook UDP server management, communication testing, touchpad
+  calibration, and touch-from-button map selection.
+- Missing prerequisite: `input_common/src/drivers/udp_client.rs` exposes
+  `reload_sockets`, `CalibrationConfigurationJob`, and `test_communication`,
+  but all three are non-functional stubs. In addition,
+  `input_common/src/helpers/udp_protocol.rs` validates responses but cannot
+  serialize requests or decode response payloads for a socket owner.
+- Prerequisite result: the UDP socket lifecycle, request serialization,
+  response decoding, communication test, and calibration job are implemented
+  in their upstream-owned `input_common` files.
+- Resumed result: both Controls entry points open `ConfigureMotionTouch`; UDP
+  server management, testing, calibration, and touch-from-button profile and
+  binding configuration are functional. Closing a capture or calibration
+  releases its poller/thread.
+
 ## 2026-07-31 — Windows in-process game boot
 
 - Status: interrupted while implementing the missing prerequisite.

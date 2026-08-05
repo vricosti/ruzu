@@ -1063,7 +1063,7 @@ pub fn page(
 
     let vibration_box = gtk::Box::new(gtk::Orientation::Vertical, 4);
     let vibration = gtk::CheckButton::with_label("Vibration");
-    vibration.set_active(state.borrow().vibration_enabled);
+    vibration.set_active(*common::settings::values().vibration_enabled.get_value());
     let configure_vibration = gtk::Button::with_label("Configure");
     vibration_box.append(&vibration);
     vibration_box.append(&configure_vibration);
@@ -1366,15 +1366,16 @@ pub fn page(
         });
     }
 
-    // These actions have separate upstream-owned dialogs.
-    for (button, action) in [
-        (&configure_vibration, "Configure vibration"),
-        (&configure_motion, "Configure motion"),
-    ] {
-        let action = action.to_string();
-        let player_number = index + 1;
-        button.connect_clicked(move |_| {
-            log::info!("Player {player_number}: {action} requested (not yet implemented)");
+    {
+        let hid_core = Arc::clone(&hid_core);
+        configure_vibration.connect_clicked(move |button| {
+            super::configure_vibration::present(button, Arc::clone(&hid_core));
+        });
+    }
+    {
+        let input_subsystem = Rc::clone(&input_subsystem);
+        configure_motion.connect_clicked(move |button| {
+            super::configure_motion_touch::present(button, Rc::clone(&input_subsystem));
         });
     }
 
@@ -1439,8 +1440,8 @@ pub fn page(
             if let Some(slot) = players.get_mut(controller_settings_index) {
                 let edited = page_owner.state.borrow();
                 slot.profile_name = edited.profile_name.clone();
-                slot.vibration_enabled = vibrates;
             }
+            values.vibration_enabled.set_value(vibrates);
             values.motion_enabled.set_value(uses_motion);
             values.use_docked_mode.set_value(if is_docked {
                 common::settings_enums::ConsoleMode::Docked
