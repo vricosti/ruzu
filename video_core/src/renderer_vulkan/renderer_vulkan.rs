@@ -328,7 +328,7 @@ impl RendererVulkan {
                 .get_physical_device_properties(physical_device)
         };
 
-        let device = create_device(&instance.instance, physical_device, surface.handle)?;
+        let device = create_device(&instance, physical_device, surface.handle)?;
         let mut memory_allocator = Box::new(MemoryAllocator::new(
             device.get_logical().clone(),
             memory_properties,
@@ -994,11 +994,16 @@ impl Drop for FrameDisplayedNotifyGuard {
 
 /// Port of free function `CreateDevice`.
 fn create_device(
-    instance: &ash::Instance,
+    instance: &Instance,
     physical_device: vk::PhysicalDevice,
     surface: vk::SurfaceKHR,
 ) -> Result<Device, VulkanError> {
-    Device::new(instance.clone(), physical_device, surface)
+    Device::new(
+        &instance.entry,
+        instance.instance.clone(),
+        physical_device,
+        surface,
+    )
 }
 
 /// Port of the physical-device selection portion of upstream `CreateDevice`.
