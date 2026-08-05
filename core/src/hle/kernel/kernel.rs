@@ -1850,6 +1850,11 @@ pub struct KernelCore {
     process_list: Mutex<Vec<Arc<ProcessLock>>>,
     process_list_lock: Mutex<()>,
 
+    /// Processes removed from the upstream-visible process list by
+    /// `terminate_all_processes`, but retained until cooperative CPU fibers
+    /// have stopped and Rust can safely release their thread owners.
+    terminating_processes: Mutex<Vec<Arc<ProcessLock>>>,
+
     // -- Registered objects for leak tracking --
     registered_objects: Mutex<Vec<u64>>,
     registered_in_use_objects: Mutex<Vec<u64>>,
@@ -1921,6 +1926,11 @@ pub struct KernelCore {
     /// `CloseServices`; ruzu's cooperative guest fibers are only guaranteed
     /// not to touch their captured managers after `CpuManager::shutdown`.
     deferred_server_managers: Mutex<Vec<TrackedServerManager>>,
+    /// Rust owners for service objects that upstream keeps on a guest service
+    /// thread's native stack. Cooperative fiber shutdown can discard a
+    /// suspended Rust stack without running local destructors, so these owners
+    /// are released explicitly after the fibers stop.
+    deferred_service_owners: Mutex<Vec<Box<dyn std::any::Any + Send>>>,
 
     /// Main host service threads returned by `RunOnHostCoreProcess`.
     ///
@@ -1973,6 +1983,7 @@ impl KernelCore {
 
             process_list: Mutex::new(Vec::new()),
             process_list_lock: Mutex::new(()),
+            terminating_processes: Mutex::new(Vec::new()),
             registered_objects: Mutex::new(Vec::new()),
             registered_in_use_objects: Mutex::new(Vec::new()),
 
@@ -1988,6 +1999,7 @@ impl KernelCore {
             preemption_event: None,
             server_managers: Mutex::new(Vec::new()),
             deferred_server_managers: Mutex::new(Vec::new()),
+            deferred_service_owners: Mutex::new(Vec::new()),
             host_service_threads: Mutex::new(Vec::new()),
             service_processes: Mutex::new(Vec::new()),
             host_service_processes: Mutex::new(Vec::new()),
@@ -2108,17 +2120,43 @@ impl KernelCore {
     /// thread (HighPriority, core 3, priority 16), and makes it schedulable.
     /// The scheduler will pick it up and run the fiber on guest core 3.
     pub fn run_on_guest_core_process(&self, name: &str, func: Box<dyn FnOnce() + Send>) {
+        use super::k_resource_limit::LimitableResource;
+        use super::k_scoped_resource_reservation::KScopedResourceReservation;
+
         const SERVICE_THREAD_PRIORITY: i32 = 16;
         const SERVICE_THREAD_CORE: i32 = 3;
 
-        // Create a service process for tracking.
+        // Make and initialize the service process before registration.
+        // Upstream uses a default CreateProcessParameter and is_real=false.
         let process = Arc::new(ProcessLock::from_value(super::k_process::KProcess::new()));
+        {
+            let mut process_guard = process.lock().unwrap();
+            let rc = process_guard.initialize(
+                &[],
+                0,
+                0,
+                0,
+                0,
+                0,
+                self.get_system_resource_limit(),
+                false,
+            );
+            assert_eq!(rc, crate::hle::result::RESULT_SUCCESS.get_inner_value());
+            process_guard.bind_self_reference(&process);
+        }
+
         self.register_process(Arc::clone(&process));
-        // Minimal init — service processes don't need page tables or user memory.
         self.service_processes
             .lock()
             .unwrap()
             .push(Arc::clone(&process));
+
+        // Reserve the service thread from the process resource limit before
+        // creating it, matching KScopedResourceReservation upstream.
+        let resource_limit = process.lock().unwrap().resource_limit.clone();
+        let mut thread_reservation =
+            KScopedResourceReservation::new(resource_limit, LimitableResource::ThreadCountMax, 1);
+        assert!(thread_reservation.succeeded());
 
         // Create the service thread.
         let thread = Arc::new(KThreadLock::new(super::k_thread::KThread::new()));
@@ -2155,7 +2193,9 @@ impl KernelCore {
             );
         }
 
-        // Upstream registers the thread before making it runnable.
+        // Commit the reservation, then register the thread before making it
+        // runnable, matching upstream ordering.
+        thread_reservation.commit();
         process
             .lock()
             .unwrap()
@@ -2483,10 +2523,23 @@ impl KernelCore {
         SCHEDULER_LOCK_PTR.store(std::ptr::null_mut(), Ordering::Release);
         PENDING_ACTIVE_CORE_UPDATES.lock().unwrap().clear();
         self.schedulers.clear();
+        self.cores.clear();
         self.main_threads.clear();
         self.idle_threads.clear();
+        self.application_thread = None;
         self.service_processes.lock().unwrap().clear();
         self.host_service_processes.lock().unwrap().clear();
+        self.process_list.lock().unwrap().clear();
+        self.terminating_processes.lock().unwrap().clear();
+
+        // Upstream's thread/process Close() chain leaves no objects in the
+        // scheduler context. Drop the Rust owning container now rather than
+        // retaining stopped fibers until the next Initialize call.
+        self.global_scheduler_context = None;
+        self.core_timing = None;
+
+        // Upstream closes its persistent system resource limit in Shutdown.
+        self.system_resource_limit = None;
 
         if let Some(ref container) = self.global_object_list_container {
             container.finalize();
@@ -2558,6 +2611,83 @@ impl KernelCore {
 
         for tracked in deferred {
             ServerManager::join_host_threads(&tracked.host_threads, &tracked.name);
+        }
+
+        let service_owners = {
+            let mut owners = self.deferred_service_owners.lock().unwrap();
+            std::mem::take(&mut *owners)
+        };
+        drop(service_owners);
+    }
+
+    /// Preserve an upstream stack-owned service object outside a cooperative
+    /// guest fiber so its Rust destructor runs during shutdown.
+    pub fn retain_service_lifetime_owner<T>(&self, owner: T)
+    where
+        T: Send + 'static,
+    {
+        self.deferred_service_owners
+            .lock()
+            .unwrap()
+            .push(Box::new(owner));
+    }
+
+    /// Release process and thread owners after cooperative guest fibers stop.
+    ///
+    /// Upstream intrusive references run `KThread::Finalize` and
+    /// `KProcess::Finalize` from the final `Close()`. Rust must defer that final
+    /// owner release until `CpuManager::shutdown`, because a suspended fiber may
+    /// still be borrowing its `KThread` before then.
+    pub fn finalize_terminated_processes_after_cpu_shutdown(&self) {
+        let processes = {
+            let mut processes = self.terminating_processes.lock().unwrap();
+            std::mem::take(&mut *processes)
+        };
+
+        for process in processes {
+            let threads = {
+                let process = process.lock().unwrap();
+                process.thread_objects.values().cloned().collect::<Vec<_>>()
+            };
+
+            for thread in threads {
+                let (thread_id, object_id, global_scheduler_context) = {
+                    let thread = thread.lock().unwrap();
+                    (
+                        thread.get_thread_id(),
+                        thread.get_object_id(),
+                        thread
+                            .global_scheduler_context
+                            .as_ref()
+                            .and_then(Weak::upgrade),
+                    )
+                };
+                if let Some(gsc) = global_scheduler_context {
+                    gsc.lock().unwrap().remove_thread(thread_id);
+                }
+
+                let (parent, resource_limit_release_hint) = {
+                    let mut thread = thread.lock().unwrap();
+                    let parent = thread.parent.as_ref().and_then(Weak::upgrade);
+                    let resource_limit_release_hint = thread.resource_limit_release_hint;
+                    thread.finalize();
+                    (parent, resource_limit_release_hint)
+                };
+                KThread::post_destroy(parent, resource_limit_release_hint);
+                self.unregister_kernel_object(object_id);
+            }
+
+            // Session service destructors unregister process-owned events.
+            // Detach and release those Arc owners without holding ProcessLock,
+            // otherwise their callbacks recursively acquire the same mutex.
+            let (client_sessions, sessions) = {
+                let mut process = process.lock().unwrap();
+                process.take_session_owners_for_finalize()
+            };
+            drop(client_sessions);
+            drop(sessions);
+
+            process.lock().unwrap().finalize();
         }
     }
 
@@ -2650,6 +2780,25 @@ impl KernelCore {
         self.process_list.lock().unwrap().clone()
     }
 
+    /// Terminate every registered process and clear the live process list.
+    /// Matches upstream `KernelCore::Impl::TerminateAllProcesses()`.
+    fn terminate_all_processes(&self) {
+        let _guard = self.process_list_lock.lock().unwrap();
+        let processes = {
+            let mut process_list = self.process_list.lock().unwrap();
+            std::mem::take(&mut *process_list)
+        };
+
+        for process in &processes {
+            let _ = process.lock().unwrap().terminate();
+        }
+
+        // Upstream drops the process-list reference with Close(). Cooperative
+        // Rust fibers need the equivalent final release deferred until the CPU
+        // threads have joined.
+        self.terminating_processes.lock().unwrap().extend(processes);
+    }
+
     /// Suspend or resume emulation threads for the current application process.
     ///
     /// Upstream: `KernelCore::SuspendEmulation(bool)`.
@@ -2679,16 +2828,14 @@ impl KernelCore {
         }
     }
 
-    /// Begin kernel-side shutdown for the current application process.
+    /// Begin kernel-side shutdown for all registered processes.
     ///
     /// Upstream: `KernelCore::ShutdownCores()`.
-    /// The current Rust port uses process termination plus per-core interrupts
-    /// to drive CpuManager guest fibers into their shutdown yield path.
+    /// Rust uses the same all-process termination point, then interrupts each
+    /// core to drive cooperative guest fibers into their shutdown yield path.
     pub fn shutdown_cores(&self) {
-        if let Some(process) = self.system_ref.get().current_process_arc.as_ref().cloned() {
-            let _ = process.lock().unwrap().terminate();
-            KWorkerTaskManager::wait_for_global_idle();
-        }
+        self.terminate_all_processes();
+        KWorkerTaskManager::wait_for_global_idle();
 
         self.interrupt_all_cores();
     }
@@ -3526,6 +3673,25 @@ mod tests {
     }
 
     #[test]
+    fn finalize_services_drops_stack_owned_service_adapters() {
+        struct DropProbe(Arc<AtomicBool>);
+
+        impl Drop for DropProbe {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+
+        let kernel = KernelCore::new();
+        let dropped = Arc::new(AtomicBool::new(false));
+        kernel.retain_service_lifetime_owner(DropProbe(Arc::clone(&dropped)));
+
+        assert!(!dropped.load(Ordering::Acquire));
+        kernel.finalize_services_after_cpu_shutdown();
+        assert!(dropped.load(Ordering::Acquire));
+    }
+
+    #[test]
     fn finalize_services_does_not_lock_a_stopped_guest_manager() {
         let kernel = KernelCore::new();
         let manager = ServerManager::new_shared(SystemRef::null());
@@ -3577,6 +3743,7 @@ mod tests {
         let service_process = kernel.service_processes.lock().unwrap()[0].clone();
         let thread = {
             let process = service_process.lock().unwrap();
+            assert!(process.is_initialized);
             process.thread_objects.values().next().cloned()
         }
         .expect("service process should keep its thread object");
@@ -3588,6 +3755,35 @@ mod tests {
             .as_ref()
             .and_then(Weak::upgrade)
             .is_some());
+    }
+
+    #[test]
+    fn stopped_guest_service_releases_captured_owner() {
+        let mut kernel = KernelCore::new();
+        kernel.initialize();
+        kernel.initialize_system_resource_limit(16 * 1024 * 1024, 0);
+
+        let owner = Arc::new(());
+        let weak_owner = Arc::downgrade(&owner);
+        kernel.run_on_guest_core_process(
+            "svc-lifetime-test",
+            Box::new({
+                let owner = Arc::clone(&owner);
+                move || drop(owner)
+            }),
+        );
+        drop(owner);
+
+        assert!(weak_owner.upgrade().is_some());
+        assert_eq!(kernel.get_process_list().len(), 1);
+
+        kernel.shutdown_cores();
+        assert!(kernel.get_process_list().is_empty());
+        kernel.finalize_services_after_cpu_shutdown();
+        kernel.finalize_terminated_processes_after_cpu_shutdown();
+        kernel.shutdown();
+
+        assert!(weak_owner.upgrade().is_none());
     }
 
     #[test]

@@ -1,7 +1,7 @@
+use crate::adsp::apps::audio_renderer::command_list_processor::MemoryHandle;
 use crate::common::common::CpuAddr;
 use crate::renderer::command::util::write_copy;
 use crate::renderer::effect::aux_::{AuxBufferInfo, AuxInfoDsp};
-use crate::{guest_read_block, guest_write_block};
 use std::fmt::Write;
 
 #[derive(Debug, Clone, Copy)]
@@ -31,8 +31,8 @@ pub struct CaptureCommand {
 }
 
 impl CapturePayload {
-    pub fn process(&self, mix_buffers: &mut [i32], sample_count: usize) {
-        process_capture_command(self, mix_buffers, sample_count);
+    pub fn process(&self, memory: &MemoryHandle, mix_buffers: &mut [i32], sample_count: usize) {
+        process_capture_command(self, memory, mix_buffers, sample_count);
     }
 
     pub fn verify(&self) -> bool {
@@ -60,6 +60,7 @@ pub fn write_capture_payload(cmd: &CaptureCommand, output: &mut [u8]) -> usize {
 
 pub fn process_capture_command(
     payload: &CapturePayload,
+    memory: &MemoryHandle,
     mix_buffers: &mut [i32],
     sample_count: usize,
 ) {
@@ -67,6 +68,7 @@ pub fn process_capture_command(
         let input_start = payload.input as usize * sample_count;
         let input = &mix_buffers[input_start..input_start + sample_count];
         let _ = write_capture_buffer(
+            memory,
             payload.send_buffer_info,
             payload.send_buffer,
             payload.count_max,
@@ -76,7 +78,7 @@ pub fn process_capture_command(
             payload.update_count,
         );
     } else {
-        reset_capture_info(payload.send_buffer_info);
+        reset_capture_info(memory, payload.send_buffer_info);
     }
 }
 
@@ -92,17 +94,18 @@ pub fn dump_capture_command(payload: &CapturePayload, dump: &mut String) {
     );
 }
 
-fn reset_capture_info(addr: CpuAddr) {
-    let Some(mut info) = read_aux_info(addr) else {
+fn reset_capture_info(memory: &MemoryHandle, addr: CpuAddr) {
+    let Some(mut info) = read_aux_info(memory, addr) else {
         return;
     };
     info.read_offset = 0;
     info.write_offset = 0;
     info.total_sample_count = 0;
-    let _ = write_aux_info(addr, &info);
+    let _ = write_aux_info(memory, addr, &info);
 }
 
 fn write_capture_buffer(
+    memory: &MemoryHandle,
     info_addr: CpuAddr,
     buffer_addr: CpuAddr,
     count_max: u32,
@@ -118,7 +121,7 @@ fn write_capture_buffer(
         return 0;
     }
 
-    let Some(mut info) = read_aux_buffer_info(info_addr) else {
+    let Some(mut info) = read_aux_buffer_info(memory, info_addr) else {
         return 0;
     };
 
@@ -135,7 +138,7 @@ fn write_capture_buffer(
             let write_addr =
                 buffer_addr + target_write_offset as usize * std::mem::size_of::<i32>();
             let end = write_pos + to_write;
-            if !guest_write_block(
+            if !memory.write_block(
                 write_addr as u64,
                 i32_slice_as_bytes(&input[write_pos..end]),
             ) {
@@ -175,38 +178,42 @@ fn write_capture_buffer(
         info.dsp_info.total_sample_count = new_sample_count;
     }
 
-    let _ = write_aux_buffer_info(info_addr, &info);
+    let _ = write_aux_buffer_info(memory, info_addr, &info);
     write_count
 }
 
-fn read_aux_info(addr: CpuAddr) -> Option<AuxInfoDsp> {
+fn read_aux_info(memory: &MemoryHandle, addr: CpuAddr) -> Option<AuxInfoDsp> {
     if addr == 0 {
         return None;
     }
     let mut info = AuxInfoDsp::default();
-    guest_read_block(addr as u64, aux_info_as_bytes_mut(&mut info)).then_some(info)
+    memory
+        .read_block(addr as u64, aux_info_as_bytes_mut(&mut info))
+        .then_some(info)
 }
 
-fn write_aux_info(addr: CpuAddr, info: &AuxInfoDsp) -> bool {
+fn write_aux_info(memory: &MemoryHandle, addr: CpuAddr, info: &AuxInfoDsp) -> bool {
     if addr == 0 {
         return false;
     }
-    guest_write_block(addr as u64, aux_info_as_bytes(info))
+    memory.write_block(addr as u64, aux_info_as_bytes(info))
 }
 
-fn read_aux_buffer_info(addr: CpuAddr) -> Option<AuxBufferInfo> {
+fn read_aux_buffer_info(memory: &MemoryHandle, addr: CpuAddr) -> Option<AuxBufferInfo> {
     if addr == 0 {
         return None;
     }
     let mut info = AuxBufferInfo::default();
-    guest_read_block(addr as u64, aux_buffer_info_as_bytes_mut(&mut info)).then_some(info)
+    memory
+        .read_block(addr as u64, aux_buffer_info_as_bytes_mut(&mut info))
+        .then_some(info)
 }
 
-fn write_aux_buffer_info(addr: CpuAddr, info: &AuxBufferInfo) -> bool {
+fn write_aux_buffer_info(memory: &MemoryHandle, addr: CpuAddr, info: &AuxBufferInfo) -> bool {
     if addr == 0 {
         return false;
     }
-    guest_write_block(addr as u64, aux_buffer_info_as_bytes(info))
+    memory.write_block(addr as u64, aux_buffer_info_as_bytes(info))
 }
 
 fn aux_info_as_bytes(info: &AuxInfoDsp) -> &[u8] {

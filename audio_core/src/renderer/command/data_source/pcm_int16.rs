@@ -1,3 +1,4 @@
+use crate::adsp::apps::audio_renderer::command_list_processor::MemoryHandle;
 use crate::common::common::{CpuAddr, SampleFormat, SrcQuality};
 use crate::common::wave_buffer::WaveBufferVersion2;
 use crate::renderer::command::data_source::decode::{
@@ -27,9 +28,16 @@ pub struct PcmInt16DataSourceVersion1Payload {
 pub type PcmInt16DataSourceVersion2Payload = PcmInt16DataSourceVersion1Payload;
 
 impl PcmInt16DataSourceVersion1Payload {
-    pub fn process(&self, mix_buffers: &mut [i32], sample_count: usize, target_sample_rate: u32) {
+    pub fn process(
+        &self,
+        memory: &MemoryHandle,
+        mix_buffers: &mut [i32],
+        sample_count: usize,
+        target_sample_rate: u32,
+    ) {
         process_pcm_int16_data_source_version1_command(
             self,
+            memory,
             mix_buffers,
             sample_count,
             target_sample_rate,
@@ -48,12 +56,14 @@ impl PcmInt16DataSourceVersion1Payload {
 impl PcmInt16DataSourceVersion2Payload {
     pub fn process_v2(
         &self,
+        memory: &MemoryHandle,
         mix_buffers: &mut [i32],
         sample_count: usize,
         target_sample_rate: u32,
     ) {
         process_pcm_int16_data_source_version2_command(
             self,
+            memory,
             mix_buffers,
             sample_count,
             target_sample_rate,
@@ -85,21 +95,31 @@ pub fn write_pcm_int16_data_source_version2_payload(
 
 pub fn process_pcm_int16_data_source_version1_command(
     payload: &PcmInt16DataSourceVersion1Payload,
-    mix_buffers: &mut [i32],
-    sample_count: usize,
-    target_sample_rate: u32,
-) {
-    process_pcm_int16_data_source(payload, mix_buffers, sample_count, target_sample_rate, true);
-}
-
-pub fn process_pcm_int16_data_source_version2_command(
-    payload: &PcmInt16DataSourceVersion2Payload,
+    memory: &MemoryHandle,
     mix_buffers: &mut [i32],
     sample_count: usize,
     target_sample_rate: u32,
 ) {
     process_pcm_int16_data_source(
         payload,
+        memory,
+        mix_buffers,
+        sample_count,
+        target_sample_rate,
+        true,
+    );
+}
+
+pub fn process_pcm_int16_data_source_version2_command(
+    payload: &PcmInt16DataSourceVersion2Payload,
+    memory: &MemoryHandle,
+    mix_buffers: &mut [i32],
+    sample_count: usize,
+    target_sample_rate: u32,
+) {
+    process_pcm_int16_data_source(
+        payload,
+        memory,
         mix_buffers,
         sample_count,
         target_sample_rate,
@@ -172,6 +192,7 @@ fn write_pcm_int16_data_source_payload(command: &DataSourceCommand, output: &mut
 
 fn process_pcm_int16_data_source(
     payload: &PcmInt16DataSourceVersion1Payload,
+    memory: &MemoryHandle,
     mix_buffers: &mut [i32],
     sample_count: usize,
     target_sample_rate: u32,
@@ -194,21 +215,24 @@ fn process_pcm_int16_data_source(
         }
     }
 
-    decode_from_wave_buffers(DecodeFromWaveBuffersArgs {
-        sample_format: SampleFormat::PcmInt16,
-        output: &mut mix_buffers[output_range],
-        voice_state,
-        wave_buffers: &wave_buffers,
-        channel: payload.channel_index,
-        channel_count: payload.channel_count,
-        src_quality: payload.src_quality,
-        pitch: payload.pitch,
-        source_sample_rate: payload.sample_rate,
-        target_sample_rate,
-        sample_count: sample_count as u32,
-        data_address: 0,
-        data_size: 0,
-        is_voice_played_sample_count_reset_at_loop_point_supported: (payload.flags & 1) != 0,
-        is_voice_pitch_and_src_skipped_supported: (payload.flags & 2) != 0,
-    });
+    decode_from_wave_buffers(
+        memory,
+        DecodeFromWaveBuffersArgs {
+            sample_format: SampleFormat::PcmInt16,
+            output: &mut mix_buffers[output_range],
+            voice_state,
+            wave_buffers: &wave_buffers,
+            channel: payload.channel_index,
+            channel_count: payload.channel_count,
+            src_quality: payload.src_quality,
+            pitch: payload.pitch,
+            source_sample_rate: payload.sample_rate,
+            target_sample_rate,
+            sample_count: sample_count as u32,
+            data_address: 0,
+            data_size: 0,
+            is_voice_played_sample_count_reset_at_loop_point_supported: (payload.flags & 1) != 0,
+            is_voice_pitch_and_src_skipped_supported: (payload.flags & 2) != 0,
+        },
+    );
 }

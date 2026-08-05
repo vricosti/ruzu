@@ -5,7 +5,7 @@
 //! Port of zuyu/src/core/hle/service/am/service/application_proxy_service.cpp
 
 use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 
 use crate::core::SystemRef;
 use crate::hle::kernel::k_process::KProcess;
@@ -20,13 +20,13 @@ use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFrame
 /// - 0: OpenApplicationProxy
 pub struct IApplicationProxyService {
     system: SystemRef,
-    window_system: Arc<Mutex<WindowSystem>>,
+    window_system: Weak<Mutex<WindowSystem>>,
     handlers: BTreeMap<u32, FunctionInfo>,
     handlers_tipc: BTreeMap<u32, FunctionInfo>,
 }
 
 impl IApplicationProxyService {
-    pub fn new(system: SystemRef, window_system: Arc<Mutex<WindowSystem>>) -> Self {
+    pub fn new(system: SystemRef, window_system: Weak<Mutex<WindowSystem>>) -> Self {
         let handlers = build_handler_map(&[(
             0,
             Some(Self::open_application_proxy_handler),
@@ -54,6 +54,7 @@ impl IApplicationProxyService {
             pid
         );
         self.window_system
+            .upgrade()?
             .lock()
             .unwrap()
             .get_by_applet_resource_user_id(pid)
@@ -125,5 +126,25 @@ impl ServiceFramework for IApplicationProxyService {
 
     fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
         &self.handlers_tipc
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn service_does_not_own_window_system() {
+        let window_system = Arc::new(Mutex::new(WindowSystem::new(SystemRef::null())));
+        let weak = Arc::downgrade(&window_system);
+        let service = IApplicationProxyService::new(SystemRef::null(), weak.clone());
+
+        drop(window_system);
+
+        assert!(
+            weak.upgrade().is_none(),
+            "AM services must mirror upstream's non-owning WindowSystem references"
+        );
+        drop(service);
     }
 }

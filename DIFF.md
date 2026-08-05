@@ -32396,3 +32396,316 @@ Rust files: `externals/rdynarmic/src/frontend/a32/{decoder.rs, decoder_thumb32.r
   x64 JIT regression verifies exact `SHLL` and `SHLL2` low/high 64-bit results.
 - The complete release `rdynarmic` library suite passes: 780 passed, 0 failed,
   4 ignored.
+
+## 2026-08-05 — video_core/src/vulkan_common/vulkan_device.rs vs video_core/vulkan_common/vulkan_device.{h,cpp}
+
+### Intentional differences
+- Rust uses ash builders for Vulkan `pNext` chains and owned `CString` extension
+  names. `VK_EXT_depth_bias_control` uses a local ABI-exact payload because ash
+  0.37 predates that extension; its owner remains `vulkan_device.rs`.
+- The VMA allocator remains owned by Rust's `MemoryAllocator` in
+  `renderer_vulkan`, rather than by `Device`. Logical-device and allocator
+  destruction still follow their upstream dependency order.
+- `VK_KHR_portability_subset` and the MoltenVK shader-demote exclusion are
+  retained for the supported Apple backend. The audited upstream revision does
+  not contain those newer MoltenVK requirements.
+- `VK_EXT_device_fault` remains opt-in through `RUZU_VK_DEVICE_FAULT`; it is
+  absent from ordinary device creation.
+
+### Unintentional differences (fixed)
+- `Device::new` now queries actual surface support, selects distinct graphics
+  and present families when required, and rejects missing queues with the same
+  Vulkan errors as `SetupFamilies`.
+- The feature and extension chains now cover every upstream macro entry,
+  including core 1.2/1.3 promotion rules. The exact queried feature chain is
+  reused for device creation and unsuitable extension payloads are cleared
+  while preserving `sType` and `pNext`.
+- Mandatory extensions, mandatory feature bits, Vulkan 1.1, and all four
+  minimum limits are validated. Recommended extensions and features are logged
+  through the asynchronous logging system.
+- Driver, subgroup, float-control, push-descriptor, subgroup-size-control, and
+  transform-feedback properties are fetched in one properties chain.
+- `RemoveUnsuitableExtensions` feature predicates and the Qualcomm, Turnip,
+  ARM, NVIDIA, RADV, AMD, Intel, ANV, and MoltenVK workarounds now match the
+  upstream conditions and extension-removal behavior.
+- Format capabilities, ASTC coverage, depth/stencil blits, D24 support, subgroup
+  width, conditional barriers, tooling, memory budgets, NVIDIA architecture,
+  scaled formats, MSAA restrictions, and broken-driver flags now come from host
+  probes rather than constants.
+- Timeline semaphores are rejected on Qualcomm and Turnip, and clock boosting
+  now uses the upstream validated-driver, Steam Deck, and debugging-tool rules.
+- The scalar feature-backed capability values for shader atomic int64, shader
+  demote, and subgroup size control no longer incorrectly depend on whether a
+  promoted extension name was loaded.
+- Primitive topology restart, 4444 formats, and uint8 indices now preserve
+  upstream's split between extension presence and queried feature bits. The
+  extension names remain loaded when advertised; the topology and 4444 public
+  capability queries read their dedicated feature values, while uint8-index
+  support follows extension presence exactly as upstream.
+- Nsight diagnostics now prepend `VkDeviceDiagnosticsConfigCreateInfoNV` with
+  the three upstream flags, and the tracker exists only while that setting and
+  extension are active.
+- Restored the two missing format alternatives, upstream fallback diagnostics,
+  float-control and dispatch accessors, and unsigned memory-accounting behavior.
+
+### Missing items
+- Android/ARM64 Adreno BCn binary patching remains unavailable because ruzu has
+  no adrenotools integration. The format override and driver-code patch are not
+  used by the desktop Vulkan paths audited here.
+
+### Binary layout verification
+- PASS: the local depth-bias payload has Vulkan's 32-byte/8-byte layout on
+  64-bit hosts (24-byte/4-byte on 32-bit), the registry `sType`, and the exact
+  field order. The complete creation chain rejects duplicate structure types.
+- PASS: enabled extension pointers reference owned NUL-terminated strings for
+  the full duration of `vkCreateDevice`.
+
+### Behavioral verification
+- Re-read the complete upstream header and implementation after implementation.
+  Thirteen focused tests cover extension promotion, mandatory suitability,
+  format alternatives, depth-bias ABI, memory accounting, driver naming,
+  MoltenVK limits, and the AMD sampler-minmax exclusion.
+- `cargo check -p video_core --release --lib` passes. The full `video_core`
+  suite was not used as a gate because its known shader-cache tests still hang;
+  the targeted Vulkan-device suite passes 13/13.
+
+## 2026-08-05 — video_core/src/renderer_vulkan/renderer_vulkan.rs vs video_core/renderer_vulkan/renderer_vulkan.cpp
+
+### Intentional differences
+- Rust passes its `Instance` wrapper to `create_device` so the ash entry and
+  instance dispatch objects remain available to surface and tooling extension
+  loaders. Upstream passes the equivalent `VkInstance` and `InstanceDispatch`
+  separately.
+
+### Unintentional differences (fixed)
+- `create_device` previously discarded the entry dispatch needed by
+  `Device::SetupFamilies` and `CollectToolingInfo`; it now forwards the same
+  construction dependencies as upstream.
+
+### Binary layout verification
+- PASS: this changes only host-side constructor references and no Vulkan or
+  guest-visible payload.
+
+### Behavioral verification
+- Re-read upstream `CreateDevice` and the Rust call site after implementation;
+  the release `video_core` check and focused device tests pass.
+
+## 2026-08-05 — core/src/core_timing.rs vs core/core_timing.{h,cpp}
+
+### Intentional differences
+- Rust stores the timing owner in `Arc<CoreTiming>`, but the timing thread now
+  borrows it through a stable raw pointer. This matches upstream's
+  `std::ref(*this)` ownership: the owner remains responsible for setting the
+  shutdown flag and joining the thread in `Reset`/`Drop`.
+- `System::drop` calls `CoreTiming::reset` explicitly. Upstream owns
+  `CoreTiming` by value, so `System::~System` reaches `CoreTiming::~CoreTiming`
+  unconditionally; Rust must perform that owner action before residual
+  subsystem `Arc` handles can defer the final `CoreTiming` destructor.
+
+### Unintentional differences (fixed)
+- The timing thread previously cloned its own `Arc<CoreTiming>`. That strong
+  self-reference prevented `Drop::reset` from ever running and leaked one
+  timing thread after every frontend Stop/relaunch cycle.
+
+### Binary layout verification
+- PASS: only host-side thread ownership changed; timing events and guest-visible
+  state are unchanged.
+
+### Behavioral verification
+- Re-read upstream `Initialize`, `ThreadEntry`, `Reset`, and the destructor.
+  `timer_thread_does_not_own_core_timing` verifies that dropping the external
+  owner stops and joins the thread instead of retaining the object.
+- `dropping_system_stops_core_timing_with_external_arc_alive` verifies the
+  upstream destruction contract across the Rust `Arc` adaptation.
+
+## 2026-08-05 — core/src/hle/service/am/applet_manager.rs vs core/hle/service/am/applet_manager.{h,cpp}
+
+### Intentional differences
+- Rust represents upstream's non-owning `WindowSystem*` as
+  `Weak<Mutex<WindowSystem>>`; callers still provide a strong `Arc` while
+  `set_window_system` performs the upstream initialization sequence.
+
+### Unintentional differences (fixed)
+- `AppletManagerInner` previously retained an owning `Arc<WindowSystem>`, which
+  formed a cycle with the AM service owners and leaked `EventObserver` after
+  every frontend Stop/relaunch cycle.
+
+### Binary layout verification
+- PASS: the ownership correction affects host objects only; AM IPC payloads and
+  guest-visible structures are unchanged.
+
+### Behavioral verification
+- Re-read upstream `SetWindowSystem`, `RequestExit`, and
+  `OperationModeChanged`; lock scope and call ordering remain unchanged.
+  Focused tests verify shutdown wakeup and non-owning WindowSystem lifetime.
+
+## 2026-08-05 — core/src/hle/service/am/am.rs vs core/hle/service/am/am.cpp
+
+### Intentional differences
+- Upstream owns `WindowSystem` directly on the `LoopProcess` stack. Rust owns
+  it in one local `Arc` so it can be shared through mutex guards, while every
+  service receives only a `Weak` non-owning reference.
+
+### Unintentional differences (fixed)
+- The two named-service factories previously captured strong `Arc` clones.
+  Guest IPC sessions could therefore keep `WindowSystem`, `EventObserver`, and
+  the stopped emulation system alive after `ServerManager::RunServer` returned.
+
+### Binary layout verification
+- PASS: this changes host object ownership only; no IPC payload or guest state
+  layout changed.
+
+### Behavioral verification
+- Re-read upstream `LoopProcess`: the local `WindowSystem` outlives both
+  registered services and is destroyed when the server exits. The Rust local
+  owner now has the same lifetime and the factories cannot extend it.
+
+## 2026-08-05 — core/src/hle/service/am/service/{all_system_applet_proxies_service,application_accessor,application_creator,application_proxy,application_proxy_service,home_menu_functions,library_applet_creator,library_applet_proxy,system_applet_proxy,window_controller}.rs vs core/hle/service/am/service/*.{h,cpp}
+
+### Intentional differences
+- Rust represents each upstream `WindowSystem& m_window_system` field as
+  `Weak<Mutex<WindowSystem>>`. Active commands upgrade it for the duration of
+  the call; upstream obtains the same temporary access through its reference.
+
+### Unintentional differences (fixed)
+- All ten service objects previously stored an owning `Arc<WindowSystem>`.
+  Parent proxies also cloned that owner into child services, forming cycles
+  through guest-held IPC sessions and leaking AM/timing threads after Stop.
+
+### Binary layout verification
+- PASS: these are host-only service fields; command tables, response payloads,
+  and guest-visible object behavior are unchanged.
+
+### Behavioral verification
+- Re-read every corresponding header and constructor, then checked every child
+  service creation site. Upstream consistently stores and forwards the same
+  non-owning `WindowSystem&`; Rust now consistently forwards `Weak` clones.
+- `service_does_not_own_window_system` verifies that a live root AM service
+  cannot extend the `WindowSystem` lifetime.
+
+## 2026-08-05 — core/src/hle/service/os/event.rs vs core/hle/service/os/event.{h,cpp}
+
+### Intentional differences
+- Rust's lazily materialized kernel bridge stores owning `Arc`s for `KEvent`
+  and `KReadableEvent`, replacing the explicit `Close()` calls in upstream's
+  `Event` destructor. Its process lookup is a `Weak<ProcessLock>`, matching the
+  non-owning kernel/service-context relationship used by upstream.
+
+### Unintentional differences (fixed)
+- `KernelEventBridge` previously retained both an owning process `Arc` and an
+  owning scheduler `Arc`. The scheduler field was never read. Together with a
+  service thread's captured manager this formed a process/fiber/service cycle,
+  while the scheduler owner retained `CoreTiming` after every frontend Stop.
+- Event creation previously failed unless a scheduler could be resolved even
+  though no event operation used it. The bridge now requires only its actual
+  upstream owner, `KEvent`.
+
+### Binary layout verification
+- PASS: the bridge is host-only; kernel object IDs, IPC handles, and event
+  signal state retain their existing representation.
+
+### Behavioral verification
+- Re-read upstream construction, destruction, `Signal`, `Clear`, and
+  `GetHandle`. Kernel signal/clear still run while the owning process exists;
+  after process destruction only the host-side event is updated.
+- The two focused event tests pass, including a regression proving that a
+  bridge cannot extend process lifetime and remains safe after process drop.
+
+## 2026-08-05 — core/src/hle/service/{server_manager.rs,nvnflinger/buffer_queue_producer.rs,psc/time/power_state_service.rs,psc/time/service_manager.rs} vs corresponding upstream service event call sites
+
+### Intentional differences
+- These Rust call sites lazily attach kernel-readable events because the Rust
+  IPC bridge materializes handles on demand; upstream creates them through
+  `ServiceContext` at service construction time.
+
+### Unintentional differences (fixed)
+- The call sites previously resolved and forwarded a scheduler solely to
+  satisfy the non-upstream owning field in `Event`. They now forward only the
+  event objects and owning process needed to register the readable handle.
+
+### Binary layout verification
+- PASS: event registration IDs and returned IPC handles are unchanged.
+
+### Behavioral verification
+- Re-read the corresponding upstream event handout paths and verified that no
+  operation depends on retaining a scheduler. `cargo check -p core --lib` and
+  the focused event suite pass.
+
+## 2026-08-05 — core/src/hle/kernel/k_process.rs vs core/hle/kernel/k_process.{h,cpp}
+
+### Intentional differences
+- Rust stores the four upstream `unique_ptr<ArmInterface>` values as boxed trait
+  objects. Their ownership and per-core array placement remain in `KProcess`.
+
+### Unintentional differences (fixed)
+- `KProcess::finalize` described the upstream expensive-resource cleanup but
+  did not execute it. It now clears every ARM interface and then the exclusive
+  monitor in the same order as upstream. This releases JIT memory and its four
+  `CoreTiming` references even when another Rust owner retains the finalized
+  process object.
+
+### Binary layout verification
+- PASS: the correction only releases host-owned JIT objects; process ABI,
+  thread contexts, and guest memory layouts are unchanged.
+
+### Behavioral verification
+- Re-read upstream `KProcess::Finalize`, `KProcess` field ownership, and
+  `InitializeInterfaces`. `finalize_releases_arm_interfaces_before_process_drop`
+  verifies immediate destruction of all four interfaces while the process
+  remains alive.
+
+## 2026-08-05 — audio_core/src/adsp/apps/audio_renderer/command_list_processor.rs and renderer/command/{data_source,effect,sink} vs corresponding audio_core upstream files
+
+### Intentional differences
+- Rust represents upstream's non-owning `Core::Memory::Memory*` as a clonable
+  `MemoryHandle` containing the current process memory `Arc`. Commands receive
+  that handle from their `CommandListProcessor`, preserving the same per-list
+  ownership boundary without a global memory accessor.
+- Unit tests without a kernel process use the existing direct host-pointer
+  command buffers through a test-only empty `MemoryHandle`; production never
+  falls back to host pointers when process memory is unavailable.
+
+### Unintentional differences (fixed)
+- Audio guest-memory reads and writes previously used a process-global
+  `OnceLock`, so every GUI relaunch continued decoding ADPCM and processing
+  auxiliary, capture, and circular-buffer commands against the first stopped
+  process. `CommandListProcessor::initialize` now rebinds memory from its
+  current `KProcess` on every command list, matching upstream's
+  `memory = &process.GetMemory()` assignment.
+- All data-source decoders, auxiliary/capture effects, and circular-buffer
+  sinks now use the processor-owned memory handle, matching each upstream
+  `*processor.memory` call site.
+
+### Binary layout verification
+- PASS: command structures, samples, wave-buffer metadata, and guest addresses
+  are unchanged; only the host memory owner used to resolve those addresses
+  changed.
+
+### Behavioral verification
+- Re-read `CommandListProcessor::{Initialize,Process}` and every affected
+  upstream command `Process` method. The focused
+  `initialize_rebinds_memory_to_the_current_process` test passes, and
+  `cargo check -p audio_core --tests` passes.
+
+## 2026-08-05 — audio_core/src/renderer/{system.rs,audio_renderer.rs} vs audio_core/renderer/{system,audio_renderer}.{h,cpp}
+
+### Intentional differences
+- Rust returns the auto-mode termination event from `request_stop` so the
+  wrapper can release its `Mutex<System>` before waiting. This is the Rust
+  equivalent of upstream `System::Stop`, whose scoped lock ends before
+  `terminate_event.Wait()`.
+
+### Unintentional differences (fixed)
+- The wrapper previously held the Rust system mutex while waiting for the DSP
+  termination event, preventing the renderer thread from acquiring that same
+  mutex to complete shutdown. State changes still occur under the owner lock,
+  while the wait now occurs after releasing it, in upstream order.
+
+### Binary layout verification
+- PASS: this changes host synchronization scope only; renderer parameters,
+  work buffers, and guest-visible audio state are unchanged.
+
+### Behavioral verification
+- Re-read upstream `Renderer::Stop`, `System::Stop`, and `System::Finalize`.
+  `stop_releases_system_mutex_while_waiting_for_auto_mode` covers the lock and
+  wait ordering.

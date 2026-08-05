@@ -5,7 +5,7 @@
 //! Port of zuyu/src/core/hle/service/am/service/library_applet_creator.cpp
 
 use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 
 use crate::core::SystemRef;
 use crate::hle::result::{ResultCode, RESULT_SUCCESS, RESULT_UNKNOWN};
@@ -32,7 +32,7 @@ use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFrame
 pub struct ILibraryAppletCreator {
     system: SystemRef,
     applet: Arc<Mutex<crate::hle::service::am::applet::Applet>>,
-    window_system: Arc<Mutex<crate::hle::service::am::window_system::WindowSystem>>,
+    window_system: Weak<Mutex<crate::hle::service::am::window_system::WindowSystem>>,
     handlers: BTreeMap<u32, FunctionInfo>,
     handlers_tipc: BTreeMap<u32, FunctionInfo>,
 }
@@ -41,7 +41,7 @@ impl ILibraryAppletCreator {
     pub fn new(
         system: SystemRef,
         applet: Arc<Mutex<crate::hle::service::am::applet::Applet>>,
-        window_system: Arc<Mutex<crate::hle::service::am::window_system::WindowSystem>>,
+        window_system: Weak<Mutex<crate::hle::service::am::window_system::WindowSystem>>,
     ) -> Self {
         let handlers = build_handler_map(&[
             (
@@ -193,6 +193,8 @@ impl ILibraryAppletCreator {
         }
 
         self.window_system
+            .upgrade()
+            .expect("WindowSystem must outlive active AM services")
             .lock()
             .unwrap()
             .track_applet(Arc::clone(&applet), false);

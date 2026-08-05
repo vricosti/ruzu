@@ -66,7 +66,15 @@ impl Renderer {
             return;
         }
 
-        let session_id = self.system.lock().get_session_id() as i32;
+        let (session_id, terminate_event) = {
+            let mut system = self.system.lock();
+            let session_id = system.get_session_id() as i32;
+            let terminate_event = system.is_active().then(|| system.request_stop()).flatten();
+            (session_id, terminate_event)
+        };
+        if let Some(terminate_event) = terminate_event {
+            terminate_event.wait();
+        }
         self.system.lock().finalize();
         if self.system_registered {
             self.manager.lock().remove_system(&self.system);
@@ -108,7 +116,10 @@ impl Renderer {
         self.system.lock().start();
     }
     pub fn stop(&self) {
-        self.system.lock().stop();
+        let terminate_event = self.system.lock().request_stop();
+        if let Some(terminate_event) = terminate_event {
+            terminate_event.wait();
+        }
     }
 
     pub fn request_update(
@@ -142,7 +153,6 @@ mod tests {
     use crate::sink::null_sink::NullSink;
     use crate::sink::sink::new_sink_handle;
     use parking_lot::Mutex;
-    use std::sync::atomic::Ordering;
     use std::sync::Arc;
 
     fn make_shared_system() -> crate::SharedSystem {
@@ -201,8 +211,8 @@ mod tests {
     }
 
     #[test]
-    fn stop_uses_system_auto_mode_wait_path() {
-        use std::sync::atomic::AtomicBool;
+    fn stop_releases_system_mutex_while_waiting_for_auto_mode() {
+        use std::sync::mpsc;
         use std::time::Duration;
 
         let core = make_shared_system();
@@ -216,30 +226,40 @@ mod tests {
         let params = make_params();
         let transfer_size = System::get_work_buffer_size(&params);
 
-        let process = Box::into_raw(Box::new(KProcess::new()));
+        let mut transfer_memory = Box::new(KTransferMemory::new());
+        let mut process = Box::new(KProcess::new());
         assert_eq!(
-            renderer.initialize(&params, std::ptr::null_mut(), transfer_size, process, 1, 0),
+            renderer.initialize(
+                &params,
+                &mut *transfer_memory,
+                transfer_size,
+                &mut *process,
+                1,
+                0,
+            ),
             ResultCode::SUCCESS
         );
         renderer.start();
 
         let terminate_event = system.lock().get_terminate_event();
-        let stop_finished = Arc::new(AtomicBool::new(false));
-        let stop_finished_thread = stop_finished.clone();
+        let (finished_tx, finished_rx) = mpsc::channel();
         let stop_thread = std::thread::spawn(move || {
             renderer.stop();
-            stop_finished_thread.store(true, Ordering::SeqCst);
+            finished_tx.send(()).unwrap();
         });
 
-        std::thread::sleep(Duration::from_millis(20));
-        assert!(!stop_finished.load(Ordering::SeqCst));
-
-        terminate_event.signal();
-        stop_thread.join().unwrap();
-        unsafe {
-            drop(Box::from_raw(process));
+        let completed_without_external_signal =
+            finished_rx.recv_timeout(Duration::from_secs(1)).is_ok();
+        if !completed_without_external_signal {
+            // Let a broken implementation unwind instead of leaving a stuck
+            // test thread after reporting the regression.
+            terminate_event.signal();
         }
+        stop_thread.join().unwrap();
 
-        assert!(stop_finished.load(Ordering::SeqCst));
+        assert!(
+            completed_without_external_signal,
+            "renderer worker could not acquire System to signal Stop"
+        );
     }
 }

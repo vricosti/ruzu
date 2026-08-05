@@ -5,7 +5,7 @@
 //! Port of zuyu/src/core/hle/service/am/service/all_system_applet_proxies_service.cpp
 
 use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 
 use crate::core::SystemRef;
 use crate::hle::kernel::k_process::KProcess;
@@ -28,13 +28,13 @@ use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFrame
 /// - 1000: GetDebugFunctions (unimplemented)
 pub struct IAllSystemAppletProxiesService {
     system: SystemRef,
-    window_system: Arc<Mutex<WindowSystem>>,
+    window_system: Weak<Mutex<WindowSystem>>,
     handlers: BTreeMap<u32, FunctionInfo>,
     handlers_tipc: BTreeMap<u32, FunctionInfo>,
 }
 
 impl IAllSystemAppletProxiesService {
-    pub fn new(system: SystemRef, window_system: Arc<Mutex<WindowSystem>>) -> Self {
+    pub fn new(system: SystemRef, window_system: Weak<Mutex<WindowSystem>>) -> Self {
         let handlers = build_handler_map(&[
             (
                 100,
@@ -67,6 +67,7 @@ impl IAllSystemAppletProxiesService {
 
     fn get_applet_from_process_id(&self, pid: u64) -> Option<Arc<Mutex<Applet>>> {
         self.window_system
+            .upgrade()?
             .lock()
             .unwrap()
             .get_by_applet_resource_user_id(pid)

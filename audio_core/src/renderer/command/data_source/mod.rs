@@ -114,13 +114,14 @@ pub fn process_data_source_command(
     payload_addr: CpuAddr,
 ) -> bool {
     let sample_rate = processor.get_target_sample_rate();
+    let memory = processor.get_memory();
     match command_id {
         CommandId::DataSourcePcmInt16Version1 => {
             let Some(payload) = read_pod::<PcmInt16DataSourceVersion1Payload>(payload_addr) else {
                 return true;
             };
             let _ = processor.with_mix_buffers_mut(|mix_buffers, sample_count, _| {
-                payload.process(mix_buffers, sample_count, sample_rate);
+                payload.process(&memory, mix_buffers, sample_count, sample_rate);
             });
             true
         }
@@ -129,7 +130,7 @@ pub fn process_data_source_command(
                 return true;
             };
             let _ = processor.with_mix_buffers_mut(|mix_buffers, sample_count, _| {
-                payload.process_v2(mix_buffers, sample_count, sample_rate);
+                payload.process_v2(&memory, mix_buffers, sample_count, sample_rate);
             });
             true
         }
@@ -138,7 +139,7 @@ pub fn process_data_source_command(
                 return true;
             };
             let _ = processor.with_mix_buffers_mut(|mix_buffers, sample_count, _| {
-                payload.process(mix_buffers, sample_count, sample_rate);
+                payload.process(&memory, mix_buffers, sample_count, sample_rate);
             });
             true
         }
@@ -147,7 +148,7 @@ pub fn process_data_source_command(
                 return true;
             };
             let _ = processor.with_mix_buffers_mut(|mix_buffers, sample_count, _| {
-                payload.process_v2(mix_buffers, sample_count, sample_rate);
+                payload.process_v2(&memory, mix_buffers, sample_count, sample_rate);
             });
             true
         }
@@ -156,7 +157,7 @@ pub fn process_data_source_command(
                 return true;
             };
             let _ = processor.with_mix_buffers_mut(|mix_buffers, sample_count, _| {
-                payload.process(mix_buffers, sample_count, sample_rate);
+                payload.process(&memory, mix_buffers, sample_count, sample_rate);
             });
             true
         }
@@ -165,7 +166,7 @@ pub fn process_data_source_command(
                 return true;
             };
             let _ = processor.with_mix_buffers_mut(|mix_buffers, sample_count, _| {
-                payload.process(mix_buffers, sample_count, sample_rate);
+                payload.process(&memory, mix_buffers, sample_count, sample_rate);
             });
             true
         }

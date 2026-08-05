@@ -387,8 +387,7 @@ impl TimeServiceManager {
 
         let (handle, readable_event) = ctx.create_readable_event(false)?;
         let owner_process = ctx.owner_process_arc()?;
-        let scheduler = self.system.get().scheduler_arc();
-        event.attach_kernel_event(Arc::clone(&readable_event), owner_process, scheduler);
+        event.attach_kernel_event(Arc::clone(&readable_event), owner_process);
         *readable_cache.lock().unwrap() = Some(readable_event);
         Some(handle)
     }

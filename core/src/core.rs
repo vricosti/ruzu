@@ -1083,6 +1083,16 @@ pub struct System {
     pub(crate) runtime_is_64bit: bool,
 }
 
+impl Drop for System {
+    fn drop(&mut self) {
+        // Upstream System owns CoreTiming by value, so CoreTiming::~CoreTiming
+        // always calls Reset when System is destroyed. Rust subsystems retain
+        // Arc handles during teardown; stop the owned timer here rather than
+        // relying on the final Arc to disappear.
+        self.core_timing.reset();
+    }
+}
+
 impl System {
     /// Creates a new System instance.
     pub fn new() -> Self {
@@ -1810,9 +1820,10 @@ impl System {
         if let Some(ref kernel) = self.kernel {
             kernel.finalize_services_after_cpu_shutdown();
         }
-        // Upstream destroys services before AudioCore. Rust service managers
-        // retain their owners until CPU fibers have stopped, so AudioCore must
-        // remain alive through the deferred service finalization above.
+
+        if let Some(ref kernel) = self.kernel {
+            kernel.finalize_terminated_processes_after_cpu_shutdown();
+        }
         self.audio_core = None;
         self.current_process_arc = None;
         self.current_process = None;
@@ -2674,6 +2685,7 @@ impl Default for System {
 #[cfg(test)]
 mod exit_state_tests {
     use super::*;
+    use std::time::{Duration, Instant};
 
     #[test]
     fn exit_lock_handle_tracks_system_state() {
@@ -2686,5 +2698,23 @@ mod exit_state_tests {
         assert!(state.load(Ordering::Acquire));
         system.set_exit_locked(false);
         assert!(!state.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn dropping_system_stops_core_timing_with_external_arc_alive() {
+        let system = System::new();
+        let core_timing = system.core_timing();
+        core_timing.set_multicore(true);
+        core_timing.initialize(|| {});
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !core_timing.has_started() && Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert!(core_timing.has_started());
+
+        drop(system);
+
+        assert!(!core_timing.has_started());
     }
 }

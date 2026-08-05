@@ -13,6 +13,7 @@ use log::{error, warn};
 use std::fmt::Write;
 use std::mem::size_of;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 static MIX_BUFFER_CLIP_LOGS: AtomicU64 = AtomicU64::new(0);
 
@@ -25,16 +26,54 @@ struct MixBufferTraceStats {
     first_i32_min_index: Option<usize>,
 }
 
-#[derive(Clone, Copy, Default)]
-struct MemoryHandle(usize);
+#[derive(Clone, Default)]
+pub struct MemoryHandle(Option<Arc<Mutex<ruzu_core::memory::memory::Memory>>>);
 
 impl MemoryHandle {
-    fn from_ptr(ptr: *mut ()) -> Self {
-        Self(ptr as usize)
+    fn from_process(process: *mut ()) -> Self {
+        let process = process as *mut ruzu_core::hle::kernel::k_process::KProcess;
+        if process.is_null() {
+            return Self::default();
+        }
+        Self(unsafe { (*process).get_memory() })
     }
 
-    fn as_ptr(self) -> *mut () {
-        self.0 as *mut ()
+    pub(crate) fn read_block(&self, address: u64, dest: &mut [u8]) -> bool {
+        let Some(memory) = self.0.as_ref() else {
+            #[cfg(test)]
+            unsafe {
+                std::ptr::copy_nonoverlapping(address as *const u8, dest.as_mut_ptr(), dest.len());
+                return true;
+            }
+            #[cfg(not(test))]
+            return false;
+        };
+        memory.lock().unwrap().read_block_checked(address, dest)
+    }
+
+    pub(crate) fn write_block(&self, address: u64, src: &[u8]) -> bool {
+        let Some(memory) = self.0.as_ref() else {
+            #[cfg(test)]
+            unsafe {
+                std::ptr::copy_nonoverlapping(src.as_ptr(), address as *mut u8, src.len());
+                return true;
+            }
+            #[cfg(not(test))]
+            return false;
+        };
+        memory.lock().unwrap().write_block(address, src)
+    }
+
+    #[cfg(test)]
+    fn is_present(&self) -> bool {
+        self.0.is_some()
+    }
+
+    #[cfg(test)]
+    fn points_to(&self, memory: &Arc<Mutex<ruzu_core::memory::memory::Memory>>) -> bool {
+        self.0
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, memory))
     }
 }
 
@@ -84,19 +123,12 @@ impl CommandListProcessor {
 
         self.system = Some(system.clone());
         self.process = ProcessHandle::from_ptr(process);
-        // Upstream stores `memory = &process.GetMemory()`.
-        self.memory = MemoryHandle::default();
-        if crate::GUEST_MEMORY_ACCESSOR.get().is_none() {
-            let process = process as *mut ruzu_core::hle::kernel::k_process::KProcess;
-            if !process.is_null() {
-                if let Some(mem) = unsafe { (*process).get_memory() } {
-                    crate::init_guest_memory_accessor(mem);
-                } else {
-                    warn!("audio_core: process.get_memory() returned None, GUEST_MEMORY_ACCESSOR not set");
-                }
-            } else {
-                warn!("audio_core: null process, GUEST_MEMORY_ACCESSOR not set");
-            }
+        // Upstream stores `memory = &process.GetMemory()` for this command
+        // list processor. Keep the corresponding process-owned Memory here;
+        // a global accessor would retain the previous process across relaunch.
+        self.memory = MemoryHandle::from_process(process);
+        if self.memory.0.is_none() {
+            warn!("audio_core: command list process has no guest Memory");
         }
         self.stream = Some(stream);
         self.header = header;
@@ -137,8 +169,8 @@ impl CommandListProcessor {
         self.process.as_ptr()
     }
 
-    pub fn get_memory(&self) -> *mut () {
-        self.memory.as_ptr()
+    pub(crate) fn get_memory(&self) -> MemoryHandle {
+        self.memory.clone()
     }
 
     pub fn get_mix_buffer_count(&self) -> usize {
@@ -489,7 +521,6 @@ mod tests {
     use crate::sink::sink::new_sink_handle;
     use crate::sink::StreamType;
     use common::fixed_point::FixedPoint;
-    use parking_lot::Mutex;
     use ruzu_core::hle::kernel::k_process::KProcess;
     use std::sync::Arc;
 
@@ -596,10 +627,61 @@ mod tests {
         ));
 
         assert_eq!(processor.get_process(), process_ptr);
-        // Memory handle is null since we can't extract MemoryManager without KProcess.
-        assert_eq!(processor.get_memory(), std::ptr::null_mut());
+        assert!(!processor.get_memory().is_present());
         assert_eq!(processor.get_mix_buffer_count(), 2);
         assert_eq!(processor.get_mix_buffer_len(), 8);
+    }
+
+    #[test]
+    fn initialize_rebinds_memory_to_the_current_process() {
+        use ruzu_core::device_memory::DeviceMemory;
+        use ruzu_core::memory::memory::Memory;
+
+        let system = make_system();
+        let mut samples = vec![0i32; 4];
+        let (bytes, stream) = serialize_commands(
+            system,
+            &[Command::ClearMixBuffer(ClearMixBufferCommand {
+                buffer_count: 1,
+            })],
+            1,
+            samples.as_mut_ptr() as CpuAddr,
+            1,
+            4,
+        );
+
+        let device_a = Box::new(DeviceMemory::with_size(0x20_000));
+        let device_b = Box::new(DeviceMemory::with_size(0x20_000));
+        let memory_a = Arc::new(std::sync::Mutex::new(unsafe {
+            Memory::new(system, &*device_a, &device_a.buffer)
+        }));
+        let memory_b = Arc::new(std::sync::Mutex::new(unsafe {
+            Memory::new(system, &*device_b, &device_b.buffer)
+        }));
+        let mut process_a = Box::new(KProcess::new());
+        process_a.memory = Some(Arc::clone(&memory_a));
+        let mut process_b = Box::new(KProcess::new());
+        process_b.memory = Some(Arc::clone(&memory_b));
+
+        let mut processor = CommandListProcessor::default();
+        assert!(processor.initialize(
+            system,
+            (&mut *process_a as *mut KProcess).cast(),
+            bytes.as_ptr() as CpuAddr,
+            bytes.len() as u64,
+            stream.clone(),
+        ));
+        assert!(processor.get_memory().points_to(&memory_a));
+
+        assert!(processor.initialize(
+            system,
+            (&mut *process_b as *mut KProcess).cast(),
+            bytes.as_ptr() as CpuAddr,
+            bytes.len() as u64,
+            stream,
+        ));
+        assert!(processor.get_memory().points_to(&memory_b));
+        assert!(!processor.get_memory().points_to(&memory_a));
     }
 
     #[test]

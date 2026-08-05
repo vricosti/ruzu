@@ -5,7 +5,7 @@
 //! Port of zuyu/src/core/hle/service/am/service/application_accessor.cpp
 
 use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
@@ -41,7 +41,7 @@ use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFrame
 /// - 201: RestartApplicationTimer (unimplemented)
 pub struct IApplicationAccessor {
     applet: Arc<Mutex<crate::hle::service::am::applet::Applet>>,
-    window_system: Arc<Mutex<crate::hle::service::am::window_system::WindowSystem>>,
+    window_system: Weak<Mutex<crate::hle::service::am::window_system::WindowSystem>>,
     handlers: BTreeMap<u32, FunctionInfo>,
     handlers_tipc: BTreeMap<u32, FunctionInfo>,
 }
@@ -49,7 +49,7 @@ pub struct IApplicationAccessor {
 impl IApplicationAccessor {
     pub fn new(
         applet: Arc<Mutex<crate::hle::service::am::applet::Applet>>,
-        window_system: Arc<Mutex<crate::hle::service::am::window_system::WindowSystem>>,
+        window_system: Weak<Mutex<crate::hle::service::am::window_system::WindowSystem>>,
     ) -> Self {
         let handlers = build_handler_map(&[
             (0, None, "GetAppletStateChangedEvent"),

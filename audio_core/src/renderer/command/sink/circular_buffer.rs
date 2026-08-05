@@ -1,5 +1,5 @@
+use crate::adsp::apps::audio_renderer::command_list_processor::MemoryHandle;
 use crate::common::common::{CpuAddr, MAX_CHANNELS};
-use crate::guest_write_block;
 use crate::renderer::command::util::write_copy;
 use std::fmt::Write;
 use std::mem::size_of;
@@ -35,7 +35,13 @@ pub fn write_circular_buffer_payload(cmd: &CircularBufferSinkCommand, output: &m
 
 impl CircularBufferSinkPayload {
     /// Port of upstream `CircularBufferSinkCommand::Process`.
-    pub fn process(mut self, payload_addr: CpuAddr, sample_count: usize, mix_buffers: &[i32]) {
+    pub fn process(
+        mut self,
+        memory: &MemoryHandle,
+        payload_addr: CpuAddr,
+        sample_count: usize,
+        mix_buffers: &[i32],
+    ) {
         let mut output = vec![0i16; sample_count];
 
         for channel in 0..self.input_count as usize {
@@ -52,7 +58,7 @@ impl CircularBufferSinkPayload {
                     sample_count * size_of::<i16>(),
                 )
             };
-            let _ = guest_write_block((self.address + self.pos as usize) as u64, output_bytes);
+            let _ = memory.write_block((self.address + self.pos as usize) as u64, output_bytes);
             self.pos += (sample_count * size_of::<i16>()) as u32;
             if self.pos >= self.size {
                 self.pos = 0;

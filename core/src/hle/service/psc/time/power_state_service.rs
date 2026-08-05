@@ -84,10 +84,9 @@ impl PowerStateRequestHandler {
 
         let (handle, readable_event) = ctx.create_readable_event(false)?;
         let owner_process = ctx.owner_process_arc()?;
-        let scheduler = self.system.get().scheduler_arc();
         self.power_state_request_manager
             .get_event()
-            .attach_kernel_event(Arc::clone(&readable_event), owner_process, scheduler);
+            .attach_kernel_event(Arc::clone(&readable_event), owner_process);
         *self.readable_event.lock().unwrap() = Some(readable_event);
         Some(handle)
     }

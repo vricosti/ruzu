@@ -5,7 +5,7 @@
 //! Port of zuyu/src/core/hle/service/am/service/home_menu_functions.cpp
 
 use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
@@ -30,7 +30,7 @@ use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFrame
 /// - 1000: SetLastApplicationExitReason (unimplemented)
 pub struct IHomeMenuFunctions {
     applet: Arc<Mutex<crate::hle::service::am::applet::Applet>>,
-    window_system: Arc<Mutex<crate::hle::service::am::window_system::WindowSystem>>,
+    window_system: Weak<Mutex<crate::hle::service::am::window_system::WindowSystem>>,
     service_context: crate::hle::service::kernel_helpers::ServiceContext,
     pop_from_general_channel_event_handle: u32,
     handlers: BTreeMap<u32, FunctionInfo>,
@@ -40,7 +40,7 @@ pub struct IHomeMenuFunctions {
 impl IHomeMenuFunctions {
     pub fn new(
         applet: Arc<Mutex<crate::hle::service::am::applet::Applet>>,
-        window_system: Arc<Mutex<crate::hle::service::am::window_system::WindowSystem>>,
+        window_system: Weak<Mutex<crate::hle::service::am::window_system::WindowSystem>>,
     ) -> Self {
         let handlers = build_handler_map(&[
             (
@@ -98,6 +98,8 @@ impl IHomeMenuFunctions {
         log::info!("IHomeMenuFunctions::RequestToGetForeground called");
         service
             .window_system
+            .upgrade()
+            .expect("WindowSystem must outlive active AM services")
             .lock()
             .unwrap()
             .request_home_menu_to_get_foreground();
@@ -114,6 +116,8 @@ impl IHomeMenuFunctions {
         log::info!("IHomeMenuFunctions::LockForeground called");
         service
             .window_system
+            .upgrade()
+            .expect("WindowSystem must outlive active AM services")
             .lock()
             .unwrap()
             .request_lock_home_menu_into_foreground();
@@ -130,6 +134,8 @@ impl IHomeMenuFunctions {
         log::info!("IHomeMenuFunctions::UnlockForeground called");
         service
             .window_system
+            .upgrade()
+            .expect("WindowSystem must outlive active AM services")
             .lock()
             .unwrap()
             .request_unlock_home_menu_into_foreground();

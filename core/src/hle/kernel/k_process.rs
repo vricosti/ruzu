@@ -2695,6 +2695,14 @@ impl KProcess {
         // Drop our reference to the resource limit.
         self.resource_limit = None;
 
+        // Upstream explicitly clears these expensive resources in Finalize:
+        // guest kernel objects do not run their C++ destructor. Preserve that
+        // lifecycle here even when another Rust Arc still retains KProcess.
+        for interface in &mut self.arm_interfaces {
+            *interface = None;
+        }
+        self.exclusive_monitor = None;
+
         // Clear thread and session objects.
         self.thread_objects.clear();
         self.thread_objects_by_thread_id.clear();
@@ -2719,6 +2727,22 @@ impl KProcess {
         // Perform inherited finalization.
         // Upstream: KSynchronizationObject::Finalize();
         self.sync_object = SynchronizationObjectState::new();
+    }
+
+    /// Detach the Rust owners whose destructors may call back into this
+    /// process. They must be dropped after releasing `ProcessLock` and before
+    /// `finalize`, matching upstream's intrusive `Close()` lifecycle without
+    /// recursively acquiring the non-reentrant Rust mutex.
+    pub(crate) fn take_session_owners_for_finalize(
+        &mut self,
+    ) -> (
+        BTreeMap<u64, Arc<Mutex<KClientSession>>>,
+        BTreeMap<u64, Arc<Mutex<KSession>>>,
+    ) {
+        (
+            std::mem::take(&mut self.client_session_objects),
+            std::mem::take(&mut self.session_objects),
+        )
     }
 
     /// Register a thread with this process.
@@ -3259,6 +3283,10 @@ impl Default for KProcess {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::arm::arm_interface::{
+        Architecture, ArmInterface, DebugWatchpoint as ArmDebugWatchpoint, HaltReason,
+        KThread as OpaqueKThread, ThreadContext,
+    };
     use crate::file_sys::program_metadata::{ProgramAddressSpaceType, ProgramMetadata};
     use crate::hle::kernel::global_scheduler_context::GlobalSchedulerContext;
     use crate::hle::kernel::k_memory_block::PAGE_SIZE;
@@ -3266,6 +3294,57 @@ mod tests {
     use crate::hle::kernel::k_resource_limit::create_resource_limit_for_process;
     use crate::hle::kernel::k_scheduler::KScheduler;
     use crate::hle::kernel::kernel::ScopedKernelForTest;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct FinalizedArmInterface(Arc<AtomicUsize>);
+
+    impl Drop for FinalizedArmInterface {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    impl ArmInterface for FinalizedArmInterface {
+        fn run_thread(&mut self, _thread: &mut OpaqueKThread) -> HaltReason {
+            HaltReason::BREAK_LOOP
+        }
+
+        fn step_thread(&mut self, thread: &mut OpaqueKThread) -> HaltReason {
+            self.run_thread(thread)
+        }
+
+        fn clear_instruction_cache(&mut self) {}
+
+        fn invalidate_cache_range(&mut self, _addr: u64, _size: usize) {}
+
+        fn get_architecture(&self) -> Architecture {
+            Architecture::AArch64
+        }
+
+        fn get_context(&self, _ctx: &mut ThreadContext) {}
+
+        fn set_context(&mut self, _ctx: &ThreadContext) {}
+
+        fn set_tpidrro_el0(&mut self, _value: u64) {}
+
+        fn get_svc_arguments(&self, args: &mut [u64; 8]) {
+            *args = [0; 8];
+        }
+
+        fn set_svc_arguments(&mut self, _args: &[u64; 8]) {}
+
+        fn get_svc_number(&self) -> u32 {
+            0
+        }
+
+        fn signal_interrupt(&mut self, _thread: &mut OpaqueKThread) {}
+
+        fn halted_watchpoint(&self) -> Option<&ArmDebugWatchpoint> {
+            None
+        }
+
+        fn rewind_breakpoint_instruction(&mut self) {}
+    }
 
     fn kernel_with_application_pool_for_test(num_pages: usize) -> ScopedKernelForTest {
         let mut kernel = ScopedKernelForTest::new();
@@ -3292,6 +3371,20 @@ mod tests {
         assert_eq!(KProcess::INITIAL_PROCESS_ID_MIN, 1);
         assert_eq!(KProcess::INITIAL_PROCESS_ID_MAX, 0x50);
         assert_eq!(KProcess::PROCESS_ID_MIN, 0x51);
+    }
+
+    #[test]
+    fn finalize_releases_arm_interfaces_before_process_drop() {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let mut process = KProcess::new();
+        for interface in &mut process.arm_interfaces {
+            *interface = Some(Box::new(FinalizedArmInterface(Arc::clone(&drops))));
+        }
+
+        process.finalize();
+
+        assert_eq!(drops.load(Ordering::SeqCst), NUM_CPU_CORES as usize);
+        assert!(process.arm_interfaces.iter().all(Option::is_none));
     }
 
     #[test]

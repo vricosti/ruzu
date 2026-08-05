@@ -6,13 +6,12 @@
 //!
 //! Event wrapper for kernel KEvent.
 
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, Weak};
 
 use crate::hle::kernel::k_event::KEvent;
 use crate::hle::kernel::k_process::KProcess;
 use crate::hle::kernel::k_process::ProcessLock;
 use crate::hle::kernel::k_readable_event::KReadableEvent;
-use crate::hle::kernel::k_scheduler::KScheduler;
 use crate::hle::service::hle_ipc::{HLERequestContext, Handle};
 
 /// Bridge from a service-layer Event to a kernel KReadableEvent.
@@ -24,8 +23,7 @@ use crate::hle::service::hle_ipc::{HLERequestContext, Handle};
 struct KernelEventBridge {
     event: Arc<Mutex<KEvent>>,
     readable_event: Arc<Mutex<KReadableEvent>>,
-    process: Arc<ProcessLock>,
-    scheduler: Arc<Mutex<KScheduler>>,
+    process: Weak<ProcessLock>,
 }
 
 /// Event — wraps a kernel event for service use.
@@ -56,7 +54,6 @@ impl Event {
         event: Arc<Mutex<KEvent>>,
         readable_event: Arc<Mutex<KReadableEvent>>,
         process: Arc<ProcessLock>,
-        scheduler: Arc<Mutex<KScheduler>>,
     ) -> Self {
         Self {
             signaled: Arc::new(Mutex::new(false)),
@@ -64,8 +61,7 @@ impl Event {
             kernel_bridge: Mutex::new(Some(KernelEventBridge {
                 event,
                 readable_event,
-                process,
-                scheduler,
+                process: Arc::downgrade(&process),
             })),
         }
     }
@@ -79,15 +75,13 @@ impl Event {
         event: Arc<Mutex<KEvent>>,
         readable_event: Arc<Mutex<KReadableEvent>>,
         process: Arc<ProcessLock>,
-        scheduler: Arc<Mutex<KScheduler>>,
     ) {
         let mut bridge = self.kernel_bridge.lock().unwrap();
         if bridge.is_none() {
             *bridge = Some(KernelEventBridge {
                 event,
                 readable_event,
-                process,
-                scheduler,
+                process: Arc::downgrade(&process),
             });
         }
     }
@@ -99,18 +93,12 @@ impl Event {
         &self,
         readable_event: Arc<Mutex<KReadableEvent>>,
         process: Arc<ProcessLock>,
-        scheduler: Arc<Mutex<KScheduler>>,
     ) {
         let owner_process_id = process.lock().unwrap().get_process_id();
         let readable_event_id = readable_event.lock().unwrap().object_id;
         let mut event = KEvent::new();
         event.initialize(owner_process_id, readable_event_id);
-        self.attach_kernel_event_owner(
-            Arc::new(Mutex::new(event)),
-            readable_event,
-            process,
-            scheduler,
-        );
+        self.attach_kernel_event_owner(Arc::new(Mutex::new(event)), readable_event, process);
     }
 
     fn create_kernel_bridge_from_context(
@@ -126,7 +114,6 @@ impl Event {
         let process = thread_guard.parent.as_ref()?.upgrade()?;
         drop(thread_guard);
 
-        let scheduler = process.lock().unwrap().scheduler.as_ref()?.upgrade()?;
         let kernel = crate::hle::kernel::kernel::get_kernel_ref()?;
 
         let event_object_id = kernel.create_new_object_id() as u64;
@@ -160,7 +147,6 @@ impl Event {
             Arc::clone(&event),
             Arc::clone(&readable_event),
             Arc::clone(&process),
-            scheduler,
         );
 
         Some(readable_event)
@@ -240,7 +226,9 @@ impl Event {
                 "Service::Event::signal bridging readable_object_id={}",
                 readable_object_id
             );
-            KEvent::signal_arc(&bridge.event, &bridge.process);
+            if let Some(process) = bridge.process.upgrade() {
+                KEvent::signal_arc(&bridge.event, &process);
+            }
             if trace_boot {
                 log::info!(
                     "Service::Event::signal: bridge signal complete readable_object_id={}",
@@ -279,7 +267,9 @@ impl Event {
         // Bridge to kernel: clear the readable end too, matching upstream
         // Event::Clear() -> KEvent::Clear().
         if let Some(ref bridge) = *self.kernel_bridge.lock().unwrap() {
-            KEvent::clear_arc(&bridge.event, &bridge.process);
+            if let Some(process) = bridge.process.upgrade() {
+                KEvent::clear_arc(&bridge.event, &process);
+            }
         }
     }
 
@@ -320,14 +310,12 @@ mod tests {
         process.register_readable_event_object(2, Arc::clone(&readable));
 
         let process = Arc::new(ProcessLock::from_value(process));
-        let scheduler = Arc::new(Mutex::new(KScheduler::new(0)));
         let event_owner = Arc::new(Mutex::new(crate::hle::kernel::k_event::KEvent::new()));
         event_owner.lock().unwrap().initialize(1, 2);
         let event = Event::new_with_kernel_event(
             Arc::clone(&event_owner),
             Arc::clone(&readable),
             Arc::clone(&process),
-            Arc::clone(&scheduler),
         );
 
         event.signal();
@@ -337,5 +325,27 @@ mod tests {
         event.clear();
         assert!(!event.is_signaled());
         assert!(!readable.lock().unwrap().is_signaled());
+    }
+
+    #[test]
+    fn kernel_bridge_does_not_own_process() {
+        let process = Arc::new(ProcessLock::from_value(KProcess::new()));
+        let weak_process = Arc::downgrade(&process);
+        let readable = Arc::new(Mutex::new(KReadableEvent::new()));
+        readable.lock().unwrap().initialize(1, 2);
+        let event_owner = Arc::new(Mutex::new(KEvent::new()));
+        event_owner.lock().unwrap().initialize(1, 2);
+        let event = Event::new_with_kernel_event(event_owner, readable, Arc::clone(&process));
+
+        drop(process);
+
+        assert!(
+            weak_process.upgrade().is_none(),
+            "service events must not extend the owning process lifetime"
+        );
+        event.signal();
+        assert!(event.is_signaled());
+        event.clear();
+        assert!(!event.is_signaled());
     }
 }

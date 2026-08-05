@@ -29,7 +29,6 @@ use crate::hle::kernel::k_port::KPort;
 use crate::hle::kernel::k_process::KProcess;
 use crate::hle::kernel::k_process::ProcessLock;
 use crate::hle::kernel::k_readable_event::KReadableEvent;
-use crate::hle::kernel::k_scheduler::KScheduler;
 use crate::hle::kernel::k_server_session::KServerSession;
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 use crate::hle::service::hle_ipc::{
@@ -394,25 +393,6 @@ impl ServerManager {
             .as_ref()
             .and_then(Weak::upgrade)
             .or_else(|| self.system.get().current_process_arc_opt())
-    }
-
-    fn current_process_and_scheduler(&self) -> Option<(Arc<ProcessLock>, Arc<Mutex<KScheduler>>)> {
-        let current_thread = self.system.get().current_thread()?;
-        let thread_guard = current_thread.lock().unwrap();
-        let process = thread_guard.parent.as_ref().and_then(Weak::upgrade)?;
-        let scheduler = thread_guard
-            .scheduler
-            .as_ref()
-            .and_then(Weak::upgrade)
-            .or_else(|| {
-                process
-                    .lock()
-                    .unwrap()
-                    .scheduler
-                    .as_ref()
-                    .and_then(Weak::upgrade)
-            })?;
-        Some((process, scheduler))
     }
 
     fn signal_kernel_event(&self, event: &Arc<Mutex<KEvent>>) {
@@ -1497,36 +1477,22 @@ impl ServerManager {
             }
             return;
         };
-        let (process, scheduler) = {
+        let process = {
             let thread_guard = current_thread.lock().unwrap();
             let process = thread_guard
                 .parent
                 .as_ref()
                 .and_then(|parent| parent.upgrade());
-            let scheduler = thread_guard
-                .scheduler
-                .as_ref()
-                .and_then(|scheduler| scheduler.upgrade())
-                .or_else(|| {
-                    process.as_ref().and_then(|process| {
-                        process
-                            .lock()
-                            .unwrap()
-                            .scheduler
-                            .as_ref()
-                            .and_then(|scheduler| scheduler.upgrade())
-                    })
-                });
-            let (Some(process), Some(scheduler)) = (process, scheduler) else {
+            let Some(process) = process else {
                 if self.boot_trace_enabled() {
                     log::info!(
-                        "ServerManager({}): ensure_kernel_event_bridge skipped (process/scheduler missing)",
+                        "ServerManager({}): ensure_kernel_event_bridge skipped (process missing)",
                         self.name
                     );
                 }
                 return;
             };
-            (process, scheduler)
+            process
         };
 
         let Some(kernel) = self.system.get().kernel() else {
@@ -1549,7 +1515,7 @@ impl ServerManager {
             .unwrap()
             .register_readable_event_object(object_id, Arc::clone(&readable_event));
         kernel.register_kernel_object(object_id);
-        event.attach_kernel_event(readable_event, process, scheduler);
+        event.attach_kernel_event(readable_event, process);
         if self.boot_trace_enabled() {
             log::info!(
                 "ServerManager({}): attached kernel bridge object_id={}",

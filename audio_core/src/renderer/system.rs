@@ -415,21 +415,6 @@ impl System {
         self.applet_resource_user_id = applet_resource_user_id;
         self.session_id = session_id;
         self.set_process(process);
-        // Wire the global guest-memory accessor used by decode.rs to translate
-        // wave-buffer guest VAs to host bytes. Upstream zuyu carries
-        // `Kernel::KProcess*` through CommandListProcessor::Initialize and uses
-        // `process.GetMemory()`. We get the same Memory directly here at audio
-        // System init — it's the application process whose memory the decode
-        // pipeline needs to read. `system.memory_shared()` returns None at this
-        // point because it queries `current_process` which isn't set yet.
-        if !process.is_null() {
-            let mem_opt = unsafe { (*process).get_memory() };
-            if let Some(mem) = mem_opt {
-                crate::init_guest_memory_accessor(mem);
-            } else {
-                log::warn!("audio_core::System::initialize: process.get_memory() returned None");
-            }
-        }
         let transfer_memory_source_address = unsafe { (*transfer_memory).get_source_address() };
         if let Some(memory) = self.core.get().get_svc_memory() {
             memory.lock().unwrap().zero_block(
@@ -622,10 +607,22 @@ impl System {
     }
 
     pub fn stop(&mut self) {
+        let terminate_event = self.request_stop();
+        if let Some(terminate_event) = terminate_event {
+            terminate_event.wait();
+        }
+    }
+
+    /// Perform the state transition from upstream `System::Stop` while the
+    /// Rust wrapper mutex is held, returning the event that must be waited on
+    /// after releasing that mutex.
+    pub(crate) fn request_stop(&mut self) -> Option<Arc<TerminateEvent>> {
         self.state = State::Stopped;
         self.active = false;
         if self.execution_mode == ExecutionMode::Auto {
-            self.terminate_event.wait();
+            Some(Arc::clone(&self.terminate_event))
+        } else {
+            None
         }
     }
 

@@ -5,7 +5,7 @@
 //! Port of zuyu/src/core/hle/service/am/service/system_applet_proxy.cpp
 
 use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 
 use crate::core::SystemRef;
 use crate::hle::kernel::k_process::KProcess;
@@ -26,7 +26,7 @@ pub struct ISystemAppletProxy {
     applet: Arc<Mutex<Applet>>,
     /// Reference to the window system.
     /// Matches upstream `WindowSystem& m_window_system`.
-    window_system: Arc<Mutex<WindowSystem>>,
+    window_system: Weak<Mutex<WindowSystem>>,
     /// Matches upstream `Kernel::KProcess* m_process`.
     process: Option<Arc<ProcessLock>>,
     handlers: BTreeMap<u32, FunctionInfo>,
@@ -38,7 +38,7 @@ impl ISystemAppletProxy {
         system: SystemRef,
         applet: Arc<Mutex<Applet>>,
         process: Option<Arc<ProcessLock>>,
-        window_system: Arc<Mutex<WindowSystem>>,
+        window_system: Weak<Mutex<WindowSystem>>,
     ) -> Self {
         let handlers = build_handler_map(&[
             (

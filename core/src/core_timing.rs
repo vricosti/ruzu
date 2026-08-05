@@ -187,11 +187,18 @@ impl CoreTiming {
             return;
         }
 
-        let ct = self.clone();
+        // Upstream passes `std::ref(*this)` to the timing thread; the thread
+        // does not own CoreTiming. Keeping a strong Arc here creates a cycle:
+        // Drop is responsible for stopping and joining the thread, but Drop
+        // cannot run while that same thread owns the final Arc.
+        //
+        // The raw pointer remains valid until Drop::reset joins this thread.
+        let ct_ptr = Arc::as_ptr(self) as usize;
 
         let handle = std::thread::Builder::new()
             .name("CoreTiming".to_string())
             .spawn(move || {
+                let ct = unsafe { &*(ct_ptr as *const CoreTiming) };
                 // Upstream: ThreadEntry calls on_thread_init() then ThreadLoop().
                 if let Some(ref init_fn) = *ct.on_thread_init.lock() {
                     init_fn();
@@ -557,7 +564,7 @@ impl CoreTiming {
     }
 
     /// Resets the timing system. Called on shutdown.
-    fn reset(&self) {
+    pub(crate) fn reset(&self) {
         self.paused.store(true, Ordering::SeqCst);
         self.shutting_down.store(true, Ordering::SeqCst);
         self.pause_event.set();
@@ -662,6 +669,21 @@ mod tests {
         assert!(
             !late_fired.load(Ordering::SeqCst),
             "later event should not have fired first"
+        );
+    }
+
+    #[test]
+    fn timer_thread_does_not_own_core_timing() {
+        let core_timing = Arc::new(CoreTiming::new());
+        core_timing.set_multicore(true);
+        core_timing.initialize(|| {});
+        let weak = Arc::downgrade(&core_timing);
+
+        drop(core_timing);
+
+        assert!(
+            weak.upgrade().is_none(),
+            "the timing thread must not keep CoreTiming alive"
         );
     }
 }

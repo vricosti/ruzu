@@ -1,8 +1,8 @@
+use crate::adsp::apps::audio_renderer::command_list_processor::MemoryHandle;
 use crate::common::common::CpuAddr;
 use crate::renderer::command::mix::copy_mix_buffer;
 use crate::renderer::command::util::write_copy;
 use crate::renderer::effect::aux_::AuxInfoDsp;
-use crate::{guest_read_block, guest_write_block};
 use std::fmt::Write;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -45,8 +45,8 @@ pub struct AuxCommand {
 }
 
 impl AuxPayload {
-    pub fn process(&self, mix_buffers: &mut [i32], sample_count: usize) {
-        process_aux_command(self, mix_buffers, sample_count);
+    pub fn process(&self, memory: &MemoryHandle, mix_buffers: &mut [i32], sample_count: usize) {
+        process_aux_command(self, memory, mix_buffers, sample_count);
     }
 
     pub fn verify(&self) -> bool {
@@ -74,7 +74,12 @@ pub fn write_aux_payload(cmd: &AuxCommand, output: &mut [u8]) -> usize {
     write_copy(&payload, output)
 }
 
-pub fn process_aux_command(payload: &AuxPayload, mix_buffers: &mut [i32], sample_count: usize) {
+pub fn process_aux_command(
+    payload: &AuxPayload,
+    memory: &MemoryHandle,
+    mix_buffers: &mut [i32],
+    sample_count: usize,
+) {
     profile_aux_process(payload, sample_count);
     let Some(input_range) = mix_buffer_range(mix_buffers, payload.input, sample_count) else {
         return;
@@ -85,6 +90,7 @@ pub fn process_aux_command(payload: &AuxPayload, mix_buffers: &mut [i32], sample
     if payload.effect_enabled {
         let input = mix_buffers[input_range.clone()].to_vec();
         let _ = write_aux_buffer(
+            memory,
             payload.send_buffer_info,
             payload.send_buffer,
             payload.count_max,
@@ -94,6 +100,7 @@ pub fn process_aux_command(payload: &AuxPayload, mix_buffers: &mut [i32], sample
             payload.update_count,
         );
         let read = read_aux_buffer(
+            memory,
             payload.return_buffer_info,
             payload.return_buffer,
             payload.count_max,
@@ -111,8 +118,8 @@ pub fn process_aux_command(payload: &AuxPayload, mix_buffers: &mut [i32], sample
             }
         }
     } else {
-        reset_aux_info(payload.send_buffer_info);
-        reset_aux_info(payload.return_buffer_info);
+        reset_aux_info(memory, payload.send_buffer_info);
+        reset_aux_info(memory, payload.return_buffer_info);
         if payload.input != payload.output {
             copy_mix_buffer(mix_buffers, sample_count, payload.output, payload.input);
         }
@@ -131,17 +138,18 @@ pub fn dump_aux_command(payload: &AuxPayload, dump: &mut String) {
     );
 }
 
-pub(crate) fn reset_aux_info(addr: CpuAddr) {
-    let Some(mut info) = read_aux_info(addr) else {
+pub(crate) fn reset_aux_info(memory: &MemoryHandle, addr: CpuAddr) {
+    let Some(mut info) = read_aux_info(memory, addr) else {
         return;
     };
     info.read_offset = 0;
     info.write_offset = 0;
     info.total_sample_count = 0;
-    let _ = write_aux_info(addr, &info);
+    let _ = write_aux_info(memory, addr, &info);
 }
 
 pub(crate) fn write_aux_buffer(
+    memory: &MemoryHandle,
     info_addr: CpuAddr,
     buffer_addr: CpuAddr,
     count_max: u32,
@@ -158,7 +166,7 @@ pub(crate) fn write_aux_buffer(
         return 0;
     }
 
-    let Some(mut info) = read_aux_info(info_addr) else {
+    let Some(mut info) = read_aux_info(memory, info_addr) else {
         return 0;
     };
 
@@ -177,7 +185,7 @@ pub(crate) fn write_aux_buffer(
             let write_addr =
                 buffer_addr + target_write_offset as usize * std::mem::size_of::<i32>();
             let end = read_pos + to_write;
-            if !guest_write_block(write_addr as u64, i32_slice_as_bytes(&input[read_pos..end])) {
+            if !memory.write_block(write_addr as u64, i32_slice_as_bytes(&input[read_pos..end])) {
                 let written = write_count.saturating_sub(remaining as u32);
                 profile_aux_write_result(written, write_count);
                 return written;
@@ -191,13 +199,14 @@ pub(crate) fn write_aux_buffer(
     if update_count != 0 {
         info.write_offset = (info.write_offset + update_count) % count_max;
     }
-    let _ = write_aux_info(info_addr, &info);
+    let _ = write_aux_info(memory, info_addr, &info);
 
     profile_aux_write_result(write_count, write_count);
     write_count
 }
 
 pub(crate) fn read_aux_buffer(
+    memory: &MemoryHandle,
     info_addr: CpuAddr,
     buffer_addr: CpuAddr,
     count_max: u32,
@@ -214,7 +223,7 @@ pub(crate) fn read_aux_buffer(
         return 0;
     }
 
-    let Some(mut info) = read_aux_info(info_addr) else {
+    let Some(mut info) = read_aux_info(memory, info_addr) else {
         return 0;
     };
 
@@ -232,7 +241,7 @@ pub(crate) fn read_aux_buffer(
         if to_read > 0 {
             let read_addr = buffer_addr + target_read_offset as usize * std::mem::size_of::<i32>();
             let out = &mut output[write_pos..write_pos + to_read];
-            if !guest_read_block(read_addr as u64, i32_slice_as_bytes_mut(out)) {
+            if !memory.read_block(read_addr as u64, i32_slice_as_bytes_mut(out)) {
                 let read = read_count.saturating_sub(remaining as u32);
                 profile_aux_read_result(read, read_count);
                 return read;
@@ -258,25 +267,27 @@ pub(crate) fn read_aux_buffer(
     if update_count != 0 {
         info.read_offset = (info.read_offset + update_count) % count_max;
     }
-    let _ = write_aux_info(info_addr, &info);
+    let _ = write_aux_info(memory, info_addr, &info);
 
     profile_aux_read_result(read_count, read_count);
     read_count
 }
 
-fn read_aux_info(addr: CpuAddr) -> Option<AuxInfoDsp> {
+fn read_aux_info(memory: &MemoryHandle, addr: CpuAddr) -> Option<AuxInfoDsp> {
     if addr == 0 {
         return None;
     }
     let mut info = AuxInfoDsp::default();
-    guest_read_block(addr as u64, aux_info_as_bytes_mut(&mut info)).then_some(info)
+    memory
+        .read_block(addr as u64, aux_info_as_bytes_mut(&mut info))
+        .then_some(info)
 }
 
-fn write_aux_info(addr: CpuAddr, info: &AuxInfoDsp) -> bool {
+fn write_aux_info(memory: &MemoryHandle, addr: CpuAddr, info: &AuxInfoDsp) -> bool {
     if addr == 0 {
         return false;
     }
-    let ok = guest_write_block(addr as u64, aux_info_as_bytes(info));
+    let ok = memory.write_block(addr as u64, aux_info_as_bytes(info));
     if !ok && profile_aux_dsp_enabled() {
         let n = AUX_INFO_WRITE_FAIL_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
         if n == 1 || n % 5000 == 0 {

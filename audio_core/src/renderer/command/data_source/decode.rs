@@ -1,3 +1,4 @@
+use crate::adsp::apps::audio_renderer::command_list_processor::MemoryHandle;
 use crate::common::common::{CpuAddr, SampleFormat, SrcQuality};
 use crate::common::wave_buffer::WaveBufferVersion2;
 use crate::renderer::command::resample::resample;
@@ -85,7 +86,7 @@ pub fn read_voice_state_mut(addr: CpuAddr) -> Option<&'static mut VoiceState> {
     Some(unsafe { &mut *(addr as *mut VoiceState) })
 }
 
-pub fn decode_from_wave_buffers(args: DecodeFromWaveBuffersArgs<'_>) {
+pub fn decode_from_wave_buffers(memory: &MemoryHandle, args: DecodeFromWaveBuffersArgs<'_>) {
     // RUZU_TRACE_DECODE: count + log entry into decode pipeline.
     // Used to diagnose "audio worker runs but voices never play" wedge.
     if std::env::var_os("RUZU_TRACE_DECODE").is_some() {
@@ -211,7 +212,7 @@ pub fn decode_from_wave_buffers(args: DecodeFromWaveBuffersArgs<'_>) {
 
             let wavebuffer = args.wave_buffers[wavebuffer_index];
             if offset == 0 && args.sample_format == SampleFormat::Adpcm && wavebuffer.context != 0 {
-                load_adpcm_context(&mut voice_state.adpcm_context, &wavebuffer);
+                load_adpcm_context(memory, &mut voice_state.adpcm_context, &wavebuffer);
             }
 
             let mut start_offset = wavebuffer.start_offset;
@@ -239,17 +240,21 @@ pub fn decode_from_wave_buffers(args: DecodeFromWaveBuffersArgs<'_>) {
 
             let samples_decoded = match args.sample_format {
                 SampleFormat::PcmInt16 => {
-                    decode_pcm_i16(&mut temp_buffer[temp_buffer_pos..], &decode_arg)
+                    decode_pcm_i16(memory, &mut temp_buffer[temp_buffer_pos..], &decode_arg)
                 }
                 SampleFormat::PcmFloat => {
-                    decode_pcm_f32(&mut temp_buffer[temp_buffer_pos..], &decode_arg)
+                    decode_pcm_f32(memory, &mut temp_buffer[temp_buffer_pos..], &decode_arg)
                 }
                 SampleFormat::Adpcm => {
-                    match read_adpcm_coefficients(args.data_address, args.data_size) {
+                    match read_adpcm_coefficients(memory, args.data_address, args.data_size) {
                         Some(coefficients) => {
                             decode_arg.coefficients = coefficients;
                             decode_arg.adpcm_context = Some(&mut voice_state.adpcm_context);
-                            decode_adpcm(&mut temp_buffer[temp_buffer_pos..], &mut decode_arg)
+                            decode_adpcm(
+                                memory,
+                                &mut temp_buffer[temp_buffer_pos..],
+                                &mut decode_arg,
+                            )
                         }
                         None => 0,
                     }
@@ -374,7 +379,11 @@ fn pitch_by_src_quality(src_quality: SrcQuality) -> usize {
     PITCH_BY_SRC_QUALITY[src_quality as usize] as usize
 }
 
-fn load_adpcm_context(target: &mut AdpcmContext, wavebuffer: &WaveBufferVersion2) {
+fn load_adpcm_context(
+    memory: &MemoryHandle,
+    target: &mut AdpcmContext,
+    wavebuffer: &WaveBufferVersion2,
+) {
     if wavebuffer.context == 0
         || wavebuffer.context_size < std::mem::size_of::<AdpcmContext>() as u64
     {
@@ -382,7 +391,7 @@ fn load_adpcm_context(target: &mut AdpcmContext, wavebuffer: &WaveBufferVersion2
     }
 
     let mut buf = [0u8; std::mem::size_of::<AdpcmContext>()];
-    if !read_audio_bytes(wavebuffer.context, &mut buf) {
+    if !read_audio_bytes(memory, wavebuffer.context, &mut buf) {
         return;
     }
     // SAFETY: AdpcmContext is repr(C) plain-old-data; bytewise copy.
@@ -395,12 +404,16 @@ fn load_adpcm_context(target: &mut AdpcmContext, wavebuffer: &WaveBufferVersion2
     }
 }
 
-fn read_adpcm_coefficients(data_address: CpuAddr, data_size: u64) -> Option<[i16; 16]> {
+fn read_adpcm_coefficients(
+    memory: &MemoryHandle,
+    data_address: CpuAddr,
+    data_size: u64,
+) -> Option<[i16; 16]> {
     if data_address == 0 || data_size < std::mem::size_of::<[i16; 16]>() as u64 {
         return None;
     }
     let mut buf = [0u8; std::mem::size_of::<[i16; 16]>()];
-    if !read_audio_bytes(data_address, &mut buf) {
+    if !read_audio_bytes(memory, data_address, &mut buf) {
         return None;
     }
 
@@ -411,21 +424,11 @@ fn read_adpcm_coefficients(data_address: CpuAddr, data_size: u64) -> Option<[i16
     Some(out)
 }
 
-fn read_audio_bytes(addr: CpuAddr, dest: &mut [u8]) -> bool {
+fn read_audio_bytes(memory: &MemoryHandle, addr: CpuAddr, dest: &mut [u8]) -> bool {
     if addr == 0 {
         return false;
     }
-
-    if crate::GUEST_MEMORY_ACCESSOR.get().is_some() {
-        return crate::guest_read_block(addr as u64, dest);
-    }
-
-    // Unit tests pass host-backed slices directly. Runtime matches upstream and
-    // goes through Core::Memory once GUEST_MEMORY_ACCESSOR is initialized.
-    unsafe {
-        std::ptr::copy_nonoverlapping(addr as *const u8, dest.as_mut_ptr(), dest.len());
-    }
-    true
+    memory.read_block(addr as u64, dest)
 }
 
 fn adpcm_coeff_pair(coefficients: &[i16; 16], coeff_index: usize) -> Option<(i32, i32)> {
@@ -495,14 +498,14 @@ fn trace_bad_adpcm_header(
     }
 }
 
-fn decode_pcm_i16(output: &mut [i16], req: &DecodeArg<'_>) -> u32 {
+fn decode_pcm_i16(memory: &MemoryHandle, output: &mut [i16], req: &DecodeArg<'_>) -> u32 {
     decode_pcm(
         output,
         req,
         |addr, sample_index| {
             let mut buf = [0u8; 2];
             let byte_offset = (sample_index * std::mem::size_of::<i16>()) as CpuAddr;
-            if !read_audio_bytes(addr + byte_offset, &mut buf) {
+            if !read_audio_bytes(memory, addr + byte_offset, &mut buf) {
                 return 0;
             }
             i16::from_le_bytes(buf)
@@ -511,14 +514,14 @@ fn decode_pcm_i16(output: &mut [i16], req: &DecodeArg<'_>) -> u32 {
     )
 }
 
-fn decode_pcm_f32(output: &mut [i16], req: &DecodeArg<'_>) -> u32 {
+fn decode_pcm_f32(memory: &MemoryHandle, output: &mut [i16], req: &DecodeArg<'_>) -> u32 {
     decode_pcm(
         output,
         req,
         |addr, sample_index| {
             let mut buf = [0u8; 4];
             let byte_offset = (sample_index * std::mem::size_of::<f32>()) as CpuAddr;
-            if !read_audio_bytes(addr + byte_offset, &mut buf) {
+            if !read_audio_bytes(memory, addr + byte_offset, &mut buf) {
                 return 0;
             }
             let sample = f32::from_le_bytes(buf);
@@ -577,7 +580,7 @@ fn decode_pcm(
     decoded as u32
 }
 
-fn decode_adpcm(output: &mut [i16], req: &mut DecodeArg<'_>) -> u32 {
+fn decode_adpcm(memory: &MemoryHandle, output: &mut [i16], req: &mut DecodeArg<'_>) -> u32 {
     let Some(context) = req.adpcm_context.as_deref_mut() else {
         return 0;
     };
@@ -619,7 +622,7 @@ fn decode_adpcm(output: &mut [i16], req: &mut DecodeArg<'_>) -> u32 {
     let read_size = size.min(req.buffer_size as usize);
     let read_addr = req.buffer + (position_in_frame / 2) as usize;
     let mut wavebuffer = vec![0u8; read_size];
-    if !read_audio_bytes(read_addr, &mut wavebuffer) {
+    if !read_audio_bytes(memory, read_addr, &mut wavebuffer) {
         return 0;
     }
 
@@ -772,23 +775,26 @@ mod tests {
             ..Default::default()
         };
 
-        decode_from_wave_buffers(DecodeFromWaveBuffersArgs {
-            sample_format: SampleFormat::PcmInt16,
-            output: &mut output,
-            voice_state: unsafe { &mut *(&mut voice_state as *mut VoiceState) },
-            wave_buffers: &wave_buffers,
-            channel: 0,
-            channel_count: 1,
-            src_quality: SrcQuality::Medium,
-            pitch: 1.0,
-            source_sample_rate: 48_000,
-            target_sample_rate: 24_000,
-            sample_count,
-            data_address: 0,
-            data_size: 0,
-            is_voice_played_sample_count_reset_at_loop_point_supported: false,
-            is_voice_pitch_and_src_skipped_supported: false,
-        });
+        decode_from_wave_buffers(
+            &MemoryHandle::default(),
+            DecodeFromWaveBuffersArgs {
+                sample_format: SampleFormat::PcmInt16,
+                output: &mut output,
+                voice_state: unsafe { &mut *(&mut voice_state as *mut VoiceState) },
+                wave_buffers: &wave_buffers,
+                channel: 0,
+                channel_count: 1,
+                src_quality: SrcQuality::Medium,
+                pitch: 1.0,
+                source_sample_rate: 48_000,
+                target_sample_rate: 24_000,
+                sample_count,
+                data_address: 0,
+                data_size: 0,
+                is_voice_played_sample_count_reset_at_loop_point_supported: false,
+                is_voice_pitch_and_src_skipped_supported: false,
+            },
+        );
 
         assert_eq!(output, [22, 53, 200, 400]);
         assert_eq!(voice_state.sample_history[..4], [500, 600, 700, 800]);
@@ -815,7 +821,7 @@ mod tests {
         };
         let mut output = [0i16; 2];
 
-        let decoded = decode_pcm_i16(&mut output, &req);
+        let decoded = decode_pcm_i16(&MemoryHandle::default(), &mut output, &req);
 
         assert_eq!(decoded, 0);
         assert_eq!(output, [0, 0]);
@@ -839,7 +845,7 @@ mod tests {
             adpcm_context: Some(&mut context),
         };
 
-        let decoded = decode_adpcm(&mut output, &mut req);
+        let decoded = decode_adpcm(&MemoryHandle::default(), &mut output, &mut req);
 
         assert_eq!(decoded, ADPCM_SAMPLES_PER_FRAME);
         assert_eq!(output, [0; ADPCM_SAMPLES_PER_FRAME as usize]);

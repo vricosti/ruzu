@@ -5,7 +5,7 @@
 //! Port of zuyu/src/core/hle/service/am/service/window_controller.cpp
 
 use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 use crate::hle::service::am::applet::Applet;
@@ -27,13 +27,13 @@ pub struct IWindowController {
     /// Matches upstream `std::shared_ptr<Applet> m_applet`.
     applet: Arc<Mutex<Applet>>,
     /// Matches upstream `WindowSystem& m_window_system`.
-    window_system: Arc<Mutex<WindowSystem>>,
+    window_system: Weak<Mutex<WindowSystem>>,
     handlers: BTreeMap<u32, FunctionInfo>,
     handlers_tipc: BTreeMap<u32, FunctionInfo>,
 }
 
 impl IWindowController {
-    pub fn new(applet: Arc<Mutex<Applet>>, window_system: Arc<Mutex<WindowSystem>>) -> Self {
+    pub fn new(applet: Arc<Mutex<Applet>>, window_system: Weak<Mutex<WindowSystem>>) -> Self {
         let handlers = build_handler_map(&[
             (0, None, "CreateWindow"),
             (
@@ -116,6 +116,8 @@ impl IWindowController {
     pub fn set_applet_window_visibility(&self, visible: bool) {
         log::info!("SetAppletWindowVisibility called, visible={}", visible);
         self.window_system
+            .upgrade()
+            .expect("WindowSystem must outlive active AM services")
             .lock()
             .unwrap()
             .request_applet_visibility_state(&self.applet, visible);

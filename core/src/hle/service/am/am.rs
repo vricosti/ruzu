@@ -24,9 +24,10 @@ use super::window_system::WindowSystem;
 pub fn loop_process(service_manager: &Arc<Mutex<ServiceManager>>, system: crate::core::SystemRef) {
     let server_manager = ServerManager::new_shared(system);
 
-    // Create a shared WindowSystem, matching upstream ownership in window_system.cpp
-    // as closely as possible while preserving Rust Arc ownership.
+    // Upstream owns WindowSystem on the LoopProcess stack. The service objects
+    // receive non-owning references, represented here by Weak.
     let window_system = Arc::new(Mutex::new(WindowSystem::new(system)));
+    let window_system_ref = Arc::downgrade(&window_system);
     let window_system_ptr = {
         let mut guard = window_system.lock().unwrap();
         &mut *guard as *mut WindowSystem
@@ -41,7 +42,7 @@ pub fn loop_process(service_manager: &Arc<Mutex<ServiceManager>>, system: crate:
     {
         let mut server_manager = server_manager.lock().unwrap();
 
-        let ws = window_system.clone();
+        let ws = window_system_ref.clone();
         let system_oe = system;
         let factory_oe: SessionRequestHandlerFactory =
             Box::new(move || -> SessionRequestHandlerPtr {
@@ -54,7 +55,7 @@ pub fn loop_process(service_manager: &Arc<Mutex<ServiceManager>>, system: crate:
             });
         server_manager.register_named_service("appletOE", factory_oe, 64);
 
-        let ws = window_system.clone();
+        let ws = window_system_ref.clone();
         let system_ae = system;
         let factory_ae: SessionRequestHandlerFactory = Box::new(
             move || -> SessionRequestHandlerPtr {
@@ -80,6 +81,16 @@ pub fn loop_process(service_manager: &Arc<Mutex<ServiceManager>>, system: crate:
         .get()
         .get_applet_manager()
         .set_window_system(Some(window_system.clone()));
+
+    // Upstream keeps WindowSystem on this guest service thread's native stack.
+    // A suspended cooperative Rust fiber cannot run stack-local destructors
+    // when CpuManager releases its context, so transfer the sole strong owner
+    // to KernelCore's explicit post-fiber service lifecycle.
+    system
+        .get()
+        .kernel()
+        .expect("AM service requires an initialized kernel")
+        .retain_service_lifetime_owner(window_system);
 
     ServerManager::run_server_shared(server_manager);
 }

@@ -5,7 +5,7 @@
 //! Port of zuyu/src/core/hle/service/am/applet_manager.cpp
 
 use std::collections::VecDeque;
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, Weak};
 
 use super::am_types::*;
 use super::applet::Applet;
@@ -351,8 +351,8 @@ pub struct AppletManager {
 }
 
 struct AppletManagerInner {
-    /// Upstream: `WindowSystem* m_window_system`
-    window_system: Option<Arc<Mutex<WindowSystem>>>,
+    /// Upstream: `WindowSystem* m_window_system` (non-owning).
+    window_system: Option<Weak<Mutex<WindowSystem>>>,
     /// Upstream: `std::unique_ptr<Process> m_pending_process`
     pending_process: Option<Arc<ProcessLock>>,
     /// Upstream: `FrontendAppletParameters m_pending_parameters`
@@ -387,8 +387,8 @@ impl AppletManager {
     pub fn set_window_system(&self, window_system: Option<Arc<Mutex<WindowSystem>>>) {
         let mut inner = self.lock.lock().unwrap();
 
-        inner.window_system = window_system;
-        if inner.window_system.is_none() {
+        inner.window_system = window_system.as_ref().map(Arc::downgrade);
+        if window_system.is_none() {
             return;
         }
 
@@ -406,7 +406,9 @@ impl AppletManager {
             }
         }
 
-        let window_system = inner.window_system.clone().unwrap();
+        // The caller owns WindowSystem for the duration of SetWindowSystem,
+        // matching the lifetime of upstream's stack-owned WindowSystem.
+        let window_system = window_system.unwrap();
         let process = inner.pending_process.take().unwrap();
         let params = inner.pending_parameters.take().unwrap();
         let run_params = inner.pending_run_params.take();
@@ -566,7 +568,7 @@ impl AppletManager {
     /// Upstream: `void RequestExit()`
     pub fn request_exit(&self) {
         let inner = self.lock.lock().unwrap();
-        if let Some(ws) = inner.window_system.as_ref() {
+        if let Some(ws) = inner.window_system.as_ref().and_then(Weak::upgrade) {
             ws.lock().unwrap().on_exit_requested();
         }
     }
@@ -574,7 +576,7 @@ impl AppletManager {
     /// Upstream: `void OperationModeChanged()`
     pub fn operation_mode_changed(&self) {
         let inner = self.lock.lock().unwrap();
-        if let Some(ws) = inner.window_system.as_ref() {
+        if let Some(ws) = inner.window_system.as_ref().and_then(Weak::upgrade) {
             ws.lock().unwrap().on_operation_mode_changed();
         }
     }
@@ -606,5 +608,24 @@ mod tests {
         system.set_shutting_down(true);
 
         waiter.join().unwrap();
+    }
+
+    #[test]
+    fn applet_manager_does_not_own_window_system() {
+        let manager = AppletManager::new();
+        let window_system = Arc::new(Mutex::new(
+            WindowSystem::new(crate::core::SystemRef::null()),
+        ));
+        let weak = Arc::downgrade(&window_system);
+
+        // The None path is non-blocking; first install a weak reference
+        // directly as SetWindowSystem(Some) must wait for a pending process.
+        manager.lock.lock().unwrap().window_system = Some(Arc::downgrade(&window_system));
+        drop(window_system);
+
+        assert!(
+            weak.upgrade().is_none(),
+            "AppletManager must mirror upstream's non-owning WindowSystem pointer"
+        );
     }
 }

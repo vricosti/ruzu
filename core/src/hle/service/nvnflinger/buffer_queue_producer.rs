@@ -1466,7 +1466,7 @@ impl IBinder for BufferQueueProducer {
     fn register_native_handle_owner(
         &self,
         process: Arc<ProcessLock>,
-        scheduler: Arc<Mutex<KScheduler>>,
+        _scheduler: Arc<Mutex<KScheduler>>,
     ) {
         let event = self.buffer_wait_event();
         if event.readable_event().is_none() {
@@ -1502,7 +1502,6 @@ impl IBinder for BufferQueueProducer {
                 event_owner,
                 Arc::clone(&readable_event),
                 Arc::clone(&process),
-                Arc::clone(&scheduler),
             );
             trace_bqp_ring(&[
                 22,
