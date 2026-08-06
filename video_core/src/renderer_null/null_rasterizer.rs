@@ -347,8 +347,14 @@ mod tests {
         let mut rast = RasterizerNull::new(sp);
 
         let ds = crate::engines::draw_manager::DrawState::default();
-        rast.draw(crate::engines::draw_manager::Maxwell3DDrawView::new(&ds), 1);
-        rast.draw(crate::engines::draw_manager::Maxwell3DDrawView::new(&ds), 4);
+        rast.draw(
+            crate::engines::draw_manager::Maxwell3DDrawView::new(&ds, false),
+            1,
+        );
+        rast.draw(
+            crate::engines::draw_manager::Maxwell3DDrawView::new(&ds, false),
+            4,
+        );
         rast.draw_texture(crate::engines::draw_manager::Maxwell3DDrawTextureView::new(
             &ds,
             crate::engines::draw_manager::DrawTextureState::default(),
@@ -508,7 +514,10 @@ mod tests {
 
         // Should work through the trait object
         let ds = crate::engines::draw_manager::DrawState::default();
-        rast.draw(crate::engines::draw_manager::Maxwell3DDrawView::new(&ds), 1);
+        rast.draw(
+            crate::engines::draw_manager::Maxwell3DDrawView::new(&ds, false),
+            1,
+        );
         rast.clear(
             crate::engines::draw_manager::Maxwell3DClearView::new(
                 crate::engines::draw_manager::ClearState::default(),

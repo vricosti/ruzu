@@ -245,10 +245,18 @@ pub trait Maxwell3DAccess {
     /// Maxwell3D view. Upstream `DrawManager::ProcessDraw` calls
     /// `maxwell3d->rasterizer->Draw(...)`; keeping this as a Maxwell3D-owned
     /// operation avoids spreading rasterizer ownership through DrawManager.
-    fn draw_rasterizer(&mut self, draw_state: &DrawState, instance_count: u32) -> bool {
+    fn draw_rasterizer(
+        &mut self,
+        draw_state: &DrawState,
+        draw_indexed: bool,
+        instance_count: u32,
+    ) -> bool {
         let mut dispatched = false;
         self.with_rasterizer_mut(&mut |rasterizer| {
-            rasterizer.draw(Maxwell3DDrawView::new(draw_state), instance_count);
+            rasterizer.draw(
+                Maxwell3DDrawView::new(draw_state, draw_indexed),
+                instance_count,
+            );
             dispatched = true;
         });
         dispatched
@@ -860,30 +868,39 @@ enum Maxwell3DDrawSource<'a> {
 /// `DrawState`.
 pub struct Maxwell3DDrawView<'a> {
     draw_state: &'a DrawState,
+    draw_indexed: bool,
     source: Maxwell3DDrawSource<'a>,
 }
 
 impl<'a> Maxwell3DDrawView<'a> {
-    pub fn new(draw_state: &'a DrawState) -> Self {
+    pub fn new(draw_state: &'a DrawState, draw_indexed: bool) -> Self {
         Self {
             draw_state,
+            draw_indexed,
             source: Maxwell3DDrawSource::Snapshot(Maxwell3DDrawRegisters::default()),
         }
     }
 
-    pub fn live(draw_state: &'a DrawState, maxwell3d: &'a mut dyn Maxwell3DAccess) -> Self {
+    pub fn live(
+        draw_state: &'a DrawState,
+        draw_indexed: bool,
+        maxwell3d: &'a mut dyn Maxwell3DAccess,
+    ) -> Self {
         Self {
             draw_state,
+            draw_indexed,
             source: Maxwell3DDrawSource::Live(maxwell3d),
         }
     }
 
     pub fn with_register_snapshot(
         draw_state: &'a DrawState,
+        draw_indexed: bool,
         registers: Maxwell3DDrawRegisters,
     ) -> Self {
         Self {
             draw_state,
+            draw_indexed,
             source: Maxwell3DDrawSource::Snapshot(registers),
         }
     }
@@ -892,11 +909,18 @@ impl<'a> Maxwell3DDrawView<'a> {
         self.draw_state
     }
 
-    pub fn draw_call_snapshot(&self, draw_indexed: bool, instance_count: u32) -> DrawCall {
+    pub fn is_indexed(&self) -> bool {
+        self.draw_indexed
+    }
+
+    pub fn draw_call_snapshot(&self, instance_count: u32) -> DrawCall {
         match &self.source {
-            Maxwell3DDrawSource::Live(maxwell3d) => {
-                build_draw_call_snapshot(self.draw_state, draw_indexed, instance_count, *maxwell3d)
-            }
+            Maxwell3DDrawSource::Live(maxwell3d) => build_draw_call_snapshot(
+                self.draw_state,
+                self.draw_indexed,
+                instance_count,
+                *maxwell3d,
+            ),
             Maxwell3DDrawSource::Snapshot(registers) => {
                 let mut shader_stages =
                     [crate::engines::maxwell_3d::ShaderStageInfo::default(); NUM_SHADER_PROGRAMS];
@@ -913,7 +937,7 @@ impl<'a> Maxwell3DDrawView<'a> {
                     topology: self.draw_state.topology,
                     vertex_first: self.draw_state.vertex_buffer.first,
                     vertex_count: self.draw_state.vertex_buffer.count,
-                    indexed: draw_indexed,
+                    indexed: self.draw_indexed,
                     index_buffer_addr: registers.index_buffer_gpu_addr,
                     index_buffer_addr_end: registers.index_buffer_gpu_addr_end,
                     index_buffer_count: self.draw_state.index_buffer.count,
@@ -1687,7 +1711,7 @@ pub struct Maxwell3DIndirectView<'a> {
 impl<'a> Maxwell3DIndirectView<'a> {
     pub fn new(draw_state: &'a DrawState, indirect_params: &'a IndirectParams) -> Self {
         Self {
-            draw_view: Maxwell3DDrawView::new(draw_state),
+            draw_view: Maxwell3DDrawView::new(draw_state, indirect_params.is_indexed),
             indirect_params,
         }
     }
@@ -1698,7 +1722,7 @@ impl<'a> Maxwell3DIndirectView<'a> {
         maxwell3d: &'a mut dyn Maxwell3DAccess,
     ) -> Self {
         Self {
-            draw_view: Maxwell3DDrawView::live(draw_state, maxwell3d),
+            draw_view: Maxwell3DDrawView::live(draw_state, indirect_params.is_indexed, maxwell3d),
             indirect_params,
         }
     }
@@ -1712,8 +1736,7 @@ impl<'a> Maxwell3DIndirectView<'a> {
     }
 
     pub fn draw_call_snapshot(&self) -> DrawCall {
-        self.draw_view
-            .draw_call_snapshot(self.indirect_params.is_indexed, 1)
+        self.draw_view.draw_call_snapshot(1)
     }
 
     pub fn dirty_flags_ptr(&mut self) -> Option<std::ptr::NonNull<[bool; 256]>> {
@@ -1786,7 +1809,7 @@ impl<'a> Maxwell3DDrawTextureView<'a> {
     pub fn new(draw_state: &'a DrawState, draw_texture_state: DrawTextureState) -> Self {
         Self {
             draw_texture_state,
-            draw_view: Maxwell3DDrawView::new(draw_state),
+            draw_view: Maxwell3DDrawView::new(draw_state, false),
         }
     }
 
@@ -1797,7 +1820,7 @@ impl<'a> Maxwell3DDrawTextureView<'a> {
     ) -> Self {
         Self {
             draw_texture_state,
-            draw_view: Maxwell3DDrawView::live(draw_state, maxwell3d),
+            draw_view: Maxwell3DDrawView::live(draw_state, false, maxwell3d),
         }
     }
 
@@ -1806,7 +1829,7 @@ impl<'a> Maxwell3DDrawTextureView<'a> {
     }
 
     pub fn draw_call_snapshot(&self) -> DrawCall {
-        self.draw_view.draw_call_snapshot(false, 1)
+        self.draw_view.draw_call_snapshot(1)
     }
 
     pub fn render_targets(&self) -> Maxwell3DRenderTargets {
@@ -2393,14 +2416,7 @@ impl DrawManager {
         let should_execute = maxwell3d.should_execute();
 
         if should_execute {
-            // `draw_state.draw_indexed` is already kept in sync with the
-            // Maxwell3D register file by the caller chains that lead into
-            // `process_draw` (draw_index_small, draw_index_array, etc.).
-            // We ensure it matches the argument before handing the state
-            // reference to the rasterizer so the rasterizer never sees a
-            // stale value.
-            self.draw_state.draw_indexed = draw_indexed;
-            maxwell3d.draw_rasterizer(&self.draw_state, instance_count);
+            maxwell3d.draw_rasterizer(&self.draw_state, draw_indexed, instance_count);
         }
     }
 
@@ -2486,14 +2502,14 @@ mod tests {
         registers.dirty_flags
             [crate::renderer_opengl::gl_state_tracker::dirty::VIEWPORTS as usize] = true;
 
-        let view = Maxwell3DDrawView::with_register_snapshot(&draw_state, registers);
+        let view = Maxwell3DDrawView::with_register_snapshot(&draw_state, true, registers);
 
         assert!(std::ptr::eq(view.draw_state(), &draw_state));
         assert_eq!(
             view.shader_program_addresses(),
             [0x1000, 0x2000, 0, 0, 0, 0]
         );
-        let draw = view.draw_call_snapshot(true, 1);
+        let draw = view.draw_call_snapshot(1);
         assert_eq!(draw.index_buffer_addr, 0x4000);
         assert_eq!(draw.index_buffer_addr_end, 0x4fff);
         assert_eq!(view.descriptor_sync_regs().tex_header_addr, 0x3000);
@@ -2512,7 +2528,7 @@ mod tests {
         registers.shader_config_enabled[ShaderStageType::TessInit.as_index().unwrap() as usize] =
             true;
 
-        let view = Maxwell3DDrawView::with_register_snapshot(&draw_state, registers);
+        let view = Maxwell3DDrawView::with_register_snapshot(&draw_state, false, registers);
 
         assert!(view.shader_config_enabled(ShaderStageType::VertexB));
         assert!(view.shader_config_enabled(ShaderStageType::TessInit));
@@ -2543,7 +2559,7 @@ mod tests {
         };
         registers.depth_mode = crate::engines::maxwell_3d::DepthMode::MinusOneToOne;
 
-        let view = Maxwell3DDrawView::with_register_snapshot(&draw_state, registers);
+        let view = Maxwell3DDrawView::with_register_snapshot(&draw_state, false, registers);
 
         assert!(view.viewport_scale_offset_enabled());
         assert_eq!(view.viewport_transforms()[0].scale_y, -20.0);

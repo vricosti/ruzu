@@ -387,6 +387,7 @@ fn get_viewport_state(
 fn viewport_state(
     draw: &DrawCall,
     index: usize,
+    scale: f32,
     depth_range_unrestricted: bool,
     nv_viewport_swizzle: bool,
 ) -> vk::Viewport {
@@ -398,7 +399,7 @@ fn viewport_state(
         src.scale_y,
         src.translate_z,
         src.scale_z,
-        1.0,
+        scale,
         draw.depth_stencil.depth_mode == crate::engines::maxwell_3d::DepthMode::MinusOneToOne,
         draw.window_origin_lower_left,
         !nv_viewport_swizzle && ((src.swizzle >> 4) & 0x7) == 3,
@@ -2259,35 +2260,31 @@ impl RasterizerVulkan {
         if !self.state_tracker.touch_viewports() {
             return;
         }
-        let viewport = if !draw.viewport_scale_offset_enabled {
-            vk::Viewport {
+        let viewports = if !draw.viewport_scale_offset_enabled {
+            vec![vk::Viewport {
                 x: draw.surface_clip.x as f32,
                 y: draw.surface_clip.y as f32,
                 width: (draw.surface_clip.width as f32).max(1.0),
                 height: (draw.surface_clip.height as f32).max(1.0),
                 min_depth: 0.0,
                 max_depth: 1.0,
-            }
+            }]
         } else {
-            viewport_state(
-                draw,
-                0,
-                self.depth_range_unrestricted,
-                self.nv_viewport_swizzle,
-            )
-        };
-        let viewports = if draw.viewport_scale_offset_enabled {
+            let scale = if self.texture_cache.base.is_rescaling {
+                common::settings::values().resolution_info.up_factor
+            } else {
+                1.0
+            };
             std::array::from_fn::<_, { NUM_VIEWPORTS }, _>(|index| {
                 viewport_state(
                     draw,
                     index,
+                    scale,
                     self.depth_range_unrestricted,
                     self.nv_viewport_swizzle,
                 )
             })[..self.max_viewports as usize]
                 .to_vec()
-        } else {
-            vec![viewport]
         };
         let device = self.device.clone();
         self.scheduler.record(move |cmdbuf| unsafe {
@@ -3064,18 +3061,18 @@ impl RasterizerInterface for RasterizerVulkan {
         if let Some(mm) = self.channel_memory_manager.as_ref().cloned() {
             mm.lock().flush_caching();
         }
-        let draw_state = draw_view.draw_state();
+        let draw_indexed = draw_view.is_indexed();
         self.draw_sequence = self.draw_sequence.wrapping_add(1);
         debug!(
             "RasterizerVulkan::draw indexed={} instances={}",
-            draw_state.draw_indexed, instance_count
+            draw_indexed, instance_count
         );
         let Some(memory_manager) = self.channel_memory_manager.as_ref().cloned() else {
             warn!("RasterizerVulkan::draw skipped: no bound channel memory manager");
             return;
         };
         let engine_dirty_flags = draw_view.dirty_flags_ptr();
-        let draw_call = draw_view.draw_call_snapshot(draw_state.draw_indexed, instance_count);
+        let draw_call = draw_view.draw_call_snapshot(instance_count);
         let read_gpu = |gpu_va: u64, output: &mut [u8]| {
             memory_manager.lock().read_block(gpu_va, output);
         };
@@ -4781,6 +4778,25 @@ mod tests {
         assert_eq!(viewport.width, 640.0);
         assert_eq!(viewport.y, 0.0);
         assert_eq!(viewport.height, 480.0);
+    }
+
+    #[test]
+    fn viewport_rescaling_matches_upstream_factor_and_rounding() {
+        let upscaled = get_viewport_state(
+            321.0, 319.0, 241.0, 239.0, 0.5, 0.5, 1.5, false, false, false, 480.0, false,
+        );
+        assert_eq!(upscaled.x, 3.0);
+        assert_eq!(upscaled.width, 957.0);
+        assert_eq!(upscaled.y, 3.0);
+        assert_eq!(upscaled.height, 717.0);
+
+        let downscaled = get_viewport_state(
+            318.0, 320.0, 238.0, 240.0, 0.5, 0.5, 0.75, false, false, false, 480.0, false,
+        );
+        assert_eq!(downscaled.x, -2.0);
+        assert_eq!(downscaled.width, 480.0);
+        assert_eq!(downscaled.y, -2.0);
+        assert_eq!(downscaled.height, 360.0);
     }
 
     #[test]

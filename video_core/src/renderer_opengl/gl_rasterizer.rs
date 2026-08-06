@@ -3594,6 +3594,7 @@ impl RasterizerInterface for RasterizerOpenGL {
         if let Some(mm) = self.channel_memory_manager.as_ref().cloned() {
             mm.lock().flush_caching();
         }
+        let is_indexed = draw_view.is_indexed();
         let draw_state = draw_view.draw_state();
         let gl_debug = GlDrawDebugFlags::get();
         let trace_draw = gl_debug.profile_gl_draw;
@@ -3617,7 +3618,7 @@ impl RasterizerInterface for RasterizerOpenGL {
         trace_gl_draw_stall!(
             "[GL_DRAW_STALL] seq={} enter indexed={} instances={} ib_count={} vb_count={}",
             draw_seq,
-            draw_state.draw_indexed,
+            is_indexed,
             instance_count,
             draw_state.index_buffer.count,
             draw_state.vertex_buffer.count
@@ -3625,7 +3626,7 @@ impl RasterizerInterface for RasterizerOpenGL {
         if trace_draw {
             info!(
                 "[GL_DRAW_PROFILE] begin indexed={} instances={} topology={:?} ib_count={} vb_count={} shader_addrs={:X?}",
-                draw_state.draw_indexed,
+                is_indexed,
                 instance_count,
                 draw_state.topology,
                 draw_state.index_buffer.count,
@@ -3722,7 +3723,6 @@ impl RasterizerInterface for RasterizerOpenGL {
             trace_gl_draw_stall!("[GL_DRAW_STALL] seq={} after_build_programs", draw_seq);
         }
 
-        let is_indexed = draw_state.draw_indexed;
         let pipeline_has_programs = pipeline.has_gl_programs();
         let pipeline_handle_after_build = pipeline.program_pipeline_handle();
         if !pipeline_has_programs {
@@ -8525,7 +8525,8 @@ mod tests {
         registers.dirty_flags[crate::dirty_flags::flags::COLOR_BUFFER3 as usize] = true;
         registers.dirty_flags[crate::dirty_flags::flags::ZETA_BUFFER as usize] = true;
         let dirty_flags = registers.dirty_flags;
-        let mut draw_view = Maxwell3DDrawView::with_register_snapshot(&draw_state, registers);
+        let mut draw_view =
+            Maxwell3DDrawView::with_register_snapshot(&draw_state, false, registers);
 
         crate::renderer_opengl::gl_texture_cache::consume_render_target_dirty_flags_for_update(
             &mut draw_view,

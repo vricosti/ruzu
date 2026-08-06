@@ -3650,14 +3650,19 @@ impl dm::Maxwell3DAccess for Maxwell3D {
         Maxwell3D::with_rasterizer_mut(self, |rasterizer| f(rasterizer)).is_some()
     }
 
-    fn draw_rasterizer(&mut self, draw_state: &dm::DrawState, instance_count: u32) -> bool {
+    fn draw_rasterizer(
+        &mut self,
+        draw_state: &dm::DrawState,
+        draw_indexed: bool,
+        instance_count: u32,
+    ) -> bool {
         let Some(handle) = self.rasterizer else {
             return false;
         };
         self.with_active_draw_manager_state(draw_state, |this| unsafe {
             handle.with_mut(|rasterizer| {
                 rasterizer.draw(
-                    dm::Maxwell3DDrawView::live(draw_state, this),
+                    dm::Maxwell3DDrawView::live(draw_state, draw_indexed, this),
                     instance_count,
                 );
             })
@@ -5404,7 +5409,7 @@ mod tests {
             let draw_state = draw_view.draw_state();
             self.calls.lock().unwrap().draws.push((
                 instance_count,
-                draw_state.draw_indexed,
+                draw_view.is_indexed(),
                 draw_view.shader_program_addresses(),
             ));
             self.calls
@@ -7832,7 +7837,7 @@ mod tests {
         engine.dirty.flags[flag as usize] = true;
 
         let draw_state = dm::DrawState::default();
-        let mut view = dm::Maxwell3DDrawView::live(&draw_state, &mut engine);
+        let mut view = dm::Maxwell3DDrawView::live(&draw_state, false, &mut engine);
         assert!(view.dirty_flags()[flag as usize]);
 
         view.clear_dirty_flag(flag);
@@ -8498,6 +8503,33 @@ mod tests {
         assert_eq!(engine.regs[GLOBAL_BASE_INSTANCE_INDEX as usize], 0);
         assert_eq!(engine.engine_state, EngineHint::None);
         assert!(engine.replace_table.is_empty());
+    }
+
+    #[test]
+    fn direct_indexed_draw_does_not_contaminate_following_array_draw() {
+        let mut engine = Maxwell3D::new();
+        let calls = Arc::new(Mutex::new(RasterizerCalls::default()));
+        let rasterizer = TestRasterizer::new(calls.clone());
+        engine.bind_rasterizer(&rasterizer);
+
+        engine.with_draw_manager(|draw_manager, this| {
+            draw_manager.draw_index(PrimitiveTopology::Triangles, 0, 36, 0, 0, 1, this);
+            assert!(!draw_manager.get_draw_state().draw_indexed);
+            draw_manager.draw_array(PrimitiveTopology::Triangles, 0, 18, 0, 1, this);
+            assert!(!draw_manager.get_draw_state().draw_indexed);
+        });
+
+        let calls = calls.lock().unwrap();
+        assert_eq!(
+            calls
+                .draws
+                .iter()
+                .map(|(_, indexed, _)| *indexed)
+                .collect::<Vec<_>>(),
+            [true, false]
+        );
+        assert!(!calls.draw_states[0].draw_indexed);
+        assert!(!calls.draw_states[1].draw_indexed);
     }
 
     #[test]

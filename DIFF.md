@@ -32867,3 +32867,62 @@ Rust files: `externals/rdynarmic/src/frontend/a32/{decoder.rs, decoder_thumb32.r
 - Two focused anisotropy tests pass. The configured-mode case forces `X4` and
   checks the fixed upstream-derived result `16.0`, rather than reproducing the
   implementation formula in the assertion.
+## 2026-08-06 — video_core/src/renderer_vulkan/vk_rasterizer.rs vs video_core/renderer_vulkan/vk_rasterizer.{h,cpp}
+
+### Intentional differences
+- Rust reads the same rescaling state through `texture_cache.base.is_rescaling`
+  and records an owned `Vec<VkViewport>` in the scheduler closure. Upstream
+  reads `TextureCache::IsRescaling()` and captures a fixed array before
+  constructing a bounded span; both submit the same device-limited viewport
+  sequence.
+
+### Unintentional differences (fixed)
+- `update_viewports` previously passed `1.0` to `get_viewport_state` for every
+  scale/offset viewport. It now uses `resolution_info.up_factor` exactly when
+  the texture cache is rescaling, matching upstream
+  `RasterizerVulkan::UpdateViewportsState` for both upscaling and downscaling.
+
+### Missing items
+- None for viewport rescaling parity.
+
+### Binary layout verification
+- PASS: the change affects only host-side Vulkan viewport values and changes no
+  guest-visible or serialized structure layout.
+
+### Behavioral verification
+- Re-read upstream `GetViewportState` and
+  `RasterizerVulkan::UpdateViewportsState` after implementation. Focused tests
+  cover identity, 1.5x upscale, and 0.75x signed downscale rounding.
+
+## 2026-08-06 — video_core/src/engines/{draw_manager.rs,maxwell_3d.rs} and video_core/src/renderer_{vulkan,opengl}/*rasterizer.rs vs video_core/engines/draw_manager.{h,cpp}, video_core/rasterizer_interface.h, and video_core/renderer_{vulkan,opengl}/*rasterizer.cpp
+
+### Intentional differences
+- Rust carries upstream's explicit `RasterizerInterface::Draw(bool is_indexed,
+  u32 instance_count)` argument inside `Maxwell3DDrawView`. This keeps the
+  borrow-safe draw-time Maxwell3D adapter while preserving the upstream
+  separation between the draw invocation argument and `DrawManager::State`.
+
+### Unintentional differences (fixed)
+- `DrawManager::process_draw` previously copied its `draw_indexed` argument
+  into the persistent `DrawState::draw_indexed` latch before dispatch. Upstream
+  never performs that assignment: direct indexed draws pass `true` only to the
+  rasterizer. The stale latch could turn a following 18-vertex array draw into
+  a 36-index draw. The explicit value now flows unchanged through Maxwell3D to
+  Vulkan and OpenGL without mutating the latch.
+
+### Missing items
+- None for the direct-draw indexed-state ownership and dispatch slice.
+
+### Binary layout verification
+- PASS: the added value is host-only state in a temporary Rust view. Maxwell3D
+  register layout, guest memory, and serialized payloads are unchanged.
+
+### Behavioral verification
+- Re-read upstream `DrawManager::DrawIndex`, `DrawEnd`, `ProcessDraw`, the
+  rasterizer interface, Vulkan `MakeDrawParams`/`Draw`, and OpenGL `Draw` line
+  by line. A focused regression test verifies that a direct indexed draw is
+  observed as indexed while the following array draw remains non-indexed and
+  the persistent latch remains clear.
+- The automated runtime sequence (`A`, select New Game, `A`, `L+R`, `A`)
+  rendered all 24 sampled cinematic frames without the diagonal artifact;
+  before this correction the same detector marked frames 8 through 13.
