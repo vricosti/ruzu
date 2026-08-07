@@ -395,6 +395,110 @@ impl BaseConfig {
         result
     }
 
+    /// Maps to `Config::ReadSystemValues` and its two `ReadCategory` calls.
+    pub fn read_system_values(&mut self) {
+        self.begin_group("System");
+        {
+            let mut values = common::settings::values_mut();
+            self.read_system_values_into(&mut values);
+        }
+        self.end_group();
+    }
+
+    fn read_system_values_into(&self, values: &mut common::settings::Values) {
+        use common::settings_enums::{AudioMode, ConsoleMode, Language, Region, TimeZone};
+
+        let language = self.read_integer_setting(
+            "language_index",
+            Some(*values.language_index.get_default() as i64),
+        );
+        values.language_index.set_value(
+            Language::from_u32(language as u32).unwrap_or(*values.language_index.get_default()),
+        );
+
+        let region = self.read_integer_setting(
+            "region_index",
+            Some(*values.region_index.get_default() as i64),
+        );
+        values.region_index.set_value(
+            Region::from_u32(region as u32).unwrap_or(*values.region_index.get_default()),
+        );
+
+        let time_zone = self.read_integer_setting(
+            "time_zone_index",
+            Some(*values.time_zone_index.get_default() as i64),
+        );
+        values.time_zone_index.set_value(
+            TimeZone::from_u32(time_zone as u32).unwrap_or(*values.time_zone_index.get_default()),
+        );
+
+        values
+            .custom_rtc_enabled
+            .set_value(self.read_boolean_setting(
+                "custom_rtc_enabled",
+                Some(*values.custom_rtc_enabled.get_default()),
+            ));
+        values
+            .custom_rtc_offset
+            .set_value(self.read_integer_setting(
+                "custom_rtc_offset",
+                Some(*values.custom_rtc_offset.get_default()),
+            ));
+        values.rng_seed_enabled.set_value(self.read_boolean_setting(
+            "rng_seed_enabled",
+            Some(*values.rng_seed_enabled.get_default()),
+        ));
+        values
+            .rng_seed
+            .set_value(self.read_u32_setting("rng_seed", *values.rng_seed.get_default()));
+        values.device_name.set_value(
+            self.read_string_setting("device_name", Some(values.device_name.get_default())),
+        );
+        values.current_user.set_value(self.read_integer_setting(
+            "current_user",
+            Some(*values.current_user.get_default() as i64),
+        ) as i32);
+
+        let console_mode = self.read_integer_setting(
+            "use_docked_mode",
+            Some(*values.use_docked_mode.get_default() as i64),
+        );
+        values.use_docked_mode.set_value(
+            ConsoleMode::from_u32(console_mode as u32)
+                .unwrap_or(*values.use_docked_mode.get_default()),
+        );
+
+        let sound_mode = self.read_integer_setting(
+            "sound_index",
+            Some(*values.sound_index.get_default() as i64),
+        );
+        values.sound_index.set_value(
+            AudioMode::from_u32(sound_mode as u32).unwrap_or(*values.sound_index.get_default()),
+        );
+    }
+
+    fn read_u32_setting(&self, key: &str, default_value: u32) -> u32 {
+        let use_default = self
+            .read_raw(&format!("{key}\\default"))
+            .and_then(Self::parse_bool)
+            .unwrap_or(true);
+        if use_default {
+            return default_value;
+        }
+        self.read_raw(key)
+            .and_then(|value| {
+                let value = value.trim_matches('"');
+                value
+                    .strip_prefix("0x")
+                    .or_else(|| value.strip_prefix("0X"))
+                    .map_or_else(
+                        || value.parse().ok(),
+                        |hex| u32::from_str_radix(hex, 16).ok(),
+                    )
+            })
+            .unwrap_or(default_value)
+    }
+
     /// Maps to `Config::ReadPlayerValues`.
     pub fn read_player_values(&self, player_index: usize) {
         let configuring_global = common::settings::is_configuring_global();
@@ -585,6 +689,51 @@ mod tests {
         assert_eq!(
             cfg.read_string_setting("binding", Some("fallback")),
             "engine:sdl,button:1"
+        );
+    }
+
+    #[test]
+    fn read_system_values_honors_configured_locale_and_defaults() {
+        let mut cfg = BaseConfig::new(ConfigType::GlobalConfig);
+        cfg.load_ini(
+            r#"
+            [System]
+            language_index\default=false
+            language_index=2
+            region_index\default=false
+            region_index=2
+            time_zone_index\default=true
+            time_zone_index=4
+            rng_seed_enabled\default=false
+            rng_seed_enabled=true
+            rng_seed\default=false
+            rng_seed=0x1234ABCD
+            sound_index\default=false
+            sound_index=2
+            "#,
+        );
+        cfg.begin_group("System");
+        let mut values = common::settings::Values::default();
+
+        cfg.read_system_values_into(&mut values);
+
+        assert_eq!(
+            *values.language_index.get_value(),
+            common::settings_enums::Language::French
+        );
+        assert_eq!(
+            *values.region_index.get_value(),
+            common::settings_enums::Region::Europe
+        );
+        assert_eq!(
+            *values.time_zone_index.get_value(),
+            common::settings_enums::TimeZone::Auto
+        );
+        assert!(*values.rng_seed_enabled.get_value());
+        assert_eq!(*values.rng_seed.get_value(), 0x1234_ABCD);
+        assert_eq!(
+            *values.sound_index.get_value(),
+            common::settings_enums::AudioMode::Surround
         );
     }
 

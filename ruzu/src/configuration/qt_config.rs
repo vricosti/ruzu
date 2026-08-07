@@ -24,6 +24,7 @@ use common::settings_input::{
     native_analog, native_button, native_motion, ControllerType, PlayerInput,
     JOYCON_BODY_NEON_BLUE, JOYCON_BODY_NEON_RED, JOYCON_BUTTONS_NEON_BLUE, JOYCON_BUTTONS_NEON_RED,
 };
+use frontend_common::config::{BaseConfig, ConfigType};
 use input_common::main_common::{generate_analog_param_from_keys, generate_keyboard_param};
 
 use crate::uisettings::GameDir;
@@ -39,6 +40,14 @@ const UI_SECTION: &str = "[UI]";
 /// Path of ruzu's own configuration file.
 pub fn config_path() -> PathBuf {
     get_ruzu_path(RuzuPath::ConfigDir).join("qt-config.ini")
+}
+
+/// Read the shared System categories through upstream's `Config` owner.
+pub fn load_system_values() {
+    let path = config_path();
+    let mut config = BaseConfig::new(ConfigType::GlobalConfig);
+    config.initialize(&path);
+    config.read_system_values();
 }
 
 /// Read the configured game directories — upstream `Config::ReadUIValues`'s

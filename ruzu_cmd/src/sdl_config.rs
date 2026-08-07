@@ -268,14 +268,7 @@ impl SdlConfig {
     /// Config layer is not ported yet, so keep this narrow bridge in the SDL
     /// config owner instead of applying RNG policy in `main.rs`.
     fn read_system_values(&mut self) {
-        let Ok(contents) = std::fs::read_to_string(&self.config_path) else {
-            log::debug!(
-                "SdlConfig::read_system_values: config_path={:?} not readable, using Settings defaults",
-                self.config_path
-            );
-            return;
-        };
-        read_rng_seed_settings_from_ini(&contents);
+        self.base.read_system_values();
     }
 
     /// Reads SDL control (button/analog/motion) config values.
@@ -492,76 +485,6 @@ fn resolve_config_path(config_path: Option<String>) -> std::path::PathBuf {
         })
 }
 
-fn read_rng_seed_settings_from_ini(contents: &str) {
-    let rng_seed_enabled_default =
-        parse_ini_bool(contents, "System", "rng_seed_enabled\\default").unwrap_or(true);
-    let rng_seed_default = parse_ini_bool(contents, "System", "rng_seed\\default").unwrap_or(true);
-
-    let mut values = common::settings::values_mut();
-    if !rng_seed_enabled_default {
-        if let Some(enabled) = parse_ini_bool(contents, "System", "rng_seed_enabled") {
-            values.rng_seed_enabled.set_value(enabled);
-        }
-    } else {
-        values.rng_seed_enabled.set_value(false);
-    }
-
-    if !rng_seed_default {
-        if let Some(seed) = parse_ini_u32(contents, "System", "rng_seed") {
-            values.rng_seed.set_value(seed);
-        }
-    } else {
-        values.rng_seed.set_value(0);
-    }
-}
-
-fn parse_ini_bool(contents: &str, section: &str, key: &str) -> Option<bool> {
-    parse_ini_value(contents, section, key).and_then(|value| match value {
-        "true" | "1" => Some(true),
-        "false" | "0" => Some(false),
-        _ => None,
-    })
-}
-
-fn parse_ini_u32(contents: &str, section: &str, key: &str) -> Option<u32> {
-    parse_ini_value(contents, section, key).and_then(|value| {
-        let value = value
-            .strip_prefix("0x")
-            .or_else(|| value.strip_prefix("0X"))
-            .unwrap_or(value);
-        u32::from_str_radix(value, 16)
-            .or_else(|_| value.parse::<u32>())
-            .ok()
-    })
-}
-
-fn parse_ini_value<'a>(contents: &'a str, section: &str, key: &str) -> Option<&'a str> {
-    let mut in_section = false;
-    for raw_line in contents.lines() {
-        let line = raw_line.trim();
-        if line.is_empty() || line.starts_with(';') || line.starts_with('#') {
-            continue;
-        }
-        if let Some(name) = line
-            .strip_prefix('[')
-            .and_then(|line| line.strip_suffix(']'))
-        {
-            in_section = name == section;
-            continue;
-        }
-        if !in_section {
-            continue;
-        }
-        let Some((found_key, value)) = line.split_once('=') else {
-            continue;
-        };
-        if found_key.trim() == key {
-            return Some(value.trim());
-        }
-    }
-    None
-}
-
 impl Drop for SdlConfig {
     /// If this is a global config, saves all values on drop.
     ///
@@ -576,10 +499,7 @@ impl Drop for SdlConfig {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        read_rng_seed_settings_from_ini, read_sdl_player_values_into, resolve_config_path,
-        DEFAULT_BUTTONS, NUM_BUTTONS,
-    };
+    use super::{read_sdl_player_values_into, resolve_config_path, DEFAULT_BUTTONS, NUM_BUTTONS};
     use common::param_package::ParamPackage;
     use common::settings_input::{native_button, PlayerInput};
     use frontend_common::config::{BaseConfig, ConfigType};
@@ -612,68 +532,6 @@ mod tests {
         let button_b = ParamPackage::from_serialized(&player.buttons[1]);
         assert_eq!(button_b.get_str("engine", ""), "keyboard");
         assert_eq!(button_b.get_int("code", -1), DEFAULT_BUTTONS[1]);
-    }
-
-    #[test]
-    fn reads_rng_seed_from_system_group_when_not_default() {
-        let old_enabled = *common::settings::values().rng_seed_enabled.get_value();
-        let old_seed = *common::settings::values().rng_seed.get_value();
-        {
-            let mut values = common::settings::values_mut();
-            values.rng_seed_enabled.set_value(false);
-            values.rng_seed.set_value(0);
-        }
-
-        read_rng_seed_settings_from_ini(
-            r#"
-            [System]
-            rng_seed_enabled\default=false
-            rng_seed_enabled=true
-            rng_seed\default=false
-            rng_seed=0x1234ABCD
-            "#,
-        );
-
-        {
-            let values = common::settings::values();
-            assert!(*values.rng_seed_enabled.get_value());
-            assert_eq!(*values.rng_seed.get_value(), 0x1234_ABCD);
-        }
-
-        let mut values = common::settings::values_mut();
-        values.rng_seed_enabled.set_value(old_enabled);
-        values.rng_seed.set_value(old_seed);
-    }
-
-    #[test]
-    fn default_rng_seed_entries_reset_to_upstream_defaults() {
-        let old_enabled = *common::settings::values().rng_seed_enabled.get_value();
-        let old_seed = *common::settings::values().rng_seed.get_value();
-        {
-            let mut values = common::settings::values_mut();
-            values.rng_seed_enabled.set_value(true);
-            values.rng_seed.set_value(0xFFFF_FFFF);
-        }
-
-        read_rng_seed_settings_from_ini(
-            r#"
-            [System]
-            rng_seed_enabled\default=true
-            rng_seed_enabled=true
-            rng_seed\default=true
-            rng_seed=0x1234ABCD
-            "#,
-        );
-
-        {
-            let values = common::settings::values();
-            assert!(!*values.rng_seed_enabled.get_value());
-            assert_eq!(*values.rng_seed.get_value(), 0);
-        }
-
-        let mut values = common::settings::values_mut();
-        values.rng_seed_enabled.set_value(old_enabled);
-        values.rng_seed.set_value(old_seed);
     }
 
     #[test]

@@ -33251,3 +33251,46 @@ Rust files: `externals/rdynarmic/src/frontend/a32/{decoder.rs, decoder_thumb32.r
   paths after the fixes. Both `cargo test -p audio_core` and its `--release`
   variant pass all 195 tests in parallel with `MALLOC_CHECK_=3`; the release
   suite also passes serially.
+## 2026-08-07 — externals/rdynarmic/src/frontend/a64/translate/simd_vector_x_indexed_element.rs vs externals/dynarmic/src/dynarmic/frontend/A64/translate/impl/simd_vector_x_indexed_element.cpp
+
+### Intentional differences
+- The vector helper is named `vector_multiply_by_element` because Rust gives all inherent `TranslatorVisitor` methods one namespace; the scalar counterpart already owns `multiply_by_element` in its upstream-corresponding module.
+- `dot_product_by_element` selects signed or unsigned byte extension with the existing `Signedness` enum instead of an upstream C++ member-function pointer. The emitted IR sequence and operation ordering are unchanged.
+
+### Unintentional differences (to fix)
+- Resolved: all 21 active upstream visitor methods now have matching Rust owners and dispatch entries. `MUL_elt` previously fell through to interpretation and suspended the guest thread on encoding `0x4FA08000`.
+
+### Missing items
+- Instructions commented out in upstream `a64.inc` remain outside the active decoder contract. The upstream FP16 `FCMLA_elt` interpreter fallback is preserved literally.
+
+### Binary layout verification
+- PASS: this slice adds translator control flow and IR emission only; no binary-layout-bearing structure is introduced or changed.
+
+## 2026-08-07 — frontend_common/src/config.rs vs frontend_common/config.{h,cpp}
+
+### Intentional differences
+- Rust enumerates the currently ported `System` and `SystemAudio` settings in `read_system_values_into` because its settings registry does not expose upstream's type-erased `BasicSetting` list. Ownership, group selection, default-marker handling, and update order remain in `BaseConfig`.
+- The RNG seed reader accepts the existing hexadecimal SDL override syntax in addition to upstream's decimal representation.
+
+### Unintentional differences (to fix)
+- Resolved: both frontends now call the shared `BaseConfig::read_system_values`; configured language, region, timezone, RTC, RNG, device, user, console-mode, and sound-mode values no longer remain at process defaults.
+
+### Missing items
+- The generic type-erased `ReadCategory` mechanism remains absent; this slice ports its complete `System`/`SystemAudio` behavior without claiming the other categories.
+
+### Binary layout verification
+- PASS: configuration parsing changes settings values only and does not alter serialized guest structures.
+
+## 2026-08-07 — core/src/hle/service/set/settings_server.rs vs core/hle/service/set/settings_server.{h,cpp}
+
+### Intentional differences
+- `get_region_code` returns the raw `u32` representation consumed by the IPC response builder. This preserves upstream's direct cast for all configured `Region` values without constructing an invalid Rust enum discriminant.
+
+### Unintentional differences (to fix)
+- Resolved: language, region, quest flag, keyboard layout, and device nickname are now read from live global settings when each command executes, matching upstream. The former constructor snapshot was permanently initialized to American English, USA, and `yuzu`.
+
+### Missing items
+- None in the settings-value ownership corrected by this slice.
+
+### Binary layout verification
+- PASS: response widths and the fixed 0x80-byte nickname and 0x1000-byte key-map payloads are unchanged.

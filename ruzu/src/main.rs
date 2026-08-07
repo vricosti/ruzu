@@ -113,6 +113,7 @@ fn main() -> glib::ExitCode {
     // before the window is built. Without this the Controls page would open on
     // an empty mapping even though one was saved last session.
     configuration::qt_config::load_control_values();
+    configuration::qt_config::load_system_values();
 
     // Upstream constructs `QApplication app(argc, argv)`. We register handling
     // of file arguments ourselves later (open a game passed on the command

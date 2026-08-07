@@ -10,8 +10,7 @@ use std::collections::BTreeMap;
 
 use super::key_code_map::*;
 use super::settings_types::{
-    KeyboardLayout, Language, LanguageCode, SystemRegionCode, AVAILABLE_LANGUAGE_CODES,
-    LANGUAGE_TO_LAYOUT,
+    KeyboardLayout, Language, LanguageCode, AVAILABLE_LANGUAGE_CODES, LANGUAGE_TO_LAYOUT,
 };
 use crate::hle::result::{ErrorModule, ResultCode, RESULT_SUCCESS};
 use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
@@ -105,14 +104,6 @@ pub mod commands {
 ///
 /// Corresponds to `ISettingsServer` in upstream settings_server.h.
 pub struct ISettingsServer {
-    /// Language index (from settings). Default: 1 (AmericanEnglish).
-    language_index: usize,
-    /// Region index (from settings). Default: 1 (USA).
-    region_index: u32,
-    /// Quest flag (from settings).
-    quest_flag: bool,
-    /// Device name (from settings).
-    device_name: String,
     handlers: BTreeMap<u32, FunctionInfo>,
     handlers_tipc: BTreeMap<u32, FunctionInfo>,
 }
@@ -185,27 +176,6 @@ impl ISettingsServer {
 
     pub fn new() -> Self {
         Self {
-            language_index: 1,
-            region_index: 1,
-            quest_flag: false,
-            device_name: "yuzu".to_string(),
-            handlers: Self::build_handlers(),
-            handlers_tipc: BTreeMap::new(),
-        }
-    }
-
-    /// Construct with explicit settings values.
-    pub fn with_settings(
-        language_index: usize,
-        region_index: u32,
-        quest_flag: bool,
-        device_name: String,
-    ) -> Self {
-        Self {
-            language_index,
-            region_index,
-            quest_flag,
-            device_name,
             handlers: Self::build_handlers(),
             handlers_tipc: BTreeMap::new(),
         }
@@ -215,11 +185,12 @@ impl ISettingsServer {
     ///
     /// Corresponds to `ISettingsServer::GetLanguageCode` in upstream.
     pub fn get_language_code(&self) -> LanguageCode {
+        let language_index = *common::settings::values().language_index.get_value() as u32 as usize;
         log::debug!(
             "ISettingsServer::get_language_code called, index={}",
-            self.language_index
+            language_index
         );
-        AVAILABLE_LANGUAGE_CODES[self.language_index]
+        AVAILABLE_LANGUAGE_CODES[language_index]
     }
 
     /// GetAvailableLanguageCodes (cmd 1).
@@ -255,10 +226,9 @@ impl ISettingsServer {
     }
 
     /// GetRegionCode (cmd 4).
-    pub fn get_region_code(&self) -> SystemRegionCode {
+    pub fn get_region_code(&self) -> u32 {
         log::debug!("ISettingsServer::get_region_code called");
-        // Safety: region_index is validated by settings.
-        unsafe { std::mem::transmute(self.region_index) }
+        *common::settings::values().region_index.get_value() as u32
     }
 
     /// GetAvailableLanguageCodes2 (cmd 5).
@@ -283,7 +253,8 @@ impl ISettingsServer {
     /// Corresponds to `ISettingsServer::GetKeyCodeMap` in upstream.
     pub fn get_key_code_map(&self) -> KeyCodeMap {
         log::debug!("ISettingsServer::get_key_code_map called");
-        let language_code = AVAILABLE_LANGUAGE_CODES[self.language_index];
+        let language_index = *common::settings::values().language_index.get_value() as u32 as usize;
+        let language_code = AVAILABLE_LANGUAGE_CODES[language_index];
         let key_code = LANGUAGE_TO_LAYOUT
             .iter()
             .find(|(lc, _)| *lc == language_code);
@@ -293,7 +264,7 @@ impl ISettingsServer {
             None => {
                 log::error!(
                     "Could not find keyboard layout for language index {}, defaulting to English us",
-                    self.language_index
+                    language_index
                 );
                 copy_key_code_map(KEY_CODE_MAP_ENGLISH_US_INTERNATIONAL)
             }
@@ -303,7 +274,7 @@ impl ISettingsServer {
     /// GetQuestFlag (cmd 8).
     pub fn get_quest_flag(&self) -> bool {
         log::debug!("ISettingsServer::get_quest_flag called");
-        self.quest_flag
+        *common::settings::values().quest_flag.get_value()
     }
 
     /// GetKeyCodeMap2 (cmd 9).
@@ -319,7 +290,8 @@ impl ISettingsServer {
     pub fn get_device_nick_name(&self) -> [u8; 0x80] {
         log::debug!("ISettingsServer::get_device_nick_name called");
         let mut out = [0u8; 0x80];
-        let bytes = self.device_name.as_bytes();
+        let device_name = common::settings::values().device_name.get_value().clone();
+        let bytes = device_name.as_bytes();
         let len = bytes.len().min(out.len());
         out[..len].copy_from_slice(&bytes[..len]);
         out
@@ -391,7 +363,7 @@ impl ISettingsServer {
 
         let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
         rb.push_result(RESULT_SUCCESS);
-        rb.push_u32(region as u32);
+        rb.push_u32(region);
     }
 
     fn get_available_language_codes2_handler(
@@ -492,8 +464,15 @@ mod tests {
 
     #[test]
     fn test_get_language_code() {
+        let old_language = *common::settings::values().language_index.get_value();
+        common::settings::values_mut()
+            .language_index
+            .set_value(common::settings_enums::Language::French);
         let server = ISettingsServer::new();
-        assert_eq!(server.get_language_code(), LanguageCode::EnUs);
+        assert_eq!(server.get_language_code(), LanguageCode::Fr);
+        common::settings::values_mut()
+            .language_index
+            .set_value(old_language);
     }
 
     #[test]
