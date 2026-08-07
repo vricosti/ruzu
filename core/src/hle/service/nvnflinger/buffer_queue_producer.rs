@@ -866,7 +866,9 @@ impl BufferQueueProducer {
             graphic_buffer: Some(graphic_buffer.clone()),
             fence,
             crop,
-            transform: transform & !NativeWindowTransform::INVERSE_DISPLAY,
+            transform: NativeWindowTransform::from_bits_retain(
+                transform.bits() & !NativeWindowTransform::INVERSE_DISPLAY.bits(),
+            ),
             scaling_mode: scaling_mode as u32,
             timestamp,
             is_auto_timestamp,
@@ -1952,6 +1954,30 @@ mod tests {
 
         let (status, _) = producer.queue_buffer(slot, &QueueBufferInput::default());
         assert_eq!(status, Status::NoError);
+    }
+
+    #[test]
+    fn queue_buffer_preserves_unnamed_rotation_bits() {
+        let core = BufferQueueCore::new();
+        install_test_consumer(&core);
+        let producer = BufferQueueProducer::new(test_service_context(), core.clone(), test_nvmap());
+        let buffer = Arc::new(NvGraphicBuffer::new(16, 16, PixelFormat::Rgba8888, 0));
+        assert_eq!(
+            producer.set_preallocated_buffer(0, Some(buffer)),
+            Status::NoError
+        );
+
+        let (status, slot, _fence) =
+            producer.dequeue_buffer(false, 16, 16, PixelFormat::Rgba8888, 0);
+        assert_eq!(status, Status::NoError.into());
+        let (status, _buffer) = producer.request_buffer(slot);
+        assert_eq!(status, Status::NoError);
+
+        let mut input = QueueBufferInput::default();
+        input.transform = NativeWindowTransform::from_bits_retain(0x0B);
+        let (status, _) = producer.queue_buffer(slot, &input);
+        assert_eq!(status, Status::NoError);
+        assert_eq!(core.mutex.lock().unwrap().queue[0].transform.bits(), 0x03);
     }
 
     #[test]

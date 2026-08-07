@@ -33311,3 +33311,26 @@ Rust files: `externals/rdynarmic/src/frontend/a32/{decoder.rs, decoder_thumb32.r
 
 ### Binary layout verification
 - PASS: only frontend configuration text and embedded translation data changed; no guest-facing binary structure changed.
+
+## 2026-08-08 — core/src/hle/service/nvnflinger/buffer_queue_producer.rs vs core/hle/service/nvnflinger/buffer_queue_producer.cpp
+
+### Intentional differences
+- Rust reconstructs `NativeWindowTransform` with `from_bits_retain` after masking the raw integer because `bitflags` masks a unary `!` to declared flags; this preserves the C++ enum's unnamed Android `FlipH`/`FlipV` bits.
+
+### Unintentional differences (to fix)
+- Resolved: queueing previously erased raw transform bits `0x01` and `0x02`, turning a guest `Rotate180` transform into `None` and presenting the Mii editor upside down.
+
+### Binary layout verification
+- PASS: `QueueBufferInput` is unchanged; the regression test verifies that input `0x0B` queues as `0x03`, preserving `Rotate180` while removing `InverseDisplay` exactly like upstream.
+
+## 2026-08-08 — core/src/hle/service/hid/hid_system_server.rs vs core/hle/service/hid/hid_system_server.cpp
+
+### Intentional differences
+- The upstream function-local request structure is module-private in Rust so its 16-byte layout and ARUID offset can be covered by a focused regression test.
+
+### Unintentional differences (to fix)
+- Resolved: `SetNpadSystemExtStateEnabled` advanced the word-based request parser once per padding fragment and read the ARUID eight bytes too late, causing the controller system applet to abort with `HID::ResultNpadNotConnected`.
+- Resolved: `GetRegisteredDevices` returned its empty device count as `u64`; upstream returns a three-word response with a `u32` count.
+
+### Binary layout verification
+- PASS: the request is parsed as the upstream `{ bool, 7-byte padding, u64 }` structure; compile-time and runtime checks verify size `0x10` and ARUID offset `0x8`.

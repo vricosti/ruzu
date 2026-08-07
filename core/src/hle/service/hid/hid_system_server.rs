@@ -22,6 +22,16 @@ fn to_ipc_result(r: common::ResultCode) -> ResultCode {
     ResultCode::new(r.raw())
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct SetNpadSystemExtStateEnabledParameters {
+    is_enabled: bool,
+    _padding: [u8; 7],
+    applet_resource_user_id: u64,
+}
+
+const _: () = assert!(std::mem::size_of::<SetNpadSystemExtStateEnabledParameters>() == 0x10);
+
 /// IHidSystemServer - system-level HID interface.
 pub struct IHidSystemServer {
     handlers: BTreeMap<u32, FunctionInfo>,
@@ -541,24 +551,20 @@ impl IHidSystemServer {
     ) {
         let server = unsafe { &*(this as *const dyn ServiceFramework as *const IHidSystemServer) };
         let mut rp = RequestParser::new(ctx);
-        let is_enabled = rp.pop_bool();
-        let _padding = rp.pop_u32(); // 7 bytes padding (4 bytes consumed here)
-        let _padding2 = rp.pop_u16(); // 2 more bytes
-        let _padding3 = rp.pop_u8(); // 1 more byte -- total 7 bytes padding
-        let aruid = rp.pop_u64();
+        let parameters = rp.pop_raw::<SetNpadSystemExtStateEnabledParameters>();
 
         log::info!(
             "SetNpadSystemExtStateEnabled called, is_enabled={}, aruid={}",
-            is_enabled,
-            aruid
+            parameters.is_enabled,
+            parameters.applet_resource_user_id
         );
 
         let rm = server.resource_manager.lock();
         let result = if let Some(npad) = rm.get_npad() {
-            to_ipc_result(
-                npad.lock()
-                    .set_npad_system_ext_state_enabled(aruid, is_enabled),
-            )
+            to_ipc_result(npad.lock().set_npad_system_ext_state_enabled(
+                parameters.applet_resource_user_id,
+                parameters.is_enabled,
+            ))
         } else {
             RESULT_SUCCESS
         };
@@ -973,9 +979,9 @@ impl IHidSystemServer {
         log::warn!("(STUBBED) GetRegisteredDevices called");
 
         // Upstream returns empty list with count = 0
-        let mut rb = ResponseBuilder::new(ctx, 4, 0, 0);
+        let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
         rb.push_result(RESULT_SUCCESS);
-        rb.push_u64(0);
+        rb.push_u32(0);
     }
 
     /// Upstream: nullptr (cmd 549)
@@ -3223,5 +3229,32 @@ impl ServiceFramework for IHidSystemServer {
 
     fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
         &self.handlers_tipc
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn set_npad_system_ext_state_enabled_parameters_preserve_aruid_offset() {
+        assert_eq!(
+            std::mem::offset_of!(
+                SetNpadSystemExtStateEnabledParameters,
+                applet_resource_user_id
+            ),
+            8
+        );
+
+        let mut ctx = HLERequestContext::new();
+        ctx.cmd_buf[0] = 1;
+        ctx.cmd_buf[1] = 0;
+        ctx.cmd_buf[2] = 0x5566_7788;
+        ctx.cmd_buf[3] = 0x1122_3344;
+        let mut parser = RequestParser::from_buffer(&ctx);
+        let parameters = parser.pop_raw::<SetNpadSystemExtStateEnabledParameters>();
+
+        assert!(parameters.is_enabled);
+        assert_eq!(parameters.applet_resource_user_id, 0x1122_3344_5566_7788);
     }
 }
