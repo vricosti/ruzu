@@ -27,7 +27,7 @@ use common::settings_input::{
 use frontend_common::config::{BaseConfig, ConfigType};
 use input_common::main_common::{generate_analog_param_from_keys, generate_keyboard_param};
 
-use crate::uisettings::GameDir;
+use crate::uisettings::{self, GameDir};
 
 /// Key prefix for every game-directory setting.
 const GAMEDIRS_PREFIX: &str = "Paths\\gamedirs\\";
@@ -48,6 +48,114 @@ pub fn load_system_values() {
     let mut config = BaseConfig::new(ConfigType::GlobalConfig);
     config.initialize(&path);
     config.read_system_values();
+}
+
+/// Read `UISettings::values.language`, the `Paths\language` entry owned by
+/// upstream `Config::ReadUIValues`.
+pub fn load_ui_language() {
+    let contents = std::fs::read_to_string(config_path()).unwrap_or_default();
+    let language = read_ui_string_setting(&contents, "Paths\\language", "");
+    uisettings::with_mut(|values| values.language.set_value(language));
+}
+
+/// Persist the selected interface locale through upstream's
+/// `Config::SaveUIValues` key and default marker.
+pub fn save_ui_language() -> io::Result<()> {
+    let path = config_path();
+    let contents = std::fs::read_to_string(&path).unwrap_or_default();
+    let language = uisettings::with(|values| values.language.get_value().clone());
+    let updated = replace_ui_string_setting(&contents, "Paths\\language", &language, "");
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, updated)
+}
+
+fn read_ui_string_setting(contents: &str, key: &str, default: &str) -> String {
+    let values = parse_section_values(contents, UI_SECTION);
+    if values
+        .get(&format!("{key}\\default"))
+        .is_none_or(|value| is_true(value))
+    {
+        return default.to_string();
+    }
+    values
+        .get(key)
+        .map(|value| unquote(value).to_string())
+        .unwrap_or_else(|| default.to_string())
+}
+
+fn replace_ui_string_setting(contents: &str, key: &str, value: &str, default: &str) -> String {
+    let default_key = format!("{key}\\default");
+    let rendered = [
+        format!("{default_key}={}", value == default),
+        format!("{key}={value}"),
+    ];
+    let mut output = Vec::new();
+    let mut in_ui = false;
+    let mut saw_ui = false;
+    let mut written = false;
+
+    for line in contents.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') {
+            if in_ui && !written {
+                output.extend(rendered.iter().cloned());
+                written = true;
+            }
+            in_ui = trimmed == UI_SECTION;
+            saw_ui |= in_ui;
+            output.push(line.to_string());
+            continue;
+        }
+        let owned = trimmed
+            .split_once('=')
+            .is_some_and(|(found, _)| found.trim() == key || found.trim() == default_key);
+        if in_ui && owned {
+            if !written {
+                output.extend(rendered.iter().cloned());
+                written = true;
+            }
+            continue;
+        }
+        output.push(line.to_string());
+    }
+
+    if !written {
+        if !saw_ui {
+            if !output.is_empty() {
+                output.push(String::new());
+            }
+            output.push(UI_SECTION.to_string());
+        }
+        output.extend(rendered);
+    }
+
+    let mut text = output.join("\n");
+    text.push('\n');
+    text
+}
+
+fn parse_section_values(
+    contents: &str,
+    section: &str,
+) -> std::collections::BTreeMap<String, String> {
+    let mut values = std::collections::BTreeMap::new();
+    let mut in_section = false;
+    for line in contents.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') {
+            in_section = trimmed == section;
+            continue;
+        }
+        if !in_section {
+            continue;
+        }
+        if let Some((key, value)) = trimmed.split_once('=') {
+            values.insert(key.trim().to_string(), value.trim().to_string());
+        }
+    }
+    values
 }
 
 /// Read the configured game directories — upstream `Config::ReadUIValues`'s
@@ -621,6 +729,40 @@ mod tests {
 
     /// The binding a real Xbox pad produces, as yuzu writes it.
     const SDL_BINDING: &str = "engine:sdl,port:0,guid:030000005e040000000b000015050000,button:1";
+
+    #[test]
+    fn ui_language_honors_default_marker() {
+        assert_eq!(
+            read_ui_string_setting(
+                "[UI]\nPaths\\language\\default=false\nPaths\\language=fr\n",
+                "Paths\\language",
+                "",
+            ),
+            "fr"
+        );
+        assert_eq!(
+            read_ui_string_setting(
+                "[UI]\nPaths\\language\\default=true\nPaths\\language=fr\n",
+                "Paths\\language",
+                "",
+            ),
+            ""
+        );
+    }
+
+    #[test]
+    fn ui_language_replacement_preserves_other_sections() {
+        let updated = replace_ui_string_setting(
+            "[UI]\nPaths\\language\\default=false\nPaths\\language=en\n[System]\nlanguage_index=2\n",
+            "Paths\\language",
+            "ja_JP",
+            "",
+        );
+        assert!(updated.contains("Paths\\language\\default=false"));
+        assert!(updated.contains("Paths\\language=ja_JP"));
+        assert!(updated.contains("[System]\nlanguage_index=2"));
+        assert_eq!(updated.matches("Paths\\language=").count(), 1);
+    }
 
     /// Upstream defaults `player.connected` to `player_index == 0`, and applies
     /// that default whether or not a config file exists. Bailing out on a

@@ -33294,3 +33294,20 @@ Rust files: `externals/rdynarmic/src/frontend/a32/{decoder.rs, decoder_thumb32.r
 
 ### Binary layout verification
 - PASS: response widths and the fixed 0x80-byte nickname and 0x1000-byte key-map payloads are unchanged.
+
+## 2026-08-07 — ruzu/src/i18n.rs, ruzu/src/configuration/configure_ui.rs, ruzu/src/configuration/qt_config.rs, and ruzu/src/game_list.rs vs yuzu/main.{h,cpp}, yuzu/configuration/configure_ui.{h,cpp}, yuzu/configuration/qt_config.{h,cpp}, and yuzu/game_list_p.h
+
+### Intentional differences
+- The GTK frontend embeds a generated JSON representation of the upstream TS catalogs and retranslates GTK widget properties directly; upstream uses Qt resource files, `QTranslator`, and `retranslateUi`.
+- Catalog generation retains only source strings referenced by the GTK frontend and changes yuzu branding to ruzu at lookup time. Strings unique to ruzu fall back to English until they have an upstream catalog counterpart.
+- The game-directory action uses the shorter `Add Game Directory` label and dedicated translations for all upstream locales so the GTK toolbar remains compact; upstream uses `Add New Game Directory`.
+
+### Unintentional differences (to fix)
+- Resolved: the interface-language selector now exposes System, English, and every locale catalog shipped by upstream, applies language changes immediately, and persists `Paths\language` in the UI configuration.
+- Resolved: the shortened game-directory action has translations for every locale catalog shipped by upstream.
+
+### Missing items
+- None in the upstream interface-language selection and game-directory label behavior covered by this slice.
+
+### Binary layout verification
+- PASS: only frontend configuration text and embedded translation data changed; no guest-facing binary structure changed.

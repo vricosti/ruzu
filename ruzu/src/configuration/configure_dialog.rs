@@ -290,11 +290,15 @@ impl ConfigureDialog {
         if let Err(error) = super::qt_config::save_control_values() {
             log::error!("Failed to save control settings: {error}");
         }
+        if let Err(error) = super::qt_config::save_ui_language() {
+            log::error!("Failed to save interface language: {error}");
+        }
         common::settings::log_settings(&common::settings::values());
     }
 
     /// Show the dialog — upstream `ConfigureDialog::exec()`.
     pub fn present(&self) {
+        crate::i18n::translate_widget_tree(&self.window);
         self.window.present();
     }
 

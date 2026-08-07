@@ -35,7 +35,7 @@ pub fn group(title: &str) -> (gtk::Box, gtk::Box) {
     outer.set_margin_bottom(8);
 
     if !title.is_empty() {
-        let label = gtk::Label::new(Some(title));
+        let label = gtk::Label::new(Some(&crate::i18n::tr(title)));
         label.set_xalign(0.0);
         label.set_margin_bottom(2);
         outer.append(&label);
@@ -84,7 +84,7 @@ pub fn page() -> (gtk::ScrolledWindow, gtk::Box) {
 pub fn labeled_row(label: &str, control: &impl IsA<gtk::Widget>) -> gtk::Box {
     let row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
 
-    let name = gtk::Label::new(Some(label));
+    let name = gtk::Label::new(Some(&crate::i18n::tr(label)));
     name.set_xalign(0.0);
     name.set_width_chars(LABEL_COLUMN_CHARS);
     name.set_max_width_chars(LABEL_COLUMN_CHARS);
@@ -107,7 +107,9 @@ pub fn combo_row(label: &str, items: &[&str], active: u32) -> (gtk::Box, gtk::Dr
 
 /// Bare combo box, for rows that need custom placement.
 pub fn combo(items: &[&str], active: u32) -> gtk::DropDown {
-    let model = gtk::StringList::new(items);
+    let translated: Vec<String> = items.iter().map(|item| crate::i18n::tr(item)).collect();
+    let translated_refs: Vec<&str> = translated.iter().map(String::as_str).collect();
+    let model = gtk::StringList::new(&translated_refs);
     let dropdown = gtk::DropDown::new(Some(model), gtk::Expression::NONE);
     // Guard against an out-of-range stored setting selecting nothing at all;
     // upstream's `setCurrentIndex` silently clamps the same way.
@@ -122,7 +124,7 @@ pub fn combo(items: &[&str], active: u32) -> gtk::DropDown {
 /// Upstream check boxes span the full row width with the label to the right of
 /// the box, rather than using the `[label] [control]` split.
 pub fn check_row(label: &str, active: bool) -> gtk::CheckButton {
-    let check = gtk::CheckButton::with_label(label);
+    let check = gtk::CheckButton::with_label(&crate::i18n::tr(label));
     check.set_active(active);
     check
 }

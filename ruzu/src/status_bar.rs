@@ -277,10 +277,12 @@ impl StatusBar {
         // `UpdateVolumeUI`.
         let muted = *values.audio_muted.get_value();
         if muted {
-            self.volume.set_label("VOLUME: MUTE");
+            self.volume.set_label(&crate::i18n::tr("VOLUME: MUTE"));
         } else {
-            self.volume
-                .set_label(&format!("VOLUME: {}%", values.volume.get_value()));
+            self.volume.set_label(&crate::i18n::tr_args(
+                "VOLUME: %1%",
+                &[values.volume.get_value().to_string()],
+            ));
         }
         set_checked(&self.volume, !muted);
     }
@@ -338,21 +340,35 @@ fn format_resolution_scale(up_factor: f32) -> String {
             .trim_end_matches('.')
             .to_string()
     };
-    format!("Scale: {scale}x")
+    crate::i18n::tr_args("Scale: %1x", &[scale])
 }
 
 fn format_shaders_building(count: i32) -> String {
     let suffix = if count == 1 { "shader" } else { "shaders" };
-    format!("Building: {count} {suffix}")
+    format!(
+        "{} {count} {}",
+        crate::i18n::tr("Building:"),
+        crate::i18n::tr(suffix)
+    )
 }
 
 fn format_game_fps(average_game_fps: f64, unlocked: bool) -> String {
-    let suffix = if unlocked { " (Unlocked)" } else { "" };
-    format!("Game: {:.0} FPS{suffix}", average_game_fps.round())
+    let fps = format!("{:.0}", average_game_fps.round());
+    crate::i18n::tr_args(
+        if unlocked {
+            "Game: %1 FPS (Unlocked)"
+        } else {
+            "Game: %1 FPS"
+        },
+        &[fps],
+    )
 }
 
 fn format_frame_time(frametime_seconds: f64) -> String {
-    format!("Frame: {:.2} ms", frametime_seconds * 1000.0)
+    crate::i18n::tr_args(
+        "Frame: %1 ms",
+        &[format!("{:.2}", frametime_seconds * 1000.0)],
+    )
 }
 
 /// Next enum discriminant, wrapping back to 0 once `max` is reached.
@@ -404,7 +420,7 @@ fn status_button(class: &str) -> gtk::Button {
 
 fn performance_label(tooltip: &str) -> gtk::Label {
     let label = gtk::Label::new(None);
-    label.set_tooltip_text(Some(tooltip));
+    label.set_tooltip_text(Some(&crate::i18n::tr(tooltip)));
     label.set_margin_start(4);
     label.set_margin_end(4);
     label.set_visible(false);

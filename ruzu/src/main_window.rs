@@ -694,6 +694,8 @@ impl GMainWindow {
             this.start_loading_demo();
         }
 
+        crate::i18n::translate_widget_tree(&this.window);
+
         this
     }
 
@@ -2338,6 +2340,19 @@ impl GMainWindow {
     pub fn present(&self) {
         self.window.present();
     }
+
+    /// Retranslate the live GTK tree and both menu representations, matching
+    /// upstream `GMainWindow::OnLanguageChanged`.
+    pub fn retranslate(&self) {
+        let menu = build_menu_model();
+        if let Some(app) = self.window.application() {
+            app.set_menubar(Some(&menu));
+        }
+        if let Some(menu_bar) = self.menu_bar.as_ref() {
+            menu_bar.set_menu_model(Some(&menu));
+        }
+        crate::i18n::translate_widget_tree(&self.window);
+    }
 }
 
 /// Install the application-scoped menu bar and its actions. Called once from
@@ -2765,7 +2780,8 @@ fn install_render_bg_css() {
 /// populated menus upstream (Recent Files, Debugging) are declared but left
 /// empty here.
 fn build_menu_model() -> gio::MenuModel {
-    let builder = gtk::Builder::from_string(MENU_UI);
+    let translated = crate::i18n::translate_builder_xml(MENU_UI);
+    let builder = gtk::Builder::from_string(&translated);
     builder
         .object::<gio::MenuModel>("menubar")
         .expect("menubar object present in menu UI definition")

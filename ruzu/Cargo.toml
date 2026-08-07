@@ -26,6 +26,7 @@ gtk = { version = "0.9", package = "gtk4", features = ["v4_6"] }
 cairo-rs = { version = "0.20", features = ["png"] }
 log = { workspace = true }
 env_logger = { workspace = true }
+serde_json = { workspace = true }
 
 # ruzu's data-directory resolver, for "Open ruzu Folder" (upstream uses
 # `Common::FS::GetYuzuPathString(YuzuPath::YuzuDir)`).

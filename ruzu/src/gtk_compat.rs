@@ -25,12 +25,14 @@ fn show_message_with_type<P: IsA<gtk::Window>>(
     detail: &str,
     message_type: MessageType,
 ) {
+    let message = crate::i18n::tr(message);
+    let detail = crate::i18n::tr(detail);
     let dialog = gtk::MessageDialog::builder()
         .modal(true)
         .message_type(message_type)
         .buttons(ButtonsType::Ok)
-        .text(message)
-        .secondary_text(detail)
+        .text(&message)
+        .secondary_text(&detail)
         .build();
     if let Some(parent) = parent {
         dialog.set_transient_for(Some(parent));
@@ -48,18 +50,22 @@ pub fn ask_question<P: IsA<gtk::Window>>(
     accept_label: &str,
     callback: impl FnOnce(bool) + 'static,
 ) {
+    let message = crate::i18n::tr(message);
+    let detail = crate::i18n::tr(detail);
+    let cancel_label = crate::i18n::tr(cancel_label);
+    let accept_label = crate::i18n::tr(accept_label);
     let dialog = gtk::MessageDialog::builder()
         .modal(true)
         .message_type(MessageType::Question)
         .buttons(ButtonsType::None)
-        .text(message)
-        .secondary_text(detail)
+        .text(&message)
+        .secondary_text(&detail)
         .build();
     if let Some(parent) = parent {
         dialog.set_transient_for(Some(parent));
     }
-    dialog.add_button(cancel_label, ResponseType::Cancel);
-    dialog.add_button(accept_label, ResponseType::Accept);
+    dialog.add_button(&cancel_label, ResponseType::Cancel);
+    dialog.add_button(&accept_label, ResponseType::Accept);
     dialog.set_default_response(ResponseType::Accept);
 
     let callback = RefCell::new(Some(callback));
@@ -81,12 +87,13 @@ pub fn open_file<P: IsA<gtk::Window>>(
     default_filter: Option<&gtk::FileFilter>,
     callback: impl FnOnce(Option<gio::File>) + 'static,
 ) {
+    let title = crate::i18n::tr(title);
     let dialog = gtk::FileChooserNative::new(
-        Some(title),
+        Some(&title),
         parent,
         FileChooserAction::Open,
-        Some("Open"),
-        Some("Cancel"),
+        Some(&crate::i18n::tr("Open")),
+        Some(&crate::i18n::tr("Cancel")),
     );
     dialog.set_modal(true);
     for filter in filters {
@@ -116,12 +123,13 @@ pub fn select_folder<P: IsA<gtk::Window>>(
     title: &str,
     callback: impl FnOnce(Option<gio::File>) + 'static,
 ) {
+    let title = crate::i18n::tr(title);
     let dialog = gtk::FileChooserNative::new(
-        Some(title),
+        Some(&title),
         parent,
         FileChooserAction::SelectFolder,
-        Some("Select"),
-        Some("Cancel"),
+        Some(&crate::i18n::tr("Select")),
+        Some(&crate::i18n::tr("Cancel")),
     );
     dialog.set_modal(true);
     // Unlike a GtkWindow, NativeDialog is not retained as an application

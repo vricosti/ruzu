@@ -213,7 +213,7 @@ impl LoadingScreen {
                     / (value - state.slow_shader_first_value) as f64
                     * diff_ms;
                 let shown_ms = (eta_ms - diff_ms + 1000.0).max(1000.0) as u64;
-                estimate = format!("Estimated Time {}", format_mm_ss(shown_ms));
+                estimate = crate::i18n::tr_args("Estimated Time %1", &[format_mm_ss(shown_ms)]);
             }
         }
 
@@ -365,9 +365,12 @@ fn format_mm_ss(ms: u64) -> String {
 
 fn stage_text(stage: LoadStage, value: usize, total: usize) -> String {
     match stage {
-        LoadStage::Prepare => "Loading...".to_owned(),
-        LoadStage::Build => format!("Loading Shaders {value} / {total}"),
-        LoadStage::Complete => "Launching...".to_owned(),
+        LoadStage::Prepare => crate::i18n::tr("Loading..."),
+        LoadStage::Build => crate::i18n::tr_args(
+            "Loading Shaders %1 / %2",
+            &[value.to_string(), total.to_string()],
+        ),
+        LoadStage::Complete => crate::i18n::tr("Launching..."),
     }
 }
 

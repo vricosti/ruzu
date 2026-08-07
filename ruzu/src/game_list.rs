@@ -531,15 +531,24 @@ impl GameListView {
         let (position, count) = filesystem_directory_position(&path);
 
         let menu = gio::Menu::new();
-        menu.append(Some("▲ Move Up"), Some("game-list.move-up"));
-        menu.append(Some("▼ Move Down"), Some("game-list.move-down"));
         menu.append(
-            Some("Open Directory Location"),
+            Some(&crate::i18n::tr("▲ Move Up")),
+            Some("game-list.move-up"),
+        );
+        menu.append(
+            Some(&crate::i18n::tr("▼ Move Down")),
+            Some("game-list.move-down"),
+        );
+        menu.append(
+            Some(&crate::i18n::tr("Open Directory Location")),
             Some("game-list.open-directory"),
         );
-        menu.append(Some("Scan Subfolders"), Some("game-list.scan-subfolders"));
         menu.append(
-            Some("Remove Game Directory"),
+            Some(&crate::i18n::tr("Scan Subfolders")),
+            Some("game-list.scan-subfolders"),
+        );
+        menu.append(
+            Some(&crate::i18n::tr("Remove Game Directory")),
             Some("game-list.remove-directory"),
         );
 
@@ -630,24 +639,27 @@ impl GameListView {
 
         let menu = gio::Menu::new();
         let start_section = gio::Menu::new();
-        start_section.append(Some("Start Game"), Some("game-list.start-game"));
+        start_section.append(
+            Some(&crate::i18n::tr("Start Game")),
+            Some("game-list.start-game"),
+        );
         menu.append_section(None, &start_section);
 
         if program_id != 0 {
             let locations = gio::Menu::new();
             locations.append(
-                Some("Open Mod Data Location"),
+                Some(&crate::i18n::tr("Open Mod Data Location")),
                 Some("game-list.open-mod-data"),
             );
             locations.append(
-                Some("Open Transferable Pipeline Cache"),
+                Some(&crate::i18n::tr("Open Transferable Pipeline Cache")),
                 Some("game-list.open-pipeline-cache"),
             );
             menu.append_section(None, &locations);
 
             let title = gio::Menu::new();
             title.append(
-                Some("Copy Title ID to Clipboard"),
+                Some(&crate::i18n::tr("Copy Title ID to Clipboard")),
                 Some("game-list.copy-title-id"),
             );
             menu.append_section(None, &title);

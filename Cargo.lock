@@ -1619,6 +1619,7 @@ dependencies = [
  "log",
  "objc",
  "parking_lot",
+ "serde_json",
  "video_core",
  "windows-sys 0.59.0",
  "x11",

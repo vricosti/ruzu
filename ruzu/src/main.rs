@@ -21,6 +21,7 @@ mod emu_window;
 mod file_menu;
 mod game_list;
 mod gtk_compat;
+mod i18n;
 mod loading_screen;
 mod main_window;
 #[cfg(target_os = "macos")]
@@ -57,6 +58,14 @@ fn set_main_window(window: Rc<GMainWindow>) {
 /// and emulation `System`.
 fn main_window() -> Option<Rc<GMainWindow>> {
     MAIN_WINDOW.with(|slot| slot.borrow().as_ref().cloned())
+}
+
+/// Apply the selected interface locale to the live launcher, matching
+/// upstream's `GMainWindow::OnLanguageChanged` retranslation step.
+pub(crate) fn retranslate_application() {
+    if let Some(window) = main_window() {
+        window.retranslate();
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -108,6 +117,10 @@ fn main() -> glib::ExitCode {
     let game_dirs = configuration::qt_config::load_game_dirs();
     log::info!("Loaded {} configured game directory(ies)", game_dirs.len());
     uisettings::with_mut(|v| v.game_dirs = game_dirs);
+
+    configuration::qt_config::load_ui_language();
+    let interface_language = uisettings::with(|v| v.language.get_value().clone());
+    i18n::set_language(&interface_language);
 
     // Upstream's `Config` constructor reads every category, controls included,
     // before the window is built. Without this the Controls page would open on

@@ -44,11 +44,6 @@ const SCREENSHOT_RESOLUTIONS: &[(u32, &str)] = &[
     (2160, "3840x2160 (4K)"),
 ];
 
-/// Interface languages offered by the frontend. Upstream scans the compiled-in
-/// Qt translation files; ruzu ships only English so far, so the list is the
-/// system-default entry plus English.
-const INTERFACE_LANGUAGES: &[(&str, &str)] = &[("", "English"), ("en", "English")];
-
 /// Build the UI tab — upstream `ConfigureUi`.
 pub fn page() -> Page {
     let (scroller, column) = w::page();
@@ -62,9 +57,35 @@ pub fn page() -> Page {
     note.set_xalign(0.0);
     general.append(&note);
 
-    let language_labels: Vec<&str> = INTERFACE_LANGUAGES.iter().map(|(_, l)| *l).collect();
-    let (language_row, language) = w::combo_row("Interface language:", &language_labels, 0);
+    let language_labels: Vec<String> = crate::i18n::AVAILABLE_LANGUAGES
+        .iter()
+        .map(|(_, label)| crate::i18n::tr(label))
+        .collect();
+    let language_refs: Vec<&str> = language_labels.iter().map(String::as_str).collect();
+    let current_language = uisettings::with(|v| v.language.get_value().clone());
+    let language_index = crate::i18n::AVAILABLE_LANGUAGES
+        .iter()
+        .position(|(locale, _)| *locale == current_language)
+        .unwrap_or(0) as u32;
+    let (language_row, language) =
+        w::combo_row("Interface language:", &language_refs, language_index);
     general.append(&language_row);
+
+    language.connect_selected_notify(|combo| {
+        if crate::i18n::is_retranslating() {
+            return;
+        }
+        let locale = crate::i18n::AVAILABLE_LANGUAGES
+            .get(combo.selected() as usize)
+            .map(|(locale, _)| *locale)
+            .unwrap_or("");
+        uisettings::with_mut(|values| values.language.set_value(locale.to_string()));
+        crate::i18n::set_language(locale);
+        crate::retranslate_application();
+        if let Some(root) = combo.root().and_downcast::<gtk::Window>() {
+            crate::i18n::translate_widget_tree(&root);
+        }
+    });
 
     let theme_labels: Vec<&str> = uisettings::THEMES.iter().map(|(name, _)| *name).collect();
     let theme_index = uisettings::with(|v| {
@@ -195,7 +216,7 @@ pub fn page() -> Page {
             .get(theme.selected() as usize)
             .map(|(name, _)| name.to_string())
             .unwrap_or_default();
-        let language_code = INTERFACE_LANGUAGES
+        let language_code = crate::i18n::AVAILABLE_LANGUAGES
             .get(language.selected() as usize)
             .map(|(code, _)| code.to_string())
             .unwrap_or_default();
