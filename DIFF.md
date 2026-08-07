@@ -32926,3 +32926,328 @@ Rust files: `externals/rdynarmic/src/frontend/a32/{decoder.rs, decoder_thumb32.r
 - The automated runtime sequence (`A`, select New Game, `A`, `L+R`, `A`)
   rendered all 24 sampled cinematic frames without the diagonal artifact;
   before this correction the same detector marked frames 8 through 13.
+
+## 2026-08-06 — video_core/src/renderer_vulkan/vk_rasterizer.rs vs video_core/renderer_vulkan/vk_rasterizer.{h,cpp}
+
+### Intentional differences
+- Rust stores an `Arc<MaxwellDeviceMemoryManager>` where upstream stores a
+  non-owning `MaxwellDeviceMemoryManager&`; the shared owner preserves the
+  same single device-memory object across the rasterizer and its caches.
+
+### Unintentional differences (fixed)
+- `RasterizerVulkan` previously forwarded device memory into sub-components
+  without retaining its own member. It now preserves upstream member ownership
+  and constructor ordering, allowing rasterizer-owned operations to use the
+  same device-memory manager directly.
+
+### Missing items
+- The broader upstream `Tegra::GPU&` owner remains represented by the existing
+  Rust callback bridge; this slice only restores the independent
+  `device_memory` member.
+
+### Binary layout verification
+- PASS: `RasterizerVulkan` is host-only state and is never serialized or copied
+  to guest memory.
+
+## 2026-08-06 — externals/rdynarmic/src/frontend/a64/translate/data_processing_crc32.rs vs externals/dynarmic/src/dynarmic/frontend/A64/translate/impl/data_processing_crc32.cpp
+
+### Intentional differences
+- The Rust decoder exposes one `DecodedInst` and dispatches the four CRC widths
+  locally, while upstream receives decoded `sf` and `sz` operands directly.
+  Both paths now apply the same `sf`/`sz` validation before selecting the same
+  width-specific IR opcode.
+
+### Unintentional differences (fixed)
+- `crc32_dispatch` and `crc32c_dispatch` previously read `sz` from bits
+  `[21:20]`, which overlap `Rm`. Upstream's decoder pattern places `sz` in bits
+  `[11:10]`. The wrong extraction translated valid `CRC32X` instructions as
+  narrower operations depending on the source register number.
+- The Rust dispatchers previously omitted upstream's unallocated-encoding
+  checks for invalid `sf`/`sz` combinations. Both CRC32 polynomials now perform
+  those checks before emitting IR.
+
+### Missing items
+- The CRC32 and CRC32C dispatch slice now covers upstream's four operand widths
+  and both unallocated-encoding conditions.
+
+### Binary layout verification
+- PASS: the correction changes instruction decoding only; JIT state and all
+  guest-visible structure layouts are unchanged.
+
+### Behavioral verification
+- Re-read upstream `CRC32` and `CRC32C` after implementation. The focused JIT
+  regression executes `CRC32X` followed by `CRC32B` over a nine-byte input and
+  verifies both intermediate results and the complete ISO CRC32 state.
+
+## 2026-08-07 — shader_recompiler/src/backend/spirv/emit_spirv_image.rs vs shader_recompiler/backend/spirv/emit_spirv_image.cpp
+
+### Intentional differences
+- Rust stores SPIR-V definitions in the emission context keyed by stable IR
+  instruction references; upstream stores each definition directly in its
+  pointer-stable `IR::Inst`.
+
+### Unintentional differences (fixed)
+- `ImageQueryLod` previously had only an unused placeholder and was omitted
+  from the SPIR-V instruction dispatch. It now loads the texture sampler,
+  emits `OpImageQueryLod` with an `F32x2` result, and constructs the upstream
+  `F32x4(query, 0.0, 0.0)` result before registering the IR definition.
+- `ImageGradient` likewise had only an unused `undef` placeholder and no
+  dispatch arm. The indexed TXD path now builds upstream's `Grad` operands,
+  including the three-derivative packing and optional minimum LOD, and uses
+  the same sparse/non-sparse sample selection and residency result handling.
+
+### Missing items
+- None for indexed `ImageQueryLod` and `ImageGradient` emission.
+
+### Binary layout verification
+- PASS: this change only affects host SPIR-V generation and does not alter
+  guest-visible data or serialized host structures.
+
+### Behavioral verification
+- The regression constructs `ImageQueryLod` followed by
+  `CompositeExtractF32x4`, matching the runtime failure chain, and verifies
+  that `OpImageQueryLod`, `OpCompositeConstruct`, and `OpCompositeExtract` are
+  emitted without an unresolved IR definition.
+- A TXD regression verifies `OpImageSampleExplicitLod` carries the `Grad`
+  operand mask and passes `spirv-val` when it is installed.
+
+## 2026-08-07 — shader_recompiler/src/backend/spirv/spirv_emit_context.rs vs shader_recompiler/backend/spirv/emit_spirv.cpp and shader_recompiler/frontend/ir/opcodes.inc
+
+### Intentional differences
+- Upstream generates its exhaustive switch directly from `opcodes.inc`. Rust
+  spells out the exhaustive `Opcode` match because the enum is the local source
+  of compile-time exhaustiveness.
+- `Branch`, `BranchConditional`, `LoopMerge`, `SelectionMerge`, `Return`, and
+  `Unreachable` are Rust-only basic-block markers. Structured SPIR-V control
+  flow remains owned by `Program::syntax_list`, matching upstream `Traverse`;
+  seeing one of these markers in instruction emission is therefore an error.
+
+### Unintentional differences (fixed)
+- The backend previously ended its opcode match with `_ => trace!`, silently
+  dropping 95 enum variants. All functional upstream operations are now
+  dispatched, and upstream `LogicError`/`NotImplementedException` cases fail
+  explicitly. No wildcard remains, so a future enum addition without a SPIR-V
+  decision is a compile error.
+- Missing dispatch covered integer 64-bit arithmetic and shifts, bit reverse,
+  U32/U64 conversions, U16 select, FP64 reciprocal operations, memory
+  barriers, geometry stream operations, and indexed image gradient/query LOD.
+
+### Missing items
+- None: every current Rust `Opcode` variant has an explicit SPIR-V dispatch
+  outcome. The 20 pre-indexed image variants remain upstream-unreachable and
+  the 47 upstream-unimplemented operations remain explicit errors.
+
+### Binary layout verification
+- PASS: dispatch changes only affect host shader generation.
+
+## 2026-08-07 — shader_recompiler/src/backend/spirv/emit_spirv_integer.rs vs shader_recompiler/backend/spirv/emit_spirv_integer.cpp
+
+### Intentional differences
+- None beyond rspirv builder calls replacing Sirit methods.
+
+### Unintentional differences (fixed)
+- Added the missing 64-bit logical left shift, logical right shift, and
+  arithmetic right shift emitters with upstream's `U64` result type.
+
+### Missing items
+- None for the integer operations reached by the exhaustive dispatch.
+
+### Binary layout verification
+- PASS: host SPIR-V generation only.
+
+## 2026-08-07 — shader_recompiler/src/backend/spirv/emit_spirv_select.rs vs shader_recompiler/backend/spirv/emit_spirv_select.cpp
+
+### Intentional differences
+- None beyond rspirv builder calls replacing Sirit methods.
+
+### Unintentional differences (fixed)
+- `SelectU16` was omitted even though upstream emits `OpSelect` with its U16
+  type. The matching emitter and dispatch are now present.
+
+### Missing items
+- `SelectU8` intentionally remains an explicit upstream-compatible
+  not-implemented error.
+
+### Binary layout verification
+- PASS: host SPIR-V generation only.
+
+## 2026-08-07 — shader_recompiler/src/backend/spirv/emit_spirv_floating_point.rs vs shader_recompiler/backend/spirv/emit_spirv_floating_point.cpp
+
+### Intentional differences
+- Rust's IR enum already distinguishes `FPMin16`, `FPMax16`, `FPSub64`,
+  `FPDiv64`, and `FPSqrt64`; upstream `opcodes.inc` does not expose those exact
+  names. Their direct SPIR-V operations are now emitted so this pre-existing
+  IR-model difference cannot create an undefined result.
+
+### Unintentional differences (fixed)
+- Added upstream `FPRecip64` (`1.0 / value`) and `FPRecipSqrt64`
+  (`InverseSqrt`) emission, which were absent from dispatch.
+
+### Missing items
+- None for the floating-point variants in the current Rust IR enum.
+
+### Binary layout verification
+- PASS: host SPIR-V generation only.
+
+## 2026-08-07 — shader_recompiler/src/backend/spirv/emit_spirv_special.rs vs shader_recompiler/backend/spirv/emit_spirv_special.cpp
+
+### Intentional differences
+- Rust panics represent upstream `NotImplementedException`, and a Rust `Value`
+  match replaces upstream `IR::Value::IsImmediate`/`Def`.
+
+### Unintentional differences (fixed)
+- `EmitVertex` and `EndPrimitive` previously only logged a trace. They now
+  enforce geometry-stream support, use immediate streams or upstream's
+  warned zero fallback, emit the stream operations, perform depth conversion,
+  and restore fixed pipeline point size in upstream order.
+
+### Missing items
+- None for geometry stream emission.
+
+### Binary layout verification
+- PASS: host SPIR-V generation only.
+
+## 2026-08-07 — audio_core/src/renderer/effect/effect_info_base.rs vs audio_core/renderer/effect/effect_info_base.h
+
+### Intentional differences
+- Rust dispatches effect-specific updates through `EffectType` because the port
+  represents upstream's virtual subclasses in one tagged host object. The
+  `Invalid` arm now retains the base virtual `Update` behavior exactly: it only
+  reports success.
+
+### Unintentional differences (fixed)
+- `EffectType::Invalid` previously applied the zeroed input's common settings,
+  changing cleanup's `UnusedMixId` and `InvalidProcessOrder` sentinels to zero.
+  An unused slot could consequently replace a real effect at process order zero.
+
+### Missing items
+- None for invalid-effect update behavior.
+
+### Binary layout verification
+- PASS: no effect parameter, state, or command payload layout changed.
+
+### Behavioral verification
+- Re-read both base `Update` overloads after implementation. The focused v1/v2
+  regression verifies that an invalid update preserves both routing sentinels.
+
+## 2026-08-07 — audio_core/src/renderer/command/command_generator.rs and audio_core/src/renderer/effect/effect_context.rs vs audio_core/renderer/command/command_generator.cpp and audio_core/renderer/effect/effect_context.{h,cpp}
+
+### Intentional differences
+- Rust clones a temporary `EffectInfoBase` after `ShouldSkip` so command
+  generation can mutably borrow the generator while retaining the original
+  effect context. Runtime state addresses are refreshed before that clone; the
+  state transition is still applied to the original object after generation.
+
+### Unintentional differences (fixed)
+- The former `EffectContext::update_info_for_command_generation` helper moved
+  `UpdateForCommandGeneration` ahead of `ShouldSkip` and command emission.
+  Upstream performs `ShouldSkip`, emits the command from the current state, and
+  only then advances the effect state. The Rust order and method ownership now
+  match that sequence.
+- Removed the command-generation helper from `EffectContext`; upstream's effect
+  context owns storage and result-state synchronization, not command emission.
+
+### Missing items
+- None for effect command-generation ordering and ownership.
+
+### Binary layout verification
+- PASS: the temporary clone and ordering change are host-only and do not alter
+  serialized command structures.
+
+### Behavioral verification
+- Re-read `CommandGenerator::GenerateEffectCommand` and all of
+  `EffectContext` after implementation. Runtime verification showed the real
+  limiter command emitted in `Initialized` state and the original effect then
+  transitioning to `Enabled`.
+
+## 2026-08-07 — audio_core/src/renderer/command/effect/{light_limiter.rs,mod.rs} vs audio_core/renderer/command/effect/light_limiter.cpp
+
+### Intentional differences
+- Upstream directly dereferences the ADSP-mapped workbuffer address. In ruzu
+  that value remains a guest virtual address, so the command reads and writes
+  it through `CommandListProcessor::MemoryHandle`, the same guest-memory
+  adaptation already used by Aux and Capture. The translated host-side state
+  and statistics addresses retain their direct access path.
+
+### Unintentional differences (fixed)
+- LightLimiter previously treated its guest workbuffer address as a host
+  pointer. Once the corrected effect ordering emitted the first limiter
+  command, this dereferenced an unmapped address and crashed outside the JIT.
+  Initialization and look-ahead processing now access that buffer through the
+  owning process memory.
+
+### Missing items
+- None for LightLimiter workbuffer access.
+
+### Binary layout verification
+- PASS: both LightLimiter payload layouts and their padding are unchanged; only
+  command processing receives the existing memory handle.
+
+### Behavioral verification
+- Re-read both LightLimiter `Process` methods and the shared initialize/apply
+  helpers after implementation. A focused command-list regression starts with
+  a NaN workbuffer, verifies initialization, and checks the final look-ahead
+  sample was written back. A release runtime run passed the title flow and
+  rendered the in-game map without the former crash or permanent black screen.
+
+## 2026-08-07 — shader_recompiler/src/backend/spirv/emit_spirv_image.rs and emit_spirv_special.rs vs shader_recompiler/backend/spirv/emit_spirv_image.cpp and emit_spirv_special.cpp
+
+### Intentional differences
+- Rust cannot overload `ImageOperands::add`, so the upstream two-value overload
+  is represented by `add_pair(mask, first, second)` in the same owner.
+
+### Unintentional differences (fixed)
+- Gradient operands no longer append their second ID by bypassing the helper;
+  mask update and both IDs are now added atomically like upstream
+  `Add(Grad, derivatives_X, derivatives_Y)`.
+- Geometry stream selection now uses `Value::is_immediate()` rather than only
+  accepting `ImmU32`. Unsupported narrow immediate types still fail in
+  `resolve_value`, matching upstream `EmitContext::Def`.
+
+### Missing items
+- Geometry stream emission and gradient operand construction have no remaining
+  omissions in the reviewed paths.
+
+### Binary layout verification
+- PASS: these changes only affect host SPIR-V instruction construction.
+
+## 2026-08-07 — audio_core/src/renderer/command/effect/delay.rs and audio renderer tests vs audio_core/renderer/command/effect/delay.cpp and sink command implementations
+
+### Intentional differences
+- Rust tracks placement-initialized `Vec`-backed delay states because they live
+  in `EffectInfoBase` raw state bytes; C++ obtains equivalent cleanup from its
+  vector destructors and assignment operators.
+- Rust rejects a negative dirty-mix count before converting it to `usize`;
+  upstream trusts the guest value and would form an invalid span.
+
+### Unintentional differences (fixed)
+- A normally owned `DelayState` could leave a stale address in the placement
+  state registry, and tests explicitly dropped that state before Rust dropped
+  it again. `DelayState::drop` now unregisters its address, while explicit raw
+  cleanup tests use `ManuallyDrop` and destroy the state exactly once.
+- `DeviceSink` tests now allocate and serialize upstream's fixed 240 frames;
+  four-frame tests for other DSP commands no longer append an invalid
+  `DeviceSink` command.
+- Circular-sink expectations now match upstream's contiguous write followed by
+  position reset, and AUX expectations preserve the untouched
+  `total_sample_count` field.
+- Input-buffer and renderer reset tests now use the recording `NullSink`; the
+  regular upstream-like null sink intentionally discards appended buffers.
+- The Capture test now allocates the full 0x80-byte `AuxBufferInfo`; its former
+  0x40-byte `AuxInfoDsp` allocation was overwritten by the command and corrupted
+  adjacent `Vec` metadata in debug builds.
+- Removed a test requiring rejection of a negative dirty mix ID, a validation
+  that upstream `UpdateMixes` does not perform.
+
+### Missing items
+- No production command implementation remains untested because of the former
+  process-wide allocator abort.
+
+### Binary layout verification
+- PASS: no command payload or effect state layout changed.
+
+### Behavioral verification
+- Re-read upstream Delay, DeviceSink, CircularBufferSink, Aux, and UpdateMixes
+  paths after the fixes. Both `cargo test -p audio_core` and its `--release`
+  variant pass all 195 tests in parallel with `MALLOC_CHECK_=3`; the release
+  suite also passes serially.

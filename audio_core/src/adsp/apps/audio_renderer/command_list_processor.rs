@@ -490,6 +490,7 @@ fn read_pod<T: Copy>(addr: CpuAddr) -> Option<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::common::common::TARGET_SAMPLE_COUNT;
     use crate::renderer::behavior::BehaviorInfo;
     use crate::renderer::command::command_buffer::CommandBuffer as RenderCommandBuffer;
     use crate::renderer::command::command_processing_time_estimator::CommandProcessingTimeEstimator;
@@ -505,7 +506,7 @@ mod tests {
     use crate::renderer::command::effect::delay::DelayState;
     use crate::renderer::command::effect::light_limiter::LightLimiterState;
     use crate::renderer::command::effect::reverb::ReverbState;
-    use crate::renderer::effect::aux_::AuxInfoDsp;
+    use crate::renderer::effect::aux_::{AuxBufferInfo, AuxInfoDsp};
     use crate::renderer::effect::compressor;
     use crate::renderer::effect::delay;
     use crate::renderer::effect::effect_info_base::ParameterState;
@@ -564,7 +565,7 @@ mod tests {
     #[test]
     fn process_does_not_truncate_command_list_to_max_process_time() {
         let system = make_system();
-        let mut samples = vec![123i32; 8];
+        let mut samples = vec![123i32; TARGET_SAMPLE_COUNT as usize * 2];
         let (bytes, stream) = serialize_commands(
             system.clone(),
             &[
@@ -573,7 +574,7 @@ mod tests {
                     name: [0; 0x100],
                     session_id: 0,
                     sample_buffer: samples.as_ptr() as CpuAddr,
-                    sample_count: 4,
+                    sample_count: samples.len() as u64,
                     input_count: 2,
                     inputs: [0, 1, 0, 0, 0, 0],
                 }),
@@ -581,7 +582,7 @@ mod tests {
             1,
             samples.as_mut_ptr() as CpuAddr,
             2,
-            4,
+            TARGET_SAMPLE_COUNT,
         );
 
         let mut processor = CommandListProcessor::default();
@@ -837,14 +838,13 @@ mod tests {
     #[test]
     fn process_downmix_and_device_sink_use_planar_inputs() {
         let system = make_system();
-        let mut mix_buffers = vec![
-            100, 200, 300, 400, // front left
-            10, 20, 30, 40, // front right
-            50, 50, 50, 50, // center
-            0, 0, 0, 0, // lfe
-            25, 25, 25, 25, // back left
-            5, 5, 5, 5, // back right
-        ];
+        let frame_count = TARGET_SAMPLE_COUNT as usize;
+        let mut mix_buffers = vec![0; frame_count * 6];
+        mix_buffers[0..4].copy_from_slice(&[100, 200, 300, 400]);
+        mix_buffers[frame_count..frame_count + 4].copy_from_slice(&[10, 20, 30, 40]);
+        mix_buffers[frame_count * 2..frame_count * 2 + 4].fill(50);
+        mix_buffers[frame_count * 4..frame_count * 4 + 4].fill(25);
+        mix_buffers[frame_count * 5..frame_count * 5 + 4].fill(5);
         let coeff = FixedPoint::<48, 16>::from_f32(1.0).to_raw();
         let (bytes, stream) = serialize_commands(
             system.clone(),
@@ -858,7 +858,7 @@ mod tests {
                     name: [0; 0x100],
                     session_id: 0,
                     sample_buffer: mix_buffers.as_ptr() as CpuAddr,
-                    sample_count: 8,
+                    sample_count: mix_buffers.len() as u64,
                     input_count: 2,
                     inputs: [0, 1, 0, 0, 0, 0],
                 }),
@@ -866,7 +866,7 @@ mod tests {
             1,
             mix_buffers.as_mut_ptr() as CpuAddr,
             6,
-            4,
+            TARGET_SAMPLE_COUNT,
         );
 
         let mut processor = CommandListProcessor::default();
@@ -944,11 +944,10 @@ mod tests {
     #[test]
     fn process_volume_and_mix_commands_modify_mix_buffers_before_device_sink() {
         let system = make_system();
-        let mut mix_buffers = vec![
-            100, 200, 300, 400, // input
-            0, 0, 0, 0, // volume output
-            10, 20, 30, 40, // mix output
-        ];
+        let frame_count = TARGET_SAMPLE_COUNT as usize;
+        let mut mix_buffers = vec![0; frame_count * 3];
+        mix_buffers[0..4].copy_from_slice(&[100, 200, 300, 400]);
+        mix_buffers[frame_count * 2..frame_count * 2 + 4].copy_from_slice(&[10, 20, 30, 40]);
         let (bytes, stream) = serialize_commands(
             system.clone(),
             &[
@@ -968,7 +967,7 @@ mod tests {
                     name: [0; 0x100],
                     session_id: 0,
                     sample_buffer: mix_buffers.as_ptr() as CpuAddr,
-                    sample_count: 12,
+                    sample_count: mix_buffers.len() as u64,
                     input_count: 2,
                     inputs: [1, 2, 0, 0, 0, 0],
                 }),
@@ -976,7 +975,7 @@ mod tests {
             1,
             mix_buffers.as_mut_ptr() as CpuAddr,
             3,
-            4,
+            TARGET_SAMPLE_COUNT,
         );
 
         let mut processor = CommandListProcessor::default();
@@ -997,13 +996,13 @@ mod tests {
     }
 
     #[test]
-    fn process_circular_sink_writes_planar_samples_wraps_ring_position_and_persists_it() {
+    fn process_circular_sink_writes_planar_samples_advances_position_and_persists_it() {
         let system = make_system();
         let mut mix_buffers = vec![
             10, 20, 30, 40, // input 0
             50, 60, 70, 80, // input 1
         ];
-        let mut ring = vec![0x55u8; 12];
+        let mut ring = vec![0x55u8; 16];
 
         let (bytes, stream) = serialize_commands(
             system.clone(),
@@ -1011,7 +1010,7 @@ mod tests {
                 input_count: 1,
                 inputs: [1, 0, 0, 0, 0, 0],
                 address: ring.as_mut_ptr() as CpuAddr,
-                size: ring.len() as u32,
+                size: 12,
                 pos: 8,
             })],
             1,
@@ -1033,7 +1032,7 @@ mod tests {
 
         assert_eq!(
             ring,
-            vec![70, 0, 80, 0, 0x55, 0x55, 0x55, 0x55, 50, 0, 60, 0,]
+            vec![0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 50, 0, 60, 0, 70, 0, 80, 0,]
         );
 
         ring.fill(0x11);
@@ -1050,7 +1049,7 @@ mod tests {
 
         assert_eq!(
             ring,
-            vec![50, 0, 60, 0, 70, 0, 80, 0, 0x11, 0x11, 0x11, 0x11,]
+            vec![50, 0, 60, 0, 70, 0, 80, 0, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11,]
         );
     }
 
@@ -1093,14 +1092,6 @@ mod tests {
                     needs_init: [true, true],
                     filter_tap_count: 2,
                 }),
-                Command::DeviceSink(DeviceSinkCommand {
-                    name: [0; 0x100],
-                    session_id: 0,
-                    sample_buffer: mix_buffers.as_ptr() as CpuAddr,
-                    sample_count: 12,
-                    input_count: 2,
-                    inputs: [1, 2, 0, 0, 0, 0],
-                }),
             ],
             1,
             mix_buffers.as_mut_ptr() as CpuAddr,
@@ -1119,10 +1110,8 @@ mod tests {
         processor.set_process_time_max(u64::MAX);
         let _ = processor.process(0);
 
-        assert_eq!(
-            stream.lock().release_buffer(8),
-            vec![10, 10, 20, 20, 30, 30, 40, 40]
-        );
+        assert_eq!(&mix_buffers[4..8], &[10, 20, 30, 40]);
+        assert_eq!(&mix_buffers[8..12], &[10, 20, 30, 40]);
     }
 
     #[test]
@@ -1141,29 +1130,19 @@ mod tests {
 
         let (bytes, stream) = serialize_commands(
             system.clone(),
-            &[
-                Command::DataSourcePcmInt16Version2(DataSourceCommand {
-                    src_quality: crate::common::common::SrcQuality::Medium,
-                    output_index: 0,
-                    flags: 2,
-                    sample_rate: 48_000,
-                    pitch: 1.0,
-                    channel_index: 0,
-                    channel_count: 1,
-                    wave_buffers,
-                    voice_state: (&mut voice_state as *mut VoiceState) as CpuAddr,
-                    data_address: 0,
-                    data_size: 0,
-                }),
-                Command::DeviceSink(DeviceSinkCommand {
-                    name: [0; 0x100],
-                    session_id: 0,
-                    sample_buffer: mix_buffers.as_ptr() as CpuAddr,
-                    sample_count: 4,
-                    input_count: 1,
-                    inputs: [0, 0, 0, 0, 0, 0],
-                }),
-            ],
+            &[Command::DataSourcePcmInt16Version2(DataSourceCommand {
+                src_quality: crate::common::common::SrcQuality::Medium,
+                output_index: 0,
+                flags: 2,
+                sample_rate: 48_000,
+                pitch: 1.0,
+                channel_index: 0,
+                channel_count: 1,
+                wave_buffers,
+                voice_state: (&mut voice_state as *mut VoiceState) as CpuAddr,
+                data_address: 0,
+                data_size: 0,
+            })],
             1,
             mix_buffers.as_mut_ptr() as CpuAddr,
             1,
@@ -1181,7 +1160,7 @@ mod tests {
         processor.set_process_time_max(u64::MAX);
         let _ = processor.process(0);
 
-        assert_eq!(stream.lock().release_buffer(4), vec![10, 20, 30, 40]);
+        assert_eq!(mix_buffers, vec![10, 20, 30, 40]);
         assert_eq!(voice_state.played_sample_count, 4);
         assert_eq!(voice_state.wave_buffers_consumed, 1);
         assert_eq!(voice_state.offset, 0);
@@ -1203,29 +1182,19 @@ mod tests {
 
         let (bytes, stream) = serialize_commands(
             system.clone(),
-            &[
-                Command::DataSourcePcmFloatVersion2(DataSourceCommand {
-                    src_quality: crate::common::common::SrcQuality::Medium,
-                    output_index: 0,
-                    flags: 2,
-                    sample_rate: 48_000,
-                    pitch: 1.0,
-                    channel_index: 0,
-                    channel_count: 1,
-                    wave_buffers,
-                    voice_state: (&mut voice_state as *mut VoiceState) as CpuAddr,
-                    data_address: 0,
-                    data_size: 0,
-                }),
-                Command::DeviceSink(DeviceSinkCommand {
-                    name: [0; 0x100],
-                    session_id: 0,
-                    sample_buffer: mix_buffers.as_ptr() as CpuAddr,
-                    sample_count: 4,
-                    input_count: 1,
-                    inputs: [0, 0, 0, 0, 0, 0],
-                }),
-            ],
+            &[Command::DataSourcePcmFloatVersion2(DataSourceCommand {
+                src_quality: crate::common::common::SrcQuality::Medium,
+                output_index: 0,
+                flags: 2,
+                sample_rate: 48_000,
+                pitch: 1.0,
+                channel_index: 0,
+                channel_count: 1,
+                wave_buffers,
+                voice_state: (&mut voice_state as *mut VoiceState) as CpuAddr,
+                data_address: 0,
+                data_size: 0,
+            })],
             1,
             mix_buffers.as_mut_ptr() as CpuAddr,
             1,
@@ -1243,10 +1212,7 @@ mod tests {
         processor.set_process_time_max(u64::MAX);
         let _ = processor.process(0);
 
-        assert_eq!(
-            stream.lock().release_buffer(4),
-            vec![0, 16383, -16383, 32767]
-        );
+        assert_eq!(mix_buffers, vec![0, 16383, -16383, 32767]);
         assert_eq!(voice_state.played_sample_count, 4);
         assert_eq!(voice_state.wave_buffers_consumed, 1);
         assert_eq!(voice_state.offset, 0);
@@ -1269,29 +1235,19 @@ mod tests {
 
         let (bytes, stream) = serialize_commands(
             system.clone(),
-            &[
-                Command::DataSourceAdpcmVersion2(DataSourceCommand {
-                    src_quality: crate::common::common::SrcQuality::Medium,
-                    output_index: 0,
-                    flags: 2,
-                    sample_rate: 48_000,
-                    pitch: 1.0,
-                    channel_index: 0,
-                    channel_count: 1,
-                    wave_buffers,
-                    voice_state: (&mut voice_state as *mut VoiceState) as CpuAddr,
-                    data_address: coeffs.as_ptr() as CpuAddr,
-                    data_size: (coeffs.len() * std::mem::size_of::<i16>()) as u64,
-                }),
-                Command::DeviceSink(DeviceSinkCommand {
-                    name: [0; 0x100],
-                    session_id: 0,
-                    sample_buffer: mix_buffers.as_ptr() as CpuAddr,
-                    sample_count: 4,
-                    input_count: 1,
-                    inputs: [0, 0, 0, 0, 0, 0],
-                }),
-            ],
+            &[Command::DataSourceAdpcmVersion2(DataSourceCommand {
+                src_quality: crate::common::common::SrcQuality::Medium,
+                output_index: 0,
+                flags: 2,
+                sample_rate: 48_000,
+                pitch: 1.0,
+                channel_index: 0,
+                channel_count: 1,
+                wave_buffers,
+                voice_state: (&mut voice_state as *mut VoiceState) as CpuAddr,
+                data_address: coeffs.as_ptr() as CpuAddr,
+                data_size: (coeffs.len() * std::mem::size_of::<i16>()) as u64,
+            })],
             1,
             mix_buffers.as_mut_ptr() as CpuAddr,
             1,
@@ -1309,7 +1265,7 @@ mod tests {
         processor.set_process_time_max(u64::MAX);
         let _ = processor.process(0);
 
-        assert_eq!(stream.lock().release_buffer(4), vec![1, 2, 3, 4]);
+        assert_eq!(mix_buffers, vec![1, 2, 3, 4]);
         assert_eq!(voice_state.played_sample_count, 4);
         assert_eq!(voice_state.wave_buffers_consumed, 1);
         assert_eq!(voice_state.offset, 0);
@@ -1362,14 +1318,6 @@ mod tests {
                     decay: FixedPoint::<49, 15>::from_f32(1.0).to_raw(),
                     depop_buffer: depop_buffer.as_mut_ptr() as CpuAddr,
                 }),
-                Command::DeviceSink(DeviceSinkCommand {
-                    name: [0; 0x100],
-                    session_id: 0,
-                    sample_buffer: mix_buffers.as_ptr() as CpuAddr,
-                    sample_count: 8,
-                    input_count: 2,
-                    inputs: [0, 1, 0, 0, 0, 0],
-                }),
             ],
             1,
             mix_buffers.as_mut_ptr() as CpuAddr,
@@ -1392,10 +1340,8 @@ mod tests {
         assert_eq!(previous_samples, vec![0, 0]);
         assert_eq!(depop_buffer[0], 5);
         assert_eq!(depop_buffer[1], -3);
-        assert_eq!(
-            stream.lock().release_buffer(8),
-            vec![5, -3, 11, 22, 30, 47, 61, 72]
-        );
+        assert_eq!(&mix_buffers[0..4], &[5, 11, 30, 61]);
+        assert_eq!(&mix_buffers[4..8], &[-3, 22, 47, 72]);
     }
 
     #[test]
@@ -1444,7 +1390,7 @@ mod tests {
         assert_eq!(&send_buffer[..4], &[10, 20, 30, 40]);
         assert_eq!(&mix_buffers[4..8], &[101, 102, 103, 104]);
         assert_eq!(send_info.write_offset, 4);
-        assert_eq!(send_info.total_sample_count, 4);
+        assert_eq!(send_info.total_sample_count, 0);
         assert_eq!(return_info.read_offset, 4);
     }
 
@@ -1513,7 +1459,7 @@ mod tests {
             9, 8, 7, 6, // input
             0, 0, 0, 0, // unused
         ];
-        let mut send_info = AuxInfoDsp::default();
+        let mut send_info = AuxBufferInfo::default();
         let mut send_buffer = vec![0i32; 8];
 
         let (bytes, stream) = serialize_commands(
@@ -1522,7 +1468,7 @@ mod tests {
                 Command::Capture(CaptureCommand {
                     input: 0,
                     output: 1,
-                    send_buffer_info: (&mut send_info as *mut AuxInfoDsp) as CpuAddr,
+                    send_buffer_info: (&mut send_info as *mut AuxBufferInfo) as CpuAddr,
                     send_buffer: send_buffer.as_mut_ptr() as CpuAddr,
                     count_max: 8,
                     write_offset: 0,
@@ -1532,7 +1478,7 @@ mod tests {
                 Command::Capture(CaptureCommand {
                     input: 0,
                     output: 1,
-                    send_buffer_info: (&mut send_info as *mut AuxInfoDsp) as CpuAddr,
+                    send_buffer_info: (&mut send_info as *mut AuxBufferInfo) as CpuAddr,
                     send_buffer: send_buffer.as_mut_ptr() as CpuAddr,
                     count_max: 8,
                     write_offset: 0,
@@ -1558,9 +1504,12 @@ mod tests {
         let _ = processor.process(0);
 
         assert_eq!(&send_buffer[..4], &[9, 8, 7, 6]);
-        assert_eq!(send_info.read_offset, 0);
-        assert_eq!(send_info.write_offset, 0);
-        assert_eq!(send_info.total_sample_count, 0);
+        assert_eq!(send_info.cpu_info.read_offset, 0);
+        assert_eq!(send_info.cpu_info.write_offset, 0);
+        assert_eq!(send_info.cpu_info.total_sample_count, 0);
+        assert_eq!(send_info.dsp_info.read_offset, 0);
+        assert_eq!(send_info.dsp_info.write_offset, 4);
+        assert_eq!(send_info.dsp_info.total_sample_count, 4);
     }
 
     #[test]
@@ -1691,7 +1640,7 @@ mod tests {
         ];
         let mut state = LightLimiterState::default();
         let mut statistics = StatisticsInternal::default();
-        let mut workbuffer = vec![0.0f32; 4];
+        let mut workbuffer = vec![f32::NAN; 1];
         let parameter = light_limiter::ParameterVersion2 {
             inputs: [0, 0, 0, 0, 0, 0],
             outputs: [1, 1, 1, 1, 1, 1],
@@ -1750,6 +1699,7 @@ mod tests {
         assert!(statistics.channel_compression_gain_min[0] <= 1.0);
         assert!(state.samples_average[0] > 0.0);
         assert!(state.compression_gain[0].is_finite());
+        assert_eq!(workbuffer, [-4000.0]);
     }
 
     #[test]
@@ -1816,12 +1766,14 @@ mod tests {
 
     #[test]
     fn process_delay_enabled_outputs_one_sample_delayed_signal() {
+        use std::mem::ManuallyDrop;
+
         let system = make_system();
         let mut mix_buffers = vec![
             100, 200, 300, 400, // input
             0, 0, 0, 0, // output
         ];
-        let mut state = DelayState::default();
+        let mut state = ManuallyDrop::new(DelayState::default());
         let mut workbuffer = vec![0.0f32; 4];
         let parameter = delay::ParameterVersion2 {
             inputs: [0, 0, 0, 0, 0, 0],
@@ -1846,7 +1798,7 @@ mod tests {
                 inputs: [0, 0, 0, 0, 0, 0],
                 outputs: [1, 1, 1, 1, 1, 1],
                 parameter,
-                state: (&mut state as *mut DelayState) as CpuAddr,
+                state: (&mut *state as *mut DelayState) as CpuAddr,
                 workbuffer: workbuffer.as_mut_ptr() as CpuAddr,
                 effect_enabled: true,
             })],
@@ -1868,8 +1820,13 @@ mod tests {
         let _ = processor.process(0);
 
         assert_eq!(&mix_buffers[4..8], &[0, 100, 200, 300]);
-        assert_eq!(state.delay_lines[0].sample_count, 1);
+        assert_eq!(state.delay_lines[0].sample_count, 0);
+        assert_eq!(state.delay_lines[0].buffer.len(), 1);
         assert_eq!(state.delay_lines[0].buffer_pos, 0);
+
+        crate::renderer::command::effect::delay::drop_delay_state_if_initialized(
+            (&mut *state as *mut DelayState) as CpuAddr,
+        );
     }
 
     #[test]

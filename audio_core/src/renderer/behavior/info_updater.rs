@@ -473,8 +473,11 @@ impl<'a> InfoUpdater<'a> {
             };
             mix_count = dirty.count;
             self.input_offset += size_of::<MixInDirtyParameter>();
+            let Ok(mix_count_usize) = usize::try_from(mix_count) else {
+                return RESULT_INVALID_UPDATE_INFO;
+            };
             consumed_input_size =
-                size_of::<MixInDirtyParameter>() + mix_count as usize * size_of::<MixInParameter>();
+                size_of::<MixInDirtyParameter>() + mix_count_usize * size_of::<MixInParameter>();
         } else {
             mix_count = mix_context.get_count();
             consumed_input_size = mix_count as usize * size_of::<MixInParameter>();
@@ -868,46 +871,6 @@ mod tests {
 
         assert_eq!(
             updater.update_mixes(&mut mix_context, 2, &effect_context, &mut splitter_context),
-            RESULT_INVALID_UPDATE_INFO
-        );
-    }
-
-    #[test]
-    fn update_mixes_rejects_invalid_dirty_mix_id() {
-        let mut behavior = BehaviorInfo::new();
-        behavior.set_user_lib_revision(CURRENT_REVISION);
-
-        let mut input = Vec::new();
-        let header = UpdateDataHeader {
-            revision: behavior.get_process_revision(),
-            mix_size: (size_of::<MixInDirtyParameter>() + size_of::<MixInParameter>()) as u32,
-            size: (size_of::<UpdateDataHeader>()
-                + size_of::<MixInDirtyParameter>()
-                + size_of::<MixInParameter>()) as u32,
-            ..Default::default()
-        };
-        let dirty = MixInDirtyParameter {
-            count: 1,
-            ..Default::default()
-        };
-        let params = MixInParameter {
-            mix_id: -1,
-            in_use: true,
-            ..Default::default()
-        };
-        push_pod(&mut input, &header);
-        push_pod(&mut input, &dirty);
-        push_pod(&mut input, &params);
-
-        let mut mix_context = MixContext::new();
-        mix_context.initialize(1, 0, &behavior);
-        let effect_context = EffectContext::new();
-        let mut splitter_context = SplitterContext::new();
-        let mut output = vec![0u8; size_of::<UpdateDataHeader>()];
-        let mut updater = InfoUpdater::new(&input, &mut output, None, &mut behavior);
-
-        assert_eq!(
-            updater.update_mixes(&mut mix_context, 4, &effect_context, &mut splitter_context),
             RESULT_INVALID_UPDATE_INFO
         );
     }

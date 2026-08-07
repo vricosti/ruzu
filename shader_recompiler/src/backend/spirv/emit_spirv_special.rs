@@ -9,6 +9,7 @@
 
 use super::spirv_emit_context::SpirvEmitContext;
 use crate::ir::types::ShaderStage;
+use crate::ir::Value;
 use rspirv::spirv::Word;
 
 fn output_position(ctx: &SpirvEmitContext) -> Option<Word> {
@@ -44,6 +45,17 @@ fn convert_depth_mode(ctx: &mut SpirvEmitContext) {
     ctx.builder
         .store(position_var, vector, None, vec![])
         .unwrap();
+}
+
+fn set_fixed_pipeline_point_size(ctx: &mut SpirvEmitContext) {
+    if let Some(point_size) = ctx.runtime_info.fixed_state_point_size {
+        if ctx.output_point_size != 0 {
+            let value = ctx.constant_f32(point_size);
+            ctx.builder
+                .store(ctx.output_point_size, value, None, vec![])
+                .unwrap();
+        }
+    }
 }
 
 /// Emit shader prologue.
@@ -85,14 +97,7 @@ pub fn emit_prologue(ctx: &mut SpirvEmitContext) {
         }
     }
     if matches!(ctx.stage, ShaderStage::VertexB | ShaderStage::Geometry) {
-        if let Some(point_size) = ctx.runtime_info.fixed_state_point_size {
-            if ctx.output_point_size != 0 {
-                let value = ctx.constant_f32(point_size);
-                ctx.builder
-                    .store(ctx.output_point_size, value, None, vec![])
-                    .unwrap();
-            }
-        }
+        set_fixed_pipeline_point_size(ctx);
     }
 }
 
@@ -114,13 +119,35 @@ pub fn emit_epilogue(ctx: &mut SpirvEmitContext) {
 /// Emit a geometry shader vertex.
 ///
 /// Matches upstream `EmitEmitVertex(EmitContext&, const IR::Value&)`.
-pub fn emit_emit_vertex(_ctx: &mut SpirvEmitContext, _stream: u32) {
-    log::trace!("SPIR-V: emit_emit_vertex");
+pub fn emit_emit_vertex(ctx: &mut SpirvEmitContext, stream: &Value) {
+    if ctx.runtime_info.convert_depth_mode && !ctx.profile.support_native_ndc {
+        convert_depth_mode(ctx);
+    }
+    if !ctx.profile.support_geometry_streams {
+        panic!("SPIR-V: geometry streams are not supported");
+    }
+    let stream = if stream.is_immediate() {
+        ctx.resolve_value(stream)
+    } else {
+        log::warn!("SPIR-V: geometry stream is not immediate");
+        ctx.const_zero_u32
+    };
+    ctx.builder.emit_stream_vertex(stream).unwrap();
+    set_fixed_pipeline_point_size(ctx);
 }
 
 /// End a geometry shader primitive.
 ///
 /// Matches upstream `EmitEndPrimitive(EmitContext&, const IR::Value&)`.
-pub fn emit_end_primitive(_ctx: &mut SpirvEmitContext, _stream: u32) {
-    log::trace!("SPIR-V: emit_end_primitive");
+pub fn emit_end_primitive(ctx: &mut SpirvEmitContext, stream: &Value) {
+    if !ctx.profile.support_geometry_streams {
+        panic!("SPIR-V: geometry streams are not supported");
+    }
+    let stream = if stream.is_immediate() {
+        ctx.resolve_value(stream)
+    } else {
+        log::warn!("SPIR-V: geometry stream is not immediate");
+        ctx.const_zero_u32
+    };
+    ctx.builder.end_stream_primitive(stream).unwrap();
 }

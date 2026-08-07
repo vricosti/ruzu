@@ -119,6 +119,32 @@ pub fn emit_fp_abs_16(ctx: &mut SpirvEmitContext, value: Word) -> Word {
         .unwrap()
 }
 
+/// FPMin16: `OpExtInst FMin` F16.
+pub fn emit_fp_min_16(ctx: &mut SpirvEmitContext, a: Word, b: Word) -> Word {
+    ctx.builder
+        .ext_inst(
+            ctx.f16_type,
+            None,
+            ctx.glsl_ext,
+            37, /* FMin */
+            vec![rspirv::dr::Operand::IdRef(a), rspirv::dr::Operand::IdRef(b)],
+        )
+        .unwrap()
+}
+
+/// FPMax16: `OpExtInst FMax` F16.
+pub fn emit_fp_max_16(ctx: &mut SpirvEmitContext, a: Word, b: Word) -> Word {
+    ctx.builder
+        .ext_inst(
+            ctx.f16_type,
+            None,
+            ctx.glsl_ext,
+            40, /* FMax */
+            vec![rspirv::dr::Operand::IdRef(a), rspirv::dr::Operand::IdRef(b)],
+        )
+        .unwrap()
+}
+
 /// FPAdd32: `OpFAdd` F32.
 pub fn emit_fp_add_32(ctx: &mut SpirvEmitContext, inst: &Inst, a: Word, b: Word) -> Word {
     let result = ctx.builder.f_add(ctx.f32_type, None, a, b).unwrap();
@@ -600,6 +626,11 @@ pub fn emit_fp_sub_64(ctx: &mut SpirvEmitContext, a: Word, b: Word) -> Word {
     ctx.builder.f_sub(ctx.f64_type, None, a, b).unwrap()
 }
 
+/// FPDiv64: `OpFDiv` F64.
+pub fn emit_fp_div_64(ctx: &mut SpirvEmitContext, a: Word, b: Word) -> Word {
+    ctx.builder.f_div(ctx.f64_type, None, a, b).unwrap()
+}
+
 /// FPMul64: `OpFMul` F64.
 pub fn emit_fp_mul_64(ctx: &mut SpirvEmitContext, inst: &Inst, a: Word, b: Word) -> Word {
     let result = ctx.builder.f_mul(ctx.f64_type, None, a, b).unwrap();
@@ -669,6 +700,38 @@ pub fn emit_fp_max_64(ctx: &mut SpirvEmitContext, a: Word, b: Word) -> Word {
             glsl_set,
             40, /* FMax */
             vec![rspirv::dr::Operand::IdRef(a), rspirv::dr::Operand::IdRef(b)],
+        )
+        .unwrap()
+}
+
+/// FPRecip64: `1.0 / value`.
+pub fn emit_fp_recip_64(ctx: &mut SpirvEmitContext, value: Word) -> Word {
+    let one = ctx.builder.constant_bit64(ctx.f64_type, 1.0f64.to_bits());
+    ctx.builder.f_div(ctx.f64_type, None, one, value).unwrap()
+}
+
+/// FPRecipSqrt64: `GLSL.std.450 InverseSqrt`.
+pub fn emit_fp_recip_sqrt_64(ctx: &mut SpirvEmitContext, value: Word) -> Word {
+    ctx.builder
+        .ext_inst(
+            ctx.f64_type,
+            None,
+            ctx.glsl_ext,
+            32, /* InverseSqrt */
+            vec![rspirv::dr::Operand::IdRef(value)],
+        )
+        .unwrap()
+}
+
+/// FPSqrt64: `GLSL.std.450 Sqrt`.
+pub fn emit_fp_sqrt_64(ctx: &mut SpirvEmitContext, value: Word) -> Word {
+    ctx.builder
+        .ext_inst(
+            ctx.f64_type,
+            None,
+            ctx.glsl_ext,
+            31, /* Sqrt */
+            vec![rspirv::dr::Operand::IdRef(value)],
         )
         .unwrap()
 }

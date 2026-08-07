@@ -20,6 +20,20 @@ pub fn emit_select_u1(
         .unwrap()
 }
 
+/// Emit `OpSelect` for U16 result.
+///
+/// Matches upstream `EmitSelectU16(EmitContext&, Id, Id, Id)`.
+pub fn emit_select_u16(
+    ctx: &mut SpirvEmitContext,
+    cond: Word,
+    true_val: Word,
+    false_val: Word,
+) -> Word {
+    ctx.builder
+        .select(ctx.u16_type, None, cond, true_val, false_val)
+        .unwrap()
+}
+
 /// Emit `OpSelect` for U32 result.
 ///
 /// Matches upstream `EmitSelectU32(EmitContext&, Id, Id, Id)`.

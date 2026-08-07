@@ -987,15 +987,16 @@ impl<'a> CommandGenerator<'a> {
                 break;
             }
 
-            let Some(mut effect_info) = self
-                .effect_context
-                .update_info_for_command_generation(effect_index as usize)
-            else {
-                continue;
+            let mut effect_info = {
+                let Some(source) = self.effect_context.get_info_mut(effect_index as u32) else {
+                    continue;
+                };
+                if source.should_skip() {
+                    continue;
+                }
+                source.refresh_runtime_addresses();
+                source.clone()
             };
-            if effect_info.should_skip() {
-                continue;
-            }
 
             let detail_type = match effect_info.get_type() {
                 EffectType::Invalid => PerformanceDetailType::Invalid,
@@ -1019,6 +1020,9 @@ impl<'a> CommandGenerator<'a> {
             self.push_effect_commands(mix_info, effect_index as usize, &mut effect_info);
             if let Some(addresses) = detail_aspect {
                 self.end_performance(mix_info.node_id, addresses);
+            }
+            if let Some(source) = self.effect_context.get_info_mut(effect_index as u32) {
+                source.update_for_command_generation();
             }
         }
     }

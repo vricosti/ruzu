@@ -253,7 +253,7 @@ mod tests {
     #[test]
     fn release_buffers_writes_audio_in_samples_before_releasing_tag() {
         let system = make_system();
-        let sink = new_sink_handle(Box::new(NullSink::new("null")));
+        let sink = new_sink_handle(Box::new(NullSink::new_recording_for_test("null")));
         let guest_memory = make_guest_memory();
         let mut session = DeviceSession::new(system.clone());
         session.initialize(

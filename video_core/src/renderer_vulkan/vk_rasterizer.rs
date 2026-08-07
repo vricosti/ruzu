@@ -553,6 +553,9 @@ pub struct RasterizerVulkan {
     instance: ash::Instance,
     physical_device: vk::PhysicalDevice,
     syncpoints: Arc<SyncpointManager>,
+    /// Shared owner counterpart of upstream
+    /// `Tegra::MaxwellDeviceMemoryManager& device_memory`.
+    device_memory: Arc<MaxwellDeviceMemoryManager>,
     channel_caches: ChannelSetupCaches<ChannelInfo>,
 
     // Sub-components (matching zuyu's architecture)
@@ -913,7 +916,7 @@ impl RasterizerVulkan {
             device.clone(),
             instance.clone(),
             physical_device,
-            device_memory,
+            Arc::clone(&device_memory),
             scheduler,
             &mut *memory_allocator,
             staging_pool.as_mut(),
@@ -989,6 +992,7 @@ impl RasterizerVulkan {
             instance,
             physical_device,
             syncpoints,
+            device_memory,
             channel_caches: ChannelSetupCaches::new(),
             scheduler: OwnerReference::new(scheduler),
             memory_allocator: NonNull::from(&mut *memory_allocator),

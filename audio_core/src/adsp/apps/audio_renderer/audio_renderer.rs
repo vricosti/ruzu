@@ -652,7 +652,7 @@ mod tests {
     #[test]
     fn wait_clears_stream_queue_when_command_buffer_requests_reset() {
         let system = make_system();
-        let sink = new_sink_handle(Box::new(NullSink::new("test")));
+        let sink = new_sink_handle(Box::new(NullSink::new_recording_for_test("test")));
         let mut renderer = AudioRenderer::new(system, sink);
         renderer.start();
         let mut mix_buffer = vec![7i32; 4];
@@ -776,12 +776,14 @@ mod tests {
 
     #[test]
     fn wait_processes_full_command_list_even_with_small_time_limit() {
+        use crate::common::common::TARGET_SAMPLE_COUNT;
+
         let system = make_system();
         let sink = new_sink_handle(Box::new(NullSink::new("test")));
         let mut renderer = AudioRenderer::new(system.clone(), sink);
         renderer.start();
 
-        let mut sample_buffer = vec![7i32; 4];
+        let mut sample_buffer = vec![7i32; TARGET_SAMPLE_COUNT as usize * 2];
         let bytes = serialize_commands(
             &[
                 Command::ClearMixBuffer(ClearMixBufferCommand { buffer_count: 2 }),
@@ -789,14 +791,14 @@ mod tests {
                     name: [0; 0x100],
                     session_id: 0,
                     sample_buffer: sample_buffer.as_ptr() as usize,
-                    sample_count: 4,
+                    sample_count: sample_buffer.len() as u64,
                     input_count: 2,
                     inputs: [0, 1, 0, 0, 0, 0],
                 }),
             ],
             1,
             sample_buffer.as_mut_ptr() as usize,
-            2,
+            TARGET_SAMPLE_COUNT,
         );
         let written = bytes.len();
 
@@ -816,24 +818,26 @@ mod tests {
 
     #[test]
     fn stop_wakes_wait_free_space_and_joins_renderer_thread() {
+        use crate::common::common::TARGET_SAMPLE_COUNT;
+
         let system = make_system();
         let sink = new_sink_handle(Box::new(NullSink::new("test")));
         let mut renderer = AudioRenderer::new(system, sink);
         renderer.start();
 
-        let mut sample_buffer = vec![7i32; 4];
+        let mut sample_buffer = vec![7i32; TARGET_SAMPLE_COUNT as usize * 2];
         let bytes = serialize_commands(
             &[Command::DeviceSink(DeviceSinkCommand {
                 name: [0; 0x100],
                 session_id: 0,
                 sample_buffer: sample_buffer.as_ptr() as usize,
-                sample_count: 4,
+                sample_count: sample_buffer.len() as u64,
                 input_count: 2,
                 inputs: [0, 1, 0, 0, 0, 0],
             })],
             1,
             sample_buffer.as_mut_ptr() as usize,
-            2,
+            TARGET_SAMPLE_COUNT,
         );
 
         let stream = renderer.shared.lock().streams[0].as_ref().unwrap().clone();

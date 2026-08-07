@@ -3840,6 +3840,18 @@ impl SpirvEmitContext {
                 let id = super::emit_spirv_floating_point::emit_fp_abs_16(self, value);
                 self.set_value(block_idx, inst_idx, id);
             }
+            Opcode::FPMin16 => {
+                let a = self.resolve_value(inst.arg(0));
+                let b = self.resolve_value(inst.arg(1));
+                let id = super::emit_spirv_floating_point::emit_fp_min_16(self, a, b);
+                self.set_value(block_idx, inst_idx, id);
+            }
+            Opcode::FPMax16 => {
+                let a = self.resolve_value(inst.arg(0));
+                let b = self.resolve_value(inst.arg(1));
+                let id = super::emit_spirv_floating_point::emit_fp_max_16(self, a, b);
+                self.set_value(block_idx, inst_idx, id);
+            }
             Opcode::FPSaturate16 => {
                 let value = self.resolve_value(inst.arg(0));
                 let id = super::emit_spirv_floating_point::emit_fp_saturate_16(self, value);
@@ -4004,10 +4016,22 @@ impl SpirvEmitContext {
                 let id = super::emit_spirv_floating_point::emit_fp_add_64(self, inst, a, b);
                 self.set_value(block_idx, inst_idx, id);
             }
+            Opcode::FPSub64 => {
+                let a = self.resolve_value(inst.arg(0));
+                let b = self.resolve_value(inst.arg(1));
+                let id = super::emit_spirv_floating_point::emit_fp_sub_64(self, a, b);
+                self.set_value(block_idx, inst_idx, id);
+            }
             Opcode::FPMul64 => {
                 let a = self.resolve_value(inst.arg(0));
                 let b = self.resolve_value(inst.arg(1));
                 let id = super::emit_spirv_floating_point::emit_fp_mul_64(self, inst, a, b);
+                self.set_value(block_idx, inst_idx, id);
+            }
+            Opcode::FPDiv64 => {
+                let a = self.resolve_value(inst.arg(0));
+                let b = self.resolve_value(inst.arg(1));
+                let id = super::emit_spirv_floating_point::emit_fp_div_64(self, a, b);
                 self.set_value(block_idx, inst_idx, id);
             }
             Opcode::FPFma64 => {
@@ -4037,6 +4061,21 @@ impl SpirvEmitContext {
                 let a = self.resolve_value(inst.arg(0));
                 let b = self.resolve_value(inst.arg(1));
                 let id = super::emit_spirv_floating_point::emit_fp_max_64(self, a, b);
+                self.set_value(block_idx, inst_idx, id);
+            }
+            Opcode::FPRecip64 => {
+                let value = self.resolve_value(inst.arg(0));
+                let id = super::emit_spirv_floating_point::emit_fp_recip_64(self, value);
+                self.set_value(block_idx, inst_idx, id);
+            }
+            Opcode::FPRecipSqrt64 => {
+                let value = self.resolve_value(inst.arg(0));
+                let id = super::emit_spirv_floating_point::emit_fp_recip_sqrt_64(self, value);
+                self.set_value(block_idx, inst_idx, id);
+            }
+            Opcode::FPSqrt64 => {
+                let value = self.resolve_value(inst.arg(0));
+                let id = super::emit_spirv_floating_point::emit_fp_sqrt_64(self, value);
                 self.set_value(block_idx, inst_idx, id);
             }
             Opcode::FPSaturate64 => {
@@ -4244,10 +4283,22 @@ impl SpirvEmitContext {
                 let id = super::emit_spirv_integer::emit_iadd_32(self, inst, a, b);
                 self.set_value(block_idx, inst_idx, id);
             }
+            Opcode::IAdd64 => {
+                let a = self.resolve_value(inst.arg(0));
+                let b = self.resolve_value(inst.arg(1));
+                let id = super::emit_spirv_integer::emit_iadd_64(self, a, b);
+                self.set_value(block_idx, inst_idx, id);
+            }
             Opcode::ISub32 => {
                 let a = self.resolve_value(inst.arg(0));
                 let b = self.resolve_value(inst.arg(1));
                 let id = super::emit_spirv_integer::emit_isub_32(self, a, b);
+                self.set_value(block_idx, inst_idx, id);
+            }
+            Opcode::ISub64 => {
+                let a = self.resolve_value(inst.arg(0));
+                let b = self.resolve_value(inst.arg(1));
+                let id = super::emit_spirv_integer::emit_isub_64(self, a, b);
                 self.set_value(block_idx, inst_idx, id);
             }
             Opcode::IMul32 => {
@@ -4282,16 +4333,34 @@ impl SpirvEmitContext {
                 let id = super::emit_spirv_integer::emit_shift_left_logical_32(self, a, b);
                 self.set_value(block_idx, inst_idx, id);
             }
+            Opcode::ShiftLeftLogical64 => {
+                let a = self.resolve_value(inst.arg(0));
+                let b = self.resolve_value(inst.arg(1));
+                let id = super::emit_spirv_integer::emit_shift_left_logical_64(self, a, b);
+                self.set_value(block_idx, inst_idx, id);
+            }
             Opcode::ShiftRightLogical32 => {
                 let a = self.resolve_value(inst.arg(0));
                 let b = self.resolve_value(inst.arg(1));
                 let id = super::emit_spirv_integer::emit_shift_right_logical_32(self, a, b);
                 self.set_value(block_idx, inst_idx, id);
             }
+            Opcode::ShiftRightLogical64 => {
+                let a = self.resolve_value(inst.arg(0));
+                let b = self.resolve_value(inst.arg(1));
+                let id = super::emit_spirv_integer::emit_shift_right_logical_64(self, a, b);
+                self.set_value(block_idx, inst_idx, id);
+            }
             Opcode::ShiftRightArithmetic32 => {
                 let a = self.resolve_value(inst.arg(0));
                 let b = self.resolve_value(inst.arg(1));
                 let id = super::emit_spirv_integer::emit_shift_right_arithmetic_32(self, a, b);
+                self.set_value(block_idx, inst_idx, id);
+            }
+            Opcode::ShiftRightArithmetic64 => {
+                let a = self.resolve_value(inst.arg(0));
+                let b = self.resolve_value(inst.arg(1));
+                let id = super::emit_spirv_integer::emit_shift_right_arithmetic_64(self, a, b);
                 self.set_value(block_idx, inst_idx, id);
             }
             Opcode::BitwiseAnd32 => {
@@ -4348,6 +4417,11 @@ impl SpirvEmitContext {
             Opcode::BitCount32 => {
                 let a = self.resolve_value(inst.arg(0));
                 let id = super::emit_spirv_integer::emit_bit_count_32(self, a);
+                self.set_value(block_idx, inst_idx, id);
+            }
+            Opcode::BitReverse32 => {
+                let value = self.resolve_value(inst.arg(0));
+                let id = super::emit_spirv_integer::emit_bit_reverse_32(self, value);
                 self.set_value(block_idx, inst_idx, id);
             }
             Opcode::FindSMsb32 => {
@@ -4494,6 +4568,13 @@ impl SpirvEmitContext {
                 let id = super::emit_spirv_select::emit_select_u32(self, cond, t, f);
                 self.set_value(block_idx, inst_idx, id);
             }
+            Opcode::SelectU16 => {
+                let cond = self.resolve_value(inst.arg(0));
+                let t = self.resolve_value(inst.arg(1));
+                let f = self.resolve_value(inst.arg(2));
+                let id = super::emit_spirv_select::emit_select_u16(self, cond, t, f);
+                self.set_value(block_idx, inst_idx, id);
+            }
             Opcode::SelectU64 => {
                 let cond = self.resolve_value(inst.arg(0));
                 let t = self.resolve_value(inst.arg(1));
@@ -4619,6 +4700,16 @@ impl SpirvEmitContext {
             Opcode::ConvertU64F64 => {
                 let value = self.resolve_value(inst.arg(0));
                 let id = super::emit_spirv_convert::emit_convert_u64_f64(self, value);
+                self.set_value(block_idx, inst_idx, id);
+            }
+            Opcode::ConvertU64U32 => {
+                let value = self.resolve_value(inst.arg(0));
+                let id = super::emit_spirv_convert::emit_convert_u64_u32(self, value);
+                self.set_value(block_idx, inst_idx, id);
+            }
+            Opcode::ConvertU32U64 => {
+                let value = self.resolve_value(inst.arg(0));
+                let id = super::emit_spirv_convert::emit_convert_u32_u64(self, value);
                 self.set_value(block_idx, inst_idx, id);
             }
             Opcode::ConvertF16F32 => {
@@ -5106,6 +5197,14 @@ impl SpirvEmitContext {
             Opcode::ImageQueryDimensions => {
                 super::emit_spirv_image::emit_image_query(self, inst, block_idx, inst_idx);
             }
+            Opcode::ImageQueryLod => {
+                super::emit_spirv_image::emit_image_query_lod(self, inst, block_idx, inst_idx);
+            }
+            Opcode::ImageGradient => {
+                super::emit_spirv_image::emit_image_gradient_inst(
+                    self, program, inst, block_idx, inst_idx,
+                );
+            }
             Opcode::ImageGather | Opcode::ImageGatherDref => {
                 super::emit_spirv_image::emit_image_gather_inst(
                     self, program, inst, block_idx, inst_idx,
@@ -5387,6 +5486,12 @@ impl SpirvEmitContext {
             Opcode::Barrier => {
                 super::emit_spirv_barriers::emit_barrier(self);
             }
+            Opcode::WorkgroupMemoryBarrier => {
+                super::emit_spirv_barriers::emit_workgroup_memory_barrier(self);
+            }
+            Opcode::DeviceMemoryBarrier => {
+                super::emit_spirv_barriers::emit_device_memory_barrier(self);
+            }
 
             // ── Register/predicate access — these are handled during
             //    SSA construction and don't emit SPIR-V directly ───────
@@ -5429,6 +5534,12 @@ impl SpirvEmitContext {
             }
             Opcode::Epilogue => {
                 super::emit_spirv_special::emit_epilogue(self);
+            }
+            Opcode::EmitVertex => {
+                super::emit_spirv_special::emit_emit_vertex(self, inst.arg(0));
+            }
+            Opcode::EndPrimitive => {
+                super::emit_spirv_special::emit_end_primitive(self, inst.arg(0));
             }
             Opcode::GetRegister
             | Opcode::SetRegister
@@ -5513,9 +5624,102 @@ impl SpirvEmitContext {
                 self.set_value(block_idx, inst_idx, id);
             }
 
-            // Everything else — skip with a trace
-            _ => {
-                log::trace!("SPIR-V: unhandled opcode {:?}", inst.opcode);
+            // These opcodes must have been rewritten by the texture pass.
+            // Their upstream emitters throw `LogicError("Unreachable instruction")`.
+            Opcode::BindlessImageSampleImplicitLod
+            | Opcode::BindlessImageSampleExplicitLod
+            | Opcode::BindlessImageSampleDrefImplicitLod
+            | Opcode::BindlessImageSampleDrefExplicitLod
+            | Opcode::BindlessImageGather
+            | Opcode::BindlessImageGatherDref
+            | Opcode::BindlessImageFetch
+            | Opcode::BindlessImageQueryDimensions
+            | Opcode::BindlessImageQueryLod
+            | Opcode::BindlessImageGradient
+            | Opcode::BoundImageSampleImplicitLod
+            | Opcode::BoundImageSampleExplicitLod
+            | Opcode::BoundImageSampleDrefImplicitLod
+            | Opcode::BoundImageSampleDrefExplicitLod
+            | Opcode::BoundImageGather
+            | Opcode::BoundImageGatherDref
+            | Opcode::BoundImageFetch
+            | Opcode::BoundImageQueryDimensions
+            | Opcode::BoundImageQueryLod
+            | Opcode::BoundImageGradient => {
+                panic!(
+                    "SPIR-V: image opcode {:?} reached the backend before indexing",
+                    inst.opcode
+                );
+            }
+
+            // Upstream declares these opcodes but its SPIR-V emitters throw
+            // `NotImplementedException` rather than silently omitting them.
+            Opcode::BitCastU16F16
+            | Opcode::BitCastU64F64
+            | Opcode::BitCastF16U16
+            | Opcode::BitCastF64U64
+            | Opcode::CompositeConstructF64x2
+            | Opcode::CompositeConstructF64x3
+            | Opcode::CompositeConstructF64x4
+            | Opcode::CompositeExtractF64x2
+            | Opcode::CompositeExtractF64x3
+            | Opcode::CompositeExtractF64x4
+            | Opcode::SelectU8
+            | Opcode::GlobalAtomicIAdd32
+            | Opcode::GlobalAtomicSMin32
+            | Opcode::GlobalAtomicUMin32
+            | Opcode::GlobalAtomicSMax32
+            | Opcode::GlobalAtomicUMax32
+            | Opcode::GlobalAtomicInc32
+            | Opcode::GlobalAtomicDec32
+            | Opcode::GlobalAtomicAnd32
+            | Opcode::GlobalAtomicOr32
+            | Opcode::GlobalAtomicXor32
+            | Opcode::GlobalAtomicExchange32
+            | Opcode::GlobalAtomicIAdd64
+            | Opcode::GlobalAtomicSMin64
+            | Opcode::GlobalAtomicUMin64
+            | Opcode::GlobalAtomicSMax64
+            | Opcode::GlobalAtomicUMax64
+            | Opcode::GlobalAtomicAnd64
+            | Opcode::GlobalAtomicOr64
+            | Opcode::GlobalAtomicXor64
+            | Opcode::GlobalAtomicExchange64
+            | Opcode::GlobalAtomicIAdd32x2
+            | Opcode::GlobalAtomicSMin32x2
+            | Opcode::GlobalAtomicUMin32x2
+            | Opcode::GlobalAtomicSMax32x2
+            | Opcode::GlobalAtomicUMax32x2
+            | Opcode::GlobalAtomicAnd32x2
+            | Opcode::GlobalAtomicOr32x2
+            | Opcode::GlobalAtomicXor32x2
+            | Opcode::GlobalAtomicExchange32x2
+            | Opcode::GlobalAtomicAddF32
+            | Opcode::GlobalAtomicAddF16x2
+            | Opcode::GlobalAtomicAddF32x2
+            | Opcode::GlobalAtomicMinF16x2
+            | Opcode::GlobalAtomicMinF32x2
+            | Opcode::GlobalAtomicMaxF16x2
+            | Opcode::GlobalAtomicMaxF32x2 => {
+                panic!(
+                    "SPIR-V: opcode {:?} is not implemented upstream",
+                    inst.opcode
+                );
+            }
+
+            // Structured control flow is emitted from `Program::syntax_list`,
+            // matching upstream's `Traverse`; these Rust-only marker opcodes
+            // are invalid inside a basic block.
+            Opcode::Branch
+            | Opcode::BranchConditional
+            | Opcode::LoopMerge
+            | Opcode::SelectionMerge
+            | Opcode::Return
+            | Opcode::Unreachable => {
+                panic!(
+                    "SPIR-V: control-flow marker {:?} reached instruction emission",
+                    inst.opcode
+                );
             }
         }
     }

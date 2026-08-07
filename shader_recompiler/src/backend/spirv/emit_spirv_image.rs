@@ -94,24 +94,6 @@ pub fn emit_image_query_dimensions(ctx: &mut SpirvEmitContext, _handle: Word, _l
     ctx.builder.undef(ctx.u32_vec4_type, None)
 }
 
-/// Emit ImageQueryLod (TMML).
-pub fn emit_image_query_lod(ctx: &mut SpirvEmitContext, _handle: Word, _coords: Word) -> Word {
-    log::trace!("SPIR-V: emit_image_query_lod");
-    ctx.builder.undef(ctx.f32_vec2_type, None)
-}
-
-/// Emit ImageGradient (TXD — explicit gradients).
-pub fn emit_image_gradient(
-    ctx: &mut SpirvEmitContext,
-    _handle: Word,
-    _coords: Word,
-    _dpdx: Word,
-    _dpdy: Word,
-) -> Word {
-    log::trace!("SPIR-V: emit_image_gradient");
-    ctx.builder.undef(ctx.f32_vec4_type, None)
-}
-
 // ── IR-instruction dispatching helpers (called from spirv_emit_context) ───
 
 use crate::ir::program::Program;
@@ -278,9 +260,96 @@ impl ImageOperands {
         operands
     }
 
+    fn for_gradient(
+        ctx: &mut SpirvEmitContext,
+        program: &Program,
+        info: TextureInstInfo,
+        derivatives: Word,
+        second_derivatives_or_offset: Value,
+        lod_clamp: Value,
+    ) -> Self {
+        let mut operands = Self::default();
+        let (derivatives_x, derivatives_y, offset) = if info.num_derivatives == 3 {
+            let second_derivatives = ctx.resolve_value(&second_derivatives_or_offset);
+            let derivatives_x = [
+                ctx.builder
+                    .composite_extract(ctx.f32_type, None, derivatives, vec![0])
+                    .unwrap(),
+                ctx.builder
+                    .composite_extract(ctx.f32_type, None, derivatives, vec![2])
+                    .unwrap(),
+                ctx.builder
+                    .composite_extract(ctx.f32_type, None, second_derivatives, vec![0])
+                    .unwrap(),
+            ];
+            let derivatives_y = [
+                ctx.builder
+                    .composite_extract(ctx.f32_type, None, derivatives, vec![1])
+                    .unwrap(),
+                ctx.builder
+                    .composite_extract(ctx.f32_type, None, derivatives, vec![3])
+                    .unwrap(),
+                ctx.builder
+                    .composite_extract(ctx.f32_type, None, second_derivatives, vec![1])
+                    .unwrap(),
+            ];
+            let derivatives_x = ctx
+                .builder
+                .composite_construct(ctx.f32_vec3_type, None, derivatives_x)
+                .unwrap();
+            let derivatives_y = ctx
+                .builder
+                .composite_construct(ctx.f32_vec3_type, None, derivatives_y)
+                .unwrap();
+            (derivatives_x, derivatives_y, Value::Void)
+        } else {
+            let count = info.num_derivatives as usize;
+            assert!((1..=2).contains(&count), "SPIR-V: invalid derivative count");
+            let mut derivatives_x = Vec::with_capacity(count);
+            let mut derivatives_y = Vec::with_capacity(count);
+            for index in 0..count as u32 {
+                derivatives_x.push(
+                    ctx.builder
+                        .composite_extract(ctx.f32_type, None, derivatives, vec![index * 2])
+                        .unwrap(),
+                );
+                derivatives_y.push(
+                    ctx.builder
+                        .composite_extract(ctx.f32_type, None, derivatives, vec![index * 2 + 1])
+                        .unwrap(),
+                );
+            }
+            let (derivatives_x, derivatives_y) = if count == 1 {
+                (derivatives_x[0], derivatives_y[0])
+            } else {
+                (
+                    ctx.builder
+                        .composite_construct(ctx.f32_vec2_type, None, derivatives_x)
+                        .unwrap(),
+                    ctx.builder
+                        .composite_construct(ctx.f32_vec2_type, None, derivatives_y)
+                        .unwrap(),
+                )
+            };
+            (derivatives_x, derivatives_y, second_derivatives_or_offset)
+        };
+        operands.add_pair(spirv::ImageOperands::GRAD, derivatives_x, derivatives_y);
+        operands.add_offset(ctx, program, offset, false);
+        if info.has_lod_clamp {
+            operands.add(spirv::ImageOperands::MIN_LOD, ctx.resolve_value(&lod_clamp));
+        }
+        operands
+    }
+
     fn add(&mut self, mask: spirv::ImageOperands, value: Word) {
         self.mask |= mask;
         self.operands.push(Operand::IdRef(value));
+    }
+
+    fn add_pair(&mut self, mask: spirv::ImageOperands, first: Word, second: Word) {
+        self.mask |= mask;
+        self.operands.push(Operand::IdRef(first));
+        self.operands.push(Operand::IdRef(second));
     }
 
     fn mask_optional(&self) -> Option<spirv::ImageOperands> {
@@ -814,6 +883,91 @@ pub fn emit_image_query(
     ctx.set_value(block_idx, inst_idx, id);
 }
 
+/// Port of upstream `EmitImageQueryLod` (TMML).
+pub fn emit_image_query_lod(
+    ctx: &mut SpirvEmitContext,
+    inst: &ir::Inst,
+    block_idx: u32,
+    inst_idx: u32,
+) {
+    let info = TextureInstInfo::from_u32(inst.flags);
+    let coords = ctx.resolve_value(inst.arg(1));
+    let sampler = texture(ctx, info, *inst.arg(0));
+    let lod = ctx
+        .builder
+        .image_query_lod(ctx.f32_vec2_type, None, sampler, coords)
+        .unwrap();
+    let id = ctx
+        .builder
+        .composite_construct(
+            ctx.f32_vec4_type,
+            None,
+            vec![lod, ctx.const_zero_f32, ctx.const_zero_f32],
+        )
+        .unwrap();
+    ctx.set_value(block_idx, inst_idx, id);
+}
+
+/// Port of upstream `EmitImageGradient` (TXD).
+pub fn emit_image_gradient_inst(
+    ctx: &mut SpirvEmitContext,
+    program: &Program,
+    inst: &ir::Inst,
+    block_idx: u32,
+    inst_idx: u32,
+) {
+    let info = TextureInstInfo::from_u32(inst.flags);
+    let coords = ctx.resolve_value(inst.arg(1));
+    let derivatives = ctx.resolve_value(inst.arg(2));
+    let operands =
+        ImageOperands::for_gradient(ctx, program, info, derivatives, *inst.arg(3), *inst.arg(4));
+    let sampler = texture(ctx, info, *inst.arg(0));
+    let sparse = inst.get_associated_pseudo(Opcode::GetSparseFromOp);
+    let id = if let Some(sparse_ref) = sparse {
+        let result_type = ctx
+            .builder
+            .type_struct(vec![ctx.u32_type, ctx.f32_vec4_type]);
+        let sample = ctx
+            .builder
+            .image_sparse_sample_explicit_lod(
+                result_type,
+                None,
+                sampler,
+                coords,
+                operands.mask,
+                operands.operands,
+            )
+            .unwrap();
+        let sample = decorate_sample(ctx, info, sample);
+        let resident_code = ctx
+            .builder
+            .composite_extract(ctx.u32_type, None, sample, vec![0])
+            .unwrap();
+        let resident = ctx
+            .builder
+            .image_sparse_texels_resident(ctx.bool_type, None, resident_code)
+            .unwrap();
+        ctx.set_value(sparse_ref.block, sparse_ref.inst, resident);
+        ctx.builder
+            .composite_extract(ctx.f32_vec4_type, None, sample, vec![1])
+            .unwrap()
+    } else {
+        let sample = ctx
+            .builder
+            .image_sample_explicit_lod(
+                ctx.f32_vec4_type,
+                None,
+                sampler,
+                coords,
+                operands.mask,
+                operands.operands,
+            )
+            .unwrap();
+        decorate_sample(ctx, info, sample)
+    };
+    ctx.set_value(block_idx, inst_idx, id);
+}
+
 /// Dispatch ImageGather / ImageGatherDref IR instructions.
 pub fn emit_image_gather_inst(
     ctx: &mut SpirvEmitContext,
@@ -1167,6 +1321,169 @@ mod tests {
         let profile = Profile::default();
         let runtime_info = RuntimeInfo::default();
         let mut ctx = SpirvEmitContext::new(&program, &profile, &runtime_info);
+        ctx.emit_program(&program);
+    }
+
+    #[test]
+    fn image_query_lod_defines_vec4_result_for_component_extract() {
+        let mut program = Program::new(ShaderStage::Fragment);
+        program.info.texture_descriptors.push(TextureDescriptor {
+            texture_type: TextureType::Color2D,
+            is_depth: false,
+            is_multisample: false,
+            has_secondary: false,
+            cbuf_index: 0,
+            cbuf_offset: 0,
+            shift_left: 0,
+            secondary_cbuf_index: 0,
+            secondary_cbuf_offset: 0,
+            secondary_shift_left: 0,
+            count: 1,
+            size_shift: 0,
+        });
+        let info = TextureInstInfo {
+            descriptor_index: 0,
+            texture_type: TextureType::Color2D as u8,
+            ..TextureInstInfo::default()
+        };
+        program.blocks.push(Block::new());
+        let block = program.block_mut(0);
+        let coords = block.append_inst(Inst::new(
+            Opcode::CompositeConstructF32x2,
+            vec![Value::ImmF32(0.25), Value::ImmF32(0.75)],
+        ));
+        let query = block.append_inst(Inst::with_flags(
+            Opcode::ImageQueryLod,
+            vec![
+                Value::Void,
+                Value::Inst(InstRef {
+                    block: 0,
+                    inst: coords,
+                }),
+            ],
+            info.to_u32(),
+        ));
+        block.append_inst(Inst::new(
+            Opcode::CompositeExtractF32x4,
+            vec![
+                Value::Inst(InstRef {
+                    block: 0,
+                    inst: query,
+                }),
+                Value::ImmU32(0),
+            ],
+        ));
+        program.syntax_list = vec![SyntaxNode::Block(0), SyntaxNode::Return];
+
+        let profile = Profile::default();
+        let runtime_info = RuntimeInfo::default();
+        let mut ctx = SpirvEmitContext::new(&program, &profile, &runtime_info);
+        ctx.emit_program(&program);
+
+        let opcodes = ctx
+            .builder
+            .module_ref()
+            .functions
+            .iter()
+            .flat_map(|function| function.blocks.iter())
+            .flat_map(|block| block.instructions.iter())
+            .map(|inst| inst.class.opcode)
+            .collect::<Vec<_>>();
+        assert!(opcodes.contains(&spirv::Op::ImageQueryLod));
+        assert!(opcodes.contains(&spirv::Op::CompositeConstruct));
+        assert!(opcodes.contains(&spirv::Op::CompositeExtract));
+        validate_with_external_tool(ctx, "image-query-lod");
+    }
+
+    #[test]
+    fn image_gradient_emits_explicit_lod_with_grad_operands() {
+        let mut program = Program::new(ShaderStage::Fragment);
+        program.info.texture_descriptors.push(TextureDescriptor {
+            texture_type: TextureType::Color2D,
+            is_depth: false,
+            is_multisample: false,
+            has_secondary: false,
+            cbuf_index: 0,
+            cbuf_offset: 0,
+            shift_left: 0,
+            secondary_cbuf_index: 0,
+            secondary_cbuf_offset: 0,
+            secondary_shift_left: 0,
+            count: 1,
+            size_shift: 0,
+        });
+        let info = TextureInstInfo {
+            descriptor_index: 0,
+            texture_type: TextureType::Color2D as u8,
+            num_derivatives: 2,
+            ..TextureInstInfo::default()
+        };
+        program.blocks.push(Block::new());
+        let block = program.block_mut(0);
+        let coords = block.append_inst(Inst::new(
+            Opcode::CompositeConstructF32x2,
+            vec![Value::ImmF32(0.25), Value::ImmF32(0.75)],
+        ));
+        let derivatives = block.append_inst(Inst::new(
+            Opcode::CompositeConstructF32x4,
+            vec![
+                Value::ImmF32(0.125),
+                Value::ImmF32(0.0),
+                Value::ImmF32(0.0),
+                Value::ImmF32(0.125),
+            ],
+        ));
+        block.append_inst(Inst::with_flags(
+            Opcode::ImageGradient,
+            vec![
+                Value::Void,
+                Value::Inst(InstRef {
+                    block: 0,
+                    inst: coords,
+                }),
+                Value::Inst(InstRef {
+                    block: 0,
+                    inst: derivatives,
+                }),
+                Value::Void,
+                Value::Void,
+            ],
+            info.to_u32(),
+        ));
+        program.syntax_list = vec![SyntaxNode::Block(0), SyntaxNode::Return];
+
+        let mut ctx = SpirvEmitContext::new(&program, &Profile::default(), &RuntimeInfo::default());
+        ctx.emit_program(&program);
+
+        let gradient = ctx
+            .builder
+            .module_ref()
+            .functions
+            .iter()
+            .flat_map(|function| function.blocks.iter())
+            .flat_map(|block| block.instructions.iter())
+            .find(|inst| inst.class.opcode == spirv::Op::ImageSampleExplicitLod)
+            .expect("gradient sample must be emitted");
+        assert!(gradient.operands.iter().any(|operand| {
+            matches!(
+                operand,
+                Operand::ImageOperands(mask) if mask.contains(spirv::ImageOperands::GRAD)
+            )
+        }));
+        validate_with_external_tool(ctx, "image-gradient");
+    }
+
+    #[test]
+    #[should_panic(expected = "reached the backend before indexing")]
+    fn preindexed_image_opcode_is_not_silently_dropped() {
+        let mut program = Program::new(ShaderStage::Fragment);
+        program.blocks.push(Block::new());
+        program
+            .block_mut(0)
+            .append_inst(Inst::new(Opcode::BoundImageGradient, vec![Value::Void; 5]));
+        program.syntax_list = vec![SyntaxNode::Block(0), SyntaxNode::Return];
+
+        let mut ctx = SpirvEmitContext::new(&program, &Profile::default(), &RuntimeInfo::default());
         ctx.emit_program(&program);
     }
 

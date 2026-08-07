@@ -218,6 +218,14 @@ impl Default for DelayState {
     }
 }
 
+impl Drop for DelayState {
+    fn drop(&mut self) {
+        initialized_delay_states()
+            .lock()
+            .remove(&(self as *mut Self as usize));
+    }
+}
+
 pub fn write_delay_payload(cmd: &DelayCommand, output: &mut [u8]) -> usize {
     let mut payload: DelayPayload = unsafe { std::mem::zeroed() };
     payload.inputs = cmd.inputs;
@@ -498,6 +506,7 @@ fn set_mix_buffer_sample(
 mod tests {
     use super::*;
     use crate::renderer::effect::effect_info_base::{EffectInfoBase, EffectType};
+    use std::mem::ManuallyDrop;
 
     fn parameter(delay_time: i32) -> delay::ParameterVersion2 {
         delay::ParameterVersion2 {
@@ -515,14 +524,14 @@ mod tests {
 
     #[test]
     fn initialize_delay_effect_replaces_registered_vec_state() {
-        let mut state = DelayState::default();
-        let addr = &mut state as *mut DelayState as CpuAddr;
+        let mut state = ManuallyDrop::new(DelayState::default());
+        let addr = &mut *state as *mut DelayState as CpuAddr;
 
-        initialize_delay_effect(&parameter(10), &mut state, 0);
+        initialize_delay_effect(&parameter(10 << 14), &mut state, 0);
         assert!(delay_state_is_initialized(addr));
         let first_len = state.delay_lines[0].buffer.len();
 
-        initialize_delay_effect(&parameter(20), &mut state, 0);
+        initialize_delay_effect(&parameter(20 << 14), &mut state, 0);
         assert!(delay_state_is_initialized(addr));
         assert_ne!(state.delay_lines[0].buffer.len(), 0);
         assert_ne!(state.delay_lines[0].buffer.len(), first_len);
@@ -547,7 +556,7 @@ mod tests {
 
     #[test]
     fn initialize_delay_effect_keeps_zero_delay_line_addressable() {
-        let mut state = DelayState::default();
+        let mut state = ManuallyDrop::new(DelayState::default());
 
         initialize_delay_effect(&parameter(0), &mut state, 0);
 
@@ -555,12 +564,12 @@ mod tests {
         assert_eq!(state.delay_lines[0].buffer.len(), 1);
         assert_eq!(state.delay_lines[0].read(), Fixed50_14::ZERO);
 
-        drop_delay_state_if_initialized(&mut state as *mut DelayState as CpuAddr);
+        drop_delay_state_if_initialized(&mut *state as *mut DelayState as CpuAddr);
     }
 
     #[test]
     fn apply_delay_effect_uses_fixed_point_floor_output() {
-        let mut state = DelayState::default();
+        let mut state = ManuallyDrop::new(DelayState::default());
         let mut params = parameter(1);
         params.state = ParameterState::Initialized;
         initialize_delay_effect(&params, &mut state, 0);
@@ -585,6 +594,6 @@ mod tests {
         assert_eq!(mix_buffers[2], 1000);
         assert_eq!(mix_buffers[3], -1000);
 
-        drop_delay_state_if_initialized(&mut state as *mut DelayState as CpuAddr);
+        drop_delay_state_if_initialized(&mut *state as *mut DelayState as CpuAddr);
     }
 }

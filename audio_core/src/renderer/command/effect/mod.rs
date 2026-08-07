@@ -200,7 +200,7 @@ pub fn process_effect_command(
                 return true;
             };
             let _ = processor.with_mix_buffers_mut(|mix_buffers, sample_count, _| {
-                payload.process(mix_buffers, sample_count);
+                payload.process(&memory, mix_buffers, sample_count);
             });
             true
         }
@@ -209,7 +209,7 @@ pub fn process_effect_command(
                 return true;
             };
             let _ = processor.with_mix_buffers_mut(|mix_buffers, sample_count, _| {
-                payload.process(mix_buffers, sample_count);
+                payload.process(&memory, mix_buffers, sample_count);
             });
             true
         }

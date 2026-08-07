@@ -1,3 +1,4 @@
+use crate::adsp::apps::audio_renderer::command_list_processor::MemoryHandle;
 use crate::common::common::{CpuAddr, MAX_CHANNELS};
 use crate::renderer::command::mix::copy_mix_buffer;
 use crate::renderer::command::util::write_copy;
@@ -29,8 +30,8 @@ pub struct LightLimiterVersion1Command {
 }
 
 impl LightLimiterVersion1Payload {
-    pub fn process(&self, mix_buffers: &mut [i32], sample_count: usize) {
-        process_light_limiter_v1_command(self, mix_buffers, sample_count);
+    pub fn process(&self, memory: &MemoryHandle, mix_buffers: &mut [i32], sample_count: usize) {
+        process_light_limiter_v1_command(self, memory, mix_buffers, sample_count);
     }
 
     pub fn verify(&self) -> bool {
@@ -67,8 +68,8 @@ pub struct LightLimiterVersion2Command {
 }
 
 impl LightLimiterVersion2Payload {
-    pub fn process(&self, mix_buffers: &mut [i32], sample_count: usize) {
-        process_light_limiter_v2_command(self, mix_buffers, sample_count);
+    pub fn process(&self, memory: &MemoryHandle, mix_buffers: &mut [i32], sample_count: usize) {
+        process_light_limiter_v2_command(self, memory, mix_buffers, sample_count);
     }
 
     pub fn verify(&self) -> bool {
@@ -135,12 +136,14 @@ pub fn write_light_limiter_v2_payload(
 
 pub fn process_light_limiter_v1_command(
     payload: &LightLimiterVersion1Payload,
+    memory: &MemoryHandle,
     mix_buffers: &mut [i32],
     sample_count: usize,
 ) {
     let parameter = light_limiter_v1_to_v2(payload.parameter);
     process_light_limiter_command(
         &parameter,
+        memory,
         &payload.inputs,
         &payload.outputs,
         payload.state,
@@ -170,11 +173,13 @@ pub fn dump_light_limiter_v1_command(payload: &LightLimiterVersion1Payload, dump
 
 pub fn process_light_limiter_v2_command(
     payload: &LightLimiterVersion2Payload,
+    memory: &MemoryHandle,
     mix_buffers: &mut [i32],
     sample_count: usize,
 ) {
     process_light_limiter_command(
         &payload.parameter,
+        memory,
         &payload.inputs,
         &payload.outputs,
         payload.state,
@@ -204,6 +209,7 @@ pub fn dump_light_limiter_v2_command(payload: &LightLimiterVersion2Payload, dump
 
 pub fn process_light_limiter_command(
     parameter: &light_limiter::ParameterVersion2,
+    memory: &MemoryHandle,
     inputs: &[i16; MAX_CHANNELS as usize],
     outputs: &[i16; MAX_CHANNELS as usize],
     state_addr: CpuAddr,
@@ -228,7 +234,7 @@ pub fn process_light_limiter_command(
                 update_light_limiter_effect_parameter(parameter, state);
             }
             ParameterState::Initialized => {
-                initialize_light_limiter_effect(parameter, state, workbuffer_addr);
+                initialize_light_limiter_effect(parameter, state, memory, workbuffer_addr);
             }
             ParameterState::Updated => {}
         }
@@ -237,6 +243,7 @@ pub fn process_light_limiter_command(
     apply_light_limiter_effect(
         parameter,
         state,
+        memory,
         effect_enabled,
         inputs,
         outputs,
@@ -283,22 +290,23 @@ pub fn update_light_limiter_effect_parameter(
 pub fn initialize_light_limiter_effect(
     parameter: &light_limiter::ParameterVersion2,
     state: &mut LightLimiterState,
+    memory: &MemoryHandle,
     workbuffer_addr: CpuAddr,
 ) {
     *state = LightLimiterState::default();
     let channel_count = parameter.channel_count.max(0) as usize;
     state.look_ahead_samples_max = parameter.look_ahead_samples_max.max(0) as u32;
-    if let Some(buffer) = read_f32_slice_mut(
-        workbuffer_addr,
-        channel_count.saturating_mul(state.look_ahead_samples_max as usize),
-    ) {
-        buffer.fill(0.0);
+    let sample_count = channel_count.saturating_mul(state.look_ahead_samples_max as usize);
+    if sample_count != 0 {
+        let zeroes = vec![0; sample_count.saturating_mul(std::mem::size_of::<f32>())];
+        let _ = memory.write_block(workbuffer_addr as u64, &zeroes);
     }
 }
 
 pub fn apply_light_limiter_effect(
     parameter: &light_limiter::ParameterVersion2,
     state: &mut LightLimiterState,
+    memory: &MemoryHandle,
     enabled: bool,
     inputs: &[i16; MAX_CHANNELS as usize],
     outputs: &[i16; MAX_CHANNELS as usize],
@@ -321,10 +329,12 @@ pub fn apply_light_limiter_effect(
     }
 
     let lookahead_len = parameter.look_ahead_samples_max.max(0) as usize;
-    let mut lookahead_buffers = read_f32_slice_mut(
+    let mut lookahead_storage = read_f32_buffer(
+        memory,
         workbuffer_addr,
         active_channels.saturating_mul(lookahead_len),
     );
+    let mut lookahead_buffers = lookahead_storage.as_deref_mut();
     let mut statistics = if parameter.statistics_enabled {
         read_statistics_internal_mut(result_state_addr)
     } else {
@@ -410,6 +420,10 @@ pub fn apply_light_limiter_effect(
             }
         }
     }
+
+    if let Some(buffer) = lookahead_storage.as_deref() {
+        write_f32_buffer(memory, workbuffer_addr, buffer);
+    }
 }
 
 fn read_light_limiter_state_mut(addr: CpuAddr) -> Option<&'static mut LightLimiterState> {
@@ -436,16 +450,31 @@ fn read_statistics_internal_mut(addr: CpuAddr) -> Option<&'static mut Statistics
     Some(unsafe { &mut *(addr as *mut StatisticsInternal) })
 }
 
-fn read_f32_slice_mut(addr: CpuAddr, len: usize) -> Option<&'static mut [f32]> {
-    if addr == 0 {
+fn read_f32_buffer(memory: &MemoryHandle, addr: CpuAddr, len: usize) -> Option<Vec<f32>> {
+    if addr == 0 || len == 0 {
         return None;
     }
-    crate::raw_write_trace::maybe_trace_write_at(
-        "light_limiter:f32_slice_mut",
-        addr,
-        len * std::mem::size_of::<f32>(),
-    );
-    Some(unsafe { std::slice::from_raw_parts_mut(addr as *mut f32, len) })
+    let mut bytes = vec![0; len.checked_mul(std::mem::size_of::<f32>())?];
+    if !memory.read_block(addr as u64, &mut bytes) {
+        return None;
+    }
+    Some(
+        bytes
+            .chunks_exact(4)
+            .map(|word| f32::from_le_bytes(word.try_into().expect("four-byte chunk")))
+            .collect(),
+    )
+}
+
+fn write_f32_buffer(memory: &MemoryHandle, addr: CpuAddr, values: &[f32]) {
+    if addr == 0 || values.is_empty() {
+        return;
+    }
+    let mut bytes = Vec::with_capacity(values.len() * std::mem::size_of::<f32>());
+    for value in values {
+        bytes.extend_from_slice(&value.to_le_bytes());
+    }
+    let _ = memory.write_block(addr as u64, &bytes);
 }
 
 fn recip_estimate_f32(value: f32) -> f32 {

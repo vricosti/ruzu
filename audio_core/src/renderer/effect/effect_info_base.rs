@@ -428,12 +428,6 @@ impl EffectInfoBase {
 
         match params.type_ {
             EffectType::Invalid => {
-                self.apply_common_settings(
-                    params.is_new,
-                    params.enabled,
-                    params.mix_id as i32,
-                    params.process_order as i32,
-                );
                 Self::set_success(error_info);
             }
             EffectType::Mix => buffer_mixer::update_v1(self, error_info, params, pool_mapper),
@@ -466,12 +460,6 @@ impl EffectInfoBase {
 
         match params.type_ {
             EffectType::Invalid => {
-                self.apply_common_settings(
-                    params.is_new,
-                    params.enabled,
-                    params.mix_id as i32,
-                    params.process_order as i32,
-                );
                 Self::set_success(error_info);
             }
             EffectType::Mix => buffer_mixer::update_v2(self, error_info, params, pool_mapper),
@@ -639,5 +627,38 @@ impl EffectInfoBase {
 impl Drop for EffectInfoBase {
     fn drop(&mut self) {
         self.drop_owned_raw_state();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn invalid_effect_update_preserves_cleanup_routing_fields() {
+        let mapper = PoolMapper::new(None, false);
+        let mut error_info = ErrorInfo::default();
+        let mut effect = EffectInfoBase::default();
+        let v1 = InParameterVersion1 {
+            mix_id: 0,
+            process_order: 0,
+            ..Default::default()
+        };
+
+        effect.update_v1(&mut error_info, &v1, &mapper);
+
+        assert_eq!(effect.get_mix_id(), UNUSED_MIX_ID);
+        assert_eq!(effect.get_processing_order(), INVALID_PROCESS_ORDER);
+
+        let v2 = InParameterVersion2 {
+            mix_id: 0,
+            process_order: 0,
+            ..Default::default()
+        };
+
+        effect.update_v2(&mut error_info, &v2, &mapper);
+
+        assert_eq!(effect.get_mix_id(), UNUSED_MIX_ID);
+        assert_eq!(effect.get_processing_order(), INVALID_PROCESS_ORDER);
     }
 }

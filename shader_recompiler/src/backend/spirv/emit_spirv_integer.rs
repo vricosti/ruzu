@@ -138,6 +138,13 @@ pub fn emit_shift_left_logical_32(ctx: &mut SpirvEmitContext, base: Word, shift:
         .unwrap()
 }
 
+/// ShiftLeftLogical64: `OpShiftLeftLogical`.
+pub fn emit_shift_left_logical_64(ctx: &mut SpirvEmitContext, base: Word, shift: Word) -> Word {
+    ctx.builder
+        .shift_left_logical(ctx.u64_type, None, base, shift)
+        .unwrap()
+}
+
 /// ShiftRightLogical32: `OpShiftRightLogical`.
 pub fn emit_shift_right_logical_32(ctx: &mut SpirvEmitContext, base: Word, shift: Word) -> Word {
     ctx.builder
@@ -145,10 +152,24 @@ pub fn emit_shift_right_logical_32(ctx: &mut SpirvEmitContext, base: Word, shift
         .unwrap()
 }
 
+/// ShiftRightLogical64: `OpShiftRightLogical`.
+pub fn emit_shift_right_logical_64(ctx: &mut SpirvEmitContext, base: Word, shift: Word) -> Word {
+    ctx.builder
+        .shift_right_logical(ctx.u64_type, None, base, shift)
+        .unwrap()
+}
+
 /// ShiftRightArithmetic32: `OpShiftRightArithmetic`.
 pub fn emit_shift_right_arithmetic_32(ctx: &mut SpirvEmitContext, base: Word, shift: Word) -> Word {
     ctx.builder
         .shift_right_arithmetic(ctx.u32_type, None, base, shift)
+        .unwrap()
+}
+
+/// ShiftRightArithmetic64: `OpShiftRightArithmetic`.
+pub fn emit_shift_right_arithmetic_64(ctx: &mut SpirvEmitContext, base: Word, shift: Word) -> Word {
+    ctx.builder
+        .shift_right_arithmetic(ctx.u64_type, None, base, shift)
         .unwrap()
 }
 

@@ -36,13 +36,6 @@ impl EffectContext {
         self.effect_infos.get_mut(index as usize)
     }
 
-    pub fn update_info_for_command_generation(&mut self, index: usize) -> Option<EffectInfoBase> {
-        let source = self.effect_infos.get_mut(index)?;
-        source.refresh_runtime_addresses();
-        source.update_for_command_generation();
-        Some(source.clone())
-    }
-
     pub fn get_result_state(&self, index: u32) -> Option<&EffectResultState> {
         self.result_states_cpu.get(index as usize)
     }
