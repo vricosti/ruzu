@@ -230,6 +230,7 @@ impl ILibraryAppletProxy {
             ctx,
             Arc::new(
                 super::library_applet_self_accessor::ILibraryAppletSelfAccessor::new(
+                    proxy.system,
                     proxy.applet.clone(),
                 ),
             ),

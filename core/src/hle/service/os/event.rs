@@ -20,6 +20,7 @@ use crate::hle::service::hle_ipc::{HLERequestContext, Handle};
 /// which in turn calls `KReadableEvent::Signal()`. This bridge replicates that
 /// chain: when the service Event is signaled, we also signal the kernel readable
 /// event to wake any threads blocked in WaitSynchronization.
+#[derive(Clone)]
 struct KernelEventBridge {
     event: Arc<Mutex<KEvent>>,
     readable_event: Arc<Mutex<KReadableEvent>>,
@@ -212,7 +213,8 @@ impl Event {
         self.signal_host_only();
 
         // Bridge to kernel: signal the KEvent owner, which wakes the readable end.
-        if let Some(ref bridge) = *self.kernel_bridge.lock().unwrap() {
+        let bridge = self.kernel_bridge.lock().unwrap().clone();
+        if let Some(bridge) = bridge {
             let readable_object_id = bridge.readable_event.lock().unwrap().object_id;
             let trace_boot = std::env::var_os("RUZU_APPLET_BOOT_TRACE")
                 .is_some_and(|value| value != std::ffi::OsStr::new("0"));
@@ -266,7 +268,8 @@ impl Event {
 
         // Bridge to kernel: clear the readable end too, matching upstream
         // Event::Clear() -> KEvent::Clear().
-        if let Some(ref bridge) = *self.kernel_bridge.lock().unwrap() {
+        let bridge = self.kernel_bridge.lock().unwrap().clone();
+        if let Some(bridge) = bridge {
             if let Some(process) = bridge.process.upgrade() {
                 KEvent::clear_arc(&bridge.event, &process);
             }

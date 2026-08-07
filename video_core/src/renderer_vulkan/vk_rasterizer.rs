@@ -154,17 +154,6 @@ fn parse_vulkan_sync_draw_interval(value: Option<&str>) -> Option<u32> {
     value?.parse::<u32>().ok().filter(|interval| *interval != 0)
 }
 
-fn needs_gather_subpixel_offset(driver_id: vk::DriverId) -> bool {
-    matches!(
-        driver_id,
-        vk::DriverId::AMD_PROPRIETARY
-            | vk::DriverId::AMD_OPEN_SOURCE
-            | vk::DriverId::MESA_RADV
-            | vk::DriverId::INTEL_PROPRIETARY_WINDOWS
-            | vk::DriverId::INTEL_OPEN_SOURCE_MESA
-    )
-}
-
 fn vulkan_sync_draw_interval() -> Option<u32> {
     static INTERVAL: OnceLock<Option<u32>> = OnceLock::new();
     *INTERVAL.get_or_init(|| {
@@ -719,13 +708,8 @@ impl RasterizerVulkan {
         driver_id: vk::DriverId,
         width: u32,
         height: u32,
-        supported_spirv_version: u32,
+        profile: Profile,
         host_info: HostTranslateInfo,
-        descriptor_aliasing_supported: bool,
-        shader_float_controls_supported: bool,
-        float_controls_properties: vk::PhysicalDeviceFloatControlsProperties,
-        shader_demote_to_helper_invocation_supported: bool,
-        depth_clip_control_supported: bool,
         depth_bounds_supported: bool,
         depth_range_unrestricted: bool,
         nv_viewport_swizzle: bool,
@@ -811,36 +795,6 @@ impl RasterizerVulkan {
         ));
 
         // Create shader recompiler pipeline cache
-        let float_control = float_controls_properties;
-        let profile = Profile {
-            supported_spirv: supported_spirv_version,
-            unified_descriptor_binding: true,
-            support_descriptor_aliasing: descriptor_aliasing_supported,
-            support_int64: host_info.support_int64,
-            min_ssbo_alignment: u64::from(host_info.min_ssbo_alignment),
-            support_float_controls: shader_float_controls_supported,
-            support_separate_denorm_behavior: float_control.denorm_behavior_independence
-                == vk::ShaderFloatControlsIndependence::ALL,
-            support_separate_rounding_mode: float_control.rounding_mode_independence
-                == vk::ShaderFloatControlsIndependence::ALL,
-            support_fp16_denorm_preserve: float_control.shader_denorm_preserve_float16 != 0,
-            support_fp32_denorm_preserve: float_control.shader_denorm_preserve_float32 != 0,
-            support_fp16_denorm_flush: float_control.shader_denorm_flush_to_zero_float16 != 0,
-            support_fp32_denorm_flush: float_control.shader_denorm_flush_to_zero_float32 != 0,
-            support_fp16_signed_zero_nan_preserve: float_control
-                .shader_signed_zero_inf_nan_preserve_float16
-                != 0,
-            support_fp32_signed_zero_nan_preserve: float_control
-                .shader_signed_zero_inf_nan_preserve_float32
-                != 0,
-            support_fp64_signed_zero_nan_preserve: float_control
-                .shader_signed_zero_inf_nan_preserve_float64
-                != 0,
-            support_demote_to_helper_invocation: shader_demote_to_helper_invocation_supported,
-            support_native_ndc: depth_clip_control_supported,
-            need_gather_subpixel_offset: needs_gather_subpixel_offset(driver_id),
-            ..Profile::default()
-        };
         let shader_cache = ShaderPipelineCache::new(profile.clone());
         let must_emulate_scaled_formats =
             must_emulate_scaled_formats || !profile.support_scaled_attributes;
@@ -4657,22 +4611,6 @@ mod tests {
         assert_eq!(parse_vulkan_sync_draw_interval(Some("0")), None);
         assert_eq!(parse_vulkan_sync_draw_interval(Some("1")), Some(1));
         assert_eq!(parse_vulkan_sync_draw_interval(Some("32")), Some(32));
-    }
-
-    #[test]
-    fn gather_subpixel_offset_matches_upstream_driver_list() {
-        for driver in [
-            vk::DriverId::AMD_PROPRIETARY,
-            vk::DriverId::AMD_OPEN_SOURCE,
-            vk::DriverId::MESA_RADV,
-            vk::DriverId::INTEL_PROPRIETARY_WINDOWS,
-            vk::DriverId::INTEL_OPEN_SOURCE_MESA,
-        ] {
-            assert!(needs_gather_subpixel_offset(driver));
-        }
-        assert!(!needs_gather_subpixel_offset(
-            vk::DriverId::NVIDIA_PROPRIETARY
-        ));
     }
 
     #[test]

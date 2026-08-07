@@ -1656,22 +1656,19 @@ impl KProcess {
     /// Matches upstream `KProcess::IncrementRunningThreadCount()`.
     pub fn increment_running_thread_count(&self) {
         self.num_running_threads
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Decrement running thread count.
-    /// Matches upstream `KProcess::DecrementRunningThreadCount()` (k_process.cpp:756-762).
-    ///
-    /// Returns true if the count reached zero and the caller should terminate
-    /// the process. Upstream calls `this->Terminate()` inline, but we cannot
-    /// do that here because the caller typically holds thread locks that would
-    /// deadlock with terminate()'s thread iteration. The caller must drop its
-    /// locks and then call `process.terminate()`.
-    pub fn decrement_running_thread_count(&mut self) -> bool {
+    /// Matches upstream `KProcess::DecrementRunningThreadCount()` (k_process.cpp:769-775).
+    pub fn decrement_running_thread_count(&mut self) {
         let prev = self
             .num_running_threads
-            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-        prev == 1
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        assert!(prev > 0, "running thread count underflow");
+        if prev == 1 {
+            let _ = self.terminate();
+        }
     }
 
     pub fn clear_running_thread(&mut self, thread_id: u64) {
@@ -2261,8 +2258,13 @@ impl KProcess {
 
         // If we need to terminate, do so.
         if needs_terminate {
-            // Start termination.
-            let start_result = self.start_termination(None);
+            // `StartTermination()` excludes the current thread upstream.
+            let current_thread_id = self
+                .scheduler
+                .as_ref()
+                .and_then(Weak::upgrade)
+                .and_then(|scheduler| scheduler.lock().unwrap().get_scheduler_current_thread_id());
+            let start_result = self.start_termination(current_thread_id);
             if start_result == RESULT_SUCCESS.get_inner_value() {
                 // Finish termination.
                 self.finish_termination();
@@ -2311,27 +2313,30 @@ impl KProcess {
     /// use blocking `KThread::terminate_thread()` when the target is already in
     /// a state that can complete immediately without needing guest execution.
     fn terminate_children(&mut self, thread_to_not_terminate_id: Option<u64>) -> u32 {
-        let children: Vec<Arc<KThreadLock>> = self.thread_objects.values().cloned().collect();
+        let children: Vec<(u64, Arc<KThreadLock>)> = self
+            .thread_objects_by_thread_id
+            .iter()
+            .map(|(&thread_id, thread)| (thread_id, Arc::clone(thread)))
+            .collect();
 
-        for child in &children {
-            let mut guard = child.lock().unwrap();
-            if Some(guard.thread_id) == thread_to_not_terminate_id {
+        for (thread_id, child) in &children {
+            if Some(*thread_id) == thread_to_not_terminate_id {
                 continue;
             }
+            let mut guard = child.lock().unwrap();
             if guard.get_state() != super::k_thread::ThreadState::TERMINATED {
                 guard.request_terminate();
             }
         }
 
-        for child in children {
+        for (thread_id, child) in children {
+            if Some(thread_id) == thread_to_not_terminate_id {
+                continue;
+            }
             let should_terminate = {
                 let guard = child.lock().unwrap();
-                if Some(guard.thread_id) == thread_to_not_terminate_id {
-                    false
-                } else {
-                    let state = guard.get_state();
-                    state == super::k_thread::ThreadState::INITIALIZED || guard.is_signaled()
-                }
+                let state = guard.get_state();
+                state == super::k_thread::ThreadState::INITIALIZED || guard.is_signaled()
             };
 
             if should_terminate {
@@ -3855,6 +3860,39 @@ mod tests {
             super::super::k_thread::ThreadState::TERMINATED
         );
         assert!(!current.lock().unwrap().is_termination_requested());
+    }
+
+    #[test]
+    fn last_running_thread_exit_terminates_process() {
+        let process = Arc::new(ProcessLock::from_value(KProcess::new()));
+        let scheduler = Arc::new(Mutex::new(KScheduler::new(0)));
+        scheduler.lock().unwrap().set_scheduler_current_thread_id(1);
+
+        let current = Arc::new(KThreadLock::new(KThread::new()));
+        {
+            let mut thread = current.lock().unwrap();
+            thread.thread_id = 1;
+            thread.object_id = 10;
+            thread.parent = Some(Arc::downgrade(&process));
+            thread.set_state(super::super::k_thread::ThreadState::RUNNABLE);
+        }
+
+        {
+            let mut process = process.lock().unwrap();
+            process.attach_scheduler(&scheduler);
+            process.state = ProcessState::Running;
+            process.increment_running_thread_count();
+            process.register_thread_object(Arc::clone(&current));
+        }
+
+        current.lock().unwrap().exit();
+        KWorkerTaskManager::wait_for_global_idle();
+
+        assert_eq!(process.lock().unwrap().state, ProcessState::Terminated);
+        assert_eq!(
+            current.lock().unwrap().get_state(),
+            super::super::k_thread::ThreadState::TERMINATED
+        );
     }
 
     #[test]

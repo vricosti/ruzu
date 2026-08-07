@@ -1462,11 +1462,10 @@ static SCHEDULER_CALLBACKS: super::k_scheduler_lock::SchedulerCallbacks =
 fn real_disable_scheduling() {
     apply_pending_active_core_updates();
 
-    if let Some(current_thread) = get_current_emu_thread() {
-        let mut thread = current_thread.lock().unwrap();
+    with_current_thread_fast_mut(|thread| {
         debug_assert!(thread.get_disable_dispatch_count() >= 0);
         thread.disable_dispatch();
-    }
+    });
 }
 
 fn real_enable_scheduling(cores_needing_scheduling: u64) {

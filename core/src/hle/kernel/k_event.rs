@@ -28,7 +28,7 @@ impl KEvent {
     /// `KEvent::Signal` / `Clear` open `KScopedSchedulerLock sl(kernel)`
     /// at entry. Resolves through the kernel singleton; no GSC mutex
     /// round-trip needed.
-    fn lock_scheduler_for_process(_process: &KProcess) -> Option<KScopedSchedulerLock<'static>> {
+    fn lock_scheduler() -> Option<KScopedSchedulerLock<'static>> {
         let scheduler_lock = super::kernel::scheduler_lock()?;
         Some(KScopedSchedulerLock::new(scheduler_lock))
     }
@@ -60,7 +60,7 @@ impl KEvent {
     /// Signal the event.
     /// Matches upstream `KEvent::Signal`.
     pub fn signal(&mut self, process: &KProcess) -> u32 {
-        let _scheduler_guard = Self::lock_scheduler_for_process(process);
+        let _scheduler_guard = Self::lock_scheduler();
 
         if self.readable_event_destroyed {
             return RESULT_SUCCESS.get_inner_value();
@@ -77,7 +77,7 @@ impl KEvent {
     /// Clear the event.
     /// Matches upstream `KEvent::Clear`.
     pub fn clear(&mut self, process: &KProcess) -> u32 {
-        let _scheduler_guard = Self::lock_scheduler_for_process(process);
+        let _scheduler_guard = Self::lock_scheduler();
 
         if self.readable_event_destroyed {
             return RESULT_SUCCESS.get_inner_value();
@@ -99,6 +99,10 @@ impl KEvent {
     /// After the sync-object refactor the signal path only needs the scheduler
     /// lock (acquired inside `signal`), not the `KProcess` Mutex.
     pub fn signal_arc(event: &Arc<Mutex<KEvent>>, process: &Arc<ProcessLock>) -> u32 {
+        // Upstream acquires KScopedSchedulerLock at KEvent::Signal entry,
+        // before touching the embedded KReadableEvent.
+        let _scheduler_guard = Self::lock_scheduler();
+
         let readable_event_id = {
             let event = event.lock().unwrap();
             if event.readable_event_destroyed {
@@ -122,6 +126,9 @@ impl KEvent {
 
     /// Rust helper for clearing a shared `KEvent` through the current owner process.
     pub fn clear_arc(event: &Arc<Mutex<KEvent>>, process: &Arc<ProcessLock>) -> u32 {
+        // Matches upstream KEvent::Clear lock ordering.
+        let _scheduler_guard = Self::lock_scheduler();
+
         let readable_event_id = {
             let event = event.lock().unwrap();
             if event.readable_event_destroyed {
@@ -188,5 +195,36 @@ mod tests {
 
         assert_eq!(event.signal(&process), RESULT_SUCCESS.get_inner_value());
         assert!(readable.lock().unwrap().is_signaled());
+    }
+
+    #[test]
+    fn shared_event_signal_clear_roundtrip_uses_same_readable_event() {
+        let process = Arc::new(ProcessLock::new(KProcess::new()));
+        let readable_id = 123;
+        let event_id = 456;
+
+        let event = Arc::new(Mutex::new(KEvent::new()));
+        event.lock().unwrap().initialize(1, readable_id);
+
+        let readable = Arc::new(Mutex::new(
+            super::super::k_readable_event::KReadableEvent::new(),
+        ));
+        readable.lock().unwrap().initialize(event_id, readable_id);
+        process
+            .lock()
+            .unwrap()
+            .register_readable_event_object(readable_id, Arc::clone(&readable));
+
+        assert_eq!(
+            KEvent::signal_arc(&event, &process),
+            RESULT_SUCCESS.get_inner_value()
+        );
+        assert!(readable.lock().unwrap().is_signaled());
+
+        assert_eq!(
+            KEvent::clear_arc(&event, &process),
+            RESULT_SUCCESS.get_inner_value()
+        );
+        assert!(!readable.lock().unwrap().is_signaled());
     }
 }

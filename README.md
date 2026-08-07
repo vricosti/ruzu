@@ -85,6 +85,9 @@ installed; `setup.sh` installed them, and the validation command was
 
 ## Building
 
+For first-time runtime setup, including installing your own dumped keys and
+firmware, see the [ruzu quickstart guide](docs/quickstart.md).
+
 ### Requirements
 
 - Rust **1.75** or newer (the workspace `rust-version`; the platforms above were

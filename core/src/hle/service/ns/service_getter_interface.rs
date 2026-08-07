@@ -7,9 +7,12 @@
 //! IServiceGetterInterface dispatches to sub-interfaces.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
-use crate::hle::result::ResultCode;
+use super::content_management_interface::IContentManagementInterface;
+use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
+use crate::hle::service::ipc_helpers::ResponseBuilder;
 use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
 
 /// IPC command table for IServiceGetterInterface.
@@ -90,7 +93,7 @@ impl IServiceGetterInterface {
             ),
             (
                 commands::GET_CONTENT_MANAGEMENT_INTERFACE,
-                None,
+                Some(Self::get_content_management_interface_handler),
                 "GetContentManagementInterface",
             ),
             (
@@ -157,14 +160,42 @@ impl IServiceGetterInterface {
         log::debug!("IServiceGetterInterface::get_download_task_interface called");
     }
 
+    fn get_content_management_interface_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        let service =
+            unsafe { &*(this as *const dyn ServiceFramework as *const IServiceGetterInterface) };
+        let interface = Arc::new(service.get_content_management_interface());
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 1);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_ipc_interface(interface);
+    }
+
     /// GetContentManagementInterface (cmd 7998).
-    pub fn get_content_management_interface(&self) {
+    pub fn get_content_management_interface(&self) -> IContentManagementInterface {
         log::debug!("IServiceGetterInterface::get_content_management_interface called");
+        IContentManagementInterface::new(self.system)
     }
 
     /// GetDocumentInterface (cmd 7999).
     pub fn get_document_interface(&self) {
         log::debug!("IServiceGetterInterface::get_document_interface called");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn content_management_getter_has_upstream_handler() {
+        let service = IServiceGetterInterface::new(crate::core::SystemRef::null(), "ns:am2");
+        assert!(service
+            .handlers()
+            .get(&commands::GET_CONTENT_MANAGEMENT_INTERFACE)
+            .and_then(|info| info.handler_callback)
+            .is_some());
     }
 }
 

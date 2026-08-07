@@ -176,6 +176,7 @@ fn push_in_show_controller(
 /// Upstream: `void PushInShowCabinetData(system, channel)`
 fn push_in_show_cabinet_data(
     system_tick: u64,
+    cabinet_mode: crate::hle::service::am::frontend::applet_cabinet::CabinetMode,
     channel: &super::applet_data_broker::AppletStorageChannel,
 ) {
     use crate::hle::service::am::frontend::applet_cabinet::{
@@ -192,9 +193,8 @@ fn push_in_show_cabinet_data(
         system_tick,
     };
 
-    // Upstream: amiibo_settings.applet_mode = system.GetFrontendAppletHolder().GetCabinetMode()
-    // We use the default (StartNicknameAndOwnerSettings = 0) since we have no frontend holder.
-    let amiibo_settings = StartParamForAmiiboSettings::default();
+    let mut amiibo_settings = StartParamForAmiiboSettings::default();
+    amiibo_settings.applet_mode = cabinet_mode;
 
     let mut arg_buf = vec![0u8; std::mem::size_of::<CommonArguments>()];
     let mut settings_buf = vec![0u8; std::mem::size_of::<StartParamForAmiiboSettings>()];
@@ -308,7 +308,7 @@ pub enum LaunchType {
     ApplicationInitiated,
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy)]
 pub struct FrontendAppletParameters {
     pub program_id: ProgramId,
     pub applet_id: AppletId,
@@ -316,6 +316,19 @@ pub struct FrontendAppletParameters {
     pub launch_type: LaunchType,
     pub program_index: i32,
     pub previous_program_index: i32,
+}
+
+impl Default for FrontendAppletParameters {
+    fn default() -> Self {
+        Self {
+            program_id: 0,
+            applet_id: AppletId::default(),
+            applet_type: AppletType::default(),
+            launch_type: LaunchType::default(),
+            program_index: 0,
+            previous_program_index: -1,
+        }
+    }
 }
 
 /// Parameters needed to call `KProcess::run()`, stored alongside the pending
@@ -420,6 +433,7 @@ impl AppletManager {
             Process::with_process(process.clone()),
             params.applet_id == AppletId::Application,
         );
+        applet.program_id = params.program_id;
         applet.applet_id = params.applet_id;
         applet.applet_type = params.applet_type;
         applet.previous_program_index = params.previous_program_index;
@@ -474,7 +488,15 @@ impl AppletManager {
             }
             AppletId::Cabinet => {
                 let channel = initialize_fake_caller_applet(&mut applet);
-                push_in_show_cabinet_data(system_tick, channel);
+                let cabinet_mode = if self.system.is_null() {
+                    Default::default()
+                } else {
+                    self.system
+                        .get()
+                        .frontend_applet_holder()
+                        .get_cabinet_mode()
+                };
+                push_in_show_cabinet_data(system_tick, cabinet_mode, channel);
             }
             AppletId::MiiEdit => {
                 let channel = initialize_fake_caller_applet(&mut applet);
@@ -587,6 +609,44 @@ mod tests {
     use super::*;
     use std::sync::Arc;
     use std::time::Duration;
+
+    #[test]
+    fn frontend_parameters_default_previous_program_index_matches_upstream() {
+        let parameters = FrontendAppletParameters::default();
+
+        assert_eq!(parameters.program_index, 0);
+        assert_eq!(parameters.previous_program_index, -1);
+        assert_eq!(parameters.launch_type, LaunchType::FrontendInitiated);
+    }
+
+    #[test]
+    fn set_window_system_uses_frontend_program_id() {
+        let manager = AppletManager::new();
+        let window_system = Arc::new(Mutex::new(WindowSystem::new(SystemRef::null())));
+        let process = Arc::new(ProcessLock::from_value(KProcess::new()));
+        let expected_program_id = 0x0100_0000_0000_100d;
+
+        {
+            let mut inner = manager.lock.lock().unwrap();
+            inner.pending_process = Some(process);
+            inner.pending_parameters = Some(FrontendAppletParameters {
+                program_id: expected_program_id,
+                applet_id: AppletId::Application,
+                applet_type: AppletType::Application,
+                ..FrontendAppletParameters::default()
+            });
+            inner.pending_run_params = None;
+        }
+
+        manager.set_window_system(Some(Arc::clone(&window_system)));
+
+        let applet = window_system
+            .lock()
+            .unwrap()
+            .get_main_applet()
+            .expect("frontend application should be tracked");
+        assert_eq!(applet.lock().unwrap().program_id, expected_program_id);
+    }
 
     #[test]
     fn set_window_system_returns_during_shutdown_without_pending_process() {

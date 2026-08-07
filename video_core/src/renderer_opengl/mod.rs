@@ -732,7 +732,7 @@ impl RendererOpenGL {
         self.base_data
             .settings
             .screenshot_requested
-            .store(false, std::sync::atomic::Ordering::Relaxed);
+            .store(false, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Render framebuffers to a memory buffer (for screenshots).
@@ -832,6 +832,15 @@ impl RendererBase for RendererOpenGL {
 
     fn composite(&mut self, layers: &[FramebufferConfig]) {
         self.composite_impl(layers);
+    }
+
+    fn request_screenshot(
+        &mut self,
+        data: *mut std::ffi::c_void,
+        callback: Box<dyn FnOnce(bool) + Send>,
+        layout: FramebufferLayout,
+    ) {
+        self.base_data.request_screenshot(data, callback, layout);
     }
 
     fn set_shader_cache_gpu_reader(&mut self, reader: crate::renderer_base::ShaderCacheGpuReader) {

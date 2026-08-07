@@ -309,6 +309,8 @@ pub struct Device {
     pub subgroup_size_control_properties: vk::PhysicalDeviceSubgroupSizeControlProperties,
     /// Transform feedback properties.
     pub transform_feedback_properties: vk::PhysicalDeviceTransformFeedbackPropertiesEXT,
+    /// Raw `VkPhysicalDeviceTransformFeedbackFeaturesEXT::geometryStreams` feature bit.
+    pub transform_feedback_geometry_streams_supported: bool,
 
     /// Core physical device features.
     pub device_features: vk::PhysicalDeviceFeatures,
@@ -1388,6 +1390,9 @@ impl Device {
             push_descriptor_properties,
             subgroup_size_control_properties,
             transform_feedback_properties,
+            transform_feedback_geometry_streams_supported: transform_feedback_features
+                .geometry_streams
+                != 0,
             device_features,
             shader_float16_supported: supports_shader_float16,
             timeline_semaphore_supported,
@@ -1923,7 +1928,7 @@ impl Device {
     }
 
     pub fn are_transform_feedback_geometry_streams_supported(&self) -> bool {
-        self.extensions.transform_feedback
+        self.transform_feedback_geometry_streams_supported
     }
 
     pub fn is_ext_custom_border_color_supported(&self) -> bool {

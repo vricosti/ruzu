@@ -8,13 +8,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::framebuffer_config::FramebufferConfig;
-
-/// Framebuffer layout for screenshots.
-#[derive(Debug, Clone, Default)]
-pub struct FramebufferLayout {
-    pub width: u32,
-    pub height: u32,
-}
+pub use ruzu_core::frontend::framebuffer_layout::FramebufferLayout;
 
 /// Renderer settings (screenshots, etc.).
 pub struct RendererSettings {
@@ -83,6 +77,14 @@ pub trait RendererBase: Send {
     /// Returns true if a screenshot is being processed.
     fn is_screenshot_pending(&self) -> bool;
 
+    /// Request a screenshot of the next composited frame.
+    fn request_screenshot(
+        &mut self,
+        data: *mut std::ffi::c_void,
+        callback: Box<dyn FnOnce(bool) + Send>,
+        layout: FramebufferLayout,
+    );
+
     /// Install a *GPU virtual address* reader on the renderer's shader cache.
     ///
     /// This reader's first argument is a **GPU virtual address**
@@ -138,7 +140,7 @@ impl RendererBaseData {
 
     /// Returns true if a screenshot is being processed.
     pub fn is_screenshot_pending(&self) -> bool {
-        self.settings.screenshot_requested.load(Ordering::Relaxed)
+        self.settings.screenshot_requested.load(Ordering::SeqCst)
     }
 
     /// Request a screenshot of the next frame.
@@ -153,16 +155,59 @@ impl RendererBaseData {
             return;
         }
         self.settings.screenshot_bits = data;
-        self.settings.screenshot_complete_callback = Some(callback);
+        self.settings.screenshot_complete_callback = Some(Box::new(move |invert_y| {
+            let _ = std::thread::Builder::new()
+                .name("Screenshot".to_owned())
+                .spawn(move || callback(invert_y));
+        }));
         self.settings.screenshot_framebuffer_layout = layout;
         self.settings
             .screenshot_requested
-            .store(true, Ordering::Relaxed);
+            .store(true, Ordering::SeqCst);
     }
 }
 
 impl Default for RendererBaseData {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn screenshot_request_publishes_pointer_layout_and_async_callback() {
+        let mut renderer = RendererBaseData::new();
+        let mut pixel = 0u32;
+        let layout = FramebufferLayout {
+            width: 1,
+            height: 1,
+            ..FramebufferLayout::default()
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+
+        renderer.request_screenshot(
+            (&mut pixel as *mut u32).cast(),
+            Box::new(move |invert_y| tx.send(invert_y).unwrap()),
+            layout,
+        );
+
+        assert!(renderer.is_screenshot_pending());
+        assert_eq!(
+            renderer.settings.screenshot_bits,
+            (&mut pixel as *mut u32).cast()
+        );
+        assert_eq!(renderer.settings.screenshot_framebuffer_layout.width, 1);
+        renderer
+            .settings
+            .screenshot_complete_callback
+            .take()
+            .unwrap()(true);
+        assert_eq!(
+            rx.recv_timeout(std::time::Duration::from_secs(1)).unwrap(),
+            true
+        );
     }
 }

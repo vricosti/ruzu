@@ -26,6 +26,7 @@ use crate::shader_cache::{GraphicsEnvironments, ShaderCache as SharedShaderCache
 use crate::shader_environment::{
     load_pipelines, serialize_pipeline, ComputeEnvironment, FileEnvironment,
 };
+use crate::vulkan_common::vulkan_device::{Device, NvidiaArchitecture};
 use shader_recompiler::backend::bindings::Bindings;
 use shader_recompiler::host_translate_info::HostTranslateInfo;
 use shader_recompiler::{Profile, RuntimeInfo};
@@ -36,6 +37,84 @@ use super::fixed_pipeline_state::FixedPipelineState;
 use super::graphics_pipeline::{GraphicsPipeline, GraphicsPipelineCache, GraphicsPipelineKey};
 
 use super::render_pass_cache::RenderPassCache;
+
+fn needs_gather_subpixel_offset(driver_id: vk::DriverId) -> bool {
+    matches!(
+        driver_id,
+        vk::DriverId::AMD_PROPRIETARY
+            | vk::DriverId::AMD_OPEN_SOURCE
+            | vk::DriverId::MESA_RADV
+            | vk::DriverId::INTEL_PROPRIETARY_WINDOWS
+            | vk::DriverId::INTEL_OPEN_SOURCE_MESA
+    )
+}
+
+/// Builds the Vulkan shader profile owned by upstream `PipelineCache`.
+pub(super) fn make_shader_profile(device: &Device) -> Profile {
+    let float_control = device.float_control_properties();
+    let driver_id = device.get_driver_id();
+    Profile {
+        supported_spirv: device.supported_spirv_version(),
+        unified_descriptor_binding: true,
+        support_descriptor_aliasing: device.is_descriptor_aliasing_supported(),
+        support_int8: device.is_int8_supported(),
+        support_int16: device.is_shader_int16_supported(),
+        support_int64: device.is_shader_int64_supported(),
+        support_vertex_instance_id: false,
+        support_float_controls: device.is_khr_shader_float_controls_supported(),
+        support_separate_denorm_behavior: float_control.denorm_behavior_independence
+            == vk::ShaderFloatControlsIndependence::ALL,
+        support_separate_rounding_mode: float_control.rounding_mode_independence
+            == vk::ShaderFloatControlsIndependence::ALL,
+        support_fp16_denorm_preserve: float_control.shader_denorm_preserve_float16 != 0,
+        support_fp32_denorm_preserve: float_control.shader_denorm_preserve_float32 != 0,
+        support_fp16_denorm_flush: float_control.shader_denorm_flush_to_zero_float16 != 0,
+        support_fp32_denorm_flush: float_control.shader_denorm_flush_to_zero_float32 != 0,
+        support_fp16_signed_zero_nan_preserve: float_control
+            .shader_signed_zero_inf_nan_preserve_float16
+            != 0,
+        support_fp32_signed_zero_nan_preserve: float_control
+            .shader_signed_zero_inf_nan_preserve_float32
+            != 0,
+        support_fp64_signed_zero_nan_preserve: float_control
+            .shader_signed_zero_inf_nan_preserve_float64
+            != 0,
+        support_explicit_workgroup_layout: device
+            .is_khr_workgroup_memory_explicit_layout_supported(),
+        support_vote: device.is_subgroup_feature_supported(vk::SubgroupFeatureFlags::VOTE),
+        support_viewport_index_layer_non_geometry: device
+            .is_ext_shader_viewport_index_layer_supported(),
+        support_viewport_mask: device.is_nv_viewport_array2_supported(),
+        support_typeless_image_loads: device.is_formatless_image_load_supported(),
+        support_demote_to_helper_invocation: device
+            .is_ext_shader_demote_to_helper_invocation_supported(),
+        support_int64_atomics: device.is_ext_shader_atomic_int64_supported(),
+        support_derivative_control: true,
+        support_geometry_shader_passthrough: device.is_nv_geometry_shader_passthrough_supported(),
+        support_native_ndc: device.is_ext_depth_clip_control_supported(),
+        support_scaled_attributes: !device.must_emulate_scaled_formats(),
+        support_multi_viewport: device.supports_multi_viewport(),
+        support_geometry_streams: device.are_transform_feedback_geometry_streams_supported(),
+        warp_size_potentially_larger_than_guest: device
+            .is_warp_size_potentially_bigger_than_guest(),
+        lower_left_origin_mode: false,
+        need_declared_frag_colors: false,
+        need_gather_subpixel_offset: needs_gather_subpixel_offset(driver_id),
+        has_broken_spirv_clamp: driver_id == vk::DriverId::INTEL_PROPRIETARY_WINDOWS,
+        has_broken_spirv_position_input: driver_id == vk::DriverId::QUALCOMM_PROPRIETARY,
+        has_broken_unsigned_image_offsets: false,
+        has_broken_signed_operations: false,
+        has_broken_fp16_float_controls: driver_id == vk::DriverId::NVIDIA_PROPRIETARY,
+        ignore_nan_fp_comparisons: false,
+        has_broken_spirv_subgroup_mask_vector_extract_dynamic: driver_id
+            == vk::DriverId::QUALCOMM_PROPRIETARY,
+        has_broken_robust: device.is_nvidia()
+            && device.get_nvidia_arch() <= NvidiaArchitecture::Pascal,
+        min_ssbo_alignment: device.get_storage_buffer_alignment(),
+        max_user_clip_distances: device.get_max_user_clip_distances(),
+        ..Profile::default()
+    }
+}
 
 /// One-time installation of the shader-exception panic-hook filter. The hook
 /// remains process-wide, but only typed shader exceptions inside this
@@ -1351,6 +1430,22 @@ mod tests {
         RtControlInfo, SamplerBinding, ScissorInfo, ShaderStageInfo, StencilFaceInfo, ViewportInfo,
         ZetaInfo,
     };
+
+    #[test]
+    fn gather_subpixel_offset_matches_upstream_driver_list() {
+        for driver in [
+            vk::DriverId::AMD_PROPRIETARY,
+            vk::DriverId::AMD_OPEN_SOURCE,
+            vk::DriverId::MESA_RADV,
+            vk::DriverId::INTEL_PROPRIETARY_WINDOWS,
+            vk::DriverId::INTEL_OPEN_SOURCE_MESA,
+        ] {
+            assert!(needs_gather_subpixel_offset(driver));
+        }
+        assert!(!needs_gather_subpixel_offset(
+            vk::DriverId::NVIDIA_PROPRIETARY
+        ));
+    }
 
     #[test]
     fn shader_exception_scope_catches_only_shader_exceptions() {

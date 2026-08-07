@@ -48,6 +48,106 @@ pub fn load_system_values() {
     let mut config = BaseConfig::new(ConfigType::GlobalConfig);
     config.initialize(&path);
     config.read_system_values();
+
+    let contents = std::fs::read_to_string(path).unwrap_or_default();
+    let storage = parse_section_values(&contents, "Data%20Storage");
+    if storage
+        .get("tas_directory\\default")
+        .is_some_and(|value| !is_true(value))
+    {
+        if let Some(path) = storage.get("tas_directory") {
+            common::fs::path_util::set_ruzu_path(
+                RuzuPath::TASDir,
+                std::path::Path::new(unquote(path)),
+            );
+        }
+    }
+}
+
+/// Persist the three settings owned by upstream `ConfigureTasDialog`.
+pub fn save_tas_values() -> io::Result<()> {
+    let path = config_path();
+    let mut contents = std::fs::read_to_string(&path).unwrap_or_default();
+    let values = common::settings::values();
+    for (key, value, default) in [
+        (
+            "pause_tas_on_load",
+            *values.pause_tas_on_load.get_value(),
+            *values.pause_tas_on_load.get_default(),
+        ),
+        (
+            "tas_enable",
+            *values.tas_enable.get_value(),
+            *values.tas_enable.get_default(),
+        ),
+        (
+            "tas_loop",
+            *values.tas_loop.get_value(),
+            *values.tas_loop.get_default(),
+        ),
+    ] {
+        contents = replace_section_setting(
+            &contents,
+            "Controls",
+            key,
+            &value.to_string(),
+            value == default,
+        );
+    }
+    drop(values);
+    contents = replace_section_setting(
+        &contents,
+        "Data%20Storage",
+        "tas_directory",
+        &common::fs::path_util::get_ruzu_path_string(RuzuPath::TASDir),
+        false,
+    );
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, contents)
+}
+
+fn replace_section_setting(
+    contents: &str,
+    section: &str,
+    key: &str,
+    value: &str,
+    is_default: bool,
+) -> String {
+    let mut lines: Vec<String> = contents.lines().map(str::to_owned).collect();
+    let header = format!("[{section}]");
+    let start = lines.iter().position(|line| line.trim() == header);
+    let start = match start {
+        Some(start) => start,
+        None => {
+            if !lines.is_empty() && !lines.last().is_some_and(String::is_empty) {
+                lines.push(String::new());
+            }
+            lines.push(header);
+            lines.len() - 1
+        }
+    };
+    let end = lines[start + 1..]
+        .iter()
+        .position(|line| line.trim().starts_with('['))
+        .map_or(lines.len(), |offset| start + 1 + offset);
+    let assignments = [
+        (format!("{key}\\default="), is_default.to_string()),
+        (format!("{key}="), value.to_owned()),
+    ];
+    let mut insert_at = end;
+    for (prefix, rendered) in assignments {
+        if let Some(index) = (start + 1..end).find(|&index| lines[index].starts_with(&prefix)) {
+            lines[index] = format!("{prefix}{rendered}");
+        } else {
+            lines.insert(insert_at, format!("{prefix}{rendered}"));
+            insert_at += 1;
+        }
+    }
+    let mut output = lines.join("\n");
+    output.push('\n');
+    output
 }
 
 /// Read `UISettings::values.language`, the `Paths\language` entry owned by
@@ -726,6 +826,17 @@ fn is_true(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tas_setting_replacement_preserves_sections_and_default_marker() {
+        let original = "[Controls]\ntas_enable\\default=true\ntas_enable=false\n[UI]\nfoo=bar\n";
+        let updated = replace_section_setting(original, "Controls", "tas_enable", "true", false);
+
+        assert!(updated.contains("tas_enable\\default=false"));
+        assert!(updated.contains("tas_enable=true"));
+        assert!(updated.contains("[UI]\nfoo=bar"));
+        assert_eq!(updated.matches("tas_enable=").count(), 1);
+    }
 
     /// The binding a real Xbox pad produces, as yuzu writes it.
     const SDL_BINDING: &str = "engine:sdl,port:0,guid:030000005e040000000b000015050000,button:1";

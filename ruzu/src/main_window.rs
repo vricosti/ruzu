@@ -10,10 +10,9 @@
 //   * a central widget hosting the game list;
 //   * a `QStatusBar` with a message label plus permanent status widgets.
 //
-// This module reproduces that structure with GTK4. The menu *actions* are
-// registered as stubs (they log when triggered) so the menus are visible and
-// selectable but not yet wired to real behaviour — matching the current
-// milestone: "build the main window with un-wired menus".
+// This module reproduces that structure with GTK4. Implemented actions are
+// owned by `GMainWindow`; entries whose upstream subsystem is still absent are
+// registered as explicit logging stubs by `install_menu_actions`.
 
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
@@ -53,6 +52,10 @@ const INPUT_UPDATE_TIMEOUT_MS: u64 = 1;
 /// Upstream `status_bar_update_timer` interval.
 const STATUS_BAR_UPDATE_TIMEOUT_MS: u64 = 500;
 
+const QUICKSTART_URL: &str = "https://github.com/vricosti/ruzu/blob/main/docs/quickstart.md";
+const MISSING_KEYS_TITLE: &str = "Derivation Components Missing";
+const MISSING_KEYS_DETAIL: &str = "Encryption keys are missing. <br>Please follow <a href='https://github.com/vricosti/ruzu/blob/main/docs/quickstart.md'>the ruzu quickstart guide</a> to install your keys and firmware, then add your games.";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FullscreenHotkey {
     Toggle,
@@ -83,6 +86,10 @@ fn fullscreen_hotkey(keyval: gtk::gdk::Key) -> Option<FullscreenHotkey> {
         gtk::gdk::Key::Escape => Some(FullscreenHotkey::Exit),
         _ => None,
     }
+}
+
+fn should_warn_about_missing_keys(keys_present: bool) -> bool {
+    !keys_present
 }
 
 /// The main launcher window.
@@ -116,6 +123,10 @@ pub struct GMainWindow {
     session_generation: Cell<u64>,
     /// Bottom status bar (renderer / accuracy / dock / filter / AA / volume).
     status_bar: Rc<StatusBar>,
+    /// Last TAS state reflected in the menu labels.
+    tas_state: Cell<input_common::drivers::tas_input::TasState>,
+    /// Prevent duplicate asynchronous amiibo file choosers.
+    is_amiibo_file_select_active: Cell<bool>,
     /// Native render-window handles for the running game, so it can be resized
     /// when the GTK window resizes.
     render: RefCell<Option<RenderHandles>>,
@@ -366,6 +377,23 @@ mod fullscreen_hotkey_tests {
 }
 
 #[cfg(test)]
+mod pause_menu_tests {
+    use super::*;
+    use input_common::drivers::tas_input::TasState;
+
+    #[test]
+    fn pause_label_follows_emulation_thread_state() {
+        let running = menu_ui_for_state(TasState::Stopped, false);
+        assert!(running.contains(">_Pause</attribute>"));
+        assert!(!running.contains(">_Continue</attribute>"));
+
+        let paused = menu_ui_for_state(TasState::Stopped, true);
+        assert!(paused.contains(">_Continue</attribute>"));
+        assert!(!paused.contains(">_Pause</attribute>"));
+    }
+}
+
+#[cfg(test)]
 mod stop_confirmation_tests {
     use super::*;
 
@@ -395,6 +423,51 @@ mod stop_confirmation_tests {
             stop_confirmation(ConfirmStop::AskNever, true),
             StopConfirmation::None
         );
+    }
+}
+
+#[cfg(test)]
+mod startup_prerequisite_tests {
+    use super::*;
+
+    #[test]
+    fn startup_warning_is_shown_only_when_keys_are_missing() {
+        assert!(should_warn_about_missing_keys(false));
+        assert!(!should_warn_about_missing_keys(true));
+        assert!(!MISSING_KEYS_DETAIL.contains("yuzu"));
+        assert!(MISSING_KEYS_DETAIL.contains(QUICKSTART_URL));
+        assert!(include_str!("../../docs/quickstart.md").contains("Install decryption keys"));
+    }
+}
+
+#[cfg(test)]
+mod help_menu_tests {
+    use super::*;
+
+    #[test]
+    fn help_menu_only_exposes_quickstart_and_about() {
+        assert!(MENU_ACTION_NAMES.contains(&"open_quickstart_guide"));
+        assert!(MENU_ACTION_NAMES.contains(&"about"));
+        for removed in ["report_compatibility", "open_mods_page", "open_faq"] {
+            assert!(!MENU_ACTION_NAMES.contains(&removed));
+            assert!(!MENU_UI.contains(&format!("app.{removed}")));
+        }
+        assert_eq!(MENU_UI.matches("app.open_quickstart_guide").count(), 1);
+        assert_eq!(MENU_UI.matches("app.about").count(), 1);
+    }
+
+    #[test]
+    fn unimplemented_multiplayer_menu_is_hidden() {
+        assert!(!MENU_UI.contains("_Multiplayer"));
+        for action in [
+            "view_lobby",
+            "start_room",
+            "connect_to_room",
+            "show_room",
+            "leave_room",
+        ] {
+            assert!(!MENU_UI.contains(&format!("app.{action}")));
+        }
     }
 }
 
@@ -557,6 +630,8 @@ impl GMainWindow {
             stop_confirmation_pending: Cell::new(false),
             session_generation: Cell::new(0),
             status_bar,
+            tas_state: Cell::new(input_common::drivers::tas_input::TasState::Stopped),
+            is_amiibo_file_select_active: Cell::new(false),
             render: RefCell::new(None),
             render_size: Cell::new((0, 0)),
             configure_dialog: RefCell::new(None),
@@ -588,12 +663,12 @@ impl GMainWindow {
         this.stack.set_visible_child_name(PAGE_GAME_LIST);
         *this.game_list.borrow_mut() = Some(game_list_handle);
 
-        // First run with an importable yuzu configuration: ask before copying
-        // anything. Deferred to an idle callback so the window is on screen
-        // behind the dialog rather than appearing after it.
-        if offer_config_import {
+        // Upstream shows the window before checking decryption components.
+        // Defer the check so GTK has presented the parent window, and sequence
+        // ruzu's optional first-run import before it to avoid stacked dialogs.
+        {
             let this = Rc::clone(&this);
-            glib::idle_add_local_once(move || this.maybe_offer_yuzu_import());
+            glib::idle_add_local_once(move || this.run_startup_checks(offer_config_import));
         }
 
         // Keep the embedded render surface sized to the central stack as the
@@ -719,6 +794,17 @@ impl GMainWindow {
         ));
         app.add_action(&load_folder);
 
+        // Upstream `connect_menu(action_Pause, OnPauseContinueGame)` and the
+        // default "Continue/Pause Emulation" hotkey.
+        let pause = gio::SimpleAction::new("pause", None);
+        pause.connect_activate(glib::clone!(
+            #[weak(rename_to = this)]
+            self,
+            move |_, _| this.on_pause_continue_game()
+        ));
+        app.add_action(&pause);
+        app.set_accels_for_action("app.pause", &["F4"]);
+
         // Upstream `connect_menu(action_Stop, OnStopGame)` and the default
         // "Stop Emulation" hotkey.
         let stop = gio::SimpleAction::new("stop", None);
@@ -764,6 +850,44 @@ impl GMainWindow {
         window_action!("install_keys", on_install_decryption_keys);
         window_action!("install_firmware", on_install_firmware);
         window_action!("verify_installed_contents", on_verify_installed_contents);
+        window_action!("load_amiibo", on_load_amiibo);
+        window_action!("load_album", on_album);
+        window_action!("load_mii_edit", on_mii_edit);
+        window_action!("open_controller_menu", on_open_controller_menu);
+        window_action!("capture_screenshot", on_capture_screenshot);
+        window_action!("tas_start", on_tas_start_stop);
+        window_action!("tas_record", on_tas_record);
+        window_action!("tas_reset", on_tas_reset);
+        window_action!("configure_tas", on_configure_tas);
+
+        for (name, mode) in [
+            (
+                "load_cabinet_nickname_owner",
+                ruzu_core::hle::service::am::frontend::applet_cabinet::CabinetMode::StartNicknameAndOwnerSettings,
+            ),
+            (
+                "load_cabinet_eraser",
+                ruzu_core::hle::service::am::frontend::applet_cabinet::CabinetMode::StartGameDataEraser,
+            ),
+            (
+                "load_cabinet_restorer",
+                ruzu_core::hle::service::am::frontend::applet_cabinet::CabinetMode::StartRestorer,
+            ),
+            (
+                "load_cabinet_formatter",
+                ruzu_core::hle::service::am::frontend::applet_cabinet::CabinetMode::StartFormatter,
+            ),
+        ] {
+            let action = gio::SimpleAction::new(name, None);
+            action.connect_activate(glib::clone!(
+                #[weak(rename_to = this)]
+                self,
+                move |_, _| this.on_cabinet(mode)
+            ));
+            app.add_action(&action);
+        }
+        window_action!("open_quickstart_guide", on_open_quickstart_guide);
+        window_action!("about", on_about);
 
         // The blocks above replace the startup stubs by name, which resets
         // their enabled state; re-apply it (upstream re-runs `UpdateMenuState`
@@ -1108,18 +1232,23 @@ impl GMainWindow {
         }
     }
 
+    /// Run the checks that upstream performs after presenting the main window.
+    fn run_startup_checks(self: &Rc<Self>, offer_config_import: bool) {
+        if offer_config_import && self.maybe_offer_yuzu_import() {
+            return;
+        }
+        self.on_check_firmware_decryption();
+    }
+
     /// On a first run with an existing yuzu installation, offer to import its
     /// configuration.
     ///
     /// ruzu has no upstream counterpart for this — yuzu has nothing to migrate
-    /// *from*. The rule is that nothing is copied without the user saying so,
-    /// and yuzu's directory is only ever read.
-    ///
-    /// The offer is made once: whichever way it is answered, a marker is
-    /// written into ruzu's config directory so the next launch starts silently.
-    fn maybe_offer_yuzu_import(self: &Rc<Self>) {
+    /// *from*. The offer is made once, and the key check follows its response.
+    /// Return whether the asynchronous import question was presented.
+    fn maybe_offer_yuzu_import(self: &Rc<Self>) -> bool {
         let Some(import) = crate::config_import::available_import() else {
-            return;
+            return false;
         };
 
         crate::gtk_compat::ask_question(
@@ -1144,9 +1273,44 @@ impl GMainWindow {
                     } else {
                         import.decline();
                     }
+                    this.on_check_firmware_decryption();
                 }
             ),
         );
+        true
+    }
+
+    /// Upstream `GMainWindow::OnCheckFirmwareDecryption`.
+    ///
+    /// Missing firmware by itself does not produce a startup warning upstream;
+    /// it only hides the firmware version and disables firmware applets.
+    fn on_check_firmware_decryption(&self) {
+        if should_warn_about_missing_keys(frontend_common::content_manager::are_keys_present()) {
+            crate::gtk_compat::show_warning_markup(
+                Some(&self.window),
+                MISSING_KEYS_TITLE,
+                MISSING_KEYS_DETAIL,
+            );
+        }
+    }
+
+    /// Upstream `GMainWindow::OnOpenQuickstartGuide`.
+    fn on_open_quickstart_guide(&self) {
+        if let Err(error) =
+            gio::AppInfo::launch_default_for_uri(QUICKSTART_URL, gio::AppLaunchContext::NONE)
+        {
+            log::error!("Failed to open quickstart guide: {error}");
+            let detail = crate::i18n::tr_args(
+                "Unable to open the URL \"%1\".",
+                &[QUICKSTART_URL.to_string()],
+            );
+            crate::gtk_compat::show_warning(Some(&self.window), "Error opening URL", &detail);
+        }
+    }
+
+    /// Upstream `GMainWindow::OnAbout`.
+    fn on_about(&self) {
+        crate::about_dialog::AboutDialog::new(&self.window).present();
     }
 
     /// Re-read everything that came from the freshly imported configuration.
@@ -1181,7 +1345,7 @@ impl GMainWindow {
         }
 
         let filter = gtk::FileFilter::new();
-        filter.set_name(Some("prod.keys"));
+        filter.set_name(Some("prod.keys (prod.keys)"));
         filter.add_pattern("prod.keys");
 
         log::info!("Install Decryption Keys: opening file chooser");
@@ -1461,6 +1625,392 @@ impl GMainWindow {
         }
     }
 
+    fn system_applet_path(&self, program_id: u64, applet_name: &str) -> Option<String> {
+        use ruzu_core::file_sys::nca_metadata::ContentRecordType;
+        use ruzu_core::file_sys::registered_cache::ContentProvider;
+        let vfs = ruzu_core::file_sys::vfs::vfs_real::RealVfsFilesystem::new();
+        let mut filesystem =
+            ruzu_core::hle::service::filesystem::filesystem::FileSystemController::new();
+        filesystem.create_factories(vfs, false);
+        let Some(contents) = filesystem.get_system_nand_contents() else {
+            self.alert(
+                "No firmware available",
+                &format!("Please install the firmware to use the {applet_name}."),
+            );
+            return None;
+        };
+        let Some(nca) = contents.get_entry(program_id, ContentRecordType::Program) else {
+            self.alert(
+                applet_name,
+                &format!("The {applet_name} is not available. Please reinstall the firmware."),
+            );
+            return None;
+        };
+        Some(nca.get_base_file().get_full_path())
+    }
+
+    /// Upstream `GMainWindow::OnLoadAmiibo`.
+    fn on_load_amiibo(self: &Rc<Self>) {
+        use input_common::drivers::virtual_amiibo::State;
+
+        if self
+            .session
+            .borrow()
+            .as_ref()
+            .and_then(EmulationSession::program_id)
+            .is_none()
+            || self.is_amiibo_file_select_active.get()
+        {
+            return;
+        }
+
+        let state = self
+            .input_subsystem
+            .borrow()
+            .get_virtual_amiibo()
+            .map(|amiibo| amiibo.get_current_state());
+        match state {
+            Some(State::TagNearby) => {
+                if let Some(amiibo) = self.input_subsystem.borrow_mut().get_virtual_amiibo_mut() {
+                    amiibo.close_amiibo();
+                }
+                self.alert("Amiibo", "The current amiibo has been removed");
+                return;
+            }
+            Some(State::WaitingForAmiibo) => {}
+            _ => {
+                self.alert("Error", "The current game is not looking for amiibos");
+                return;
+            }
+        }
+
+        let amiibo_filter = gtk::FileFilter::new();
+        amiibo_filter.set_name(Some(&crate::i18n::tr("Amiibo File (*.bin)")));
+        amiibo_filter.add_pattern("*.bin");
+        let all_files = gtk::FileFilter::new();
+        all_files.set_name(Some(&crate::i18n::tr("All Files (*.*)")));
+        all_files.add_pattern("*");
+
+        self.is_amiibo_file_select_active.set(true);
+        crate::gtk_compat::open_file(
+            Some(&self.window),
+            "Load Amiibo",
+            &[amiibo_filter.clone(), all_files],
+            Some(&amiibo_filter),
+            glib::clone!(
+                #[weak(rename_to = this)]
+                self,
+                move |result| {
+                    this.is_amiibo_file_select_active.set(false);
+                    let Some(path) = result.and_then(|file| file.path()) else {
+                        return;
+                    };
+                    this.load_amiibo(&path);
+                }
+            ),
+        );
+    }
+
+    /// Upstream `GMainWindow::LoadAmiibo`.
+    fn load_amiibo(&self, path: &std::path::Path) {
+        use input_common::drivers::virtual_amiibo::Info;
+
+        let result = self
+            .input_subsystem
+            .borrow_mut()
+            .get_virtual_amiibo_mut()
+            .map(|amiibo| amiibo.load_amiibo_from_file(&path.to_string_lossy()))
+            .unwrap_or(Info::Unknown);
+        let detail = match result {
+            Info::Success => return,
+            Info::NotAnAmiibo => "The selected file is not a valid amiibo",
+            Info::UnableToLoad => "The selected file is already on use",
+            Info::WrongDeviceState => "The current game is not looking for amiibos",
+            Info::Unknown => "An unknown error occurred",
+        };
+        self.alert("Error loading Amiibo data", detail);
+    }
+
+    fn launch_system_applet(
+        self: &Rc<Self>,
+        program_id: ruzu_core::hle::service::am::am_types::AppletProgramId,
+        applet_id: ruzu_core::hle::service::am::am_types::AppletId,
+        applet_name: &str,
+        cabinet_mode: Option<ruzu_core::hle::service::am::frontend::applet_cabinet::CabinetMode>,
+    ) {
+        use ruzu_core::hle::service::am::am_types::AppletType;
+        use ruzu_core::hle::service::am::applet_manager::{FrontendAppletParameters, LaunchType};
+
+        let program_id = program_id as u64;
+        let Some(path) = self.system_applet_path(program_id, applet_name) else {
+            return;
+        };
+        self.boot_game_with_parameters(
+            path,
+            crate::boot::BootParameters {
+                applet: FrontendAppletParameters {
+                    program_id,
+                    applet_id,
+                    applet_type: AppletType::LibraryApplet,
+                    launch_type: LaunchType::FrontendInitiated,
+                    program_index: 0,
+                    previous_program_index: -1,
+                },
+                cabinet_mode,
+            },
+        );
+    }
+
+    fn on_album(self: &Rc<Self>) {
+        use ruzu_core::hle::service::am::am_types::{AppletId, AppletProgramId};
+        self.launch_system_applet(
+            AppletProgramId::PhotoViewer,
+            AppletId::PhotoViewer,
+            "Album applet",
+            None,
+        );
+    }
+
+    fn on_cabinet(
+        self: &Rc<Self>,
+        mode: ruzu_core::hle::service::am::frontend::applet_cabinet::CabinetMode,
+    ) {
+        use ruzu_core::hle::service::am::am_types::{AppletId, AppletProgramId};
+        self.launch_system_applet(
+            AppletProgramId::Cabinet,
+            AppletId::Cabinet,
+            "Cabinet applet",
+            Some(mode),
+        );
+    }
+
+    fn on_mii_edit(self: &Rc<Self>) {
+        use ruzu_core::hle::service::am::am_types::{AppletId, AppletProgramId};
+        self.launch_system_applet(
+            AppletProgramId::MiiEdit,
+            AppletId::MiiEdit,
+            "Mii editor",
+            None,
+        );
+    }
+
+    fn on_open_controller_menu(self: &Rc<Self>) {
+        use ruzu_core::hle::service::am::am_types::{AppletId, AppletProgramId};
+        self.launch_system_applet(
+            AppletProgramId::Controller,
+            AppletId::Controller,
+            "Controller Menu",
+            None,
+        );
+    }
+
+    fn on_capture_screenshot(self: &Rc<Self>) {
+        use common::settings_enums::AspectRatio;
+        use ruzu_core::frontend::framebuffer_layout::{ScreenDocked, ScreenUndocked};
+
+        let Some(program_id) = self
+            .session
+            .borrow()
+            .as_ref()
+            .and_then(EmulationSession::program_id)
+        else {
+            return;
+        };
+        let values = common::settings::values();
+        let mut height = crate::uisettings::with(|ui| *ui.screenshot_height.get_value());
+        if height == 0 {
+            height = if common::settings::is_docked_mode(&values) {
+                ScreenDocked::HEIGHT
+            } else {
+                ScreenUndocked::HEIGHT
+            };
+            height = (height as f32 * values.resolution_info.up_factor) as u32;
+        }
+        let width = match *values.aspect_ratio.get_value() {
+            AspectRatio::R16_9 => height * 16 / 9,
+            AspectRatio::R4_3 => height * 4 / 3,
+            AspectRatio::R21_9 => height * 21 / 9,
+            AspectRatio::R16_10 => height * 16 / 10,
+            AspectRatio::Stretch => self
+                .render
+                .borrow()
+                .as_ref()
+                .map(|render| {
+                    let current = render.framebuffer_layout.read().unwrap();
+                    (height as f64 * current.width as f64 / current.height as f64).round() as u32
+                })
+                .unwrap_or(height * 16 / 9),
+        };
+        let layout = default_frame_layout(width, height);
+        let date = glib::DateTime::now_local()
+            .and_then(|date| date.format("%Y-%m-%d_%H-%M-%S-%f"))
+            .map(|date| date.to_string())
+            .unwrap_or_else(|_| "unknown-time".to_owned());
+        let base = crate::uisettings::with(|ui| {
+            let configured = ui.screenshot_path.get_value();
+            if configured.is_empty() {
+                common::fs::path_util::get_ruzu_path(
+                    common::fs::path_util::RuzuPath::ScreenshotsDir,
+                )
+            } else {
+                configured.into()
+            }
+        });
+        let path = base.join(format!("{program_id:016x}_{date}.png"));
+
+        #[cfg(target_os = "windows")]
+        if crate::uisettings::with(|ui| *ui.enable_screenshot_save_as.get_value()) {
+            if !self
+                .session
+                .borrow()
+                .as_ref()
+                .is_some_and(EmulationSession::pause)
+            {
+                log::error!("Failed to pause emulation before screenshot file selection");
+                return;
+            }
+
+            let filter = gtk::FileFilter::new();
+            filter.set_name(Some(&crate::i18n::tr("PNG Image (*.png)")));
+            filter.add_mime_type("image/png");
+            filter.add_pattern("*.png");
+            crate::gtk_compat::save_file(
+                Some(&self.window),
+                "Capture Screenshot",
+                &path,
+                std::slice::from_ref(&filter),
+                Some(&filter),
+                glib::clone!(
+                    #[weak(rename_to = this)]
+                    self,
+                    move |file| {
+                        let resumed = this
+                            .session
+                            .borrow()
+                            .as_ref()
+                            .is_some_and(EmulationSession::resume);
+                        if !resumed {
+                            log::error!(
+                                "Failed to resume emulation after screenshot file selection"
+                            );
+                            return;
+                        }
+                        let Some(path) = file.and_then(|file| file.path()) else {
+                            return;
+                        };
+                        this.capture_screenshot_to(path, layout);
+                    }
+                ),
+            );
+            return;
+        }
+
+        self.capture_screenshot_to(path, layout);
+    }
+
+    fn capture_screenshot_to(&self, path: std::path::PathBuf, layout: FramebufferLayout) {
+        if !self
+            .session
+            .borrow()
+            .as_ref()
+            .is_some_and(|session| session.capture_screenshot(path, layout))
+        {
+            log::error!("Failed to send screenshot request to the emulation thread");
+        }
+    }
+
+    fn reset_tas_system_buttons(&self) {
+        use hid_core::hid_types::NpadIdType;
+        self.hid_core
+            .lock()
+            .get_emulated_controller(NpadIdType::Player1)
+            .lock()
+            .reset_system_buttons();
+    }
+
+    fn on_tas_start_stop(self: &Rc<Self>) {
+        if self.session.borrow().is_none() {
+            return;
+        }
+        self.reset_tas_system_buttons();
+        if let Some(tas) = self.input_subsystem.borrow().get_tas() {
+            tas.lock().start_stop();
+        }
+        self.refresh_tas_ui();
+    }
+
+    fn on_tas_record(self: &Rc<Self>) {
+        if self.session.borrow().is_none() {
+            return;
+        }
+        self.reset_tas_system_buttons();
+        let Some(tas) = self.input_subsystem.borrow().get_tas() else {
+            return;
+        };
+        if tas.lock().record() {
+            self.refresh_tas_ui();
+            return;
+        }
+        self.refresh_tas_ui();
+        crate::gtk_compat::ask_question(
+            Some(&self.window),
+            "TAS Recording",
+            "Overwrite file of player 1?",
+            "No",
+            "Yes",
+            move |overwrite| tas.lock().save_recording(overwrite),
+        );
+    }
+
+    fn on_tas_reset(self: &Rc<Self>) {
+        if let Some(tas) = self.input_subsystem.borrow().get_tas() {
+            tas.lock().reset();
+        }
+    }
+
+    /// GTK counterpart of upstream `OnTasStateChanged` plus the TAS portion of
+    /// `UpdateStatusBar`.
+    fn refresh_tas_ui(&self) {
+        use input_common::drivers::tas_input::TasState;
+
+        let status = if self.session.borrow().is_some() {
+            self.input_subsystem
+                .borrow()
+                .get_tas()
+                .map(|tas| tas.lock().get_status())
+        } else {
+            None
+        };
+        self.status_bar.update_tas(status);
+
+        let state = status.map(|status| status.0).unwrap_or(TasState::Stopped);
+        if self.tas_state.replace(state) == state {
+            return;
+        }
+        self.refresh_menu_model();
+    }
+
+    /// Rebuild GTK's immutable menu model after an upstream QAction label
+    /// change (pause/continue, TAS start/stop, or language change).
+    fn refresh_menu_model(&self) {
+        let is_paused = self
+            .session
+            .borrow()
+            .as_ref()
+            .is_some_and(EmulationSession::is_paused);
+        let menu = build_menu_model_for_state(self.tas_state.get(), is_paused);
+        if let Some(app) = self.window.application() {
+            app.set_menubar(Some(&menu));
+        }
+        if let Some(menu_bar) = self.menu_bar.as_ref() {
+            menu_bar.set_menu_model(Some(&menu));
+        }
+    }
+
+    fn on_configure_tas(self: &Rc<Self>) {
+        crate::configuration::configure_tas::present(self.window.upcast_ref());
+    }
+
     /// Show a modal message — the `QMessageBox` calls peppered through the
     /// upstream handlers.
     fn alert(&self, message: &str, detail: &str) {
@@ -1549,11 +2099,19 @@ impl GMainWindow {
         );
     }
 
+    pub fn boot_game(self: &Rc<Self>, filepath: String) {
+        self.boot_game_with_parameters(filepath, crate::boot::BootParameters::default());
+    }
+
     /// Boot `filepath` into the embedded render surface. Stand-in for upstream
     /// `GMainWindow::BootGame`: attach the Metal layer, show the loading screen,
     /// start the boot thread, and reveal the render view when loading completes.
     #[cfg(target_os = "macos")]
-    pub fn boot_game(self: &Rc<Self>, filepath: String) {
+    fn boot_game_with_parameters(
+        self: &Rc<Self>,
+        filepath: String,
+        parameters: crate::boot::BootParameters,
+    ) {
         use crate::emu_window::GtkEmuWindow;
 
         // The render surface only exists once the window is realized, and the
@@ -1570,7 +2128,7 @@ impl GMainWindow {
                     && this.stack.width() > 0
                     && this.stack.height() > 0
                 {
-                    this.boot_game(filepath.clone());
+                    this.boot_game_with_parameters(filepath.clone(), parameters);
                     glib::ControlFlow::Break
                 } else {
                     glib::ControlFlow::Continue
@@ -1582,6 +2140,9 @@ impl GMainWindow {
         // Stop any existing session first (upstream stops before re-booting).
         if let Some(mut session) = self.session.borrow_mut().take() {
             session.stop();
+        }
+        if let Some(tas) = self.input_subsystem.borrow().get_tas() {
+            tas.lock().stop();
         }
         let session_generation = self.session_generation.get().wrapping_add(1);
         self.session_generation.set(session_generation);
@@ -1699,7 +2260,9 @@ impl GMainWindow {
             shown_state,
             framebuffer_layout,
             Arc::clone(&self.hid_core),
+            self.input_subsystem.borrow().get_tas(),
             filepath,
+            parameters,
             loading_event,
         );
         *self.session.borrow_mut() = Some(session);
@@ -1717,7 +2280,11 @@ impl GMainWindow {
     /// an X11 child `Window` instead of a `CAMetalLayer` sub-view, matching
     /// upstream's per-platform `GetWindowSystemInfo`.
     #[cfg(target_os = "linux")]
-    pub fn boot_game(self: &Rc<Self>, filepath: String) {
+    fn boot_game_with_parameters(
+        self: &Rc<Self>,
+        filepath: String,
+        parameters: crate::boot::BootParameters,
+    ) {
         use crate::emu_window::GtkEmuWindow;
         use crate::render_window_x11 as render;
         use ruzu_core::frontend::emu_window::{WindowSystemInfo, WindowSystemType};
@@ -1733,7 +2300,7 @@ impl GMainWindow {
                     && this.stack.width() > 0
                     && this.stack.height() > 0
                 {
-                    this.boot_game(filepath.clone());
+                    this.boot_game_with_parameters(filepath.clone(), parameters);
                     glib::ControlFlow::Break
                 } else {
                     glib::ControlFlow::Continue
@@ -1745,6 +2312,9 @@ impl GMainWindow {
         // Stop any existing session first (upstream stops before re-booting).
         if let Some(mut session) = self.session.borrow_mut().take() {
             session.stop();
+        }
+        if let Some(tas) = self.input_subsystem.borrow().get_tas() {
+            tas.lock().stop();
         }
         let session_generation = self.session_generation.get().wrapping_add(1);
         self.session_generation.set(session_generation);
@@ -1863,7 +2433,9 @@ impl GMainWindow {
             shown_state,
             framebuffer_layout,
             Arc::clone(&self.hid_core),
+            self.input_subsystem.borrow().get_tas(),
             filepath,
+            parameters,
             loading_event,
         );
         *self.session.borrow_mut() = Some(session);
@@ -1881,7 +2453,11 @@ impl GMainWindow {
     /// `windowHandle()->winId()` to Vulkan. GTK has no native surface per
     /// widget, so `render_window_windows` creates the equivalent child directly.
     #[cfg(target_os = "windows")]
-    pub fn boot_game(self: &Rc<Self>, filepath: String) {
+    fn boot_game_with_parameters(
+        self: &Rc<Self>,
+        filepath: String,
+        parameters: crate::boot::BootParameters,
+    ) {
         use crate::emu_window::GtkEmuWindow;
         use crate::render_window_windows as render;
         use ruzu_core::frontend::emu_window::{WindowSystemInfo, WindowSystemType};
@@ -1895,7 +2471,7 @@ impl GMainWindow {
                     && this.stack.width() > 0
                     && this.stack.height() > 0
                 {
-                    this.boot_game(filepath.clone());
+                    this.boot_game_with_parameters(filepath.clone(), parameters);
                     glib::ControlFlow::Break
                 } else {
                     glib::ControlFlow::Continue
@@ -1908,6 +2484,9 @@ impl GMainWindow {
         // next one. Stop the session first so Vulkan no longer owns its HWND.
         if let Some(mut session) = self.session.borrow_mut().take() {
             session.stop();
+        }
+        if let Some(tas) = self.input_subsystem.borrow().get_tas() {
+            tas.lock().stop();
         }
         if let Some(handles) = self.render.borrow_mut().take() {
             render::destroy_render_window(handles.child_window as _);
@@ -2017,7 +2596,9 @@ impl GMainWindow {
             shown_state,
             framebuffer_layout,
             Arc::clone(&self.hid_core),
+            self.input_subsystem.borrow().get_tas(),
             filepath,
+            parameters,
             loading_event,
         );
         *self.session.borrow_mut() = Some(session);
@@ -2031,7 +2612,11 @@ impl GMainWindow {
 
     /// In-process boot needs a platform-specific native render surface.
     #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
-    pub fn boot_game(self: &Rc<Self>, _filepath: String) {
+    fn boot_game_with_parameters(
+        self: &Rc<Self>,
+        _filepath: String,
+        _parameters: crate::boot::BootParameters,
+    ) {
         log::error!("In-process boot is not implemented on this platform yet");
     }
 
@@ -2157,6 +2742,59 @@ impl GMainWindow {
         }
     }
 
+    /// Resume the emulation thread — upstream `GMainWindow::OnStartGame`.
+    fn on_start_game(&self) {
+        let resumed = self
+            .session
+            .borrow()
+            .as_ref()
+            .is_some_and(EmulationSession::resume);
+        if !resumed {
+            log::error!("Failed to resume the emulation thread");
+            return;
+        }
+        if let Some(app) = self.window.application() {
+            update_menu_state(&app, true, false);
+        }
+        self.refresh_tas_ui();
+        self.refresh_menu_model();
+    }
+
+    /// Suspend the emulation thread — upstream `GMainWindow::OnPauseGame`.
+    fn on_pause_game(&self) {
+        let paused = self
+            .session
+            .borrow()
+            .as_ref()
+            .is_some_and(EmulationSession::pause);
+        if !paused {
+            log::error!("Failed to pause the emulation thread");
+            return;
+        }
+        if let Some(app) = self.window.application() {
+            update_menu_state(&app, true, true);
+        }
+        self.refresh_menu_model();
+    }
+
+    /// Toggle pause only while a title is active — upstream
+    /// `GMainWindow::OnPauseContinueGame`.
+    fn on_pause_continue_game(&self) {
+        let Some(is_paused) = self
+            .session
+            .borrow()
+            .as_ref()
+            .map(EmulationSession::is_paused)
+        else {
+            return;
+        };
+        if is_paused {
+            self.on_start_game();
+        } else {
+            self.on_pause_game();
+        }
+    }
+
     /// Upstream `GMainWindow::OnStopGame` and `ConfirmShutdownGame`.
     fn on_stop_game(self: &Rc<Self>) {
         let Some(exit_locked) = self
@@ -2250,6 +2888,9 @@ impl GMainWindow {
         if let Some(mut session) = self.session.borrow_mut().take() {
             session.stop();
         }
+        if let Some(tas) = self.input_subsystem.borrow().get_tas() {
+            tas.lock().stop();
+        }
 
         if let Some(handles) = self.render.borrow_mut().take() {
             #[cfg(target_os = "linux")]
@@ -2266,9 +2907,11 @@ impl GMainWindow {
         self.loading_screen.clear();
         self.show_game_list();
         self.status_bar.update_performance(None, None);
+        self.refresh_tas_ui();
         if let Some(app) = self.window.application() {
             update_menu_state(&app, false, true);
         }
+        self.refresh_menu_model();
 
         if let Some((message, detail)) = failure {
             self.alert(&message, &detail);
@@ -2330,6 +2973,7 @@ impl GMainWindow {
                         .and_then(EmulationSession::shaders_building);
                     this.status_bar
                         .update_performance(results, shaders_building);
+                    this.refresh_tas_ui();
                     glib::ControlFlow::Continue
                 }
             ),
@@ -2344,13 +2988,7 @@ impl GMainWindow {
     /// Retranslate the live GTK tree and both menu representations, matching
     /// upstream `GMainWindow::OnLanguageChanged`.
     pub fn retranslate(&self) {
-        let menu = build_menu_model();
-        if let Some(app) = self.window.application() {
-            app.set_menubar(Some(&menu));
-        }
-        if let Some(menu_bar) = self.menu_bar.as_ref() {
-            menu_bar.set_menu_model(Some(&menu));
-        }
+        self.refresh_menu_model();
         crate::i18n::translate_widget_tree(&self.window);
     }
 }
@@ -2780,11 +3418,41 @@ fn install_render_bg_css() {
 /// populated menus upstream (Recent Files, Debugging) are declared but left
 /// empty here.
 fn build_menu_model() -> gio::MenuModel {
-    let translated = crate::i18n::translate_builder_xml(MENU_UI);
+    build_menu_model_for_tas_state(input_common::drivers::tas_input::TasState::Stopped)
+}
+
+fn build_menu_model_for_tas_state(
+    state: input_common::drivers::tas_input::TasState,
+) -> gio::MenuModel {
+    build_menu_model_for_state(state, false)
+}
+
+fn build_menu_model_for_state(
+    state: input_common::drivers::tas_input::TasState,
+    is_paused: bool,
+) -> gio::MenuModel {
+    let menu_ui = menu_ui_for_state(state, is_paused);
+    let translated = crate::i18n::translate_builder_xml(&menu_ui);
     let builder = gtk::Builder::from_string(&translated);
     builder
         .object::<gio::MenuModel>("menubar")
         .expect("menubar object present in menu UI definition")
+}
+
+fn menu_ui_for_state(state: input_common::drivers::tas_input::TasState, is_paused: bool) -> String {
+    use input_common::drivers::tas_input::TasState;
+
+    let mut menu_ui = match state {
+        TasState::Running => MENU_UI.replace(">_Start</attribute>", ">_Stop Running</attribute>"),
+        TasState::Recording => {
+            MENU_UI.replace(">R_ecord</attribute>", ">Stop R_ecording</attribute>")
+        }
+        TasState::Stopped => MENU_UI.to_owned(),
+    };
+    if is_paused {
+        menu_ui = menu_ui.replace(">_Pause</attribute>", ">_Continue</attribute>");
+    }
+    menu_ui
 }
 
 /// Every action name referenced by [`MENU_UI`], without the `app.` prefix.
@@ -2835,10 +3503,7 @@ const MENU_ACTION_NAMES: &[&str] = &[
     "show_room",
     "leave_room",
     // Help
-    "report_compatibility",
-    "open_mods_page",
     "open_quickstart_guide",
-    "open_faq",
     "about",
 ];
 
@@ -2866,9 +3531,11 @@ const RUNNING_ACTIONS: &[&str] = &[
     "stop",
     "restart",
     "configure_current_game",
-    "report_compatibility",
     "load_amiibo",
     "pause",
+    "tas_start",
+    "tas_record",
+    "tas_reset",
 ];
 
 /// Menu actions that open a system applet, which upstream enables only when
@@ -3133,52 +3800,15 @@ const MENU_UI: &str = r##"<?xml version="1.0" encoding="UTF-8"?>
       </section>
     </submenu>
 
-    <submenu>
-      <attribute name="label" translatable="yes">_Multiplayer</attribute>
-      <section>
-        <item>
-          <attribute name="label" translatable="yes">_Browse Public Game Lobby</attribute>
-          <attribute name="action">app.view_lobby</attribute>
-        </item>
-        <item>
-          <attribute name="label" translatable="yes">_Create Room</attribute>
-          <attribute name="action">app.start_room</attribute>
-        </item>
-        <item>
-          <attribute name="label" translatable="yes">_Direct Connect to Room</attribute>
-          <attribute name="action">app.connect_to_room</attribute>
-        </item>
-      </section>
-      <section>
-        <item>
-          <attribute name="label" translatable="yes">_Show Current Room</attribute>
-          <attribute name="action">app.show_room</attribute>
-        </item>
-        <item>
-          <attribute name="label" translatable="yes">_Leave Room</attribute>
-          <attribute name="action">app.leave_room</attribute>
-        </item>
-      </section>
-    </submenu>
+    <!-- Multiplayer stays hidden until the GTK actions, ENet transport, and
+         ruzu-owned public lobby service are implemented. -->
 
     <submenu>
       <attribute name="label" translatable="yes">_Help</attribute>
       <section>
         <item>
-          <attribute name="label" translatable="yes">_Report Compatibility</attribute>
-          <attribute name="action">app.report_compatibility</attribute>
-        </item>
-        <item>
-          <attribute name="label" translatable="yes">Open _Mods Page</attribute>
-          <attribute name="action">app.open_mods_page</attribute>
-        </item>
-        <item>
           <attribute name="label" translatable="yes">Open _Quickstart Guide</attribute>
           <attribute name="action">app.open_quickstart_guide</attribute>
-        </item>
-        <item>
-          <attribute name="label" translatable="yes">_FAQ</attribute>
-          <attribute name="action">app.open_faq</attribute>
         </item>
       </section>
       <section>

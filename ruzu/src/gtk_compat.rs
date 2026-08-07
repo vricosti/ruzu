@@ -11,12 +11,17 @@ use gtk::{gio, ButtonsType, FileChooserAction, MessageType, ResponseType};
 
 /// Show a modal informational message using the GTK 4.0 MessageDialog API.
 pub fn show_message<P: IsA<gtk::Window>>(parent: Option<&P>, message: &str, detail: &str) {
-    show_message_with_type(parent, message, detail, MessageType::Info);
+    show_message_with_type(parent, message, detail, MessageType::Info, false);
 }
 
 /// Show a modal warning using the GTK 4.0 MessageDialog API.
 pub fn show_warning<P: IsA<gtk::Window>>(parent: Option<&P>, message: &str, detail: &str) {
-    show_message_with_type(parent, message, detail, MessageType::Warning);
+    show_message_with_type(parent, message, detail, MessageType::Warning, false);
+}
+
+/// Show a warning whose translated detail contains trusted Pango markup.
+pub fn show_warning_markup<P: IsA<gtk::Window>>(parent: Option<&P>, message: &str, detail: &str) {
+    show_message_with_type(parent, message, detail, MessageType::Warning, true);
 }
 
 fn show_message_with_type<P: IsA<gtk::Window>>(
@@ -24,15 +29,23 @@ fn show_message_with_type<P: IsA<gtk::Window>>(
     message: &str,
     detail: &str,
     message_type: MessageType,
+    detail_uses_markup: bool,
 ) {
     let message = crate::i18n::tr(message);
     let detail = crate::i18n::tr(detail);
+    let detail = if detail_uses_markup {
+        // Qt rich text uses HTML line breaks; GtkLabel consumes Pango markup.
+        detail.replace("<br>", "\n").replace("<br/>", "\n")
+    } else {
+        detail
+    };
     let dialog = gtk::MessageDialog::builder()
         .modal(true)
         .message_type(message_type)
         .buttons(ButtonsType::Ok)
         .text(&message)
         .secondary_text(&detail)
+        .secondary_use_markup(detail_uses_markup)
         .build();
     if let Some(parent) = parent {
         dialog.set_transient_for(Some(parent));
@@ -104,6 +117,53 @@ pub fn open_file<P: IsA<gtk::Window>>(
     }
     // Unlike a GtkWindow, NativeDialog is not retained as an application
     // toplevel. Keep a strong reference until the response signal fires.
+    let keep_alive = dialog.clone();
+    dialog.run_async(move |dialog, response| {
+        let file = (response == ResponseType::Accept)
+            .then(|| dialog.file())
+            .flatten();
+        dialog.destroy();
+        drop(keep_alive);
+        callback(file);
+    });
+}
+
+/// Open a native save-file chooser and return the selected file, or `None`
+/// when cancelled. This is the pre-4.10 counterpart of `FileDialog::save`.
+#[cfg(target_os = "windows")]
+pub fn save_file<P: IsA<gtk::Window>>(
+    parent: Option<&P>,
+    title: &str,
+    initial_file: &std::path::Path,
+    filters: &[gtk::FileFilter],
+    default_filter: Option<&gtk::FileFilter>,
+    callback: impl FnOnce(Option<gio::File>) + 'static,
+) {
+    let title = crate::i18n::tr(title);
+    let dialog = gtk::FileChooserNative::new(
+        Some(&title),
+        parent,
+        FileChooserAction::Save,
+        Some(&crate::i18n::tr("Save")),
+        Some(&crate::i18n::tr("Cancel")),
+    );
+    dialog.set_modal(true);
+    for filter in filters {
+        dialog.add_filter(filter);
+    }
+    if let Some(filter) = default_filter {
+        dialog.set_filter(filter);
+    }
+    if let Some(parent) = initial_file.parent() {
+        let folder = gio::File::for_path(parent);
+        if let Err(error) = dialog.set_current_folder(Some(&folder)) {
+            log::warn!("Failed to select initial screenshot directory: {error}");
+        }
+    }
+    if let Some(name) = initial_file.file_name().and_then(|name| name.to_str()) {
+        dialog.set_current_name(name);
+    }
+
     let keep_alive = dialog.clone();
     dialog.run_async(move |dialog, response| {
         let file = (response == ResponseType::Accept)

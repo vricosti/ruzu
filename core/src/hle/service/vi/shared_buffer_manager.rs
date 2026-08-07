@@ -100,6 +100,23 @@ const SHARED_BUFFER_POOL_LAYOUT: SharedMemoryPoolLayout = {
     layout
 };
 
+fn make_graphic_buffer(producer: &BufferQueueProducer, slot: u32, handle: u32) {
+    let mut buffer = NvGraphicBuffer::new(
+        SHARED_BUFFER_WIDTH,
+        SHARED_BUFFER_HEIGHT,
+        SHARED_BUFFER_BLOCK_LINEAR_FORMAT,
+        0,
+    );
+    buffer.stride = SHARED_BUFFER_BLOCK_LINEAR_STRIDE as i32;
+    buffer.external_format = SHARED_BUFFER_BLOCK_LINEAR_FORMAT;
+    buffer.buffer_id = handle;
+    buffer.offset = slot * SHARED_BUFFER_SLOT_SIZE;
+
+    // Upstream ASSERT evaluates SetPreallocatedBuffer in every build.
+    let status = producer.set_preallocated_buffer(slot as i32, Some(Arc::new(buffer)));
+    assert_eq!(status, Status::NoError);
+}
+
 struct Mt19937_64 {
     state: [u64; 312],
     index: usize,
@@ -260,24 +277,6 @@ impl SharedBufferManager {
         Err(vi_results::RESULT_OPERATION_FAILED)
     }
 
-    fn make_graphic_buffer(&self, producer: &BufferQueueProducer, slot: u32, handle: u32) {
-        let mut buffer = NvGraphicBuffer::new(
-            SHARED_BUFFER_WIDTH,
-            SHARED_BUFFER_HEIGHT,
-            SHARED_BUFFER_BLOCK_LINEAR_FORMAT,
-            0,
-        );
-        buffer.stride = SHARED_BUFFER_BLOCK_LINEAR_STRIDE as i32;
-        buffer.external_format = SHARED_BUFFER_BLOCK_LINEAR_FORMAT;
-        buffer.buffer_id = handle;
-        buffer.offset = slot * SHARED_BUFFER_SLOT_SIZE;
-        let buffer = Arc::new(buffer);
-        debug_assert_eq!(
-            producer.set_preallocated_buffer(slot as i32, Some(buffer)),
-            Status::NoError
-        );
-    }
-
     pub fn create_session(
         &self,
         owner_process: &Arc<ProcessLock>,
@@ -342,8 +341,8 @@ impl SharedBufferManager {
         container.set_layer_blending(layer_id, enable_blending)?;
 
         let producer = container.get_layer_producer_handle(layer_id)?;
-        self.make_graphic_buffer(&producer, 0, create_params.handle);
-        self.make_graphic_buffer(&producer, 1, create_params.handle);
+        make_graphic_buffer(&producer, 0, create_params.handle);
+        make_graphic_buffer(&producer, 1, create_params.handle);
 
         inner.sessions.insert(
             aruid,
@@ -532,7 +531,14 @@ impl SharedBufferManager {
 
 #[cfg(test)]
 mod tests {
-    use super::Mt19937_64;
+    use std::sync::{Arc, Mutex};
+
+    use crate::hle::service::kernel_helpers::ServiceContext;
+    use crate::hle::service::nvdrv::core::container::Container as NvDrvContainer;
+    use crate::hle::service::nvnflinger::buffer_queue_core::BufferQueueCore;
+    use crate::hle::service::nvnflinger::buffer_queue_producer::BufferQueueProducer;
+
+    use super::{make_graphic_buffer, Mt19937_64, SHARED_BUFFER_SLOT_SIZE};
 
     #[test]
     fn mt19937_64_matches_std_reference_sequence() {
@@ -542,5 +548,22 @@ mod tests {
         assert_eq!(rng.next_u64(), 13_109_570_281_517_897_720);
         assert_eq!(rng.next_u64(), 17_462_938_647_148_434_322);
         assert_eq!(rng.next_u64(), 355_488_278_567_739_596);
+    }
+
+    #[test]
+    fn make_graphic_buffer_installs_preallocated_slot() {
+        let core = BufferQueueCore::new();
+        let service_context = Arc::new(Mutex::new(ServiceContext::new(
+            "SharedBufferManagerTest".to_string(),
+        )));
+        let nvmap = NvDrvContainer::new().get_nv_map_file_handle();
+        let producer = BufferQueueProducer::new(service_context, Arc::clone(&core), nvmap);
+
+        make_graphic_buffer(&producer, 1, 0x1234);
+
+        let inner = core.mutex.lock().unwrap();
+        let buffer = inner.slots[1].graphic_buffer.as_ref().unwrap();
+        assert_eq!(buffer.buffer.buffer_id, 0x1234);
+        assert_eq!(buffer.buffer.offset, SHARED_BUFFER_SLOT_SIZE);
     }
 }

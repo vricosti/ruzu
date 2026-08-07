@@ -13,7 +13,7 @@
 //   configure_camera, configure_debug_controller, configure_input_per_game,
 //   configure_input_profile_dialog,
 //   configure_per_game, configure_per_game_addons,
-//   configure_ringcon, configure_tas,
+//   configure_ringcon,
 //   configure_touchscreen_advanced, configure_touch_widget.
 //
 // `qt_config` covers only the game-directory array of its upstream counterpart
@@ -41,6 +41,7 @@ pub mod configure_mouse_panning;
 pub mod configure_network;
 pub mod configure_profile_manager;
 pub mod configure_system;
+pub mod configure_tas;
 pub mod configure_touch_from_button;
 pub mod configure_ui;
 pub mod configure_vibration;

@@ -1173,6 +1173,10 @@ impl System {
         &self.frontend_applet_holder
     }
 
+    pub fn frontend_applet_holder_mut(&mut self) -> &mut FrontendAppletHolder {
+        &mut self.frontend_applet_holder
+    }
+
     /// Initializes the system.
     /// This function will initialize core functionality used for system emulation.
     ///
@@ -1446,6 +1450,26 @@ impl System {
     ///   2. CreateApplicationProcess — loader, ROM loading, process creation
     ///   3. SetupForApplicationProcess — ServiceManager, Services, powered on
     pub fn load(&mut self, filepath: &str) -> SystemResultStatus {
+        self.load_with_parameters(
+            filepath,
+            FrontendAppletParameters {
+                applet_id: AppletId::Application,
+                applet_type: AppletType::Application,
+                launch_type: LaunchType::FrontendInitiated,
+                program_index: 0,
+                previous_program_index: -1,
+                ..FrontendAppletParameters::default()
+            },
+        )
+    }
+
+    /// Load a program using the frontend applet identity supplied by the
+    /// launcher. Port of `System::Load(..., FrontendAppletParameters&)`.
+    pub fn load_with_parameters(
+        &mut self,
+        filepath: &str,
+        mut params: FrontendAppletParameters,
+    ) -> SystemResultStatus {
         // Phase 1: Initialize kernel (upstream: InitializeKernel(system))
         self.initialize_kernel();
 
@@ -1468,7 +1492,12 @@ impl System {
             content_provider: self.content_provider.clone(),
             filesystem_controller: Some(self.filesystem_controller.clone()),
         };
-        let loader = crate::loader::loader::get_loader(&mut loader_system, file, 0, 0);
+        let loader = crate::loader::loader::get_loader(
+            &mut loader_system,
+            file,
+            params.program_id,
+            params.program_index as usize,
+        );
 
         let mut loader = match loader {
             Some(l) => l,
@@ -1686,6 +1715,7 @@ impl System {
             // Extract program_id in a separate binding so the MutexGuard<KProcess>
             // is dropped before calling create_and_insert_by_frontend_applet_parameters.
             let app_program_id = process_arc.lock().unwrap().get_program_id();
+            params.program_id = app_program_id;
             let trace_boot = std::env::var_os("RUZU_APPLET_BOOT_TRACE")
                 .is_some_and(|value| value != std::ffi::OsStr::new("0"));
             if trace_boot {
@@ -1703,14 +1733,7 @@ impl System {
             self.applet_manager
                 .create_and_insert_by_frontend_applet_parameters(
                     process_arc.clone(),
-                    FrontendAppletParameters {
-                        program_id: app_program_id,
-                        applet_id: AppletId::Application,
-                        applet_type: AppletType::Application,
-                        launch_type: LaunchType::FrontendInitiated,
-                        program_index: 0,
-                        previous_program_index: -1,
-                    },
+                    params,
                     crate::hle::service::am::applet_manager::PendingRunParameters {
                         priority,
                         stack_size,

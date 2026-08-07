@@ -44,14 +44,17 @@ pub enum AlbumStorage {
 }
 
 /// Screenshot decoder flags.
-#[repr(u64)]
+#[repr(transparent)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum ScreenShotDecoderFlag {
-    #[default]
-    None = 0,
-    EnableFancyUpsampling = 1 << 0,
-    EnableBlockSmoothing = 1 << 1,
+pub struct ScreenShotDecoderFlag(pub u64);
+
+impl ScreenShotDecoderFlag {
+    pub const NONE: Self = Self(0);
+    pub const ENABLE_FANCY_UPSAMPLING: Self = Self(1 << 0);
+    pub const ENABLE_BLOCK_SMOOTHING: Self = Self(1 << 1);
 }
+
+const _: () = assert!(core::mem::size_of::<ScreenShotDecoderFlag>() == 0x8);
 
 /// nn::capsrv::ShimLibraryVersion
 #[repr(u64)]

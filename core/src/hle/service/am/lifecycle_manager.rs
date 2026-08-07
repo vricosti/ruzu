@@ -529,4 +529,19 @@ mod tests {
 
         assert!(lifecycle.operation_mode_changed_system_event.is_signaled());
     }
+
+    #[test]
+    fn initial_non_application_focus_transition_enqueues_foreground_message() {
+        let mut lifecycle = LifecycleManager::new(false);
+        assert_eq!(lifecycle.requested_focus_state, FocusState::Unknown);
+        assert_eq!(lifecycle.acknowledged_focus_state, FocusState::Unknown);
+
+        lifecycle.set_focus_state(FocusState::InFocus);
+
+        assert!(lifecycle.system_event.is_signaled());
+        let mut message = AppletMessage::None;
+        assert!(lifecycle.pop_message(&mut message));
+        assert_eq!(message, AppletMessage::ChangeIntoForeground);
+        assert!(!lifecycle.system_event.is_signaled());
+    }
 }

@@ -2707,7 +2707,7 @@ impl KThread {
                 );
             }
             self.resource_limit_release_hint = true;
-            let _ = process.decrement_running_thread_count();
+            process.decrement_running_thread_count();
         }
 
         // Perform termination under the scheduler lock.

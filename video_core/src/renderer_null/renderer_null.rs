@@ -130,6 +130,15 @@ impl RendererBase for RendererNull {
         self.base_data.is_screenshot_pending()
     }
 
+    fn request_screenshot(
+        &mut self,
+        _data: *mut std::ffi::c_void,
+        callback: Box<dyn FnOnce(bool) + Send>,
+        _layout: ruzu_core::frontend::framebuffer_layout::FramebufferLayout,
+    ) {
+        callback(false);
+    }
+
     fn set_guest_memory_writer(&mut self, writer: crate::renderer_base::GuestMemoryWriter) {
         self.rasterizer.set_guest_memory_writer(writer);
     }

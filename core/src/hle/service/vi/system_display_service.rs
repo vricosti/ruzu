@@ -105,6 +105,55 @@ impl ISystemDisplayService {
         unsafe { &*(this as *const dyn ServiceFramework as *const Self) }
     }
 
+    fn push_shared_buffer_memory_handle_id_response(
+        ctx: &mut HLERequestContext,
+        nvmap_handle: i32,
+        size: u64,
+    ) {
+        let mut rb = ResponseBuilder::new(ctx, 6, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_i32(nvmap_handle);
+        rb.push_u32(0); // Align upstream's following Out<u64> to eight bytes.
+        rb.push_u64(size);
+    }
+
+    fn push_acquire_shared_frame_buffer_response(
+        ctx: &mut HLERequestContext,
+        fence: &Fence,
+        slots: [i32; 4],
+        target_slot: i64,
+    ) {
+        let mut rb = ResponseBuilder::new(ctx, 18, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_raw(fence);
+        for slot in slots {
+            rb.push_i32(slot);
+        }
+        rb.push_u32(0); // Align upstream's following Out<s64> to eight bytes.
+        rb.push_i64(target_slot);
+    }
+
+    fn parse_present_shared_frame_buffer_request(
+        ctx: &HLERequestContext,
+    ) -> (Fence, Rectangle<i32>, u32, i32, u64, i64) {
+        let mut rp = RequestParser::new(ctx);
+        let fence = rp.pop_raw();
+        let crop_region = rp.pop_raw();
+        let window_transform = rp.pop_u32();
+        let swap_interval = rp.pop_i32();
+        let _padding = rp.pop_u32();
+        let layer_id = rp.pop_u64();
+        let surface_id = rp.pop_i64();
+        (
+            fence,
+            crop_region,
+            window_transform,
+            swap_interval,
+            layer_id,
+            surface_id,
+        )
+    }
+
     /// cmd 2205: SetLayerZ
     fn set_layer_z(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         let mut rp = RequestParser::new(ctx);
@@ -224,10 +273,7 @@ impl ISystemDisplayService {
                     )
                 };
                 ctx.write_buffer(bytes, 0);
-                let mut rb = ResponseBuilder::new(ctx, 5, 0, 0);
-                rb.push_result(RESULT_SUCCESS);
-                rb.push_i32(nvmap_handle);
-                rb.push_u64(size);
+                Self::push_shared_buffer_memory_handle_id_response(ctx, nvmap_handle, size);
             }
             Err(err) => {
                 let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
@@ -271,13 +317,7 @@ impl ISystemDisplayService {
             .acquire_shared_frame_buffer(layer_id)
         {
             Ok((fence, slots, target_slot)) => {
-                let mut rb = ResponseBuilder::new(ctx, 8, 0, 0);
-                rb.push_result(RESULT_SUCCESS);
-                rb.push_raw(&fence);
-                for slot in slots {
-                    rb.push_i32(slot);
-                }
-                rb.push_i64(target_slot);
+                Self::push_acquire_shared_frame_buffer_response(ctx, &fence, slots, target_slot);
             }
             Err(err) => {
                 let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
@@ -288,13 +328,8 @@ impl ISystemDisplayService {
 
     fn present_shared_frame_buffer(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         let svc = Self::as_self(this);
-        let mut rp = RequestParser::new(ctx);
-        let fence: Fence = rp.pop_raw();
-        let crop_region: Rectangle<i32> = rp.pop_raw();
-        let window_transform = rp.pop_u32();
-        let swap_interval = rp.pop_i32();
-        let layer_id = rp.pop_u64();
-        let surface_id = rp.pop_i64();
+        let (fence, crop_region, window_transform, swap_interval, layer_id, surface_id) =
+            Self::parse_present_shared_frame_buffer_request(ctx);
 
         let result = svc
             .container
@@ -353,6 +388,65 @@ impl ISystemDisplayService {
             .cancel_shared_frame_buffer(layer_id, slot);
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(result.err().unwrap_or(RESULT_SUCCESS));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shared_buffer_memory_handle_response_aligns_size_after_nvmap_handle() {
+        let mut ctx = HLERequestContext::new();
+        ISystemDisplayService::push_shared_buffer_memory_handle_id_response(
+            &mut ctx,
+            0x1234_5678,
+            0x1122_3344_5566_7788,
+        );
+
+        let start = ctx.data_payload_offset as usize;
+        assert_eq!(
+            &ctx.cmd_buf[start..start + 6],
+            &[0, 0, 0x1234_5678, 0, 0x5566_7788, 0x1122_3344]
+        );
+    }
+
+    #[test]
+    fn acquire_shared_frame_buffer_response_matches_upstream_cmif_layout() {
+        let mut ctx = HLERequestContext::new();
+        let fence = Fence::no_fence();
+        ISystemDisplayService::push_acquire_shared_frame_buffer_response(
+            &mut ctx,
+            &fence,
+            [0, 1, -1, -1],
+            0x1122_3344_5566_7788,
+        );
+
+        let start = ctx.data_payload_offset as usize;
+        assert_eq!(ctx.write_size - ctx.data_payload_offset, 18);
+        assert_eq!(
+            ctx.cmd_buf[start + 11..start + 15],
+            [0, 1, u32::MAX, u32::MAX]
+        );
+        assert_eq!(ctx.cmd_buf[start + 15], 0);
+        assert_eq!(ctx.cmd_buf[start + 16], 0x5566_7788);
+        assert_eq!(ctx.cmd_buf[start + 17], 0x1122_3344);
+    }
+
+    #[test]
+    fn present_shared_frame_buffer_request_aligns_64_bit_arguments() {
+        let mut ctx = HLERequestContext::new();
+        let start = ctx.data_payload_offset as usize + 2;
+        ctx.cmd_buf[start + 15] = 0xDEAD_BEEF;
+        ctx.cmd_buf[start + 16] = 0x5566_7788;
+        ctx.cmd_buf[start + 17] = 0x1122_3344;
+        ctx.cmd_buf[start + 18] = 0xDDEE_FF00;
+        ctx.cmd_buf[start + 19] = 0x99AA_BBCC;
+
+        let (_, _, _, _, layer_id, surface_id) =
+            ISystemDisplayService::parse_present_shared_frame_buffer_request(&ctx);
+        assert_eq!(layer_id, 0x1122_3344_5566_7788);
+        assert_eq!(surface_id as u64, 0x99AA_BBCC_DDEE_FF00);
     }
 }
 

@@ -33301,6 +33301,7 @@ Rust files: `externals/rdynarmic/src/frontend/a32/{decoder.rs, decoder_thumb32.r
 - The GTK frontend embeds a generated JSON representation of the upstream TS catalogs and retranslates GTK widget properties directly; upstream uses Qt resource files, `QTranslator`, and `retranslateUi`.
 - Catalog generation retains only source strings referenced by the GTK frontend and changes yuzu branding to ruzu at lookup time. Strings unique to ruzu fall back to English until they have an upstream catalog counterpart.
 - The game-directory action uses the shorter `Add Game Directory` label and dedicated translations for all upstream locales so the GTK toolbar remains compact; upstream uses `Add New Game Directory`.
+- Under `cfg(test)`, the selected locale is thread-local so parallel frontend tests cannot change one another's language. Production retains the process-wide locale used by the live GTK frontend.
 
 ### Unintentional differences (to fix)
 - Resolved: the interface-language selector now exposes System, English, and every locale catalog shipped by upstream, applies language changes immediately, and persists `Paths\language` in the UI configuration.
@@ -33311,6 +33312,387 @@ Rust files: `externals/rdynarmic/src/frontend/a32/{decoder.rs, decoder_thumb32.r
 
 ### Binary layout verification
 - PASS: only frontend configuration text and embedded translation data changed; no guest-facing binary structure changed.
+
+## 2026-08-07 — ruzu/src/main_window.rs and ruzu/src/gtk_compat.rs vs yuzu/main.{h,cpp}
+
+### Intentional differences
+- GTK presents the missing-keys warning from an idle callback so its parent window is already mapped. When ruzu's separate first-run configuration import is available, the key check follows that dialogue instead of presenting two modal dialogues at once.
+- Qt's `<br>` rich text is converted to a newline before the trusted translated text is passed to Pango markup.
+- The warning and `OnOpenQuickstartGuide` point to ruzu's public GitHub quickstart instead of yuzu's retired website. The guide contains setup instructions only and does not distribute or link to copyrighted files.
+
+### Unintentional differences (to fix)
+- Resolved: startup now calls the `OnCheckFirmwareDecryption` counterpart and shows upstream's translated `Derivation Components Missing` warning when `AreKeysPresent` is false.
+- Resolved: the Help menu's quickstart action now opens the ruzu guide instead of remaining an unwired action.
+- Resolved: decryption-key installation opens a file chooser restricted to `prod.keys` with upstream's `prod.keys (prod.keys)` filter label, while firmware installation opens a directory-only chooser, matching `QFileDialog::getOpenFileName` and `QFileDialog::getExistingDirectory` respectively.
+
+### Missing items
+- The firmware-version status label and launcher-owned `Core::System` content-provider refresh used by the remainder of upstream `OnCheckFirmwareDecryption` are not present in the GTK frontend. Firmware-dependent action enablement is already updated through `update_menu_state`.
+
+### Binary layout verification
+- PASS: the change affects only frontend startup sequencing and dialogue presentation.
+
+## 2026-08-07 — core/src/hle/kernel/k_process.rs, core/src/hle/kernel/k_thread.rs, and core/src/hle/service/am/window_system.rs vs core/hle/kernel/k_process.{h,cpp}, core/hle/kernel/k_thread.cpp, and core/hle/service/am/window_system.{h,cpp}
+
+### Intentional differences
+- `TerminateChildren` snapshots `(thread_id, Arc<Mutex<KThread>>)` pairs and compares the exempt thread ID before acquiring its mutex. Upstream compares raw `KThread*` values; the Rust ordering avoids recursively locking the current thread while preserving the same two-pass child order.
+- Production `WindowSystem` construction always carries the upstream-equivalent `Core::System&`. The exit call is skipped only for isolated Rust service tests that explicitly construct a null `SystemRef` and have no frontend to notify.
+
+### Unintentional differences (fixed)
+- `KProcess::decrement_running_thread_count` previously returned an ignored boolean when the last running thread exited. It now invokes `terminate()` inline, matching upstream `DecrementRunningThreadCount()`.
+- The running-thread counter used relaxed Rust atomics; increment and decrement now retain the sequentially consistent ordering of upstream's default C++ atomic operators.
+- Process termination now exempts the current guest thread from `TerminateChildren`, matching upstream `StartTermination()` instead of attempting to relock and terminate the caller.
+- `WindowSystem::prune_terminated_applets_locked` previously set an unread Rust-only `should_exit` flag. It now calls `System::exit()` when the final applet is removed, matching upstream and allowing the frontend to leave its loading state.
+
+### Missing items
+- None in the last-thread and last-applet termination paths corrected by this slice.
+
+### Binary layout verification
+- PASS: these changes affect host lifecycle control flow only; no guest-facing structure or serialized payload changed.
+
+## 2026-08-07 — ruzu/src/about_dialog.rs and ruzu/src/main_window.rs vs yuzu/about_dialog.{h,cpp}, yuzu/aboutdialog.ui, and yuzu/main.{h,cpp,ui}
+
+### Intentional differences
+- The GTK frontend uses the native `GtkAboutDialog` instead of reproducing the Qt `.ui` widget tree. It retains upstream's program/build identity, project description, legal notice, GPLv3 licence, source link, and contributor attribution.
+- The dialogue embeds ruzu's rusty-lemon PNG instead of resolving upstream's themed yuzu icon. Embedding the project-specific mark also keeps portable and first-run builds independent of the host icon theme.
+- The Help menu intentionally omits Report Compatibility, Open Mods Page, and FAQ at the user's request; it exposes only Open Quickstart Guide and About ruzu.
+- Project links and branding point to ruzu rather than yuzu.
+
+### Unintentional differences (to fix)
+- Resolved: `app.about` was previously an inert registered stub. It now owns and presents the corresponding about dialogue.
+
+### Missing items
+- None in the two retained Help-menu actions.
+
+### Binary layout verification
+- PASS: this frontend-only change introduces no guest-facing structure or serialized payload.
+
+## 2026-08-07 — ruzu/src/main_window.rs vs yuzu/main.ui
+
+### Intentional differences
+- The GTK menu omits upstream's Multiplayer submenu while retaining its action names and the separately owned network modules. Exposing the submenu would currently present five non-functional commands: the GTK handlers are stubs, ENet transport is not ported, and public-lobby discovery still models yuzu's web service rather than a ruzu-owned endpoint.
+
+### Unintentional differences (to fix)
+- Resolved: the non-functional Multiplayer submenu is no longer visible in the launcher.
+
+### Missing items
+- Re-enabling the submenu requires the upstream-owned multiplayer GTK views and handlers, functional ENet room transport, and a deliberately selected public-lobby backend.
+
+### Binary layout verification
+- PASS: only the frontend menu model changed; network protocol structures and guest-facing data are untouched.
+
+## 2026-08-07 — core/src/core.rs, core/src/hle/service/am/applet_manager.rs, and core/src/hle/service/am/frontend/applets.rs vs core/core.{h,cpp}, core/hle/service/am/applet_manager.{h,cpp}, and core/hle/service/am/frontend/applets.{h,cpp}
+
+### Intentional differences
+- `System::load_with_parameters` accepts `FrontendAppletParameters` by value because the GTK boot request crosses a host-thread boundary. It still updates the program ID from the loaded process before passing the parameters to `AppletManager::create_and_insert_by_frontend_applet_parameters`.
+- `FrontendAppletHolder` is owned directly by Rust `System`; its cabinet mode and current applet ID preserve the same ownership and launch-time ordering as upstream.
+
+### Unintentional differences (to fix)
+- Resolved: frontend launches previously always used application identity. Album, Cabinet, Mii Editor, and Controller now reach the loader and applet manager with upstream's `LibraryApplet` identity, frontend launch type, program ID, and previous program index.
+- Resolved: `AppletManager::set_window_system` now copies the frontend `program_id` into the constructed `Applet`, matching upstream instead of retaining only the process-derived value from `Applet::new`.
+- Resolved: Cabinet launch data now uses the mode selected by the frontend instead of an unconditional default.
+
+### Missing items
+- The broader set of frontend applet implementations already listed in the AM audit remains outside this launch-identity slice.
+
+### Binary layout verification
+- PASS: existing upstream-sized `CommonArguments`, controller, Mii, album, and Cabinet payload structures are reused; this slice changes their selection and launch state, not their layout.
+
+## 2026-08-07 — input_common/src/drivers/virtual_amiibo.rs, input_common/src/input_engine.rs, input_common/src/input_poller.rs, and input_common/src/main_common.rs vs input_common/drivers/virtual_amiibo.{h,cpp}, input_common/input_engine.{h,cpp}, input_common/input_poller.{h,cpp}, and input_common/main.{h,cpp}
+
+### Intentional differences
+- Rust models `VirtualAmiibo`'s C++ inheritance with a composed `InputEngine` plus an `InputEngineOutput` adapter. The adapter and driver state are shared with `Arc<Mutex<...>>`, while factories receive the same engine instance.
+- `OutputFromIdentifier` clones the output adapter before invoking it. This preserves upstream virtual dispatch while avoiding retention of the composed engine mutex when a concrete driver publishes a callback through that engine.
+- Amiibo files use `std::fs` rather than upstream `Common::FS::IOFile`; accepted sizes, zero-extension, state transitions, and result codes match upstream.
+
+### Unintentional differences (to fix)
+- Resolved: `virtual_amiibo` was constructed but not registered as an input/output factory, so guest NFC polling could never reach it.
+- Resolved: NFC callbacks were dispatched while the engine mutex was still held, deadlocking when the callback read its updated NFC status. Pending callbacks are now dispatched after releasing the mutex.
+
+### Missing items
+- Resolved in the camera/virtual-gamepad factory parity slice below: both drivers now share their registered engine with frontend accessors.
+
+### Binary layout verification
+- PASS: `NfcStatus`, Amiibo payload sizes (`0x214`, `0x21c`, `0x23c`) and Mifare size (`0x400`) are unchanged.
+
+## 2026-08-07 — input_common/src/drivers/tas_input.rs, input_common/src/main_common.rs, ruzu/src/boot.rs, ruzu/src/status_bar.rs, and ruzu/src/configuration/configure_tas.rs vs input_common/drivers/tas_input.{h,cpp}, input_common/main.{h,cpp}, yuzu/bootmanager.cpp, yuzu/main.{h,cpp}, and yuzu/configuration/configure_tas.{cpp,ui}
+
+### Intentional differences
+- GTK rebuilds its immutable `GMenuModel` when TAS state changes; Qt changes the two existing `QAction` labels in place. Enabled states and displayed labels remain equivalent.
+- The renderer's frame-present callback records controller state and advances TAS because Rust's `System` is owned by the boot thread. This is the same per-displayed-frame point used by upstream `GRenderWindow::OnFrameDisplayed`.
+- The GTK configuration dialog uses a native folder chooser. Upstream's currently disabled pause-on-load checkbox remains visible but insensitive.
+
+### Unintentional differences (to fix)
+- Resolved: TAS was not registered as a factory and only exposed placeholder methods. Script loading, sparse-frame parsing, playback, recording, reset, file writing, status reporting, menu transitions, and per-frame updates now follow upstream.
+- Resolved: TAS parsing now accepts signed frame numbers like `std::stoi`, and session replacement/shutdown stops active playback before dropping the render session.
+
+### Missing items
+- The configurable hotkey dispatcher remains a frontend-wide missing subsystem; the implemented TAS commands are available from the Tools menu.
+
+### Binary layout verification
+- PASS: TAS files remain text; button bit assignments, ten-player arrays, axis normalization, and script naming match upstream.
+
+## 2026-08-07 — video_core/src/renderer_base.rs, video_core/src/renderer_vulkan/renderer_vulkan.rs, video_core/src/renderer_opengl/mod.rs, video_core/src/renderer_null/renderer_null.rs, ruzu/src/boot.rs, and ruzu/src/main_window.rs vs video_core/renderer_base.{h,cpp}, video_core/renderer_vulkan/renderer_vulkan.cpp, video_core/renderer_opengl/renderer_opengl.cpp, and yuzu/main.cpp
+
+### Intentional differences
+- The GTK boot thread owns the screenshot buffer until the renderer's detached completion callback writes it with Cairo. Upstream stores the buffer in `GRenderWindow` and emits a Qt signal before `QImage::save`.
+- The Null renderer completes an accepted request immediately because it has no composited frame to service later.
+
+### Unintentional differences (to fix)
+- Resolved: renderer settings now carry the screenshot pointer, callback, framebuffer layout, and atomic pending state; Vulkan and OpenGL forward requests through their upstream screenshot paths.
+- Resolved: the frontend now computes upstream aspect-ratio dimensions, names captures with title ID and timestamp, creates the screenshot directory, handles renderer Y inversion, and writes PNG output asynchronously.
+
+### Missing items
+- Resolved in the Windows Save As parity slice below: the chooser now pauses and resumes the owning emulation thread around selection.
+
+### Binary layout verification
+- PASS: screenshots use a host-owned four-byte-per-pixel buffer and do not alter guest-facing structures.
+
+## 2026-08-07 — ruzu/src/main_window.rs and ruzu/src/boot.rs vs yuzu/main.{h,cpp,ui}
+
+### Intentional differences
+- GTK's asynchronous native file chooser replaces `QFileDialog`; the `is_amiibo_file_select_active` guard preserves upstream's single-dialog lifecycle.
+- System applets are resolved from a short-lived launcher filesystem controller because the running `System` is owned by the boot thread. Both controllers address the same installed system NAND content.
+
+### Unintentional differences (to fix)
+- Resolved: Load/Remove Amiibo, the four Cabinet modes, Open Album, Open Mii Editor, Open Controller Menu, Capture Screenshot, and all four TAS actions no longer resolve to logging stubs.
+- Resolved: direct Amiibo loading now removes an attached tag, rejects games that are not polling, filters `.bin` files, and reports every upstream `VirtualAmiibo::Info` failure.
+
+### Missing items
+- The frontend-wide configurable hotkey dispatcher remains recorded in its owning entry above; the visible Tools-menu actions themselves are wired.
+
+### Binary layout verification
+- PASS: frontend action wiring introduces no guest-facing serialized layout.
+
+## 2026-08-07 — input_common/src/drivers/camera.rs, input_common/src/drivers/virtual_gamepad.rs, and input_common/src/main_common.rs vs input_common/drivers/camera.{h,cpp}, input_common/drivers/virtual_gamepad.{h,cpp}, and input_common/main.{h,cpp}
+
+### Intentional differences
+- Rust models the two upstream `InputEngine` subclasses with composed `Arc<Mutex<InputEngine>>` values. The frontend driver and the global input/output factories receive the same allocation, preserving upstream shared ownership and callback visibility.
+- `CameraOutput` adapts the upstream virtual `SetCameraFormat` override without retaining the engine mutex while touching camera state.
+
+### Unintentional differences (to fix)
+- Resolved: `camera` and `virtual_gamepad` were constructed without `RegisterEngine`, so global bindings created unrelated dummy devices and camera data was never published.
+- Resolved: `Camera::set_camera_data` now performs the upstream nearest-neighbour resize and calls `InputEngine::set_camera`; format requests made through the output factory update the same status used by the frontend camera driver.
+- Resolved: shutdown now unregisters both factories in upstream order with the other engines.
+
+### Missing items
+- The platform camera capture frontend that supplies frames to `Camera::set_camera_data` remains a separate GTK render-window slice; this change completes the input-subsystem factory and driver path.
+
+### Binary layout verification
+- PASS: `CameraStatus`, `PadIdentifier`, virtual button IDs, virtual stick IDs, and the ten-player identifier scheme are unchanged.
+
+## 2026-08-07 — ruzu/src/main_window.rs, ruzu/src/boot.rs, and ruzu/src/gtk_compat.rs vs yuzu/main.cpp
+
+### Intentional differences
+- GTK 4.6 uses an asynchronous `FileChooserNative` Save dialog instead of Qt's synchronous `QFileDialog`. The emulation-thread pause and resume commands carry acknowledgements so the upstream pause-dialog-resume ordering is preserved before the callback continues.
+- The GTK compatibility helper owns only toolkit mechanics; screenshot naming, settings, pause/resume ordering, and capture dispatch remain owned by `main_window.rs` as in upstream `GMainWindow::OnCaptureScreenshot`.
+
+### Unintentional differences (to fix)
+- Resolved: Windows now honors `enable_screenshot_save_as`, proposes the upstream-generated PNG filename, pauses before opening the chooser, resumes after either selection or cancellation, and captures only when a file was selected.
+
+### Missing items
+- The frontend-wide configurable hotkey dispatcher remains outside this screenshot action slice.
+
+### Binary layout verification
+- PASS: the chooser and pause commands are frontend-only and introduce no guest-facing serialized data.
+
+## 2026-08-07 — ruzu/src/main_window.rs and ruzu/src/boot.rs vs yuzu/main.{h,cpp,ui}
+
+### Intentional differences
+- GTK rebuilds its immutable `GMenuModel` to change `_Pause` to `_Continue`, whereas upstream mutates the existing `QAction` text. Both the native macOS menu and the in-window GTK menu receive the same rebuilt model.
+- Rust's boot thread owns `System`, so `OnPauseGame` and `OnStartGame` send acknowledged commands to that thread before changing frontend state. Upstream calls `EmuThread::SetRunning` directly from the Qt frontend thread.
+
+### Unintentional differences (to fix)
+- Resolved: `app.pause` was a logging stub even though the menu entry was enabled while a title ran.
+- Resolved: the existing `System::pause`/`System::run` command path was compiled only on Windows because it had first been introduced for the Windows screenshot chooser. Pause, resume, state tracking, the F4 shortcut, screenshot enablement, and the Pause/Continue label now apply on every frontend platform.
+
+### Missing items
+- Upstream also starts/stops its play-time manager, OS sleep inhibition, Discord presence and Linux GameMode from `OnStartGame`/`OnPauseGame`. Those frontend services do not yet have ruzu counterparts; emulated CPU, timing and kernel suspension itself is complete.
+
+### Binary layout verification
+- PASS: the pause protocol and atomic state are host-frontend state and do not alter guest-facing structures.
+
+## 2026-08-07 — core/src/hle/service/caps/caps_a.rs and caps_types.rs vs core/hle/service/caps/caps_a.{h,cpp} and caps_types.h
+
+### Intentional differences
+- Rust uses raw, `repr(C)` request mirrors for `AlbumFileId` and `ScreenShotDecodeOption` before constructing typed values. This preserves the upstream byte layout without creating an invalid Rust enum from untrusted guest bytes.
+- `ScreenShotDecoderFlag` is a transparent `u64` newtype rather than a Rust enum so combined and unknown flag bits retain the same bit pattern accepted by the upstream C++ enum.
+- The upstream CMIF template wrapper is represented by command-local dispatch shims; method ownership, input alignment, output ordering, buffer indices, and response layouts remain in `caps_a.rs`.
+
+### Unintentional differences (to fix)
+- Resolved: all eight methods implemented by upstream `IAlbumAccessorService` existed as Rust business methods but were registered with null IPC callbacks, causing the Album applet to abort on command 18.
+
+### Missing items
+- Commands left without handlers match the `nullptr` entries in the upstream `IAlbumAccessorService` function table.
+
+### Binary layout verification
+- PASS: `AlbumFileIdRaw` is 0x18 bytes, `ScreenShotDecodeOptionRaw` is 0x20 bytes, `ScreenShotDecoderFlag` is 0x8 bytes, and the existing `LoadAlbumScreenShotImageOutput` remains 0x450 bytes. Output buffers are emitted in upstream declaration order.
+
+## 2026-08-07 — core/src/hle/service/ns/service_getter_interface.rs vs core/hle/service/ns/service_getter_interface.{h,cpp}
+
+### Intentional differences
+- Rust constructs the returned `IContentManagementInterface` in the command-local IPC shim and registers it through `ResponseBuilder`; this is the direct equivalent of upstream's `Out<SharedPointer<IContentManagementInterface>>` CMIF serialization.
+
+### Unintentional differences (to fix)
+- Resolved: command 7998 was registered without a callback and its Rust method returned no object, while upstream constructs and returns a new `IContentManagementInterface`.
+
+### Missing items
+- The other interface getters remain outside this Album-launch correction and retain their pre-existing null Rust callbacks.
+
+### Binary layout verification
+- PASS: command 7998 returns only the upstream result word and one domain/session object; it has no raw guest payload.
+
+## 2026-08-07 — core/src/hle/service/ns/content_management_interface.rs vs core/hle/service/ns/content_management_interface.{h,cpp}
+
+### Intentional differences
+- The IPC shims parse `StorageId` through its raw `u8` representation before constructing the Rust enum, avoiding invalid-enum undefined behavior for malformed guest requests.
+- The stored `SystemRef` is Rust's non-owning equivalent of the upstream `Core::System&` retained by `ServiceFramework`.
+
+### Unintentional differences (to fix)
+- Resolved: upstream commands 11, 43, 47, and 48 were registered with implementations, while all Rust callbacks were null.
+- Resolved: total/free-space queries returned fixed 32/16 GiB values instead of calling `FileSystemController`.
+- Resolved: the occupied-size stub encoded storage ID 3 while labeling it SD card; it now emits upstream `StorageId::SdCard` (5).
+
+### Missing items
+- Commands 600, 601, 605, and 607 remain without handlers, matching their upstream `nullptr` entries.
+
+### Binary layout verification
+- PASS: `ApplicationOccupiedSize` remains 0x80 bytes, each 0x20-byte entity is fully initialized including padding, and size responses retain the upstream signed 64-bit bit pattern.
+
+## 2026-08-07 — core/src/hle/service/am/am_types.rs and lifecycle_manager.rs vs core/hle/service/am/am_types.h and lifecycle_manager.{h,cpp}
+
+### Intentional differences
+- Rust names the upstream unnamed, value-initialized `FocusState` value zero `Unknown`; this is required to represent the exact initial C++ enum bit pattern without constructing an invalid Rust enum.
+
+### Unintentional differences (to fix)
+- Resolved: Rust previously defaulted `FocusState` to `InFocus` (1), suppressing the initial non-application `ChangeIntoForeground` transition that upstream produces from its zero-initialized requested and acknowledged focus states.
+
+### Missing items
+- None in the focus-state initialization and initial foreground-message slice.
+
+### Binary layout verification
+- PASS: `FocusState` remains `repr(u8)`; values 1 through 3 retain their upstream ABI values, and value 0 now preserves the upstream initial field representation.
+
+## 2026-08-07 — core/src/hle/service/kernel_helpers.rs vs core/hle/service/kernel_helpers.{h,cpp}
+
+### Intentional differences
+- Rust resolves the current process through the emulation-thread TLS and the active kernel singleton because the existing `ServiceContext` constructor predates explicit `SystemRef` propagation. When no current process exists, it creates, initializes, assigns a kernel process ID to, and registers a service process as upstream does.
+- Unit tests constructed without an active kernel retain the host-only `Event` fallback; runtime contexts with an initialized kernel always create the kernel-backed event pair.
+
+### Unintentional differences (to fix)
+- Resolved: `CreateEvent` previously allocated only a host `Event`, so direct users of `BufferQueueProducer::GetNativeHandle` received no readable event until the Binder command happened to materialize one.
+- Resolved: event creation now reserves `EventCountMax`, initializes and process-registers a `KEvent`/`KReadableEvent` pair, commits the reservation after registration, and releases the service-owner reservation from `CloseEvent`.
+
+### Binary layout verification
+- PASS: this ownership correction changes no guest payload layout; exported event handles still resolve through the existing deferred CMIF copy-object path.
+
+## 2026-08-07 — core/src/hle/service/vi/system_display_service.rs vs core/hle/service/vi/system_display_service.{h,cpp}
+
+### Unintentional differences (to fix)
+- Resolved: `GetSharedBufferMemoryHandleId` serialized its `s32` handle and following `u64` size without the upstream CMIF alignment word. The guest therefore read zero for the size and rejected shared-buffer initialization with VI result `0x272`.
+- Resolved: `AcquireSharedFrameBuffer` advertised only eight response words instead of the upstream eighteen and omitted the alignment word before its final `s64`; the guest received a truncated result and aborted after its first successful dequeue.
+- Resolved: `PresentSharedFrameBuffer` omitted the matching input alignment word before `layer_id` and `surface_id`, shifting both 64-bit arguments.
+
+### Binary layout verification
+- PASS: the memory-handle response is six 32-bit words. The acquire response is eighteen words: result, 36-byte fence, four `s32` slots, alignment padding, then the final `s64`. Present consumes the corresponding padding before its two aligned 64-bit inputs.
+
+## 2026-08-07 — core/src/hle/service/vi/shared_buffer_manager.rs vs core/hle/service/vi/shared_buffer_manager.{h,cpp}
+
+### Intentional differences
+- Rust stores the mapped guest address in `SharedBufferSession` so `destroy_session` can unmap the page group; upstream obtains equivalent mapping lifetime through its kernel page-table ownership.
+
+### Unintentional differences (to fix)
+- Resolved: `MakeGraphicBuffer` was an instance method and placed `SetPreallocatedBuffer` inside `debug_assert_eq!`. Release builds removed the call entirely, leaving both shared-buffer slots unconfigured and their acquirable event unsignaled. It is now a module-local helper like upstream and always evaluates the call before asserting success.
+
+### Binary layout verification
+- PASS: `SharedMemorySlot` remains 0x18 bytes, `SharedMemoryPoolLayout` remains 0x188 bytes, and each `NvGraphicBuffer` retains the upstream dimensions, stride, format, handle and slot offset.
+
+## 2026-08-07 — core/src/hle/service/nfc/nfc.rs vs core/hle/service/nfc/nfc.{h,cpp}
+
+### Intentional differences
+- Rust wraps the shared `NfcInterface` implementation in `IUser`, `ISystem`, and `MFIUser` instead of using C++ inheritance. Each wrapper owns the distinct upstream command table and delegates dispatch without changing command ownership.
+- Named services use `Arc<dyn SessionRequestHandler>` factories because the Rust `ServerManager` creates one handler per accepted session; this is the existing Rust equivalent of upstream `shared_ptr<ServiceFramework>` registration.
+
+### Unintentional differences (to fix)
+- Resolved: `LoopProcess` registered `nfc:am`, `nfc:mf:u`, `nfc:user`, and `nfc:sys` as generic stubs instead of the four upstream service classes, so interface-creation responses contained no IPC object.
+- Resolved: all three inner service types shared the `IUser` command table. `ISystem` now owns commands 100, 500, and 510, while `MFIUser` owns the upstream Mifare command IDs 0 through 13.
+
+### Missing items
+- `IAm` commands 0 through 2, `ISystem` command 510, and pass-through session commands 1301 through 1302 remain without callbacks, matching their upstream `nullptr` entries.
+
+### Binary layout verification
+- PASS: the four manager commands return the upstream two-word result plus one IPC interface object. This slice adds no raw guest structures.
+
+## 2026-08-07 — core/src/hle/service/nfc/nfc_interface.rs vs core/hle/service/nfc/nfc_interface.{h,cpp}
+
+### Intentional differences
+- `NfcInterface::new` receives the handler map built by the concrete interface in `nfc.rs`; this keeps the command tables with their upstream `nfc.cpp` owners while retaining Rust's shared implementation object instead of C++ inheritance.
+
+### Unintentional differences (to fix)
+- Resolved: the common constructor hard-coded the `IUser` table, which made it impossible for the concrete NFC interfaces to preserve their different upstream command IDs.
+
+### Missing items
+- The pre-existing device-manager, system-settings, and kernel-event approximations in `nfc_interface.rs` remain outside this service-registration prerequisite and require their own upstream parity pass.
+
+### Binary layout verification
+- PASS: moving handler-map ownership changes dispatch metadata only; all existing NFC request and response payload layouts are unchanged.
+
+## 2026-08-07 — video_core/src/renderer_vulkan/pipeline_cache.rs vs video_core/renderer_vulkan/vk_pipeline_cache.{h,cpp}
+
+### Intentional differences
+- Rust exposes `make_shader_profile` to the renderer because the current ownership graph constructs `RasterizerVulkan` after creating the Vulkan `Device`; the resulting `Profile` remains owned by `PipelineCache` and is cloned only for the existing Rust shader-cache layers.
+- Profile fields not initialized by the upstream Vulkan constructor retain `Profile::default()` values through Rust struct update syntax.
+
+### Unintentional differences (to fix)
+- Resolved: Vulkan shader-profile construction lived in `vk_rasterizer.rs` rather than the pipeline-cache counterpart that owns it upstream.
+- Resolved: the reduced profile omitted upstream capability values for int8/int16, explicit workgroup layout, subgroup vote, viewport layer/mask, typeless image loads, int64 atomics, derivative control, geometry passthrough, scaled attributes, multi-viewport, geometry streams, warp size, driver workarounds, robust access, and clip-distance limits.
+
+### Missing items
+- None in the Vulkan `Shader::Profile` construction slice.
+
+### Binary layout verification
+- PASS: `Profile` is host-only compiler metadata and is not serialized as a guest payload; all upstream fields are assigned with matching scalar types and values.
+
+## 2026-08-07 — video_core/src/renderer_vulkan/vk_rasterizer.rs vs video_core/renderer_vulkan/vk_rasterizer.{h,cpp}
+
+### Intentional differences
+- The Rust rasterizer receives an already constructed `Profile` because its constructor does not retain the full Vulkan `Device` wrapper.
+
+### Unintentional differences (to fix)
+- Resolved: the rasterizer previously owned a partial shader-profile initializer that belongs to upstream `PipelineCache`.
+
+### Missing items
+- None in the profile-ownership correction.
+
+### Binary layout verification
+- PASS: this moves host compiler metadata only and changes no guest-visible or Vulkan structure layout.
+
+## 2026-08-07 — video_core/src/renderer_vulkan/renderer_vulkan.rs vs video_core/renderer_vulkan/renderer_vulkan.cpp
+
+### Intentional differences
+- Rust calls the pipeline-cache-owned profile builder before constructing `RasterizerVulkan`; this is the ownership adapter required because the Rust rasterizer constructor takes decomposed Vulkan capabilities rather than upstream's retained `Device&`.
+
+### Unintentional differences (to fix)
+- Resolved: the renderer previously passed a reduced set of raw profile capabilities into the rasterizer instead of transferring the complete pipeline-cache profile.
+
+### Missing items
+- None in the shader-profile propagation slice.
+
+### Binary layout verification
+- PASS: the adapter transfers an owned host-side `Profile` and does not serialize it.
+
+## 2026-08-07 — video_core/src/vulkan_common/vulkan_device.rs vs video_core/vulkan_common/vulkan_device.{h,cpp}
+
+### Intentional differences
+- Rust stores the queried `geometryStreams` feature as a dedicated boolean because it does not retain upstream's complete nested `Device::Features` chain after logical-device creation.
+
+### Unintentional differences (to fix)
+- Resolved: `are_transform_feedback_geometry_streams_supported` returned the filtered transform-feedback extension suitability flag, while upstream returns the raw queried `geometryStreams` feature bit.
+
+### Missing items
+- None in the transform-feedback geometry-stream capability accessor.
+
+### Binary layout verification
+- PASS: the added boolean is host-only `Device` state; Vulkan feature structures and guest payloads are unchanged.
 
 ## 2026-08-08 — core/src/hle/service/nvnflinger/buffer_queue_producer.rs vs core/hle/service/nvnflinger/buffer_queue_producer.cpp
 

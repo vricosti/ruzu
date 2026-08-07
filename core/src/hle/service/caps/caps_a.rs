@@ -12,11 +12,35 @@ use std::sync::{Arc, Mutex};
 use super::caps_manager::AlbumManager;
 use super::caps_result::*;
 use super::caps_types::{
-    AlbumEntry, AlbumFileId, AlbumStorage, LoadAlbumScreenShotImageOutput, ScreenShotDecodeOption,
+    AlbumEntry, AlbumFileDateTime, AlbumFileId, AlbumStorage, ContentType,
+    LoadAlbumScreenShotImageOutput, ScreenShotDecodeOption, ScreenShotDecoderFlag,
 };
-use crate::hle::result::{ErrorModule, ResultCode};
+use crate::hle::result::{ErrorModule, ResultCode, RESULT_SUCCESS};
 use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
+use crate::hle::service::ipc_helpers::{RequestParser, ResponseBuilder};
 use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct AlbumFileIdRaw {
+    application_id: u64,
+    date: AlbumFileDateTime,
+    storage: u8,
+    content_type: u8,
+    padding: [u8; 5],
+    unknown: u8,
+}
+
+const _: () = assert!(core::mem::size_of::<AlbumFileIdRaw>() == 0x18);
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct ScreenShotDecodeOptionRaw {
+    flags: u64,
+    padding: [u8; 0x18],
+}
+
+const _: () = assert!(core::mem::size_of::<ScreenShotDecodeOptionRaw>() == 0x20);
 
 /// IPC command table for IAlbumAccessorService.
 ///
@@ -76,11 +100,15 @@ impl IAlbumAccessorService {
     pub fn new(album_manager: Arc<Mutex<AlbumManager>>) -> Self {
         let handlers = build_handler_map(&[
             (0, None, "GetAlbumFileCount"),
-            (1, None, "GetAlbumFileList"),
+            (
+                1,
+                Some(Self::get_album_file_list_handler),
+                "GetAlbumFileList",
+            ),
             (2, None, "LoadAlbumFile"),
-            (3, None, "DeleteAlbumFile"),
+            (3, Some(Self::delete_album_file_handler), "DeleteAlbumFile"),
             (4, None, "StorageCopyAlbumFile"),
-            (5, None, "IsAlbumMounted"),
+            (5, Some(Self::is_album_mounted_handler), "IsAlbumMounted"),
             (6, None, "GetAlbumUsage"),
             (7, None, "GetAlbumFileSize"),
             (8, None, "LoadAlbumFileThumbnail"),
@@ -93,18 +121,34 @@ impl IAlbumAccessorService {
             (15, None, "GetAlbumUsage3"),
             (16, None, "GetAlbumMountResult"),
             (17, None, "GetAlbumUsage16"),
-            (18, None, "Unknown18"),
+            (18, Some(Self::unknown18_handler), "Unknown18"),
             (19, None, "Unknown19"),
             (100, None, "GetAlbumFileCountEx0"),
-            (101, None, "GetAlbumFileListEx0"),
+            (
+                101,
+                Some(Self::get_album_file_list_ex0_handler),
+                "GetAlbumFileListEx0",
+            ),
             (202, None, "SaveEditedScreenShot"),
             (301, None, "GetLastThumbnail"),
             (302, None, "GetLastOverlayMovieThumbnail"),
-            (401, None, "GetAutoSavingStorage"),
+            (
+                401,
+                Some(Self::get_auto_saving_storage_handler),
+                "GetAutoSavingStorage",
+            ),
             (501, None, "GetRequiredStorageSpaceSizeToCopyAll"),
             (1001, None, "LoadAlbumScreenShotThumbnailImageEx0"),
-            (1002, None, "LoadAlbumScreenShotImageEx1"),
-            (1003, None, "LoadAlbumScreenShotThumbnailImageEx1"),
+            (
+                1002,
+                Some(Self::load_album_screen_shot_image_ex1_handler),
+                "LoadAlbumScreenShotImageEx1",
+            ),
+            (
+                1003,
+                Some(Self::load_album_screen_shot_thumbnail_image_ex1_handler),
+                "LoadAlbumScreenShotThumbnailImageEx1",
+            ),
             (8001, None, "ForceAlbumUnmounted"),
             (8002, None, "ResetAlbumMountStatus"),
             (8011, None, "RefreshAlbumCache"),
@@ -121,6 +165,230 @@ impl IAlbumAccessorService {
             handlers_tipc: BTreeMap::new(),
             manager: album_manager,
         }
+    }
+
+    fn as_self(this: &dyn ServiceFramework) -> &Self {
+        unsafe { &*(this as *const dyn ServiceFramework as *const Self) }
+    }
+
+    fn parse_album_storage(raw: u8) -> Result<AlbumStorage, ResultCode> {
+        match raw {
+            0 => Ok(AlbumStorage::Nand),
+            1 => Ok(AlbumStorage::Sd),
+            _ => Err(RESULT_INVALID_STORAGE),
+        }
+    }
+
+    fn parse_album_file_id(raw: AlbumFileIdRaw) -> Result<AlbumFileId, ResultCode> {
+        let storage = Self::parse_album_storage(raw.storage)?;
+        let content_type = match raw.content_type {
+            0 => ContentType::Screenshot,
+            1 => ContentType::Movie,
+            3 => ContentType::ExtraMovie,
+            _ => return Err(RESULT_INVALID_FILE_CONTENTS),
+        };
+        Ok(AlbumFileId {
+            application_id: raw.application_id,
+            date: raw.date,
+            storage,
+            content_type,
+            _padding: raw.padding,
+            unknown: raw.unknown,
+        })
+    }
+
+    fn entries_as_bytes(entries: &[AlbumEntry]) -> &[u8] {
+        unsafe {
+            core::slice::from_raw_parts(
+                entries.as_ptr().cast::<u8>(),
+                core::mem::size_of_val(entries),
+            )
+        }
+    }
+
+    fn value_as_bytes<T>(value: &T) -> &[u8] {
+        unsafe {
+            core::slice::from_raw_parts((value as *const T).cast::<u8>(), core::mem::size_of::<T>())
+        }
+    }
+
+    fn write_buffer_if_nonempty(ctx: &HLERequestContext, data: &[u8], index: usize) {
+        if !data.is_empty() {
+            ctx.write_buffer(data, index);
+        }
+    }
+
+    fn get_album_file_list_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let service = Self::as_self(this);
+        let mut request = RequestParser::new(ctx);
+        let storage = Self::parse_album_storage(request.pop_u8());
+        let mut entries = vec![
+            AlbumEntry::default();
+            ctx.get_write_buffer_size(0) / core::mem::size_of::<AlbumEntry>()
+        ];
+        let (result, count) = match storage {
+            Ok(storage) => match service.get_album_file_list(storage, &mut entries) {
+                Ok(count) => (RESULT_SUCCESS, count),
+                Err(result) => (result, 0),
+            },
+            Err(result) => (result, 0),
+        };
+        Self::write_buffer_if_nonempty(ctx, Self::entries_as_bytes(&entries), 0);
+        let mut response = ResponseBuilder::new(ctx, 4, 0, 0);
+        response.push_result(result);
+        response.push_u64(count);
+    }
+
+    fn delete_album_file_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let service = Self::as_self(this);
+        let mut request = RequestParser::new(ctx);
+        request.align_for::<AlbumFileIdRaw>();
+        let result = match Self::parse_album_file_id(request.pop_raw::<AlbumFileIdRaw>()) {
+            Ok(file_id) => service
+                .delete_album_file(file_id)
+                .err()
+                .unwrap_or(RESULT_SUCCESS),
+            Err(result) => result,
+        };
+        let mut response = ResponseBuilder::new(ctx, 2, 0, 0);
+        response.push_result(result);
+    }
+
+    fn is_album_mounted_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let service = Self::as_self(this);
+        let mut request = RequestParser::new(ctx);
+        let storage = Self::parse_album_storage(request.pop_u8());
+        let (result, is_mounted) = match storage {
+            Ok(storage) => match service.is_album_mounted(storage) {
+                Ok(is_mounted) => (RESULT_SUCCESS, is_mounted),
+                Err(result) => (result, false),
+            },
+            Err(result) => (result, false),
+        };
+        let mut response = ResponseBuilder::new(ctx, 3, 0, 0);
+        response.push_result(result);
+        response.push_bool(is_mounted);
+    }
+
+    fn unknown18_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let service = Self::as_self(this);
+        let mut out_buffer = vec![0u8; ctx.get_write_buffer_size(0)];
+        let (result, out_buffer_size) = match service.unknown18(&mut out_buffer) {
+            Ok(size) => (RESULT_SUCCESS, size),
+            Err(result) => (result, 0),
+        };
+        Self::write_buffer_if_nonempty(ctx, &out_buffer, 0);
+        let mut response = ResponseBuilder::new(ctx, 3, 0, 0);
+        response.push_result(result);
+        response.push_u32(out_buffer_size);
+    }
+
+    fn get_album_file_list_ex0_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let service = Self::as_self(this);
+        let mut request = RequestParser::new(ctx);
+        let storage = Self::parse_album_storage(request.pop_u8());
+        let flags = request.pop_u8();
+        let mut entries = vec![
+            AlbumEntry::default();
+            ctx.get_write_buffer_size(0) / core::mem::size_of::<AlbumEntry>()
+        ];
+        let (result, count) = match storage {
+            Ok(storage) => match service.get_album_file_list_ex0(storage, flags, &mut entries) {
+                Ok(count) => (RESULT_SUCCESS, count),
+                Err(result) => (result, 0),
+            },
+            Err(result) => (result, 0),
+        };
+        Self::write_buffer_if_nonempty(ctx, Self::entries_as_bytes(&entries), 0);
+        let mut response = ResponseBuilder::new(ctx, 4, 0, 0);
+        response.push_result(result);
+        response.push_u64(count);
+    }
+
+    fn get_auto_saving_storage_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let service = Self::as_self(this);
+        let (result, is_autosaving) = match service.get_auto_saving_storage() {
+            Ok(value) => (RESULT_SUCCESS, value),
+            Err(result) => (result, false),
+        };
+        let mut response = ResponseBuilder::new(ctx, 3, 0, 0);
+        response.push_result(result);
+        response.push_bool(is_autosaving);
+    }
+
+    fn parse_load_request(
+        ctx: &HLERequestContext,
+    ) -> Result<(AlbumFileId, ScreenShotDecodeOption), ResultCode> {
+        let mut request = RequestParser::new(ctx);
+        request.align_for::<AlbumFileIdRaw>();
+        let file_id = Self::parse_album_file_id(request.pop_raw::<AlbumFileIdRaw>())?;
+        request.align_for::<ScreenShotDecodeOptionRaw>();
+        let options = request.pop_raw::<ScreenShotDecodeOptionRaw>();
+        Ok((
+            file_id,
+            ScreenShotDecodeOption {
+                flags: ScreenShotDecoderFlag(options.flags),
+                _padding: options.padding,
+            },
+        ))
+    }
+
+    fn write_load_outputs(
+        ctx: &mut HLERequestContext,
+        image_output: &LoadAlbumScreenShotImageOutput,
+        image: &[u8],
+        out_buffer: &[u8],
+    ) {
+        ctx.write_buffer(Self::value_as_bytes(image_output), 0);
+        Self::write_buffer_if_nonempty(ctx, image, 1);
+        Self::write_buffer_if_nonempty(ctx, out_buffer, 2);
+    }
+
+    fn load_album_screen_shot_image_ex1_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        let service = Self::as_self(this);
+        let request = Self::parse_load_request(ctx);
+        let mut image_output = LoadAlbumScreenShotImageOutput::default();
+        let mut image = vec![0u8; ctx.get_write_buffer_size(1)];
+        let out_buffer = vec![0u8; ctx.get_write_buffer_size(2)];
+        let result = match request {
+            Ok((file_id, options)) => service
+                .load_album_screen_shot_image_ex1(&file_id, &options, &mut image_output, &mut image)
+                .err()
+                .unwrap_or(RESULT_SUCCESS),
+            Err(result) => result,
+        };
+        Self::write_load_outputs(ctx, &image_output, &image, &out_buffer);
+        let mut response = ResponseBuilder::new(ctx, 2, 0, 0);
+        response.push_result(result);
+    }
+
+    fn load_album_screen_shot_thumbnail_image_ex1_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        let service = Self::as_self(this);
+        let request = Self::parse_load_request(ctx);
+        let mut image_output = LoadAlbumScreenShotImageOutput::default();
+        let mut image = vec![0u8; ctx.get_write_buffer_size(1)];
+        let out_buffer = vec![0u8; ctx.get_write_buffer_size(2)];
+        let result = match request {
+            Ok((file_id, options)) => service
+                .load_album_screen_shot_thumbnail_image_ex1(
+                    &file_id,
+                    &options,
+                    &mut image_output,
+                    &mut image,
+                )
+                .err()
+                .unwrap_or(RESULT_SUCCESS),
+            Err(result) => result,
+        };
+        Self::write_load_outputs(ctx, &image_output, &image, &out_buffer);
+        let mut response = ResponseBuilder::new(ctx, 2, 0, 0);
+        response.push_result(result);
     }
 
     /// GetAlbumFileList (cmd 1).
@@ -384,5 +652,66 @@ impl ServiceFramework for IAlbumAccessorService {
 
     fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
         &self.handlers_tipc
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn service() -> IAlbumAccessorService {
+        IAlbumAccessorService::new(Arc::new(Mutex::new(AlbumManager::new())))
+    }
+
+    #[test]
+    fn upstream_implemented_commands_have_ipc_handlers() {
+        let service = service();
+        for command in [1, 3, 5, 18, 101, 401, 1002, 1003] {
+            assert!(
+                service
+                    .handlers
+                    .get(&command)
+                    .unwrap()
+                    .handler_callback
+                    .is_some(),
+                "command {command} must be wired like upstream"
+            );
+        }
+    }
+
+    #[test]
+    fn screenshot_decoder_flags_preserve_combined_and_unknown_bits() {
+        let raw = ScreenShotDecodeOptionRaw {
+            flags: 0x8000_0000_0000_0003,
+            padding: [0; 0x18],
+        };
+        let option = ScreenShotDecodeOption {
+            flags: ScreenShotDecoderFlag(raw.flags),
+            _padding: raw.padding,
+        };
+        assert_eq!(option.flags.0, raw.flags);
+    }
+
+    #[test]
+    fn invalid_album_discriminants_are_rejected_without_constructing_invalid_enums() {
+        assert_eq!(
+            IAlbumAccessorService::parse_album_storage(2),
+            Err(RESULT_INVALID_STORAGE)
+        );
+        let raw = AlbumFileIdRaw {
+            content_type: 2,
+            ..AlbumFileIdRaw::default()
+        };
+        assert_eq!(
+            IAlbumAccessorService::parse_album_file_id(raw),
+            Err(RESULT_INVALID_FILE_CONTENTS)
+        );
+    }
+
+    #[test]
+    fn unknown18_reports_zero_bytes_like_upstream() {
+        let service = service();
+        let mut output = [0x55; 16];
+        assert_eq!(service.unknown18(&mut output), Ok(0));
     }
 }

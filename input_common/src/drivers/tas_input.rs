@@ -6,6 +6,8 @@
 //! TAS (Tool-Assisted Speedrun) input driver for recording and playing back controller inputs.
 
 use common::uuid::UUID;
+use parking_lot::Mutex;
+use std::sync::Arc;
 
 use crate::input_engine::{InputEngine, PadIdentifier};
 
@@ -39,7 +41,7 @@ pub enum TasButton {
 }
 
 /// Port of `TasAnalog` struct from tas_input.h
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct TasAnalog {
     pub x: f32,
     pub y: f32,
@@ -100,7 +102,7 @@ const TEXT_TO_TAS_BUTTON: &[(&str, TasButton)] = &[
 
 /// Port of `Tas` class from tas_input.h / tas_input.cpp
 pub struct Tas {
-    engine: InputEngine,
+    engine: Arc<Mutex<InputEngine>>,
     script_length: usize,
     is_recording: bool,
     is_running: bool,
@@ -114,12 +116,13 @@ pub struct Tas {
 impl Tas {
     /// Port of Tas::Tas
     pub fn new(input_engine: String) -> Self {
+        let enabled = *common::settings::values().tas_enable.get_value();
         let mut tas = Self {
-            engine: InputEngine::new(input_engine),
+            engine: Arc::new(Mutex::new(InputEngine::new(input_engine))),
             script_length: 0,
             is_recording: false,
             is_running: false,
-            needs_reset: true, // Settings::values.tas_enable check would go here
+            needs_reset: !enabled,
             commands: Default::default(),
             record_commands: Vec::new(),
             current_command: 0,
@@ -133,20 +136,18 @@ impl Tas {
                 port: player_index,
                 pad: 0,
             };
-            tas.engine.pre_set_controller(&identifier);
+            tas.engine.lock().pre_set_controller(&identifier);
         }
         tas.clear_input();
+        if enabled {
+            tas.load_tas_files();
+        }
         tas
     }
 
     /// Returns a reference to the underlying input engine.
-    pub fn engine(&self) -> &InputEngine {
-        &self.engine
-    }
-
-    /// Returns a mutable reference to the underlying input engine.
-    pub fn engine_mut(&mut self) -> &mut InputEngine {
-        &mut self.engine
+    pub fn engine(&self) -> Arc<Mutex<InputEngine>> {
+        Arc::clone(&self.engine)
     }
 
     /// Changes the input status that will be stored in each frame.
@@ -162,8 +163,12 @@ impl Tas {
     /// Main loop that records or executes input.
     /// Port of Tas::UpdateThread
     pub fn update_thread(&mut self) {
-        // In C++: if (!Settings::values.tas_enable) { if (is_running) { Stop(); } return; }
-        // For now, we skip the settings check.
+        if !*common::settings::values().tas_enable.get_value() {
+            if self.is_running {
+                self.stop();
+            }
+            return;
+        }
 
         if self.is_recording {
             self.record_commands.push(self.last_input.clone());
@@ -204,9 +209,11 @@ impl Tas {
 
                 for i in 0..(std::mem::size_of::<u64>() * 8) {
                     let button_status = (command.buttons & (1u64 << i)) != 0;
-                    self.engine
-                        .set_button(&identifier, i as i32, button_status)
-                        .dispatch();
+                    let callbacks =
+                        self.engine
+                            .lock()
+                            .set_button(&identifier, i as i32, button_status);
+                    callbacks.dispatch();
                 }
                 self.set_tas_axis(&identifier, TasAxis::StickX as u8, command.l_axis.x);
                 self.set_tas_axis(&identifier, TasAxis::StickY as u8, command.l_axis.y);
@@ -214,8 +221,7 @@ impl Tas {
                 self.set_tas_axis(&identifier, TasAxis::SubstickY as u8, command.r_axis.y);
             }
         } else {
-            // In C++: is_running = Settings::values.tas_loop.GetValue();
-            self.is_running = false;
+            self.is_running = *common::settings::values().tas_loop.get_value();
             self.load_tas_files();
             self.current_command = 0;
             self.clear_input();
@@ -225,7 +231,9 @@ impl Tas {
     /// Sets the flag to start or stop the TAS command execution.
     /// Port of Tas::StartStop
     pub fn start_stop(&mut self) {
-        // In C++: if (!Settings::values.tas_enable) { return; }
+        if !*common::settings::values().tas_enable.get_value() {
+            return;
+        }
         if self.is_running {
             self.stop();
         } else {
@@ -242,7 +250,9 @@ impl Tas {
     /// Sets the flag to reload the file and start from the beginning.
     /// Port of Tas::Reset
     pub fn reset(&mut self) {
-        // In C++: if (!Settings::values.tas_enable) { return; }
+        if !*common::settings::values().tas_enable.get_value() {
+            return;
+        }
         self.needs_reset = true;
     }
 
@@ -250,7 +260,9 @@ impl Tas {
     /// Returns true if the current recording status is enabled.
     /// Port of Tas::Record
     pub fn record(&mut self) -> bool {
-        // In C++: if (!Settings::values.tas_enable) { return true; }
+        if !*common::settings::values().tas_enable.get_value() {
+            return true;
+        }
         self.is_recording = !self.is_recording;
         self.is_recording
     }
@@ -309,21 +321,54 @@ impl Tas {
     }
 
     /// Port of Tas::LoadTasFile
-    fn load_tas_file(&mut self, player_index: usize, _file_index: usize) {
+    fn load_tas_file(&mut self, player_index: usize, file_index: usize) {
         self.commands[player_index].clear();
 
-        // In C++, this reads from the TAS directory. We skip actual file I/O
-        // since the file system paths depend on Settings. The logic is preserved.
-        // A full port would read: Common::FS::GetYuzuPath(TASDir) / "script{file_index}-{player_index+1}.txt"
-        let _file_content = String::new(); // Placeholder for file read
+        let path = common::fs::path_util::get_ruzu_path(common::fs::path_util::RuzuPath::TASDir)
+            .join(format!("script{file_index}-{}.txt", player_index + 1));
+        let file = std::fs::read_to_string(path).unwrap_or_default();
+        self.commands[player_index] = self.parse_tas_file(&file);
+        log::info!(
+            "TAS file loaded! {} frames",
+            self.commands[player_index].len()
+        );
+    }
 
-        // Parse would happen here following the C++ logic.
-        // For each line: "frame_no buttons axis_l axis_r"
-        log::info!("TAS file loaded! 0 frames");
+    fn parse_tas_file(&self, file: &str) -> Vec<TasCommand> {
+        let mut commands = Vec::new();
+        let mut frame_no = 0i32;
+        for line in file.lines().filter(|line| !line.is_empty()) {
+            let segments: Vec<_> = line.split(' ').collect();
+            if segments.len() < 4 {
+                continue;
+            }
+            match segments[0].parse::<i32>() {
+                Ok(num_frames) => {
+                    while frame_no < num_frames {
+                        commands.push(TasCommand::default());
+                        frame_no += 1;
+                    }
+                }
+                Err(error) => {
+                    log::error!(
+                        "Invalid frame number '{}' at command {}: {error}",
+                        segments[0],
+                        frame_no
+                    );
+                }
+            }
+            commands.push(TasCommand {
+                buttons: self.read_command_buttons(segments[1]),
+                l_axis: self.read_command_axis(segments[2]),
+                r_axis: self.read_command_axis(segments[3]),
+            });
+            frame_no += 1;
+        }
+        commands
     }
 
     /// Port of Tas::WriteTasFile
-    fn write_tas_file(&self, _file_name: &str) {
+    fn write_tas_file(&self, file_name: &str) {
         let mut output_text = String::new();
         for (frame, line) in self.record_commands.iter().enumerate() {
             output_text.push_str(&format!(
@@ -335,12 +380,13 @@ impl Tas {
             ));
         }
 
-        // In C++, this writes to the TAS directory. We skip actual file I/O.
-        // A full port would write: Common::FS::GetYuzuPath(TASDir) / file_name
-        if output_text.is_empty() {
-            log::error!("Writing the TAS-file has failed! Empty output");
-        } else {
-            log::info!("TAS file written to file!");
+        let directory =
+            common::fs::path_util::get_ruzu_path(common::fs::path_util::RuzuPath::TASDir);
+        let result = std::fs::create_dir_all(&directory)
+            .and_then(|()| std::fs::write(directory.join(file_name), output_text.as_bytes()));
+        match result {
+            Ok(()) => log::info!("TAS file written to file!"),
+            Err(error) => log::error!("Writing the TAS-file has failed: {error}"),
         }
     }
 
@@ -381,10 +427,14 @@ impl Tas {
 
     /// Port of Tas::ClearInput
     fn clear_input(&mut self) {
-        for callbacks in self.engine.reset_button_state() {
+        let (button_callbacks, analog_callbacks) = {
+            let mut engine = self.engine.lock();
+            (engine.reset_button_state(), engine.reset_analog_state())
+        };
+        for callbacks in button_callbacks {
             callbacks.dispatch();
         }
-        for callbacks in self.engine.reset_analog_state() {
+        for callbacks in analog_callbacks {
             callbacks.dispatch();
         }
     }
@@ -412,14 +462,47 @@ impl Tas {
 
     /// Port of Tas::SetTasAxis
     fn set_tas_axis(&mut self, identifier: &PadIdentifier, axis: u8, value: f32) {
-        self.engine
-            .set_axis(identifier, axis as i32, value)
-            .dispatch();
+        let callbacks = self.engine.lock().set_axis(identifier, axis as i32, value);
+        callbacks.dispatch();
     }
 }
 
 impl Drop for Tas {
     fn drop(&mut self) {
         self.stop();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_sparse_frames_buttons_and_axes_like_upstream() {
+        let tas = Tas::new("tas-test".to_owned());
+        let commands = tas.parse_tas_file(
+            "2 KEY_A;KEY_ZR 32767;-32767 0;16383\n\
+             3 NONE 0;0 -32767;32767\n",
+        );
+
+        assert_eq!(commands.len(), 4);
+        assert_eq!(commands[0].buttons, 0);
+        assert_eq!(commands[1].buttons, 0);
+        assert_eq!(
+            commands[2].buttons,
+            TasButton::ButtonA as u64 | TasButton::TriggerZR as u64
+        );
+        assert_eq!(commands[2].l_axis, TasAnalog { x: 1.0, y: -1.0 });
+        assert!((commands[2].r_axis.y - 16383.0 / 32767.0).abs() < f32::EPSILON);
+        assert_eq!(commands[3].r_axis, TasAnalog { x: -1.0, y: 1.0 });
+    }
+
+    #[test]
+    fn accepts_negative_frame_numbers_like_std_stoi() {
+        let tas = Tas::new("tas-test-negative-frame".to_owned());
+        let commands = tas.parse_tas_file("-1 KEY_A 0;0 0;0\n");
+
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0].buttons, TasButton::ButtonA as u64);
     }
 }

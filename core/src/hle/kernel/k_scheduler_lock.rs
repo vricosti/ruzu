@@ -480,12 +480,18 @@ mod tests {
     }
 
     #[test]
-    fn outermost_unlock_updates_highest_before_enabling_scheduling() {
+    fn nested_unlock_defers_update_and_enable_until_outermost_unlock() {
         CALLBACK_ORDER.store(0, Ordering::SeqCst);
         let mut lock = KAbstractSchedulerLock::new();
         lock.set_callbacks(&TEST_CALLBACKS);
 
         lock.lock();
+        lock.lock();
+        lock.unlock();
+
+        assert_eq!(CALLBACK_ORDER.load(Ordering::SeqCst), 1);
+        assert_eq!(lock.get_lock_count(), 1);
+
         lock.unlock();
 
         assert_eq!(CALLBACK_ORDER.load(Ordering::SeqCst), 3);

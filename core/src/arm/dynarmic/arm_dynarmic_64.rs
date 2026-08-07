@@ -2268,7 +2268,10 @@ impl ArmDynarmic64 {
         // `RUZU_NO_FASTMEM=1` env-var disables fastmem entirely (forces
         // the slow callback path for all memory accesses) — useful for
         // debugging fastmem-related issues without rebuilding.
-        let mut page_table_pointer: Option<*const u8> = {
+        let no_fastmem = std::env::var_os("RUZU_NO_FASTMEM").is_some();
+        let mut page_table_pointer: Option<*const u8> = if no_fastmem {
+            None
+        } else {
             let kernel_process = unsafe {
                 &*(process as *const _ as *const crate::hle::kernel::k_process::KProcess)
             };
@@ -2280,8 +2283,10 @@ impl ArmDynarmic64 {
                 .filter(|p| !p.is_null())
         };
 
-        let mut fastmem_pointer: Option<*mut u8> = if std::env::var("RUZU_NO_FASTMEM").is_ok() {
-            log::warn!("ArmDynarmic64: RUZU_NO_FASTMEM set — fastmem disabled");
+        let mut fastmem_pointer: Option<*mut u8> = if no_fastmem {
+            log::warn!(
+                "ArmDynarmic64: RUZU_NO_FASTMEM set — fastmem and page-table paths disabled"
+            );
             None
         } else {
             core_memory

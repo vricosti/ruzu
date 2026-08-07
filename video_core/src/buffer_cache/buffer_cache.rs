@@ -1951,7 +1951,6 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
         } else {
             binding.size
         };
-
         // Touch the buffer.
         self.touch_buffer(binding.buffer_id);
 

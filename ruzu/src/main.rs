@@ -14,6 +14,7 @@ use std::rc::Rc;
 use gtk::prelude::*;
 use gtk::{gio, glib};
 
+mod about_dialog;
 mod boot;
 mod config_import;
 mod configuration;

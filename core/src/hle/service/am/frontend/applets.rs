@@ -20,6 +20,7 @@ use crate::hle::result::ResultCode;
 use crate::hle::service::am::am_types::{AppletId, LibraryAppletMode};
 use crate::hle::service::am::applet_data_broker::AppletDataBroker;
 
+use super::applet_cabinet::CabinetMode;
 use super::applet_controller::Controller;
 use super::applet_mii_edit::MiiEdit;
 use super::applet_software_keyboard::SoftwareKeyboard;
@@ -44,6 +45,7 @@ pub trait FrontendApplet: Send + Sync {
 ///
 /// Port of FrontendAppletHolder class.
 pub struct FrontendAppletHolder {
+    cabinet_mode: CabinetMode,
     current_applet_id: AppletId,
     controller: Arc<dyn ControllerApplet>,
     software_keyboard: Arc<dyn SoftwareKeyboardApplet>,
@@ -52,10 +54,19 @@ pub struct FrontendAppletHolder {
 impl FrontendAppletHolder {
     pub fn new(hid_core: Arc<Mutex<HIDCore>>) -> Self {
         Self {
+            cabinet_mode: CabinetMode::default(),
             current_applet_id: AppletId::None,
             controller: Arc::new(DefaultControllerApplet::new(hid_core)),
             software_keyboard: Arc::new(DefaultSoftwareKeyboardApplet::new()),
         }
+    }
+
+    pub fn get_cabinet_mode(&self) -> CabinetMode {
+        self.cabinet_mode
+    }
+
+    pub fn set_cabinet_mode(&mut self, mode: CabinetMode) {
+        self.cabinet_mode = mode;
     }
 
     pub fn get_current_applet_id(&self) -> AppletId {
@@ -89,5 +100,22 @@ impl FrontendAppletHolder {
             ))),
             _ => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stores_frontend_selected_applet_and_cabinet_mode() {
+        let hid_core = Arc::new(Mutex::new(HIDCore::new()));
+        let mut holder = FrontendAppletHolder::new(hid_core);
+
+        holder.set_current_applet_id(AppletId::Cabinet);
+        holder.set_cabinet_mode(CabinetMode::StartFormatter);
+
+        assert_eq!(holder.get_current_applet_id(), AppletId::Cabinet);
+        assert_eq!(holder.get_cabinet_mode(), CabinetMode::StartFormatter);
     }
 }

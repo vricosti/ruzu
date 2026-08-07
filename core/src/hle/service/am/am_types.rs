@@ -25,7 +25,10 @@ pub enum GamePlayRecordingState {
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum FocusState {
+    // Upstream value-initializes LifecycleManager's focus-state fields with
+    // `{}`, producing the unnamed underlying value 0 before the first update.
     #[default]
+    Unknown = 0,
     InFocus = 1,
     NotInFocus = 2,
     Background = 3,

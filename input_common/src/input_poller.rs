@@ -1505,57 +1505,82 @@ struct OutputFromIdentifier {
     input_engine: Arc<Mutex<InputEngine>>,
 }
 
+impl OutputFromIdentifier {
+    /// Clone the concrete driver before invoking it. This mirrors C++ virtual
+    /// dispatch without retaining the composed `InputEngine` mutex across a
+    /// driver call that may publish fresh input through that same engine.
+    fn output_handler(&self) -> Option<Arc<dyn crate::input_engine::InputEngineOutput>> {
+        self.input_engine.lock().output_handler()
+    }
+}
+
 impl OutputDevice for OutputFromIdentifier {
     fn set_led(&mut self, status: &LedStatus) -> DriverResult {
-        self.input_engine.lock().set_leds(&self.identifier, status)
+        self.output_handler()
+            .map_or(DriverResult::NotSupported, |output| {
+                output.set_leds(&self.identifier, status)
+            })
     }
 
     fn set_vibration(&mut self, status: &VibrationStatus) -> DriverResult {
-        self.input_engine
-            .lock()
-            .set_vibration(&self.identifier, status)
+        self.output_handler()
+            .map_or(DriverResult::NotSupported, |output| {
+                output.set_vibration(&self.identifier, status)
+            })
     }
 
     fn is_vibration_enabled(&self) -> bool {
-        self.input_engine
-            .lock()
-            .is_vibration_enabled(&self.identifier)
+        self.output_handler()
+            .is_some_and(|output| output.is_vibration_enabled(&self.identifier))
     }
 
     fn set_polling_mode(&mut self, mode: PollingMode) -> DriverResult {
-        self.input_engine
-            .lock()
-            .set_polling_mode(&self.identifier, mode)
+        self.output_handler()
+            .map_or(DriverResult::NotSupported, |output| {
+                output.set_polling_mode(&self.identifier, mode)
+            })
     }
 
     fn set_camera_format(&mut self, format: CameraFormat) -> DriverResult {
-        self.input_engine
-            .lock()
-            .set_camera_format(&self.identifier, format)
+        self.output_handler()
+            .map_or(DriverResult::NotSupported, |output| {
+                output.set_camera_format(&self.identifier, format)
+            })
     }
 
     fn supports_nfc(&self) -> NfcState {
-        self.input_engine.lock().supports_nfc(&self.identifier)
+        self.output_handler()
+            .map_or(NfcState::NotSupported, |output| {
+                output.supports_nfc(&self.identifier)
+            })
     }
 
     fn start_nfc_polling(&mut self) -> NfcState {
-        self.input_engine.lock().start_nfc_polling(&self.identifier)
+        self.output_handler()
+            .map_or(NfcState::NotSupported, |output| {
+                output.start_nfc_polling(&self.identifier)
+            })
     }
 
     fn stop_nfc_polling(&mut self) -> NfcState {
-        self.input_engine.lock().stop_nfc_polling(&self.identifier)
+        self.output_handler()
+            .map_or(NfcState::NotSupported, |output| {
+                output.stop_nfc_polling(&self.identifier)
+            })
     }
 
     fn read_amiibo_data(&mut self, out_data: &mut Vec<u8>) -> NfcState {
-        self.input_engine
-            .lock()
-            .read_amiibo_data(&self.identifier, out_data)
+        self.output_handler()
+            .map_or(NfcState::NotSupported, |output| {
+                output.read_amiibo_data(&self.identifier, out_data)
+            })
     }
 
     fn write_nfc_data(&mut self, data: &[u8]) -> NfcState {
-        self.input_engine
-            .lock()
-            .write_nfc_data(&self.identifier, data)
+        self.output_handler()
+            .map_or(NfcState::NotSupported, |output| {
+                output.write_nfc_data(&self.identifier, data)
+            })
     }
 
     fn read_mifare_data(
@@ -1563,15 +1588,17 @@ impl OutputDevice for OutputFromIdentifier {
         request: &MifareRequest,
         out_data: &mut MifareRequest,
     ) -> NfcState {
-        self.input_engine
-            .lock()
-            .read_mifare_data(&self.identifier, request, out_data)
+        self.output_handler()
+            .map_or(NfcState::NotSupported, |output| {
+                output.read_mifare_data(&self.identifier, request, out_data)
+            })
     }
 
     fn write_mifare_data(&mut self, request: &MifareRequest) -> NfcState {
-        self.input_engine
-            .lock()
-            .write_mifare_data(&self.identifier, request)
+        self.output_handler()
+            .map_or(NfcState::NotSupported, |output| {
+                output.write_mifare_data(&self.identifier, request)
+            })
     }
 }
 

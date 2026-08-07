@@ -54,9 +54,6 @@ struct WindowSystemInner {
 
     /// Applet map by aruid — upstream: std::map<u64, std::shared_ptr<Applet>>
     applets: BTreeMap<u64, Arc<Mutex<Applet>>>,
-
-    /// Whether the system should exit (set when all applets terminate).
-    should_exit: bool,
 }
 
 impl WindowSystem {
@@ -70,7 +67,6 @@ impl WindowSystem {
                 home_menu_aruid: None,
                 application_aruid: None,
                 applets: BTreeMap::new(),
-                should_exit: false,
             }),
         }
     }
@@ -261,11 +257,6 @@ impl WindowSystem {
         // No-op, matching upstream
     }
 
-    /// Whether the system should exit (all applets terminated).
-    pub fn should_exit(&self) -> bool {
-        self.lock.lock().unwrap().should_exit
-    }
-
     // --- Private helpers ---
 
     fn request_update(&self) {
@@ -356,7 +347,12 @@ impl WindowSystem {
 
         // If the last applet has exited, exit the system.
         if inner.applets.is_empty() {
-            inner.should_exit = true;
+            // Production construction always supplies the upstream-owned
+            // `Core::System&`. A null reference is supported only by isolated
+            // Rust service tests that do not own a frontend.
+            if !self.system.is_null() {
+                self.system.get().exit();
+            }
         }
     }
 
@@ -481,5 +477,26 @@ impl Drop for WindowSystem {
                 .get_applet_manager()
                 .set_window_system(None::<Arc<Mutex<WindowSystem>>>);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    #[test]
+    fn empty_window_system_requests_frontend_exit() {
+        let mut system = crate::core::System::new();
+        let exit_requested = Arc::new(AtomicBool::new(false));
+        let callback_flag = Arc::clone(&exit_requested);
+        system.register_exit_callback(Box::new(move || {
+            callback_flag.store(true, Ordering::Release);
+        }));
+
+        let window_system = WindowSystem::new(crate::core::SystemRef::from_ref(&system));
+        window_system.update();
+
+        assert!(exit_requested.load(Ordering::Acquire));
     }
 }

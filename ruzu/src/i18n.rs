@@ -5,8 +5,12 @@
 // locale selection and widget translation in its GTK frontend.
 
 use std::cell::Cell;
+#[cfg(test)]
+use std::cell::RefCell;
 use std::collections::HashMap;
-use std::sync::{OnceLock, RwLock};
+use std::sync::OnceLock;
+#[cfg(not(test))]
+use std::sync::RwLock;
 
 use gtk::prelude::*;
 
@@ -82,7 +86,13 @@ pub const AVAILABLE_LANGUAGES: &[(&str, &str)] = &[
     ("zh_TW", "繁體中文"),
 ];
 
+#[cfg(not(test))]
 static CONFIGURED_LANGUAGE: OnceLock<RwLock<String>> = OnceLock::new();
+
+#[cfg(test)]
+thread_local! {
+    static CONFIGURED_LANGUAGE: RefCell<String> = RefCell::new("en".to_string());
+}
 
 thread_local! {
     static RETRANSLATING: Cell<bool> = const { Cell::new(false) };
@@ -96,6 +106,7 @@ impl Drop for RetranslationGuard {
     }
 }
 
+#[cfg(not(test))]
 fn configured_language() -> &'static RwLock<String> {
     // Tests and non-GTK helpers are deterministic until the frontend applies
     // its stored locale. `main` explicitly sets `""` when System is selected.
@@ -103,11 +114,23 @@ fn configured_language() -> &'static RwLock<String> {
 }
 
 pub fn set_language(locale: &str) {
-    *configured_language().write().unwrap() = locale.to_string();
+    #[cfg(not(test))]
+    {
+        *configured_language().write().unwrap() = locale.to_string();
+    }
+    #[cfg(test)]
+    CONFIGURED_LANGUAGE.with(|language| *language.borrow_mut() = locale.to_string());
 }
 
 pub fn language() -> String {
-    configured_language().read().unwrap().clone()
+    #[cfg(not(test))]
+    {
+        configured_language().read().unwrap().clone()
+    }
+    #[cfg(test)]
+    {
+        CONFIGURED_LANGUAGE.with(|language| language.borrow().clone())
+    }
 }
 
 pub fn is_retranslating() -> bool {
@@ -153,6 +176,14 @@ fn resolve_catalog_locale(locale: &str) -> String {
 }
 
 fn normalize_for_catalog(text: &str) -> (String, bool) {
+    if catalog_source(text).is_some()
+        || AVAILABLE_LANGUAGES
+            .iter()
+            .any(|(locale, _)| catalog_translation(locale, text).is_some())
+    {
+        return (text.to_string(), false);
+    }
+
     let branded = text.replace("ruzu", "yuzu").replace("Ruzu", "Yuzu");
     if catalog_source(&branded).is_some()
         || AVAILABLE_LANGUAGES
@@ -294,6 +325,13 @@ mod tests {
         set_language("fr");
         assert_eq!(tr("Cancel"), "Annuler");
         assert_eq!(tr("Add Game Directory"), "Ajouter un répertoire de jeux");
+        let quickstart = tr(
+            "Encryption keys are missing. <br>Please follow <a href='https://github.com/vricosti/ruzu/blob/main/docs/quickstart.md'>the ruzu quickstart guide</a> to install your keys and firmware, then add your games.",
+        );
+        assert!(
+            quickstart.contains("https://github.com/vricosti/ruzu/blob/main/docs/quickstart.md")
+        );
+        assert!(quickstart.contains("guide de démarrage rapide ruzu"));
         assert_eq!(tr("_File"), "_Fichier");
         assert_eq!(tr("About ruzu"), "À propos de ruzu");
         set_language("de");

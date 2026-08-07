@@ -20,7 +20,7 @@
 // concurrently-modified `ruzu_cmd`/`frontend_common` trees; unifying the two is
 // deferred tech debt.
 
-use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, SyncSender};
 use std::sync::{Arc, OnceLock, RwLock};
 use std::thread::JoinHandle;
@@ -31,6 +31,41 @@ use ruzu_core::frontend::framebuffer_layout::FramebufferLayout;
 use ruzu_core::perf_stats::PerfStatsResults;
 
 use crate::loading_screen::LoadStage;
+
+#[derive(Debug, Clone, Copy)]
+pub struct BootParameters {
+    pub applet: ruzu_core::hle::service::am::applet_manager::FrontendAppletParameters,
+    pub cabinet_mode: Option<ruzu_core::hle::service::am::frontend::applet_cabinet::CabinetMode>,
+}
+
+impl Default for BootParameters {
+    fn default() -> Self {
+        use ruzu_core::hle::service::am::am_types::{AppletId, AppletType};
+        use ruzu_core::hle::service::am::applet_manager::{FrontendAppletParameters, LaunchType};
+
+        Self {
+            applet: FrontendAppletParameters {
+                applet_id: AppletId::Application,
+                applet_type: AppletType::Application,
+                launch_type: LaunchType::FrontendInitiated,
+                program_index: 0,
+                previous_program_index: -1,
+                ..FrontendAppletParameters::default()
+            },
+            cabinet_mode: None,
+        }
+    }
+}
+
+enum EmulationCommand {
+    Stop,
+    Pause(SyncSender<()>),
+    Resume(SyncSender<()>),
+    CaptureScreenshot {
+        path: std::path::PathBuf,
+        layout: FramebufferLayout,
+    },
+}
 
 /// Assets read from the current application loader for the loading screen.
 #[derive(Debug, Default)]
@@ -66,11 +101,13 @@ pub type LoadingEventFn = Arc<dyn Fn(LoadingEvent) + Send + Sync + 'static>;
 /// system down: `System::pause` + `System::shutdown_main_process`, mirroring the
 /// tail of `ruzu_cmd`'s `main`.
 pub struct EmulationSession {
-    stop_tx: Option<Sender<()>>,
+    command_tx: Option<Sender<EmulationCommand>>,
     join: Option<JoinHandle<()>>,
     perf_results: Arc<RwLock<PerfStatsResults>>,
     shaders_building: Arc<AtomicI32>,
     running: Arc<AtomicBool>,
+    paused: Arc<AtomicBool>,
+    program_id: Arc<AtomicU64>,
     exit_locked: Arc<AtomicBool>,
     frontend_stop_requested: Arc<AtomicBool>,
 }
@@ -100,6 +137,12 @@ impl EmulationSession {
             .then(|| self.shaders_building.load(Ordering::Acquire))
     }
 
+    pub fn program_id(&self) -> Option<u64> {
+        self.running
+            .load(Ordering::Acquire)
+            .then(|| self.program_id.load(Ordering::Acquire))
+    }
+
     /// Whether the running application requested that frontend exits be
     /// confirmed. Mirrors `Core::System::GetExitLocked()`.
     pub fn exit_locked(&self) -> bool {
@@ -109,13 +152,56 @@ impl EmulationSession {
     /// Begin the upstream graceful shutdown path without blocking the GTK main
     /// loop. Completion is reported through [`LoadingEvent::StopComplete`].
     pub fn request_stop(&mut self) -> bool {
-        if let Some(tx) = self.stop_tx.take() {
+        if let Some(tx) = self.command_tx.take() {
             self.frontend_stop_requested.store(true, Ordering::Release);
-            let _ = tx.send(());
+            let _ = tx.send(EmulationCommand::Stop);
             true
         } else {
             false
         }
+    }
+
+    pub fn capture_screenshot(&self, path: std::path::PathBuf, layout: FramebufferLayout) -> bool {
+        self.command_tx.as_ref().is_some_and(|tx| {
+            tx.send(EmulationCommand::CaptureScreenshot { path, layout })
+                .is_ok()
+        })
+    }
+
+    pub fn is_paused(&self) -> bool {
+        self.paused.load(Ordering::Acquire)
+    }
+
+    pub fn pause(&self) -> bool {
+        if self.is_paused() {
+            return true;
+        }
+        let Some(tx) = self.command_tx.as_ref() else {
+            return false;
+        };
+        let (completed_tx, completed_rx) = std::sync::mpsc::sync_channel(0);
+        let completed =
+            tx.send(EmulationCommand::Pause(completed_tx)).is_ok() && completed_rx.recv().is_ok();
+        if completed {
+            self.paused.store(true, Ordering::Release);
+        }
+        completed
+    }
+
+    pub fn resume(&self) -> bool {
+        if !self.is_paused() {
+            return true;
+        }
+        let Some(tx) = self.command_tx.as_ref() else {
+            return false;
+        };
+        let (completed_tx, completed_rx) = std::sync::mpsc::sync_channel(0);
+        let completed =
+            tx.send(EmulationCommand::Resume(completed_tx)).is_ok() && completed_rx.recv().is_ok();
+        if completed {
+            self.paused.store(false, Ordering::Release);
+        }
+        completed
     }
 
     /// Signal the boot thread to shut the system down and join it.
@@ -144,18 +230,23 @@ pub fn boot_game(
     shown_state: Arc<AtomicBool>,
     framebuffer_layout: Arc<RwLock<FramebufferLayout>>,
     hid_core: Arc<parking_lot::Mutex<hid_core::hid_core::HIDCore>>,
+    tas: Option<Arc<parking_lot::Mutex<input_common::drivers::tas_input::Tas>>>,
     filepath: String,
+    parameters: BootParameters,
     loading_event: LoadingEventFn,
 ) -> EmulationSession {
-    let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
+    let (command_tx, command_rx) = std::sync::mpsc::channel::<EmulationCommand>();
     let perf_results = Arc::new(RwLock::new(PerfStatsResults::default()));
     let shaders_building = Arc::new(AtomicI32::new(0));
     let running = Arc::new(AtomicBool::new(false));
+    let paused = Arc::new(AtomicBool::new(false));
+    let program_id = Arc::new(AtomicU64::new(0));
     let frontend_stop_requested = Arc::new(AtomicBool::new(false));
     let (exit_locked_tx, exit_locked_rx) = std::sync::mpsc::sync_channel(1);
     let boot_perf_results = Arc::clone(&perf_results);
     let boot_shaders_building = Arc::clone(&shaders_building);
     let boot_running = Arc::clone(&running);
+    let boot_program_id = Arc::clone(&program_id);
     let boot_frontend_stop_requested = Arc::clone(&frontend_stop_requested);
 
     let join = std::thread::Builder::new()
@@ -167,12 +258,15 @@ pub fn boot_game(
                 shown_state,
                 framebuffer_layout,
                 hid_core,
+                tas,
                 filepath,
+                parameters,
                 loading_event,
-                stop_rx,
+                command_rx,
                 boot_perf_results,
                 boot_shaders_building,
                 boot_running,
+                boot_program_id,
                 exit_locked_tx,
                 boot_frontend_stop_requested,
             );
@@ -184,11 +278,13 @@ pub fn boot_game(
         .expect("boot thread publishes System exit-lock state");
 
     EmulationSession {
-        stop_tx: Some(stop_tx),
+        command_tx: Some(command_tx),
         join: Some(join),
         perf_results,
         shaders_building,
         running,
+        paused,
+        program_id,
         exit_locked,
         frontend_stop_requested,
     }
@@ -201,12 +297,15 @@ fn run_boot(
     shown_state: Arc<AtomicBool>,
     framebuffer_layout: Arc<RwLock<FramebufferLayout>>,
     hid_core: Arc<parking_lot::Mutex<hid_core::hid_core::HIDCore>>,
+    tas: Option<Arc<parking_lot::Mutex<input_common::drivers::tas_input::Tas>>>,
     filepath: String,
+    parameters: BootParameters,
     loading_event: LoadingEventFn,
-    stop_rx: Receiver<()>,
+    command_rx: Receiver<EmulationCommand>,
     perf_results: Arc<RwLock<PerfStatsResults>>,
     shaders_building: Arc<AtomicI32>,
     running: Arc<AtomicBool>,
+    program_id: Arc<AtomicU64>,
     exit_locked_tx: SyncSender<Arc<AtomicBool>>,
     frontend_stop_requested: Arc<AtomicBool>,
 ) {
@@ -225,9 +324,16 @@ fn run_boot(
     common::settings::log_settings(&common::settings::values());
 
     // System init — upstream `Core::System system{}; system.Initialize();`.
+    let tas_hid_core = Arc::clone(&hid_core);
     let mut system = System::new_with_hid_core(hid_core);
     let _ = exit_locked_tx.send(system.exit_locked_state());
     system.initialize();
+    system
+        .frontend_applet_holder_mut()
+        .set_current_applet_id(parameters.applet.applet_id);
+    if let Some(mode) = parameters.cabinet_mode {
+        system.frontend_applet_holder_mut().set_cabinet_mode(mode);
+    }
 
     // Content provider / filesystem / factories (upstream core.cpp:367-370).
     {
@@ -301,6 +407,37 @@ fn run_boot(
         };
         let renderer_device_memory = Arc::clone(host1x.memory_manager());
         let frame_displayed_notify = Arc::new(move || {
+            if let Some(tas) = tas.as_ref() {
+                use hid_core::hid_types::NpadIdType;
+                use input_common::drivers::tas_input::TasAnalog;
+
+                let controller = tas_hid_core
+                    .lock()
+                    .get_emulated_controller(NpadIdType::Player1);
+                let controller = controller.lock();
+                let buttons = controller
+                    .get_buttons_values()
+                    .iter()
+                    .enumerate()
+                    .fold(0u64, |buttons, (index, value)| {
+                        buttons | (u64::from(value.value) << index)
+                    });
+                let sticks = controller.get_sticks();
+                drop(controller);
+                let mut tas = tas.lock();
+                tas.record_input(
+                    buttons,
+                    TasAnalog {
+                        x: sticks.left.x as f32 / 32767.0,
+                        y: sticks.left.y as f32 / 32767.0,
+                    },
+                    TasAnalog {
+                        x: sticks.right.x as f32 / 32767.0,
+                        y: sticks.right.y as f32 / 32767.0,
+                    },
+                );
+                tas.update_thread();
+            }
             if !frame_displayed.swap(true, Ordering::AcqRel) {
                 frame_loading_event(LoadingEvent::FirstFrame);
             }
@@ -423,7 +560,7 @@ fn run_boot(
     }));
 
     // Load the ROM (upstream `system.Load(...)`). Triggers the factory above.
-    let load_result = system.load(&filepath);
+    let load_result = system.load_with_parameters(&filepath, parameters.applet);
     if load_result != SystemResultStatus::Success {
         log::error!("Failed to load ROM '{filepath}': {load_result:?}");
         loading_event(LoadingEvent::Failed {
@@ -432,6 +569,7 @@ fn run_boot(
         });
         return;
     }
+    program_id.store(system.runtime_program_id(), Ordering::Release);
 
     let loader = system.get_app_loader();
     let mut assets = LoadingScreenAssets::default();
@@ -512,10 +650,21 @@ fn run_boot(
         if guest_exit_requested.load(Ordering::Acquire) {
             break false;
         }
-        match stop_rx.recv_timeout(Duration::from_millis(500)) {
-            Ok(()) | Err(RecvTimeoutError::Disconnected) => {
+        match command_rx.recv_timeout(Duration::from_millis(500)) {
+            Ok(EmulationCommand::Stop) | Err(RecvTimeoutError::Disconnected) => {
                 frontend_stop_requested.store(true, Ordering::Release);
                 break true;
+            }
+            Ok(EmulationCommand::CaptureScreenshot { path, layout }) => {
+                request_screenshot(&system, path, layout);
+            }
+            Ok(EmulationCommand::Pause(completed)) => {
+                system.pause();
+                let _ = completed.send(());
+            }
+            Ok(EmulationCommand::Resume(completed)) => {
+                system.run();
+                let _ = completed.send(());
             }
             Err(RecvTimeoutError::Timeout) => {
                 let sample = system.get_and_reset_perf_stats();
@@ -564,6 +713,68 @@ fn run_boot(
     ));
 }
 
+fn request_screenshot(
+    system: &ruzu_core::core::System,
+    path: std::path::PathBuf,
+    layout: FramebufferLayout,
+) {
+    let Some(gpu) = system
+        .gpu_core()
+        .and_then(|gpu| gpu.as_any().downcast_ref::<video_core::gpu::Gpu>())
+    else {
+        log::error!("Cannot capture screenshot: GPU renderer is unavailable");
+        return;
+    };
+    let mut renderer = gpu.renderer();
+    let Some(renderer) = renderer.as_mut() else {
+        log::error!("Cannot capture screenshot: renderer is unavailable");
+        return;
+    };
+    if renderer.is_screenshot_pending() {
+        log::warn!("A screenshot is already requested or in progress");
+        return;
+    }
+
+    let width = layout.width;
+    let height = layout.height;
+    let mut pixels = vec![0u8; width as usize * height as usize * 4];
+    let pixels_ptr = pixels.as_mut_ptr().cast();
+    renderer.request_screenshot(
+        pixels_ptr,
+        Box::new(move |invert_y| {
+            if invert_y {
+                let stride = width as usize * 4;
+                for y in 0..height as usize / 2 {
+                    let opposite = height as usize - y - 1;
+                    let (top, bottom) = pixels.split_at_mut(opposite * stride);
+                    top[y * stride..(y + 1) * stride].swap_with_slice(&mut bottom[..stride]);
+                }
+            }
+            let result = (|| -> Result<(), Box<dyn std::error::Error>> {
+                if let Some(parent) = path.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                let stride = cairo::Format::Rgb24.stride_for_width(width)?;
+                let surface = cairo::ImageSurface::create_for_data(
+                    pixels,
+                    cairo::Format::Rgb24,
+                    width as i32,
+                    height as i32,
+                    stride,
+                )?;
+                let mut file = std::fs::File::create(&path)?;
+                surface.write_to_png(&mut file)?;
+                Ok(())
+            })();
+            match result {
+                Ok(()) => log::info!("Screenshot saved to {:?}", path),
+                Err(error) => log::error!("Failed to save screenshot to {:?}: {error}", path),
+            }
+        }),
+        layout,
+    );
+}
+
 /// Select the terminal frontend event after the emulation thread has completed
 /// `ShutdownMainProcess`. Upstream emits `QThread::finished` only after that
 /// teardown; publishing earlier makes GTK join the still-running boot thread.
@@ -601,23 +812,73 @@ mod tests {
     use ruzu_core::core::SystemResultStatus;
 
     #[test]
+    fn default_boot_parameters_launch_an_application() {
+        use ruzu_core::hle::service::am::am_types::{AppletId, AppletType};
+        use ruzu_core::hle::service::am::applet_manager::LaunchType;
+
+        let parameters = BootParameters::default();
+        assert_eq!(parameters.applet.applet_id, AppletId::Application);
+        assert_eq!(parameters.applet.applet_type, AppletType::Application);
+        assert_eq!(parameters.applet.launch_type, LaunchType::FrontendInitiated);
+        assert_eq!(parameters.applet.previous_program_index, -1);
+        assert!(parameters.cabinet_mode.is_none());
+    }
+
+    #[test]
     fn requesting_stop_is_idempotent_and_marks_frontend_shutdown() {
-        let (stop_tx, stop_rx) = std::sync::mpsc::channel();
+        let (command_tx, command_rx) = std::sync::mpsc::channel();
         let frontend_stop_requested = Arc::new(AtomicBool::new(false));
         let mut session = EmulationSession {
-            stop_tx: Some(stop_tx),
+            command_tx: Some(command_tx),
             join: None,
             perf_results: Arc::new(RwLock::new(PerfStatsResults::default())),
             shaders_building: Arc::new(AtomicI32::new(0)),
             running: Arc::new(AtomicBool::new(false)),
+            paused: Arc::new(AtomicBool::new(false)),
+            program_id: Arc::new(AtomicU64::new(0)),
             exit_locked: Arc::new(AtomicBool::new(false)),
             frontend_stop_requested: Arc::clone(&frontend_stop_requested),
         };
 
         assert!(session.request_stop());
         assert!(frontend_stop_requested.load(Ordering::Acquire));
-        assert_eq!(stop_rx.recv(), Ok(()));
+        assert!(matches!(command_rx.recv(), Ok(EmulationCommand::Stop)));
         assert!(!session.request_stop());
+    }
+
+    #[test]
+    fn pause_and_resume_round_trip_updates_session_state() {
+        let (command_tx, command_rx) = std::sync::mpsc::channel();
+        let mut session = EmulationSession {
+            command_tx: Some(command_tx),
+            join: None,
+            perf_results: Arc::new(RwLock::new(PerfStatsResults::default())),
+            shaders_building: Arc::new(AtomicI32::new(0)),
+            running: Arc::new(AtomicBool::new(true)),
+            paused: Arc::new(AtomicBool::new(false)),
+            program_id: Arc::new(AtomicU64::new(0)),
+            exit_locked: Arc::new(AtomicBool::new(false)),
+            frontend_stop_requested: Arc::new(AtomicBool::new(false)),
+        };
+        let worker = std::thread::spawn(move || {
+            let Ok(EmulationCommand::Pause(completed)) = command_rx.recv() else {
+                panic!("expected pause command");
+            };
+            completed.send(()).unwrap();
+            let Ok(EmulationCommand::Resume(completed)) = command_rx.recv() else {
+                panic!("expected resume command");
+            };
+            completed.send(()).unwrap();
+            assert!(matches!(command_rx.recv(), Ok(EmulationCommand::Stop)));
+        });
+
+        assert!(!session.is_paused());
+        assert!(session.pause());
+        assert!(session.is_paused());
+        assert!(session.resume());
+        assert!(!session.is_paused());
+        session.stop();
+        worker.join().unwrap();
     }
 
     #[test]

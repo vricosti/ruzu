@@ -330,6 +330,10 @@ impl InputEngine {
         self.output = Some(output);
     }
 
+    pub(crate) fn output_handler(&self) -> Option<Arc<dyn InputEngineOutput>> {
+        self.output.as_ref().map(Arc::clone)
+    }
+
     pub fn set_metadata_handler(&mut self, metadata: Arc<dyn InputEngineMetadata>) {
         self.metadata = Some(metadata);
     }

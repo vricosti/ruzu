@@ -5,7 +5,10 @@
 //!
 //! Virtual controller that is always assigned to the game input.
 
+use std::sync::Arc;
+
 use common::uuid::UUID;
+use parking_lot::Mutex;
 
 use crate::input_engine::{BasicMotion, InputEngine, PadIdentifier};
 
@@ -47,34 +50,29 @@ pub enum VirtualStick {
 
 /// Port of `VirtualGamepad` class from virtual_gamepad.h / virtual_gamepad.cpp
 pub struct VirtualGamepad {
-    engine: InputEngine,
+    engine: Arc<Mutex<InputEngine>>,
 }
 
 impl VirtualGamepad {
     /// Port of VirtualGamepad::VirtualGamepad
     pub fn new(input_engine: String) -> Self {
-        let mut vg = Self {
-            engine: InputEngine::new(input_engine),
-        };
-        for i in 0..PLAYER_INDEX_COUNT {
-            let identifier = vg.get_identifier(i);
-            vg.engine.pre_set_controller(&identifier);
+        let engine = Arc::new(Mutex::new(InputEngine::new(input_engine)));
+        {
+            let mut engine = engine.lock();
+            for i in 0..PLAYER_INDEX_COUNT {
+                engine.pre_set_controller(&Self::get_identifier(i));
+            }
         }
-        vg
+        Self { engine }
     }
 
-    /// Returns a reference to the underlying input engine.
-    pub fn engine(&self) -> &InputEngine {
-        &self.engine
+    /// Returns the shared underlying input engine.
+    pub fn engine(&self) -> Arc<Mutex<InputEngine>> {
+        Arc::clone(&self.engine)
     }
 
-    /// Returns a mutable reference to the underlying input engine.
-    pub fn engine_mut(&mut self) -> &mut InputEngine {
-        &mut self.engine
-    }
-
-    pub fn get_engine_name(&self) -> &str {
-        self.engine.get_engine_name()
+    pub fn get_engine_name(&self) -> String {
+        self.engine.lock().get_engine_name().to_owned()
     }
 
     /// Sets the status of all buttons bound with the key to pressed (by int id).
@@ -83,10 +81,9 @@ impl VirtualGamepad {
         if player_index > PLAYER_INDEX_COUNT {
             return;
         }
-        let identifier = self.get_identifier(player_index);
-        self.engine
-            .set_button(&identifier, button_id, value)
-            .dispatch();
+        let identifier = Self::get_identifier(player_index);
+        let callbacks = self.engine.lock().set_button(&identifier, button_id, value);
+        callbacks.dispatch();
     }
 
     /// Sets the status of all buttons bound with the key to pressed (by enum).
@@ -107,13 +104,17 @@ impl VirtualGamepad {
         if player_index > PLAYER_INDEX_COUNT {
             return;
         }
-        let identifier = self.get_identifier(player_index);
-        self.engine
-            .set_axis(&identifier, axis_id * 2, x_value)
-            .dispatch();
-        self.engine
-            .set_axis(&identifier, (axis_id * 2) + 1, y_value)
-            .dispatch();
+        let identifier = Self::get_identifier(player_index);
+        let callbacks = {
+            let mut engine = self.engine.lock();
+            [
+                engine.set_axis(&identifier, axis_id * 2, x_value),
+                engine.set_axis(&identifier, (axis_id * 2) + 1, y_value),
+            ]
+        };
+        for callback in callbacks {
+            callback.dispatch();
+        }
     }
 
     /// Sets the status of a stick to a specific player index (by enum).
@@ -141,7 +142,7 @@ impl VirtualGamepad {
         accel_y: f32,
         accel_z: f32,
     ) {
-        let identifier = self.get_identifier(player_index);
+        let identifier = Self::get_identifier(player_index);
         let motion_data = BasicMotion {
             gyro_x,
             gyro_y,
@@ -151,9 +152,8 @@ impl VirtualGamepad {
             accel_z,
             delta_timestamp,
         };
-        self.engine
-            .set_motion(&identifier, 0, &motion_data)
-            .dispatch();
+        let callbacks = self.engine.lock().set_motion(&identifier, 0, &motion_data);
+        callbacks.dispatch();
     }
 
     /// Restores all inputs into the neutral position.
@@ -188,7 +188,7 @@ impl VirtualGamepad {
 
     /// Returns the correct identifier corresponding to the player index.
     /// Port of VirtualGamepad::GetIdentifier
-    fn get_identifier(&self, player_index: usize) -> PadIdentifier {
+    fn get_identifier(player_index: usize) -> PadIdentifier {
         PadIdentifier {
             guid: UUID::new(),
             port: player_index,

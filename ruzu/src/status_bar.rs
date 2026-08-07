@@ -21,6 +21,7 @@ use common::settings;
 use common::settings_enums::{
     AntiAliasing, ConsoleMode, GpuAccuracy, RendererBackend, ScalingFilter, ShaderBackend,
 };
+use input_common::drivers::tas_input::{TasState, PLAYER_NUMBER};
 use ruzu_core::perf_stats::PerfStatsResults;
 
 /// The status bar and handles to the value buttons so they can be refreshed.
@@ -32,6 +33,7 @@ pub struct StatusBar {
     filter: gtk::Button,
     aa: gtk::Button,
     volume: gtk::Button,
+    tas_state: gtk::Label,
     shader_building: gtk::Label,
     res_scale: gtk::Label,
     game_fps: gtk::Label,
@@ -69,6 +71,7 @@ impl StatusBar {
         message.set_hexpand(true);
         root.append(&message);
 
+        let tas_state = performance_label("Current TAS playback or recording state");
         let shader_building = performance_label("The amount of shaders currently being built");
         let res_scale = performance_label("The current selected resolution scaling multiplier.");
         let game_fps =
@@ -76,7 +79,13 @@ impl StatusBar {
         let frame_time = performance_label(
             "Time taken to emulate a Switch frame, excluding frame limiting and v-sync.",
         );
-        for label in [&shader_building, &res_scale, &game_fps, &frame_time] {
+        for label in [
+            &tas_state,
+            &shader_building,
+            &res_scale,
+            &game_fps,
+            &frame_time,
+        ] {
             root.append(label);
         }
 
@@ -88,6 +97,7 @@ impl StatusBar {
             filter,
             aa,
             volume,
+            tas_state,
             shader_building,
             res_scale,
             game_fps,
@@ -329,6 +339,54 @@ impl StatusBar {
             label.set_visible(true);
         }
     }
+
+    /// Update upstream's `tas_label` from `GMainWindow::GetTasStateDescription`.
+    pub fn update_tas(&self, status: Option<(TasState, usize, [usize; PLAYER_NUMBER])>) {
+        if !*settings::values().tas_enable.get_value() {
+            self.tas_state.set_visible(false);
+            return;
+        }
+        let Some((state, current_frame, frame_counts)) = status else {
+            self.tas_state.set_visible(false);
+            return;
+        };
+
+        self.tas_state
+            .set_label(&format_tas_state(state, current_frame, frame_counts));
+        self.tas_state.set_visible(true);
+    }
+}
+
+fn create_tas_frames_string(frames: [usize; PLAYER_NUMBER]) -> String {
+    let Some(last_player) = frames.iter().rposition(|frames| *frames != 0) else {
+        return String::new();
+    };
+    frames[..=last_player]
+        .iter()
+        .map(usize::to_string)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn format_tas_state(
+    state: TasState,
+    current_frame: usize,
+    frames: [usize; PLAYER_NUMBER],
+) -> String {
+    let frame_counts = create_tas_frames_string(frames);
+    match state {
+        TasState::Running => crate::i18n::tr_args(
+            "TAS state: Running %1/%2",
+            &[current_frame.to_string(), frame_counts],
+        ),
+        TasState::Recording => {
+            crate::i18n::tr_args("TAS state: Recording %1", &[frames[0].to_string()])
+        }
+        TasState::Stopped => crate::i18n::tr_args(
+            "TAS state: Idle %1/%2",
+            &[current_frame.to_string(), frame_counts],
+        ),
+    }
 }
 
 fn format_resolution_scale(up_factor: f32) -> String {
@@ -539,5 +597,18 @@ mod tests {
         assert_eq!(format_game_fps(59.4, false), "Game: 59 FPS");
         assert_eq!(format_game_fps(59.5, true), "Game: 60 FPS (Unlocked)");
         assert_eq!(format_frame_time(1.0 / 60.0), "Frame: 16.67 ms");
+    }
+
+    #[test]
+    fn tas_frame_counts_preserve_empty_player_slots() {
+        let mut frames = [0usize; PLAYER_NUMBER];
+        frames[1] = 120;
+        frames[3] = 40;
+
+        assert_eq!(create_tas_frames_string(frames), "0, 120, 0, 40");
+        assert_eq!(
+            format_tas_state(TasState::Running, 12, frames),
+            "TAS state: Running 12/0, 120, 0, 40"
+        );
     }
 }

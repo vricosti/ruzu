@@ -51,6 +51,9 @@ SHORT_GAME_DIRECTORY_TRANSLATIONS = {
     "zh_TW": "加入遊戲資料夾",
 }
 
+UPSTREAM_MISSING_KEYS_DETAIL = "Encryption keys are missing. <br>Please follow <a href='https://yuzu-emu.org/help/quickstart/'>the yuzu quickstart guide</a> to get all your keys, firmware and games."
+RUZU_MISSING_KEYS_DETAIL = "Encryption keys are missing. <br>Please follow <a href='https://github.com/vricosti/ruzu/blob/main/docs/quickstart.md'>the ruzu quickstart guide</a> to install your keys and firmware, then add your games."
+
 
 def read_catalog(path: Path, rust_text: str) -> OrderedDict[str, str]:
     messages: OrderedDict[str, str] = OrderedDict()
@@ -63,6 +66,13 @@ def read_catalog(path: Path, rust_text: str) -> OrderedDict[str, str]:
         if translation.get("type") in {"unfinished", "vanished", "obsolete"}:
             continue
         translated = "".join(translation.itertext())
+        if source == UPSTREAM_MISSING_KEYS_DETAIL and RUZU_MISSING_KEYS_DETAIL in rust_text:
+            messages[RUZU_MISSING_KEYS_DETAIL] = (
+                translated
+                .replace("https://yuzu-emu.org/help/quickstart/", "https://github.com/vricosti/ruzu/blob/main/docs/quickstart.md")
+                .replace("yuzu", "ruzu")
+                .replace("Yuzu", "Ruzu")
+            )
         candidates = {
             source,
             source.replace("&", "_"),

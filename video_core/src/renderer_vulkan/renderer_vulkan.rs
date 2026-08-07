@@ -402,6 +402,7 @@ impl RendererVulkan {
             supports_float16,
         );
         let driver_id = device.get_driver_id();
+        let shader_profile = super::pipeline_cache::make_shader_profile(&device);
         let host_info = HostTranslateInfo {
             support_float64: device.is_float64_supported(),
             support_float16: device.is_float16_supported(),
@@ -427,13 +428,8 @@ impl RendererVulkan {
             driver_id,
             CAPTURE_IMAGE_WIDTH,
             CAPTURE_IMAGE_HEIGHT,
-            device.supported_spirv_version(),
+            shader_profile,
             host_info,
-            device.is_descriptor_aliasing_supported(),
-            device.is_khr_shader_float_controls_supported(),
-            device.float_controls_properties,
-            device.is_ext_shader_demote_to_helper_invocation_supported(),
-            device.is_ext_depth_clip_control_supported(),
             device.is_depth_bounds_supported(),
             device.is_ext_depth_range_unrestricted_supported(),
             device.is_nv_viewport_swizzle_supported(),
@@ -758,7 +754,7 @@ impl RendererVulkan {
         self.base_data
             .settings
             .screenshot_requested
-            .store(false, Ordering::Relaxed);
+            .store(false, Ordering::SeqCst);
     }
 
     /// Port of `RendererVulkan::RenderAppletCaptureLayer`.
@@ -902,6 +898,15 @@ impl RendererBase for RendererVulkan {
 
     fn is_screenshot_pending(&self) -> bool {
         self.base_data.is_screenshot_pending()
+    }
+
+    fn request_screenshot(
+        &mut self,
+        data: *mut std::ffi::c_void,
+        callback: Box<dyn FnOnce(bool) + Send>,
+        layout: FramebufferLayout,
+    ) {
+        self.base_data.request_screenshot(data, callback, layout);
     }
 
     fn set_guest_memory_writer(&mut self, writer: crate::renderer_base::GuestMemoryWriter) {

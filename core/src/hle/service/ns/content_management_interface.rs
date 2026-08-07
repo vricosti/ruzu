@@ -9,8 +9,10 @@
 use std::collections::BTreeMap;
 
 use super::ns_types::{ApplicationOccupiedSize, ApplicationOccupiedSizeEntity};
-use crate::hle::result::ResultCode;
+use crate::file_sys::romfs_factory::StorageId;
+use crate::hle::result::{ResultCode, RESULT_SUCCESS, RESULT_UNKNOWN};
 use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
+use crate::hle::service::ipc_helpers::{RequestParser, ResponseBuilder};
 use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
 
 /// IPC command table for IContentManagementInterface.
@@ -31,25 +33,34 @@ pub mod commands {
 ///
 /// Corresponds to `IContentManagementInterface` in upstream.
 pub struct IContentManagementInterface {
+    system: crate::core::SystemRef,
     handlers: BTreeMap<u32, FunctionInfo>,
     handlers_tipc: BTreeMap<u32, FunctionInfo>,
 }
 
 impl IContentManagementInterface {
-    pub fn new() -> Self {
+    pub fn new(system: crate::core::SystemRef) -> Self {
         let handlers = build_handler_map(&[
             (
                 commands::CALCULATE_APPLICATION_OCCUPIED_SIZE,
-                None,
+                Some(Self::calculate_application_occupied_size_handler),
                 "CalculateApplicationOccupiedSize",
             ),
             (
                 commands::CHECK_SD_CARD_MOUNT_STATUS,
-                None,
+                Some(Self::check_sd_card_mount_status_handler),
                 "CheckSdCardMountStatus",
             ),
-            (commands::GET_TOTAL_SPACE_SIZE, None, "GetTotalSpaceSize"),
-            (commands::GET_FREE_SPACE_SIZE, None, "GetFreeSpaceSize"),
+            (
+                commands::GET_TOTAL_SPACE_SIZE,
+                Some(Self::get_total_space_size_handler),
+                "GetTotalSpaceSize",
+            ),
+            (
+                commands::GET_FREE_SPACE_SIZE,
+                Some(Self::get_free_space_size_handler),
+                "GetFreeSpaceSize",
+            ),
             (
                 commands::COUNT_APPLICATION_CONTENT_META,
                 None,
@@ -72,8 +83,104 @@ impl IContentManagementInterface {
             ),
         ]);
         Self {
+            system,
             handlers,
             handlers_tipc: BTreeMap::new(),
+        }
+    }
+
+    fn as_self(this: &dyn ServiceFramework) -> &Self {
+        unsafe { &*(this as *const dyn ServiceFramework as *const Self) }
+    }
+
+    fn parse_storage_id(raw: u8) -> Option<StorageId> {
+        match raw {
+            0 => Some(StorageId::None),
+            1 => Some(StorageId::Host),
+            2 => Some(StorageId::GameCard),
+            3 => Some(StorageId::NandSystem),
+            4 => Some(StorageId::NandUser),
+            5 => Some(StorageId::SdCard),
+            _ => None,
+        }
+    }
+
+    fn calculate_application_occupied_size_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        let service = Self::as_self(this);
+        let mut rp = RequestParser::new(ctx);
+        let application_id = rp.pop_u64();
+        match service.calculate_application_occupied_size(application_id) {
+            Ok(size) => {
+                let mut rb = ResponseBuilder::new(
+                    ctx,
+                    2 + (core::mem::size_of::<ApplicationOccupiedSize>() / 4) as u32,
+                    0,
+                    0,
+                );
+                rb.push_result(RESULT_SUCCESS);
+                rb.push_raw(&size);
+            }
+            Err(result) => {
+                let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+                rb.push_result(result);
+            }
+        }
+    }
+
+    fn check_sd_card_mount_status_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        let service = Self::as_self(this);
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(match service.check_sd_card_mount_status() {
+            Ok(()) => RESULT_SUCCESS,
+            Err(result) => result,
+        });
+    }
+
+    fn get_total_space_size_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let service = Self::as_self(this);
+        let mut rp = RequestParser::new(ctx);
+        let Some(storage_id) = Self::parse_storage_id(rp.pop_u8()) else {
+            let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+            rb.push_result(RESULT_UNKNOWN);
+            return;
+        };
+        match service.get_total_space_size(storage_id) {
+            Ok(size) => {
+                let mut rb = ResponseBuilder::new(ctx, 4, 0, 0);
+                rb.push_result(RESULT_SUCCESS);
+                rb.push_i64(size);
+            }
+            Err(result) => {
+                let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+                rb.push_result(result);
+            }
+        }
+    }
+
+    fn get_free_space_size_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let service = Self::as_self(this);
+        let mut rp = RequestParser::new(ctx);
+        let Some(storage_id) = Self::parse_storage_id(rp.pop_u8()) else {
+            let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+            rb.push_result(RESULT_UNKNOWN);
+            return;
+        };
+        match service.get_free_space_size(storage_id) {
+            Ok(size) => {
+                let mut rb = ResponseBuilder::new(ctx, 4, 0, 0);
+                rb.push_result(RESULT_SUCCESS);
+                rb.push_i64(size);
+            }
+            Err(result) => {
+                let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+                rb.push_result(result);
+            }
         }
     }
 
@@ -90,7 +197,7 @@ impl IContentManagementInterface {
         );
 
         let stub_entity = ApplicationOccupiedSizeEntity {
-            storage_id: 3, // StorageId::SdCard
+            storage_id: StorageId::SdCard as u8,
             _padding: [0; 7],
             app_size: 8 * 1024 * 1024 * 1024,   // 8 GiB
             patch_size: 2 * 1024 * 1024 * 1024, // 2 GiB
@@ -113,31 +220,77 @@ impl IContentManagementInterface {
     /// GetTotalSpaceSize (cmd 47).
     ///
     /// Corresponds to upstream `IContentManagementInterface::GetTotalSpaceSize`.
-    pub fn get_total_space_size(&self, storage_id: u8) -> Result<i64, ResultCode> {
+    pub fn get_total_space_size(&self, storage_id: StorageId) -> Result<i64, ResultCode> {
         log::info!(
-            "(STUBBED) GetTotalSpaceSize called, storage_id={}",
-            storage_id
+            "(STUBBED) GetTotalSpaceSize called, storage_id={:?}",
+            storage_id,
         );
-        // Upstream: system.GetFileSystemController().GetTotalSpaceSize(storage_id)
-        // FileSystemController::get_total_space_size is not yet ported — it requires
-        // sdmc_factory/bis_factory integration to query real filesystem sizes.
-        // Return 32 GiB stub matching the stubbed upstream behavior in the emulator.
-        Ok(32 * 1024 * 1024 * 1024) // 32 GiB stub
+        let controller = self.system.get().get_filesystem_controller();
+        let size = controller.lock().unwrap().get_total_space_size(storage_id);
+        Ok(size as i64)
     }
 
     /// GetFreeSpaceSize (cmd 48).
     ///
     /// Corresponds to upstream `IContentManagementInterface::GetFreeSpaceSize`.
-    pub fn get_free_space_size(&self, storage_id: u8) -> Result<i64, ResultCode> {
+    pub fn get_free_space_size(&self, storage_id: StorageId) -> Result<i64, ResultCode> {
         log::info!(
-            "(STUBBED) GetFreeSpaceSize called, storage_id={}",
-            storage_id
+            "(STUBBED) GetFreeSpaceSize called, storage_id={:?}",
+            storage_id,
         );
-        // Upstream: system.GetFileSystemController().GetFreeSpaceSize(storage_id)
-        // FileSystemController::get_free_space_size is not yet ported — it requires
-        // sdmc_factory/bis_factory integration to query real filesystem sizes.
-        // Return 16 GiB stub matching the stubbed upstream behavior in the emulator.
-        Ok(16 * 1024 * 1024 * 1024) // 16 GiB stub
+        let controller = self.system.get().get_filesystem_controller();
+        let size = controller.lock().unwrap().get_free_space_size(storage_id);
+        Ok(size as i64)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn upstream_implemented_commands_have_handlers() {
+        let service = IContentManagementInterface::new(crate::core::SystemRef::null());
+        for command in [11, 43, 47, 48] {
+            assert!(service
+                .handlers()
+                .get(&command)
+                .and_then(|info| info.handler_callback)
+                .is_some());
+        }
+        for command in [600, 601, 605, 607] {
+            assert!(service
+                .handlers()
+                .get(&command)
+                .and_then(|info| info.handler_callback)
+                .is_none());
+        }
+    }
+
+    #[test]
+    fn occupied_size_matches_upstream_stub_layout_and_values() {
+        let service = IContentManagementInterface::new(crate::core::SystemRef::null());
+        let size = service.calculate_application_occupied_size(0).unwrap();
+        for entity in size.entities {
+            assert_eq!(entity.storage_id, StorageId::SdCard as u8);
+            assert_eq!(entity._padding, [0; 7]);
+            assert_eq!(entity.app_size, 8 * 1024 * 1024 * 1024);
+            assert_eq!(entity.patch_size, 2 * 1024 * 1024 * 1024);
+            assert_eq!(entity.aoc_size, 12 * 1024 * 1024);
+        }
+    }
+
+    #[test]
+    fn storage_id_parser_accepts_only_upstream_values() {
+        assert_eq!(
+            IContentManagementInterface::parse_storage_id(0),
+            Some(StorageId::None)
+        );
+        assert_eq!(
+            IContentManagementInterface::parse_storage_id(5),
+            Some(StorageId::SdCard)
+        );
+        assert_eq!(IContentManagementInterface::parse_storage_id(6), None);
     }
 }
 

@@ -126,7 +126,7 @@ struct InputSubsystemImpl {
     mouse: Option<Mouse>,
     touch_screen: Option<TouchScreen>,
     udp_client: Option<UdpClient>,
-    tas_input: Option<tas_input::Tas>,
+    tas_input: Option<Arc<Mutex<tas_input::Tas>>>,
     camera: Option<Camera>,
     virtual_amiibo: Option<VirtualAmiibo>,
     virtual_gamepad: Option<VirtualGamepad>,
@@ -181,10 +181,18 @@ impl InputSubsystemImpl {
         ] {
             register_engine(engine, &mapping_factory);
         }
-        self.tas_input = Some(tas_input::Tas::new("tas".to_string()));
-        self.camera = Some(Camera::new("camera".to_string()));
-        self.virtual_amiibo = Some(VirtualAmiibo::new("virtual_amiibo".to_string()));
-        self.virtual_gamepad = Some(VirtualGamepad::new("virtual_gamepad".to_string()));
+        let tas = Arc::new(Mutex::new(tas_input::Tas::new("tas".to_string())));
+        register_engine(tas.lock().engine(), &mapping_factory);
+        self.tas_input = Some(tas);
+        let camera = Camera::new("camera".to_string());
+        register_engine(camera.engine(), &mapping_factory);
+        self.camera = Some(camera);
+        let virtual_amiibo = VirtualAmiibo::new("virtual_amiibo".to_string());
+        register_engine(virtual_amiibo.engine(), &mapping_factory);
+        self.virtual_amiibo = Some(virtual_amiibo);
+        let virtual_gamepad = VirtualGamepad::new("virtual_gamepad".to_string());
+        register_engine(virtual_gamepad.engine(), &mapping_factory);
+        self.virtual_gamepad = Some(virtual_gamepad);
 
         // Upstream: `RegisterEngine("sdl", sdl);` under HAVE_SDL2.
         let sdl = SDLDriver::new("sdl".to_string());
@@ -204,6 +212,10 @@ impl InputSubsystemImpl {
             "mouse",
             "touch",
             "cemuhookudp",
+            "tas",
+            "camera",
+            "virtual_amiibo",
+            "virtual_gamepad",
             "sdl",
         ] {
             unregister_input_factory(name);
@@ -280,6 +292,9 @@ impl InputSubsystemImpl {
         }
         if let Some(ref udp_client) = self.udp_client {
             engines.push(udp_client.engine());
+        }
+        if let Some(ref tas) = self.tas_input {
+            engines.push(tas.lock().engine());
         }
         if let Some(ref sdl) = self.sdl {
             engines.push(sdl.engine());
@@ -486,13 +501,13 @@ impl InputSubsystem {
 
     /// Retrieves the underlying TAS input device.
     /// Port of InputSubsystem::GetTas
-    pub fn get_tas(&self) -> Option<&tas_input::Tas> {
-        self.imp.tas_input.as_ref()
+    pub fn get_tas(&self) -> Option<Arc<Mutex<tas_input::Tas>>> {
+        self.imp.tas_input.as_ref().map(Arc::clone)
     }
 
     /// Retrieves the underlying TAS input device (mutable).
-    pub fn get_tas_mut(&mut self) -> Option<&mut tas_input::Tas> {
-        self.imp.tas_input.as_mut()
+    pub fn get_tas_mut(&mut self) -> Option<Arc<Mutex<tas_input::Tas>>> {
+        self.imp.tas_input.as_ref().map(Arc::clone)
     }
 
     /// Retrieves the underlying camera input device.
@@ -732,6 +747,95 @@ mod tests {
         udp.force_update();
         assert_eq!(udp_status.lock().unwrap().input_type, InputType::Motion);
 
+        let mut amiibo_params = ParamPackage::default();
+        amiibo_params.set_str("engine", "virtual_amiibo".to_string());
+        amiibo_params.set_int("nfc", 0);
+        let mut amiibo_input = common::input::create_input_device(&amiibo_params);
+        let amiibo_status = capture_status(amiibo_input.as_mut());
+        let mut amiibo = common::input::create_output_device(&amiibo_params);
+        assert_eq!(amiibo.supports_nfc(), common::input::NfcState::Success);
+        assert_eq!(
+            amiibo.set_polling_mode(common::input::PollingMode::NFC),
+            common::input::DriverResult::Success
+        );
+        assert_eq!(amiibo.start_nfc_polling(), common::input::NfcState::Success);
+        assert_eq!(
+            subsystem.get_virtual_amiibo().unwrap().get_current_state(),
+            crate::drivers::virtual_amiibo::State::WaitingForAmiibo
+        );
+
+        let mut tag = vec![0u8; 0x21c];
+        assert_eq!(
+            subsystem
+                .get_virtual_amiibo_mut()
+                .unwrap()
+                .load_amiibo_from_data(&mut tag),
+            crate::drivers::virtual_amiibo::Info::Success
+        );
+        assert_eq!(
+            amiibo_status.lock().unwrap().nfc_status.state,
+            common::input::NfcState::NewAmiibo
+        );
+        assert_eq!(amiibo.stop_nfc_polling(), common::input::NfcState::Success);
+        assert_eq!(
+            amiibo_status.lock().unwrap().nfc_status.state,
+            common::input::NfcState::AmiiboRemoved
+        );
+
+        let mut camera_params = ParamPackage::default();
+        camera_params.set_str("engine", "camera".to_string());
+        camera_params.set_str("guid", UUID::default().raw_string());
+        camera_params.set_int("port", 0);
+        camera_params.set_int("pad", 0);
+        camera_params.set_int("camera", 0);
+        let mut camera_input = common::input::create_input_device(&camera_params);
+        let camera_status = capture_status(camera_input.as_mut());
+        let mut camera_output = common::input::create_output_device(&camera_params);
+        assert_eq!(
+            camera_output.set_camera_format(common::input::CameraFormat::Size20x15),
+            common::input::DriverResult::Success
+        );
+        assert_eq!(subsystem.get_camera().unwrap().get_image_width(), 20);
+        subsystem
+            .get_camera_mut()
+            .unwrap()
+            .set_camera_data(2, 2, &[0x11, 0x22, 0x33, 0x44]);
+        let camera_status = camera_status.lock().unwrap().clone();
+        assert_eq!(camera_status.input_type, InputType::IrSensor);
+        assert_eq!(
+            camera_status.camera_status,
+            common::input::CameraFormat::Size20x15
+        );
+        assert_eq!(camera_status.raw_data.len(), 20 * 15);
+        assert_eq!(camera_status.raw_data[0], 0x11);
+        assert_eq!(camera_status.raw_data[19], 0x22);
+        assert_eq!(camera_status.raw_data[14 * 20], 0x33);
+
+        let mut gamepad_params = ParamPackage::default();
+        gamepad_params.set_str("engine", "virtual_gamepad".to_string());
+        gamepad_params.set_str("guid", UUID::default().raw_string());
+        gamepad_params.set_int("port", 0);
+        gamepad_params.set_int("pad", 0);
+        gamepad_params.set_int("button", 0);
+        let mut gamepad_input = common::input::create_input_device(&gamepad_params);
+        let gamepad_status = capture_status(gamepad_input.as_mut());
+        subsystem
+            .get_virtual_gamepad_mut()
+            .unwrap()
+            .set_button_state(
+                0,
+                crate::drivers::virtual_gamepad::VirtualButton::ButtonA,
+                true,
+            );
+        let gamepad_status = gamepad_status.lock().unwrap().clone();
+        assert_eq!(gamepad_status.input_type, InputType::Button);
+        assert!(gamepad_status.button_status.value);
+
+        drop(amiibo_input);
+        drop(amiibo);
+        drop(camera_input);
+        drop(camera_output);
+        drop(gamepad_input);
         drop(udp);
         drop(touch);
         drop(analog);
