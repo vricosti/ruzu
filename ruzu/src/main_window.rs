@@ -499,6 +499,36 @@ mod help_menu_tests {
 }
 
 #[cfg(test)]
+mod menu_mnemonic_tests {
+    use super::*;
+
+    #[test]
+    fn every_visible_top_level_menu_has_an_upstream_mnemonic() {
+        for label in ["_File", "_Emulation", "_View", "_Tools", "_Help"] {
+            assert!(
+                MENU_UI.contains(&format!(">{label}</attribute>")),
+                "missing mnemonic for {label}"
+            );
+        }
+    }
+
+    #[test]
+    fn boolean_view_action_exposes_and_toggles_checkbox_state() {
+        let action = stateful_boolean_action("test_view_toggle", true);
+        assert_eq!(
+            action.state().and_then(|state| state.get::<bool>()),
+            Some(true)
+        );
+
+        assert!(!toggle_boolean_action(&action));
+        assert_eq!(
+            action.state().and_then(|state| state.get::<bool>()),
+            Some(false)
+        );
+    }
+}
+
+#[cfg(test)]
 mod render_pointer_tests {
     use super::*;
     use ruzu_core::frontend::framebuffer_layout::Rectangle;
@@ -586,11 +616,18 @@ impl GMainWindow {
         // bar, so the same `GMenuModel` is rendered in-window as a
         // `PopoverMenuBar` — the position upstream's `QMenuBar` occupies.
         let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        install_menu_css();
 
         #[cfg(not(target_os = "macos"))]
         let menu_bar = {
             let menubar = gtk::PopoverMenuBar::from_model(Some(&build_menu_model()));
             menubar.set_halign(gtk::Align::Start);
+            menubar.connect_map(|menubar| {
+                force_menu_mnemonic_underlines(menubar.upcast_ref());
+            });
+            menubar.connect_menu_model_notify(|menubar| {
+                force_menu_mnemonic_underlines(menubar.upcast_ref());
+            });
             root.append(&menubar);
             Some(menubar)
         };
@@ -3591,6 +3628,83 @@ fn install_render_bg_css() {
             gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
         );
     });
+}
+
+/// Give boolean menu actions a complete checkbox indicator.
+///
+/// GTK's menu model correctly exposes stateful boolean actions through a
+/// `check` CSS node, but desktop themes commonly make that node's border
+/// transparent and leave only the checked glyph visible. Upstream's checkable
+/// `QAction` entries retain the control outline, so restore it for menu checks
+/// while continuing to let GTK render and activate the action itself.
+fn install_menu_css() {
+    use std::sync::Once;
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        let Some(display) = gtk::gdk::Display::default() else {
+            return;
+        };
+        let provider = gtk::CssProvider::new();
+        provider.load_from_data(
+            "popover.menu check {\
+                 min-width: 14px;\
+                 min-height: 14px;\
+                 border: 1px solid alpha(currentColor, 0.55);\
+                 border-radius: 2px;\
+                 background-color: transparent;\
+                 background-image: none;\
+                 box-shadow: none;\
+                 transform: none;\
+             }\
+             popover.menu check:checked {\
+                 border-color: @theme_selected_bg_color;\
+                 background-color: @theme_selected_bg_color;\
+                 color: @theme_selected_fg_color;\
+             }\
+             popover.menu check:disabled {\
+                 opacity: 0.5;\
+             }",
+        );
+        gtk::style_context_add_provider_for_display(
+            &display,
+            &provider,
+            gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
+        );
+    });
+}
+
+/// Keep Qt-style menu mnemonic underlines visible in GTK.
+///
+/// `GtkPopoverMenuBar` already creates mnemonic-enabled labels from the `_`
+/// markers in [`MENU_UI`], but GTK normally hides their underlines until the
+/// user starts keyboard navigation. Upstream's `QMenuBar` renders them
+/// permanently. Applying a Pango underline to the label's existing mnemonic
+/// key changes presentation only; GTK remains the owner of `Alt+key`
+/// activation and translated mnemonic selection.
+fn force_menu_mnemonic_underlines(root: &gtk::Widget) {
+    if let Some(label) = root.downcast_ref::<gtk::Label>() {
+        if let Some(mnemonic) = label.mnemonic_keyval().to_unicode() {
+            let text = label.text();
+            if let Some((start, character)) = text
+                .char_indices()
+                .find(|(_, character)| character.to_lowercase().eq(mnemonic.to_lowercase()))
+            {
+                let attributes = label.attributes().unwrap_or_default();
+                let mut underline: gtk::pango::Attribute =
+                    gtk::pango::AttrInt::new_underline(gtk::pango::Underline::Low).into();
+                underline.set_start_index(start as u32);
+                underline.set_end_index((start + character.len_utf8()) as u32);
+                attributes.change(underline);
+                label.set_attributes(Some(&attributes));
+            }
+        }
+    }
+
+    let mut child = root.first_child();
+    while let Some(current) = child {
+        child = current.next_sibling();
+        force_menu_mnemonic_underlines(&current);
+    }
 }
 
 /// Build the GMenu model that mirrors upstream `main.ui`'s menu bar.

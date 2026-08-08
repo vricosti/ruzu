@@ -34192,3 +34192,17 @@ Rust files: `externals/rdynarmic/src/frontend/a32/{decoder.rs, decoder_thumb32.r
 - `process_light_limiter_v2_updates_statistics_and_writes_output` passes and verifies exact one-sample look-ahead output, normalized statistics, fixed-point state, and an untouched workbuffer; the cleanup regression verifies destruction of the registered vector-backed state.
 - Full `cargo test -p audio_core`: 197 passed, 0 failed; doc tests also pass.
 - A release runtime trace showed `LightLimiterVersion2` preserving final mix-buffer amplitudes instead of reducing them to `0/±1`; `SinkStream` subsequently received nonzero samples at effective volume 1 through Cubeb's `pulse-rust` backend.
+
+## 2026-08-08 — ruzu/src/{game_list.rs,main_window.rs} vs yuzu/{game_list_p.h,uisettings.h,main.ui}
+
+### Unintentional differences (fixed)
+- The game list hard-coded the small icon dimensions (`48x48` for games and `24x24` for folders), which compressed its rows relative to upstream. It now uses upstream's standard defaults: `64x64` game icons and `48x48` folder icons.
+- GTK hid the menu mnemonics copied from upstream until keyboard navigation began, whereas Qt displays their underlined accelerator letters permanently. The main window now keeps mnemonic rendering visible while retaining the upstream labels and accelerator assignments.
+- GTK desktop themes rendered checkable boolean menu actions as a bare checkmark with no unchecked-state outline. A host-only menu style now preserves GTK's stateful actions while rendering their `check` node as a bordered checkbox in both states.
+
+### Binary layout verification
+- PASS: the changed constants and mnemonic visibility affect only host-side GTK presentation.
+
+### Verification
+- Re-read upstream `GameListItemPath`, the `UISettings::values.{game_icon_size,folder_icon_size}` defaults, and the mnemonic-bearing menu labels in `main.ui` after implementation.
+- A live GTK/XWayland check confirmed permanent mnemonic underlines in the menu bar and menu entries, `Alt+V` activation, and bordered checked/unchecked rendering for the stateful boolean View actions.

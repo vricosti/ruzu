@@ -35,10 +35,10 @@ use crate::uisettings::{self, GameDir};
 use crate::util::controller_navigation::{ControllerNavigation, NavigationKey};
 
 /// Pixel size of the game icon shown in the list.
-const ICON_SIZE: i32 = 48;
+const ICON_SIZE: i32 = 64;
 
 /// Pixel size of the folder icon on a directory row.
-const FOLDER_ICON_SIZE: i32 = 24;
+const FOLDER_ICON_SIZE: i32 = 48;
 
 /// Ruzu-specific default requested for newly added filesystem directories.
 const NEW_DIRECTORY_DEEP_SCAN: bool = true;
