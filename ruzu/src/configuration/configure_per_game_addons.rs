@@ -3,10 +3,13 @@
 
 //! GTK counterpart of `yuzu/configuration/configure_per_game_addons.{h,cpp,ui}`.
 
+use std::cell::Cell;
+use std::cmp::Ordering;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use gtk::prelude::*;
+use gtk::{gio, glib};
 use ruzu_core::file_sys::patch_manager::PatchManager;
 use ruzu_core::file_sys::registered_cache::ContentProviderUnion;
 use ruzu_core::file_sys::vfs::vfs_real::RealVfsFilesystem;
@@ -20,6 +23,12 @@ use super::configure_dialog::Page;
 pub struct AddOn {
     pub name: String,
     pub version: String,
+}
+
+struct AddOnRow {
+    name: String,
+    version: String,
+    enabled: Cell<bool>,
 }
 
 /// `ConfigurePerGameAddons::LoadFromFile`.
@@ -73,58 +82,49 @@ pub fn page(title_id: u64, patches: &[AddOn]) -> Page {
     root.set_margin_start(10);
     root.set_margin_end(10);
 
-    let table = gtk::Box::new(gtk::Orientation::Vertical, 0);
-    let header = gtk::Box::new(gtk::Orientation::Horizontal, 0);
-    header.add_css_class("ruzu-properties-table-header");
-    let name_header = gtk::Label::new(Some("Patch Name"));
-    name_header.set_xalign(0.0);
-    name_header.set_hexpand(true);
-    let version_header = gtk::Label::new(Some("Version"));
-    version_header.set_xalign(0.0);
-    version_header.set_width_chars(16);
-    header.append(&name_header);
-    header.append(&version_header);
-    table.append(&header);
-
-    let rows = gtk::Box::new(gtk::Orientation::Vertical, 0);
     let disabled = common::settings::values()
         .disabled_addons
         .get(&title_id)
         .cloned()
         .unwrap_or_default();
-    let mut checks = Vec::with_capacity(patches.len());
+    let store = gio::ListStore::new::<glib::BoxedAnyObject>();
     for patch in patches {
-        let row = gtk::Box::new(gtk::Orientation::Horizontal, 0);
-        let check = gtk::CheckButton::with_label(&patch.name);
-        check.set_active(!disabled.contains(&patch.name));
-        check.set_hexpand(true);
-        let version = gtk::Label::new(Some(&patch.version));
-        version.set_xalign(0.0);
-        version.set_width_chars(16);
-        row.append(&check);
-        row.append(&version);
-        rows.append(&row);
-        checks.push((patch.name.clone(), check));
+        store.append(&glib::BoxedAnyObject::new(AddOnRow {
+            name: patch.name.clone(),
+            version: patch.version.clone(),
+            enabled: Cell::new(!disabled.contains(&patch.name)),
+        }));
     }
 
-    let scroller = gtk::ScrolledWindow::builder()
-        .hexpand(true)
-        .vexpand(true)
-        .child(&rows)
-        .build();
-    table.append(&scroller);
+    let view = gtk::ColumnView::new(None::<gtk::SingleSelection>);
+    view.set_hexpand(true);
+    view.set_vexpand(true);
+    view.set_show_column_separators(true);
+    view.set_show_row_separators(false);
+
+    let name_column = addon_name_column();
+    let version_column = addon_version_column();
+    view.append_column(&name_column);
+    view.append_column(&version_column);
+
+    let sort_model = gtk::SortListModel::new(Some(store.clone()), view.sorter());
+    let selection = gtk::SingleSelection::new(Some(sort_model));
+    view.set_model(Some(&selection));
 
     let frame = gtk::Frame::new(None);
     frame.set_hexpand(true);
     frame.set_vexpand(true);
-    frame.set_child(Some(&table));
+    frame.set_child(Some(&view));
     root.append(&frame);
 
     Page::new("Add-Ons", root, move || {
-        let mut disabled: Vec<String> = checks
-            .iter()
-            .filter(|(_, check)| !check.is_active())
-            .map(|(name, _)| name.clone())
+        let mut disabled: Vec<String> = (0..store.n_items())
+            .filter_map(|index| store.item(index))
+            .filter_map(|item| item.downcast::<glib::BoxedAnyObject>().ok())
+            .filter_map(|item| {
+                let row = item.borrow::<AddOnRow>();
+                (!row.enabled.get()).then(|| row.name.clone())
+            })
             .collect();
         disabled.sort();
 
@@ -144,4 +144,88 @@ pub fn page(title_id: u64, patches: &[AddOn]) -> Page {
         }
         settings.disabled_addons.insert(title_id, disabled);
     })
+}
+
+fn addon_name_column() -> gtk::ColumnViewColumn {
+    let factory = gtk::SignalListItemFactory::new();
+    factory.connect_setup(|_, item| {
+        let item = item.downcast_ref::<gtk::ListItem>().unwrap();
+        let check = gtk::CheckButton::new();
+        check.set_hexpand(true);
+        let weak_item = item.downgrade();
+        check.connect_toggled(move |check| {
+            let Some(item) = weak_item.upgrade() else {
+                return;
+            };
+            let Some(row) = item.item().and_downcast::<glib::BoxedAnyObject>() else {
+                return;
+            };
+            row.borrow::<AddOnRow>().enabled.set(check.is_active());
+        });
+        item.set_child(Some(&check));
+    });
+    factory.connect_bind(|_, item| {
+        let item = item.downcast_ref::<gtk::ListItem>().unwrap();
+        let Some(check) = item.child().and_downcast::<gtk::CheckButton>() else {
+            return;
+        };
+        let Some(row) = item.item().and_downcast::<glib::BoxedAnyObject>() else {
+            return;
+        };
+        let row = row.borrow::<AddOnRow>();
+        check.set_label(Some(&row.name));
+        check.set_active(row.enabled.get());
+    });
+
+    let sorter =
+        gtk::CustomSorter::new(|a, b| compare_addon_rows(a, b, |row| row.name.to_lowercase()));
+    let column = gtk::ColumnViewColumn::new(Some("Patch Name"), Some(factory));
+    column.set_expand(true);
+    column.set_resizable(true);
+    column.set_sorter(Some(&sorter));
+    column
+}
+
+fn addon_version_column() -> gtk::ColumnViewColumn {
+    let factory = gtk::SignalListItemFactory::new();
+    factory.connect_setup(|_, item| {
+        let item = item.downcast_ref::<gtk::ListItem>().unwrap();
+        item.set_child(Some(&gtk::Label::builder().xalign(0.0).build()));
+    });
+    factory.connect_bind(|_, item| {
+        let item = item.downcast_ref::<gtk::ListItem>().unwrap();
+        let Some(label) = item.child().and_downcast::<gtk::Label>() else {
+            return;
+        };
+        let Some(row) = item.item().and_downcast::<glib::BoxedAnyObject>() else {
+            return;
+        };
+        label.set_label(&row.borrow::<AddOnRow>().version);
+    });
+
+    let sorter =
+        gtk::CustomSorter::new(|a, b| compare_addon_rows(a, b, |row| row.version.to_lowercase()));
+    let column = gtk::ColumnViewColumn::new(Some("Version"), Some(factory));
+    column.set_fixed_width(130);
+    column.set_resizable(true);
+    column.set_sorter(Some(&sorter));
+    column
+}
+
+fn compare_addon_rows(
+    a: &glib::Object,
+    b: &glib::Object,
+    value: impl Fn(&AddOnRow) -> String,
+) -> gtk::Ordering {
+    let Some(a) = a.downcast_ref::<glib::BoxedAnyObject>() else {
+        return gtk::Ordering::Equal;
+    };
+    let Some(b) = b.downcast_ref::<glib::BoxedAnyObject>() else {
+        return gtk::Ordering::Equal;
+    };
+    match value(&a.borrow::<AddOnRow>()).cmp(&value(&b.borrow::<AddOnRow>())) {
+        Ordering::Less => gtk::Ordering::Smaller,
+        Ordering::Equal => gtk::Ordering::Equal,
+        Ordering::Greater => gtk::Ordering::Larger,
+    }
 }

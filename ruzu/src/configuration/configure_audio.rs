@@ -11,6 +11,8 @@
 // (`ConfigureAudio::UpdateAudioDevices`), because each sink enumerates its own
 // devices.
 
+use std::rc::Rc;
+
 use gtk::prelude::*;
 
 use common::settings_enums::AudioEngine;
@@ -30,37 +32,49 @@ pub fn page() -> Page {
 
     let (group, content) = w::group("Audio");
 
-    // Output engine. Upstream lists every compiled-in sink, `auto` first.
-    let engines = audio_engine_labels();
-    let engine_refs: Vec<&str> = engines.iter().map(String::as_str).collect();
+    // Output engine. Upstream inserts `auto`, then every compiled-in sink in
+    // `AudioCore::Sink::GetSinkIDs()` order.
+    let engines = Rc::new(audio_engines());
+    let engine_labels: Vec<String> = engines
+        .iter()
+        .map(|engine| engine.canonicalize().to_string())
+        .collect();
+    let engine_refs: Vec<&str> = engine_labels.iter().map(String::as_str).collect();
     let engine_index = engines
         .iter()
-        .position(|name| {
-            name == common::settings::values()
-                .sink_id
-                .get_value()
-                .canonicalize()
-        })
+        .position(|engine| engine == common::settings::values().sink_id.get_value())
         .unwrap_or(0) as u32;
     let (engine_row, engine) = w::combo_row("Output Engine:", &engine_refs, engine_index);
     content.append(&engine_row);
 
+    let initial_engine = engines
+        .get(engine_index as usize)
+        .copied()
+        .unwrap_or(AudioEngine::Auto);
     let output_device_value = common::settings::values()
         .audio_output_device_id
         .get_value()
         .clone();
+    let output_devices = audio_devices(initial_engine, false);
+    let output_refs: Vec<&str> = output_devices.iter().map(String::as_str).collect();
     let (output_row, output_device) = w::combo_row(
         "Output Device:",
-        &[AUTO_DEVICE],
-        if output_device_value == AUTO_DEVICE {
-            0
-        } else {
-            0
-        },
+        &output_refs,
+        selected_device(&output_devices, &output_device_value),
     );
     content.append(&output_row);
 
-    let (input_row, input_device) = w::combo_row("Input Device:", &[AUTO_DEVICE], 0);
+    let input_device_value = common::settings::values()
+        .audio_input_device_id
+        .get_value()
+        .clone();
+    let input_devices = audio_devices(initial_engine, true);
+    let input_refs: Vec<&str> = input_devices.iter().map(String::as_str).collect();
+    let (input_row, input_device) = w::combo_row(
+        "Input Device:",
+        &input_refs,
+        selected_device(&input_devices, &input_device_value),
+    );
     content.append(&input_row);
 
     let mode_value = *common::settings::values().sound_index.get_value();
@@ -91,19 +105,25 @@ pub fn page() -> Page {
 
     column.append(&group);
 
-    // Upstream re-enumerates both device combos when the engine changes. The
-    // sink registry (`AudioCore::Sink::GetDeviceListForSink`) is not reachable
-    // from the dialog yet, so the lists stay at "auto"; log the intent so the
-    // gap is visible rather than looking like the sink has one device.
-    engine.connect_selected_notify(|_| {
-        log::info!("Audio: engine changed (device enumeration not yet wired)");
+    // Upstream clears and re-enumerates both device combos when the engine
+    // changes. Clearing selects the leading `auto` entry for each list.
+    let engines_for_devices = Rc::clone(&engines);
+    let output_device_for_engine = output_device.clone();
+    let input_device_for_engine = input_device.clone();
+    engine.connect_selected_notify(move |engine| {
+        let sink_id = engines_for_devices
+            .get(engine.selected() as usize)
+            .copied()
+            .unwrap_or(AudioEngine::Auto);
+        set_devices(&output_device_for_engine, audio_devices(sink_id, false), 0);
+        set_devices(&input_device_for_engine, audio_devices(sink_id, true), 0);
     });
 
     Page::new("Audio", scroller, move || {
-        let engine_name = engines
+        let sink_id = engines
             .get(engine.selected() as usize)
-            .cloned()
-            .unwrap_or_else(|| AUTO_DEVICE.to_string());
+            .copied()
+            .unwrap_or(AudioEngine::Auto);
         let output_name = combo_text(&output_device).unwrap_or_else(|| AUTO_DEVICE.to_string());
         let input_name = combo_text(&input_device).unwrap_or_else(|| AUTO_DEVICE.to_string());
         let mode_value = tr::value_at(tr::AUDIO_MODE, mode.selected());
@@ -113,9 +133,7 @@ pub fn page() -> Page {
 
         {
             let mut values = common::settings::values_mut();
-            if let Some(sink) = AudioEngine::from_string(&engine_name) {
-                values.sink_id.set_value(sink);
-            }
+            values.sink_id.set_value(sink_id);
             values.audio_output_device_id.set_value(output_name);
             values.audio_input_device_id.set_value(input_name);
             values.sound_index.set_value(mode_value);
@@ -139,23 +157,39 @@ fn combo_text(dropdown: &gtk::DropDown) -> Option<String> {
         .map(|s| s.to_string())
 }
 
-/// The audio sinks the build offers — upstream `AudioCore::Sink::GetSinkIDs()`,
-/// which always starts with `auto`.
-///
-/// `oboe` is Android-only upstream and has no ruzu backend, so it is left out
-/// rather than offered as a sink that cannot be selected successfully.
-const AUDIO_ENGINES: &[AudioEngine] = &[
-    AudioEngine::Auto,
-    AudioEngine::Cubeb,
-    AudioEngine::Sdl2,
-    AudioEngine::Null,
-];
+fn audio_engines() -> Vec<AudioEngine> {
+    let mut engines = vec![AudioEngine::Auto];
+    engines.extend(
+        audio_core::sink::sink_details::get_sink_ids()
+            .into_iter()
+            .filter(|engine| *engine != AudioEngine::Auto),
+    );
+    engines
+}
 
-fn audio_engine_labels() -> Vec<String> {
-    AUDIO_ENGINES
+fn audio_devices(engine: AudioEngine, capture: bool) -> Vec<String> {
+    let mut devices = vec![AUTO_DEVICE.to_string()];
+    devices.extend(audio_core::sink::sink_details::get_device_list_for_sink(
+        engine, capture,
+    ));
+    devices
+}
+
+fn selected_device(devices: &[String], selected: &str) -> u32 {
+    devices
         .iter()
-        .map(|engine| engine.canonicalize().to_string())
-        .collect()
+        .position(|device| device == selected)
+        .unwrap_or(0) as u32
+}
+
+fn set_devices(dropdown: &gtk::DropDown, devices: Vec<String>, selected: u32) {
+    let device_refs: Vec<&str> = devices.iter().map(String::as_str).collect();
+    dropdown.set_model(Some(&gtk::StringList::new(&device_refs)));
+    dropdown.set_selected(if (selected as usize) < devices.len() {
+        selected
+    } else {
+        0
+    });
 }
 
 #[cfg(test)]
@@ -166,16 +200,26 @@ mod tests {
     fn auto_is_the_first_engine() {
         // Upstream's sink list always leads with "auto"; the combo's default
         // selection depends on it.
-        assert_eq!(audio_engine_labels()[0], "auto");
+        assert_eq!(audio_engines()[0], AudioEngine::Auto);
     }
 
     #[test]
     fn engine_labels_round_trip_through_from_string() {
-        for label in audio_engine_labels() {
+        for label in audio_engines()
+            .into_iter()
+            .map(|engine| engine.canonicalize().to_string())
+        {
             assert!(
                 AudioEngine::from_string(&label).is_some(),
                 "engine label {label} is not parseable"
             );
         }
+    }
+
+    #[test]
+    fn missing_saved_device_falls_back_to_auto() {
+        let devices = vec!["auto".to_string(), "speakers".to_string()];
+        assert_eq!(selected_device(&devices, "speakers"), 1);
+        assert_eq!(selected_device(&devices, "removed device"), 0);
     }
 }

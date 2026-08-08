@@ -56,6 +56,19 @@ const QUICKSTART_URL: &str = "https://github.com/vricosti/ruzu/blob/main/docs/qu
 const MISSING_KEYS_TITLE: &str = "Derivation Components Missing";
 const MISSING_KEYS_DETAIL: &str = "Encryption keys are missing. <br>Please follow <a href='https://github.com/vricosti/ruzu/blob/main/docs/quickstart.md'>the ruzu quickstart guide</a> to install your keys and firmware, then add your games.";
 
+/// Upstream `StartGameType` from `yuzu/main.h`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StartGameType {
+    Normal,
+    Global,
+}
+
+fn boot_parameters_for_start_type(start_type: StartGameType) -> crate::boot::BootParameters {
+    let mut parameters = crate::boot::BootParameters::default();
+    parameters.use_global_configuration = start_type == StartGameType::Global;
+    parameters
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FullscreenHotkey {
     Toggle,
@@ -380,6 +393,17 @@ mod fullscreen_hotkey_tests {
 }
 
 #[cfg(test)]
+mod start_game_type_tests {
+    use super::*;
+
+    #[test]
+    fn global_menu_action_bypasses_only_the_per_game_configuration() {
+        assert!(!boot_parameters_for_start_type(StartGameType::Normal).use_global_configuration);
+        assert!(boot_parameters_for_start_type(StartGameType::Global).use_global_configuration);
+    }
+}
+
+#[cfg(test)]
 mod pause_menu_tests {
     use super::*;
     use input_common::drivers::tas_input::TasState;
@@ -678,7 +702,9 @@ impl GMainWindow {
                 #[weak(rename_to = w)]
                 this,
                 #[upgrade_or_default]
-                move |path: String| w.boot_game(path)
+                move |path: String, start_type: StartGameType| {
+                    w.boot_game_from_list(path, start_type)
+                }
             ),
         );
         this.stack.add_named(&game_list, Some(PAGE_GAME_LIST));
@@ -1869,6 +1895,7 @@ impl GMainWindow {
                     previous_program_index: -1,
                 },
                 cabinet_mode,
+                use_global_configuration: false,
             },
         );
     }
@@ -2213,6 +2240,11 @@ impl GMainWindow {
 
     pub fn boot_game(self: &Rc<Self>, filepath: String) {
         self.boot_game_with_parameters(filepath, crate::boot::BootParameters::default());
+    }
+
+    /// Upstream `GMainWindow::BootGameFromList`.
+    fn boot_game_from_list(self: &Rc<Self>, filepath: String, start_type: StartGameType) {
+        self.boot_game_with_parameters(filepath, boot_parameters_for_start_type(start_type));
     }
 
     fn controller_applet_for_boot(

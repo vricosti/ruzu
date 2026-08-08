@@ -233,18 +233,6 @@ pub const CONFIRM_STOP: &[(ConfirmStop, &str)] = &[
     (ConfirmStop::AskNever, "Never ask"),
 ];
 
-/// VSync modes — upstream deliberately skips this enum in
-/// `ComboboxEnumeration` ("Intentionally skipping VSyncMode to let the UI fill
-/// that one out") because `ConfigureGraphics` rebuilds the list per backend:
-/// only the modes the selected renderer supports are offered. The labels come
-/// from `ConfigureGraphics::PopulateVSyncModeSelection`.
-pub const VSYNC_MODE_LABELS: &[(&str, &str)] = &[
-    ("Immediate", "Immediate (Off)"),
-    ("Mailbox", "Mailbox"),
-    ("Fifo", "FIFO (On)"),
-    ("FifoRelaxed", "FIFO Relaxed"),
-];
-
 #[cfg(test)]
 mod tests {
     use super::*;

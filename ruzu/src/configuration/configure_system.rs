@@ -153,8 +153,13 @@ pub fn page() -> Page {
     speed_check.set_active(limit_enabled);
     let speed_spin = gtk::SpinButton::with_range(1.0, 9999.0, 1.0);
     speed_spin.set_value(*common::settings::values().speed_limit.get_value() as f64);
-    speed_spin.set_sensitive(limit_enabled);
-    let speed_row = gated_row(&speed_check, &speed_spin);
+    speed_spin.set_hexpand(true);
+    let speed_suffix = gtk::Label::new(Some("%"));
+    let speed_control = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+    speed_control.append(&speed_spin);
+    speed_control.append(&speed_suffix);
+    speed_control.set_sensitive(limit_enabled);
+    let speed_row = gated_row(&speed_check, &speed_control);
     core.append(&speed_row);
 
     column.append(&core_group);
@@ -164,7 +169,7 @@ pub fn page() -> Page {
     gate(&custom_rtc_check, &rtc_offset);
     connect_rtc_controls(&custom_rtc_check, &custom_rtc_entry, &rtc_offset);
     gate(&rng_seed_check, &rng_seed_entry);
-    gate(&speed_check, &speed_spin);
+    gate(&speed_check, &speed_control);
 
     // Line the control column up across both groups. The check-box rows would
     // otherwise sit ~20px left of the combo rows above them.
@@ -191,6 +196,8 @@ pub fn page() -> Page {
         let time_zone_value = time_zone.selected();
         let rtc_on = custom_rtc_check.is_active();
         let rtc_offset_value = rtc_offset.value() as i64;
+        let rtc_value = parse_rtc(&custom_rtc_entry.text())
+            .unwrap_or_else(|| unix_time_seconds() + rtc_offset_value);
         let seed_on = rng_seed_check.is_active();
         let seed_value = u32::from_str_radix(rng_seed_entry.text().trim(), 16).unwrap_or(0);
         let device = device_name.text().to_string();
@@ -211,6 +218,7 @@ pub fn page() -> Page {
             values.time_zone_index.set_value(zone);
         }
         values.custom_rtc_enabled.set_value(rtc_on);
+        values.custom_rtc.set_value(rtc_value);
         values.custom_rtc_offset.set_value(rtc_offset_value);
         values.rng_seed_enabled.set_value(seed_on);
         values.rng_seed.set_value(seed_value);
@@ -405,10 +413,33 @@ fn parse_rtc(text: &str) -> Option<i64> {
     let day: i64 = date_parts.next()?.parse().ok()?;
     let month: i64 = date_parts.next()?.parse().ok()?;
     let year: i64 = date_parts.next()?.parse().ok()?;
+    if date_parts.next().is_some() || !(1..=12).contains(&month) {
+        return None;
+    }
     let mut time_parts = time.split(':');
     let hour: i64 = time_parts.next()?.parse().ok()?;
     let minute: i64 = time_parts.next()?.parse().ok()?;
+    if time_parts.next().is_some()
+        || !(0..=23).contains(&hour)
+        || !(0..=59).contains(&minute)
+        || !(1..=days_in_month(year, month)).contains(&day)
+    {
+        return None;
+    }
     Some(days_from_civil(year, month, day) * 86_400 + hour * 3600 + minute * 60)
+}
+
+fn days_in_month(year: i64, month: i64) -> i64 {
+    match month {
+        2 if year.rem_euclid(4) == 0
+            && (year.rem_euclid(100) != 0 || year.rem_euclid(400) == 0) =>
+        {
+            29
+        }
+        2 => 28,
+        4 | 6 | 9 | 11 => 30,
+        _ => 31,
+    }
 }
 
 /// Days since 1970-01-01 → (year, month, day). Hinnant's `civil_from_days`.
@@ -467,6 +498,9 @@ mod tests {
         // the user noticing; upstream's QDateTimeEdit can't produce this state.
         assert_eq!(parse_rtc("not a date"), None);
         assert_eq!(parse_rtc("27-07-2026 14:06"), None);
+        assert_eq!(parse_rtc("31/02/2026 14:06"), None);
+        assert_eq!(parse_rtc("01/01/2026 24:00"), None);
+        assert!(parse_rtc("29/02/2024 23:59").is_some());
     }
 
     #[test]

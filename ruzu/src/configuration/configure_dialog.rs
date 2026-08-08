@@ -113,6 +113,11 @@ impl ConfigureDialog {
         // main window.
         let _ = &parent;
 
+        // Upstream constructs Advanced Graphics first and gives Graphics a
+        // callback to `ExposeComputeOption` when a Vulkan device requires it.
+        let advanced_graphics = configure_graphics_advanced::page();
+        let graphics = configure_graphics::page(advanced_graphics.expose_compute_option);
+
         // Upstream `PopulateSelectionList`'s six rows, in order.
         let sections = vec![
             Section {
@@ -141,10 +146,7 @@ impl ConfigureDialog {
             },
             Section {
                 name: "Graphics",
-                pages: vec![
-                    configure_graphics::page(),
-                    configure_graphics_advanced::page(),
-                ],
+                pages: vec![graphics, advanced_graphics.page],
             },
             Section {
                 name: "Audio",

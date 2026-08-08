@@ -7,6 +7,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::sync::Arc;
 
 use frontend_common::config::{BaseConfig, ConfigType};
 use gtk::prelude::*;
@@ -19,8 +20,11 @@ use super::{
     qt_config,
 };
 
-const DEFAULT_WIDTH: i32 = 1000;
-const DEFAULT_HEIGHT: i32 = 650;
+// The reference Properties capture is 1010x661 including the Linux window
+// frame. Mutter adds 28x66 pixels around this GTK client on the reference
+// desktop, so these client dimensions reproduce the upstream capture.
+const DEFAULT_WIDTH: i32 = 982;
+const DEFAULT_HEIGHT: i32 = 595;
 const INFO_PANEL_WIDTH: i32 = 280;
 const ICON_SIZE: i32 = 256;
 
@@ -65,7 +69,11 @@ pub struct ConfigurePerGame {
 }
 
 impl ConfigurePerGame {
-    pub fn new(parent: Option<&gtk::Window>, properties: GameProperties) -> Rc<Self> {
+    pub fn new(
+        parent: Option<&gtk::Window>,
+        properties: GameProperties,
+        hid_core: Arc<parking_lot::Mutex<hid_core::hid_core::HIDCore>>,
+    ) -> Rc<Self> {
         install_properties_css();
         common::settings::set_configuring_global(false);
 
@@ -77,14 +85,16 @@ impl ConfigurePerGame {
 
         let patches =
             configure_per_game_addons::load_from_file(properties.title_id, &properties.path);
+        let advanced_graphics = configure_graphics_advanced::page();
+        let graphics = configure_graphics::page(advanced_graphics.expose_compute_option);
         let mut pages = vec![
             configure_per_game_addons::page(properties.title_id, &patches),
             configure_system::page(),
             configure_cpu::page(),
-            configure_graphics::page(),
-            configure_graphics_advanced::page(),
+            graphics,
+            advanced_graphics.page,
             configure_audio::page(),
-            configure_input_per_game::page(),
+            configure_input_per_game::page(hid_core),
         ];
         #[cfg(unix)]
         pages.push(configure_linux_tab::page());
@@ -109,10 +119,10 @@ impl ConfigurePerGame {
             notebook.append_page(&page.widget, Some(&gtk::Label::new(Some(&page.title))));
         }
 
-        let body = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        let body = gtk::Box::new(gtk::Orientation::Horizontal, 5);
         body.set_margin_top(8);
-        body.set_margin_start(8);
-        body.set_margin_end(8);
+        body.set_margin_start(2);
+        body.set_margin_end(2);
         body.append(&info_panel(&properties));
         body.append(&notebook);
 
@@ -121,14 +131,13 @@ impl ConfigurePerGame {
         ));
         status.set_xalign(0.0);
         status.set_hexpand(true);
-        let cancel = gtk::Button::with_label("Cancel");
-        let ok = gtk::Button::with_label("OK");
-        ok.add_css_class("suggested-action");
+        let cancel = dialog_button("window-close-symbolic", "Cancel", "ruzu-properties-cancel");
+        let ok = dialog_button("emblem-ok-symbolic", "OK", "ruzu-properties-ok");
 
         let footer = gtk::Box::new(gtk::Orientation::Horizontal, 6);
         footer.set_margin_top(8);
         footer.set_margin_bottom(8);
-        footer.set_margin_start(8);
+        footer.set_margin_start(2);
         footer.set_margin_end(8);
         footer.append(&status);
         footer.append(&cancel);
@@ -177,6 +186,12 @@ impl ConfigurePerGame {
     pub fn present(&self) {
         crate::i18n::translate_widget_tree(&self.window);
         self.window.present();
+        // Upstream gives the dialog itself `Qt::ClickFocus`; no read-only Info
+        // field receives the orange keyboard-focus ring on first presentation.
+        let window = self.window.clone();
+        glib::idle_add_local_once(move || {
+            gtk::prelude::GtkWindowExt::set_focus(&window, None::<&gtk::Widget>)
+        });
     }
 
     pub fn connect_closed(&self, callback: impl Fn() + 'static) {
@@ -200,6 +215,18 @@ impl ConfigurePerGame {
         let setting_state = prepare_custom_settings();
         for page in &self.pages {
             (page.apply)();
+        }
+        {
+            use common::settings_enums::ConsoleMode;
+            use common::settings_input::ControllerType;
+
+            let mut values = common::settings::values_mut();
+            if common::settings::is_docked_mode(&values)
+                && values.players.get_value()[0].controller_type == ControllerType::Handheld
+            {
+                values.use_docked_mode.set_value(ConsoleMode::Handheld);
+                values.use_docked_mode.set_global(true);
+            }
         }
         preserve_global_selections(&setting_state);
 
@@ -256,7 +283,7 @@ fn install_properties_css() {
              window.ruzu-properties entry,\
              window.ruzu-properties spinbutton,\
              window.ruzu-properties dropdown > button {\
-                 min-height: 24px;\
+                 min-height: 20px;\
                  padding-top: 0;\
                  padding-bottom: 0;\
                  border-radius: 2px;\
@@ -265,6 +292,12 @@ fn install_properties_css() {
                  background-color: shade(@theme_bg_color, 0.98);\
                  border-bottom: 1px solid @borders;\
                  padding: 2px;\
+             }\
+             window.ruzu-properties .ruzu-properties-cancel image {\
+                 color: #b02020;\
+             }\
+             window.ruzu-properties .ruzu-properties-ok image {\
+                 color: #3b7f3b;\
              }",
         );
         gtk::style_context_add_provider_for_display(
@@ -273,6 +306,16 @@ fn install_properties_css() {
             gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
         );
     });
+}
+
+fn dialog_button(icon_name: &str, label: &str, css_class: &str) -> gtk::Button {
+    let content = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+    content.append(&gtk::Image::from_icon_name(icon_name));
+    content.append(&gtk::Label::new(Some(label)));
+    let button = gtk::Button::new();
+    button.add_css_class(css_class);
+    button.set_child(Some(&content));
+    button
 }
 
 fn custom_config_path(title_id: u64, game_path: &Path) -> PathBuf {
@@ -333,9 +376,11 @@ fn info_panel(properties: &GameProperties) -> gtk::Frame {
     let frame = gtk::Frame::new(Some("Info"));
     frame.set_width_request(INFO_PANEL_WIDTH);
     frame.set_hexpand(false);
-    frame.set_vexpand(false);
+    // Upstream's group box fills the dialog body while its inner vertical
+    // spacer absorbs height changes. The icon and metadata grid remain fixed.
+    frame.set_vexpand(true);
     frame.set_halign(gtk::Align::Start);
-    frame.set_valign(gtk::Align::Start);
+    frame.set_valign(gtk::Align::Fill);
     let content = gtk::Box::new(gtk::Orientation::Vertical, 6);
     content.set_margin_top(8);
     content.set_margin_bottom(8);

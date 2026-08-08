@@ -34049,32 +34049,44 @@ Rust files: `externals/rdynarmic/src/frontend/a32/{decoder.rs, decoder_thumb32.r
 - Re-read upstream switchable-setting selection and `Config::{ReadCategory,WriteCategory}` flows after implementation.
 - Configuration boundary/default-marker tests are included in the 166-test `ruzu` suite.
 
-## 2026-08-08 — ruzu/src/configuration/{configure_per_game.rs,configure_per_game_addons.rs,configure_input_per_game.rs} and ruzu/src/vk_device_info.rs vs yuzu/configuration/{configure_per_game.{h,cpp,ui},configure_per_game_addons.{h,cpp,ui},configure_input_per_game.{h,cpp,ui},configure_graphics.cpp}
+## 2026-08-08 — ruzu/src/configuration/{configure_per_game.rs,configure_per_game_addons.rs,configure_system.rs,configure_cpu.rs,configure_graphics.rs,configure_graphics_advanced.rs,configure_audio.rs,configure_input_per_game.rs,configure_linux_tab.rs}, ruzu/src/vk_device_info.rs, and audio_core/src/sink/sink_details.rs vs yuzu/configuration/{configure_per_game,configure_per_game_addons,configure_system,configure_cpu,configure_graphics,configure_graphics_advanced,configure_audio,configure_input_per_game,configure_linux_tab}.{h,cpp,ui} and audio_core/sink/sink_details.{h,cpp}
 
 ### Intentional differences
-- GTK composes the permanent information panel and notebook in code; upstream loads the equivalent Qt `.ui` files. The left panel is fixed at 280 pixels and its icon at 256 by 256 pixels, preserving the upstream size-policy behavior while the notebook expands.
+- GTK composes the permanent information panel and notebook in code; upstream loads the equivalent Qt `.ui` files. The left panel is fixed at 280 pixels and its icon at 256 by 256 pixels, preserving the upstream size-policy behavior while the notebook expands. The 982x595 GTK client size reproduces the 1010x661 framed reference dialog on the tested desktop.
 - The Vulkan device list is queried through `ash` instead of Qt's Vulkan wrappers; it exposes the same physical-device names to the Graphics page.
 - The non-blocking GTK window is retained by `GameListView` until `close-request`; upstream owns a stack-local modal `QDialog` for the duration of `exec()`.
+- GTK text entry is used for the custom RTC value where upstream uses `QDateTimeEdit`; the parser rejects impossible dates and times before writing the same Unix timestamp setting.
 
 ### Unintentional differences (fixed)
 - The title Properties action and dialog were absent. The dialog now owns Add-Ons, System, CPU, Graphics, Advanced Graphics, Audio, Input Profiles, and Linux pages in upstream order.
 - The dialog previously reused global configuration state without a per-title owner. It now reads, applies, writes, and restores the selected title's custom configuration.
 - Closing and reopening Properties could retain a dead native GTK window. The game-list owner is now cleared at `close-request`, matching the upstream dialog lifetime.
 - The System page omitted upstream locale validation and its unsupported-locale warning.
+- The custom RTC entry was displayed but never stored. It now updates `custom_rtc`, while its offset control preserves upstream's separate `custom_rtc_offset` ownership.
+- The Linux/AArch64 CPU page omitted upstream's `HAS_NCE` backend selector. It is now exposed only on the target where ruzu builds NCE.
+- The Graphics page used static device and VSync choices. It now enumerates physical devices, derives backend-specific VSync choices, and drives the Advanced page's compute-option exposure in upstream order.
+- The Audio page used a fixed sink/device list. It now obtains compiled sink IDs and per-sink input/output devices through `audio_core::sink::sink_details`, refreshing both device lists when the sink changes.
+- Input Profiles previously changed configuration text without reloading the corresponding emulated controllers. It now follows `ConfigureInputPerGame::LoadConfiguration`, including the Player 1 handheld mirror and controller reloads outside the settings lock.
+- The Add-Ons page used hand-built labels instead of upstream's sortable two-column patch view. It now uses a single-selection `GtkColumnView`, applies checked states through `PatchManager`, and invalidates the cache after saving.
+- The dialog did not enforce upstream's docked/handheld consistency check before saving per-title controls.
 
 ### Missing items
-- Input Profiles currently exposes the per-game profile selection surface but not every upstream profile-management action.
-- Add-On enablement is loaded from the title patch manager; complete installed-content removal remains owned by the still-unported Remove actions in the title context menu.
+- `vk_device_info.rs` creates a headless Vulkan instance, so it cannot query presentation modes against the live render surface. The Graphics page falls back to Immediate/FIFO when no surface-specific list is available.
+- Add-On enablement matches this dialog's upstream ownership; installed-content removal remains owned by the separate, still-unported Remove actions in the title context menu.
+- The Rust Oboe sink remains a stub, so the upstream Android-only Oboe row is not exposed.
 
 ### Binary layout verification
 - N/A: frontend widgets, host metadata, and INI configuration only.
 
 ### Verification
 - Re-read all matching `.h`, `.cpp`, and `.ui` files after implementation, including the fixed left-panel size policies and page order.
-- Runtime verification opened and closed the same title's Properties window twice without launching the title or retaining a destroyed window.
-- `cargo test -p ruzu --bin ruzu -- --test-threads=1`: 166 passed; `cargo build --release --bin ruzu` passes.
+- Runtime verification captured all eight tabs against the eight reference screenshots and opened the same title's Properties window twice without launching the title or retaining a destroyed window.
+- The Add-Ons tab has Patch Name/Version headers and native sort/resize behavior; System, CPU, Graphics, Advanced Graphics, Audio, Input Profiles, and Linux expose the same visible groups and row order as the reference captures.
+- `cargo test -p audio_core sink_details --lib -- --test-threads=1`: 1 passed.
+- `cargo test -p ruzu --bin ruzu -- --test-threads=1`: 172 passed.
+- `cargo build --release -p ruzu --bin ruzu`: passed.
 
-## 2026-08-08 — ruzu/src/game_list.rs, ruzu/src/configuration/qt_config.rs, core/src/file_sys/control_metadata.rs and core/src/loader/{loader.rs,nro.rs,nsp.rs,xci.rs} vs yuzu/{game_list.cpp,game_list.h,game_list_worker.cpp,main.cpp} and core/loader/*
+## 2026-08-08 — ruzu/src/{game_list.rs,main_window.rs,boot.rs}, ruzu/src/configuration/qt_config.rs, core/src/file_sys/control_metadata.rs and core/src/loader/{loader.rs,nro.rs,nsp.rs,xci.rs} vs yuzu/{game_list.cpp,game_list.h,game_list_worker.cpp,main.cpp,main.h} and core/loader/*
 
 ### Intentional differences
 - GTK uses a square `PopoverMenu` and per-popover `GSimpleActionGroup`; upstream uses a stack-local `QMenu`. Section and submenu ownership follows `GameList::AddGamePopup`.
@@ -34084,15 +34096,16 @@ Rust files: `externals/rdynarmic/src/frontend/a32/{decoder.rs, decoder_thumb32.r
 - The title menu omitted Favorite, global-configuration launch, save-data location, the Remove and Dump RomFS submenus, integrity verification, shortcut creation, and Properties. Their visibility, order, grouping, and Title-ID conditions now follow upstream.
 - Loader rows lacked the metadata needed by the permanent Properties information panel. NRO, NSP, and XCI loaders now expose the selected title's NACP-derived name, developer, version, icon, format, size, filename, and program ID.
 - Favorites were not loaded or saved through upstream's `[UI]` `UIGameList\\favorites` array representation.
+- `Start Game without Custom Configuration` shared the normal activation callback. `StartGameType::{Normal,Global}` now reaches the boot owner, restores global switchable settings for both paths, and loads the title configuration and per-game controls only for `Normal`, before system initialization.
+- The Remove submenu lacked upstream's separator between individual removals and the two aggregate removal actions.
 
 ### Missing items
 - Remove, Dump RomFS, integrity verification, and shortcut actions still require their upstream backend implementations; their current unavailable warnings are explicit temporary behavior.
-- `Start Game without Custom Configuration` has the correct menu/action path but still shares the ordinary boot path until per-boot global-config selection is wired into the session owner.
 
 ### Binary layout verification
 - PASS: NACP fields are read through the existing guest-layout type; all new row metadata and menu state are host-only.
 
 ### Verification
 - Re-read upstream `GameList::{PopupContextMenu,AddGamePopup}`, the corresponding `GMainWindow` handlers, and each modified loader metadata accessor after implementation.
-- Runtime verification exercised the exact title context menu and two successive Properties openings.
-- Game-list menu, favorite serialization, loader metadata, and navigation regressions are covered by the passing 166-test `ruzu` suite.
+- Runtime verification exercised the exact title context-menu order and separators, followed by two successive Properties openings.
+- `StartGameType` and per-game configuration-path regressions are included in the passing 172-test `ruzu` suite.

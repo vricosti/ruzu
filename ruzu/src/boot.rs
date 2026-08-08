@@ -36,6 +36,8 @@ use crate::loading_screen::LoadStage;
 pub struct BootParameters {
     pub applet: ruzu_core::hle::service::am::applet_manager::FrontendAppletParameters,
     pub cabinet_mode: Option<ruzu_core::hle::service::am::frontend::applet_cabinet::CabinetMode>,
+    /// Upstream `StartGameType::Global`: bypass the title's custom config.
+    pub use_global_configuration: bool,
 }
 
 impl Default for BootParameters {
@@ -53,6 +55,7 @@ impl Default for BootParameters {
                 ..FrontendAppletParameters::default()
             },
             cabinet_mode: None,
+            use_global_configuration: false,
         }
     }
 }
@@ -336,6 +339,13 @@ fn run_boot(
         value: 0,
         total: 0,
     });
+
+    // Upstream `GMainWindow::BootGame` selects the title's `QtConfig` before
+    // constructing/loading the emulation system. The explicit Global menu
+    // action restores every switchable setting instead.
+    if apply_boot_configuration(&filepath, parameters.use_global_configuration) {
+        hid_core.lock().reload_input_devices();
+    }
 
     // Log configuration (upstream logs settings during EmuWindow construction).
     common::settings::log_settings(&common::settings::values());
@@ -746,6 +756,75 @@ fn run_boot(
     ));
 }
 
+/// Select global or per-title settings in upstream `GMainWindow::BootGame`
+/// order, before `System::Initialize` and `System::Load` consume them.
+fn apply_boot_configuration(filepath: &str, use_global_configuration: bool) -> bool {
+    {
+        let mut values = common::settings::values_mut();
+        common::settings::restore_global_state(&mut values, false);
+        values.players.set_global(true);
+    }
+    common::settings::set_configuring_global(true);
+
+    if use_global_configuration {
+        return false;
+    }
+
+    let Some(program_id) = read_program_id(filepath) else {
+        return false;
+    };
+    let config_path = per_game_config_path(program_id, filepath);
+    common::settings::set_configuring_global(false);
+    let mut config = frontend_common::config::BaseConfig::new(
+        frontend_common::config::ConfigType::PerGameConfig,
+    );
+    config.initialize(&config_path);
+    config.read_values();
+    crate::configuration::qt_config::load_per_game_control_values(&config_path);
+    common::settings::set_configuring_global(true);
+    true
+}
+
+/// Resolve the title id through the same loader path upstream creates before
+/// constructing its per-game `QtConfig`.
+fn read_program_id(filepath: &str) -> Option<u64> {
+    use ruzu_core::file_sys::fs_filesystem::OpenMode;
+    use ruzu_core::file_sys::registered_cache::ContentProviderUnion;
+    use ruzu_core::file_sys::vfs::vfs_real::RealVfsFilesystem;
+    use ruzu_core::hle::service::filesystem::filesystem::FileSystemController;
+    use ruzu_core::loader::loader::{get_loader, ResultStatus, System as LoaderSystem};
+
+    let vfs = RealVfsFilesystem::new();
+    let content_provider = Arc::new(std::sync::Mutex::new(ContentProviderUnion::new()));
+    let mut controller = FileSystemController::new();
+    controller.set_content_provider(Arc::clone(&content_provider));
+    controller.create_factories(vfs.clone(), false);
+    let controller = Arc::new(std::sync::Mutex::new(controller));
+    let mut loader_system = LoaderSystem {
+        content_provider: Some(content_provider),
+        filesystem_controller: Some(controller),
+    };
+    let file = vfs.arc_open_file(filepath, OpenMode::READ)?;
+    let loader = get_loader(&mut loader_system, file, 0, 0)?;
+    let mut program_id = 0;
+    (loader.read_program_id(&mut program_id) == ResultStatus::Success).then_some(program_id)
+}
+
+fn per_game_config_path(program_id: u64, filepath: &str) -> std::path::PathBuf {
+    let filename = if program_id == 0 {
+        std::path::Path::new(filepath)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("game")
+            .to_string()
+    } else {
+        format!("{program_id:016X}")
+    };
+    common::fs::path_util::get_ruzu_path(common::fs::path_util::RuzuPath::ConfigDir)
+        .join("custom")
+        .join(format!("{filename}.ini"))
+}
+
 fn request_screenshot(
     system: &ruzu_core::core::System,
     path: std::path::PathBuf,
@@ -855,6 +934,16 @@ mod tests {
         assert_eq!(parameters.applet.launch_type, LaunchType::FrontendInitiated);
         assert_eq!(parameters.applet.previous_program_index, -1);
         assert!(parameters.cabinet_mode.is_none());
+        assert!(!parameters.use_global_configuration);
+    }
+
+    #[test]
+    fn per_game_config_uses_title_id_or_filename_like_upstream() {
+        let title = per_game_config_path(0x0100_1234_5678_9000, "/games/ignored.nsp");
+        assert!(title.ends_with("custom/0100123456789000.ini"));
+
+        let homebrew = per_game_config_path(0, "/games/sample.nro");
+        assert!(homebrew.ends_with("custom/sample.nro.ini"));
     }
 
     #[test]

@@ -13,16 +13,20 @@
 // per backend by `PopulateVSyncModeSelection`, because each backend supports a
 // different subset of the modes.
 
+use std::cell::RefCell;
+use std::rc::Rc;
+
+use ash::vk;
 use gtk::prelude::*;
 
-use common::settings_enums::RendererBackend;
+use common::settings_enums::{RendererBackend, VSyncMode};
 
 use super::configure_dialog::Page;
 use super::shared_translation as tr;
 use super::shared_widget as w;
 
 /// Build the Graphics tab — upstream `ConfigureGraphics`.
-pub fn page() -> Page {
+pub fn page(expose_compute_option: impl Fn() + 'static) -> Page {
     let (scroller, column) = w::page();
 
     // --- "API Settings" ---------------------------------------------------
@@ -48,6 +52,12 @@ pub fn page() -> Page {
     // `VkDeviceInfo::Record` counterpart.
     let mut device_records = Vec::new();
     crate::vk_device_info::populate_records(&mut device_records);
+    for record in &device_records {
+        if record.has_broken_compute {
+            expose_compute_option();
+        }
+    }
+    let device_records = Rc::new(device_records);
     let mut device_labels: Vec<String> = device_records
         .iter()
         .map(|record| record.name.clone())
@@ -62,6 +72,9 @@ pub fn page() -> Page {
 
     // Only one of the two rows is ever visible, matching `UpdateAPILayout`.
     apply_api_layout(backend_value, &shader_row, &device_row);
+    let api_uses_global = common::settings::values().renderer_backend.using_global();
+    shader_row.set_sensitive(!api_uses_global);
+    device_row.set_sensitive(!api_uses_global);
 
     column.append(&api_group);
 
@@ -90,18 +103,19 @@ pub fn page() -> Page {
     );
     settings.append(&astc_row);
 
-    let vsync_labels: Vec<&str> = tr::VSYNC_MODE_LABELS.iter().map(|(_, l)| *l).collect();
-    let vsync_index = tr::VSYNC_MODE_LABELS
+    let initial_vsync_mode =
+        setting_to_present_mode(*common::settings::values().vsync_mode.get_value());
+    let initial_present_modes =
+        present_modes_for(backend_value, selected_device as usize, &device_records);
+    let initial_vsync_labels = present_mode_labels(&initial_present_modes, backend_value);
+    let initial_vsync_refs: Vec<&str> = initial_vsync_labels.iter().map(String::as_str).collect();
+    let initial_vsync_index = initial_present_modes
         .iter()
-        .position(|(name, _)| {
-            *name
-                == common::settings::values()
-                    .vsync_mode
-                    .get_value()
-                    .canonicalize()
-        })
+        .position(|mode| *mode == initial_vsync_mode)
         .unwrap_or(0) as u32;
-    let (vsync_row, vsync) = w::combo_row("VSync Mode:", &vsync_labels, vsync_index);
+    let (vsync_row, vsync) = w::combo_row("VSync Mode:", &initial_vsync_refs, initial_vsync_index);
+    vsync.set_sensitive(backend_value != RendererBackend::Null);
+    let vsync_modes = Rc::new(RefCell::new(initial_present_modes));
     settings.append(&vsync_row);
 
     let nvdec_value = *common::settings::values().nvdec_emulation.get_value();
@@ -167,9 +181,39 @@ pub fn page() -> Page {
     {
         let shader_row = shader_row.clone();
         let device_row = device_row.clone();
+        let device = device.clone();
+        let vsync = vsync.clone();
+        let vsync_modes = Rc::clone(&vsync_modes);
+        let device_records = Rc::clone(&device_records);
         backend.connect_selected_notify(move |combo| {
             let selected = tr::value_at(tr::RENDERER_BACKEND, combo.selected());
             apply_api_layout(selected, &shader_row, &device_row);
+            shader_row.set_sensitive(true);
+            device_row.set_sensitive(true);
+            repopulate_vsync(
+                &vsync,
+                &vsync_modes,
+                selected,
+                device.selected() as usize,
+                &device_records,
+            );
+        });
+    }
+
+    {
+        let backend = backend.clone();
+        let vsync = vsync.clone();
+        let vsync_modes = Rc::clone(&vsync_modes);
+        let device_records = Rc::clone(&device_records);
+        device.connect_selected_notify(move |device| {
+            let selected_backend = tr::value_at(tr::RENDERER_BACKEND, backend.selected());
+            repopulate_vsync(
+                &vsync,
+                &vsync_modes,
+                selected_backend,
+                device.selected() as usize,
+                &device_records,
+            );
         });
     }
 
@@ -180,10 +224,11 @@ pub fn page() -> Page {
         let disk = disk_cache.is_active();
         let async_value = async_gpu.is_active();
         let astc_value = tr::value_at(tr::ASTC_DECODE_MODE, astc.selected());
-        let vsync_name = tr::VSYNC_MODE_LABELS
+        let vsync_value = vsync_modes
+            .borrow()
             .get(vsync.selected() as usize)
-            .map(|(name, _)| *name)
-            .unwrap_or("Fifo");
+            .copied()
+            .map(present_mode_to_setting);
         let nvdec_value = tr::value_at(tr::NVDEC_EMULATION, nvdec.selected());
         let fullscreen_value = tr::value_at(tr::FULLSCREEN_MODE, fullscreen.selected());
         let aspect_value = tr::value_at(tr::ASPECT_RATIO, aspect.selected());
@@ -200,8 +245,10 @@ pub fn page() -> Page {
         values.use_disk_shader_cache.set_value(disk);
         values.use_asynchronous_gpu_emulation.set_value(async_value);
         values.accelerate_astc.set_value(astc_value);
-        if let Some(mode) = common::settings_enums::VSyncMode::from_string(vsync_name) {
-            values.vsync_mode.set_value(mode);
+        if backend_value != RendererBackend::Null {
+            if let Some(mode) = vsync_value {
+                values.vsync_mode.set_value(mode);
+            }
         }
         values.nvdec_emulation.set_value(nvdec_value);
         values.fullscreen_mode.set_value(fullscreen_value);
@@ -227,6 +274,96 @@ fn apply_api_layout(backend: RendererBackend, shader_row: &gtk::Box, device_row:
     device_row.set_visible(backend == RendererBackend::Vulkan);
 }
 
+const DEFAULT_PRESENT_MODES: &[vk::PresentModeKHR] =
+    &[vk::PresentModeKHR::IMMEDIATE, vk::PresentModeKHR::FIFO];
+
+fn setting_to_present_mode(mode: VSyncMode) -> vk::PresentModeKHR {
+    match mode {
+        VSyncMode::Immediate => vk::PresentModeKHR::IMMEDIATE,
+        VSyncMode::Mailbox => vk::PresentModeKHR::MAILBOX,
+        VSyncMode::Fifo => vk::PresentModeKHR::FIFO,
+        VSyncMode::FifoRelaxed => vk::PresentModeKHR::FIFO_RELAXED,
+    }
+}
+
+fn present_mode_to_setting(mode: vk::PresentModeKHR) -> VSyncMode {
+    match mode {
+        vk::PresentModeKHR::IMMEDIATE => VSyncMode::Immediate,
+        vk::PresentModeKHR::MAILBOX => VSyncMode::Mailbox,
+        vk::PresentModeKHR::FIFO_RELAXED => VSyncMode::FifoRelaxed,
+        _ => VSyncMode::Fifo,
+    }
+}
+
+fn present_modes_for(
+    backend: RendererBackend,
+    device: usize,
+    records: &[crate::vk_device_info::Record],
+) -> Vec<vk::PresentModeKHR> {
+    if backend == RendererBackend::Vulkan {
+        if let Some(record) = records.get(device) {
+            if !record.vsync_support.is_empty() {
+                return record.vsync_support.clone();
+            }
+        }
+    }
+    DEFAULT_PRESENT_MODES.to_vec()
+}
+
+fn translate_present_mode(
+    mode: vk::PresentModeKHR,
+    backend: RendererBackend,
+) -> Option<&'static str> {
+    match mode {
+        vk::PresentModeKHR::IMMEDIATE if backend == RendererBackend::OpenGL => Some("Off"),
+        vk::PresentModeKHR::IMMEDIATE => Some("Immediate (VSync Off)"),
+        vk::PresentModeKHR::MAILBOX => Some("Mailbox (Recommended)"),
+        vk::PresentModeKHR::FIFO if backend == RendererBackend::OpenGL => Some("On"),
+        vk::PresentModeKHR::FIFO => Some("FIFO (VSync On)"),
+        vk::PresentModeKHR::FIFO_RELAXED => Some("FIFO Relaxed"),
+        _ => None,
+    }
+}
+
+fn present_mode_labels(modes: &[vk::PresentModeKHR], backend: RendererBackend) -> Vec<String> {
+    modes
+        .iter()
+        .filter_map(|mode| translate_present_mode(*mode, backend))
+        .map(crate::i18n::tr)
+        .collect()
+}
+
+fn repopulate_vsync(
+    dropdown: &gtk::DropDown,
+    current_modes: &RefCell<Vec<vk::PresentModeKHR>>,
+    backend: RendererBackend,
+    device: usize,
+    records: &[crate::vk_device_info::Record],
+) {
+    if backend == RendererBackend::Null {
+        dropdown.set_sensitive(false);
+        return;
+    }
+    dropdown.set_sensitive(true);
+
+    let selected_mode = current_modes
+        .borrow()
+        .get(dropdown.selected() as usize)
+        .copied()
+        .unwrap_or(vk::PresentModeKHR::FIFO);
+    let modes = present_modes_for(backend, device, records);
+    let labels = present_mode_labels(&modes, backend);
+    let label_refs: Vec<&str> = labels.iter().map(String::as_str).collect();
+    dropdown.set_model(Some(&gtk::StringList::new(&label_refs)));
+    dropdown.set_selected(
+        modes
+            .iter()
+            .position(|mode| *mode == selected_mode)
+            .unwrap_or(0) as u32,
+    );
+    *current_modes.borrow_mut() = modes;
+}
+
 /// The configured background colour as a GDK colour.
 fn background_rgba() -> gtk::gdk::RGBA {
     let values = common::settings::values();
@@ -236,4 +373,47 @@ fn background_rgba() -> gtk::gdk::RGBA {
         *values.bg_blue.get_value() as f32 / 255.0,
         1.0,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn vsync_setting_present_mode_round_trip_matches_upstream() {
+        for setting in [
+            VSyncMode::Immediate,
+            VSyncMode::Mailbox,
+            VSyncMode::Fifo,
+            VSyncMode::FifoRelaxed,
+        ] {
+            assert_eq!(
+                present_mode_to_setting(setting_to_present_mode(setting)),
+                setting
+            );
+        }
+    }
+
+    #[test]
+    fn opengl_uses_the_two_default_present_modes_and_short_labels() {
+        let modes = present_modes_for(RendererBackend::OpenGL, 0, &[]);
+        assert_eq!(modes, DEFAULT_PRESENT_MODES);
+        assert_eq!(
+            present_mode_labels(&modes, RendererBackend::OpenGL),
+            ["Off", "On"]
+        );
+    }
+
+    #[test]
+    fn vulkan_uses_the_selected_devices_present_modes() {
+        let records = [crate::vk_device_info::Record {
+            name: "test".to_string(),
+            vsync_support: vec![vk::PresentModeKHR::MAILBOX, vk::PresentModeKHR::FIFO],
+            has_broken_compute: false,
+        }];
+        assert_eq!(
+            present_modes_for(RendererBackend::Vulkan, 0, &records),
+            records[0].vsync_support
+        );
+    }
 }

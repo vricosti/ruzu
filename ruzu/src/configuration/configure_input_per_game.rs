@@ -5,6 +5,7 @@
 
 use std::cell::RefCell;
 use std::rc::Rc;
+use std::sync::Arc;
 
 use gtk::prelude::*;
 
@@ -16,7 +17,7 @@ const PLAYER_COUNT: usize = 8;
 const HANDHELD_INDEX: usize = 8;
 
 /// Build the eight per-player profile selectors in upstream order.
-pub fn page() -> Page {
+pub fn page(hid_core: Arc<parking_lot::Mutex<hid_core::hid_core::HIDCore>>) -> Page {
     let (scroller, column) = w::page();
     let (group, content) = w::group("Input Profiles");
 
@@ -56,43 +57,69 @@ pub fn page() -> Page {
     }
     column.append(&group);
 
+    let (controllers, handheld_controller) = {
+        let hid_core = hid_core.lock();
+        let controllers = (0..PLAYER_COUNT)
+            .map(|index| hid_core.get_emulated_controller_by_index(index))
+            .collect::<Vec<_>>();
+        let handheld = hid_core.get_emulated_controller(hid_core::hid_types::NpadIdType::Handheld);
+        (controllers, handheld)
+    };
+
     Page::new("Input Profiles", scroller, move || {
-        let mut settings = common::settings::values_mut();
         let mut profiles = profiles.borrow_mut();
 
         for (index, selector) in selectors.iter().enumerate() {
-            settings.players.set_global(false);
             let selected = selector.selected() as usize;
             if selected == 0 {
-                settings.players.get_value_mut()[index].profile_name.clear();
-                if index == 0 {
-                    settings.players.get_value_mut()[HANDHELD_INDEX] = Default::default();
+                {
+                    let mut settings = common::settings::values_mut();
+                    settings.players.set_global(false);
+                    settings.players.get_value_mut()[index].profile_name.clear();
+                    if index == 0 {
+                        settings.players.get_value_mut()[HANDHELD_INDEX] = Default::default();
+                    }
+                    settings.players.set_global(true);
                 }
-                settings.players.set_global(true);
+                controllers[index].lock().reload_from_settings();
                 continue;
             }
             let Some(profile_name) = profile_names.get(selected - 1) else {
                 continue;
             };
-            let player = &mut settings.players.get_value_mut()[index];
-            if profiles.load_profile(profile_name, player) {
-                player.profile_name = profile_name.clone();
-                player.connected = true;
+            let loaded = {
+                let mut settings = common::settings::values_mut();
+                settings.players.set_global(false);
+                let player = &mut settings.players.get_value_mut()[index];
+                if !profiles.load_profile(profile_name, player) {
+                    false
+                } else {
+                    player.profile_name = profile_name.clone();
+                    player.connected = true;
 
+                    if index == 0 {
+                        let handheld = if player.controller_type
+                            == common::settings_input::ControllerType::Handheld
+                        {
+                            player.clone()
+                        } else {
+                            Default::default()
+                        };
+                        settings.players.get_value_mut()[HANDHELD_INDEX] = handheld;
+                    }
+                    true
+                }
+            };
+            if loaded {
+                controllers[index].lock().reload_from_settings();
                 if index == 0 {
-                    settings.players.get_value_mut()[HANDHELD_INDEX] = if player.controller_type
-                        == common::settings_input::ControllerType::Handheld
-                    {
-                        player.clone()
-                    } else {
-                        Default::default()
-                    };
+                    handheld_controller.lock().reload_from_settings();
                 }
             }
         }
 
         // `ConfigureInputPerGame::SaveConfiguration` forces custom storage
         // before serializing, even when the final combo selects globals.
-        settings.players.set_global(false);
+        common::settings::values_mut().players.set_global(false);
     })
 }

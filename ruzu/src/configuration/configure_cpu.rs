@@ -38,6 +38,22 @@ pub fn page() -> Page {
 
     column.append(&general_group);
 
+    // Upstream compiles and reveals this group only with `HAS_NCE`. Ruzu's NCE
+    // backend is available on Linux/AArch64 under the equivalent target cfg.
+    #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+    let backend = {
+        let (backend_group, backend_content) = w::group("CPU Backend");
+        let backend_value = *common::settings::values().cpu_backend.get_value();
+        let (backend_row, backend) = w::combo_row(
+            "Backend:",
+            &tr::labels(tr::CPU_BACKEND),
+            tr::index_of(tr::CPU_BACKEND, &backend_value),
+        );
+        backend_content.append(&backend_row);
+        column.append(&backend_group);
+        backend
+    };
+
     // --- "Unsafe CPU Optimization Settings" -------------------------------
     // Upstream shows this group only while accuracy is `Unsafe`
     // (`ConfigureCpu::UpdateGroup`).
@@ -117,6 +133,10 @@ pub fn page() -> Page {
         let monitor = ignore_global_monitor.is_active();
 
         let mut values = common::settings::values_mut();
+        #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+        values
+            .cpu_backend
+            .set_value(tr::value_at(tr::CPU_BACKEND, backend.selected()));
         values.cpu_accuracy.set_value(accuracy_value);
         values.cpuopt_unsafe_unfuse_fma.set_value(unfuse);
         values.cpuopt_unsafe_reduce_fp_error.set_value(fp_error);

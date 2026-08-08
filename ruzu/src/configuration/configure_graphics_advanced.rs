@@ -17,8 +17,16 @@ use super::configure_dialog::Page;
 use super::shared_translation as tr;
 use super::shared_widget as w;
 
+/// The page plus upstream's `ExposeComputeOption` callback. `ConfigurePerGame`
+/// passes the callback to `ConfigureGraphics`, preserving the same ownership
+/// and construction order as the C++ dialog.
+pub struct BuildResult {
+    pub page: Page,
+    pub expose_compute_option: Box<dyn Fn()>,
+}
+
 /// Build the Graphics "Advanced" tab — upstream `ConfigureGraphicsAdvanced`.
-pub fn page() -> Page {
+pub fn page() -> BuildResult {
     let (scroller, column) = w::page();
 
     let (group, content) = w::group("Advanced Graphics Settings");
@@ -122,7 +130,8 @@ pub fn page() -> Page {
 
     column.append(&group);
 
-    Page::new("Adv. Graphics", scroller, move || {
+    let expose_compute_pipelines = compute_pipelines.clone();
+    let page = Page::new("Adv. Graphics", scroller, move || {
         let accuracy_value = tr::value_at(tr::GPU_ACCURACY, accuracy.selected());
         let aniso_value = tr::value_at(tr::ANISOTROPY_MODE, aniso.selected());
         let recompression_value = tr::value_at(tr::ASTC_RECOMPRESSION, recompression.selected());
@@ -153,5 +162,10 @@ pub fn page() -> Page {
         values.use_video_framerate.set_value(framerate);
         values.barrier_feedback_loops.set_value(barriers);
         values.enable_compute_pipelines.set_value(compute);
-    })
+    });
+
+    BuildResult {
+        page,
+        expose_compute_option: Box::new(move || expose_compute_pipelines.set_visible(true)),
+    }
 }

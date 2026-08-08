@@ -30,6 +30,7 @@ use ruzu_core::hle::service::filesystem::filesystem::FileSystemController;
 use ruzu_core::loader::loader::{get_loader, FileType, ResultStatus, System as LoaderSystem};
 
 use crate::configuration::qt_config;
+use crate::main_window::StartGameType;
 use crate::uisettings::{self, GameDir};
 use crate::util::controller_navigation::{ControllerNavigation, NavigationKey};
 
@@ -181,7 +182,8 @@ struct GameListView {
     /// per-directory toolbar actions after every single use of them.
     selection: gtk::SingleSelection,
     controller_navigation: ControllerNavigation,
-    on_activate: Rc<dyn Fn(String)>,
+    hid_core: Arc<parking_lot::Mutex<hid_core::hid_core::HIDCore>>,
+    on_activate: Rc<dyn Fn(String, StartGameType)>,
     property_dialog:
         RefCell<Option<Rc<crate::configuration::configure_per_game::ConfigurePerGame>>>,
 }
@@ -219,7 +221,7 @@ impl GameListHandle {
 
 /// Build the game list widget. `on_activate` is invoked with the game's path
 /// when a game row is activated (double-click / Enter).
-pub fn build<F: Fn(String) + 'static>(
+pub fn build<F: Fn(String, StartGameType) + 'static>(
     hid_core: &Arc<parking_lot::Mutex<hid_core::hid_core::HIDCore>>,
     on_activate: F,
 ) -> (gtk::Widget, GameListHandle) {
@@ -253,7 +255,7 @@ pub fn build<F: Fn(String) + 'static>(
         view.grab_focus();
     });
 
-    let on_activate: Rc<dyn Fn(String)> = Rc::new(on_activate);
+    let on_activate: Rc<dyn Fn(String, StartGameType)> = Rc::new(on_activate);
     let context_view: Rc<RefCell<Weak<GameListView>>> = Rc::new(RefCell::new(Weak::new()));
     let on_context_menu: ContextMenuHandler = {
         let context_view = Rc::clone(&context_view);
@@ -349,6 +351,7 @@ pub fn build<F: Fn(String) + 'static>(
         all_games: RefCell::new(Vec::new()),
         selection: selection.clone(),
         controller_navigation: ControllerNavigation::new(hid_core),
+        hid_core: Arc::clone(hid_core),
         on_activate,
         property_dialog: RefCell::new(None),
     });
@@ -556,7 +559,7 @@ impl GameListView {
         if entry.is_folder() {
             row.set_expanded(!row.is_expanded());
         } else {
-            (self.on_activate)(entry.path());
+            (self.on_activate)(entry.path(), StartGameType::Normal);
         }
     }
 
@@ -631,7 +634,7 @@ impl GameListView {
         anchor: &gtk::Widget,
         x: f64,
         y: f64,
-        on_activate: Rc<dyn Fn(String)>,
+        on_activate: Rc<dyn Fn(String, StartGameType)>,
     ) {
         if entry.is_folder() {
             self.popup_directory_context_menu(entry, anchor, x, y);
@@ -750,7 +753,7 @@ impl GameListView {
         anchor: &gtk::Widget,
         x: f64,
         y: f64,
-        on_activate: Rc<dyn Fn(String)>,
+        on_activate: Rc<dyn Fn(String, StartGameType)>,
     ) {
         let path = entry.path();
         let program_id = entry.program_id();
@@ -798,45 +801,51 @@ impl GameListView {
 
         let commands = gio::Menu::new();
         let remove = gio::Menu::new();
+        let remove_individual = gio::Menu::new();
         if program_id != 0 {
-            remove.append(
+            remove_individual.append(
                 Some(&crate::i18n::tr("Remove Installed Update")),
                 Some("game-list.remove-update"),
             );
-            remove.append(
+            remove_individual.append(
                 Some(&crate::i18n::tr("Remove All Installed DLC")),
                 Some("game-list.remove-dlc"),
             );
         }
-        remove.append(
+        remove_individual.append(
             Some(&crate::i18n::tr("Remove Custom Configuration")),
             Some("game-list.remove-custom-config"),
         );
-        remove.append(
+        remove_individual.append(
             Some(&crate::i18n::tr("Remove Play Time Data")),
             Some("game-list.remove-play-time"),
         );
-        remove.append(
+        remove_individual.append(
             Some(&crate::i18n::tr("Remove Cache Storage")),
             Some("game-list.remove-cache-storage"),
         );
         if program_id != 0 {
-            remove.append(
+            remove_individual.append(
                 Some(&crate::i18n::tr("Remove OpenGL Pipeline Cache")),
                 Some("game-list.remove-gl-cache"),
             );
-            remove.append(
+            remove_individual.append(
                 Some(&crate::i18n::tr("Remove Vulkan Pipeline Cache")),
                 Some("game-list.remove-vk-cache"),
             );
-            remove.append(
+        }
+        remove.append_section(None, &remove_individual);
+        if program_id != 0 {
+            let remove_all = gio::Menu::new();
+            remove_all.append(
                 Some(&crate::i18n::tr("Remove All Pipeline Caches")),
                 Some("game-list.remove-all-caches"),
             );
-            remove.append(
+            remove_all.append(
                 Some(&crate::i18n::tr("Remove All Installed Contents")),
                 Some("game-list.remove-all-content"),
             );
+            remove.append_section(None, &remove_all);
         }
         commands.append_submenu(Some(&crate::i18n::tr("Remove")), &remove);
 
@@ -887,14 +896,16 @@ impl GameListView {
         {
             let path = path.clone();
             let on_activate = Rc::clone(&on_activate);
-            start_game.connect_activate(move |_, _| on_activate(path.clone()));
+            start_game
+                .connect_activate(move |_, _| on_activate(path.clone(), StartGameType::Normal));
         }
         actions.add_action(&start_game);
 
         let start_game_global = gio::SimpleAction::new("start-game-global", None);
         {
             let path = path.clone();
-            start_game_global.connect_activate(move |_, _| on_activate(path.clone()));
+            start_game_global
+                .connect_activate(move |_, _| on_activate(path.clone(), StartGameType::Global));
         }
         actions.add_action(&start_game_global);
 
@@ -1060,6 +1071,7 @@ impl GameListView {
         let dialog = crate::configuration::configure_per_game::ConfigurePerGame::new(
             self.parent_window().as_ref(),
             properties,
+            Arc::clone(&self.hid_core),
         );
         dialog.connect_closed({
             let view = Rc::downgrade(self);
