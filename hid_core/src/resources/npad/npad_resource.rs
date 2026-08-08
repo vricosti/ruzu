@@ -4,6 +4,7 @@
 //! Port of hid_core/resources/npad/npad_resource.h and npad_resource.cpp
 
 use common::ResultCode;
+use std::sync::Arc;
 
 use crate::hid_result;
 use crate::hid_types::*;
@@ -27,7 +28,15 @@ struct NpadState {
     flag: DataStatusFlag,
     aruid: u64,
     data: NPadData,
+    controller_state: [NpadControllerState; MAX_SUPPORTED_NPAD_ID_TYPES],
     npad_revision: NpadRevision,
+}
+
+type StyleSetUpdateEvent = Arc<dyn Fn() + Send + Sync>;
+
+#[derive(Default)]
+struct NpadControllerState {
+    style_set_update_event: Option<StyleSetUpdateEvent>,
 }
 
 impl Default for NpadState {
@@ -36,6 +45,7 @@ impl Default for NpadState {
             flag: DataStatusFlag::default(),
             aruid: 0,
             data: NPadData::new(),
+            controller_state: std::array::from_fn(|_| NpadControllerState::default()),
             npad_revision: NpadRevision::Revision0,
         }
     }
@@ -188,6 +198,41 @@ impl NPadResource {
                 .is_supported_styleset_set());
         }
         Err(hid_result::RESULT_NPAD_NOT_CONNECTED)
+    }
+
+    /// Rust crate-boundary adapter for upstream
+    /// `NPadResource::AcquireNpadStyleSetUpdateEventHandle`.
+    ///
+    /// The kernel event is owned by `core`, while `NPadResource` belongs to
+    /// `hid_core`; retaining an opaque signaling endpoint preserves upstream's
+    /// per-ARUID/per-controller event ownership without introducing a circular
+    /// crate dependency.
+    pub fn register_style_set_update_event(
+        &mut self,
+        aruid: u64,
+        npad_id: NpadIdType,
+        event: StyleSetUpdateEvent,
+    ) -> ResultCode {
+        let Some(aruid_index) = self.get_index_from_aruid(aruid) else {
+            return hid_result::RESULT_NPAD_NOT_CONNECTED;
+        };
+        let npad_index = crate::hid_util::npad_id_type_to_index(npad_id);
+        self.state[aruid_index].controller_state[npad_index].style_set_update_event = Some(event);
+        self.signal_style_set_update_event(aruid, npad_id)
+    }
+
+    /// Port of `NPadResource::SignalStyleSetUpdateEvent`.
+    pub fn signal_style_set_update_event(&self, aruid: u64, npad_id: NpadIdType) -> ResultCode {
+        let Some(aruid_index) = self.get_index_from_aruid(aruid) else {
+            return hid_result::RESULT_NPAD_NOT_CONNECTED;
+        };
+        let npad_index = crate::hid_util::npad_id_type_to_index(npad_id);
+        if let Some(event) =
+            &self.state[aruid_index].controller_state[npad_index].style_set_update_event
+        {
+            event();
+        }
+        ResultCode::SUCCESS
     }
 
     fn npad_style_mask_for_revision(&self, idx: usize) -> NpadStyleSet {
@@ -603,15 +648,53 @@ impl NPadResource {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
     use super::NPadResource;
     use crate::hid_result;
-    use crate::hid_types::NpadStyleSet;
+    use crate::hid_types::{NpadIdType, NpadStyleSet};
     use crate::resources::applet_resource::SYSTEM_ARUID;
     use crate::resources::npad::npad_types::{
         NpadHandheldActivationMode, NpadJoyHoldType, NpadRevision,
     };
 
     const ARUID: u64 = 0x1234;
+
+    #[test]
+    fn style_set_update_event_is_owned_per_aruid_and_controller() {
+        let mut resource = NPadResource::new();
+        assert!(resource
+            .register_applet_resource_user_id(ARUID)
+            .is_success());
+        let signal_count = Arc::new(AtomicUsize::new(0));
+        let signal_count_copy = Arc::clone(&signal_count);
+
+        assert!(resource
+            .register_style_set_update_event(
+                ARUID,
+                NpadIdType::Player1,
+                Arc::new(move || {
+                    signal_count_copy.fetch_add(1, Ordering::Relaxed);
+                }),
+            )
+            .is_success());
+        assert_eq!(signal_count.load(Ordering::Relaxed), 1);
+
+        assert!(resource
+            .signal_style_set_update_event(ARUID, NpadIdType::Player1)
+            .is_success());
+        assert!(resource
+            .signal_style_set_update_event(ARUID, NpadIdType::Player2)
+            .is_success());
+        assert_eq!(signal_count.load(Ordering::Relaxed), 2);
+
+        resource.unregister_applet_resource_user_id(ARUID);
+        assert_eq!(
+            resource.signal_style_set_update_event(ARUID, NpadIdType::Player1),
+            hid_result::RESULT_NPAD_NOT_CONNECTED
+        );
+    }
 
     #[test]
     fn supported_style_set_errors_match_upstream() {

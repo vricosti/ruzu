@@ -34,6 +34,7 @@ impl ProcessorBase {
             ImageTransferProcessorFormat::Size80x60 => 80 * 60,
             ImageTransferProcessorFormat::Size40x30 => 40 * 30,
             ImageTransferProcessorFormat::Size20x15 => 20 * 15,
+            ImageTransferProcessorFormat::None => 0,
         }
     }
 
@@ -44,6 +45,7 @@ impl ProcessorBase {
             ImageTransferProcessorFormat::Size80x60 => 80,
             ImageTransferProcessorFormat::Size40x30 => 40,
             ImageTransferProcessorFormat::Size20x15 => 20,
+            ImageTransferProcessorFormat::None => 0,
         }
     }
 
@@ -54,6 +56,7 @@ impl ProcessorBase {
             ImageTransferProcessorFormat::Size80x60 => 60,
             ImageTransferProcessorFormat::Size40x30 => 30,
             ImageTransferProcessorFormat::Size20x15 => 15,
+            ImageTransferProcessorFormat::None => 0,
         }
     }
 }
@@ -61,5 +64,27 @@ impl ProcessorBase {
 impl Default for ProcessorBase {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn camera_none_uses_the_upstream_default_dimensions() {
+        assert_eq!(ImageTransferProcessorFormat::None as u32, 5);
+        assert_eq!(
+            ProcessorBase::get_data_size(ImageTransferProcessorFormat::None),
+            0
+        );
+        assert_eq!(
+            ProcessorBase::get_data_width(ImageTransferProcessorFormat::None),
+            0
+        );
+        assert_eq!(
+            ProcessorBase::get_data_height(ImageTransferProcessorFormat::None),
+            0
+        );
     }
 }

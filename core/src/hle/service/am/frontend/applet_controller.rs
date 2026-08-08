@@ -4,7 +4,8 @@
 //! Port of zuyu/src/core/hle/service/am/frontend/applet_controller.h
 //! Port of zuyu/src/core/hle/service/am/frontend/applet_controller.cpp
 
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, Weak};
 
 use hid_core::hid_types::NpadStyleSet;
 
@@ -14,6 +15,7 @@ use crate::frontend::applets::controller::{
 };
 use crate::hle::result::{ErrorModule, ResultCode, RESULT_SUCCESS};
 use crate::hle::service::am::am_types::{CommonArguments, LibraryAppletMode};
+use crate::hle::service::am::applet::Applet;
 use crate::hle::service::am::applet_data_broker::AppletDataBroker;
 
 use super::applets::FrontendApplet;
@@ -168,6 +170,7 @@ const _: () = assert!(std::mem::size_of::<ControllerSupportResultInfo>() == 0xC)
 
 pub struct Controller {
     system: SystemRef,
+    applet: Weak<Mutex<Applet>>,
     broker: Arc<AppletDataBroker>,
     applet_mode: LibraryAppletMode,
     frontend: Arc<dyn ControllerApplet>,
@@ -178,21 +181,29 @@ pub struct Controller {
     controller_user_arg_new: ControllerSupportArgNew,
     controller_update_arg: ControllerUpdateFirmwareArg,
     controller_key_remapping_arg: ControllerKeyRemappingArg,
-    complete: bool,
+    completion: Arc<ControllerCompletion>,
     status: ResultCode,
     is_single_mode: bool,
-    out_data: Vec<u8>,
+}
+
+#[derive(Default)]
+struct ControllerCompletion {
+    complete: AtomicBool,
+    executing: AtomicBool,
+    out_data: Mutex<Vec<u8>>,
 }
 
 impl Controller {
     pub fn new(
         system: SystemRef,
+        applet: Weak<Mutex<Applet>>,
         broker: Arc<AppletDataBroker>,
         applet_mode: LibraryAppletMode,
         frontend: Arc<dyn ControllerApplet>,
     ) -> Self {
         Self {
             system,
+            applet,
             broker,
             applet_mode,
             frontend,
@@ -203,10 +214,9 @@ impl Controller {
             controller_user_arg_new: ControllerSupportArgNew::default(),
             controller_update_arg: ControllerUpdateFirmwareArg::default(),
             controller_key_remapping_arg: ControllerKeyRemappingArg::default(),
-            complete: false,
+            completion: Arc::new(ControllerCompletion::default()),
             status: RESULT_SUCCESS,
             is_single_mode: false,
-            out_data: Vec::new(),
         }
     }
 
@@ -270,11 +280,18 @@ impl Controller {
         }
     }
 
-    fn configuration_complete(&mut self, is_success: bool) {
-        let hid_core = self.system.get().hid_core();
+    fn configuration_complete(
+        system: SystemRef,
+        applet: &Weak<Mutex<Applet>>,
+        broker: &Arc<AppletDataBroker>,
+        completion: &Arc<ControllerCompletion>,
+        is_single_mode: bool,
+        is_success: bool,
+    ) {
+        let hid_core = system.get().hid_core();
         let hid_core = hid_core.lock();
         let result_info = ControllerSupportResultInfo {
-            player_count: if self.is_single_mode {
+            player_count: if is_single_mode {
                 1
             } else {
                 hid_core.get_player_count()
@@ -296,9 +313,27 @@ impl Controller {
             result_info.result
         );
 
-        self.complete = true;
-        self.out_data = Self::struct_to_vec(&result_info);
-        self.broker.get_out_data().push(self.out_data.clone());
+        let out_data = Self::struct_to_vec(&result_info);
+        *completion.out_data.lock().unwrap() = out_data.clone();
+        broker.get_out_data().push(out_data);
+        completion.complete.store(true, Ordering::Release);
+
+        // A default frontend may invoke the callback inline while the accessor
+        // still owns the Applet mutex. In that case the accessor observes
+        // `is_complete()` after Execute returns and performs Exit. A graphical
+        // frontend invokes it later and must perform upstream's Exit here.
+        if !completion.executing.load(Ordering::Acquire) {
+            Self::exit(applet);
+        }
+    }
+
+    fn exit(applet: &Weak<Mutex<Applet>>) {
+        let Some(applet) = applet.upgrade() else {
+            return;
+        };
+        let mut applet = applet.lock().unwrap();
+        applet.is_completed = true;
+        applet.signal_state_changed_event_without_process();
     }
 }
 
@@ -460,6 +495,7 @@ impl FrontendApplet for Controller {
     }
 
     fn execute(&mut self) {
+        self.completion.executing.store(true, Ordering::Release);
         match self.support_mode() {
             ControllerSupportMode::ShowControllerSupport => {
                 let parameters = match self.controller_applet_version {
@@ -486,18 +522,22 @@ impl FrontendApplet for Controller {
 
                 log::debug!("Controller Parameters: {:?}", parameters);
 
-                let callback_result = Arc::new(Mutex::new(None));
-                let callback_result_copy = Arc::clone(&callback_result);
+                let system = self.system;
+                let applet = self.applet.clone();
+                let broker = Arc::clone(&self.broker);
+                let completion = Arc::clone(&self.completion);
+                let is_single_mode = self.is_single_mode;
                 let callback: ReconfigureCallback = Box::new(move |is_success| {
-                    *callback_result_copy.lock().unwrap() = Some(is_success);
+                    Self::configuration_complete(
+                        system,
+                        &applet,
+                        &broker,
+                        &completion,
+                        is_single_mode,
+                        is_success,
+                    );
                 });
                 self.frontend.reconfigure_controllers(callback, &parameters);
-                let is_success = callback_result
-                    .lock()
-                    .unwrap()
-                    .take()
-                    .expect("Controller frontend did not complete synchronously");
-                self.configuration_complete(is_success);
             }
             ControllerSupportMode::ShowControllerStrapGuide
             | ControllerSupportMode::ShowControllerFirmwareUpdate
@@ -506,10 +546,18 @@ impl FrontendApplet for Controller {
                     "ControllerSupportMode={:?} is not implemented",
                     self.support_mode()
                 );
-                self.configuration_complete(true);
+                Self::configuration_complete(
+                    self.system,
+                    &self.applet,
+                    &self.broker,
+                    &self.completion,
+                    self.is_single_mode,
+                    true,
+                );
             }
             ControllerSupportMode::MaxControllerSupportMode => unreachable!(),
         }
+        self.completion.executing.store(false, Ordering::Release);
     }
 
     fn request_exit(&mut self) {
@@ -525,7 +573,7 @@ impl FrontendApplet for Controller {
     }
 
     fn is_complete(&self) -> bool {
-        self.complete
+        self.completion.complete.load(Ordering::Acquire)
     }
 }
 
@@ -533,8 +581,28 @@ impl FrontendApplet for Controller {
 mod tests {
     use crate::core::System;
     use crate::hle::service::am::am_types::AppletId;
+    use crate::hle::service::am::applet::Applet;
+    use crate::hle::service::os::process::Process;
 
     use super::*;
+
+    struct DeferredControllerApplet {
+        callback: Arc<Mutex<Option<ReconfigureCallback>>>,
+    }
+
+    impl crate::frontend::applets::applet::Applet for DeferredControllerApplet {
+        fn close(&self) {}
+    }
+
+    impl ControllerApplet for DeferredControllerApplet {
+        fn reconfigure_controllers(
+            &self,
+            callback: ReconfigureCallback,
+            _parameters: &ControllerParameters,
+        ) {
+            *self.callback.lock().unwrap() = Some(callback);
+        }
+    }
 
     fn bytes_of<T>(value: &T) -> Vec<u8> {
         unsafe {
@@ -571,6 +639,7 @@ mod tests {
             .frontend_applet_holder()
             .get_applet(
                 system_ref,
+                Weak::new(),
                 Arc::clone(&broker),
                 AppletId::Controller,
                 LibraryAppletMode::AllForeground,
@@ -591,5 +660,54 @@ mod tests {
         assert_eq!(result.player_count, 1);
         assert_eq!(result.selected_id, 0);
         assert_eq!(result.result, ControllerSupportResult::Success as u32);
+    }
+
+    #[test]
+    fn controller_applet_completes_after_deferred_frontend_callback() {
+        let system = System::new();
+        let system_ref = SystemRef::from_ref(&system);
+        let applet = Arc::new(Mutex::new(Applet::new(system_ref, Process::new(), false)));
+        let broker = Arc::new(AppletDataBroker::new());
+        let callback = Arc::new(Mutex::new(None));
+        let frontend: Arc<dyn ControllerApplet> = Arc::new(DeferredControllerApplet {
+            callback: Arc::clone(&callback),
+        });
+
+        let mut common = CommonArguments::default();
+        common.library_version = ControllerAppletVersion::Version8 as u32;
+        let private = ControllerSupportArgPrivate {
+            arg_private_size: std::mem::size_of::<ControllerSupportArgPrivate>() as u32,
+            arg_size: std::mem::size_of::<ControllerSupportArgNew>() as u32,
+            mode: ControllerSupportMode::ShowControllerSupport as u8,
+            caller: ControllerSupportCaller::Application as u8,
+            style_set: NpadStyleSet::FULLKEY.bits(),
+            ..ControllerSupportArgPrivate::default()
+        };
+        let mut user = ControllerSupportArgNew::default();
+        user.header.player_count_min = 1;
+        user.header.player_count_max = 4;
+
+        broker.get_in_data().push(bytes_of(&common));
+        broker.get_in_data().push(bytes_of(&private));
+        broker.get_in_data().push(bytes_of(&user));
+
+        let mut controller = Controller::new(
+            system_ref,
+            Arc::downgrade(&applet),
+            Arc::clone(&broker),
+            LibraryAppletMode::AllForeground,
+            frontend,
+        );
+        controller.initialize();
+        controller.execute();
+
+        assert!(!controller.is_complete());
+        assert!(!applet.lock().unwrap().is_completed);
+
+        callback.lock().unwrap().take().unwrap()(true);
+
+        assert!(controller.is_complete());
+        assert!(applet.lock().unwrap().is_completed);
+        assert!(broker.get_out_data().pop().is_ok());
     }
 }

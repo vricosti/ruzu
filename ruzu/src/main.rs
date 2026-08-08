@@ -15,6 +15,7 @@ use gtk::prelude::*;
 use gtk::{gio, glib};
 
 mod about_dialog;
+mod applets;
 mod boot;
 mod config_import;
 mod configuration;

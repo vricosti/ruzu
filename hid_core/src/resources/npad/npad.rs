@@ -6,18 +6,20 @@
 //! Main NPad controller resource managing all npad-related state including
 //! style sets, vibration, six-axis sensors, and abstracted pad management.
 
+use common::input::PollingMode;
 use common::ResultCode;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use crate::frontend::emulated_controller::{
     apply_simple_npad_stick_buttons, get_simple_npad_button_state, AnalogSticks, BatteryLevelState,
-    ControllerColors, ControllerTriggerType, ControllerUpdateCallback,
+    ControllerColors, ControllerTriggerType, ControllerUpdateCallback, EmulatedDeviceIndex,
 };
 use crate::hid_core::{EmulatedControllerHandle, HIDCore, AVAILABLE_CONTROLLERS};
 use crate::hid_result;
 use crate::hid_types::*;
 use crate::hid_util;
+use crate::resources::abstracted_pad::abstract_pad::{AbstractPad, FullAbstractPad};
 use crate::resources::applet_resource::{AppletResourceHolder, ARUID_INDEX_MAX};
 use crate::resources::npad::npad_resource::NPadResource;
 use crate::resources::npad::npad_types::*;
@@ -123,6 +125,7 @@ pub struct NPad {
     callback_events: Arc<parking_lot::Mutex<ControllerCallbackEvents>>,
     press_state: AtomicU64,
     npad_resource: NPadResource,
+    abstracted_pads: FullAbstractPad,
     vibration: NpadVibration,
     vibration_devices: [NpadVibrationDevice; 2],
     ref_counter: i32,
@@ -131,6 +134,11 @@ pub struct NPad {
 
 impl Default for NPad {
     fn default() -> Self {
+        let abstracted_pads = std::array::from_fn(|index| {
+            let mut pad = AbstractPad::new();
+            pad.set_npad_id(hid_util::index_to_npad_id_type(index));
+            pad
+        });
         Self {
             hid_core: None,
             controller_data: Box::new(std::array::from_fn(|_| {
@@ -141,6 +149,7 @@ impl Default for NPad {
             )),
             press_state: AtomicU64::new(0),
             npad_resource: NPadResource::new(),
+            abstracted_pads,
             vibration: NpadVibration::new(),
             vibration_devices: [NpadVibrationDevice::new(), NpadVibrationDevice::new()],
             ref_counter: 0,
@@ -396,6 +405,8 @@ impl NPad {
                 if !is_connected {
                     if controller.is_connected {
                         Self::disconnect_controller(npad, controller);
+                        self.npad_resource
+                            .signal_style_set_update_event(aruid, npad_id);
                     }
                     continue;
                 }
@@ -415,6 +426,8 @@ impl NPad {
                     // until OnUpdate; replay the lost disconnect before using
                     // the final connected type.
                     Self::disconnect_controller(npad, controller);
+                    self.npad_resource
+                        .signal_style_set_update_event(aruid, npad_id);
                 }
                 if !controller.is_connected
                     && self
@@ -428,7 +441,32 @@ impl NPad {
                         colors,
                         battery,
                     );
-                    last_active_controller = Some(npad_id);
+                    device.connect(false);
+                    device.set_led_pattern();
+                    if controller_type == NpadStyleIndex::JoyconDual {
+                        if controller.is_dual_left_connected {
+                            device.set_polling_mode(
+                                EmulatedDeviceIndex::LeftIndex,
+                                PollingMode::Active,
+                            );
+                        }
+                        if controller.is_dual_right_connected {
+                            device.set_polling_mode(
+                                EmulatedDeviceIndex::RightIndex,
+                                PollingMode::Active,
+                            );
+                        }
+                    } else {
+                        device
+                            .set_polling_mode(EmulatedDeviceIndex::AllDevices, PollingMode::Active);
+                    }
+                    self.npad_resource
+                        .signal_style_set_update_event(aruid, npad_id);
+                    Self::write_empty_entry(npad);
+                    if let Some(hid_core) = self.hid_core.as_ref() {
+                        hid_core.lock().set_last_active_controller(npad_id);
+                    }
+                    self.abstracted_pads[hid_util::npad_id_type_to_index(npad_id)].update();
                 } else {
                     if events
                         & (controller_trigger_bit(ControllerTriggerType::Battery)
@@ -610,9 +648,9 @@ impl NPad {
         npad.system_properties.raw = 0;
         npad.fullkey_color = NpadFullKeyColorState::default();
         npad.joycon_color = NpadJoyColorState::default();
-        npad.battery_level_dual = NpadBatteryLevel::default();
-        npad.battery_level_left = NpadBatteryLevel::default();
-        npad.battery_level_right = NpadBatteryLevel::default();
+        npad.battery_level_dual = NpadBatteryLevel::Empty;
+        npad.battery_level_left = NpadBatteryLevel::Empty;
+        npad.battery_level_right = NpadBatteryLevel::Empty;
 
         match controller_type {
             NpadStyleIndex::None => return,
@@ -753,7 +791,6 @@ impl NPad {
         }
 
         controller.is_connected = true;
-        Self::write_empty_entry(npad);
     }
 
     fn disconnect_controller(npad: &mut NpadInternalState, controller: &mut NpadControllerData) {
@@ -814,6 +851,7 @@ impl NPad {
             body_colors,
             battery_level,
         );
+        Self::write_empty_entry(npad);
     }
 
     fn request_pad_state_update(
@@ -1321,9 +1359,6 @@ impl NPad {
     }
 
     /// Port of NPad::SetNpadSystemExtStateEnabled.
-    /// Upstream additionally iterates abstracted_pads and calls
-    /// abstracted_pad->EnableAppletToGetInput(aruid) on success.
-    /// AbstractedPad integration is not yet wired up.
     pub fn set_npad_system_ext_state_enabled(
         &mut self,
         aruid: u64,
@@ -1333,18 +1368,19 @@ impl NPad {
             .npad_resource
             .set_npad_system_ext_state_enabled(aruid, is_enabled);
         if result.is_success() {
-            // Upstream: for (auto& abstract_pad : abstracted_pads) {
-            //     abstract_pad->EnableAppletToGetInput(aruid);
-            // }
-            // Requires AbstractedPad array to be stored in NPad.
+            for abstracted_pad in &mut self.abstracted_pads {
+                abstracted_pad.enable_applet_to_get_input(aruid);
+            }
         }
         result
     }
 
     /// Port of NPad::EnableAppletToGetInput.
-    /// Upstream iterates abstracted_pads and calls EnableAppletToGetInput(aruid).
-    /// Requires AbstractedPad array to be stored in NPad, which is not yet wired up.
-    pub fn enable_applet_to_get_input(&mut self, _aruid: u64) {}
+    pub fn enable_applet_to_get_input(&mut self, aruid: u64) {
+        for abstracted_pad in &mut self.abstracted_pads {
+            abstracted_pad.enable_applet_to_get_input(aruid);
+        }
+    }
 
     /// Port of NPad::GetAppletDetailedUiType.
     pub fn get_applet_detailed_ui_type(&self, npad_id: NpadIdType) -> AppletDetailedUiType {
@@ -2013,5 +2049,16 @@ mod tests {
                 .raw
                 != 0
         );
+    }
+
+    #[test]
+    fn abstracted_pads_are_owned_and_indexed_like_upstream() {
+        let npad = NPad::new();
+        for (index, pad) in npad.abstracted_pads.iter().enumerate() {
+            assert_eq!(
+                pad.get_last_active_npad(),
+                crate::hid_util::index_to_npad_id_type(index)
+            );
+        }
     }
 }

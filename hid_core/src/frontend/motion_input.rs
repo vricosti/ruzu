@@ -83,6 +83,7 @@ impl Quaternion {
     }
 }
 
+#[derive(Debug, Clone)]
 pub struct MotionInput {
     // PID constants
     kp: f32,

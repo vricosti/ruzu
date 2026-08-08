@@ -230,6 +230,7 @@ pub fn boot_game(
     shown_state: Arc<AtomicBool>,
     framebuffer_layout: Arc<RwLock<FramebufferLayout>>,
     hid_core: Arc<parking_lot::Mutex<hid_core::hid_core::HIDCore>>,
+    controller_applet: Option<Arc<dyn ruzu_core::frontend::applets::controller::ControllerApplet>>,
     tas: Option<Arc<parking_lot::Mutex<input_common::drivers::tas_input::Tas>>>,
     filepath: String,
     parameters: BootParameters,
@@ -258,6 +259,7 @@ pub fn boot_game(
                 shown_state,
                 framebuffer_layout,
                 hid_core,
+                controller_applet,
                 tas,
                 filepath,
                 parameters,
@@ -297,6 +299,7 @@ fn run_boot(
     shown_state: Arc<AtomicBool>,
     framebuffer_layout: Arc<RwLock<FramebufferLayout>>,
     hid_core: Arc<parking_lot::Mutex<hid_core::hid_core::HIDCore>>,
+    controller_applet: Option<Arc<dyn ruzu_core::frontend::applets::controller::ControllerApplet>>,
     tas: Option<Arc<parking_lot::Mutex<input_common::drivers::tas_input::Tas>>>,
     filepath: String,
     parameters: BootParameters,
@@ -328,6 +331,15 @@ fn run_boot(
     let mut system = System::new_with_hid_core(hid_core);
     let _ = exit_locked_tx.send(system.exit_locked_state());
     system.initialize();
+    if let Some(controller) = controller_applet {
+        log::info!("Installing GUI controller selector frontend");
+        system.set_frontend_applet_set(
+            ruzu_core::hle::service::am::frontend::applets::FrontendAppletSet {
+                controller: Some(controller),
+                software_keyboard: None,
+            },
+        );
+    }
     system
         .frontend_applet_holder_mut()
         .set_current_applet_id(parameters.applet.applet_id);

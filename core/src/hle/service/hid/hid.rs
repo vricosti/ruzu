@@ -3,6 +3,7 @@
 //! Entry point for the HID service module.
 
 use std::any::Any;
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -15,6 +16,7 @@ use hid_core::resources::shared_memory_holder::KSharedMemoryBacking;
 use crate::core_timing;
 use crate::hle::kernel::k_shared_memory::{KSharedMemory, MemoryPermission};
 use crate::hle::service::hle_ipc::{SessionRequestHandlerFactory, SessionRequestHandlerPtr};
+use crate::hle::service::os::event::Event;
 use crate::hle::service::server_manager::ServerManager;
 
 /// Implementation of `hid_core::KSharedMemoryBacking` that allocates real
@@ -210,6 +212,9 @@ pub fn loop_process(system: crate::core::SystemRef) {
     ];
 
     let server_manager = ServerManager::new_shared(system);
+    let npad_style_set_events = Arc::new(parking_lot::Mutex::new(
+        BTreeMap::<(u64, u32), Arc<Event>>::new(),
+    ));
 
     {
         let mut server_manager = server_manager.lock().unwrap();
@@ -218,6 +223,7 @@ pub fn loop_process(system: crate::core::SystemRef) {
         {
             let rm = resource_manager.clone();
             let fw = firmware_settings.clone();
+            let style_set_events = Arc::clone(&npad_style_set_events);
             let system_ref = system;
             let factory: SessionRequestHandlerFactory =
                 Box::new(move || -> SessionRequestHandlerPtr {
@@ -225,6 +231,7 @@ pub fn loop_process(system: crate::core::SystemRef) {
                         system_ref,
                         rm.clone(),
                         fw.clone(),
+                        Arc::clone(&style_set_events),
                     ))
                 });
             server_manager.register_named_service("hid", factory, 64);
@@ -269,8 +276,11 @@ pub fn loop_process(system: crate::core::SystemRef) {
 
         // "irs" -> IRS
         {
+            let system = system.clone();
             let factory: SessionRequestHandlerFactory =
-                Box::new(move || -> SessionRequestHandlerPtr { Arc::new(super::irs::Irs::new()) });
+                Box::new(move || -> SessionRequestHandlerPtr {
+                    Arc::new(super::irs::Irs::new(system.clone()))
+                });
             server_manager.register_named_service("irs", factory, 64);
         }
 

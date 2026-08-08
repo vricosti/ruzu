@@ -181,6 +181,7 @@ impl ILibraryAppletCreator {
             applet_guard.caller_applet_broker = Some(Arc::clone(&broker));
             applet_guard.frontend = self.system.get().frontend_applet_holder().get_applet(
                 self.system,
+                Arc::downgrade(&applet),
                 Arc::clone(&broker),
                 applet_id,
                 mode,

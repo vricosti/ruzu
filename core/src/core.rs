@@ -22,7 +22,7 @@ use crate::hle::service::am::am_types::{AppletId, AppletType};
 use crate::hle::service::am::applet_manager::{
     AppletManager, FrontendAppletParameters, LaunchType,
 };
-use crate::hle::service::am::frontend::applets::FrontendAppletHolder;
+use crate::hle::service::am::frontend::applets::{FrontendAppletHolder, FrontendAppletSet};
 use crate::hle::service::am::process_creation::build_application_launch_property;
 use crate::hle::service::apm::apm_controller::Controller as ApmController;
 use crate::hle::service::glue::glue_manager::{ARPManager, ApplicationLaunchProperty};
@@ -1177,6 +1177,11 @@ impl System {
         &mut self.frontend_applet_holder
     }
 
+    /// Upstream: `System::SetFrontendAppletSet` in `core.cpp`.
+    pub fn set_frontend_applet_set(&mut self, set: FrontendAppletSet) {
+        self.frontend_applet_holder.set_frontend_applet_set(set);
+    }
+
     /// Initializes the system.
     /// This function will initialize core functionality used for system emulation.
     ///
@@ -1264,6 +1269,10 @@ impl System {
         // Upstream: KernelCore holds System& from construction.
         // Set it here since Rust can't pass &self during construction.
         let system_ref = SystemRef::from_ref(self);
+        let device_memory = self
+            .device_memory
+            .as_deref()
+            .expect("device memory must be created in initialize()");
 
         let kernel = self
             .kernel
@@ -1352,6 +1361,15 @@ impl System {
             // slab, so the capacity is conservative — 256 page-sized
             // entries is far above the dormant usage.
             kernel.initialize_page_table_manager(256);
+
+            // Upstream `KernelCore::Impl::InitializeHackSharedMemory` runs
+            // after the physical memory manager is ready. Initialize the IRS
+            // object here so every `irs` session returns the same backing.
+            let result = kernel.initialize_irs_shared_memory(device_memory);
+            assert!(
+                result.is_success(),
+                "failed to initialize IRS shared memory"
+            );
         }
 
         // Provide CoreTiming to the kernel so guest thread functions can access it.

@@ -149,6 +149,9 @@ pub struct GMainWindow {
     ///
     /// Upstream owner: `Core::System::Impl::hid_core`.
     hid_core: Arc<parking_lot::Mutex<hid_core::hid_core::HIDCore>>,
+    /// GUI controller applet installed for each boot unless explicitly disabled.
+    /// Upstream owner: `GMainWindow` through `QtControllerSelector`.
+    controller_applet: Arc<crate::applets::controller::GtkControllerSelector>,
 }
 
 /// Handles needed to resize the embedded render surface on window resize.
@@ -619,6 +622,17 @@ impl GMainWindow {
             });
         }
 
+        let hid_core = Arc::new(parking_lot::Mutex::new(hid_core::hid_core::HIDCore::new()));
+        let input_subsystem = Rc::new(RefCell::new(input_common::InputSubsystem::new()));
+        let (controller_applet, controller_applet_requests) =
+            crate::applets::controller::GtkControllerSelector::new();
+        let controller_applet_frontend = crate::applets::controller::ControllerAppletFrontend::new(
+            &window,
+            Arc::clone(&hid_core),
+            Rc::clone(&input_subsystem),
+            controller_applet_requests,
+        );
+
         let this = Rc::new(Self {
             window,
             menu_bar,
@@ -636,9 +650,12 @@ impl GMainWindow {
             render_size: Cell::new((0, 0)),
             configure_dialog: RefCell::new(None),
             game_list: RefCell::new(None),
-            input_subsystem: Rc::new(RefCell::new(input_common::InputSubsystem::new())),
-            hid_core: Arc::new(parking_lot::Mutex::new(hid_core::hid_core::HIDCore::new())),
+            input_subsystem,
+            hid_core,
+            controller_applet,
         });
+
+        controller_applet_frontend.start();
 
         // Upstream calls `input_subsystem->Initialize()` from the
         // `GRenderWindow` constructor. Do it once here, before any boot, so the
@@ -2103,6 +2120,17 @@ impl GMainWindow {
         self.boot_game_with_parameters(filepath, crate::boot::BootParameters::default());
     }
 
+    fn controller_applet_for_boot(
+        &self,
+    ) -> Option<Arc<dyn ruzu_core::frontend::applets::controller::ControllerApplet>> {
+        (!crate::uisettings::with(|values| *values.controller_applet_disabled.get_value())).then(
+            || {
+                Arc::clone(&self.controller_applet)
+                    as Arc<dyn ruzu_core::frontend::applets::controller::ControllerApplet>
+            },
+        )
+    }
+
     /// Boot `filepath` into the embedded render surface. Stand-in for upstream
     /// `GMainWindow::BootGame`: attach the Metal layer, show the loading screen,
     /// start the boot thread, and reveal the render view when loading completes.
@@ -2260,6 +2288,7 @@ impl GMainWindow {
             shown_state,
             framebuffer_layout,
             Arc::clone(&self.hid_core),
+            self.controller_applet_for_boot(),
             self.input_subsystem.borrow().get_tas(),
             filepath,
             parameters,
@@ -2433,6 +2462,7 @@ impl GMainWindow {
             shown_state,
             framebuffer_layout,
             Arc::clone(&self.hid_core),
+            self.controller_applet_for_boot(),
             self.input_subsystem.borrow().get_tas(),
             filepath,
             parameters,
@@ -2596,6 +2626,7 @@ impl GMainWindow {
             shown_state,
             framebuffer_layout,
             Arc::clone(&self.hid_core),
+            self.controller_applet_for_boot(),
             self.input_subsystem.borrow().get_tas(),
             filepath,
             parameters,

@@ -48,6 +48,8 @@ pub enum ImageTransferProcessorFormat {
     Size80x60 = 2,
     Size40x30 = 3,
     Size20x15 = 4,
+    /// Internal camera sentinel representable by C++ enum casts upstream.
+    None = 5,
 }
 
 /// This is nn::irsensor::PackedImageTransferProcessorFormat

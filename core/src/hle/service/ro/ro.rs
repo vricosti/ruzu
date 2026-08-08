@@ -16,8 +16,12 @@ use super::ro_results;
 use super::ro_types::{ModuleId, NroHeader, NrrHeader, NrrKind};
 use crate::hle::kernel::k_process::KProcess;
 use crate::hle::kernel::k_process::ProcessLock;
+use crate::hle::kernel::svc_common::PseudoHandle;
 use crate::hle::result::ResultCode;
+use crate::hle::service::cmif_serialization::CmifRequest;
+use crate::hle::service::cmif_types::ClientProcessId;
 use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
+use crate::hle::service::ipc_helpers::ResponseBuilder;
 use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
 
 // Convenience definitions — matches upstream ro.cpp.
@@ -220,8 +224,7 @@ impl ProcessContext {
                 .as_ref()
                 .ok_or(ro_results::RESULT_INVALID_PROCESS)?;
             let process = process_arc.lock().unwrap();
-            let mem = process.process_memory.read().unwrap();
-            let nro_data = mem.read_bytes(base_address, size as usize);
+            let nro_data = process.read_memory_vec(base_address, size as usize);
 
             let mut hasher = Sha256::new();
             hasher.update(&nro_data);
@@ -265,8 +268,8 @@ impl ProcessContext {
         // Read the NRO header from process memory.
         let header: NroHeader = {
             let process = process_arc.lock().unwrap();
-            let mem = process.process_memory.read().unwrap();
-            let header_bytes = mem.read_bytes(base_address, std::mem::size_of::<NroHeader>());
+            let header_bytes =
+                process.read_memory_vec(base_address, std::mem::size_of::<NroHeader>());
             assert!(header_bytes.len() >= std::mem::size_of::<NroHeader>());
             unsafe { std::ptr::read_unaligned(header_bytes.as_ptr() as *const NroHeader) }
         };
@@ -425,13 +428,18 @@ impl RoContext {
         process: Option<Arc<ProcessLock>>,
         process_id: u64,
     ) -> Result<usize, ResultCode> {
+        let process = process.ok_or(ro_results::RESULT_INVALID_PROCESS)?;
+        if process.lock().unwrap().process_id != process_id {
+            return Err(ro_results::RESULT_INVALID_PROCESS);
+        }
+
         // Check if a process context already exists.
         if self.get_context_index_by_process_id(process_id).is_some() {
             return Err(ro_results::RESULT_INVALID_SESSION);
         }
 
         // Allocate a context.
-        let context_id = self.allocate_context(process, process_id);
+        let context_id = self.allocate_context(Some(process), process_id);
         Ok(context_id)
     }
 
@@ -480,8 +488,8 @@ impl RoContext {
         // Read NRR header from process memory.
         let (num_hashes, hashes_offset) = {
             let process = process_arc.lock().unwrap();
-            let mem = process.process_memory.read().unwrap();
-            let header_bytes = mem.read_bytes(nrr_address, std::mem::size_of::<NrrHeader>());
+            let header_bytes =
+                process.read_memory_vec(nrr_address, std::mem::size_of::<NrrHeader>());
             assert!(header_bytes.len() >= std::mem::size_of::<NrrHeader>());
             let header: NrrHeader =
                 unsafe { std::ptr::read_unaligned(header_bytes.as_ptr() as *const NrrHeader) };
@@ -498,8 +506,8 @@ impl RoContext {
         let mut hashes = Vec::with_capacity(num_hashes);
         if hash_data_size > 0 {
             let process = process_arc.lock().unwrap();
-            let mem = process.process_memory.read().unwrap();
-            let hash_bytes = mem.read_bytes(nrr_address + hashes_offset as u64, hash_data_size);
+            let hash_bytes =
+                process.read_memory_vec(nrr_address + hashes_offset as u64, hash_data_size);
             for i in 0..num_hashes {
                 let offset = i * 32;
                 let mut hash = [0u8; 32];
@@ -753,7 +761,7 @@ impl RoContext {
 ///
 /// Corresponds to `RoInterface` in upstream ro.cpp.
 pub struct RoInterface {
-    pub context_id: u64,
+    context_id: Mutex<u64>,
     pub nrr_kind: NrrKind,
     /// Shared RO context. Upstream passes one `std::shared_ptr<RoContext>` to
     /// both `"ldr:ro"` and `"ro:1"` factories.
@@ -764,24 +772,237 @@ pub struct RoInterface {
 }
 
 impl RoInterface {
+    fn as_self(this: &dyn ServiceFramework) -> &Self {
+        unsafe { &*(this as *const dyn ServiceFramework as *const Self) }
+    }
+
+    fn resolve_process_from_handle(
+        ctx: &HLERequestContext,
+        process_handle: u32,
+    ) -> Option<Arc<ProcessLock>> {
+        let process = ctx.owner_process_arc()?;
+        if process_handle == PseudoHandle::CurrentProcess as u32 || process_handle == 0 {
+            return Some(process);
+        }
+
+        let (object_id, current_process_id) = {
+            let process = process.lock().unwrap();
+            (
+                process.handle_table.get_object(process_handle)?,
+                process.get_process_id(),
+            )
+        };
+        if object_id == current_process_id {
+            return Some(process);
+        }
+
+        ctx.get_system()?
+            .get()
+            .kernel()?
+            .get_process_by_id(object_id)
+    }
+
+    fn skip_client_process_id(request: &mut CmifRequest<'_>) {
+        request.align_for::<ClientProcessId>();
+        let _ = request.raw::<ClientProcessId>();
+    }
+
+    fn map_manual_load_module_memory(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let service = Self::as_self(this);
+        let process_id = ctx.get_pid();
+        let mut request = CmifRequest::new(ctx);
+        Self::skip_client_process_id(&mut request);
+        request.align_for::<u64>();
+        let nro_address = request.u64();
+        let nro_size = request.u64();
+        let bss_address = request.u64();
+        let bss_size = request.u64();
+        let context_id = *service.context_id.lock().unwrap() as usize;
+        let result = (|| {
+            let mut ro = service.ro.lock().unwrap();
+            ro.validate_process(context_id, process_id)?;
+            ro.map_manual_load_module_memory(
+                context_id,
+                nro_address,
+                nro_size,
+                bss_address,
+                bss_size,
+            )
+        })();
+        let mut rb = ResponseBuilder::new(ctx, 4, 0, 0);
+        match result {
+            Ok(load_address) => {
+                rb.push_result(crate::hle::result::RESULT_SUCCESS);
+                rb.push_u64(load_address);
+            }
+            Err(result) => rb.push_result(result),
+        }
+    }
+
+    fn unmap_manual_load_module_memory(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let service = Self::as_self(this);
+        let process_id = ctx.get_pid();
+        let mut request = CmifRequest::new(ctx);
+        Self::skip_client_process_id(&mut request);
+        request.align_for::<u64>();
+        let nro_address = request.u64();
+        let context_id = *service.context_id.lock().unwrap() as usize;
+        let result = (|| {
+            let mut ro = service.ro.lock().unwrap();
+            ro.validate_process(context_id, process_id)?;
+            ro.unmap_manual_load_module_memory(context_id, nro_address)
+        })();
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(match result {
+            Ok(()) => crate::hle::result::RESULT_SUCCESS,
+            Err(result) => result,
+        });
+    }
+
+    fn register_module_info(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let service = Self::as_self(this);
+        let process_id = ctx.get_pid();
+        let mut request = CmifRequest::new(ctx);
+        Self::skip_client_process_id(&mut request);
+        request.align_for::<u64>();
+        let nrr_address = request.u64();
+        let nrr_size = request.u64();
+        let context_id = *service.context_id.lock().unwrap() as usize;
+        let result = (|| {
+            let mut ro = service.ro.lock().unwrap();
+            ro.validate_process(context_id, process_id)?;
+            ro.register_module_info(context_id, nrr_address, nrr_size, NrrKind::User, true)
+        })();
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(match result {
+            Ok(()) => crate::hle::result::RESULT_SUCCESS,
+            Err(result) => result,
+        });
+    }
+
+    fn unregister_module_info(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let service = Self::as_self(this);
+        let process_id = ctx.get_pid();
+        let mut request = CmifRequest::new(ctx);
+        Self::skip_client_process_id(&mut request);
+        request.align_for::<u64>();
+        let nrr_address = request.u64();
+        let context_id = *service.context_id.lock().unwrap() as usize;
+        let result = (|| {
+            let mut ro = service.ro.lock().unwrap();
+            ro.validate_process(context_id, process_id)?;
+            ro.unregister_module_info(context_id, nrr_address)
+        })();
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(match result {
+            Ok(()) => crate::hle::result::RESULT_SUCCESS,
+            Err(result) => result,
+        });
+    }
+
+    fn register_process_handle(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let service = Self::as_self(this);
+        let process_id = ctx.get_pid();
+        let mut request = CmifRequest::new(ctx);
+        Self::skip_client_process_id(&mut request);
+        drop(request);
+        let process_handle = ctx.get_copy_handle(0);
+        let process = Self::resolve_process_from_handle(ctx, process_handle);
+        let result = service
+            .ro
+            .lock()
+            .unwrap()
+            .register_process(process, process_id);
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        match result {
+            Ok(context_id) => {
+                *service.context_id.lock().unwrap() = context_id as u64;
+                rb.push_result(crate::hle::result::RESULT_SUCCESS);
+            }
+            Err(result) => rb.push_result(result),
+        }
+    }
+
+    fn register_process_module_info(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let service = Self::as_self(this);
+        let process_id = ctx.get_pid();
+        let mut request = CmifRequest::new(ctx);
+        Self::skip_client_process_id(&mut request);
+        request.align_for::<u64>();
+        let nrr_address = request.u64();
+        let nrr_size = request.u64();
+        drop(request);
+        let _process_handle = ctx.get_copy_handle(0);
+        let context_id = *service.context_id.lock().unwrap() as usize;
+        let result = (|| {
+            let mut ro = service.ro.lock().unwrap();
+            ro.validate_process(context_id, process_id)?;
+            ro.register_module_info(
+                context_id,
+                nrr_address,
+                nrr_size,
+                service.nrr_kind,
+                service.nrr_kind == NrrKind::JitPlugin,
+            )
+        })();
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(match result {
+            Ok(()) => crate::hle::result::RESULT_SUCCESS,
+            Err(result) => result,
+        });
+    }
+
     pub fn new(name: &str, ro: Arc<Mutex<RoContext>>, nrr_kind: NrrKind) -> Self {
         let handlers = build_handler_map(&[
-            (0, None, "MapManualLoadModuleMemory"),
-            (1, None, "UnmapManualLoadModuleMemory"),
-            (2, None, "RegisterModuleInfo"),
-            (3, None, "UnregisterModuleInfo"),
-            (4, None, "RegisterProcessHandle"),
-            (10, None, "RegisterProcessModuleInfo"),
+            (
+                0,
+                Some(Self::map_manual_load_module_memory),
+                "MapManualLoadModuleMemory",
+            ),
+            (
+                1,
+                Some(Self::unmap_manual_load_module_memory),
+                "UnmapManualLoadModuleMemory",
+            ),
+            (2, Some(Self::register_module_info), "RegisterModuleInfo"),
+            (
+                3,
+                Some(Self::unregister_module_info),
+                "UnregisterModuleInfo",
+            ),
+            (
+                4,
+                Some(Self::register_process_handle),
+                "RegisterProcessHandle",
+            ),
+            (
+                10,
+                Some(Self::register_process_module_info),
+                "RegisterProcessModuleInfo",
+            ),
         ]);
 
         Self {
-            context_id: INVALID_CONTEXT_ID,
+            context_id: Mutex::new(INVALID_CONTEXT_ID),
             nrr_kind,
             ro,
             name: name.to_string(),
             handlers,
             handlers_tipc: BTreeMap::new(),
         }
+    }
+}
+
+impl Drop for RoInterface {
+    fn drop(&mut self) {
+        let context_id = *self
+            .context_id
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) as usize;
+        self.ro
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .unregister_process(context_id);
     }
 }
 
@@ -846,4 +1067,135 @@ pub fn loop_process(system: crate::core::SystemRef) {
     }
 
     ServerManager::run_server_shared(server_manager);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::{System, SystemRef};
+    use crate::hle::ipc;
+    use crate::hle::kernel::k_thread::{KThread, KThreadLock};
+    use crate::hle::kernel::kernel::ScopedKernelForTest;
+
+    #[test]
+    fn ro_interface_registers_every_upstream_command() {
+        let ro = Arc::new(Mutex::new(RoContext::new()));
+        let service = RoInterface::new("ldr:ro", ro, NrrKind::User);
+
+        for command in [0, 1, 2, 3, 4, 10] {
+            assert!(service.handlers[&command].handler_callback.is_some());
+        }
+    }
+
+    #[test]
+    fn register_process_validates_pid_and_rejects_duplicate_context() {
+        let process = Arc::new(ProcessLock::from_value(KProcess::new()));
+        process.lock().unwrap().process_id = 81;
+        let mut ro = RoContext::new();
+
+        assert_eq!(
+            ro.register_process(Some(Arc::clone(&process)), 82),
+            Err(ro_results::RESULT_INVALID_PROCESS)
+        );
+        let context_id = ro.register_process(Some(Arc::clone(&process)), 81).unwrap();
+        assert_eq!(
+            ro.register_process(Some(process), 81),
+            Err(ro_results::RESULT_INVALID_SESSION)
+        );
+        ro.unregister_process(context_id);
+    }
+
+    #[test]
+    fn register_process_uses_the_out_of_band_client_process_id() {
+        let process = Arc::new(ProcessLock::from_value(KProcess::new()));
+        process.lock().unwrap().process_id = 0x51;
+        let thread = Arc::new(KThreadLock::new(KThread::new()));
+        thread.lock().unwrap().parent = Some(Arc::downgrade(&process));
+
+        let mut ctx = HLERequestContext::new_with_thread(thread, 0x2000);
+        ctx.populate_from_incoming_command_buffer(&[
+            ipc::CommandType::Request as u32,
+            1u32 << 31,
+            1 | (1 << 1),
+            0,
+            0,
+            PseudoHandle::CurrentProcess as u32,
+        ]);
+
+        let ro = Arc::new(Mutex::new(RoContext::new()));
+        let service = RoInterface::new("ldr:ro", Arc::clone(&ro), NrrKind::User);
+        RoInterface::register_process_handle(&service, &mut ctx);
+
+        let context_id = *service.context_id.lock().unwrap() as usize;
+        assert_ne!(context_id as u64, INVALID_CONTEXT_ID);
+        assert_eq!(
+            ro.lock().unwrap().validate_process(context_id, 0x51),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn explicit_process_handle_resolves_the_handle_target() {
+        let mut system = System::new_for_test();
+        let current = Arc::new(ProcessLock::from_value(KProcess::new()));
+        let target = Arc::new(ProcessLock::from_value(KProcess::new()));
+        {
+            let mut current = current.lock().unwrap();
+            current.process_id = 0x51;
+            current.initialize_handle_table();
+        }
+        target.lock().unwrap().process_id = 0x52;
+
+        let target_handle = current.lock().unwrap().handle_table.add(0x52).unwrap();
+        system.set_current_process_arc(Arc::clone(&current));
+        system
+            .kernel()
+            .unwrap()
+            .register_process(Arc::clone(&target));
+
+        let mut scoped_kernel = ScopedKernelForTest::new();
+        scoped_kernel
+            .kernel_mut()
+            .set_system_ref(SystemRef::from_ref(&system));
+
+        let thread = Arc::new(KThreadLock::new(KThread::new()));
+        thread.lock().unwrap().parent = Some(Arc::downgrade(&current));
+        let ctx = HLERequestContext::new_with_thread(thread, 0x2000);
+
+        let resolved = RoInterface::resolve_process_from_handle(&ctx, target_handle).unwrap();
+        assert!(Arc::ptr_eq(&resolved, &target));
+    }
+
+    #[test]
+    fn dropping_interface_recovers_a_poisoned_ro_context() {
+        let ro = Arc::new(Mutex::new(RoContext::new()));
+        let poisoned = Arc::clone(&ro);
+        assert!(std::thread::spawn(move || {
+            let _guard = poisoned.lock().unwrap();
+            panic!("poison RO context for Drop regression test");
+        })
+        .join()
+        .is_err());
+
+        let service = RoInterface::new("ldr:ro", ro, NrrKind::User);
+        drop(service);
+    }
+
+    #[test]
+    fn ro_request_reserves_raw_space_for_the_out_of_band_process_id() {
+        let mut ctx = HLERequestContext::new();
+        ctx.cmd_buf[2] = 0;
+        ctx.cmd_buf[3] = 0;
+        ctx.cmd_buf[4] = 0x0d15_4000;
+        ctx.cmd_buf[5] = 0x0000_0021;
+        ctx.cmd_buf[6] = 0x0000_0080;
+        ctx.cmd_buf[7] = 0;
+
+        let mut request = CmifRequest::new(&mut ctx);
+        RoInterface::skip_client_process_id(&mut request);
+        request.align_for::<u64>();
+
+        assert_eq!(request.u64(), 0x0000_0021_0d15_4000);
+        assert_eq!(request.u64(), 0x80);
+    }
 }

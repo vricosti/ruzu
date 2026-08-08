@@ -26124,8 +26124,9 @@ Rust files: `externals/rdynarmic/src/frontend/a32/{decoder.rs, decoder_thumb32.r
   `unique_ptr`.
 
 ### Missing items
-- Motion, battery, colour, camera, NFC and ring devices; the TAS and virtual
-  device variants; `SetPollingMode`; the turbo timer.
+- TAS button/stick devices and the Android-specific output parameter/device
+  remain outside this slice. Motion, battery, colour, camera, NFC, ring,
+  virtual-gamepad devices, polling and the turbo timer are now ported.
 
 ### Binary layout verification
 - PASS: `NpadButtonState`, `DebugPadButton`, `AnalogStickState` and
@@ -26149,8 +26150,9 @@ Rust files: `externals/rdynarmic/src/frontend/a32/{decoder.rs, decoder_thumb32.r
   order.
 
 ### Missing items
-- `TransformToMotion`, `TransformToBattery`, `TransformToAnalog`,
-  `TransformToCamera`, `TransformToNfc` and `TransformToColor`.
+- `TransformToBattery`, `TransformToAnalog` and `TransformToColor` remain
+  incomplete. `TransformToMotion`, `TransformToCamera` and `TransformToNfc`
+  now match upstream.
 
 ### Binary layout verification
 - N/A: pure conversion functions.
@@ -33716,3 +33718,186 @@ Rust files: `externals/rdynarmic/src/frontend/a32/{decoder.rs, decoder_thumb32.r
 
 ### Binary layout verification
 - PASS: the request is parsed as the upstream `{ bool, 7-byte padding, u64 }` structure; compile-time and runtime checks verify size `0x10` and ARUID offset `0x8`.
+
+## 2026-08-08 — hid_core/src/frontend/emulated_controller.rs vs hid_core/frontend/emulated_controller.{h,cpp}
+
+### Intentional differences
+- Polling state is stored in the existing shared `ControllerStatus` mutex rather than upstream's controller-wide mutex. Input callbacks already share this status across driver threads; the left/right values and mutation ordering are unchanged.
+- Motion, camera, ring and NFC callback state uses that same shared mutex because Rust driver callbacks cannot capture a mutable controller borrow. The state fields, update order and callback visibility match upstream.
+- Status getters clone owned vectors and `MotionInput` snapshots instead of returning C++ references or relying on implicit C++ copies.
+- The button-to-motion converter uses `fastrand` for the same independent uniform `[-5000, 5000]` samples produced by upstream's `random_device`/`mt19937` path.
+
+### Unintentional differences (to fix)
+- Resolved: `ControllerStatus` omitted `left_polling_mode` and `right_polling_mode`, and `EmulatedController` omitted `SetPollingMode`/`GetPollingMode`. The port now dispatches to the same left, right, and virtual-NFC output devices, preserves upstream's mapped-device fallback to `Active`, and prefers a successful virtual-NFC result.
+- Resolved: `ReloadFromSettings` disconnected a controller without first restoring a non-active right polling mode to `Active`.
+- Resolved: `AddNfcHandle` and `RemoveNfcHandle` changed only the counter; they now enter NFC polling and restore active polling at the same counter transitions as upstream.
+- Resolved: `HasNfc`, `SetCameraFormat`, NFC start/stop/read/write operations, ring parameter/output state, and the camera/ring/NFC callbacks were absent. They now use the same physical-device-first and virtual-device fallback rules as upstream.
+- Resolved: motion parameters did not create devices or callbacks, calibration and drift modes were stubs, and `StatusUpdate` ignored `force_update`. Physical and virtual motion devices now feed `MotionInput`, update the complete guest-facing motion state, and follow upstream calibration/refresh behavior.
+- Resolved: `LoadVirtualGamepadParams` and the virtual button/stick/motion callback set were absent. The helper and all three device groups now preserve upstream ownership and parameter placement.
+
+### Binary layout verification
+- PASS: these are host-side controller states and do not alter guest shared-memory structures. `cargo test -p hid_core` passes all 47 tests, including camera fallback, NFC device priority, specialized callback propagation, forced motion refresh, mapped/virtual NFC polling, style-event ownership, and abstract-pad indexing regressions.
+
+## 2026-08-08 — hid_core/src/irsensor/irs_types.rs and processor_base.rs vs hid_core/irsensor/irs_types.h and processor_base.cpp
+
+### Intentional differences
+- Rust declares an explicit `ImageTransferProcessorFormat::None = 5` variant so the value produced by upstream's `CameraFormat` enum cast remains representable without constructing an invalid Rust enum discriminant.
+
+### Unintentional differences (fixed)
+- The initial camera conversion collapsed `CameraFormat::None` to `Size320x240`. The sentinel now retains its upstream numeric value, and processor size/width/height helpers return zero through the same C++ `default` behavior.
+
+### Binary layout verification
+- PASS: all existing IRS format discriminants remain 0 through 4; the internal sentinel uses the upstream camera discriminant 5, and the regression test verifies its zero size/width/height behavior.
+
+## 2026-08-08 — core/src/hle/kernel/svc_dispatch.rs vs core/hle/kernel/{svc.cpp,svc/svc_event.cpp}
+
+### Intentional differences
+- Rust keeps the AArch32/AArch64 ABI switch arms in the manually maintained dispatcher; upstream generates `SvcWrap_*64` and `SvcWrap_*64From32` functions in `svc.cpp`.
+
+### Unintentional differences (to fix)
+- Resolved: the AArch64 `SignalEvent`, `ClearEvent`, and `CreateEvent` SVCs fell through to stub success even though their method-owner implementations already existed. They now use the same register mapping as upstream: handle in `x0`, result in `x0`, and created write/read handles in `x1`/`x2`.
+
+### Missing items
+- Other AArch64 SVCs that still reach the dispatcher's explicit stub fallback require separate parity audits.
+- `CreateEvent` does not yet reserve `LimitableResource::EventCountMax`. Porting the reservation requires the matching `KEvent::PostDestroy` lifecycle first: process object maps currently retain events after their last handle is removed, so committing a reservation now would leak the quota until process teardown.
+
+### Binary layout verification
+- PASS: no kernel object layout changed; the regression test creates, signals, and clears one event through `call64` and verifies the readable event state after each dispatched SVC.
+
+## 2026-08-08 — core/src/{core.rs,hle/kernel/kernel.rs} vs core/hle/kernel/kernel.{h,cpp}
+
+### Intentional differences
+- Rust stores the IRS shared-memory object together with its object-registry id because process handles refer to numeric object ids rather than intrusive `KAutoObject` pointers.
+- Initialization is invoked from `System::initialize_kernel` after the physical pools are ready; this is the Rust counterpart of upstream `InitializeHackSharedMemory` ordering.
+
+### Unintentional differences (to fix)
+- Resolved: `KernelCore` did not own the persistent 0x8000-byte IRS shared memory returned by the IRS service.
+- Resolved: repeated IRS shared-memory initialization replaced the kernel-owned object without finalizing its allocation. Repeated calls now preserve the first object and return success.
+
+### Missing items
+- The font, time, and HIDBus objects initialized by the same upstream helper remain separate parity slices.
+
+### Binary layout verification
+- PASS: the regression test verifies a persistent 0x8000-byte `KSharedMemory` object with owner permission `None` and user permission `Read`.
+
+## 2026-08-08 — core/src/hle/service/hid/irs.rs vs core/hle/service/hid/irs.{h,cpp}
+
+### Intentional differences
+- Rust validates the raw NPad id before constructing the enum, avoiding undefined behavior while returning upstream `ResultInvalidNpadId` for the same invalid values.
+- Registering the shared-memory object in the caller process is explicit because Rust's IPC response builder accepts object ids rather than typed `OutCopyHandle<KSharedMemory>` values.
+
+### Unintentional differences (to fix)
+- Resolved: command 304 returned success without the kernel IRS shared-memory copy handle.
+- Resolved: command 311 returned success without its four-byte `IrCameraHandle`, preventing software from progressing after controller selection.
+
+### Missing items
+- IRS image-processor commands outside 304 and 311 remain existing stubs and require separate processor-owned parity passes.
+
+### Binary layout verification
+- PASS: `IrCameraHandle` is four bytes and its explicit zeroed padding is covered by a byte-level regression test.
+
+## 2026-08-08 — core/src/hle/service/hid/{hid.rs,hid_server.rs} vs core/hle/service/hid/{hid.cpp,hid_server.cpp}
+
+### Intentional differences
+- The kernel `Event` map is shared by all `IHidServer` sessions in `hid.rs`, while `NPadResource` retains an opaque callback; this preserves upstream service-wide event identity without making `hid_core` depend on `core`.
+
+### Unintentional differences (to fix)
+- Resolved: each HID session previously owned an isolated style-set event map, so controller changes could not reliably signal the handle returned by another session.
+- Resolved: command 106 now registers the exact per-ARUID/per-controller signaling endpoint in `NPadResource` and propagates acquisition errors before returning a copy handle.
+
+### Binary layout verification
+- PASS: command 106 retains the upstream result-plus-copy-handle response and changes no guest structure layout.
+
+## 2026-08-08 — hid_core/src/resources/npad/npad_resource.rs vs hid_core/resources/npad/npad_resource.{h,cpp}
+
+### Intentional differences
+- `NpadControllerState` stores an `Arc<dyn Fn()>` instead of `KEvent*`; the callback is dropped with `NpadState`, matching upstream `FreeAppletResourceId` event cleanup ownership.
+
+### Unintentional differences (to fix)
+- Resolved: style-set update events were absent from the per-ARUID/per-controller `NpadState` and could not be signaled by controller callbacks.
+
+### Binary layout verification
+- PASS: this is host-only resource state; the focused test verifies controller isolation, immediate acquisition signaling, repeated signaling, and cleanup on ARUID unregister.
+
+## 2026-08-08 — hid_core/src/resources/npad/npad.rs vs hid_core/resources/npad/npad.{h,cpp}
+
+### Intentional differences
+- Driver callbacks are coalesced until `on_update` because the Rust input engine dispatches outside its lock; a disconnect-plus-connect pair is replayed in upstream order before the final connected state is initialized.
+
+### Unintentional differences (to fix)
+- Resolved: connect and disconnect transitions did not signal their per-controller style-set event.
+- Resolved: controller initialization omitted `Connect`, LED setup, active polling mode, the post-signal empty LIFO entry, last-active-controller update, and `AbstractPad::Update`.
+- Resolved: `NPad` did not own the upstream ten-element `abstracted_pads` array, leaving `EnableAppletToGetInput` and successful system-extension enablement as no-ops.
+
+### Missing items
+- The pre-existing Rust `AbstractPad` subsystem still lacks upstream `SetExternals` wiring and contains incomplete handler implementations; the restored ownership and calls therefore do not complete that separate subsystem.
+
+### Binary layout verification
+- PASS: the NPad shared-memory structure is unchanged; controller initialization writes the existing LIFOs, and the regression test verifies all ten abstract pads use upstream NPad-id ordering.
+
+## 2026-08-08 — core/src/hle/service/ro/ro.rs vs core/hle/service/ro/ro.cpp
+
+### Intentional differences
+- The session context id is protected by a mutex because Rust service handlers receive shared references; upstream serializes mutation through its service object.
+- Guest reads use `KProcess::read_memory_vec`, which is the target's current process-memory abstraction for the upstream `KProcess::GetMemory` access.
+- Each handler snapshots the mutex-protected context id before entering `RoContext`; upstream stores a plain `size_t` and relies on the same register-once, session-serialized service contract. No handler mutates the id after successful registration.
+
+### Unintentional differences (to fix)
+- Resolved: all six `RoInterface` command-table entries were disconnected from the already ported `RoContext` implementation.
+- Resolved: process registration now validates the supplied process and PID, stores the per-session context id, and unregisters it when the interface is dropped.
+- Resolved: the handlers used the reserved raw `ClientProcessId` slot, whose value is zero, as the caller PID. Upstream reserves its eight-byte raw layout slot but fills the argument from the `SendCurrentPid` handle descriptor; the handlers now skip the slot, use `HLERequestContext::get_pid()`, and read the following 64-bit arguments at their actual offsets.
+- Resolved: explicit process handles were only checked for existence and then replaced with the calling process. The service now resolves the handle's object id through the kernel process list and passes the designated `KProcess`, matching upstream `InCopyHandle<KProcess>::Get()`.
+- Resolved: `RoInterface::drop` could panic on a poisoned `RoContext` mutex and abort during unwinding. Destruction now recovers both mutex guards so unregistering a session remains non-throwing like the upstream destructor.
+
+### Binary layout verification
+- PASS: the raw request retains the eight-byte `ClientProcessId` reservation before the upstream-ordered 64-bit arguments. Focused tests verify its offsets, current and explicit target process handles, PID validation, and non-panicking destruction after mutex poisoning; the runtime check registers the NRR, loads all requested NROs, and reaches frame presentation.
+
+## 2026-08-08 — core/src/hle/service/am/frontend/applets.rs and core/src/core.rs vs core/hle/service/am/frontend/applets.{h,cpp} and core/core.cpp
+
+### Intentional differences
+- Rust stores frontend implementations in `Arc<dyn Applet>` values because a frontend implementation is shared with the independently running emulation thread; upstream transfers `std::unique_ptr` ownership into `FrontendAppletHolder`.
+- Defaults are installed by `FrontendAppletHolder::new` because the current Rust holder is constructed with `HIDCore`; upstream constructs an empty set and calls `SetDefaultAppletsIfMissing` after system initialization.
+
+### Unintentional differences (to fix)
+- Resolved: `FrontendAppletHolder` exposed fixed default controller and software-keyboard fields, so a graphical frontend could not replace the default auto-configuring controller applet. `FrontendAppletSet`, `get_frontend_applet_set`, `set_frontend_applet_set`, and the `System::set_frontend_applet_set` owner now follow upstream's replace-only-non-null behavior.
+
+### Missing items
+- The Rust frontend set currently contains the two frontend traits represented by this holder, controller and software keyboard. Upstream also owns cabinet, error, Mii editor, parental controls, photo viewer, profile selector, and web-browser implementations in the same set; those existing applet slices require their frontend traits before they can be added without placeholders.
+- `SetDefaultAppletsIfMissing` and `ClearAll` remain implicit in the current constructor/drop lifecycle rather than exposed as upstream-owned methods.
+
+### Binary layout verification
+- PASS: the change affects host-side trait-object ownership only. The focused regression test verifies that replacing the controller preserves an omitted software-keyboard implementation.
+
+## 2026-08-08 — ruzu/src/applets/controller.rs, ruzu/src/boot.rs, and ruzu/src/main_window.rs vs yuzu/applets/qt_controller.{h,cpp} and yuzu/main.cpp
+
+### Intentional differences
+- The GTK frontend uses an `mpsc` request queue polled on GLib's main context instead of Qt queued signals. In both implementations the HLE callback originates on the emulation thread, the modal dialog is owned by the GUI thread, and completion is returned only after controller configuration mode is disabled.
+- Controller images are rendered from ruzu's existing Cairo controller artwork instead of loading the upstream Qt raster resources. This keeps the standalone frontend independent from the zuyu source tree while preserving the same controller-type ownership and enabled/disabled presentation.
+
+### Unintentional differences (to fix)
+- Resolved: GUI boots never installed a graphical controller selector, so `DefaultControllerApplet` immediately accepted requests and the game-specific controller dialog could never appear.
+- Resolved: the GTK selector now preserves upstream's single-player automatic-accept rule, `keep_controllers_connected` ordering, compatible controller rules, sequential player propagation, unsupported-player disconnection, and callback cancellation on `Close`.
+- Resolved: the selector was a compact text-only form. Its 839-by-630 layout now follows `qt_controller.ui`: supported-controller artwork and player range, a four-by-two player grid, synchronized card/footer connection controls, dynamic controller artwork, LED patterns, explain text, optional border colors, console mode, vibration and motion controls, and the upstream Cancel/OK validation flow.
+- Resolved: the applet frontend did not receive `GMainWindow`'s input subsystem, so the existing motion/touch configuration dialog could not be opened from the controller applet. Vibration and motion now invoke their matching implemented dialogs.
+- Resolved: accepting the dialog did not apply the selected docked, vibration and motion values. Application now precedes disabling HID configuration, matching `ApplyConfiguration` followed by the main-window cleanup path.
+- Resolved: the existing upstream-derived `ControllerNavigation` helper was not owned by the applet dialog. The dialog now installs it after loading controller configuration, drains its queued GTK-main-thread actions, and preserves upstream Enter/Escape, player-count Left/Right, and focus Up/Down behavior.
+
+### Missing items
+- `ConfigureInputProfileDialog` and the Profiles/Create action remain unported; each player therefore exposes only upstream's default `Use Current Config` profile entry.
+- The upstream status-button refresh, immediate `System::ApplySettings`, and `SaveAllValues` calls after dialog completion remain separate main-window parity work.
+
+### Binary layout verification
+- PASS: controller parameters are cloned without serialization changes and no guest-visible structure layout is modified. Six focused tests cover request transfer, single-player limits, controller compatibility, sequential player propagation, preview-art mapping, and fixed-buffer explain text.
+
+## 2026-08-08 — core/src/hle/service/am/frontend/applet_controller.rs, frontend/applets.rs, and service/library_applet_creator.rs vs core/hle/service/am/frontend/applet_controller.{h,cpp}, frontend/applets.{h,cpp}, and service/library_applet_creator.cpp
+
+### Intentional differences
+- Rust shares asynchronous completion state through `Arc<ControllerCompletion>` because the callback must outlive the mutable `Controller` borrow. Upstream captures `this` while `FrontendApplet` owns the applet through a weak pointer.
+- The `executing` flag avoids recursively acquiring Rust's outer `Mutex<Applet>` when the default frontend invokes its callback inline. The accessor performs completion in that case; a callback delivered after `Execute` returns performs `Exit` itself. Both paths publish output before signaling completion, matching upstream ordering.
+
+### Unintentional differences (to fix)
+- Resolved: `Controller::execute` required `ReconfigureControllers` to invoke its callback synchronously and panicked when the GTK frontend queued the dialog on the main thread.
+- Resolved: controller applets did not receive the owning applet weak reference, so a deferred callback could not set `is_completed` or signal the state-changed event as upstream `FrontendApplet::Exit` does.
+
+### Binary layout verification
+- PASS: `ControllerSupportResultInfo` remains `0xC` bytes with deterministic zero padding. Focused tests cover both inline default completion and completion after a deferred frontend callback.

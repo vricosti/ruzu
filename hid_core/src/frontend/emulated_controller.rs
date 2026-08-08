@@ -11,18 +11,25 @@ use std::time::Instant;
 use parking_lot::Mutex;
 
 use common::input::{
-    ButtonStatus, CallbackStatus, DriverResult, InputCallback, InputDevice, OutputDevice,
-    StickStatus, TriggerStatus, VibrationAmplificationType, VibrationStatus,
+    AnalogStatus, BatteryLevel, BodyColorStatus, ButtonStatus, CallbackStatus, CameraFormat,
+    CameraStatus, DriverResult, InputCallback, InputDevice, MifareRequest, MotionStatus, NfcState,
+    NfcStatus, OutputDevice, PollingMode, StickStatus, TriggerStatus, VibrationAmplificationType,
+    VibrationStatus,
 };
 use common::param_package::ParamPackage;
 use common::settings_input::{self, ControllerType};
 use common::uuid::UUID;
 
 use crate::frontend::input_converter::{
-    transform_to_button, transform_to_stick, transform_to_trigger,
+    transform_to_button, transform_to_camera, transform_to_motion, transform_to_nfc,
+    transform_to_stick, transform_to_trigger,
 };
-use crate::frontend::motion_input::IS_AT_REST_STANDARD;
+use crate::frontend::motion_input::{
+    MotionInput, IS_AT_REST_LOOSE, IS_AT_REST_STANDARD, IS_AT_REST_TIGHT, THRESHOLD_LOOSE,
+    THRESHOLD_STANDARD, THRESHOLD_TIGHT,
+};
 use crate::hid_types::*;
+use crate::irsensor::irs_types::ImageTransferProcessorFormat;
 
 pub const MAX_EMULATED_CONTROLLERS: usize = 2;
 pub const OUTPUT_DEVICES_SIZE: usize = 5;
@@ -33,6 +40,9 @@ pub const TURBO_BUTTON_DELAY: u32 = 4;
 // Use a common UUID for TAS and Virtual Gamepad.
 const TAS_UUID: UUID = UUID::from_bytes([
     0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x7, 0xA5, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0,
+]);
+const VIRTUAL_UUID: UUID = UUID::from_bytes([
+    0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x7, 0xFF, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0,
 ]);
 
 static SIMPLE_NPAD_BUTTON_STATE: AtomicU64 = AtomicU64::new(0);
@@ -168,6 +178,13 @@ pub struct BatteryLevelState {
     pub right: NpadPowerInfo,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct CameraState {
+    pub format: ImageTransferProcessorFormat,
+    pub data: Vec<u8>,
+    pub sample: usize,
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 pub struct RingSensorForce {
     pub force: f32,
@@ -181,6 +198,12 @@ pub struct ControllerMotion {
     pub euler: Vec3f,
     pub orientation: [Vec3f; 3],
     pub is_at_rest: bool,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ControllerMotionInfo {
+    pub raw_status: MotionStatus,
+    pub emulated: MotionInput,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -268,12 +291,18 @@ fn is_controller_supported(npad: NpadStyleIndex, supported: NpadStyleTag) -> boo
 /// struct guarded by the controller's mutex. Here they live behind their own
 /// `Arc<Mutex<..>>` because the input devices call back from SDL's thread and
 /// must be able to write them without holding a borrow of the controller.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct ControllerStatus {
     // Data from input_common
     pub button_values: Vec<ButtonStatus>,
     pub stick_values: Vec<StickStatus>,
+    pub motion_values: [ControllerMotionInfo; 2],
     pub trigger_values: Vec<TriggerStatus>,
+    pub color_values: [BodyColorStatus; 2],
+    pub battery_values: [BatteryLevel; 2],
+    pub camera_values: CameraStatus,
+    pub ring_analog_value: AnalogStatus,
+    pub nfc_values: NfcStatus,
 
     // Data for HID services
     pub home_button_state: HomeButtonState,
@@ -281,7 +310,16 @@ pub struct ControllerStatus {
     pub npad_button_state: NpadButtonState,
     pub debug_pad_button_state: DebugPadButton,
     pub analog_stick_state: AnalogSticks,
+    pub motion_state: MotionState,
     pub gc_trigger_state: NpadGcTriggerState,
+    pub colors_state: ControllerColors,
+    pub battery_state: BatteryLevelState,
+    pub camera_state: CameraState,
+    pub ring_analog_state: RingSensorForce,
+    pub nfc_state: NfcStatus,
+    pub left_polling_mode: PollingMode,
+    pub right_polling_mode: PollingMode,
+    pub motion_sensitivity: f32,
 
     /// Mirrors the controller's `npad_type`, so `set_button` can apply
     /// upstream's GameCube special case without reaching back into it.
@@ -301,21 +339,136 @@ impl ControllerStatus {
                 settings_input::native_button::NUM_BUTTONS
             ],
             stick_values: vec![StickStatus::default(); settings_input::native_analog::NUM_ANALOGS],
+            motion_values: std::array::from_fn(|_| ControllerMotionInfo::default()),
             trigger_values: vec![
                 TriggerStatus::default();
                 settings_input::native_trigger::NUM_TRIGGERS
             ],
+            color_values: [BodyColorStatus::default(); 2],
+            battery_values: [BatteryLevel::default(); 2],
+            camera_values: CameraStatus::default(),
+            ring_analog_value: AnalogStatus::default(),
+            nfc_values: NfcStatus::default(),
             home_button_state: HomeButtonState::default(),
             capture_button_state: CaptureButtonState::default(),
             npad_button_state: NpadButtonState::default(),
             debug_pad_button_state: DebugPadButton::default(),
             analog_stick_state: AnalogSticks::default(),
+            motion_state: [ControllerMotion::default(); 2],
             gc_trigger_state: NpadGcTriggerState::default(),
+            colors_state: ControllerColors::default(),
+            battery_state: BatteryLevelState::default(),
+            camera_state: CameraState::default(),
+            ring_analog_state: RingSensorForce::default(),
+            nfc_state: NfcStatus::default(),
+            left_polling_mode: PollingMode::Active,
+            right_polling_mode: PollingMode::Active,
+            motion_sensitivity: IS_AT_REST_STANDARD,
             npad_type: NpadStyleIndex::None,
             is_configuring: false,
             system_buttons_enabled: true,
         }
     }
+}
+
+impl Default for ControllerStatus {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Port of `EmulatedController::SetColors`.
+fn set_colors(
+    status: &Arc<Mutex<ControllerStatus>>,
+    event_context: &Arc<ControllerEventContext>,
+    callback: &CallbackStatus,
+    index: usize,
+) {
+    if index >= 2 {
+        return;
+    }
+
+    let mut status = status.lock();
+    status.color_values[index] = callback.color_status;
+    if status.is_configuring {
+        drop(status);
+        trigger_on_change(event_context, ControllerTriggerType::Color, false);
+        return;
+    }
+    if status.color_values[index].body == 0 {
+        return;
+    }
+
+    let color = status.color_values[index];
+    status.colors_state.fullkey = NpadControllerColor {
+        body: EmulatedController::get_npad_color(color.body),
+        button: EmulatedController::get_npad_color(color.buttons),
+    };
+    if status.npad_type == NpadStyleIndex::Fullkey {
+        status.colors_state.left = NpadControllerColor {
+            body: EmulatedController::get_npad_color(color.left_grip),
+            button: EmulatedController::get_npad_color(color.buttons),
+        };
+        status.colors_state.right = NpadControllerColor {
+            body: EmulatedController::get_npad_color(color.right_grip),
+            button: EmulatedController::get_npad_color(color.buttons),
+        };
+    } else if index == EmulatedDeviceIndex::LeftIndex as usize {
+        status.colors_state.left = NpadControllerColor {
+            body: EmulatedController::get_npad_color(color.body),
+            button: EmulatedController::get_npad_color(color.buttons),
+        };
+    } else {
+        status.colors_state.right = NpadControllerColor {
+            body: EmulatedController::get_npad_color(color.body),
+            button: EmulatedController::get_npad_color(color.buttons),
+        };
+    }
+    drop(status);
+    trigger_on_change(event_context, ControllerTriggerType::Color, true);
+}
+
+/// Port of `EmulatedController::SetBattery`.
+fn set_battery(
+    status: &Arc<Mutex<ControllerStatus>>,
+    event_context: &Arc<ControllerEventContext>,
+    callback: &CallbackStatus,
+    index: usize,
+) {
+    if index >= 2 {
+        return;
+    }
+
+    let mut status = status.lock();
+    status.battery_values[index] = callback.battery_status;
+    if !status.is_configuring {
+        let (is_powered, is_charging, battery_level) = match callback.battery_status {
+            BatteryLevel::Charging => (true, true, NpadBatteryLevel::Full),
+            BatteryLevel::Medium => (false, false, NpadBatteryLevel::High),
+            BatteryLevel::Low => (false, false, NpadBatteryLevel::Low),
+            BatteryLevel::Critical => (false, false, NpadBatteryLevel::Critical),
+            BatteryLevel::Empty => (false, false, NpadBatteryLevel::Empty),
+            BatteryLevel::None | BatteryLevel::Full => (true, false, NpadBatteryLevel::Full),
+        };
+        let power_info = NpadPowerInfo {
+            is_powered,
+            is_charging,
+            _padding: [0; 6],
+            battery_level,
+        };
+        if index == EmulatedDeviceIndex::LeftIndex as usize {
+            status.battery_state.left = power_info;
+        } else {
+            status.battery_state.right = power_info;
+        }
+    }
+    let service_update = !status.is_configuring;
+    drop(status);
+    trigger_on_change(
+        event_context,
+        ControllerTriggerType::Battery,
+        service_update,
+    );
 }
 
 /// Port of EmulatedController::SetButton.
@@ -631,6 +784,135 @@ fn set_trigger(
     trigger_on_change(event_context, ControllerTriggerType::Trigger, true);
 }
 
+/// Port of `EmulatedController::SetMotion`.
+fn set_motion(
+    status: &Arc<Mutex<ControllerStatus>>,
+    event_context: &Arc<ControllerEventContext>,
+    callback: &CallbackStatus,
+    index: usize,
+) {
+    let mut status = status.lock();
+    if index >= status.motion_values.len() {
+        return;
+    }
+    let raw_status = transform_to_motion(callback);
+    let motion_sensitivity = status.motion_sensitivity;
+    let motion_value = &mut status.motion_values[index];
+    motion_value.raw_status = raw_status;
+    motion_value.emulated.set_acceleration(Vec3f {
+        x: raw_status.accel.x.value,
+        y: raw_status.accel.y.value,
+        z: raw_status.accel.z.value,
+    });
+    motion_value.emulated.set_gyroscope(Vec3f {
+        x: raw_status.gyro.x.value,
+        y: raw_status.gyro.y.value,
+        z: raw_status.gyro.z.value,
+    });
+    motion_value
+        .emulated
+        .set_user_gyro_threshold(raw_status.gyro.x.properties.threshold);
+    motion_value
+        .emulated
+        .update_rotation(raw_status.delta_timestamp);
+    motion_value
+        .emulated
+        .update_orientation(raw_status.delta_timestamp);
+
+    status.motion_state[index] = ControllerMotion {
+        accel: motion_value.emulated.get_acceleration(),
+        gyro: motion_value.emulated.get_gyroscope(),
+        rotation: motion_value.emulated.get_rotations(),
+        euler: motion_value.emulated.get_euler_angles(),
+        orientation: motion_value.emulated.get_orientation(),
+        is_at_rest: !motion_value.emulated.is_moving(motion_sensitivity),
+    };
+    let service_update = !status.is_configuring;
+    drop(status);
+    trigger_on_change(event_context, ControllerTriggerType::Motion, service_update);
+}
+
+/// Port of `EmulatedController::SetCamera`.
+fn set_camera(
+    status: &Arc<Mutex<ControllerStatus>>,
+    event_context: &Arc<ControllerEventContext>,
+    callback: &CallbackStatus,
+) {
+    let mut status = status.lock();
+    status.camera_values = transform_to_camera(callback);
+    if !status.is_configuring {
+        status.camera_state.sample += 1;
+        status.camera_state.format = camera_format_to_irs(status.camera_values.format);
+        status.camera_state.data = status.camera_values.data.clone();
+    }
+    let service_update = !status.is_configuring;
+    drop(status);
+    trigger_on_change(
+        event_context,
+        ControllerTriggerType::IrSensor,
+        service_update,
+    );
+}
+
+/// Port of `EmulatedController::SetRingAnalog`.
+fn set_ring_analog(
+    status: &Arc<Mutex<ControllerStatus>>,
+    event_context: &Arc<ControllerEventContext>,
+    callback: &CallbackStatus,
+) {
+    let mut status = status.lock();
+    let force_value = transform_to_stick(callback);
+    status.ring_analog_value = force_value.x;
+    if !status.is_configuring {
+        status.ring_analog_state.force = force_value.x.value;
+    }
+    let service_update = !status.is_configuring;
+    drop(status);
+    trigger_on_change(
+        event_context,
+        ControllerTriggerType::RingController,
+        service_update,
+    );
+}
+
+/// Port of `EmulatedController::SetNfc`.
+fn set_nfc(
+    status: &Arc<Mutex<ControllerStatus>>,
+    event_context: &Arc<ControllerEventContext>,
+    callback: &CallbackStatus,
+) {
+    let mut status = status.lock();
+    status.nfc_values = transform_to_nfc(callback);
+    if !status.is_configuring {
+        status.nfc_state = status.nfc_values.clone();
+    }
+    let service_update = !status.is_configuring;
+    drop(status);
+    trigger_on_change(event_context, ControllerTriggerType::Nfc, service_update);
+}
+
+fn camera_format_to_irs(format: CameraFormat) -> ImageTransferProcessorFormat {
+    match format {
+        CameraFormat::Size320x240 => ImageTransferProcessorFormat::Size320x240,
+        CameraFormat::Size160x120 => ImageTransferProcessorFormat::Size160x120,
+        CameraFormat::Size80x60 => ImageTransferProcessorFormat::Size80x60,
+        CameraFormat::Size40x30 => ImageTransferProcessorFormat::Size40x30,
+        CameraFormat::Size20x15 => ImageTransferProcessorFormat::Size20x15,
+        CameraFormat::None => ImageTransferProcessorFormat::None,
+    }
+}
+
+fn irs_format_to_camera(format: ImageTransferProcessorFormat) -> CameraFormat {
+    match format {
+        ImageTransferProcessorFormat::Size320x240 => CameraFormat::Size320x240,
+        ImageTransferProcessorFormat::Size160x120 => CameraFormat::Size160x120,
+        ImageTransferProcessorFormat::Size80x60 => CameraFormat::Size80x60,
+        ImageTransferProcessorFormat::Size40x30 => CameraFormat::Size40x30,
+        ImageTransferProcessorFormat::Size20x15 => CameraFormat::Size20x15,
+        ImageTransferProcessorFormat::None => CameraFormat::None,
+    }
+}
+
 pub struct EmulatedController {
     npad_id_type: NpadIdType,
     npad_type: NpadStyleIndex,
@@ -638,7 +920,6 @@ pub struct EmulatedController {
     is_configuring: bool,
     is_initialized: bool,
     system_buttons_enabled: bool,
-    motion_sensitivity: f32,
     turbo_button_state: u32,
     nfc_handles: usize,
     last_vibration_value: [VibrationValue; 2],
@@ -659,25 +940,35 @@ pub struct EmulatedController {
     stick_params: Vec<ParamPackage>,
     motion_params: Vec<ParamPackage>,
     trigger_params: Vec<ParamPackage>,
-    ring_params: [ParamPackage; 1],
+    battery_params: [ParamPackage; 2],
+    color_params: [ParamPackage; 2],
+    camera_params: [ParamPackage; 2],
+    ring_params: [ParamPackage; 2],
+    nfc_params: [ParamPackage; 2],
     output_params: Vec<ParamPackage>,
+    virtual_button_params: Vec<ParamPackage>,
+    virtual_stick_params: Vec<ParamPackage>,
+    virtual_motion_params: Vec<ParamPackage>,
 
     // The live devices, kept alive so their callbacks keep firing. Upstream's
     // `button_devices` / `stick_devices` / `trigger_devices`.
     button_devices: Vec<Box<dyn InputDevice>>,
     stick_devices: Vec<Box<dyn InputDevice>>,
+    motion_devices: Vec<Box<dyn InputDevice>>,
     trigger_devices: Vec<Box<dyn InputDevice>>,
+    battery_devices: Vec<Box<dyn InputDevice>>,
+    color_devices: Vec<Box<dyn InputDevice>>,
+    camera_devices: Vec<Box<dyn InputDevice>>,
+    ring_analog_devices: Vec<Box<dyn InputDevice>>,
+    nfc_devices: Vec<Box<dyn InputDevice>>,
     output_devices: Vec<Box<dyn OutputDevice>>,
+    virtual_button_devices: Vec<Box<dyn InputDevice>>,
+    virtual_stick_devices: Vec<Box<dyn InputDevice>>,
+    virtual_motion_devices: Vec<Box<dyn InputDevice>>,
 
     /// The controller's status, shared with the device callbacks: they run on
     /// the driver's thread and cannot borrow the controller itself.
     status: Arc<Mutex<ControllerStatus>>,
-
-    // Stores the current status of all controller input
-    motion_state: MotionState,
-    colors_state: ControllerColors,
-    battery_state: BatteryLevelState,
-    ring_analog_state: RingSensorForce,
 }
 
 fn vibration_status(vibration: VibrationValue, strength: f32) -> VibrationStatus {
@@ -746,7 +1037,6 @@ impl EmulatedController {
             is_configuring: false,
             is_initialized: false,
             system_buttons_enabled: true,
-            motion_sensitivity: IS_AT_REST_STANDARD,
             turbo_button_state: 0,
             nfc_handles: 0,
             last_vibration_value: [DEFAULT_VIBRATION_VALUE; 2],
@@ -769,17 +1059,38 @@ impl EmulatedController {
                 ParamPackage::default();
                 settings_input::native_trigger::NUM_TRIGGERS
             ],
-            ring_params: [ParamPackage::default()],
+            battery_params: std::array::from_fn(|_| ParamPackage::default()),
+            color_params: std::array::from_fn(|_| ParamPackage::default()),
+            camera_params: std::array::from_fn(|_| ParamPackage::default()),
+            ring_params: std::array::from_fn(|_| ParamPackage::default()),
+            nfc_params: std::array::from_fn(|_| ParamPackage::default()),
             output_params: vec![ParamPackage::default(); OUTPUT_DEVICES_SIZE],
+            virtual_button_params: vec![
+                ParamPackage::default();
+                settings_input::native_button::NUM_BUTTONS
+            ],
+            virtual_stick_params: vec![
+                ParamPackage::default();
+                settings_input::native_analog::NUM_ANALOGS
+            ],
+            virtual_motion_params: vec![
+                ParamPackage::default();
+                settings_input::native_motion::NUM_MOTIONS
+            ],
             button_devices: Vec::new(),
             stick_devices: Vec::new(),
+            motion_devices: Vec::new(),
             trigger_devices: Vec::new(),
+            battery_devices: Vec::new(),
+            color_devices: Vec::new(),
+            camera_devices: Vec::new(),
+            ring_analog_devices: Vec::new(),
+            nfc_devices: Vec::new(),
             output_devices: Vec::new(),
+            virtual_button_devices: Vec::new(),
+            virtual_stick_devices: Vec::new(),
+            virtual_motion_devices: Vec::new(),
             status: Arc::new(Mutex::new(ControllerStatus::new())),
-            motion_state: [ControllerMotion::default(); 2],
-            colors_state: ControllerColors::default(),
-            battery_state: BatteryLevelState::default(),
-            ring_analog_state: RingSensorForce::default(),
         }
     }
 
@@ -960,8 +1271,17 @@ impl EmulatedController {
         self.is_initialized = false;
         self.button_devices.clear();
         self.stick_devices.clear();
+        self.motion_devices.clear();
         self.trigger_devices.clear();
+        self.battery_devices.clear();
+        self.color_devices.clear();
+        self.camera_devices.clear();
+        self.ring_analog_devices.clear();
+        self.nfc_devices.clear();
         self.output_devices.clear();
+        self.virtual_button_devices.clear();
+        self.virtual_stick_devices.clear();
+        self.virtual_motion_devices.clear();
     }
 
     pub fn enable_configuration(&mut self) {
@@ -1017,6 +1337,36 @@ impl EmulatedController {
         self.is_configuring
     }
 
+    /// Port of EmulatedController::LoadVirtualGamepadParams.
+    fn load_virtual_gamepad_params(&mut self) {
+        let player_index = crate::hid_util::npad_id_type_to_index(self.npad_id_type);
+        let mut common_params = ParamPackage::default();
+        common_params.set_str("engine", "virtual_gamepad".to_string());
+        common_params.set_int("port", player_index as i32);
+        self.virtual_button_params.fill(common_params.clone());
+        self.virtual_stick_params.fill(common_params.clone());
+        self.virtual_motion_params.fill(common_params);
+
+        for (index, param) in self.virtual_button_params.iter_mut().enumerate() {
+            param.set_int("button", index as i32);
+        }
+        self.virtual_stick_params[settings_input::native_analog::Values::LStick as usize]
+            .set_int("axis_x", 0);
+        self.virtual_stick_params[settings_input::native_analog::Values::LStick as usize]
+            .set_int("axis_y", 1);
+        self.virtual_stick_params[settings_input::native_analog::Values::RStick as usize]
+            .set_int("axis_x", 2);
+        self.virtual_stick_params[settings_input::native_analog::Values::RStick as usize]
+            .set_int("axis_y", 3);
+        for param in &mut self.virtual_stick_params {
+            param.set_float("deadzone", 0.0);
+            param.set_float("range", 1.0);
+        }
+        for param in &mut self.virtual_motion_params {
+            param.set_int("motion", 0);
+        }
+    }
+
     /// Port of EmulatedController::LoadDevices.
     ///
     /// Upstream derives trigger and output parameters from representative
@@ -1034,11 +1384,44 @@ impl EmulatedController {
         self.trigger_params[EmulatedDeviceIndex::RightIndex as usize] =
             self.button_params[settings_input::native_button::Values::ZR as usize].clone();
 
+        self.color_params[EmulatedDeviceIndex::LeftIndex as usize] = left_joycon.clone();
+        self.color_params[EmulatedDeviceIndex::RightIndex as usize] = right_joycon.clone();
+        self.battery_params[EmulatedDeviceIndex::LeftIndex as usize] = left_joycon.clone();
+        self.battery_params[EmulatedDeviceIndex::RightIndex as usize] = right_joycon.clone();
+        for color in &mut self.color_params {
+            color.set_int("color", 1);
+        }
+        for battery in &mut self.battery_params {
+            battery.set_int("battery", 1);
+        }
+
+        self.camera_params[0] = right_joycon.clone();
+        self.camera_params[0].set_int("camera", 1);
+        self.nfc_params[1] = right_joycon.clone();
+        self.nfc_params[1].set_int("nfc", 1);
+
+        if matches!(
+            self.npad_id_type,
+            NpadIdType::Player1 | NpadIdType::Handheld
+        ) {
+            self.camera_params[1] = ParamPackage::from_serialized("engine:camera,camera:1");
+            self.nfc_params[0] = ParamPackage::from_serialized("engine:virtual_amiibo,nfc:1");
+            #[cfg(not(target_os = "android"))]
+            {
+                self.ring_params[1] =
+                    ParamPackage::from_serialized("engine:joycon,axis_x:100,axis_y:101");
+            }
+        }
+
         self.output_params[DeviceIndex::Left as usize] = left_joycon;
         self.output_params[DeviceIndex::Right as usize] = right_joycon;
+        self.output_params[2] = self.camera_params[1].clone();
+        self.output_params[3] = self.nfc_params[0].clone();
         for output in &mut self.output_params {
             output.set_int("output", 1);
         }
+
+        self.load_virtual_gamepad_params();
 
         self.button_devices = self
             .button_params
@@ -1050,8 +1433,38 @@ impl EmulatedController {
             .iter()
             .map(common::input::create_input_device)
             .collect();
+        self.motion_devices = self
+            .motion_params
+            .iter()
+            .map(common::input::create_input_device)
+            .collect();
         self.trigger_devices = self
             .trigger_params
+            .iter()
+            .map(common::input::create_input_device)
+            .collect();
+        self.battery_devices = self
+            .battery_params
+            .iter()
+            .map(common::input::create_input_device)
+            .collect();
+        self.color_devices = self
+            .color_params
+            .iter()
+            .map(common::input::create_input_device)
+            .collect();
+        self.camera_devices = self
+            .camera_params
+            .iter()
+            .map(common::input::create_input_device)
+            .collect();
+        self.ring_analog_devices = self
+            .ring_params
+            .iter()
+            .map(common::input::create_input_device)
+            .collect();
+        self.nfc_devices = self
+            .nfc_params
             .iter()
             .map(common::input::create_input_device)
             .collect();
@@ -1059,6 +1472,21 @@ impl EmulatedController {
             .output_params
             .iter()
             .map(common::input::create_output_device)
+            .collect();
+        self.virtual_button_devices = self
+            .virtual_button_params
+            .iter()
+            .map(common::input::create_input_device)
+            .collect();
+        self.virtual_stick_devices = self
+            .virtual_stick_params
+            .iter()
+            .map(common::input::create_input_device)
+            .collect();
+        self.virtual_motion_devices = self
+            .virtual_motion_params
+            .iter()
+            .map(common::input::create_input_device)
             .collect();
     }
 
@@ -1107,6 +1535,116 @@ impl EmulatedController {
             device.force_update();
         }
 
+        for (index, device) in self.battery_devices.iter_mut().enumerate() {
+            let status = Arc::clone(&self.status);
+            let event_context = Arc::clone(&self.event_context);
+            device.set_callback(InputCallback {
+                on_change: Some(Arc::new(move |callback| {
+                    set_battery(&status, &event_context, callback, index);
+                })),
+            });
+            device.force_update();
+        }
+
+        for (index, device) in self.color_devices.iter_mut().enumerate() {
+            let status = Arc::clone(&self.status);
+            let event_context = Arc::clone(&self.event_context);
+            device.set_callback(InputCallback {
+                on_change: Some(Arc::new(move |callback| {
+                    set_colors(&status, &event_context, callback, index);
+                })),
+            });
+            device.force_update();
+        }
+
+        for (index, device) in self.motion_devices.iter_mut().enumerate() {
+            let status = Arc::clone(&self.status);
+            let event_context = Arc::clone(&self.event_context);
+            device.set_callback(InputCallback {
+                on_change: Some(Arc::new(move |callback| {
+                    set_motion(&status, &event_context, callback, index);
+                })),
+            });
+
+            let mut status = self.status.lock();
+            let sensitivity = status.motion_sensitivity;
+            let emulated = &mut status.motion_values[index].emulated;
+            emulated.reset_rotations();
+            emulated.reset_quaternion();
+            status.motion_state[index] = ControllerMotion {
+                accel: emulated.get_acceleration(),
+                gyro: emulated.get_gyroscope(),
+                rotation: emulated.get_rotations(),
+                euler: emulated.get_euler_angles(),
+                orientation: emulated.get_orientation(),
+                is_at_rest: !emulated.is_moving(sensitivity),
+            };
+        }
+
+        for device in &mut self.camera_devices {
+            let status = Arc::clone(&self.status);
+            let event_context = Arc::clone(&self.event_context);
+            device.set_callback(InputCallback {
+                on_change: Some(Arc::new(move |callback| {
+                    set_camera(&status, &event_context, callback);
+                })),
+            });
+            device.force_update();
+        }
+
+        for device in &mut self.ring_analog_devices {
+            let status = Arc::clone(&self.status);
+            let event_context = Arc::clone(&self.event_context);
+            device.set_callback(InputCallback {
+                on_change: Some(Arc::new(move |callback| {
+                    set_ring_analog(&status, &event_context, callback);
+                })),
+            });
+            device.force_update();
+        }
+
+        for device in &mut self.nfc_devices {
+            let status = Arc::clone(&self.status);
+            let event_context = Arc::clone(&self.event_context);
+            device.set_callback(InputCallback {
+                on_change: Some(Arc::new(move |callback| {
+                    set_nfc(&status, &event_context, callback);
+                })),
+            });
+            device.force_update();
+        }
+
+        for (index, device) in self.virtual_button_devices.iter_mut().enumerate() {
+            let status = Arc::clone(&self.status);
+            let event_context = Arc::clone(&self.event_context);
+            device.set_callback(InputCallback {
+                on_change: Some(Arc::new(move |callback| {
+                    set_button(&status, &event_context, callback, index, VIRTUAL_UUID);
+                })),
+            });
+        }
+
+        for (index, device) in self.virtual_stick_devices.iter_mut().enumerate() {
+            let status = Arc::clone(&self.status);
+            let event_context = Arc::clone(&self.event_context);
+            device.set_callback(InputCallback {
+                on_change: Some(Arc::new(move |callback| {
+                    set_stick(&status, &event_context, callback, index, VIRTUAL_UUID);
+                })),
+            });
+        }
+
+        for (index, device) in self.virtual_motion_devices.iter_mut().enumerate() {
+            let status = Arc::clone(&self.status);
+            let event_context = Arc::clone(&self.event_context);
+            device.set_callback(InputCallback {
+                on_change: Some(Arc::new(move |callback| {
+                    set_motion(&status, &event_context, callback, index);
+                })),
+            });
+        }
+
+        self.turbo_button_state = 0;
         self.is_initialized = true;
     }
 
@@ -1137,6 +1675,9 @@ impl EmulatedController {
         }
         self.ring_params[0] = ParamPackage::from_serialized(&ringcon_analog);
 
+        self.status.lock().color_values = [BodyColorStatus::default(); 2];
+        self.reload_colors_from_settings();
+
         // Other or debug controllers are always a Pro Controller upstream.
         let npad_type = if self.npad_id_type == NpadIdType::Other {
             NpadStyleIndex::Fullkey
@@ -1145,6 +1686,11 @@ impl EmulatedController {
         };
         self.set_npad_style_index(npad_type);
         self.original_npad_type = self.npad_type;
+
+        // Disable special features before disconnecting.
+        if self.get_polling_mode(EmulatedDeviceIndex::RightIndex) != PollingMode::Active {
+            self.set_polling_mode(EmulatedDeviceIndex::RightIndex, PollingMode::Active);
+        }
 
         self.disconnect();
         if connected {
@@ -1181,6 +1727,13 @@ impl EmulatedController {
         self.reload_input();
     }
 
+    /// Port of EmulatedController::StartMotionCalibration.
+    pub fn start_motion_calibration(&mut self) {
+        for motion in &mut self.status.lock().motion_values {
+            motion.emulated.calibrate();
+        }
+    }
+
     /// Port of EmulatedController::GetButtonParam.
     pub fn get_button_param(&self, index: usize) -> ParamPackage {
         self.button_params.get(index).cloned().unwrap_or_default()
@@ -1194,6 +1747,17 @@ impl EmulatedController {
     /// Port of EmulatedController::GetMotionParam.
     pub fn get_motion_param(&self, index: usize) -> ParamPackage {
         self.motion_params.get(index).cloned().unwrap_or_default()
+    }
+
+    /// Port of EmulatedController::GetRingParam.
+    pub fn get_ring_param(&self) -> ParamPackage {
+        self.ring_params[0].clone()
+    }
+
+    /// Port of EmulatedController::SetRingParam.
+    pub fn set_ring_param(&mut self, param: ParamPackage) {
+        self.ring_params[0] = param;
+        self.reload_input();
     }
 
     /// Load every parameter from one `PlayerInput` and reload the devices once.
@@ -1234,6 +1798,21 @@ impl EmulatedController {
         self.status.lock().trigger_values.clone()
     }
 
+    /// Port of EmulatedController::GetMotionValues.
+    pub fn get_motion_values(&self) -> [ControllerMotionInfo; 2] {
+        self.status.lock().motion_values.clone()
+    }
+
+    /// Port of EmulatedController::GetCameraValues.
+    pub fn get_camera_values(&self) -> CameraStatus {
+        self.status.lock().camera_values.clone()
+    }
+
+    /// Port of EmulatedController::GetRingSensorValues.
+    pub fn get_ring_sensor_values(&self) -> AnalogStatus {
+        self.status.lock().ring_analog_value
+    }
+
     /// Port of EmulatedController::SaveCurrentConfig.
     pub fn save_current_config(&self) {
         let player_index = crate::hid_util::npad_id_type_to_index(self.npad_id_type);
@@ -1265,11 +1844,28 @@ impl EmulatedController {
 
     /// Port of EmulatedController::ReloadColorsFromSettings.
     pub fn reload_colors_from_settings(&mut self) {
-        // Upstream reads body_color_left/right from player settings.
-        log::debug!(
-            "EmulatedController::reload_colors_from_settings called for {:?}",
-            self.npad_id_type
-        );
+        let mut status = self.status.lock();
+        if status.color_values[EmulatedDeviceIndex::LeftIndex as usize].body != 0
+            && status.color_values[EmulatedDeviceIndex::RightIndex as usize].body != 0
+        {
+            return;
+        }
+
+        let player_index = crate::hid_util::npad_id_type_to_index(self.npad_id_type);
+        let settings = common::settings::values();
+        let player = &settings.players.get_value()[player_index];
+        status.colors_state.fullkey = NpadControllerColor {
+            body: Self::get_npad_color(player.body_color_left),
+            button: Self::get_npad_color(player.button_color_left),
+        };
+        status.colors_state.left = NpadControllerColor {
+            body: Self::get_npad_color(player.body_color_left),
+            button: Self::get_npad_color(player.button_color_left),
+        };
+        status.colors_state.right = NpadControllerColor {
+            body: Self::get_npad_color(player.body_color_right),
+            button: Self::get_npad_color(player.button_color_right),
+        };
     }
 
     /// Port of EmulatedController::IsControllerFullkey.
@@ -1358,25 +1954,32 @@ impl EmulatedController {
 
     /// Port of EmulatedController::GetMotions.
     pub fn get_motions(&self) -> MotionState {
-        let _lock = self.mutex.lock();
-        self.motion_state
+        self.status.lock().motion_state
     }
 
     /// Port of EmulatedController::GetColors.
     pub fn get_colors(&self) -> ControllerColors {
-        let _lock = self.mutex.lock();
-        self.colors_state
+        self.status.lock().colors_state
     }
 
     /// Port of EmulatedController::GetBattery.
     pub fn get_battery(&self) -> BatteryLevelState {
-        let _lock = self.mutex.lock();
-        self.battery_state
+        self.status.lock().battery_state
+    }
+
+    /// Port of EmulatedController::GetCamera.
+    pub fn get_camera(&self) -> CameraState {
+        self.status.lock().camera_state.clone()
     }
 
     /// Port of EmulatedController::GetRingSensorForce.
     pub fn get_ring_sensor_force(&self) -> RingSensorForce {
-        self.ring_analog_state
+        self.status.lock().ring_analog_state
+    }
+
+    /// Port of EmulatedController::GetNfc.
+    pub fn get_nfc(&self) -> NfcStatus {
+        self.status.lock().nfc_state.clone()
     }
 
     /// Port of EmulatedController::GetNpadColor.
@@ -1467,6 +2070,81 @@ impl EmulatedController {
                 .is_some_and(|device| device.is_vibration_enabled())
     }
 
+    /// Port of EmulatedController::SetPollingMode.
+    pub fn set_polling_mode(
+        &mut self,
+        device_index: EmulatedDeviceIndex,
+        polling_mode: PollingMode,
+    ) -> DriverResult {
+        log::info!(
+            "Set polling mode {:?}, device_index={:?}",
+            polling_mode,
+            device_index
+        );
+
+        if !self.is_initialized {
+            return DriverResult::InvalidHandle;
+        }
+
+        if device_index == EmulatedDeviceIndex::LeftIndex {
+            self.status.lock().left_polling_mode = polling_mode;
+            return self.output_devices[DeviceIndex::Left as usize].set_polling_mode(polling_mode);
+        }
+
+        if device_index == EmulatedDeviceIndex::RightIndex {
+            self.status.lock().right_polling_mode = polling_mode;
+            let virtual_nfc_result = self.output_devices[3].set_polling_mode(polling_mode);
+            let mapped_nfc_result =
+                self.output_devices[DeviceIndex::Right as usize].set_polling_mode(polling_mode);
+
+            // Restore previous state.
+            if mapped_nfc_result != DriverResult::Success {
+                self.output_devices[DeviceIndex::Right as usize]
+                    .set_polling_mode(PollingMode::Active);
+            }
+
+            if virtual_nfc_result == DriverResult::Success {
+                return virtual_nfc_result;
+            }
+            return mapped_nfc_result;
+        }
+
+        {
+            let mut status = self.status.lock();
+            status.left_polling_mode = polling_mode;
+            status.right_polling_mode = polling_mode;
+        }
+        self.output_devices[DeviceIndex::Left as usize].set_polling_mode(polling_mode);
+        self.output_devices[DeviceIndex::Right as usize].set_polling_mode(polling_mode);
+        self.output_devices[3].set_polling_mode(polling_mode);
+        DriverResult::Success
+    }
+
+    /// Port of EmulatedController::GetPollingMode.
+    pub fn get_polling_mode(&self, device_index: EmulatedDeviceIndex) -> PollingMode {
+        let status = self.status.lock();
+        if device_index == EmulatedDeviceIndex::LeftIndex {
+            status.left_polling_mode
+        } else {
+            status.right_polling_mode
+        }
+    }
+
+    /// Port of EmulatedController::SetCameraFormat.
+    pub fn set_camera_format(&mut self, camera_format: ImageTransferProcessorFormat) -> bool {
+        log::info!("Set camera format {:?}", camera_format);
+        if !self.is_initialized {
+            return false;
+        }
+        let camera_format = irs_format_to_camera(camera_format);
+        if self.output_devices[DeviceIndex::Right as usize].set_camera_format(camera_format)
+            == DriverResult::Success
+        {
+            return true;
+        }
+        self.output_devices[2].set_camera_format(camera_format) == DriverResult::Success
+    }
+
     /// Port of EmulatedController::GetActualVibrationValue.
     pub fn get_actual_vibration_value(&self, device_index: DeviceIndex) -> VibrationValue {
         let _lock = self.mutex.lock();
@@ -1479,35 +2157,148 @@ impl EmulatedController {
 
     /// Port of EmulatedController::HasNfc.
     pub fn has_nfc(&self) -> bool {
-        // Upstream checks nfc_devices[1] for NFC support
-        false
+        if !self.is_initialized {
+            return false;
+        }
+        if !matches!(
+            self.npad_type,
+            NpadStyleIndex::JoyconRight
+                | NpadStyleIndex::JoyconDual
+                | NpadStyleIndex::Fullkey
+                | NpadStyleIndex::Handheld
+        ) {
+            return false;
+        }
+        let has_virtual_nfc = matches!(
+            self.npad_id_type,
+            NpadIdType::Player1 | NpadIdType::Handheld
+        );
+        let is_virtual_nfc_supported =
+            self.output_devices[3].supports_nfc() != NfcState::NotSupported;
+        self.is_connected(false) && has_virtual_nfc && is_virtual_nfc_supported
     }
 
     /// Port of EmulatedController::AddNfcHandle.
     pub fn add_nfc_handle(&mut self) -> bool {
         self.nfc_handles += 1;
-        true
+        self.set_polling_mode(EmulatedDeviceIndex::RightIndex, PollingMode::NFC)
+            == DriverResult::Success
     }
 
     /// Port of EmulatedController::RemoveNfcHandle.
     pub fn remove_nfc_handle(&mut self) -> bool {
+        self.nfc_handles = self.nfc_handles.wrapping_sub(1);
         if self.nfc_handles == 0 {
-            return false;
+            return self.set_polling_mode(EmulatedDeviceIndex::RightIndex, PollingMode::Active)
+                == DriverResult::Success;
         }
-        self.nfc_handles -= 1;
         true
     }
 
+    /// Port of EmulatedController::StartNfcPolling.
+    pub fn start_nfc_polling(&mut self) -> bool {
+        if !self.is_initialized {
+            return false;
+        }
+        let device_result = self.output_devices[DeviceIndex::Right as usize].start_nfc_polling();
+        let virtual_device_result = self.output_devices[3].start_nfc_polling();
+        device_result == NfcState::Success || virtual_device_result == NfcState::Success
+    }
+
+    /// Port of EmulatedController::StopNfcPolling.
+    pub fn stop_nfc_polling(&mut self) -> bool {
+        if !self.is_initialized {
+            return false;
+        }
+        let device_result = self.output_devices[DeviceIndex::Right as usize].stop_nfc_polling();
+        let virtual_device_result = self.output_devices[3].stop_nfc_polling();
+        device_result == NfcState::Success || virtual_device_result == NfcState::Success
+    }
+
+    /// Port of EmulatedController::ReadAmiiboData.
+    pub fn read_amiibo_data(&mut self, data: &mut Vec<u8>) -> bool {
+        if !self.is_initialized {
+            return false;
+        }
+        if self.output_devices[DeviceIndex::Right as usize].read_amiibo_data(data)
+            == NfcState::Success
+        {
+            return true;
+        }
+        self.output_devices[3].read_amiibo_data(data) == NfcState::Success
+    }
+
+    /// Port of EmulatedController::ReadMifareData.
+    pub fn read_mifare_data(
+        &mut self,
+        request: &MifareRequest,
+        out_data: &mut MifareRequest,
+    ) -> bool {
+        if !self.is_initialized {
+            return false;
+        }
+        if self.output_devices[DeviceIndex::Right as usize].read_mifare_data(request, out_data)
+            == NfcState::Success
+        {
+            return true;
+        }
+        self.output_devices[3].read_mifare_data(request, out_data) == NfcState::Success
+    }
+
+    /// Port of EmulatedController::WriteMifareData.
+    pub fn write_mifare_data(&mut self, request: &MifareRequest) -> bool {
+        if !self.is_initialized {
+            return false;
+        }
+        if self.output_devices[DeviceIndex::Right as usize].write_mifare_data(request)
+            == NfcState::Success
+        {
+            return true;
+        }
+        self.output_devices[3].write_mifare_data(request) == NfcState::Success
+    }
+
+    /// Port of EmulatedController::WriteNfc.
+    pub fn write_nfc(&mut self, data: &[u8]) -> bool {
+        if !self.is_initialized {
+            return false;
+        }
+        if self.output_devices[DeviceIndex::Right as usize].supports_nfc() != NfcState::NotSupported
+        {
+            return self.output_devices[DeviceIndex::Right as usize].write_nfc_data(data)
+                == NfcState::Success;
+        }
+        self.output_devices[3].write_nfc_data(data) == NfcState::Success
+    }
+
     /// Port of EmulatedController::SetGyroscopeZeroDriftMode.
-    pub fn set_gyroscope_zero_drift_mode(&mut self, _mode: GyroscopeZeroDriftMode) {
-        // Upstream iterates over motion_values and sets zero drift mode on each MotionInput.
-        // Requires MotionInput integration.
+    pub fn set_gyroscope_zero_drift_mode(&mut self, mode: GyroscopeZeroDriftMode) {
+        let mut status = self.status.lock();
+        let (sensitivity, threshold) = match mode {
+            GyroscopeZeroDriftMode::Loose => (IS_AT_REST_LOOSE, THRESHOLD_LOOSE),
+            GyroscopeZeroDriftMode::Tight => (IS_AT_REST_TIGHT, THRESHOLD_TIGHT),
+            GyroscopeZeroDriftMode::Standard => (IS_AT_REST_STANDARD, THRESHOLD_STANDARD),
+        };
+        status.motion_sensitivity = sensitivity;
+        for motion in &mut status.motion_values {
+            motion.emulated.set_gyro_threshold(threshold);
+        }
     }
 
     /// Port of EmulatedController::StatusUpdate.
     pub fn status_update(&mut self) {
         self.turbo_button_state = (self.turbo_button_state + 1) % (TURBO_BUTTON_DELAY * 2);
-        // Upstream also force-updates motion devices that need constant refreshing.
+        let force_updates = {
+            let status = self.status.lock();
+            std::array::from_fn::<_, 2, _>(|index| {
+                status.motion_values[index].raw_status.force_update
+            })
+        };
+        for (index, device) in self.motion_devices.iter_mut().enumerate() {
+            if force_updates.get(index).copied().unwrap_or(false) {
+                device.force_update();
+            }
+        }
     }
 
     /// Port of EmulatedController::GetTurboButtonMask.
@@ -1561,6 +2352,24 @@ impl EmulatedController {
         }
     }
 
+    /// Port of `EmulatedController::SetLedPattern`.
+    pub fn set_led_pattern(&mut self) {
+        if !self.is_initialized {
+            return;
+        }
+
+        let pattern = self.get_led_pattern();
+        let status = common::input::LedStatus {
+            led_1: pattern.raw & (1 << 0) != 0,
+            led_2: pattern.raw & (1 << 1) != 0,
+            led_3: pattern.raw & (1 << 2) != 0,
+            led_4: pattern.raw & (1 << 3) != 0,
+        };
+        for device in &mut self.output_devices {
+            device.set_led(&status);
+        }
+    }
+
     pub fn set_callback(&mut self, update_callback: ControllerUpdateCallback) -> i32 {
         let key = self.last_callback_key;
         self.event_context
@@ -1592,6 +2401,146 @@ impl EmulatedController {
 mod tests {
     use super::*;
     use common::input::{AnalogStatus, InputType};
+
+    struct PollingOutputDevice {
+        calls: Arc<Mutex<Vec<PollingMode>>>,
+        result: DriverResult,
+    }
+
+    struct LedOutputDevice {
+        calls: Arc<Mutex<Vec<common::input::LedStatus>>>,
+    }
+
+    #[derive(Default)]
+    struct SpecializedOutputCalls {
+        camera_formats: Vec<CameraFormat>,
+        start_nfc: usize,
+        stop_nfc: usize,
+        read_amiibo: usize,
+        write_nfc: usize,
+        read_mifare: usize,
+        write_mifare: usize,
+    }
+
+    struct SpecializedOutputDevice {
+        calls: Arc<Mutex<SpecializedOutputCalls>>,
+        driver_result: DriverResult,
+        nfc_state: NfcState,
+        supports_nfc: NfcState,
+    }
+
+    impl OutputDevice for SpecializedOutputDevice {
+        fn set_camera_format(&mut self, format: CameraFormat) -> DriverResult {
+            self.calls.lock().camera_formats.push(format);
+            self.driver_result
+        }
+
+        fn supports_nfc(&self) -> NfcState {
+            self.supports_nfc
+        }
+
+        fn start_nfc_polling(&mut self) -> NfcState {
+            self.calls.lock().start_nfc += 1;
+            self.nfc_state
+        }
+
+        fn stop_nfc_polling(&mut self) -> NfcState {
+            self.calls.lock().stop_nfc += 1;
+            self.nfc_state
+        }
+
+        fn read_amiibo_data(&mut self, out_data: &mut Vec<u8>) -> NfcState {
+            self.calls.lock().read_amiibo += 1;
+            if self.nfc_state == NfcState::Success {
+                out_data.push(0xA5);
+            }
+            self.nfc_state
+        }
+
+        fn write_nfc_data(&mut self, _data: &[u8]) -> NfcState {
+            self.calls.lock().write_nfc += 1;
+            self.nfc_state
+        }
+
+        fn read_mifare_data(
+            &mut self,
+            _request: &MifareRequest,
+            _out_data: &mut MifareRequest,
+        ) -> NfcState {
+            self.calls.lock().read_mifare += 1;
+            self.nfc_state
+        }
+
+        fn write_mifare_data(&mut self, _request: &MifareRequest) -> NfcState {
+            self.calls.lock().write_mifare += 1;
+            self.nfc_state
+        }
+    }
+
+    fn specialized_output_device(
+        driver_result: DriverResult,
+        nfc_state: NfcState,
+        supports_nfc: NfcState,
+    ) -> (Box<dyn OutputDevice>, Arc<Mutex<SpecializedOutputCalls>>) {
+        let calls = Arc::new(Mutex::new(SpecializedOutputCalls::default()));
+        (
+            Box::new(SpecializedOutputDevice {
+                calls: Arc::clone(&calls),
+                driver_result,
+                nfc_state,
+                supports_nfc,
+            }),
+            calls,
+        )
+    }
+
+    struct CountingInputDevice {
+        force_updates: Arc<Mutex<usize>>,
+        callback: InputCallback,
+    }
+
+    impl InputDevice for CountingInputDevice {
+        fn force_update(&mut self) {
+            *self.force_updates.lock() += 1;
+        }
+
+        fn set_callback(&mut self, callback: InputCallback) {
+            self.callback = callback;
+        }
+
+        fn trigger_on_change(&self, status: &CallbackStatus) {
+            if let Some(callback) = &self.callback.on_change {
+                callback(status);
+            }
+        }
+    }
+
+    impl OutputDevice for LedOutputDevice {
+        fn set_led(&mut self, status: &common::input::LedStatus) -> DriverResult {
+            self.calls.lock().push(*status);
+            DriverResult::Success
+        }
+    }
+
+    impl OutputDevice for PollingOutputDevice {
+        fn set_polling_mode(&mut self, polling_mode: PollingMode) -> DriverResult {
+            self.calls.lock().push(polling_mode);
+            self.result
+        }
+    }
+
+    fn polling_output_device(
+        result: DriverResult,
+    ) -> (Box<dyn OutputDevice>, Arc<Mutex<Vec<PollingMode>>>) {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        (
+            Box::new(PollingOutputDevice {
+                calls: Arc::clone(&calls),
+                result,
+            }),
+            calls,
+        )
+    }
 
     fn event_context(npad_id_type: NpadIdType) -> Arc<ControllerEventContext> {
         Arc::new(ControllerEventContext {
@@ -1954,8 +2903,15 @@ mod tests {
         controller.unload_input();
         assert!(controller.button_devices.is_empty());
         assert!(controller.stick_devices.is_empty());
+        assert!(controller.motion_devices.is_empty());
         assert!(controller.trigger_devices.is_empty());
+        assert!(controller.camera_devices.is_empty());
+        assert!(controller.ring_analog_devices.is_empty());
+        assert!(controller.nfc_devices.is_empty());
         assert!(controller.output_devices.is_empty());
+        assert!(controller.virtual_button_devices.is_empty());
+        assert!(controller.virtual_stick_devices.is_empty());
+        assert!(controller.virtual_motion_devices.is_empty());
     }
 
     #[test]
@@ -1981,6 +2937,250 @@ mod tests {
             .output_params
             .iter()
             .all(|param| param.get_int("output", 0) == 1));
+        assert_eq!(
+            controller.virtual_motion_params[0].get_str("engine", ""),
+            "virtual_gamepad"
+        );
+        assert_eq!(controller.virtual_motion_params[0].get_int("motion", -1), 0);
+    }
+
+    #[test]
+    fn right_polling_prefers_virtual_nfc_and_restores_a_rejected_mapped_device() {
+        let mut controller = EmulatedController::new(NpadIdType::Player1);
+        let (left, _) = polling_output_device(DriverResult::NotSupported);
+        let (right, right_calls) = polling_output_device(DriverResult::NotSupported);
+        let (camera, _) = polling_output_device(DriverResult::NotSupported);
+        let (virtual_nfc, virtual_nfc_calls) = polling_output_device(DriverResult::Success);
+        let (android, _) = polling_output_device(DriverResult::NotSupported);
+        controller.output_devices = vec![left, right, camera, virtual_nfc, android];
+        controller.is_initialized = true;
+
+        assert_eq!(
+            controller.set_polling_mode(EmulatedDeviceIndex::RightIndex, PollingMode::NFC),
+            DriverResult::Success
+        );
+        assert_eq!(
+            controller.get_polling_mode(EmulatedDeviceIndex::RightIndex),
+            PollingMode::NFC
+        );
+        assert_eq!(*virtual_nfc_calls.lock(), vec![PollingMode::NFC]);
+        assert_eq!(
+            *right_calls.lock(),
+            vec![PollingMode::NFC, PollingMode::Active]
+        );
+    }
+
+    #[test]
+    fn all_devices_polling_updates_both_controller_modes() {
+        let mut controller = EmulatedController::new(NpadIdType::Player1);
+        let (left, left_calls) = polling_output_device(DriverResult::NotSupported);
+        let (right, right_calls) = polling_output_device(DriverResult::NotSupported);
+        let (camera, camera_calls) = polling_output_device(DriverResult::NotSupported);
+        let (virtual_nfc, virtual_nfc_calls) = polling_output_device(DriverResult::NotSupported);
+        let (android, android_calls) = polling_output_device(DriverResult::NotSupported);
+        controller.output_devices = vec![left, right, camera, virtual_nfc, android];
+        controller.is_initialized = true;
+
+        assert_eq!(
+            controller.set_polling_mode(EmulatedDeviceIndex::AllDevices, PollingMode::IR),
+            DriverResult::Success
+        );
+        assert_eq!(
+            controller.get_polling_mode(EmulatedDeviceIndex::LeftIndex),
+            PollingMode::IR
+        );
+        assert_eq!(
+            controller.get_polling_mode(EmulatedDeviceIndex::RightIndex),
+            PollingMode::IR
+        );
+        assert_eq!(*left_calls.lock(), vec![PollingMode::IR]);
+        assert_eq!(*right_calls.lock(), vec![PollingMode::IR]);
+        assert_eq!(*virtual_nfc_calls.lock(), vec![PollingMode::IR]);
+        assert!(camera_calls.lock().is_empty());
+        assert!(android_calls.lock().is_empty());
+    }
+
+    #[test]
+    fn camera_format_falls_back_to_the_virtual_camera() {
+        let mut controller = EmulatedController::new(NpadIdType::Player1);
+        let (left, _) = polling_output_device(DriverResult::NotSupported);
+        let (right, right_calls) = specialized_output_device(
+            DriverResult::NotSupported,
+            NfcState::NotSupported,
+            NfcState::NotSupported,
+        );
+        let (camera, camera_calls) = specialized_output_device(
+            DriverResult::Success,
+            NfcState::NotSupported,
+            NfcState::NotSupported,
+        );
+        let (virtual_nfc, _) = polling_output_device(DriverResult::NotSupported);
+        let (android, _) = polling_output_device(DriverResult::NotSupported);
+        controller.output_devices = vec![left, right, camera, virtual_nfc, android];
+        controller.is_initialized = true;
+
+        assert!(controller.set_camera_format(ImageTransferProcessorFormat::Size80x60));
+        assert_eq!(
+            right_calls.lock().camera_formats,
+            vec![CameraFormat::Size80x60]
+        );
+        assert_eq!(
+            camera_calls.lock().camera_formats,
+            vec![CameraFormat::Size80x60]
+        );
+    }
+
+    #[test]
+    fn nfc_support_and_operations_follow_upstream_device_priority() {
+        let mut controller = EmulatedController::new(NpadIdType::Player1);
+        controller.set_npad_style_index(NpadStyleIndex::Fullkey);
+        controller.connect(false);
+        let (left, _) = polling_output_device(DriverResult::NotSupported);
+        let (right, right_calls) = specialized_output_device(
+            DriverResult::NotSupported,
+            NfcState::NotSupported,
+            NfcState::NotSupported,
+        );
+        let (camera, _) = polling_output_device(DriverResult::NotSupported);
+        let (virtual_nfc, virtual_calls) = specialized_output_device(
+            DriverResult::NotSupported,
+            NfcState::Success,
+            NfcState::Success,
+        );
+        let (android, _) = polling_output_device(DriverResult::NotSupported);
+        controller.output_devices = vec![left, right, camera, virtual_nfc, android];
+        controller.is_initialized = true;
+
+        assert!(controller.has_nfc());
+        assert!(controller.start_nfc_polling());
+        assert!(controller.stop_nfc_polling());
+        let mut amiibo = Vec::new();
+        assert!(controller.read_amiibo_data(&mut amiibo));
+        assert_eq!(amiibo, vec![0xA5]);
+        assert!(
+            controller.read_mifare_data(&MifareRequest::default(), &mut MifareRequest::default())
+        );
+        assert!(controller.write_mifare_data(&MifareRequest::default()));
+        assert!(controller.write_nfc(&[1, 2, 3]));
+
+        let right_calls = right_calls.lock();
+        assert_eq!(right_calls.start_nfc, 1);
+        assert_eq!(right_calls.stop_nfc, 1);
+        assert_eq!(right_calls.read_amiibo, 1);
+        assert_eq!(right_calls.read_mifare, 1);
+        assert_eq!(right_calls.write_mifare, 1);
+        assert_eq!(right_calls.write_nfc, 0);
+        drop(right_calls);
+        let virtual_calls = virtual_calls.lock();
+        assert_eq!(virtual_calls.start_nfc, 1);
+        assert_eq!(virtual_calls.stop_nfc, 1);
+        assert_eq!(virtual_calls.read_amiibo, 1);
+        assert_eq!(virtual_calls.read_mifare, 1);
+        assert_eq!(virtual_calls.write_mifare, 1);
+        assert_eq!(virtual_calls.write_nfc, 1);
+    }
+
+    #[test]
+    fn specialized_input_callbacks_update_guest_visible_state() {
+        let status = Arc::new(Mutex::new(ControllerStatus::new()));
+        let events = event_context(NpadIdType::Player1);
+
+        let mut motion_callback = CallbackStatus {
+            input_type: InputType::Motion,
+            ..Default::default()
+        };
+        motion_callback.motion_status.accel.z.raw_value = -1.0;
+        motion_callback.motion_status.gyro.x.raw_value = 0.02;
+        motion_callback.motion_status.gyro.x.properties.threshold = THRESHOLD_STANDARD;
+        motion_callback.motion_status.delta_timestamp = 1000;
+        set_motion(&status, &events, &motion_callback, 0);
+        assert_eq!(status.lock().motion_state[0].accel.z, -1.0);
+
+        set_camera(
+            &status,
+            &events,
+            &CallbackStatus {
+                input_type: InputType::IrSensor,
+                camera_status: CameraFormat::Size40x30,
+                raw_data: vec![1, 2, 3],
+                ..Default::default()
+            },
+        );
+        assert_eq!(status.lock().camera_state.sample, 1);
+        assert_eq!(status.lock().camera_state.data, vec![1, 2, 3]);
+
+        set_ring_analog(&status, &events, &stick_callback(0.5, 0.0));
+        assert_eq!(status.lock().ring_analog_state.force, 0.5);
+
+        let mut nfc_status = NfcStatus::default();
+        nfc_status.state = NfcState::NewAmiibo;
+        set_nfc(
+            &status,
+            &events,
+            &CallbackStatus {
+                input_type: InputType::Nfc,
+                nfc_status,
+                ..Default::default()
+            },
+        );
+        assert_eq!(status.lock().nfc_state.state, NfcState::NewAmiibo);
+    }
+
+    #[test]
+    fn motion_drift_mode_and_forced_refresh_match_upstream() {
+        let mut controller = EmulatedController::new(NpadIdType::Player1);
+        controller.set_gyroscope_zero_drift_mode(GyroscopeZeroDriftMode::Tight);
+        assert_eq!(
+            controller.status.lock().motion_sensitivity,
+            IS_AT_REST_TIGHT
+        );
+
+        controller.status.lock().motion_values[0]
+            .raw_status
+            .force_update = true;
+        let first_updates = Arc::new(Mutex::new(0));
+        let second_updates = Arc::new(Mutex::new(0));
+        controller.motion_devices = vec![
+            Box::new(CountingInputDevice {
+                force_updates: Arc::clone(&first_updates),
+                callback: InputCallback { on_change: None },
+            }),
+            Box::new(CountingInputDevice {
+                force_updates: Arc::clone(&second_updates),
+                callback: InputCallback { on_change: None },
+            }),
+        ];
+
+        controller.status_update();
+        assert_eq!(*first_updates.lock(), 1);
+        assert_eq!(*second_updates.lock(), 0);
+    }
+
+    #[test]
+    fn set_led_pattern_updates_every_output_device() {
+        let mut controller = EmulatedController::new(NpadIdType::Player3);
+        let first_calls = Arc::new(Mutex::new(Vec::new()));
+        let second_calls = Arc::new(Mutex::new(Vec::new()));
+        controller.output_devices = vec![
+            Box::new(LedOutputDevice {
+                calls: Arc::clone(&first_calls),
+            }),
+            Box::new(LedOutputDevice {
+                calls: Arc::clone(&second_calls),
+            }),
+        ];
+        controller.is_initialized = true;
+
+        controller.set_led_pattern();
+
+        for calls in [first_calls, second_calls] {
+            let calls = calls.lock();
+            assert_eq!(calls.len(), 1);
+            assert!(calls[0].led_1);
+            assert!(calls[0].led_2);
+            assert!(calls[0].led_3);
+            assert!(!calls[0].led_4);
+        }
     }
 
     #[test]

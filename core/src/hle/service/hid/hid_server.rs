@@ -30,8 +30,10 @@ pub struct IHidServer {
     handlers_tipc: BTreeMap<u32, FunctionInfo>,
     resource_manager: Arc<parking_lot::Mutex<ResourceManager>>,
     firmware_settings: Arc<HidFirmwareSettings>,
-    npad_style_set_events: parking_lot::Mutex<BTreeMap<(u64, u32), Arc<Event>>>,
+    npad_style_set_events: NpadStyleSetEvents,
 }
+
+pub type NpadStyleSetEvents = Arc<parking_lot::Mutex<BTreeMap<(u64, u32), Arc<Event>>>>;
 
 impl IHidServer {
     fn trace_npad(cmd: u32, result: ResultCode, aruid: u64, arg0: u64, arg1: u64, out0: u64) {
@@ -57,6 +59,7 @@ impl IHidServer {
         system: SystemRef,
         resource_manager: Arc<parking_lot::Mutex<ResourceManager>>,
         firmware_settings: Arc<HidFirmwareSettings>,
+        npad_style_set_events: NpadStyleSetEvents,
     ) -> Self {
         // clang-format off
         let handlers = build_handler_map(&[
@@ -649,7 +652,7 @@ impl IHidServer {
             handlers_tipc: BTreeMap::new(),
             resource_manager,
             firmware_settings,
-            npad_style_set_events: parking_lot::Mutex::new(BTreeMap::new()),
+            npad_style_set_events,
         }
     }
 
@@ -661,14 +664,6 @@ impl IHidServer {
     /// Upstream: `IHidServer::GetResourceManager()`.
     pub fn get_resource_manager(&self) -> Arc<parking_lot::Mutex<ResourceManager>> {
         self.resource_manager.clone()
-    }
-
-    fn signal_npad_style_set_events(&self, aruid: u64) {
-        for ((event_aruid, _npad_id), event) in self.npad_style_set_events.lock().iter() {
-            if *event_aruid == aruid {
-                event.signal();
-            }
-        }
     }
 
     fn stub_success_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
@@ -1575,9 +1570,6 @@ impl IHidServer {
         } else {
             RESULT_SUCCESS
         };
-        if result.is_success() {
-            server.signal_npad_style_set_events(aruid);
-        }
         Self::trace_npad(100, result, aruid, supported_style_set_raw as u64, 0, 0);
 
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
@@ -1686,9 +1678,6 @@ impl IHidServer {
                 result.0
             );
         }
-        if result.is_success() {
-            server.signal_npad_style_set_events(aruid);
-        }
         Self::trace_npad(
             103,
             result,
@@ -1723,7 +1712,7 @@ impl IHidServer {
         let _padding = rp.pop_u32();
         let aruid = rp.pop_u64();
         let unknown = rp.pop_u64();
-        let _npad_id: NpadIdType = unsafe { core::mem::transmute(npad_id_raw) };
+        let npad_id: NpadIdType = unsafe { core::mem::transmute(npad_id_raw) };
         log::debug!("IHidServer::AcquireNpadStyleSetUpdateEventHandle called, npad_id=0x{:X}, aruid={}, unknown={}",
             npad_id_raw, aruid, unknown);
         let event = {
@@ -1734,20 +1723,41 @@ impl IHidServer {
                     .or_insert_with(|| Arc::new(Event::new())),
             )
         };
-        // Upstream signals the event immediately after handing it out.
-        event.signal();
-        let handle = event.copy_handle(ctx).unwrap_or(0);
+        let result = {
+            let resource_manager = server.resource_manager.lock();
+            if let Some(npad) = resource_manager.get_npad() {
+                let event_to_signal = Arc::clone(&event);
+                to_ipc_result(
+                    npad.lock()
+                        .npad_resource_mut()
+                        .register_style_set_update_event(
+                            aruid,
+                            npad_id,
+                            Arc::new(move || event_to_signal.signal()),
+                        ),
+                )
+            } else {
+                RESULT_SUCCESS
+            }
+        };
+        let handle = if result.is_success() {
+            event.copy_handle(ctx).unwrap_or(0)
+        } else {
+            0
+        };
         Self::trace_npad(
             106,
-            RESULT_SUCCESS,
+            result,
             aruid,
             npad_id_raw as u64,
             unknown,
             handle as u64,
         );
-        let mut rb = ResponseBuilder::new(ctx, 2, 1, 0);
-        rb.push_result(RESULT_SUCCESS);
-        rb.push_copy_objects(handle);
+        let mut rb = ResponseBuilder::new(ctx, 2, u32::from(result.is_success()), 0);
+        rb.push_result(result);
+        if result.is_success() {
+            rb.push_copy_objects(handle);
+        }
     }
 
     // cmd 107: DisconnectNpad
@@ -1831,9 +1841,6 @@ impl IHidServer {
                 create_result.0,
                 result.0
             );
-        }
-        if result.is_success() {
-            server.signal_npad_style_set_events(aruid);
         }
         Self::trace_npad(
             109,

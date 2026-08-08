@@ -8,7 +8,8 @@
 //! analog properties, battery levels, etc.
 
 use common::input::{
-    ButtonStatus, CallbackStatus, InputType, StickStatus, TouchStatus, TriggerStatus,
+    AnalogProperties, ButtonStatus, CallbackStatus, CameraStatus, InputType, MotionStatus,
+    NfcStatus, StickStatus, TouchStatus, TriggerStatus,
 };
 
 /// Sanitizes an analog value by applying deadzone, range, offset and invert properties.
@@ -266,6 +267,80 @@ pub fn transform_to_button(callback: &CallbackStatus) -> ButtonStatus {
     status
 }
 
+/// Converts callback data to motion input.
+///
+/// Port of upstream `TransformToMotion`.
+pub fn transform_to_motion(callback: &CallbackStatus) -> MotionStatus {
+    let mut status = match callback.input_type {
+        InputType::Button => {
+            let properties = AnalogProperties {
+                deadzone: 0.0,
+                range: 1.0,
+                offset: 0.0,
+                ..Default::default()
+            };
+            let mut status = MotionStatus {
+                delta_timestamp: 1000,
+                force_update: true,
+                ..Default::default()
+            };
+            for axis in [
+                &mut status.accel.x,
+                &mut status.accel.y,
+                &mut status.accel.z,
+                &mut status.gyro.x,
+                &mut status.gyro.y,
+                &mut status.gyro.z,
+            ] {
+                axis.properties = properties;
+            }
+            status.accel.z.raw_value = -1.0;
+            if transform_to_button(callback).value {
+                for axis in [
+                    &mut status.accel.x,
+                    &mut status.accel.y,
+                    &mut status.accel.z,
+                    &mut status.gyro.x,
+                    &mut status.gyro.y,
+                    &mut status.gyro.z,
+                ] {
+                    axis.raw_value = f32::from(fastrand::i16(-5000..=5000)) * 0.001;
+                }
+            }
+            status
+        }
+        InputType::Motion => callback.motion_status,
+        input_type => {
+            log::error!(
+                "Conversion from input type {:?} to motion not implemented",
+                input_type
+            );
+            MotionStatus::default()
+        }
+    };
+
+    for axis in [
+        &mut status.accel.x,
+        &mut status.accel.y,
+        &mut status.accel.z,
+        &mut status.gyro.x,
+        &mut status.gyro.y,
+        &mut status.gyro.z,
+    ] {
+        let properties = axis.properties;
+        sanitize_analog(
+            &mut axis.raw_value,
+            &mut axis.value,
+            properties.deadzone,
+            properties.range,
+            properties.offset,
+            properties.inverted,
+            false,
+        );
+    }
+    status
+}
+
 /// Converts callback data to a normalized stick status.
 ///
 /// Port of upstream `TransformToStick`.
@@ -358,4 +433,35 @@ pub fn transform_to_touch(callback: &CallbackStatus) -> TouchStatus {
         status.pressed.value = !status.pressed.value;
     }
     status
+}
+
+/// Converts callback data to an infrared-camera frame.
+///
+/// Port of upstream `TransformToCamera`.
+pub fn transform_to_camera(callback: &CallbackStatus) -> CameraStatus {
+    if callback.input_type == InputType::IrSensor {
+        return CameraStatus {
+            format: callback.camera_status,
+            data: callback.raw_data.clone(),
+        };
+    }
+    log::error!(
+        "Conversion from input type {:?} to camera not implemented",
+        callback.input_type
+    );
+    CameraStatus::default()
+}
+
+/// Converts callback data to an NFC status.
+///
+/// Port of upstream `TransformToNfc`.
+pub fn transform_to_nfc(callback: &CallbackStatus) -> NfcStatus {
+    if callback.input_type == InputType::Nfc {
+        return callback.nfc_status.clone();
+    }
+    log::error!(
+        "Conversion from input type {:?} to NFC not implemented",
+        callback.input_type
+    );
+    NfcStatus::default()
 }

@@ -1564,6 +1564,14 @@ fn call64(system: &System, imm: u32, args: &mut SvcArgs) {
             };
             set_arg64(args, 0, result.get_inner_value() as u64);
         }
+        Some(SvcId::SignalEvent) => {
+            let result = svc_event::signal_event(system, get_arg64(args, 0) as u32);
+            set_arg64(args, 0, result.get_inner_value() as u64);
+        }
+        Some(SvcId::ClearEvent) => {
+            let result = svc_event::clear_event(system, get_arg64(args, 0) as u32);
+            set_arg64(args, 0, result.get_inner_value() as u64);
+        }
         Some(SvcId::GetThreadContext3) => {
             let result = svc_thread::get_thread_context3(
                 system,
@@ -1653,6 +1661,14 @@ fn call64(system: &System, imm: u32, args: &mut SvcArgs) {
                 get_arg64(args, 3) as i32,
             );
             set_arg64(args, 0, result.get_inner_value() as u64);
+        }
+        Some(SvcId::CreateEvent) => {
+            let mut write_handle = 0;
+            let mut read_handle = 0;
+            let result = svc_event::create_event(system, &mut write_handle, &mut read_handle);
+            set_arg64(args, 0, result.get_inner_value() as u64);
+            set_arg64(args, 1, write_handle as u64);
+            set_arg64(args, 2, read_handle as u64);
         }
 
         // ====================================================================
@@ -3318,6 +3334,7 @@ mod tests {
     use crate::hle::kernel::k_scheduler::KScheduler;
     use crate::hle::kernel::k_thread::{KThread, KThreadLock, ThreadState};
     use crate::hle::kernel::k_worker_task_manager::KWorkerTaskManager;
+    use crate::hle::result::RESULT_SUCCESS;
     use std::sync::{Arc, Mutex};
 
     fn test_system() -> System {
@@ -3430,6 +3447,41 @@ mod tests {
             crate::hle::kernel::svc::svc_results::RESULT_INVALID_ADDRESS.get_inner_value() as u64,
             "UnmapPhysicalMemory must reach its AArch64 handler instead of returning stub success"
         );
+    }
+
+    #[test]
+    fn call64_routes_event_create_signal_and_clear() {
+        let system = test_system();
+        let mut args: SvcArgs = [0; 8];
+
+        call64(&system, SvcId::CreateEvent as u32, &mut args);
+        assert_eq!(args[0], RESULT_SUCCESS.get_inner_value() as u64);
+        let write_handle = args[1] as u32;
+        let read_handle = args[2] as u32;
+        assert_ne!(write_handle, 0);
+        assert_ne!(read_handle, 0);
+
+        args = [0; 8];
+        args[0] = write_handle as u64;
+        call64(&system, SvcId::SignalEvent as u32, &mut args);
+        assert_eq!(args[0], RESULT_SUCCESS.get_inner_value() as u64);
+
+        {
+            let process = system.current_process_arc().lock().unwrap();
+            let object_id = process.handle_table.get_object(read_handle).unwrap();
+            let event = process.get_readable_event_by_object_id(object_id).unwrap();
+            assert!(event.lock().unwrap().is_signaled());
+        }
+
+        args = [0; 8];
+        args[0] = read_handle as u64;
+        call64(&system, SvcId::ClearEvent as u32, &mut args);
+        assert_eq!(args[0], RESULT_SUCCESS.get_inner_value() as u64);
+
+        let process = system.current_process_arc().lock().unwrap();
+        let object_id = process.handle_table.get_object(read_handle).unwrap();
+        let event = process.get_readable_event_by_object_id(object_id).unwrap();
+        assert!(!event.lock().unwrap().is_signaled());
     }
 
     #[test]

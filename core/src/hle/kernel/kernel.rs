@@ -20,6 +20,7 @@ use super::k_memory_manager::KMemoryManager;
 use super::k_port::KPort;
 use super::k_process::KProcess;
 use super::k_scheduler::KScheduler;
+use super::k_shared_memory::{KSharedMemory, MemoryPermission};
 use super::k_thread::{KThread, KThreadLock, ThreadState};
 
 use super::global_scheduler_context::GlobalSchedulerContext;
@@ -32,7 +33,9 @@ use super::k_thread::SuspendType;
 use super::k_worker_task_manager::KWorkerTaskManager;
 use super::physical_core::PhysicalCore;
 use crate::core_timing::CoreTiming;
+use crate::device_memory::DeviceMemory;
 use crate::hardware_properties;
+use crate::hle::result::ResultCode;
 
 // Thread-local host thread ID.
 // Upstream: `static inline thread_local u8 host_thread_id = UINT8_MAX` in KernelCore::Impl.
@@ -1868,6 +1871,10 @@ pub struct KernelCore {
     /// Physical memory manager. Upstream: `Impl::memory_manager`.
     memory_manager: KMemoryManager,
 
+    /// Kernel-owned shared memory exposed by the IRS service.
+    /// Upstream: `KernelCore::Impl::irs_shared_mem`.
+    irs_shared_mem: Option<(u64, Arc<KSharedMemory>)>,
+
     /// Kernel-wide resource limit. Upstream:
     /// `KernelCore::Impl::system_resource_limit` set by
     /// `InitializeSystemResourceLimit` at boot. Holds PhysicalMemoryMax,
@@ -1987,6 +1994,7 @@ impl KernelCore {
             registered_in_use_objects: Mutex::new(Vec::new()),
 
             memory_manager: KMemoryManager::new(),
+            irs_shared_mem: None,
             system_resource_limit: None,
             memory_block_slab_manager: None,
             page_table_manager: None,
@@ -2530,6 +2538,7 @@ impl KernelCore {
         self.host_service_processes.lock().unwrap().clear();
         self.process_list.lock().unwrap().clear();
         self.terminating_processes.lock().unwrap().clear();
+        self.irs_shared_mem = None;
 
         // Upstream's thread/process Close() chain leaves no objects in the
         // scheduler context. Drop the Rust owning container now rather than
@@ -3294,6 +3303,44 @@ impl KernelCore {
         &mut self.memory_manager
     }
 
+    /// Initialize the kernel-owned IRS shared memory.
+    ///
+    /// This is the IRS portion of upstream
+    /// `KernelCore::Impl::InitializeHackSharedMemory`: the object is allocated
+    /// once by the kernel, has no owner mapping, and is exposed read-only to
+    /// user processes.
+    pub fn initialize_irs_shared_memory(&mut self, device_memory: &DeviceMemory) -> ResultCode {
+        const IRS_SHARED_MEMORY_SIZE: usize = 0x8000;
+
+        if self.irs_shared_mem.is_some() {
+            return crate::hle::result::RESULT_SUCCESS;
+        }
+
+        let mut shared_memory = KSharedMemory::new();
+        let result = shared_memory.initialize(
+            device_memory,
+            &mut self.memory_manager,
+            MemoryPermission::None,
+            MemoryPermission::Read,
+            IRS_SHARED_MEMORY_SIZE,
+        );
+        if result.is_error() {
+            return result;
+        }
+
+        let object_id = self.create_new_object_id() as u64;
+        self.irs_shared_mem = Some((object_id, Arc::new(shared_memory)));
+        crate::hle::result::RESULT_SUCCESS
+    }
+
+    /// Get the persistent IRS shared-memory object and its kernel object id.
+    /// Upstream: `KernelCore::GetIrsSharedMem()`.
+    pub fn get_irs_shared_mem(&self) -> Option<(u64, Arc<KSharedMemory>)> {
+        self.irs_shared_mem
+            .as_ref()
+            .map(|(object_id, shared_memory)| (*object_id, Arc::clone(shared_memory)))
+    }
+
     /// Get the kernel-wide resource limit. Upstream:
     /// `KernelCore::GetSystemResourceLimit()`.
     pub fn get_system_resource_limit(
@@ -3595,6 +3642,31 @@ impl KernelCore {
 mod tests {
     use super::*;
     use crate::core::SystemRef;
+
+    #[test]
+    fn irs_shared_memory_is_kernel_owned_and_persistent() {
+        use crate::device_memory::dram_memory_map;
+        use crate::hle::kernel::k_memory_manager::Pool;
+
+        let device_memory = DeviceMemory::with_size(0x1_0000);
+        let mut kernel = KernelCore::new();
+        kernel
+            .memory_manager_mut()
+            .initialize_pool(Pool::SECURE, dram_memory_map::BASE, 0x1_0000);
+
+        assert!(kernel
+            .initialize_irs_shared_memory(&device_memory)
+            .is_success());
+        let (first_id, first) = kernel.get_irs_shared_mem().unwrap();
+        assert!(kernel
+            .initialize_irs_shared_memory(&device_memory)
+            .is_success());
+        let (second_id, second) = kernel.get_irs_shared_mem().unwrap();
+
+        assert_eq!(first.get_size(), 0x8000);
+        assert_eq!(first_id, second_id);
+        assert!(Arc::ptr_eq(&first, &second));
+    }
 
     #[test]
     fn scoped_test_kernels_are_isolated_per_host_thread() {
