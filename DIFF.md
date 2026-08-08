@@ -33823,11 +33823,13 @@ Rust files: `externals/rdynarmic/src/frontend/a32/{decoder.rs, decoder_thumb32.r
 
 ### Intentional differences
 - Driver callbacks are coalesced until `on_update` because the Rust input engine dispatches outside its lock; a disconnect-plus-connect pair is replayed in upstream order before the final connected state is initialized.
+- `SetLastActiveController` updates discovered while holding an `EmulatedController` guard are deferred until the end of `on_update`. Upstream can perform the assignment inline because `HIDCore` is not protected by Rust's outer mutex; deferral preserves the same final value while maintaining the required `HIDCore`-before-controller lock order.
 
 ### Unintentional differences (to fix)
 - Resolved: connect and disconnect transitions did not signal their per-controller style-set event.
 - Resolved: controller initialization omitted `Connect`, LED setup, active polling mode, the post-signal empty LIFO entry, last-active-controller update, and `AbstractPad::Update`.
 - Resolved: `NPad` did not own the upstream ten-element `abstracted_pads` array, leaving `EnableAppletToGetInput` and successful system-extension enablement as no-ops.
+- Resolved: controller initialization acquired `HIDCore` while still holding the corresponding `EmulatedController`, inverting the order used by `HIDCore::set_supported_style_tag` and allowing the controller applet to deadlock during launch.
 
 ### Missing items
 - The pre-existing Rust `AbstractPad` subsystem still lacks upstream `SetExternals` wiring and contains incomplete handler implementations; the restored ownership and calls therefore do not complete that separate subsystem.
@@ -33883,7 +33885,7 @@ Rust files: `externals/rdynarmic/src/frontend/a32/{decoder.rs, decoder_thumb32.r
 - Resolved: the existing upstream-derived `ControllerNavigation` helper was not owned by the applet dialog. The dialog now installs it after loading controller configuration, drains its queued GTK-main-thread actions, and preserves upstream Enter/Escape, player-count Left/Right, and focus Up/Down behavior.
 
 ### Missing items
-- `ConfigureInputProfileDialog` and the Profiles/Create action remain unported; each player therefore exposes only upstream's default `Use Current Config` profile entry.
+- Resolved: `ConfigureInputProfileDialog` and the Profiles/Create action are ported; see the later entry for `ruzu/src/configuration/configure_input_profile_dialog.rs`.
 - The upstream status-button refresh, immediate `System::ApplySettings`, and `SaveAllValues` calls after dialog completion remain separate main-window parity work.
 
 ### Binary layout verification
@@ -33901,3 +33903,106 @@ Rust files: `externals/rdynarmic/src/frontend/a32/{decoder.rs, decoder_thumb32.r
 
 ### Binary layout verification
 - PASS: `ControllerSupportResultInfo` remains `0xC` bytes with deterministic zero padding. Focused tests cover both inline default completion and completion after a deferred frontend callback.
+
+## 2026-08-08 — core/src/hle/kernel/kernel.rs vs core/hle/kernel/kernel.cpp
+
+### Intentional differences
+- Rust defers final `KThread` owner release until cooperative CPU fibers have stopped; resource-limit accounting remains identical to upstream.
+
+### Unintentional differences (fixed)
+- `run_on_guest_core_process` created unreserved dummy threads for the `sm` and `account` services to imitate observed thread IDs. Upstream creates only the reserved service thread; shutdown now finalizes exactly one thread for each committed `ThreadCountMax` reservation.
+
+### Missing items
+- None for this lifecycle correction.
+
+### Binary layout verification
+- PASS: only host-side service-thread lifecycle and accounting changed.
+
+### Verification
+- Re-read upstream `KernelCore::RunOnGuestCoreProcess`, `KThread::PostDestroy`, and the scoped thread-reservation flow.
+- `guest_service_thread_reservation_is_balanced_at_shutdown` verifies a committed reservation returns to zero without underflow.
+
+## 2026-08-08 — ruzu/src/{boot.rs,main_window.rs} vs yuzu/main.{h,cpp}
+
+### Intentional differences
+- GTK receives boot-thread completion through `LoadingEvent::StopComplete`; this keeps its main loop responsive while Rust tears down the emulation owners. Upstream uses Qt signals and `QThread::wait` for the equivalent ownership handoff.
+
+### Unintentional differences (fixed)
+- Closing the main window used the normal one-to-five-second graceful stop timer, while upstream `ShutdownGame` invokes `OnEmulationStopTimeExpired` immediately.
+- The GTK close handler synchronously joined the boot thread and could destroy its parent X11 window before the deferred render-target cleanup, producing `BadWindow`. It now waits asynchronously, releases the native render target, and only then closes the parent.
+
+### Missing items
+- None for the main-window shutdown ordering corrected here.
+
+### Binary layout verification
+- N/A: frontend command and lifecycle state only.
+
+### Verification
+- Re-read upstream `GMainWindow::{closeEvent,ShutdownGame,OnShutdownBegin,OnEmulationStopped}` after implementation.
+- `requesting_force_stop_bypasses_the_graceful_stop_command` verifies close requests use the immediate command and remain idempotent.
+
+## 2026-08-08 — core/src/hle/kernel/{k_page_table_base.rs,k_memory_block_manager.rs,k_process_page_table.rs} and core/src/memory/memory.rs vs core/hle/kernel/{k_page_table_base.{h,cpp},k_memory_block_manager.{h,cpp}} and core/memory.{h,cpp}
+
+### Intentional differences
+- `KPageTableBase::new` starts with a null `SystemRef` and receives the non-owning reference when `Memory` is attached, because the existing Rust constructor does not yet take `KernelCore&`; upstream initializes both references in its constructor.
+- The kernel memory-block slab is retained as an `Arc`; upstream stores a raw pointer owned by `KSystemResource`. Unit-only block managers may still be initialized and finalized without a slab, while every runtime page table uses the kernel-owned slab.
+- `KPageGroup` stores block information in its existing `Vec` representation rather than upstream's `KBlockInfoManager` slab, without changing physical page close ordering.
+
+### Unintentional differences (to fix)
+- Resolved: page-table finalization cleared every flat 4 KiB entry and resized the backing arrays before destroying them. Upstream finalizes memory blocks, then resets `m_impl` directly; the previous 39-bit path walked 134,217,728 entries and delayed shutdown by about 3.8 seconds.
+- Resolved: `KMemoryBlockManager::finalize` dropped its tree without invoking the page-table block callback or returning nodes to `KMemoryBlockSlabManager`.
+- Resolved: finalization omitted fastmem unmapping, physical-page reference release through `KPageGroup::CloseAndReset`, and insecure/IPC resource-limit release.
+- Resolved: `FinalizeProcess` and the upstream-owned `m_system`/`m_memory_block_slab_manager` state were absent from `KPageTableBase`.
+
+### Missing items
+- Unsafe mapped-memory cleanup remains the same explicit unimplemented path as upstream.
+
+### Binary layout verification
+- N/A: the modified state and callbacks are host-only page-table ownership data. No guest-visible structure changed.
+
+### Verification
+- Re-read upstream `KPageTableBase::{FinalizeProcess,Finalize}`, `KMemoryBlockManager::{Initialize,Finalize}`, and Linux `Memory::Impl::{MapMemoryRegion,UnmapRegion}` after implementation.
+- `finalize_invokes_callback_and_returns_blocks_to_slab` verifies callback order and slab accounting; `finalize_large_free_address_space_releases_page_table_directly` verifies a 39-bit free table is destroyed without an entry-by-entry unmap.
+- Corrected the existing coalescing regression fixture to pass its end address (`0x40004000`) rather than a size (`0x4000`) to `initialize(start, end)`, and to expect upstream's stop-after-crossing-update-end behavior.
+
+## 2026-08-08 — ruzu/src/configuration/configure_input_profile_dialog.rs and ruzu/src/applets/controller.rs vs yuzu/configuration/configure_input_profile_dialog.{h,cpp,ui} and yuzu/applets/qt_controller.ui
+
+### Intentional differences
+- The dialog does not add its own Clear and Defaults buttons. Upstream places them in `configure_input_profile_dialog.ui` and forwards them to `ConfigureInputPlayer::ClearAll` / `RestoreDefaults`; in ruzu those two buttons already live inside the player page widget itself, with the same semantics, so duplicating them would give the dialog two of each.
+- `QDialog::exec()`'s nested event loop has no GTK equivalent. The dialog is presented modally and non-blocking; upstream's `CallConfigureInputProfileDialog` returns only after the dialog closes, but nothing runs after that call, so the observable behavior is the same.
+- The applet dialog no longer forces upstream's 630-pixel height and sizes to its content instead. The `.ui` geometry is 839x630, but Qt shrinks the dialog to its layout minimum (observed: 858x446 for one player), which GTK does not do on its own. Width still follows upstream at 839.
+
+### Unintentional differences (fixed)
+- Fixed: `present()` created a fresh `InputProfiles` on every click. Upstream `QtControllerSelectorDialog` owns a single `std::unique_ptr<InputProfiles>` member (`qt_controller.cpp:68`) and passes it to every `ConfigureInputProfileDialog` it opens, so profile state and registered dropdowns are shared across invocations. Ownership now sits on the applet and the context is passed in.
+- Fixed: the applet's bottom band was missing `inputConfigGroup` entirely, so the Profiles/Create action had no entry point.
+- Fixed: `topControllerApplet` and `bottomControllerApplet` were laid out with outer margins, so their backgrounds stopped at the content. Upstream sets left/right margins to zero and centres the top row between `controllerAppletHorizontalSpacer2` and `...Spacer3`; padding now lives inside the bands, which span the full dialog width.
+- Fixed: `middleControllerApplet` did not absorb spare vertical space. Upstream `verticalLayout_2` uses `stretch="0,3,0"`, which pins the footer to the bottom edge.
+- Fixed: `groupPlayerNConnected` was rendered with both a labelled checkbox and a centred label, showing "P1" twice. Upstream's group box has an empty title.
+- Fixed: the player card was sized 126x112. Upstream pins it to 100x100 through matching `minimumSize` and `maximumSize`.
+- Fixed: `labelPlayerN` was styled with GTK's `title-3` class. Upstream declares a plain `QLabel` with no font override.
+- Fixed: unsupported controller types were dimmed to 22% opacity. Upstream swaps in the `*_disabled` artwork, which is the full-strength outline crossed by a diagonal stroke.
+- Fixed: `closeButtons` was rendered as a separate `GtkDialog` action row. Upstream keeps the error label and button box inside `bottomControllerApplet`.
+
+### Missing items
+- The profile editor is reached only from the controller applet. Upstream also exposes it from `ConfigureInput`'s own Profiles button, which remains unported.
+
+### Verification
+- Re-read upstream `yuzu/configuration/configure_input_profile_dialog.{h,cpp,ui}`, `yuzu/applets/qt_controller.{cpp,ui}`, and `yuzu/configuration/configure_input_player.cpp` (`ClearAll`, `RestoreDefaults`, `UpdateMappingWithDefaults`, the `player_index == 9` branch).
+- Confirmed `hid_util::index_to_npad_id_type(9)` yields `NpadIdType::Other`, matching upstream's scratch controller for profile editing.
+- Confirmed the `.ui` `<connections>` block wires `buttonBox` to `accept()` only, so neither response applies the mapping.
+- `cargo build --release -p ruzu --bin ruzu`
+
+## 2026-08-08 — ruzu/src/main_window.rs and input_common/src/main_common.rs vs yuzu/bootmanager.{h,cpp} and input_common/drivers/keyboard.{h,cpp}
+
+### Intentional differences
+- GTK attaches the focus-leave controller to `GMainWindow` because ruzu's embedded native X11 render surface is not a GTK widget. Upstream overrides `GRenderWindow::focusOutEvent`; both paths reset input when the render-owning window loses focus.
+
+### Unintentional differences (fixed)
+- The GTK frontend did not release keyboard, mouse, and touch states when its render window lost focus. A release event omitted by a focus transition could therefore leave a mapped controller button pressed indefinitely. The handler now calls `release_all_keys`, `release_all_buttons`, and `release_all_touch` in upstream order.
+
+### Binary layout verification
+- N/A: frontend event routing and host input-engine state only.
+
+### Verification
+- Re-read upstream `GRenderWindow::focusOutEvent` and `Keyboard::ReleaseAllKeys` after implementation.
+- `release_all_keys_clears_pressed_controller_bindings` verifies that the reset clears a pressed controller-binding key in the keyboard engine; the existing input-engine reset tests verify release callbacks are dispatched after the engine lock is dropped.

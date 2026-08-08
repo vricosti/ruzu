@@ -59,6 +59,7 @@ impl Default for BootParameters {
 
 enum EmulationCommand {
     Stop,
+    ForceStop,
     Pause(SyncSender<()>),
     Resume(SyncSender<()>),
     CaptureScreenshot {
@@ -155,6 +156,19 @@ impl EmulationSession {
         if let Some(tx) = self.command_tx.take() {
             self.frontend_stop_requested.store(true, Ordering::Release);
             let _ = tx.send(EmulationCommand::Stop);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Begin the immediate shutdown path used when the frontend itself closes.
+    /// Upstream `GMainWindow::ShutdownGame` calls `OnEmulationStopTimeExpired`
+    /// immediately instead of waiting for the normal graceful-exit timer.
+    pub fn request_force_stop(&mut self) -> bool {
+        if let Some(tx) = self.command_tx.take() {
+            self.frontend_stop_requested.store(true, Ordering::Release);
+            let _ = tx.send(EmulationCommand::ForceStop);
             true
         } else {
             false
@@ -658,14 +672,18 @@ fn run_boot(
     // GTK owns the main event loop. The boot thread retains ownership of
     // `System`, samples the same counters as upstream's 500 ms GUI timer, and
     // waits for a stop request between samples.
-    let stopped_by_frontend = loop {
+    let (stopped_by_frontend, force_stop) = loop {
         if guest_exit_requested.load(Ordering::Acquire) {
-            break false;
+            break (false, false);
         }
         match command_rx.recv_timeout(Duration::from_millis(500)) {
             Ok(EmulationCommand::Stop) | Err(RecvTimeoutError::Disconnected) => {
                 frontend_stop_requested.store(true, Ordering::Release);
-                break true;
+                break (true, false);
+            }
+            Ok(EmulationCommand::ForceStop) => {
+                frontend_stop_requested.store(true, Ordering::Release);
+                break (true, true);
             }
             Ok(EmulationCommand::CaptureScreenshot { path, layout }) => {
                 request_screenshot(&system, path, layout);
@@ -702,17 +720,20 @@ fn run_boot(
         system.set_shutting_down(true);
         system.set_exit_requested(true);
         system.get_applet_manager().request_exit();
-        let timeout = if system.debugger_enabled() {
-            Duration::ZERO
-        } else if system.get_exit_locked() {
-            Duration::from_secs(5)
-        } else {
-            Duration::from_secs(1)
-        };
-        let deadline = std::time::Instant::now() + timeout;
-        while !guest_exit_requested.load(Ordering::Acquire) && std::time::Instant::now() < deadline
-        {
-            std::thread::sleep(Duration::from_millis(10));
+        if !force_stop {
+            let timeout = if system.debugger_enabled() {
+                Duration::ZERO
+            } else if system.get_exit_locked() {
+                Duration::from_secs(5)
+            } else {
+                Duration::from_secs(1)
+            };
+            let deadline = std::time::Instant::now() + timeout;
+            while !guest_exit_requested.load(Ordering::Acquire)
+                && std::time::Instant::now() < deadline
+            {
+                std::thread::sleep(Duration::from_millis(10));
+            }
         }
     }
 
@@ -856,6 +877,28 @@ mod tests {
         assert!(frontend_stop_requested.load(Ordering::Acquire));
         assert!(matches!(command_rx.recv(), Ok(EmulationCommand::Stop)));
         assert!(!session.request_stop());
+    }
+
+    #[test]
+    fn requesting_force_stop_bypasses_the_graceful_stop_command() {
+        let (command_tx, command_rx) = std::sync::mpsc::channel();
+        let frontend_stop_requested = Arc::new(AtomicBool::new(false));
+        let mut session = EmulationSession {
+            command_tx: Some(command_tx),
+            join: None,
+            perf_results: Arc::new(RwLock::new(PerfStatsResults::default())),
+            shaders_building: Arc::new(AtomicI32::new(0)),
+            running: Arc::new(AtomicBool::new(false)),
+            paused: Arc::new(AtomicBool::new(false)),
+            program_id: Arc::new(AtomicU64::new(0)),
+            exit_locked: Arc::new(AtomicBool::new(false)),
+            frontend_stop_requested: Arc::clone(&frontend_stop_requested),
+        };
+
+        assert!(session.request_force_stop());
+        assert!(frontend_stop_requested.load(Ordering::Acquire));
+        assert!(matches!(command_rx.recv(), Ok(EmulationCommand::ForceStop)));
+        assert!(!session.request_force_stop());
     }
 
     #[test]

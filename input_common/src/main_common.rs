@@ -841,4 +841,18 @@ mod tests {
         drop(analog);
         subsystem.shutdown();
     }
+
+    #[test]
+    fn release_all_keys_clears_pressed_controller_bindings() {
+        let mut keyboard = Keyboard::new("focus_test_keyboard".to_string());
+        let engine = keyboard.engine();
+        let identifier = PadIdentifier::default();
+        engine.lock().pre_set_button(&identifier, 42);
+
+        keyboard.press_key(42);
+        assert!(engine.lock().get_button(&identifier, 42));
+
+        keyboard.release_all_keys();
+        assert!(!engine.lock().get_button(&identifier, 42));
+    }
 }

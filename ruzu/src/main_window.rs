@@ -112,8 +112,8 @@ pub struct GMainWindow {
     /// `System` + emu thread on `GMainWindow`).
     session: RefCell<Option<EmulationSession>>,
     /// GTK close requests are asynchronous when confirmation is required.
-    /// These flags prevent duplicate dialogs and let the accepted request pass
-    /// through the close handler exactly once.
+    /// These flags prevent duplicate dialogs and retain an accepted close until
+    /// asynchronous emulation teardown has released the native render target.
     close_confirmation_pending: Cell<bool>,
     close_confirmed: Cell<bool>,
     /// Prevent duplicate asynchronous `ConfirmShutdownGame` dialogs.
@@ -744,10 +744,12 @@ impl GMainWindow {
                     return glib::Propagation::Proceed;
                 }
 
-                if w.close_confirmed.replace(false) {
-                    if let Some(mut session) = w.session.borrow_mut().take() {
-                        session.stop();
+                if w.close_confirmed.get() {
+                    if let Some(session) = w.session.borrow_mut().as_mut() {
+                        let _ = session.request_force_stop();
+                        return glib::Propagation::Stop;
                     }
+                    w.close_confirmed.set(false);
                     return glib::Propagation::Proceed;
                 }
 
@@ -1012,6 +1014,16 @@ impl GMainWindow {
     /// preserving them keeps imported bindings and newly captured bindings in
     /// the same key space.
     fn install_input_handlers(self: &Rc<Self>) {
+        let focus = gtk::EventControllerFocus::new();
+        focus.connect_leave(glib::clone!(
+            #[weak(rename_to = this)]
+            self,
+            move |_| {
+                this.release_all_input();
+            }
+        ));
+        self.window.add_controller(focus);
+
         let keys = gtk::EventControllerKey::new();
         // Capture, so a key bound to a game control is not first swallowed by a
         // focused widget in the launcher chrome.
@@ -1131,6 +1143,20 @@ impl GMainWindow {
             }
         ));
         self.window.add_controller(scroll);
+    }
+
+    /// Port of `GRenderWindow::focusOutEvent`.
+    fn release_all_input(&self) {
+        let mut subsystem = self.input_subsystem.borrow_mut();
+        if let Some(keyboard) = subsystem.get_keyboard_mut() {
+            keyboard.release_all_keys();
+        }
+        if let Some(mouse) = subsystem.get_mouse_mut() {
+            mouse.release_all_buttons();
+        }
+        if let Some(touch_screen) = subsystem.get_touch_screen_mut() {
+            touch_screen.release_all_touch();
+        }
     }
 
     /// One key press or release — upstream's `keyPressEvent` / `keyReleaseEvent`.
@@ -2915,6 +2941,7 @@ impl GMainWindow {
     /// before releasing the native render target, clear the loading assets,
     /// restore the game list, and then report an error when applicable.
     fn on_emulation_stopped(self: &Rc<Self>, failure: Option<(String, String)>) {
+        let close_after_stop = self.close_confirmed.get();
         self.stop_confirmation_pending.set(false);
         if let Some(mut session) = self.session.borrow_mut().take() {
             session.stop();
@@ -2946,6 +2973,10 @@ impl GMainWindow {
 
         if let Some((message, detail)) = failure {
             self.alert(&message, &detail);
+        }
+        if close_after_stop {
+            self.close_confirmed.set(false);
+            self.window.close();
         }
     }
 
