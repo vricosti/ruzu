@@ -323,13 +323,12 @@ impl AppLoader for AppLoaderNsp {
     }
 
     /// Maps to upstream `AppLoader_NSP::ReadControlData`.
-    fn read_control_data(&self, _control: &mut NACP) -> ResultStatus {
-        // Upstream copies *nacp_file into the output NACP.
-        // The loader::NACP type does not yet support assignment from
-        // file_sys::control_metadata::NACP. When the loader NACP type is unified
-        // with file_sys NACP, this will copy the data.
+    fn read_control_data(&self, control: &mut NACP) -> ResultStatus {
         match &self.nacp_file {
-            Some(_nacp) => ResultStatus::Success,
+            Some(nacp) => {
+                *control = nacp.clone();
+                ResultStatus::Success
+            }
             None => ResultStatus::ErrorNoControl,
         }
     }

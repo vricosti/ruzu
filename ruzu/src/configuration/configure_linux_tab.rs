@@ -15,6 +15,7 @@
 
 use gtk::prelude::*;
 
+use super::configure_dialog::Page;
 use super::shared_widget as w;
 
 /// Build the "Linux" group. Returns the group's outer box plus the gamemode
@@ -27,4 +28,18 @@ pub fn group() -> (gtk::Box, gtk::CheckButton) {
     content.append(&gamemode);
 
     (outer, gamemode)
+}
+
+/// Build the standalone per-game Linux tab. Upstream adds this tab directly to
+/// `ConfigurePerGame` on Unix instead of embedding it in General.
+pub fn page() -> Page {
+    let (scroller, column) = w::page();
+    let (linux, gamemode) = group();
+    column.append(&linux);
+
+    Page::new("Linux", scroller, move || {
+        common::settings::values_mut()
+            .enable_gamemode
+            .set_value(gamemode.is_active());
+    })
 }

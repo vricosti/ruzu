@@ -60,6 +60,16 @@ macro_rules! settings_enum {
             }
         }
 
+        impl std::str::FromStr for $name {
+            type Err = ();
+
+            fn from_str(value: &str) -> Result<Self, Self::Err> {
+                Self::from_string(value)
+                    .or_else(|| value.parse::<u32>().ok().and_then(Self::from_u32))
+                    .ok_or(())
+            }
+        }
+
         impl Default for $name {
             fn default() -> Self {
                 // First variant is the default
@@ -126,6 +136,16 @@ impl Default for AudioEngine {
 impl std::fmt::Display for AudioEngine {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.canonicalize())
+    }
+}
+
+impl std::str::FromStr for AudioEngine {
+    type Err = ();
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::from_string(value)
+            .or_else(|| value.parse::<u32>().ok().and_then(Self::from_u32))
+            .ok_or(())
     }
 }
 

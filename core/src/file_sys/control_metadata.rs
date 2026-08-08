@@ -119,6 +119,7 @@ impl LanguageEntry {
 
 /// The raw NACP file format — 0x4000 bytes.
 /// Corresponds to upstream `RawNACP`.
+#[derive(Clone)]
 #[repr(C)]
 pub struct RawNACP {
     pub language_entries: [LanguageEntry; 16],
@@ -172,6 +173,7 @@ const _: () = assert!(std::mem::size_of::<RawNACP>() == 0x4000);
 
 /// A class representing the NACP control metadata format.
 /// Corresponds to upstream `NACP`.
+#[derive(Clone)]
 pub struct NACP {
     raw: Box<RawNACP>,
 }

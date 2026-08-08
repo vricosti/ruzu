@@ -27,8 +27,7 @@ pub struct System {
 
 pub use crate::hle::kernel::k_process::KProcess;
 
-/// Opaque placeholder for FileSys::NACP (not yet fully ported).
-pub struct NACP;
+pub use crate::file_sys::control_metadata::NACP;
 
 /// File types supported by the loader.
 ///

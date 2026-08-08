@@ -596,6 +596,11 @@ impl GMainWindow {
 
         // --- Status bar (upstream `QStatusBar`) -------------------------------
         let status_bar = StatusBar::new();
+        status_bar
+            .widget()
+            .set_visible(crate::uisettings::with(|values| {
+                *values.show_status_bar.get_value()
+            }));
         root.append(status_bar.widget());
 
         window.set_child(Some(&root));
@@ -708,7 +713,7 @@ impl GMainWindow {
         // need the window (render surface, loading screen, stack) so they live
         // here rather than in the app-startup registration.
         this.register_boot_actions(app);
-        this.register_fullscreen_actions(app);
+        this.register_view_actions(app);
 
         // Keep the checkable menu action and the window chrome synchronized
         // when the compositor exits fullscreen independently.
@@ -916,6 +921,68 @@ impl GMainWindow {
 
     /// Register upstream's checkable `View > Fullscreen` action and its two
     /// hotkeys: `F11` toggles it, while `Esc` only exits fullscreen.
+    fn register_view_actions(self: &Rc<Self>, app: &Application) {
+        self.register_fullscreen_actions(app);
+
+        let single_window = stateful_boolean_action(
+            "single_window_mode",
+            crate::uisettings::with(|values| *values.single_window_mode.get_value()),
+        );
+        single_window.connect_activate(|action, _| {
+            let enabled = toggle_boolean_action(action);
+            crate::uisettings::with_mut(|values| values.single_window_mode.set_value(enabled));
+            persist_view_settings();
+        });
+        app.add_action(&single_window);
+
+        let display_headers = stateful_boolean_action(
+            "display_dock_widget_headers",
+            crate::uisettings::with(|values| *values.display_titlebar.get_value()),
+        );
+        display_headers.connect_activate(|action, _| {
+            let enabled = toggle_boolean_action(action);
+            crate::uisettings::with_mut(|values| values.display_titlebar.set_value(enabled));
+            persist_view_settings();
+        });
+        app.add_action(&display_headers);
+
+        let show_filter = stateful_boolean_action(
+            "show_filter_bar",
+            crate::uisettings::with(|values| *values.show_filter_bar.get_value()),
+        );
+        show_filter.connect_activate(glib::clone!(
+            #[weak(rename_to = this)]
+            self,
+            move |action, _| {
+                let visible = toggle_boolean_action(action);
+                crate::uisettings::with_mut(|values| values.show_filter_bar.set_value(visible));
+                if let Some(game_list) = this.game_list.borrow().as_ref() {
+                    game_list.set_filter_visible(visible);
+                }
+                persist_view_settings();
+            }
+        ));
+        app.add_action(&show_filter);
+
+        let show_status = stateful_boolean_action(
+            "show_status_bar",
+            crate::uisettings::with(|values| *values.show_status_bar.get_value()),
+        );
+        show_status.connect_activate(glib::clone!(
+            #[weak(rename_to = this)]
+            self,
+            move |action, _| {
+                let visible = toggle_boolean_action(action);
+                crate::uisettings::with_mut(|values| values.show_status_bar.set_value(visible));
+                this.status_bar
+                    .widget()
+                    .set_visible(visible && !this.window.is_fullscreen());
+                persist_view_settings();
+            }
+        ));
+        app.add_action(&show_status);
+    }
+
     fn register_fullscreen_actions(self: &Rc<Self>, app: &Application) {
         let initially_checked = crate::uisettings::with(|values| *values.fullscreen.get_value());
         let fullscreen =
@@ -952,6 +1019,7 @@ impl GMainWindow {
             .unwrap_or(false);
         self.set_fullscreen_action_state(app, checked);
         crate::uisettings::with_mut(|values| values.fullscreen.set_value(checked));
+        persist_view_settings();
 
         // Upstream leaves the action checked when no game is running, but
         // ToggleFullscreen returns without changing the launcher window.
@@ -964,6 +1032,7 @@ impl GMainWindow {
         if self.session.borrow().is_some() && self.window.is_fullscreen() {
             self.set_fullscreen_action_state(app, false);
             crate::uisettings::with_mut(|values| values.fullscreen.set_value(false));
+            persist_view_settings();
             self.set_fullscreen(false);
         }
     }
@@ -3052,6 +3121,25 @@ impl GMainWindow {
     pub fn retranslate(&self) {
         self.refresh_menu_model();
         crate::i18n::translate_widget_tree(&self.window);
+    }
+}
+
+fn stateful_boolean_action(name: &str, initial: bool) -> gio::SimpleAction {
+    gio::SimpleAction::new_stateful(name, None, &initial.to_variant())
+}
+
+fn toggle_boolean_action(action: &gio::SimpleAction) -> bool {
+    let enabled = !action
+        .state()
+        .and_then(|state| state.get::<bool>())
+        .unwrap_or(false);
+    action.set_state(&enabled.to_variant());
+    enabled
+}
+
+fn persist_view_settings() {
+    if let Err(error) = crate::configuration::qt_config::save_view_values() {
+        log::error!("Failed to save View menu settings: {error}");
     }
 }
 

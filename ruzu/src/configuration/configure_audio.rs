@@ -25,6 +25,7 @@ const AUTO_DEVICE: &str = "auto";
 
 /// Build the Audio tab — upstream `ConfigureAudio`.
 pub fn page() -> Page {
+    let configuring_global = common::settings::is_configuring_global();
     let (scroller, column) = w::page();
 
     let (group, content) = w::group("Audio");
@@ -78,12 +79,14 @@ pub fn page() -> Page {
         "Mute audio",
         *common::settings::values().audio_muted.get_value(),
     );
+    mute.set_visible(configuring_global);
     content.append(&mute);
 
     let mute_background = w::check_row(
         "Mute audio when in background",
         crate::uisettings::with(|v| *v.mute_when_in_background.get_value()),
     );
+    mute_background.set_visible(configuring_global);
     content.append(&mute_background);
 
     column.append(&group);
@@ -117,9 +120,13 @@ pub fn page() -> Page {
             values.audio_input_device_id.set_value(input_name);
             values.sound_index.set_value(mode_value);
             values.volume.set_value(volume_value);
-            values.audio_muted.set_value(muted);
+            if configuring_global {
+                values.audio_muted.set_value(muted);
+            }
         }
-        crate::uisettings::with_mut(|v| v.mute_when_in_background.set_value(muted_background));
+        if configuring_global {
+            crate::uisettings::with_mut(|v| v.mute_when_in_background.set_value(muted_background));
+        }
     })
 }
 

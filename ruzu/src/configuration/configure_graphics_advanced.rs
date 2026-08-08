@@ -122,7 +122,7 @@ pub fn page() -> Page {
 
     column.append(&group);
 
-    Page::new("Advanced", scroller, move || {
+    Page::new("Adv. Graphics", scroller, move || {
         let accuracy_value = tr::value_at(tr::GPU_ACCURACY, accuracy.selected());
         let aniso_value = tr::value_at(tr::ANISOTROPY_MODE, aniso.selected());
         let recompression_value = tr::value_at(tr::ASTC_RECOMPRESSION, recompression.selected());

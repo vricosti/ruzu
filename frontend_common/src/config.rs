@@ -10,10 +10,12 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use common::settings_common::InputSetting;
+use common::settings_enums::Category;
 use common::settings_input::{
     ControllerType, PlayerInput, JOYCON_BODY_NEON_BLUE, JOYCON_BODY_NEON_RED,
     JOYCON_BUTTONS_NEON_BLUE, JOYCON_BUTTONS_NEON_RED,
 };
+use common::settings_setting::BasicSetting;
 
 // ---------------------------------------------------------------------------
 // ConfigType
@@ -310,6 +312,164 @@ impl BaseConfig {
             .get(&section)
             .and_then(|values| values.get(&full_key))
             .map(String::as_str)
+    }
+
+    fn write_raw(&mut self, key: &str, value: String) {
+        let section = self.get_section();
+        let full_key = self.get_full_key(key, false);
+        self.ini.entry(section).or_default().insert(full_key, value);
+    }
+
+    /// Maps to `Config::ReadSettingGeneric`.
+    fn read_setting_generic(&self, setting: &mut dyn BasicSetting) {
+        if !setting.save() || (!setting.switchable() && !self.global) {
+            return;
+        }
+
+        let key = adjust_key(setting.label());
+        let mut use_global = true;
+        if setting.switchable() && !self.global {
+            use_global = self.read_boolean_setting(&format!("{key}\\use_global"), Some(true));
+            setting.set_global(use_global);
+        }
+
+        if self.global || !use_global {
+            let is_default = self.read_boolean_setting(&format!("{key}\\default"), Some(true));
+            if is_default {
+                setting.load_string("");
+            } else {
+                let value = self.read_string_setting(&key, Some(&setting.default_to_string()));
+                setting.load_string(&value);
+            }
+        }
+    }
+
+    /// Maps to `Config::WriteSettingGeneric`.
+    fn write_setting_generic(&mut self, setting: &mut dyn BasicSetting) {
+        if !setting.save() {
+            return;
+        }
+
+        let key = adjust_key(setting.label());
+        if setting.switchable() {
+            if !self.global {
+                self.write_raw(
+                    &format!("{key}\\use_global"),
+                    to_string_bool(setting.using_global()),
+                );
+            }
+            if self.global || !setting.using_global() {
+                let value = if self.global {
+                    setting.to_string_global()
+                } else {
+                    setting.to_string_repr()
+                };
+                self.write_raw(
+                    &format!("{key}\\default"),
+                    to_string_bool(value == setting.default_to_string()),
+                );
+                self.write_raw(&key, adjust_output_string(&value));
+            }
+        } else if self.global {
+            let value = setting.to_string_repr();
+            self.write_raw(
+                &format!("{key}\\default"),
+                to_string_bool(value == setting.default_to_string()),
+            );
+            self.write_raw(&key, adjust_output_string(&value));
+        }
+    }
+
+    /// Maps to `Config::ReadCategory`.
+    pub fn read_category(&mut self, category: Category) {
+        self.begin_group(category.translate());
+        {
+            let mut values = common::settings::values_mut();
+            values.for_each_setting_in_category_mut(category, |setting| {
+                self.read_setting_generic(setting)
+            });
+        }
+        self.end_group();
+    }
+
+    /// Maps to `Config::WriteCategory`.
+    pub fn write_category(&mut self, category: Category) {
+        self.begin_group(category.translate());
+        {
+            let mut values = common::settings::values_mut();
+            values.for_each_setting_in_category_mut(category, |setting| {
+                self.write_setting_generic(setting)
+            });
+        }
+        self.end_group();
+    }
+
+    /// Read the categories shared by global and per-game configurations.
+    /// Maps to `Config::ReadValues`'s non-global portion.
+    pub fn read_values(&mut self) {
+        for category in [
+            Category::Controls,
+            Category::Core,
+            Category::Cpu,
+            Category::CpuDebug,
+            Category::CpuUnsafe,
+            Category::Linux,
+            Category::Renderer,
+            Category::RendererAdvanced,
+            Category::RendererDebug,
+            Category::Audio,
+            Category::System,
+            Category::SystemAudio,
+        ] {
+            self.read_category(category);
+        }
+    }
+
+    /// Write the categories shared by global and per-game configurations.
+    /// Maps to `Config::SaveValues`'s non-global portion.
+    pub fn save_values(&mut self) {
+        for category in [
+            Category::Controls,
+            Category::Core,
+            Category::Cpu,
+            Category::CpuDebug,
+            Category::CpuUnsafe,
+            Category::Linux,
+            Category::Renderer,
+            Category::RendererAdvanced,
+            Category::RendererDebug,
+            Category::Audio,
+            Category::System,
+            Category::SystemAudio,
+        ] {
+            self.write_category(category);
+        }
+    }
+
+    /// Serialize the current INI document to `config_loc`.
+    /// Maps to `Config::WriteToIni`.
+    pub fn write_to_ini(&self) -> std::io::Result<()> {
+        let path = Path::new(&self.config_loc);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+
+        let mut output = String::new();
+        for (section, values) in &self.ini {
+            if !section.is_empty() {
+                output.push('[');
+                output.push_str(section);
+                output.push_str("]\n");
+            }
+            for (key, value) in values {
+                output.push_str(key);
+                output.push('=');
+                output.push_str(value);
+                output.push('\n');
+            }
+            output.push('\n');
+        }
+        std::fs::write(path, output)
     }
 
     fn parse_bool(value: &str) -> Option<bool> {
@@ -630,6 +790,7 @@ fn controller_type_from_config(value: i64) -> ControllerType {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use common::settings_common::SwitchableSetting;
 
     #[test]
     fn test_adjust_key() {
@@ -806,5 +967,54 @@ mod tests {
     fn test_to_string_bool() {
         assert_eq!(to_string_bool(true), "true");
         assert_eq!(to_string_bool(false), "false");
+    }
+
+    #[test]
+    fn per_game_generic_setting_round_trips_global_state_and_custom_value() {
+        let mut config = BaseConfig::new(ConfigType::PerGameConfig);
+        config.load_ini(
+            "[Core]\nuse_multi_core\\use_global=false\nuse_multi_core\\default=false\nuse_multi_core=false\n",
+        );
+        config.begin_group("Core");
+
+        let mut setting = SwitchableSetting::new(true, "use_multi_core", Category::Core);
+        config.read_setting_generic(&mut setting);
+        assert!(!setting.using_global());
+        assert!(!*setting.get_value());
+        assert!(*setting.get_value_global());
+
+        setting.set_value(true);
+        config.write_setting_generic(&mut setting);
+        assert_eq!(
+            config
+                .ini
+                .get("Core")
+                .and_then(|section| section.get("use_multi_core\\use_global"))
+                .map(String::as_str),
+            Some("false")
+        );
+        assert_eq!(
+            config
+                .ini
+                .get("Core")
+                .and_then(|section| section.get("use_multi_core"))
+                .map(String::as_str),
+            Some("true")
+        );
+    }
+
+    #[test]
+    fn enum_settings_accept_upstream_canonical_and_numeric_forms() {
+        use std::str::FromStr;
+
+        assert_eq!(
+            common::settings_enums::RendererBackend::from_str("Vulkan"),
+            Ok(common::settings_enums::RendererBackend::Vulkan)
+        );
+        assert_eq!(
+            common::settings_enums::RendererBackend::from_str("1"),
+            Ok(common::settings_enums::RendererBackend::Vulkan)
+        );
+        assert!(common::settings_enums::RendererBackend::from_str("invalid").is_err());
     }
 }

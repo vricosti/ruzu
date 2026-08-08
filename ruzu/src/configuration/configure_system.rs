@@ -12,6 +12,10 @@
 
 use gtk::prelude::*;
 
+use std::cell::Cell;
+use std::rc::Rc;
+use std::time::{SystemTime, UNIX_EPOCH};
+
 use super::configure_dialog::Page;
 use super::shared_translation as tr;
 use super::shared_widget as w;
@@ -22,8 +26,21 @@ use super::shared_widget as w;
 /// carrying the same "dd/MM/yyyy HH:mm" text upstream displays.
 const RTC_FORMAT: &str = "%d/%m/%Y %H:%M";
 
+/// Upstream `LOCALE_BLOCKLIST`. Each bit marks a language that is invalid for
+/// the corresponding region index.
+const LOCALE_BLOCKLIST: [u32; 7] = [
+    0b0100011100001100000, // Japan
+    0b0000001101001100100, // Americas
+    0b0100110100001000010, // Europe
+    0b0100110100001000010, // Australia
+    0b0000000000000000000, // China
+    0b0100111100001000000, // Korea
+    0b0100111100001000000, // Taiwan
+];
+
 /// Build the System tab — upstream `ConfigureSystem`.
 pub fn page() -> Page {
+    let configuring_global = common::settings::is_configuring_global();
     let (scroller, column) = w::page();
 
     // --- "System" ---------------------------------------------------------
@@ -55,13 +72,18 @@ pub fn page() -> Page {
     let rtc_enabled = *common::settings::values().custom_rtc_enabled.get_value();
     let custom_rtc_check = gtk::CheckButton::with_label("Custom RTC Date:");
     custom_rtc_check.set_active(rtc_enabled);
+    let rtc_offset_value = *common::settings::values().custom_rtc_offset.get_value();
     let custom_rtc_entry = gtk::Entry::new();
-    custom_rtc_entry.set_text(&format_rtc(
-        *common::settings::values().custom_rtc.get_value(),
-    ));
+    custom_rtc_entry.set_text(&format_rtc(unix_time_seconds() + rtc_offset_value));
     custom_rtc_entry.set_sensitive(rtc_enabled);
     let rtc_row = gated_row(&custom_rtc_check, &custom_rtc_entry);
     system.append(&rtc_row);
+
+    let rtc_offset = gtk::SpinButton::with_range(i32::MIN as f64, i32::MAX as f64, 1.0);
+    rtc_offset.set_value(rtc_offset_value as f64);
+    rtc_offset.set_sensitive(rtc_enabled);
+    let rtc_offset_row = w::labeled_row(" ", &rtc_offset);
+    system.append(&rtc_offset_row);
 
     // RNG seed, gated the same way.
     let seed_enabled = *common::settings::values().rng_seed_enabled.get_value();
@@ -78,7 +100,30 @@ pub fn page() -> Page {
 
     let device_name_value = common::settings::values().device_name.get_value().clone();
     let (device_name_row, device_name) = w::entry_row("Device Name", &device_name_value);
+    device_name_row.set_visible(configuring_global);
     system.append(&device_name_row);
+
+    let console_mode_value = *common::settings::values().use_docked_mode.get_value();
+    let docked = gtk::CheckButton::with_label("Docked");
+    let handheld = gtk::CheckButton::with_label("Handheld");
+    handheld.set_group(Some(&docked));
+    if console_mode_value == common::settings_enums::ConsoleMode::Handheld {
+        handheld.set_active(true);
+    } else {
+        docked.set_active(true);
+    }
+    let console_buttons = gtk::Box::new(gtk::Orientation::Horizontal, 24);
+    console_buttons.append(&docked);
+    console_buttons.append(&handheld);
+    let console_mode_row = w::labeled_row("Console Mode:", &console_buttons);
+    console_mode_row.set_visible(!configuring_global);
+    system.append(&console_mode_row);
+
+    let invalid_locale = gtk::Label::new(None);
+    invalid_locale.set_wrap(true);
+    invalid_locale.set_xalign(0.0);
+    system.append(&invalid_locale);
+    connect_locale_validation(&language, &region, &invalid_locale);
 
     column.append(&system_group);
 
@@ -116,6 +161,8 @@ pub fn page() -> Page {
 
     // Gate each dependent control on its check box, as upstream does.
     gate(&custom_rtc_check, &custom_rtc_entry);
+    gate(&custom_rtc_check, &rtc_offset);
+    connect_rtc_controls(&custom_rtc_check, &custom_rtc_entry, &rtc_offset);
     gate(&rng_seed_check, &rng_seed_entry);
     gate(&speed_check, &speed_spin);
 
@@ -126,8 +173,10 @@ pub fn page() -> Page {
         &region_row,
         &time_zone_row,
         &rtc_row,
+        &rtc_offset_row,
         &seed_row,
         &device_name_row,
+        &console_mode_row,
         &memory_row,
         &speed_row,
     ]);
@@ -141,7 +190,7 @@ pub fn page() -> Page {
         let region_value = tr::value_at(tr::REGION, region.selected());
         let time_zone_value = time_zone.selected();
         let rtc_on = custom_rtc_check.is_active();
-        let rtc_value = parse_rtc(&custom_rtc_entry.text());
+        let rtc_offset_value = rtc_offset.value() as i64;
         let seed_on = rng_seed_check.is_active();
         let seed_value = u32::from_str_radix(rng_seed_entry.text().trim(), 16).unwrap_or(0);
         let device = device_name.text().to_string();
@@ -149,6 +198,11 @@ pub fn page() -> Page {
         let memory_value = tr::value_at(tr::MEMORY_LAYOUT, memory.selected());
         let limit_on = speed_check.is_active();
         let limit_value = speed_spin.value() as u16;
+        let console_mode = if handheld.is_active() {
+            common::settings_enums::ConsoleMode::Handheld
+        } else {
+            common::settings_enums::ConsoleMode::Docked
+        };
 
         let mut values = common::settings::values_mut();
         values.language_index.set_value(language_value);
@@ -157,17 +211,123 @@ pub fn page() -> Page {
             values.time_zone_index.set_value(zone);
         }
         values.custom_rtc_enabled.set_value(rtc_on);
-        if let Some(rtc) = rtc_value {
-            values.custom_rtc.set_value(rtc);
-        }
+        values.custom_rtc_offset.set_value(rtc_offset_value);
         values.rng_seed_enabled.set_value(seed_on);
         values.rng_seed.set_value(seed_value);
-        values.device_name.set_value(device);
+        if configuring_global {
+            values.device_name.set_value(device);
+        }
         values.use_multi_core.set_value(multi);
         values.memory_layout_mode.set_value(memory_value);
         values.use_speed_limit.set_value(limit_on);
         values.speed_limit.set_value(limit_value);
+        if !configuring_global {
+            values.use_docked_mode.set_value(console_mode);
+        }
     })
+}
+
+/// `ConfigureSystem::UpdateRtcTime` plus its reciprocal date/offset update.
+fn connect_rtc_controls(enabled: &gtk::CheckButton, date: &gtk::Entry, offset: &gtk::SpinButton) {
+    let updating = Rc::new(Cell::new(false));
+
+    offset.connect_value_changed({
+        let date = date.clone();
+        let updating = Rc::clone(&updating);
+        move |offset| {
+            if updating.replace(true) {
+                return;
+            }
+            date.set_text(&format_rtc(unix_time_seconds() + offset.value() as i64));
+            updating.set(false);
+        }
+    });
+
+    date.connect_changed({
+        let offset = offset.clone();
+        let updating = Rc::clone(&updating);
+        move |date| {
+            if updating.replace(true) {
+                return;
+            }
+            if let Some(timestamp) = parse_rtc(&date.text()) {
+                offset.set_value((timestamp - unix_time_seconds()) as f64);
+            }
+            updating.set(false);
+        }
+    });
+
+    enabled.connect_toggled({
+        let date = date.clone();
+        let offset = offset.clone();
+        let updating = Rc::clone(&updating);
+        move |enabled| {
+            if !enabled.is_active() || updating.replace(true) {
+                return;
+            }
+            date.set_text(&format_rtc(unix_time_seconds() + offset.value() as i64));
+            updating.set(false);
+        }
+    });
+}
+
+fn unix_time_seconds() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// Upstream `IsValidLocale`.
+fn is_valid_locale(region_index: u32, language_index: u32) -> bool {
+    LOCALE_BLOCKLIST
+        .get(region_index as usize)
+        .is_some_and(|blocked| ((blocked >> language_index) & 1) == 0)
+}
+
+fn connect_locale_validation(
+    language: &gtk::DropDown,
+    region: &gtk::DropDown,
+    warning: &gtk::Label,
+) {
+    let update = Rc::new({
+        let language = language.clone();
+        let region = region.clone();
+        let warning = warning.clone();
+        move || {
+            let valid = is_valid_locale(region.selected(), language.selected());
+            warning.set_visible(!valid);
+            if valid {
+                warning.set_text("");
+                return;
+            }
+
+            let language_name = language
+                .selected_item()
+                .and_downcast::<gtk::StringObject>()
+                .map(|item| item.string().to_string())
+                .unwrap_or_default();
+            let region_name = region
+                .selected_item()
+                .and_downcast::<gtk::StringObject>()
+                .map(|item| item.string().to_string())
+                .unwrap_or_default();
+            warning.set_text(&crate::i18n::tr_args(
+                "Warning: \"%1\" is not a valid language for region \"%2\"",
+                &[language_name, region_name],
+            ));
+        }
+    });
+
+    language.connect_selected_notify({
+        let update = Rc::clone(&update);
+        move |_| update()
+    });
+    region.connect_selected_notify({
+        let update = Rc::clone(&update);
+        move |_| update()
+    });
+    update();
 }
 
 /// A row whose label column is a check box gating the control on its right —
@@ -315,5 +475,14 @@ mod tests {
             time_zone_labels().len(),
             common::settings_enums::TimeZone::canonicalizations().len()
         );
+    }
+
+    #[test]
+    fn locale_validation_matches_upstream_blocklist() {
+        assert!(is_valid_locale(0, 0));
+        assert!(!is_valid_locale(0, 6));
+        assert!(!is_valid_locale(2, 1));
+        assert!(is_valid_locale(4, 18));
+        assert!(!is_valid_locale(7, 0));
     }
 }

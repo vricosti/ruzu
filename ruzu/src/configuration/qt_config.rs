@@ -32,6 +32,12 @@ use crate::uisettings::{self, GameDir};
 /// Key prefix for every game-directory setting.
 const GAMEDIRS_PREFIX: &str = "Paths\\gamedirs\\";
 
+/// Upstream `QtConfig::ReadUIGamelistValues` opens the `UiGameList` category and
+/// reads a `favorites` array of `program_id` entries. `TranslateCategory` renders
+/// that category as `UIGameList`, and the group is a key prefix inside `[UI]`
+/// rather than a section of its own — the same shape as `Paths\gamedirs\`.
+const FAVORITES_PREFIX: &str = "UIGameList\\favorites\\";
+
 /// The INI section the game-directory keys live in. Upstream's `QSettings`
 /// group for the whole UI config is `UI`, and the `Paths\` part is a key
 /// prefix inside it, not a section of its own.
@@ -158,6 +164,100 @@ pub fn load_ui_language() {
     uisettings::with_mut(|values| values.language.set_value(language));
 }
 
+/// Read upstream's checkable `View` action state from `Category::Ui`.
+pub fn load_view_values() {
+    let contents = std::fs::read_to_string(config_path()).unwrap_or_default();
+    let ui = parse_section_values(&contents, "UI");
+    uisettings::with_mut(|values| {
+        values.single_window_mode.set_value(read_ui_bool_setting(
+            &ui,
+            "singleWindowMode",
+            *values.single_window_mode.get_default(),
+        ));
+        values.fullscreen.set_value(read_ui_bool_setting(
+            &ui,
+            "fullscreen",
+            *values.fullscreen.get_default(),
+        ));
+        values.display_titlebar.set_value(read_ui_bool_setting(
+            &ui,
+            "displayTitleBars",
+            *values.display_titlebar.get_default(),
+        ));
+        values.show_filter_bar.set_value(read_ui_bool_setting(
+            &ui,
+            "showFilterBar",
+            *values.show_filter_bar.get_default(),
+        ));
+        values.show_status_bar.set_value(read_ui_bool_setting(
+            &ui,
+            "showStatusBar",
+            *values.show_status_bar.get_default(),
+        ));
+    });
+}
+
+/// Persist the five checkable `View` actions through upstream
+/// `QtConfig::SaveUIValues`'s generic `Category::Ui` writer.
+pub fn save_view_values() -> io::Result<()> {
+    let path = config_path();
+    let mut contents = std::fs::read_to_string(&path).unwrap_or_default();
+    uisettings::with(|values| {
+        for (key, value, default) in [
+            (
+                "singleWindowMode",
+                *values.single_window_mode.get_value(),
+                *values.single_window_mode.get_default(),
+            ),
+            (
+                "fullscreen",
+                *values.fullscreen.get_value(),
+                *values.fullscreen.get_default(),
+            ),
+            (
+                "displayTitleBars",
+                *values.display_titlebar.get_value(),
+                *values.display_titlebar.get_default(),
+            ),
+            (
+                "showFilterBar",
+                *values.show_filter_bar.get_value(),
+                *values.show_filter_bar.get_default(),
+            ),
+            (
+                "showStatusBar",
+                *values.show_status_bar.get_value(),
+                *values.show_status_bar.get_default(),
+            ),
+        ] {
+            contents =
+                replace_section_setting(&contents, "UI", key, &value.to_string(), value == default);
+        }
+    });
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, contents)
+}
+
+fn read_ui_bool_setting(
+    values: &std::collections::BTreeMap<String, String>,
+    key: &str,
+    default: bool,
+) -> bool {
+    if values
+        .get(&format!("{key}\\default"))
+        .is_none_or(|value| is_true(value))
+    {
+        default
+    } else {
+        values
+            .get(key)
+            .map(|value| is_true(value))
+            .unwrap_or(default)
+    }
+}
+
 /// Persist the selected interface locale through upstream's
 /// `Config::SaveUIValues` key and default marker.
 pub fn save_ui_language() -> io::Result<()> {
@@ -242,10 +342,15 @@ fn parse_section_values(
 ) -> std::collections::BTreeMap<String, String> {
     let mut values = std::collections::BTreeMap::new();
     let mut in_section = false;
+    let section_header = if section.starts_with('[') {
+        section.to_string()
+    } else {
+        format!("[{section}]")
+    };
     for line in contents.lines() {
         let trimmed = line.trim();
         if trimmed.starts_with('[') {
-            in_section = trimmed == section;
+            in_section = trimmed == section_header;
             continue;
         }
         if !in_section {
@@ -280,6 +385,121 @@ pub fn save_game_dirs(dirs: &[GameDir]) -> io::Result<()> {
         std::fs::create_dir_all(parent)?;
     }
     std::fs::write(&path, updated)
+}
+
+/// Read the favorited program IDs — upstream `QtConfig::ReadUIGamelistValues`.
+pub fn load_favorited_ids() -> Vec<u64> {
+    match std::fs::read_to_string(config_path()) {
+        Ok(contents) => parse_favorited_ids(&contents),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// Persist `ids` back into ruzu's config — upstream `QtConfig::SaveUIGamelistValues`.
+///
+/// As with [`save_game_dirs`], every other key is preserved byte-for-byte and the
+/// rewritten block takes the position of the first old line.
+pub fn save_favorited_ids(ids: &[u64]) -> io::Result<()> {
+    let path = config_path();
+    let contents = std::fs::read_to_string(&path).unwrap_or_default();
+    let updated = replace_favorited_ids(&contents, ids);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&path, updated)
+}
+
+/// Upstream reads the array with `ReadUnsignedIntegerSetting`, so the on-disk value
+/// is an unsigned decimal program ID.
+pub fn parse_favorited_ids(contents: &str) -> Vec<u64> {
+    use std::collections::BTreeMap;
+
+    let mut size: Option<u32> = None;
+    let mut ids: BTreeMap<u32, u64> = BTreeMap::new();
+
+    for line in contents.lines() {
+        let line = line.trim();
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let Some(rest) = key.strip_prefix(FAVORITES_PREFIX) else {
+            continue;
+        };
+        let Some((index_str, field)) = rest.split_once('\\') else {
+            if rest == "size" {
+                size = value.trim().parse().ok();
+            }
+            continue;
+        };
+        let Ok(index) = index_str.parse::<u32>() else {
+            continue;
+        };
+        // `…\default` suffixes are metadata, not the value.
+        if field == "program_id" {
+            if let Ok(program_id) = value.trim().parse::<u64>() {
+                ids.insert(index, program_id);
+            }
+        }
+    }
+
+    ids.into_iter()
+        // yuzu's arrays are 1-based on disk, so `size = N` covers 1..=N.
+        .filter(|(index, _)| size.is_none_or(|size| *index <= size))
+        .map(|(_, program_id)| program_id)
+        .collect()
+}
+
+/// Return `contents` with its `UIGameList\favorites\…` lines replaced by `ids`.
+fn replace_favorited_ids(contents: &str, ids: &[u64]) -> String {
+    let had_trailing_newline = contents.is_empty() || contents.ends_with('\n');
+
+    let is_favorite_line = |line: &str| {
+        line.trim()
+            .split_once('=')
+            .is_some_and(|(key, _)| key.starts_with(FAVORITES_PREFIX))
+    };
+
+    let mut out: Vec<String> = Vec::new();
+    let mut block_written = false;
+    for line in contents.lines() {
+        if is_favorite_line(line) {
+            if !block_written {
+                out.extend(render_favorited_ids(ids));
+                block_written = true;
+            }
+            continue;
+        }
+        out.push(line.to_string());
+    }
+
+    if !block_written {
+        if !out.iter().any(|line| line.trim() == UI_SECTION) {
+            if !out.is_empty() {
+                out.push(String::new());
+            }
+            out.push(UI_SECTION.to_string());
+        }
+        out.extend(render_favorited_ids(ids));
+    }
+
+    let mut text = out.join("\n");
+    if had_trailing_newline && !text.is_empty() {
+        text.push('\n');
+    }
+    text
+}
+
+fn render_favorited_ids(ids: &[u64]) -> Vec<String> {
+    let mut lines = Vec::with_capacity(ids.len() + 1);
+    lines.push(format!("{FAVORITES_PREFIX}size={}", ids.len()));
+    for (position, program_id) in ids.iter().enumerate() {
+        // 1-based on disk, matching what yuzu writes.
+        lines.push(format!(
+            "{FAVORITES_PREFIX}{}\\program_id={program_id}",
+            position + 1
+        ));
+    }
+    lines
 }
 
 /// The INI section the per-player control bindings live in.
@@ -475,6 +695,51 @@ pub fn save_control_values() -> io::Result<()> {
         std::fs::create_dir_all(parent)?;
     }
     std::fs::write(&path, updated)
+}
+
+/// Load the custom player-profile selection and bindings for one title.
+/// Maps to `QtConfig(ConfigType::PerGameConfig)` plus
+/// `Config::ReadControlValues` / `QtConfig::ReadQtControlPlayerValues`.
+pub fn load_per_game_control_values(path: &std::path::Path) {
+    let contents = std::fs::read_to_string(path).unwrap_or_default();
+    let values = parse_controls(&contents);
+
+    let mut settings = common::settings::values_mut();
+    settings.players.set_global(false);
+    let global_players = settings.players.get_value_explicit(true).clone();
+    let players = settings.players.get_value_mut();
+    for (index, player) in players.iter_mut().enumerate() {
+        let profile_key = format!("player_{index}_profile_name");
+        let profile_name = values.get(&profile_key).cloned().unwrap_or_default();
+        if profile_name.is_empty() {
+            *player = global_players[index].clone();
+            player.profile_name.clear();
+        } else {
+            load_player_values(player, index, &values);
+        }
+    }
+}
+
+/// Save only players that select a custom profile for this title.
+/// Upstream `Config::SavePlayerValues` returns before writing when the profile
+/// name is empty in a per-game configuration.
+pub fn save_per_game_control_values(path: &std::path::Path) -> io::Result<()> {
+    let contents = std::fs::read_to_string(path).unwrap_or_default();
+    let mut entries = Vec::new();
+    {
+        let settings = common::settings::values();
+        for (index, player) in settings.players.get_value().iter().enumerate() {
+            if !player.profile_name.is_empty() {
+                append_player_entries(&mut entries, index, player);
+            }
+        }
+    }
+
+    let updated = replace_controls(&contents, &entries);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, updated)
 }
 
 /// Upstream `QtConfig::ReadQtControlPlayerValues` for
@@ -826,6 +1091,25 @@ fn is_true(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn view_boolean_settings_honor_default_markers() {
+        let values = parse_section_values(
+            "[UI]\nshowFilterBar\\default=false\nshowFilterBar=false\nshowStatusBar\\default=true\nshowStatusBar=false\n",
+            "UI",
+        );
+        assert!(!read_ui_bool_setting(&values, "showFilterBar", true));
+        assert!(read_ui_bool_setting(&values, "showStatusBar", true));
+        assert!(read_ui_bool_setting(&values, "missing", true));
+    }
+
+    #[test]
+    fn view_boolean_writer_uses_upstream_ui_keys() {
+        let updated = replace_section_setting("", "UI", "showFilterBar", "false", false);
+        assert!(updated.contains("[UI]"));
+        assert!(updated.contains("showFilterBar\\default=false"));
+        assert!(updated.contains("showFilterBar=false"));
+    }
 
     #[test]
     fn tas_setting_replacement_preserves_sections_and_default_marker() {

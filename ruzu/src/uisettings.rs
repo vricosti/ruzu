@@ -49,6 +49,12 @@ pub struct Values {
     /// settings registry.
     pub game_dirs: Vec<GameDir>,
 
+    /// Program IDs the user marked as favorites — upstream
+    /// `UISettings::values.favorited_ids`. Like `game_dirs`, upstream keeps it as a
+    /// plain `QVector<u64>` written through `BeginArray`/`EndArray` rather than
+    /// through the settings registry, so it is not a `Setting<T>` here either.
+    pub favorited_ids: Vec<u64>,
+
     // ── Ui ──────────────────────────────────────────────────────────────
     pub single_window_mode: Setting<bool>,
     pub fullscreen: Setting<bool>,
@@ -94,6 +100,7 @@ impl Default for Values {
 
         Self {
             game_dirs: Vec::new(),
+            favorited_ids: Vec::new(),
 
             single_window_mode: Setting::new(true, "singleWindowMode", Ui),
             fullscreen: Setting::new(false, "fullscreen", Ui),

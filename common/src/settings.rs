@@ -12,6 +12,7 @@ use std::sync::{LazyLock, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use log::{info, warn};
 
 use crate::settings_common::{InputSetting, Setting, Specialization, SwitchableSetting};
+use crate::settings_setting::BasicSetting;
 
 // Re-export the types that consumers most commonly need.
 pub use crate::settings_enums::{
@@ -322,6 +323,130 @@ pub struct Values {
     pub title_id: u64,
     pub keys_dir: Option<std::path::PathBuf>,
     pub games_dir: Option<std::path::PathBuf>,
+}
+
+impl Values {
+    /// Visit settings owned by one upstream category.
+    ///
+    /// This is the Rust counterpart of `Settings::values.linkage.by_category`.
+    /// Keeping the field-to-category mapping here preserves `Values` ownership
+    /// while allowing `frontend_common::Config::{Read,Write}Category` to remain
+    /// generic like upstream.
+    pub fn for_each_setting_in_category_mut(
+        &mut self,
+        category: Category,
+        mut visit: impl FnMut(&mut dyn BasicSetting),
+    ) {
+        macro_rules! visit {
+            ($($field:ident),+ $(,)?) => {{
+                $(visit(&mut self.$field);)+
+            }};
+        }
+
+        match category {
+            Category::Audio => visit!(
+                sink_id,
+                audio_output_device_id,
+                audio_input_device_id,
+                volume,
+                audio_muted,
+                dump_audio_commands,
+            ),
+            Category::Core => visit!(
+                use_multi_core,
+                memory_layout_mode,
+                use_speed_limit,
+                speed_limit,
+            ),
+            Category::Cpu => visit!(cpu_backend, cpu_accuracy),
+            Category::CpuDebug => visit!(
+                cpu_debug_mode,
+                cpuopt_page_tables,
+                cpuopt_block_linking,
+                cpuopt_return_stack_buffer,
+                cpuopt_fast_dispatcher,
+                cpuopt_context_elimination,
+                cpuopt_const_prop,
+                cpuopt_misc_ir,
+                cpuopt_reduce_misalign_checks,
+                cpuopt_fastmem,
+                cpuopt_fastmem_exclusives,
+                cpuopt_recompile_exclusives,
+                cpuopt_ignore_memory_aborts,
+            ),
+            Category::CpuUnsafe => visit!(
+                cpuopt_unsafe_unfuse_fma,
+                cpuopt_unsafe_reduce_fp_error,
+                cpuopt_unsafe_ignore_standard_fpcr,
+                cpuopt_unsafe_inaccurate_nan,
+                cpuopt_unsafe_fastmem_check,
+                cpuopt_unsafe_ignore_global_monitor,
+            ),
+            Category::Renderer => visit!(
+                renderer_backend,
+                shader_backend,
+                vulkan_device,
+                use_disk_shader_cache,
+                use_asynchronous_gpu_emulation,
+                accelerate_astc,
+                vsync_mode,
+                nvdec_emulation,
+                fullscreen_mode,
+                aspect_ratio,
+                resolution_setup,
+                scaling_filter,
+                anti_aliasing,
+                fsr_sharpening_slider,
+                bg_red,
+                bg_green,
+                bg_blue,
+            ),
+            Category::RendererAdvanced => visit!(
+                gpu_accuracy,
+                max_anisotropy,
+                astc_recompression,
+                vram_usage_mode,
+                async_presentation,
+                renderer_force_max_clock,
+                use_reactive_flushing,
+                use_asynchronous_shaders,
+                use_fast_gpu_time,
+                use_vulkan_driver_pipeline_cache,
+                enable_compute_pipelines,
+                use_video_framerate,
+                barrier_feedback_loops,
+            ),
+            Category::RendererDebug => visit!(
+                renderer_debug,
+                renderer_shader_feedback,
+                enable_nsight_aftermath,
+                disable_shader_loop_safety_checks,
+                enable_renderdoc_hotkey,
+                disable_buffer_reorder,
+            ),
+            Category::System => visit!(
+                language_index,
+                region_index,
+                time_zone_index,
+                custom_rtc_enabled,
+                custom_rtc,
+                custom_rtc_offset,
+                rng_seed_enabled,
+                rng_seed,
+                device_name,
+                current_user,
+                use_docked_mode,
+            ),
+            Category::SystemAudio => visit!(sound_index),
+            Category::Linux => visit!(enable_gamemode),
+            Category::Controls => visit!(
+                vibration_enabled,
+                enable_accurate_vibrations,
+                motion_enabled,
+            ),
+            _ => {}
+        }
+    }
 }
 
 impl Default for Values {

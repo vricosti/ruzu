@@ -35,6 +35,7 @@ mod render_window_x11;
 mod status_bar;
 mod uisettings;
 mod util;
+mod vk_device_info;
 
 use main_window::GMainWindow;
 
@@ -120,7 +121,13 @@ fn main() -> glib::ExitCode {
     log::info!("Loaded {} configured game directory(ies)", game_dirs.len());
     uisettings::with_mut(|v| v.game_dirs = game_dirs);
 
+    // Upstream `Config::ReadUIGamelistValues` reads the favorites array in the same
+    // pass that fills `game_dirs`.
+    let favorited_ids = configuration::qt_config::load_favorited_ids();
+    uisettings::with_mut(|v| v.favorited_ids = favorited_ids);
+
     configuration::qt_config::load_ui_language();
+    configuration::qt_config::load_view_values();
     let interface_language = uisettings::with(|v| v.language.get_value().clone());
     i18n::set_language(&interface_language);
 

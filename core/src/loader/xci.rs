@@ -267,14 +267,12 @@ impl AppLoader for AppLoaderXci {
     }
 
     /// Maps to upstream `AppLoader_XCI::ReadControlData`.
-    fn read_control_data(&self, _control: &mut NACP) -> ResultStatus {
-        // Upstream: if (nacp_file == nullptr) return ErrorNoControl;
-        // control = *nacp_file;
-        // The loader::NACP placeholder type does not yet support assignment
-        // from file_sys::control_metadata::NACP. When the loader NACP type
-        // is unified with file_sys NACP, this will copy the data.
+    fn read_control_data(&self, control: &mut NACP) -> ResultStatus {
         match &self.nacp_file {
-            Some(_nacp) => ResultStatus::Success,
+            Some(nacp) => {
+                *control = nacp.clone();
+                ResultStatus::Success
+            }
             None => ResultStatus::ErrorNoControl,
         }
     }

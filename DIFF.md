@@ -34006,3 +34006,93 @@ Rust files: `externals/rdynarmic/src/frontend/a32/{decoder.rs, decoder_thumb32.r
 ### Verification
 - Re-read upstream `GRenderWindow::focusOutEvent` and `Keyboard::ReleaseAllKeys` after implementation.
 - `release_all_keys_clears_pressed_controller_bindings` verifies that the reset clears a pressed controller-binding key in the keyboard engine; the existing input-engine reset tests verify release callbacks are dispatched after the engine lock is dropped.
+
+## 2026-08-08 — ruzu/src/{main_window.rs,game_list.rs,configuration/qt_config.rs} vs yuzu/{main.cpp,main.ui,game_list.cpp,game_list.h}
+
+### Intentional differences
+- GTK represents the five checkable `View` entries with stateful boolean `GSimpleAction` objects; Qt uses checkable `QAction` objects. Their checked state, activation behavior, and persisted UI keys match upstream.
+- Filtering rebuilds each directory's visible GTK child store from retained source rows because `GtkTreeListModel` has no equivalent of Qt's per-row `setRowHidden`; matching and result counts follow upstream.
+
+### Unintentional differences (fixed)
+- `Fullscreen`, `Single Window Mode`, `Display Dock Widget Headers`, `Show Filter Bar`, and `Show Status Bar` were plain actions and therefore lacked upstream's checkboxes and persisted checked state.
+- The filter bar and upstream's all-words/title-ID filtering behavior were absent.
+- The status bar ignored `showStatusBar` during initial window construction.
+
+### Missing items
+- `Single Window Mode` and `Display Dock Widget Headers` persist and display their upstream check state, but cannot alter layout until the GTK frontend owns a separate render window and dock widgets.
+
+### Binary layout verification
+- N/A: GTK menu state, filtering models, and UI configuration text only.
+
+### Verification
+- Re-read upstream `main.ui` action declarations, `GMainWindow::{LoadUISettings,ConnectMenuEvents,OnToggleFilterBar,OnToggleStatusBar,SaveUISettings}`, and `GameList::{OnTextChanged,SetFilterFocus,SetFilterVisible,ClearFilter}` after implementation.
+- `cargo test -p ruzu --bin ruzu -- --test-threads=1`: 166 passed.
+- Release runtime verification confirmed all five actions expose boolean GTK state, both bars hide/show immediately, and `showFilterBar`/`showStatusBar` persist under `[UI]`.
+
+## 2026-08-08 — common/src/{settings.rs,settings_enums.rs,settings_setting.rs} and frontend_common/src/config.rs vs common/settings*.{h,cpp} and yuzu/configuration/config.{h,cpp}
+
+### Intentional differences
+- Rust snapshots switchable settings in keyed maps while upstream iterates registered `SettingInterface` pointers; category ownership, global/custom selection, default markers, and serialized values remain equivalent.
+- `BaseConfig` writes INI text directly because ruzu has no Qt `QSettings`; category and key names follow upstream's config translation.
+
+### Unintentional differences (fixed)
+- Per-game configuration could only read a small system subset and could not select, serialize, or restore switchable custom values. The generic category path required by `ConfigurePerGame` is now available.
+- Switchable settings did not expose the upstream global/custom selection and restoration operations needed to edit a title without mutating global values.
+
+### Missing items
+- Generic config persistence currently covers the categories used by the Properties dialog; categories outside that surface remain separate parity slices.
+
+### Binary layout verification
+- N/A: host configuration ownership and INI serialization only.
+
+### Verification
+- Re-read upstream switchable-setting selection and `Config::{ReadCategory,WriteCategory}` flows after implementation.
+- Configuration boundary/default-marker tests are included in the 166-test `ruzu` suite.
+
+## 2026-08-08 — ruzu/src/configuration/{configure_per_game.rs,configure_per_game_addons.rs,configure_input_per_game.rs} and ruzu/src/vk_device_info.rs vs yuzu/configuration/{configure_per_game.{h,cpp,ui},configure_per_game_addons.{h,cpp,ui},configure_input_per_game.{h,cpp,ui},configure_graphics.cpp}
+
+### Intentional differences
+- GTK composes the permanent information panel and notebook in code; upstream loads the equivalent Qt `.ui` files. The left panel is fixed at 280 pixels and its icon at 256 by 256 pixels, preserving the upstream size-policy behavior while the notebook expands.
+- The Vulkan device list is queried through `ash` instead of Qt's Vulkan wrappers; it exposes the same physical-device names to the Graphics page.
+- The non-blocking GTK window is retained by `GameListView` until `close-request`; upstream owns a stack-local modal `QDialog` for the duration of `exec()`.
+
+### Unintentional differences (fixed)
+- The title Properties action and dialog were absent. The dialog now owns Add-Ons, System, CPU, Graphics, Advanced Graphics, Audio, Input Profiles, and Linux pages in upstream order.
+- The dialog previously reused global configuration state without a per-title owner. It now reads, applies, writes, and restores the selected title's custom configuration.
+- Closing and reopening Properties could retain a dead native GTK window. The game-list owner is now cleared at `close-request`, matching the upstream dialog lifetime.
+- The System page omitted upstream locale validation and its unsupported-locale warning.
+
+### Missing items
+- Input Profiles currently exposes the per-game profile selection surface but not every upstream profile-management action.
+- Add-On enablement is loaded from the title patch manager; complete installed-content removal remains owned by the still-unported Remove actions in the title context menu.
+
+### Binary layout verification
+- N/A: frontend widgets, host metadata, and INI configuration only.
+
+### Verification
+- Re-read all matching `.h`, `.cpp`, and `.ui` files after implementation, including the fixed left-panel size policies and page order.
+- Runtime verification opened and closed the same title's Properties window twice without launching the title or retaining a destroyed window.
+- `cargo test -p ruzu --bin ruzu -- --test-threads=1`: 166 passed; `cargo build --release --bin ruzu` passes.
+
+## 2026-08-08 — ruzu/src/game_list.rs, ruzu/src/configuration/qt_config.rs, core/src/file_sys/control_metadata.rs and core/src/loader/{loader.rs,nro.rs,nsp.rs,xci.rs} vs yuzu/{game_list.cpp,game_list.h,game_list_worker.cpp,main.cpp} and core/loader/*
+
+### Intentional differences
+- GTK uses a square `PopoverMenu` and per-popover `GSimpleActionGroup`; upstream uses a stack-local `QMenu`. Section and submenu ownership follows `GameList::AddGamePopup`.
+- Actions whose backend owner is not ported remain visible to reproduce the upstream menu surface, but report that the operation is unavailable instead of silently performing partial work.
+
+### Unintentional differences (fixed)
+- The title menu omitted Favorite, global-configuration launch, save-data location, the Remove and Dump RomFS submenus, integrity verification, shortcut creation, and Properties. Their visibility, order, grouping, and Title-ID conditions now follow upstream.
+- Loader rows lacked the metadata needed by the permanent Properties information panel. NRO, NSP, and XCI loaders now expose the selected title's NACP-derived name, developer, version, icon, format, size, filename, and program ID.
+- Favorites were not loaded or saved through upstream's `[UI]` `UIGameList\\favorites` array representation.
+
+### Missing items
+- Remove, Dump RomFS, integrity verification, and shortcut actions still require their upstream backend implementations; their current unavailable warnings are explicit temporary behavior.
+- `Start Game without Custom Configuration` has the correct menu/action path but still shares the ordinary boot path until per-boot global-config selection is wired into the session owner.
+
+### Binary layout verification
+- PASS: NACP fields are read through the existing guest-layout type; all new row metadata and menu state are host-only.
+
+### Verification
+- Re-read upstream `GameList::{PopupContextMenu,AddGamePopup}`, the corresponding `GMainWindow` handlers, and each modified loader metadata accessor after implementation.
+- Runtime verification exercised the exact title context menu and two successive Properties openings.
+- Game-list menu, favorite serialization, loader metadata, and navigation regressions are covered by the passing 166-test `ruzu` suite.

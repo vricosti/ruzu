@@ -31,6 +31,9 @@ use crate::settings_enums::Category;
 /// Every `Setting<T>` and `SwitchableSetting<T>` implements this when `T`
 /// satisfies the necessary bounds.
 pub trait BasicSetting {
+    /// Whether this setting participates in configuration persistence.
+    fn save(&self) -> bool;
+
     /// String representation of the current value (respects global state).
     fn to_string_repr(&self) -> String;
 
@@ -52,6 +55,12 @@ pub trait BasicSetting {
 
     /// Whether this is a switchable setting.
     fn switchable(&self) -> bool;
+
+    /// Whether a switchable setting currently inherits its global value.
+    fn using_global(&self) -> bool;
+
+    /// Select the global or custom storage of a switchable setting.
+    fn set_global(&mut self, global: bool);
 
     /// Whether this is a ranged setting.
     fn ranged(&self) -> bool;
@@ -120,6 +129,10 @@ impl<T> BasicSetting for Setting<T>
 where
     T: SettingType,
 {
+    fn save(&self) -> bool {
+        self.save
+    }
+
     fn to_string_repr(&self) -> String {
         format!("{}", self.get_value())
     }
@@ -155,6 +168,12 @@ where
     fn switchable(&self) -> bool {
         false
     }
+
+    fn using_global(&self) -> bool {
+        true
+    }
+
+    fn set_global(&mut self, _global: bool) {}
 
     fn ranged(&self) -> bool {
         self.is_ranged()
@@ -195,6 +214,10 @@ impl<T> BasicSetting for SwitchableSetting<T>
 where
     T: SettingType,
 {
+    fn save(&self) -> bool {
+        self.setting.save
+    }
+
     fn to_string_repr(&self) -> String {
         format!("{}", self.get_value())
     }
@@ -228,6 +251,14 @@ where
 
     fn switchable(&self) -> bool {
         true
+    }
+
+    fn using_global(&self) -> bool {
+        self.using_global()
+    }
+
+    fn set_global(&mut self, global: bool) {
+        self.set_global(global);
     }
 
     fn ranged(&self) -> bool {

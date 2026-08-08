@@ -44,11 +44,20 @@ pub fn page() -> Page {
     );
     api.append(&shader_row);
 
-    // Vulkan physical-device picker. Upstream fills this from
-    // `VkDeviceInfo::Record`s enumerated at startup; enumerating devices needs
-    // a Vulkan instance the dialog does not own, so the row offers the stored
-    // index only.
-    let (device_row, device) = w::combo_row("Device:", &["Device 0"], 0);
+    // Vulkan physical-device picker, populated from the upstream-owned
+    // `VkDeviceInfo::Record` counterpart.
+    let mut device_records = Vec::new();
+    crate::vk_device_info::populate_records(&mut device_records);
+    let mut device_labels: Vec<String> = device_records
+        .iter()
+        .map(|record| record.name.clone())
+        .collect();
+    if device_labels.is_empty() {
+        device_labels.push("Device 0".to_string());
+    }
+    let device_label_refs: Vec<&str> = device_labels.iter().map(String::as_str).collect();
+    let selected_device = (*common::settings::values().vulkan_device.get_value()).max(0) as u32;
+    let (device_row, device) = w::combo_row("Device:", &device_label_refs, selected_device);
     api.append(&device_row);
 
     // Only one of the two rows is ever visible, matching `UpdateAPILayout`.

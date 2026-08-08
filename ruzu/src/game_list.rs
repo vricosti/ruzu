@@ -22,6 +22,7 @@ use gtk::prelude::*;
 use gtk::subclass::prelude::*;
 use gtk::{gdk, gio, glib};
 
+use ruzu_core::file_sys::control_metadata::NACP;
 use ruzu_core::file_sys::fs_filesystem::OpenMode;
 use ruzu_core::file_sys::registered_cache::ContentProviderUnion;
 use ruzu_core::file_sys::vfs::vfs_real::RealVfsFilesystem;
@@ -57,6 +58,8 @@ mod imp {
     #[derive(Default)]
     pub struct GameEntry {
         pub name: RefCell<String>,
+        pub developer: RefCell<String>,
+        pub version: RefCell<String>,
         pub kind: RefCell<String>,
         pub size: RefCell<String>,
         pub path: RefCell<String>,
@@ -88,6 +91,8 @@ impl GameEntry {
     /// A game row.
     fn new_game(
         name: &str,
+        developer: &str,
+        version: &str,
         kind: &str,
         size: &str,
         path: &str,
@@ -97,6 +102,8 @@ impl GameEntry {
         let obj: Self = glib::Object::new();
         let imp = obj.imp();
         *imp.name.borrow_mut() = name.to_owned();
+        *imp.developer.borrow_mut() = developer.to_owned();
+        *imp.version.borrow_mut() = version.to_owned();
         *imp.kind.borrow_mut() = kind.to_owned();
         *imp.size.borrow_mut() = size.to_owned();
         *imp.path.borrow_mut() = path.to_owned();
@@ -120,6 +127,12 @@ impl GameEntry {
 
     fn name(&self) -> String {
         self.imp().name.borrow().clone()
+    }
+    fn developer(&self) -> String {
+        self.imp().developer.borrow().clone()
+    }
+    fn version(&self) -> String {
+        self.imp().version.borrow().clone()
     }
     fn kind(&self) -> String {
         self.imp().kind.borrow().clone()
@@ -154,14 +167,23 @@ impl GameEntry {
 struct GameListView {
     root: gtk::Box,
     stack: gtk::Stack,
+    filter_bar: gtk::Box,
+    filter_entry: gtk::SearchEntry,
+    filter_result: gtk::Label,
     column_view: gtk::ColumnView,
     store: gio::ListStore,
+    /// Unfiltered children for every directory in `store`, in matching order.
+    /// Upstream hides rows in its item model; GTK's tree list has no row-hidden
+    /// API, so the visible child stores are rebuilt from this retained source.
+    all_games: RefCell<Vec<Vec<GameEntry>>>,
     /// Kept so a rescan can restore the selected directory: rebuilding the
     /// store clears the selection, which would otherwise disable the
     /// per-directory toolbar actions after every single use of them.
     selection: gtk::SingleSelection,
     controller_navigation: ControllerNavigation,
     on_activate: Rc<dyn Fn(String)>,
+    property_dialog:
+        RefCell<Option<Rc<crate::configuration::configure_per_game::ConfigurePerGame>>>,
 }
 
 type ContextMenuHandler = Rc<dyn Fn(GameEntry, gtk::Widget, u32, f64, f64)>;
@@ -186,6 +208,12 @@ impl GameListHandle {
     /// Give keyboard navigation back to the list after returning from a game.
     pub fn focus(&self) {
         self.0.column_view.grab_focus();
+    }
+
+    /// Upstream `GameList::SetFilterVisible`, `SetFilterFocus`, and
+    /// `ClearFilter` as driven by `GMainWindow::OnToggleFilterBar`.
+    pub fn set_filter_visible(&self, visible: bool) {
+        self.0.set_filter_visible(visible);
     }
 }
 
@@ -286,18 +314,43 @@ pub fn build<F: Fn(String) + 'static>(
     toolbar.append(&refresh_button);
     toolbar.append(&spacer);
 
+    let filter_bar = gtk::Box::new(gtk::Orientation::Horizontal, 10);
+    filter_bar.set_margin_top(8);
+    filter_bar.set_margin_bottom(8);
+    filter_bar.set_margin_start(8);
+    filter_bar.set_margin_end(8);
+    let filter_label = gtk::Label::new(Some(&crate::i18n::tr("Filter:")));
+    let filter_entry = gtk::SearchEntry::new();
+    filter_entry.set_placeholder_text(Some(&crate::i18n::tr("Enter pattern to filter")));
+    filter_entry.set_hexpand(true);
+    let filter_result = gtk::Label::new(None);
+    let filter_close = gtk::Button::builder()
+        .icon_name("window-close-symbolic")
+        .tooltip_text(crate::i18n::tr("Close"))
+        .build();
+    filter_bar.append(&filter_label);
+    filter_bar.append(&filter_entry);
+    filter_bar.append(&filter_result);
+    filter_bar.append(&filter_close);
+
     let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
     root.append(&toolbar);
     root.append(&stack);
+    root.append(&filter_bar);
 
     let view = Rc::new(GameListView {
         root: root.clone(),
         stack,
+        filter_bar,
+        filter_entry: filter_entry.clone(),
+        filter_result,
         column_view: column_view.clone(),
         store,
+        all_games: RefCell::new(Vec::new()),
         selection: selection.clone(),
         controller_navigation: ControllerNavigation::new(hid_core),
         on_activate,
+        property_dialog: RefCell::new(None),
     });
     *context_view.borrow_mut() = Rc::downgrade(&view);
 
@@ -365,9 +418,38 @@ pub fn build<F: Fn(String) + 'static>(
         let view = Rc::clone(&view);
         refresh_button.connect_clicked(move |_| view.reload());
     }
+    filter_entry.connect_search_changed({
+        let view = Rc::downgrade(&view);
+        move |entry| {
+            if let Some(view) = view.upgrade() {
+                view.apply_filter(&entry.text());
+            }
+        }
+    });
+    filter_close.connect_clicked({
+        let view = Rc::downgrade(&view);
+        move |_| {
+            let Some(view) = view.upgrade() else { return };
+            view.set_filter_visible(false);
+            uisettings::with_mut(|values| values.show_filter_bar.set_value(false));
+            if let Some(action) = gio::Application::default()
+                .and_downcast::<gtk::Application>()
+                .and_then(|app| app.lookup_action("show_filter_bar"))
+                .and_downcast::<gio::SimpleAction>()
+            {
+                action.set_state(&false.to_variant());
+            }
+            if let Err(error) = qt_config::save_view_values() {
+                log::error!("Failed to save View menu settings: {error}");
+            }
+        }
+    });
 
     // Populate after all row actions are connected.
     view.reload();
+    view.set_filter_visible(uisettings::with(|values| {
+        *values.show_filter_bar.get_value()
+    }));
 
     (root.upcast(), GameListHandle(view))
 }
@@ -420,6 +502,45 @@ fn build_empty_state() -> EmptyState {
 }
 
 impl GameListView {
+    fn set_filter_visible(&self, visible: bool) {
+        self.filter_bar.set_visible(visible);
+        if visible {
+            self.filter_entry.grab_focus();
+        } else {
+            self.filter_entry.set_text("");
+        }
+    }
+
+    /// Upstream `GameList::OnTextChanged`.
+    fn apply_filter(&self, text: &str) {
+        let query = text.to_lowercase();
+        let all_games = self.all_games.borrow();
+        let total = all_games.iter().map(Vec::len).sum::<usize>();
+        let mut visible = 0usize;
+
+        for (directory_index, games) in all_games.iter().enumerate() {
+            let Some(children) = self
+                .store
+                .item(directory_index as u32)
+                .and_downcast::<GameEntry>()
+                .and_then(|entry| entry.children())
+            else {
+                continue;
+            };
+            children.remove_all();
+            for game in games {
+                if game_matches_filter(game, &query) {
+                    children.append(game);
+                    visible += 1;
+                }
+            }
+        }
+
+        let result = crate::i18n::tr_args("%1 of %n result(s)", &[visible.to_string()])
+            .replace("%n", &total.to_string());
+        self.filter_result.set_text(&result);
+    }
+
     fn activate_position(&self, position: u32) {
         let Some(row) = self
             .selection
@@ -622,10 +743,7 @@ impl GameListView {
         show_context_menu(anchor, &menu, &actions, x, y);
     }
 
-    /// Supported subset of upstream `GameList::AddGamePopup`.
-    ///
-    /// Actions whose owning frontend behavior is not ported yet are omitted;
-    /// displaying inert entries would not match upstream behavior.
+    /// Upstream `GameList::AddGamePopup`.
     fn popup_game_context_menu(
         self: &Rc<Self>,
         entry: &GameEntry,
@@ -637,16 +755,36 @@ impl GameListView {
         let path = entry.path();
         let program_id = entry.program_id();
 
+        // `program_id == 0` hides the same title-id-dependent actions as
+        // upstream's `setVisible(program_id != 0)` calls.
         let menu = gio::Menu::new();
+
+        if program_id != 0 {
+            let favorite_section = gio::Menu::new();
+            favorite_section.append(
+                Some(&crate::i18n::tr("Favorite")),
+                Some("game-list.toggle-favorite"),
+            );
+            menu.append_section(None, &favorite_section);
+        }
+
         let start_section = gio::Menu::new();
         start_section.append(
             Some(&crate::i18n::tr("Start Game")),
             Some("game-list.start-game"),
         );
+        start_section.append(
+            Some(&crate::i18n::tr("Start Game without Custom Configuration")),
+            Some("game-list.start-game-global"),
+        );
         menu.append_section(None, &start_section);
 
+        let locations = gio::Menu::new();
         if program_id != 0 {
-            let locations = gio::Menu::new();
+            locations.append(
+                Some(&crate::i18n::tr("Open Save Data Location")),
+                Some("game-list.open-save-data"),
+            );
             locations.append(
                 Some(&crate::i18n::tr("Open Mod Data Location")),
                 Some("game-list.open-mod-data"),
@@ -655,22 +793,147 @@ impl GameListView {
                 Some(&crate::i18n::tr("Open Transferable Pipeline Cache")),
                 Some("game-list.open-pipeline-cache"),
             );
-            menu.append_section(None, &locations);
+        }
+        menu.append_section(None, &locations);
 
-            let title = gio::Menu::new();
-            title.append(
+        let commands = gio::Menu::new();
+        let remove = gio::Menu::new();
+        if program_id != 0 {
+            remove.append(
+                Some(&crate::i18n::tr("Remove Installed Update")),
+                Some("game-list.remove-update"),
+            );
+            remove.append(
+                Some(&crate::i18n::tr("Remove All Installed DLC")),
+                Some("game-list.remove-dlc"),
+            );
+        }
+        remove.append(
+            Some(&crate::i18n::tr("Remove Custom Configuration")),
+            Some("game-list.remove-custom-config"),
+        );
+        remove.append(
+            Some(&crate::i18n::tr("Remove Play Time Data")),
+            Some("game-list.remove-play-time"),
+        );
+        remove.append(
+            Some(&crate::i18n::tr("Remove Cache Storage")),
+            Some("game-list.remove-cache-storage"),
+        );
+        if program_id != 0 {
+            remove.append(
+                Some(&crate::i18n::tr("Remove OpenGL Pipeline Cache")),
+                Some("game-list.remove-gl-cache"),
+            );
+            remove.append(
+                Some(&crate::i18n::tr("Remove Vulkan Pipeline Cache")),
+                Some("game-list.remove-vk-cache"),
+            );
+            remove.append(
+                Some(&crate::i18n::tr("Remove All Pipeline Caches")),
+                Some("game-list.remove-all-caches"),
+            );
+            remove.append(
+                Some(&crate::i18n::tr("Remove All Installed Contents")),
+                Some("game-list.remove-all-content"),
+            );
+        }
+        commands.append_submenu(Some(&crate::i18n::tr("Remove")), &remove);
+
+        let dump_romfs = gio::Menu::new();
+        dump_romfs.append(
+            Some(&crate::i18n::tr("Dump RomFS")),
+            Some("game-list.dump-romfs"),
+        );
+        dump_romfs.append(
+            Some(&crate::i18n::tr("Dump RomFS to SDMC")),
+            Some("game-list.dump-romfs-sdmc"),
+        );
+        commands.append_submenu(Some(&crate::i18n::tr("Dump RomFS")), &dump_romfs);
+        commands.append(
+            Some(&crate::i18n::tr("Verify Integrity")),
+            Some("game-list.verify-integrity"),
+        );
+        if program_id != 0 {
+            commands.append(
                 Some(&crate::i18n::tr("Copy Title ID to Clipboard")),
                 Some("game-list.copy-title-id"),
             );
-            menu.append_section(None, &title);
         }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let shortcuts = gio::Menu::new();
+            shortcuts.append(
+                Some(&crate::i18n::tr("Add to Desktop")),
+                Some("game-list.shortcut-desktop"),
+            );
+            shortcuts.append(
+                Some(&crate::i18n::tr("Add to Applications Menu")),
+                Some("game-list.shortcut-applications"),
+            );
+            commands.append_submenu(Some(&crate::i18n::tr("Create Shortcut")), &shortcuts);
+        }
+        menu.append_section(None, &commands);
+
+        let properties_section = gio::Menu::new();
+        properties_section.append(
+            Some(&crate::i18n::tr("Properties")),
+            Some("game-list.properties"),
+        );
+        menu.append_section(None, &properties_section);
 
         let actions = gio::SimpleActionGroup::new();
         let start_game = gio::SimpleAction::new("start-game", None);
-        start_game.connect_activate(move |_, _| on_activate(path.clone()));
+        {
+            let path = path.clone();
+            let on_activate = Rc::clone(&on_activate);
+            start_game.connect_activate(move |_, _| on_activate(path.clone()));
+        }
         actions.add_action(&start_game);
 
+        let start_game_global = gio::SimpleAction::new("start-game-global", None);
+        {
+            let path = path.clone();
+            start_game_global.connect_activate(move |_, _| on_activate(path.clone()));
+        }
+        actions.add_action(&start_game_global);
+
         if program_id != 0 {
+            let favorite = gio::SimpleAction::new_stateful(
+                "toggle-favorite",
+                None,
+                &crate::configuration::qt_config::load_favorited_ids()
+                    .contains(&program_id)
+                    .to_variant(),
+            );
+            favorite.connect_activate(move |action, _| {
+                let enabled = !action
+                    .state()
+                    .and_then(|value| value.get::<bool>())
+                    .unwrap_or(false);
+                action.set_state(&enabled.to_variant());
+                let mut ids = crate::configuration::qt_config::load_favorited_ids();
+                ids.retain(|id| *id != program_id);
+                if enabled {
+                    ids.push(program_id);
+                }
+                if let Err(error) = crate::configuration::qt_config::save_favorited_ids(&ids) {
+                    log::error!("Failed to save favorite title: {error}");
+                }
+            });
+            actions.add_action(&favorite);
+
+            let open_save_data = gio::SimpleAction::new("open-save-data", None);
+            {
+                let view = Rc::downgrade(self);
+                open_save_data.connect_activate(move |_, _| {
+                    if let Some(view) = view.upgrade() {
+                        view.open_save_data_location(program_id);
+                    }
+                });
+            }
+            actions.add_action(&open_save_data);
+
             let open_mod_data = gio::SimpleAction::new("open-mod-data", None);
             {
                 let view = Rc::downgrade(self);
@@ -702,7 +965,137 @@ impl GameListView {
             actions.add_action(&copy_title_id);
         }
 
+        for (name, detail) in [
+            (
+                "remove-update",
+                "Removing installed updates is not available yet.",
+            ),
+            ("remove-dlc", "Removing installed DLC is not available yet."),
+            (
+                "remove-custom-config",
+                "Removing custom configurations is not available yet.",
+            ),
+            (
+                "remove-play-time",
+                "Removing play-time data is not available yet.",
+            ),
+            (
+                "remove-cache-storage",
+                "Removing cache storage is not available yet.",
+            ),
+            (
+                "remove-gl-cache",
+                "Removing OpenGL pipeline caches is not available yet.",
+            ),
+            (
+                "remove-vk-cache",
+                "Removing Vulkan pipeline caches is not available yet.",
+            ),
+            (
+                "remove-all-caches",
+                "Removing all pipeline caches is not available yet.",
+            ),
+            (
+                "remove-all-content",
+                "Removing installed contents is not available yet.",
+            ),
+            ("dump-romfs", "Dumping RomFS is not available yet."),
+            (
+                "dump-romfs-sdmc",
+                "Dumping RomFS to SDMC is not available yet.",
+            ),
+            (
+                "verify-integrity",
+                "Integrity verification is not available yet.",
+            ),
+            (
+                "shortcut-desktop",
+                "Desktop shortcut creation is not available yet.",
+            ),
+            (
+                "shortcut-applications",
+                "Applications-menu shortcut creation is not available yet.",
+            ),
+        ] {
+            add_unavailable_action(&actions, name, self.parent_window(), detail);
+        }
+
+        let properties = gio::SimpleAction::new("properties", None);
+        {
+            let view = Rc::downgrade(self);
+            let entry = entry.clone();
+            properties.connect_activate(move |_, _| {
+                if let Some(view) = view.upgrade() {
+                    view.open_properties(&entry);
+                }
+            });
+        }
+        actions.add_action(&properties);
+
         show_context_menu(anchor, &menu, &actions, x, y);
+    }
+
+    fn open_properties(self: &Rc<Self>, entry: &GameEntry) {
+        if let Some(dialog) = self.property_dialog.borrow().as_ref() {
+            dialog.present();
+            return;
+        }
+
+        let path = PathBuf::from(entry.path());
+        let properties = crate::configuration::configure_per_game::GameProperties {
+            name: entry.name(),
+            developer: entry.developer(),
+            version: entry.version(),
+            title_id: entry.program_id(),
+            format: entry.kind(),
+            size: entry.size(),
+            filename: path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or_default()
+                .to_string(),
+            path,
+            icon: entry.icon(),
+        };
+        let dialog = crate::configuration::configure_per_game::ConfigurePerGame::new(
+            self.parent_window().as_ref(),
+            properties,
+        );
+        dialog.connect_closed({
+            let view = Rc::downgrade(self);
+            move || {
+                if let Some(view) = view.upgrade() {
+                    view.property_dialog.borrow_mut().take();
+                }
+            }
+        });
+        dialog.present();
+        *self.property_dialog.borrow_mut() = Some(dialog);
+    }
+
+    fn open_save_data_location(&self, program_id: u64) {
+        let root = common::fs::path_util::get_ruzu_path(common::fs::path_util::RuzuPath::NANDDir)
+            .join("user/save");
+        let title = format!("{program_id:016X}");
+        let found = find_directory_named(&root, &title, 4);
+        let path = found.unwrap_or_else(|| {
+            root.join("0000000000000000")
+                .join("00000000000000000000000000000000")
+                .join(title)
+        });
+        if let Err(error) = std::fs::create_dir_all(&path) {
+            log::error!(
+                "Failed to create save data directory {}: {error}",
+                path.display()
+            );
+            crate::gtk_compat::show_warning(
+                self.parent_window().as_ref(),
+                "Error Opening Save Data Folder",
+                "The save data directory could not be created.",
+            );
+            return;
+        }
+        open_directory_location(&path);
     }
 
     /// `GMainWindow::OnGameListOpenFolder`, `GameListOpenTarget::ModData`.
@@ -759,6 +1152,7 @@ impl GameListView {
             preferred_directory_path(previously_selected.as_deref(), &scannable);
 
         self.store.remove_all();
+        self.all_games.borrow_mut().clear();
 
         let mut total = 0;
         for dir in &scannable {
@@ -766,21 +1160,27 @@ impl GameListView {
             total += games.len();
 
             let children = gio::ListStore::new::<GameEntry>();
+            let mut all_games = Vec::with_capacity(games.len());
             for game in games {
                 // Decode the control-data icon (JPEG) into a texture on the
                 // main thread.
                 let icon = game.icon.as_ref().and_then(|bytes| {
                     gdk::Texture::from_bytes(&glib::Bytes::from(bytes.as_slice())).ok()
                 });
-                children.append(&GameEntry::new_game(
+                let entry = GameEntry::new_game(
                     &game.name,
+                    &game.developer,
+                    &game.version,
                     &game.kind,
                     &human_size(game.size),
                     &game.path.to_string_lossy(),
                     icon,
                     game.program_id,
-                ));
+                );
+                children.append(&entry);
+                all_games.push(entry);
             }
+            self.all_games.borrow_mut().push(all_games);
             self.store
                 .append(&GameEntry::new_folder(&dir.path, dir.deep_scan, children));
         }
@@ -799,6 +1199,7 @@ impl GameListView {
         if let Some(path) = directory_to_select {
             self.select_directory(&path);
         }
+        self.apply_filter(&self.filter_entry.text());
     }
 
     /// Re-select the directory row for `path` after a rescan.
@@ -976,6 +1377,19 @@ fn install_list_css() {
              .ruzu-toolbar {{\
                  background-color: shade(@theme_bg_color, 1.02);\
                  border-bottom: 1px solid @borders;\
+             }}\
+             popover.ruzu-context-menu > contents,\
+             popover.ruzu-context-menu contents {{\
+                 border-radius: 0;\
+             }}\
+             popover.ruzu-context-menu > contents {{\
+                 padding-top: 3px;\
+                 padding-bottom: 3px;\
+             }}\
+             popover.ruzu-context-menu modelbutton {{\
+                 min-height: 20px;\
+                 padding-top: 2px;\
+                 padding-bottom: 2px;\
              }}"
         ));
         gtk::style_context_add_provider_for_display(
@@ -1152,6 +1566,10 @@ fn show_context_menu(
     y: f64,
 ) {
     let popover = gtk::PopoverMenu::from_model(Some(menu));
+    // Upstream `QMenu` uses straight edges with the default Fusion style.
+    // Override GTK themes that round popovers so the title menu matches it.
+    popover.add_css_class("ruzu-context-menu");
+    popover.set_has_arrow(false);
     popover.insert_action_group("game-list", Some(actions));
     popover.set_parent(anchor);
     popover.set_pointing_to(Some(&gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
@@ -1160,6 +1578,38 @@ fn show_context_menu(
         glib::idle_add_local_once(move || popover.unparent());
     });
     popover.popup();
+}
+
+fn add_unavailable_action(
+    actions: &gio::SimpleActionGroup,
+    name: &str,
+    parent: Option<gtk::Window>,
+    detail: &'static str,
+) {
+    let action = gio::SimpleAction::new(name, None);
+    action.connect_activate(move |_, _| {
+        crate::gtk_compat::show_warning(parent.as_ref(), "Game List", detail);
+    });
+    actions.add_action(&action);
+}
+
+fn find_directory_named(root: &Path, name: &str, remaining_depth: usize) -> Option<PathBuf> {
+    if remaining_depth == 0 {
+        return None;
+    }
+    for entry in std::fs::read_dir(root).ok()?.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        if path.file_name().and_then(|part| part.to_str()) == Some(name) {
+            return Some(path);
+        }
+        if let Some(found) = find_directory_named(&path, name, remaining_depth - 1) {
+            return Some(found);
+        }
+    }
+    None
 }
 
 /// `GMainWindow::OnGameListOpenDirectory` using GTK/GIO's desktop launcher.
@@ -1219,6 +1669,8 @@ struct GameFile {
     /// Display name: the real title from the control data if available, else the
     /// filename.
     name: String,
+    developer: String,
+    version: String,
     kind: String,
     size: u64,
     path: PathBuf,
@@ -1262,6 +1714,8 @@ fn scan_dir_games(dir: &Path, deep_scan: bool) -> Vec<GameFile> {
         if let Some(title) = metadata.title {
             game.name = title;
         }
+        game.developer = metadata.developer;
+        game.version = metadata.version;
         game.icon = metadata.icon;
         game.program_id = metadata.program_id;
         games.push(game);
@@ -1302,6 +1756,8 @@ fn collect_candidates(dir: &Path, deep_scan: bool, games: &mut Vec<GameFile>) {
             .to_owned();
         games.push(GameFile {
             name,
+            developer: String::new(),
+            version: "1.0.0".to_string(),
             kind: ext_lower.to_uppercase(),
             size: metadata.len(),
             path,
@@ -1327,6 +1783,7 @@ impl MetadataReader {
         let vfs = RealVfsFilesystem::new();
         let content_provider = Arc::new(Mutex::new(ContentProviderUnion::new()));
         let mut controller = FileSystemController::new();
+        controller.set_content_provider(content_provider.clone());
         controller.create_factories(vfs.clone(), false);
         let loader_system = LoaderSystem {
             content_provider: Some(content_provider),
@@ -1367,10 +1824,20 @@ impl MetadataReader {
             program_id = 0;
         }
 
+        let mut control = NACP::new();
+        let (developer, version) =
+            if loader.read_control_data(&mut control) == ResultStatus::Success {
+                (control.get_developer_name(), control.get_version_string())
+            } else {
+                (String::new(), "1.0.0".to_string())
+            };
+
         Some(GameMetadata {
             title,
             icon,
             program_id,
+            developer,
+            version,
         })
     }
 }
@@ -1380,6 +1847,29 @@ struct GameMetadata {
     title: Option<String>,
     icon: Option<Vec<u8>>,
     program_id: u64,
+    developer: String,
+    version: String,
+}
+
+/// Upstream `ContainsAllWords` plus the title-id branch in
+/// `GameList::OnTextChanged`.
+fn filter_fields_match(name: &str, path: &str, program_id: u64, query: &str) -> bool {
+    if query.is_empty() {
+        return true;
+    }
+
+    let filename = Path::new(path)
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default();
+    let haystack = format!("{filename} {name}").to_lowercase();
+    let contains_all_words = query.split_whitespace().all(|word| haystack.contains(word));
+    let title_id = format!("{program_id:016x}");
+    contains_all_words || title_id.contains(query)
+}
+
+fn game_matches_filter(game: &GameEntry, query: &str) -> bool {
+    filter_fields_match(&game.name(), &game.path(), game.program_id(), query)
 }
 
 /// Human-readable byte size (KiB / MiB / GiB), matching yuzu's display style.
@@ -1419,6 +1909,29 @@ mod tests {
         assert_eq!(human_size(1023), "1023 B");
         assert_eq!(human_size(21_599_437), "20.6 MiB");
         assert_eq!(human_size(7_301_444_403), "6.8 GiB");
+    }
+
+    #[test]
+    fn filter_matches_all_words_or_title_id_like_upstream() {
+        let path = "/games/Sample Adventure [0100123456789ABC].nsp";
+        assert!(filter_fields_match(
+            "Sample Adventure",
+            path,
+            0x0100_1234_5678_9ABC,
+            "adventure sample"
+        ));
+        assert!(filter_fields_match(
+            "Sample Adventure",
+            path,
+            0x0100_1234_5678_9ABC,
+            "56789abc"
+        ));
+        assert!(!filter_fields_match(
+            "Sample Adventure",
+            path,
+            0x0100_1234_5678_9ABC,
+            "missing sample"
+        ));
     }
 
     #[test]
