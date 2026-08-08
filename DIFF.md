@@ -28072,8 +28072,8 @@ Rust files: `externals/rdynarmic/src/frontend/a32/{decoder.rs, decoder_thumb32.r
   ordering.
 
 ### Missing items
-- Upstream's `stop_event` request/reset lifecycle has no direct counterpart in
-  this focused network-shutdown slice.
+- Fixed in the 2026-08-08 VI shutdown parity slice: `System` now owns the
+  upstream-equivalent stop event and preserves its request/reset ordering.
 
 ### Binary layout verification
 - PASS: no guest-facing or serialized structure changed.
@@ -34109,3 +34109,86 @@ Rust files: `externals/rdynarmic/src/frontend/a32/{decoder.rs, decoder_thumb32.r
 - Re-read upstream `GameList::{PopupContextMenu,AddGamePopup}`, the corresponding `GMainWindow` handlers, and each modified loader metadata accessor after implementation.
 - Runtime verification exercised the exact title context-menu order and separators, followed by two successive Properties openings.
 - `StartGameType` and per-game configuration-path regressions are included in the passing 172-test `ruzu` suite.
+
+## 2026-08-08 — core/src/{cpu_manager.rs,hle/kernel/{k_condition_variable.rs,k_light_lock.rs,k_scheduler.rs,k_server_session.rs,k_synchronization_object.rs,k_thread.rs,kernel.rs,svc/svc_ipc.rs},hle/service/server_manager.rs} vs core/{cpu_manager.cpp,hle/kernel/{k_condition_variable.cpp,k_light_lock.{h,cpp},k_scheduler.{h,cpp},k_server_session.{h,cpp},k_synchronization_object.cpp,k_thread.{h,cpp},kernel.cpp,svc/svc_ipc.cpp},hle/service/server_manager.{h,cpp}}
+
+### Intentional differences
+- Rust stores `ServerManager` in `Arc<Mutex<ServerManager>>`, whereas upstream protects selection and deferred-list linkage with separate mutexes. The shared wait adaptation retains upstream's `m_selection_mutex` across `MultiWait::WaitAny`, but releases the outer Rust owner mutex while blocked so request workers can reply and link completed sessions to `m_deferred_list`.
+- `KThread::context_guard_owner` is an atomic core-id lock word rather than upstream's `KSpinLock`. It preserves ownership across a fiber switch without retaining a Rust mutex guard on a different stack.
+- Rust priority-inheritance trees retain both the upstream-equivalent stable `KThread` address and the thread ID needed by process-owned maps. Ordering remains `(priority, thread_id)`, matching upstream's intrusive comparator.
+- Ownerless unit-test sessions retain synchronous inline dispatch because those fixtures do not run a `ServerManager` worker. Runtime sessions created by managed ports or child IPC interfaces carry the manager owner, pending-registration queue and wakeup event, and therefore always use the upstream-shaped path.
+- Rust explicitly restores the executing fiber's `KThread` in host TLS at the guest execution boundary. Upstream establishes the same invariant through `SetCurrentThread` immediately before yielding to the selected thread's host context.
+
+### Unintentional differences (fixed)
+- Synchronous IPC routing depended on `RUZU_SERVER_THREAD_IPC_ALL`, `RUZU_SERVER_THREAD_IPC_HANDLE`, service/Binder selectors and `RUZU_INLINE_IPC`. Managed sessions are now always linked to their owning `ServerManager`; `SendSyncRequest` always performs `OnRequest`/`BeginWait`, host-thread dispatch, `SendReplyHLE`/`EndWait`.
+- Rust-only post-IPC sleeps, cooperative yields and inline reschedule switches changed service timing and scheduling. Their environment controls and behavior have been removed; `RUZU_TRACE_HOST_THREAD_IPC` is observation-only.
+- The internal manager wakeup signaled only the host condition variable. `MultiWait` blocks on the kernel-readable event, so requests arriving while a session holder was temporarily unlinked could be missed. Both event representations are now signaled.
+- The shared event loop held `Mutex<ServerManager>` across `MultiWait::WaitAny`. With multiple upstream-style BSD host workers, one worker could select and process a session while another acquired the owner mutex and slept; the first worker then could neither send its reply nor relink the selected session. `wait_signaled_shared` now performs list preparation under the owner mutex, drops it for `WaitAny`, and reacquires it only to unlink/classify the selected holder, while `selection_mutex` continues to serialize selection exactly as upstream.
+- Raw scheduler entry points reread and rewrote the priority-queue front through `refresh_highest_from_priority_queue_raw`, bypassing upstream's centralized scheduler-lock update. The repair path and its disable/trace variables are removed.
+- `context_guard` used `parking_lot::Mutex`, deliberately leaked its guard and later called unsafe `force_unlock`, while separately tracking an owner. The single atomic owner word now performs the upstream spinlock's compare-and-acquire/release role.
+- The 10 ms preemption callback interrupted every JIT core unconditionally. It now only rotates scheduler queues under the scheduler lock; all-core interruption remains diagnostic-only for live register dumps.
+- `UpdateHighestPriorityThread` omitted upstream idle accounting and `KProcess::SetRunningThread`; both are now updated in upstream order. Its scheduler-lock precondition is enforced in release builds.
+- Fibers sharing one host core could enter guest execution while TLS still named the previously resumed fiber. The executing `KThread` identity is restored before scheduler inspection, SVC dispatch or JIT execution.
+- Synchronization waits reacquired the Rust-only `Arc<Mutex<KServerSession/KPort>>` wrapper while holding the scheduler lock. Session request handling takes those locks in the opposite order. Waitable resolution now retains the owner `Arc` and uses the stable object address under the scheduler lock, matching upstream's direct object access.
+- `KLightLock::UnlockSlowPath` converted upstream's returned `KThread*` into a thread ID and looked it up in `GlobalSchedulerContext`. Host HLE dummy threads are not schedulable and are therefore absent from that registry. The priority-inheritance tree now returns the stable waiter address directly, as upstream does.
+
+### Missing items
+- Splitting the outer Rust `Mutex<ServerManager>` into upstream-equivalent selection and deferred-list synchronization remains a structural ownership task. Current lock-release ordering has runtime parity but not lock-layout parity.
+- Removing the unit-test-only inline helper requires rebuilding the direct SVC fixtures around a running `ServerManager`; it is no longer a runtime routing option.
+
+### Binary layout verification
+- PASS: all changed state is host-side scheduling, synchronization or service ownership. No guest ABI structure, IPC command-buffer layout or serialized payload changed.
+
+### Verification
+- Re-read upstream `SendSyncRequestImpl`, `KClientSession::SendSyncRequest`, `KServerSession::{OnRequest,SendReplyHLE}`, `ServerManager::{LinkToDeferredList,WaitSignaled,OnSessionEvent,CompleteSyncRequest}`, `KScheduler::{UpdateHighestPriorityThreadsImpl,ScheduleImplFiber,Unload,UpdateHighestPriorityThread}`, `CpuManager::RunThread` and the preemption callback after implementation.
+- `server_manager::tests`: 20 passed, including `shared_wait_does_not_hold_the_manager_lock`; `k_scheduler::tests`: 20 passed.
+- `k_light_lock::tests`: 2 passed; `k_synchronization_object::tests`: 3 passed; the priority-inheritance transfer regression preserves the selected waiter's stable address.
+- `request_signals_server_manager_kernel_wakeup_event` and `resumed_guest_fiber_restores_current_thread_tls` pass in release mode.
+- A 20-second release runtime launch passed both former failure points: no scheduler/session deadlock and no `KLightLock` waiter panic; the process remained live until the controlled termination.
+- A traced STK runtime run reproduced the multi-worker BSD deadlock with both selected session holders absent from `MultiWait`, then the corrected release build advanced through BSD initialization and rendered the player-identification screen instead of remaining on `Launching...`.
+- The full serial `cargo test -p core --release --lib` was attempted. It retained pre-existing failures in A32 invalid-fetch, crypto configuration, condition-variable and process tests, then stopped making progress in the dummy-thread scheduler test after those failures had polluted process-global test state; the same scheduler test passes in an isolated process.
+
+## 2026-08-08 — core/src/core.rs and core/src/hle/service/vi/vi.rs vs core/core.cpp and core/hle/service/vi/vi.cpp
+
+### Intentional differences
+- Rust models `std::stop_source`, `std::stop_token`, and `std::stop_callback` with a mutex-protected callback registry and a scoped `StopCallback`. Callback invocation occurs without holding the registry mutex, preserving upstream callback and teardown ordering without C++ stop-token primitives.
+
+### Unintentional differences (fixed)
+- `System::shutdown_main_process` omitted upstream's `stop_event.request_stop()` before `CoreTiming::SyncPause(false)` and its reset after kernel shutdown.
+- VI relied only on `Container::Drop`; it did not call `Container::on_terminate` when shutdown began. A busy VI server could therefore retain layers and displays while `CloseServices` waited for its host thread. The VI loop now keeps a scoped stop callback exactly where upstream keeps `std::stop_callback cb`.
+
+### Missing items
+- The stop token is currently consumed only by VI, matching the only upstream service loop that accepts it.
+
+### Binary layout verification
+- PASS: the stop event and callback registry are host-only lifecycle state; no guest ABI or serialized structure changed.
+
+### Verification
+- Re-read upstream `System::Impl::ShutdownMainProcess`, `Services::Services`, and `VI::LoopProcess` after implementation.
+- `cargo test -p core stop_callback --lib`: 2 passed.
+- Release builds of `ruzu` and `ruzu-cmd` passed.
+- A release STK start/stop cycle logged `vi:m` event-loop exit, `HLE:vi` host-thread exit, and `System: shutdown complete` in the same second.
+
+## 2026-08-08 — audio_core/src/renderer/command/effect/light_limiter.rs and audio_core/src/renderer/effect/effect_info_base.rs vs audio_core/renderer/command/effect/light_limiter.{h,cpp} and audio_core/renderer/effect/{light_limiter.h,effect_info_base.h}
+
+### Intentional differences
+- Rust tracks which raw `EffectInfoBase::State` buffers contain an initialized `LightLimiterState`. This supplies the destructor bookkeeping required for `Vec` values constructed in the upstream-equivalent 0x500-byte raw state storage; C++ obtains the same destruction through its typed object lifecycle.
+- Command processing retains the existing `MemoryHandle` and workbuffer arguments for payload ownership parity, but names them as unused because upstream explicitly does not use the game-supplied limiter workbuffer.
+
+### Unintentional differences (fixed)
+- Rust processed signed mix-buffer samples directly as `f32`, omitting upstream's Q15 normalization. The limiter now uses `FixedPoint<49, 15>` throughout and preserves the exact input and output scaling by 32768.
+- Rust stored limiter averages and compression gains as `f32`, and stored look-ahead samples in the guest workbuffer. The state now matches upstream ownership and ordering: fixed-point averages, fixed-point gains, signed offsets, and six host-owned fixed-point look-ahead vectors.
+- Initialization wrote zeroes into the nominally unused guest workbuffer. It now resets and resizes the host state only.
+- Statistics reported unnormalized sample magnitudes and reset inactive channels. They now use the normalized fixed-point sample and update only `channel_count` entries.
+
+### Missing items
+- None for the light-limiter command and state slice.
+
+### Binary layout verification
+- PASS: `ParameterVersion1`, `ParameterVersion2`, command payloads, and the 0x30-byte statistics payload are unchanged. `LightLimiterState` is host-only and has a compile-time `size_of <= 0x500` assertion matching upstream.
+
+### Verification
+- Re-read upstream `LightLimiterInfo::State`, `InitializeLightLimiterEffect`, `ApplyLightLimiterEffect`, and both command `Process` methods after implementation.
+- `process_light_limiter_v2_updates_statistics_and_writes_output` passes and verifies exact one-sample look-ahead output, normalized statistics, fixed-point state, and an untouched workbuffer; the cleanup regression verifies destruction of the registered vector-backed state.
+- Full `cargo test -p audio_core`: 197 passed, 0 failed; doc tests also pass.
+- A release runtime trace showed `LightLimiterVersion2` preserving final mix-buffer amplitudes instead of reducing them to `0/±1`; `SinkStream` subsequently received nonzero samples at effective volume 1 through Cubeb's `pulse-rust` backend.

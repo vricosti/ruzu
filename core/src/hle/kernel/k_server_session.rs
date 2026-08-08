@@ -203,19 +203,14 @@ pub struct KServerSession {
     pub manager: Option<Arc<Mutex<SessionRequestManager>>>,
     /// Waitable synchronization state owned by KSynchronizationObject upstream.
     pub sync_object: SynchronizationObjectState,
-    /// Weak back-pointer to the owning ServerManager's wakeup_event. When
-    /// `notify_available` fires (request enqueued, client closed, etc.), the
-    /// ServerManager's host thread is signaled directly instead of waiting for
-    /// its `wait_timeout(100ms)` to expire. Upstream gets this reactivity for
-    /// free because `MultiWait::WaitAny` translates to `svcWaitSynchronization`
-    /// on the host thread; ruzu's host service threads use a host-side wait
-    /// path (no guest thread context) so we wire the wakeup explicitly.
+    /// Weak back-pointer to the owning ServerManager's wakeup event. The
+    /// session holder is temporarily unlinked while its request is handled, so
+    /// this event closes the interval in which a new request cannot notify a
+    /// waiter on the session object itself.
     pub manager_wakeup: Option<std::sync::Weak<Event>>,
-    /// Rust bridge for inline IPC sessions: upstream's ServerManager waits on
-    /// every server endpoint, while the temporary inline path cannot link the
-    /// same endpoint without introducing a second request consumer. Closure
-    /// notifications still return to the owning ServerManager through this
-    /// queue so it retains endpoint destruction ownership.
+    /// Rust bridge for endpoint-close ownership. Closure notifications return
+    /// to the owning ServerManager through this queue so destruction remains
+    /// on the same owner as upstream.
     manager_close_queue: Option<std::sync::Weak<Mutex<Vec<u64>>>>,
     manager_close_wakeup: Option<std::sync::Weak<Event>>,
 }
@@ -2081,7 +2076,7 @@ impl KServerSession {
             .as_ref()
             .and_then(std::sync::Weak::upgrade)
         {
-            wakeup.signal_host_only();
+            wakeup.signal();
         }
     }
 
@@ -2851,13 +2846,13 @@ impl KServerSession {
         if common::trace::is_enabled(common::trace::cat::HOST_THREAD_IPC) {
             common::trace::emit_raw(common::trace::cat::HOST_THREAD_IPC, &[28, object_id]);
         }
-        // Reactively wake the owning ServerManager's host thread. Upstream
-        // doesn't need this because `MultiWait::WaitAny` becomes a real kernel
-        // wait on the host thread, and `notify_waiters_on_state` walks that
-        // waiter list. Ruzu's host service threads use a Condvar-based wait
-        // and aren't on the synchronization object's waiter list — so without
-        // this signal, the service thread stays asleep for up to its 100 ms
-        // idle timeout before noticing `is_signaled()` flipped.
+        // Wake the owning ServerManager through its kernel-readable event too.
+        // Normally the session object's waiter is enough. While a request is
+        // being handled, however, ServerManager temporarily unlinks that
+        // session holder before relinking it through the deferred list. A new
+        // request in that interval has no session waiter to notify; signaling
+        // only Event's host Condvar is insufficient because MultiWait blocks
+        // on kernel synchronization objects.
         if let Some(weak) = self.manager_wakeup.as_ref() {
             if common::trace::is_enabled(common::trace::cat::HOST_THREAD_IPC) {
                 common::trace::emit_raw(common::trace::cat::HOST_THREAD_IPC, &[29, object_id]);
@@ -2867,7 +2862,7 @@ impl KServerSession {
                     common::trace::emit_raw(common::trace::cat::HOST_THREAD_IPC, &[30, object_id]);
                     common::trace::emit_raw(common::trace::cat::HOST_THREAD_IPC, &[31, object_id]);
                 }
-                event.signal_host_only();
+                event.signal();
                 if common::trace::is_enabled(common::trace::cat::HOST_THREAD_IPC) {
                     common::trace::emit_raw(common::trace::cat::HOST_THREAD_IPC, &[32, object_id]);
                 }
@@ -3314,6 +3309,38 @@ mod tests {
         assert!(!server.is_signaled());
         server.on_client_closed();
         assert!(server.is_signaled());
+    }
+
+    #[test]
+    fn request_signals_server_manager_kernel_wakeup_event() {
+        let mut process = KProcess::new();
+        process.process_id = 7;
+
+        let event_id = 0x2000;
+        let readable_id = 0x2001;
+        let event_owner = Arc::new(Mutex::new(crate::hle::kernel::k_event::KEvent::new()));
+        event_owner
+            .lock()
+            .unwrap()
+            .initialize(process.process_id, readable_id);
+        let readable = Arc::new(Mutex::new(KReadableEvent::new()));
+        readable.lock().unwrap().initialize(event_id, readable_id);
+        process.register_readable_event_object(readable_id, Arc::clone(&readable));
+
+        let process = Arc::new(ProcessLock::from_value(process));
+        let wakeup = Arc::new(Event::new_with_kernel_event(
+            event_owner,
+            Arc::clone(&readable),
+            Arc::clone(&process),
+        ));
+
+        let mut server = KServerSession::new();
+        server.initialize(0x1000);
+        server.set_manager_wakeup(Arc::downgrade(&wakeup));
+        server.on_request(Arc::new(Mutex::new(KSessionRequest::new())));
+
+        assert!(wakeup.is_signaled());
+        assert!(readable.lock().unwrap().is_signaled());
     }
 
     // `link_waiter_uses_parent_session_object_id` removed: the handle-indirect

@@ -1633,12 +1633,14 @@ mod tests {
 
     #[test]
     fn process_light_limiter_v2_updates_statistics_and_writes_output() {
+        use std::mem::ManuallyDrop;
+
         let system = make_system();
         let mut mix_buffers = vec![
             1000, -2000, 3000, -4000, // input
             0, 0, 0, 0, // output
         ];
-        let mut state = LightLimiterState::default();
+        let mut state = ManuallyDrop::new(LightLimiterState::default());
         let mut statistics = StatisticsInternal::default();
         let mut workbuffer = vec![f32::NAN; 1];
         let parameter = light_limiter::ParameterVersion2 {
@@ -1670,7 +1672,7 @@ mod tests {
                 inputs: [0, 0, 0, 0, 0, 0],
                 outputs: [1, 1, 1, 1, 1, 1],
                 parameter,
-                state: (&mut state as *mut LightLimiterState) as CpuAddr,
+                state: (&mut *state as *mut LightLimiterState) as CpuAddr,
                 workbuffer: workbuffer.as_mut_ptr() as CpuAddr,
                 result_state: (&mut statistics as *mut StatisticsInternal) as CpuAddr,
                 effect_enabled: true,
@@ -1692,14 +1694,18 @@ mod tests {
         processor.set_process_time_max(u64::MAX);
         let _ = processor.process(0);
 
-        assert_eq!(mix_buffers[4], 0);
-        assert_ne!(&mix_buffers[4..8], &[0, 0, 0, 0]);
-        assert!(statistics.channel_max_sample[0] >= 4000.0);
+        assert_eq!(&mix_buffers[4..8], &[0, 1000, -2000, 3000]);
+        assert!((statistics.channel_max_sample[0] - (4000.0 / 32768.0)).abs() < 0.0001);
         assert!(statistics.channel_compression_gain_min[0].is_finite());
         assert!(statistics.channel_compression_gain_min[0] <= 1.0);
-        assert!(state.samples_average[0] > 0.0);
-        assert!(state.compression_gain[0].is_finite());
-        assert_eq!(workbuffer, [-4000.0]);
+        assert!(state.samples_average[0].to_raw() > 0);
+        assert!(state.compression_gain[0].to_f32().is_finite());
+        assert_eq!(state.look_ahead_sample_buffers[0][0].to_raw(), -4000);
+        assert!(workbuffer[0].is_nan());
+
+        crate::renderer::command::effect::light_limiter::drop_light_limiter_state_if_initialized(
+            (&mut *state as *mut LightLimiterState) as CpuAddr,
+        );
     }
 
     #[test]

@@ -6,9 +6,7 @@
 
 use std::sync::{Arc, Mutex, OnceLock};
 
-use super::super::k_process::ProcessLock;
 use crate::core::System;
-use crate::hle::ipc;
 use crate::hle::kernel::k_event::KEvent;
 use crate::hle::kernel::k_readable_event::KReadableEvent;
 use crate::hle::kernel::k_resource_limit::LimitableResource;
@@ -50,68 +48,6 @@ fn should_trace_sync_handle(session_handle: Handle) -> bool {
         .is_some_and(|target| target == session_handle)
 }
 
-struct HostThreadIpcConfig {
-    inline: bool,
-    all: bool,
-    handles_configured: bool,
-    handles: Vec<Handle>,
-    service_filter: Option<String>,
-    binder: bool,
-    disable_binder: bool,
-    sleep_us: u64,
-}
-
-fn host_thread_ipc_config() -> &'static HostThreadIpcConfig {
-    static CONFIG: OnceLock<HostThreadIpcConfig> = OnceLock::new();
-    CONFIG.get_or_init(|| {
-        let handles_spec = std::env::var_os("RUZU_SERVER_THREAD_IPC_HANDLE");
-        let handles = handles_spec
-            .as_ref()
-            .map(|spec| {
-                spec.to_string_lossy()
-                    .split(',')
-                    .filter_map(|raw| {
-                        let value = raw.trim();
-                        if value.is_empty() {
-                            return None;
-                        }
-                        let hex = value
-                            .strip_prefix("0x")
-                            .or_else(|| value.strip_prefix("0X"))
-                            .unwrap_or(value);
-                        u32::from_str_radix(hex, 16)
-                            .ok()
-                            .or_else(|| value.parse().ok())
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-        HostThreadIpcConfig {
-            inline: std::env::var_os("RUZU_INLINE_IPC").is_some(),
-            all: std::env::var_os("RUZU_SERVER_THREAD_IPC_ALL").is_some(),
-            handles_configured: handles_spec.is_some(),
-            handles,
-            service_filter: std::env::var("RUZU_SERVER_THREAD_IPC_SERVICE").ok(),
-            binder: std::env::var_os("RUZU_SERVER_THREAD_IPC_BINDER").is_some(),
-            disable_binder: std::env::var_os("RUZU_DISABLE_SERVER_THREAD_IPC_BINDER").is_some(),
-            sleep_us: std::env::var("RUZU_HOST_THREAD_IPC_SLEEP_US")
-                .ok()
-                .and_then(|value| value.parse().ok())
-                .unwrap_or(1),
-        }
-    })
-}
-
-fn yield_after_ipc_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var_os("RUZU_YIELD_AFTER_IPC").is_some())
-}
-
-fn inline_ipc_reschedule_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var_os("RUZU_DISABLE_INLINE_IPC_RESCHEDULE").is_none())
-}
-
 fn profile_ipc_phases_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| std::env::var_os("RUZU_PROFILE_IPC_PHASES").is_some())
@@ -130,105 +66,6 @@ fn dump_ssr_enabled() -> bool {
 fn profile_ipc_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| std::env::var_os("RUZU_PROFILE_IPC").is_some())
-}
-
-fn should_use_host_thread_ipc(session_handle: Handle) -> bool {
-    let config = host_thread_ipc_config();
-    if config.inline {
-        return false;
-    }
-    if config.all {
-        return true;
-    }
-    config.handles.contains(&session_handle)
-}
-
-fn should_use_host_thread_ipc_for_service(
-    session_handle: Handle,
-    service_name: Option<&str>,
-) -> bool {
-    if should_use_host_thread_ipc(session_handle) {
-        return true;
-    }
-    if host_thread_ipc_config().inline {
-        return false;
-    }
-
-    if let Some(service_name) = service_name {
-        if host_thread_service_filter_matches(service_name) {
-            return true;
-        }
-    }
-
-    service_name.is_some_and(default_host_thread_service_matches)
-}
-
-fn should_resolve_host_thread_service_name() -> bool {
-    let config = host_thread_ipc_config();
-    should_resolve_host_thread_service_name_from_flags(
-        config.inline,
-        config.service_filter.is_some(),
-    )
-}
-
-fn should_resolve_host_thread_service_name_from_flags(inline: bool, service_filter: bool) -> bool {
-    !inline && service_filter
-}
-
-fn default_host_thread_service_matches(service_name: &str) -> bool {
-    let config = host_thread_ipc_config();
-    default_host_thread_service_matches_from_flags(
-        service_name,
-        config.inline,
-        config.disable_binder,
-    )
-}
-
-fn default_host_thread_service_matches_from_flags(
-    service_name: &str,
-    inline: bool,
-    disable_binder: bool,
-) -> bool {
-    crate::hle::service::server_manager::ServerManager::default_host_thread_service_matches_from_flags(
-        service_name,
-        inline,
-        disable_binder,
-    )
-}
-
-fn host_thread_service_filter_matches(service_name: &str) -> bool {
-    let Some(spec) = host_thread_ipc_config().service_filter.as_deref() else {
-        return false;
-    };
-    spec.split(',').any(|raw| {
-        let value = raw.trim();
-        !value.is_empty() && (value == "*" || value == service_name)
-    })
-}
-
-fn host_thread_ipc_sleep_enabled_from_flags(
-    all: bool,
-    handle: bool,
-    binder: bool,
-    _service: bool,
-    inline: bool,
-) -> bool {
-    // Keep the sleep as an explicit broad-routing diagnostic. A service-name
-    // filter is also used to validate candidate default promotions; making it
-    // sleep after every IPC changes timing globally and does not model the
-    // eventual default path for that service.
-    !inline && (all || handle || binder)
-}
-
-fn host_thread_ipc_sleep_enabled() -> bool {
-    let config = host_thread_ipc_config();
-    host_thread_ipc_sleep_enabled_from_flags(
-        config.all,
-        config.handles_configured,
-        config.binder,
-        config.service_filter.is_some(),
-        config.inline,
-    )
 }
 
 fn parse_trace_filter_list(env_key: &str) -> Option<Vec<u64>> {
@@ -355,47 +192,6 @@ fn trace_svc_ipc_progress(
             aux2,
         ],
     );
-}
-
-fn yield_after_inline_ipc_if_requested(system: &System) {
-    // Diagnostic for ruzu's temporary inline HLE path. Upstream parks the
-    // caller while a ServerManager host fiber handles the request, which
-    // naturally gives other guest threads a scheduling opportunity. Keep this
-    // cooperative yield is promoted to the default before host-thread IPC
-    // ownership is complete.
-    if !yield_after_ipc_enabled() {
-        return;
-    }
-    let current_process = system.current_process_arc();
-    if let Some(current_thread_id) = system.current_thread_id() {
-        let sched_arc = system.scheduler_arc();
-        let scheduler_ptr = {
-            let mut scheduler = sched_arc.lock().unwrap();
-            &mut *scheduler as *mut crate::hle::kernel::k_scheduler::KScheduler
-        };
-        unsafe {
-            (*scheduler_ptr).yield_without_core_migration(current_process, current_thread_id);
-        }
-    }
-}
-
-fn reschedule_after_inline_ipc_if_needed(system: &System) {
-    if !inline_ipc_reschedule_enabled() {
-        return;
-    }
-    let Some(kernel) = system.kernel() else {
-        return;
-    };
-    let Some(scheduler) = kernel.current_scheduler() else {
-        return;
-    };
-    let sched_ptr = {
-        let mut scheduler = scheduler.lock().unwrap();
-        &mut *scheduler as *mut crate::hle::kernel::k_scheduler::KScheduler
-    };
-    unsafe {
-        crate::hle::kernel::k_scheduler::KScheduler::schedule_raw_if_needed(sched_ptr, 6);
-    }
 }
 
 fn format_ipc_trace_words(system: &System, message_address: u64, words: usize) -> Option<String> {
@@ -570,36 +366,20 @@ fn send_sync_request_impl(
     // object registration so the hot SVC path does not need to lock the client
     // endpoint just to discover its parent.
 
-    let forced_host_thread_routing = should_use_host_thread_ipc(session_handle);
-    let trace_manager_resolution = should_emit_svc_ipc_progress(
-        session_handle,
-        crate::hle::kernel::kernel::get_current_thread_id_fast().unwrap_or(0),
-    );
-    let needs_manager_resolution = forced_host_thread_routing
-        || should_resolve_host_thread_service_name()
-        || trace_manager_resolution;
-
-    // ---- Host-thread IPC routing (upstream-shaped when fully owned) ----
+    // ---- ServerManager IPC routing ----
     //
     // Upstream `KClientSession::SendSyncRequest` always parks the calling
     // guest thread (`BeginWait`) and lets the owning `ServerManager`'s
     // host fiber consume the request via `ReceiveRequestHLE` →
     // `SendReplyHLE` → `client_thread->EndWait()`. Ruzu mirrors that by
-    // pushing the session to the owning ServerManager's
-    // pending-registration queue, signaling its wakeup event, parking the
-    // guest, and yielding the fiber. The handler runs on the host fiber;
-    // `send_reply` ends the wait; the guest resumes here.
-    //
-    // Sessions fall back to the legacy inline path unless selected by explicit
-    // env gates. Historical Binder/service default-promotion experiments are
-    // documented in DIFF.md, but no service is promoted implicitly until its
-    // routing is revalidated. When host-thread routing is selected, missing
-    // ownership is treated as a wiring bug and returns `ResultInvalidHandle`
-    // instead of using an ad-hoc worker fallback.
+    // parking the guest and yielding the fiber. Session registration belongs
+    // to the owning ServerManager and happens before the client endpoint is
+    // exposed, matching upstream. The inline path below is retained only for
+    // ownerless unit-test fixtures.
     let server_session_and_manager: Option<(
         Arc<Mutex<crate::hle::kernel::k_server_session::KServerSession>>,
         Arc<Mutex<crate::hle::service::hle_ipc::SessionRequestManager>>,
-    )> = if needs_manager_resolution {
+    )> = {
         trace_svc_ipc_progress(
             11,
             session_handle,
@@ -669,8 +449,6 @@ fn send_sync_request_impl(
                 );
                 Some((server_session, manager))
             })
-    } else {
-        None
     };
     trace_svc_ipc_progress(
         17,
@@ -681,48 +459,6 @@ fn send_sync_request_impl(
         0,
         0,
     );
-    let host_thread_service_name =
-        if should_resolve_host_thread_service_name() || trace_manager_resolution {
-            server_session_and_manager
-                .as_ref()
-                .and_then(|(_, manager)| {
-                    trace_svc_ipc_progress(
-                        18,
-                        session_handle,
-                        session_object_id,
-                        message_address,
-                        Arc::as_ptr(manager) as u64,
-                        0,
-                        0,
-                    );
-                    let manager = manager.lock().unwrap();
-                    trace_svc_ipc_progress(
-                        19,
-                        session_handle,
-                        session_object_id,
-                        message_address,
-                        0,
-                        0,
-                        0,
-                    );
-                    manager
-                        .session_handler()
-                        .map(|handler| handler.service_name().to_string())
-                })
-        } else {
-            None
-        };
-    trace_svc_ipc_progress(
-        20,
-        session_handle,
-        session_object_id,
-        message_address,
-        host_thread_service_name.is_some() as u64,
-        0,
-        0,
-    );
-    let host_thread_service_routing =
-        should_use_host_thread_ipc_for_service(session_handle, host_thread_service_name.as_deref());
     let with_queue_wakeup: Option<(
         Arc<Mutex<crate::hle::kernel::k_server_session::KServerSession>>,
         Arc<Mutex<crate::hle::service::hle_ipc::SessionRequestManager>>,
@@ -750,52 +486,14 @@ fn send_sync_request_impl(
                 wakeup?,
             ))
         });
-    let host_thread_routing = forced_host_thread_routing || host_thread_service_routing;
-    let host_thread_targets = if host_thread_routing {
-        if with_queue_wakeup.is_none() {
-            // Host-thread routing is an upstream-parity path: a request must
-            // be owned by the target session's ServerManager. Falling back to
-            // an ad-hoc worker or inline dispatch would hide missing
-            // ownership and reintroduce a lifecycle upstream does not have.
-            trace_host_thread_ipc("missing_server_manager_owner", session_handle);
-            // Forensics for the boot-time InvalidHandle abort (task #123):
-            // name the link of the owner-resolution chain that failed. Only
-            // prints on the bug path, so no heisenbug risk.
-            if crate::hle::kernel::handle_forensics::enabled() {
-                let stage = OWNER_FAIL_STAGE.with(|s| s.get());
-                let stage = if stage.is_empty() {
-                    if server_session_and_manager.is_none() {
-                        if needs_manager_resolution {
-                            "parent_session_none"
-                        } else {
-                            "manager_resolution_not_attempted"
-                        }
-                    } else {
-                        "unknown"
-                    }
-                } else {
-                    stage
-                };
-                eprintln!(
-                    "[OWNER_FAIL] handle=0x{:X} parent_id={} stage={} forced={} svc_name_routing={}",
-                    session_handle,
-                    parent_id,
-                    stage,
-                    forced_host_thread_routing,
-                    host_thread_service_routing
-                );
-            }
-            trace_svc_ipc_progress(
-                21,
-                session_handle,
-                session_object_id,
-                message_address,
-                server_session_and_manager.is_some() as u64,
-                0,
-                0,
-            );
-            return RESULT_INVALID_HANDLE;
-        }
+    let has_server_manager = server_session_and_manager
+        .as_ref()
+        .is_some_and(|(_, manager)| manager.lock().unwrap().get_server_manager().is_some());
+    if has_server_manager && with_queue_wakeup.is_none() {
+        trace_host_thread_ipc("missing_server_manager_owner", session_handle);
+        return RESULT_INVALID_HANDLE;
+    }
+    let host_thread_targets = if has_server_manager {
         with_queue_wakeup
     } else {
         None
@@ -805,14 +503,9 @@ fn send_sync_request_impl(
         trace_host_thread_ipc("enqueue_begin", session_handle);
         record_phase("host_02_resolve_owner", &mut phase_last);
 
-        // One-time wiring per KServerSession:
-        //  1. Push (server_session, manager) to the queue so the host fiber
-        //     calls register_session on it (adds to multi_wait).
-        //  2. Set manager_wakeup on the KServerSession so subsequent
-        //     `notify_available` calls auto-signal the wakeup_event.
-        // register_session is idempotent (no duplicate entry in multi_wait)
-        // so re-pushing on every IPC is safe — but unnecessary work.
-        //
+        // Registration normally completed before the client endpoint became
+        // visible. Keep this idempotent queueing only for a request racing the
+        // pending-registration drain.
         let needs_setup = {
             let _lo_ss = common::lock_order::guard("server_session");
             server_session.lock().unwrap().manager_wakeup.is_none()
@@ -1251,15 +944,6 @@ fn send_sync_request_impl(
     }
     record_phase("07_send_reply", &mut phase_last);
 
-    // Upstream `PhysicalCore::RunThread` returns to the scheduler after every
-    // SVC, and the normal IPC path parks the caller while the server session
-    // handles the request. Ruzu's legacy inline HLE IPC fallback does not park
-    // the caller, so explicitly consume any pending same-core scheduling request
-    // once the inline handler and reply have completed. This keeps clean runs
-    // moving without the heavier experimental unconditional preemption that was
-    // previously guarded by `RUZU_RESCHEDULE_AFTER_IPC`.
-    reschedule_after_inline_ipc_if_needed(system);
-
     if result == crate::hle::service::ipc_helpers::RESULT_SESSION_CLOSED {
         return RESULT_SUCCESS;
     }
@@ -1339,35 +1023,6 @@ pub fn send_sync_request(system: &System, session_handle: Handle) -> ResultCode 
                 0, // service_name_id: n/a on exit
             ],
         );
-    }
-
-    yield_after_inline_ipc_if_requested(system);
-
-    // Inter-IPC OS-scheduler yield. Discovered while diagnosing
-    // core OS thread chains IPCs back-to-back, the Linux scheduler keeps
-    // it on-CPU and host service OS threads (HLE:audio, HLE:nvservices,
-    // ...) only get brief slivers of time. State that those threads
-    // should advance never does, and the guest poll-loops on stale
-    // memory.
-    //
-    // A `std::thread::sleep(1µs)` between IPCs translates to a
-    // `clock_nanosleep` syscall — guaranteed to release the CPU back to
-    // the OS scheduler so other OS threads can run. Empirically this
-    // `std::thread::yield_now()` (`sched_yield`) is too weak: Linux can
-    // reschedule the same thread if no equal-priority work is ready, so
-    // it only buys ~50 % success.
-    //
-    // Cost: ~50-100 µs per IPC × ~5 000 boot IPCs ≈ 250-500 ms added to
-    // routing is explicitly enabled. Do not apply it to the inline path:
-    // issue hundreds of thousands of tight IPC polls during boot.
-    //
-    // `RUZU_HOST_THREAD_IPC_SLEEP_US=<n>` overrides the default 1 µs;
-    // set to `0` to disable entirely (for performance investigation).
-    if host_thread_ipc_sleep_enabled() {
-        let us = host_thread_ipc_config().sleep_us;
-        if us > 0 {
-            std::thread::sleep(std::time::Duration::from_micros(us));
-        }
     }
 
     result
@@ -1625,7 +1280,6 @@ mod tests {
     use crate::hle::kernel::svc::svc_port;
     use crate::hle::result::RESULT_SUCCESS;
     use crate::hle::service::hle_ipc::SessionRequestHandlerPtr;
-    use crate::hle::service::sm::sm::ServiceManager;
     use crate::memory::memory::Memory;
     use common::page_table::{PageTable, PageType};
     use std::sync::atomic::Ordering;
@@ -2499,106 +2153,11 @@ fn reply_and_receive_impl(
 
 #[cfg(test)]
 mod reply_receive_tests {
-    use super::{
-        default_host_thread_service_matches_from_flags, host_thread_ipc_sleep_enabled_from_flags,
-        ipc_timeout_tick_from_ns, should_resolve_host_thread_service_name_from_flags,
-    };
+    use super::ipc_timeout_tick_from_ns;
 
     #[test]
     fn ipc_timeout_tick_from_ns_matches_upstream_saturation_rule() {
         assert_eq!(ipc_timeout_tick_from_ns(100, 5), 107);
         assert_eq!(ipc_timeout_tick_from_ns(i64::MAX - 1, 10), i64::MAX);
-    }
-
-    #[test]
-    fn host_thread_ipc_sleep_follows_all_routing_gates() {
-        assert!(!host_thread_ipc_sleep_enabled_from_flags(
-            false, false, false, false, false
-        ));
-        assert!(host_thread_ipc_sleep_enabled_from_flags(
-            true, false, false, false, false
-        ));
-        assert!(host_thread_ipc_sleep_enabled_from_flags(
-            false, true, false, false, false
-        ));
-        assert!(host_thread_ipc_sleep_enabled_from_flags(
-            false, false, true, false, false
-        ));
-        assert!(!host_thread_ipc_sleep_enabled_from_flags(
-            false, false, false, true, false
-        ));
-        assert!(!host_thread_ipc_sleep_enabled_from_flags(
-            true, true, true, true, true
-        ));
-    }
-
-    #[test]
-    fn service_name_resolution_is_only_for_explicit_service_filter() {
-        assert!(!should_resolve_host_thread_service_name_from_flags(
-            false, false
-        ));
-        assert!(should_resolve_host_thread_service_name_from_flags(
-            false, true
-        ));
-        assert!(!should_resolve_host_thread_service_name_from_flags(
-            true, true
-        ));
-    }
-
-    #[test]
-    fn default_host_thread_services_are_not_promoted_implicitly() {
-        for service_name in [
-            "IHOSBinderDriver",
-            "pl:s",
-            "pl:u",
-            "audren:u",
-            "IAudioRenderer",
-            "IAudioDevice",
-            "vi:m",
-            "vi:s",
-            "vi:u",
-            "IApplicationDisplayService",
-            "vi::IManagerDisplayService",
-            "vi::ISystemDisplayService",
-            "apm",
-            "apm:am",
-            "apm:sys",
-            "set",
-            "set:cal",
-            "set:fd",
-            "set:sys",
-            "lm",
-            "aoc:u",
-            "time:u",
-            "time:a",
-            "time:r",
-            "time:s",
-            "time:m",
-            "time:su",
-            "time:al",
-            "pctl",
-            "pctl:a",
-            "pctl:r",
-            "pctl:s",
-            "prepo:a",
-            "prepo:a2",
-            "prepo:m",
-            "prepo:s",
-            "prepo:u",
-            "friend:a",
-            "friend:m",
-            "friend:s",
-            "friend:u",
-            "friend:v",
-        ] {
-            assert!(
-                !default_host_thread_service_matches_from_flags(service_name, false, false),
-                "{service_name}"
-            );
-            assert!(
-                !default_host_thread_service_matches_from_flags(service_name, false, true),
-                "{service_name}"
-            );
-        }
     }
 }

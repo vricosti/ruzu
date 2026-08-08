@@ -820,7 +820,8 @@ fn dump_thread_state(kernel: &KernelCore) {
                         (
                             guard.get_thread_id(),
                             Arc::as_ptr(&thread) as usize,
-                            guard.context_guard.is_locked(),
+                            guard.context_guard_owner.load(Ordering::SeqCst)
+                                != super::k_thread::CONTEXT_GUARD_UNOWNED,
                             guard.context_guard_owner.load(Ordering::SeqCst),
                             guard.get_current_core(),
                             guard.get_active_core(),
@@ -1373,8 +1374,8 @@ fn dump_thread_state(kernel: &KernelCore) {
             // Context-guard attribution: a leaked (still-locked) guard on a
             // RUNNABLE thread wedges the switch fiber's try_lock spin.
             {
-                let ctx_locked = t.context_guard.is_locked();
                 let ctx_owner = t.context_guard_owner.load(Ordering::SeqCst);
+                let ctx_locked = ctx_owner != super::k_thread::CONTEXT_GUARD_UNOWNED;
                 let trace = t.context_guard_trace.lock();
                 if ctx_locked
                     || ctx_owner != super::k_thread::CONTEXT_GUARD_UNOWNED
@@ -2084,16 +2085,13 @@ impl KernelCore {
                     }
                 }
 
-                // Rust's guest-core fibers only observe the scheduler update
-                // after ArmInterface::RunThread returns. Force that boundary
-                // from the upstream-owned 10 ms preemption event.
-                for core_id in 0..hardware_properties::NUM_CPU_CORES as usize {
-                    if let Some(core) = kernel.physical_core(core_id) {
-                        core.interrupt();
-                    }
-                }
-
                 if DUMP_REQUESTED.load(Ordering::Relaxed) {
+                    // Register snapshots are refreshed when the JIT returns.
+                    // This interrupt is diagnostic-only; normal preemption
+                    // uses the core mask produced when the scheduler lock is
+                    // released, matching upstream.
+                    kernel.interrupt_all_cores();
+
                     // The per-core register snapshots are refreshed when the JIT
                     // returns. Wait for the interrupt above before dumping so
                     // SIGUSR1 reports the live guest loop rather than the

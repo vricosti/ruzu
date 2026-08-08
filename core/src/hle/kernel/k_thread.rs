@@ -33,6 +33,7 @@ use crate::hle::kernel::svc_types::THREAD_LOCAL_REGION_SIZE;
 use crate::hle::result::RESULT_SUCCESS;
 // RBEntry kept for structural parity with upstream m_condvar_arbiter_tree_node.
 // Currently unused: we use BTreeSet externally instead of an intrusive tree.
+
 use super::k_process::ProcessLock;
 use common::tree::RBEntry;
 
@@ -371,10 +372,36 @@ impl KAffinityMask {
 /// For lock waiters, condvar_key is effectively the address key, so we
 /// order by (priority, thread_id) which is the meaningful ordering for
 /// selecting the highest-priority waiter.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+#[derive(Clone, Copy, Debug)]
 pub struct LockWaiterKey {
     pub priority: i32,
     pub thread_id: u64,
+    /// Stable address of the waiting `KThread`.
+    ///
+    /// Upstream's intrusive tree stores the `KThread` itself. Keeping the
+    /// pointer here preserves that ownership model for kernel waiters which
+    /// are intentionally absent from the schedulable-thread registry.
+    pub thread_ptr: usize,
+}
+
+impl PartialEq for LockWaiterKey {
+    fn eq(&self, other: &Self) -> bool {
+        (self.priority, self.thread_id) == (other.priority, other.thread_id)
+    }
+}
+
+impl Eq for LockWaiterKey {}
+
+impl PartialOrd for LockWaiterKey {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for LockWaiterKey {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        (self.priority, self.thread_id).cmp(&(other.priority, other.thread_id))
+    }
 }
 
 /// Per-address lock tracking structure.
@@ -415,10 +442,11 @@ impl LockWithPriorityInheritanceInfo {
 
     /// Add a waiter thread. The caller must provide the waiter's priority and thread_id.
     /// Matches upstream `AddWaiter(KThread*)`.
-    pub fn add_waiter(&mut self, priority: i32, thread_id: u64) {
+    pub fn add_waiter(&mut self, priority: i32, thread_id: u64, thread_ptr: usize) {
         let inserted = self.tree.insert(LockWaiterKey {
             priority,
             thread_id,
+            thread_ptr,
         });
         if inserted {
             self.waiter_count += 1;
@@ -438,6 +466,7 @@ impl LockWithPriorityInheritanceInfo {
         let removed = self.tree.remove(&LockWaiterKey {
             priority,
             thread_id,
+            thread_ptr: 0,
         });
         if removed {
             self.waiter_count -= 1;
@@ -611,15 +640,10 @@ pub struct KThread {
     /// Upstream: `std::shared_ptr<Common::Fiber> m_host_context`
     pub host_context: Option<Arc<common::fiber::Fiber>>,
     /// Context guard for fiber switching.
-    /// Upstream: `KSpinLock m_context_guard`
-    pub context_guard: parking_lot::Mutex<()>,
-    /// Core currently owning `context_guard`, or `CONTEXT_GUARD_UNOWNED`.
     ///
-    /// `context_guard` is locked with `try_lock` + `mem::forget` and released
-    /// with `force_unlock`, so the guard object itself carries no ownership
-    /// information. Track the owner atomically because `KThreadLock` is a
-    /// scheduler-serialized `SyncCell`, not a host mutex, and competing switch
-    /// fibers run on different host cores.
+    /// Upstream uses `KSpinLock m_context_guard`. The owning core id is the
+    /// lock word in Rust; `CONTEXT_GUARD_UNOWNED` is the unlocked state.
+    /// This avoids retaining a host mutex guard across a fiber switch.
     pub(crate) context_guard_owner: AtomicI32,
     /// Diagnostic: last lock/unlock sites of `context_guard`
     /// (`site@host_thread`), shown by the SIGUSR1 dump to attribute leaked
@@ -748,7 +772,6 @@ impl KThread {
             is_kernel_address_key: false,
             stack_parameters: StackParameters::default(),
             host_context: None,
-            context_guard: parking_lot::Mutex::new(()),
             context_guard_owner: AtomicI32::new(CONTEXT_GUARD_UNOWNED),
             context_guard_trace: parking_lot::Mutex::new(ContextGuardTrace::default()),
             thread_type: ThreadType::User,
@@ -1269,6 +1292,7 @@ impl KThread {
         &mut self,
         waiter_thread_id: u64,
         waiter_priority: i32,
+        waiter_thread_ptr: usize,
         waiter_address_key: KProcessAddress,
         waiter_is_kernel_address_key: bool,
     ) {
@@ -1292,7 +1316,11 @@ impl KThread {
         };
 
         // Add the waiter.
-        self.held_lock_info_list[lock_idx].add_waiter(waiter_priority, waiter_thread_id);
+        self.held_lock_info_list[lock_idx].add_waiter(
+            waiter_priority,
+            waiter_thread_id,
+            waiter_thread_ptr,
+        );
     }
 
     /// Remove a waiter thread from its lock info.
@@ -1363,6 +1391,7 @@ impl KThread {
         self.add_waiter_impl(
             waiter_thread_id,
             waiter_priority,
+            waiter.as_ref().as_ptr() as usize,
             waiter_address_key,
             waiter_is_kernel_address_key,
         );
@@ -1421,6 +1450,7 @@ impl KThread {
             owner.add_waiter_impl(
                 waiter_thread_id,
                 waiter_priority,
+                waiter.as_ref().as_ptr() as usize,
                 waiter_address_key,
                 waiter_is_kernel_address_key,
             );
@@ -1471,7 +1501,7 @@ impl KThread {
         address_key: KProcessAddress,
         is_kernel_address_key: bool,
         has_waiters: &mut bool,
-    ) -> Option<(u64, i32, Option<LockWithPriorityInheritanceInfo>)> {
+    ) -> Option<(u64, i32, usize, Option<LockWithPriorityInheritanceInfo>)> {
         if should_trace_priority_inheritance() {
             log::info!(
                 "PI remove_waiter_by_key owner_tid={} prio={} base={} addr=0x{:X} kernel={}",
@@ -1532,6 +1562,7 @@ impl KThread {
 
         let next_owner_thread_id = next_owner_key.thread_id;
         let next_owner_priority = next_owner_key.priority;
+        let next_owner_thread_ptr = next_owner_key.thread_ptr;
 
         if should_trace_priority_inheritance() {
             log::info!(
@@ -1549,7 +1580,12 @@ impl KThread {
             if self.priority == next_owner_priority && self.priority < self.base_priority {
                 self.restore_priority_simplified();
             }
-            return Some((next_owner_thread_id, next_owner_priority, None));
+            return Some((
+                next_owner_thread_id,
+                next_owner_priority,
+                next_owner_thread_ptr,
+                None,
+            ));
         } else {
             // There are additional waiters — transfer to new owner.
             *has_waiters = true;
@@ -1560,7 +1596,12 @@ impl KThread {
             self.restore_priority_simplified();
         }
 
-        Some((next_owner_thread_id, next_owner_priority, Some(lock_info)))
+        Some((
+            next_owner_thread_id,
+            next_owner_priority,
+            next_owner_thread_ptr,
+            Some(lock_info),
+        ))
     }
 
     /// Simplified RestorePriority — computes new priority from base priority
@@ -1686,6 +1727,7 @@ impl KThread {
                         owner.add_waiter_impl(
                             current_thread_id,
                             new_priority,
+                            current_thread.as_ref().as_ptr() as usize,
                             lock_ref.address_key,
                             lock_ref.is_kernel_address_key,
                         );
@@ -3939,7 +3981,6 @@ impl KThread {
         if !self.is_dummy_thread() {
             return;
         }
-
         // Block until dummy_thread_runnable becomes true.
         let guard = self.dummy_thread_mutex.lock().unwrap();
         let _guard = self
@@ -4539,8 +4580,8 @@ mod tests {
 
         let mut lock_info =
             LockWithPriorityInheritanceInfo::new(KProcessAddress::new(0x4000), true);
-        lock_info.add_waiter(3, 10);
-        lock_info.add_waiter(5, 11);
+        lock_info.add_waiter(3, 10, 0);
+        lock_info.add_waiter(5, 11, 0);
 
         thread.add_held_lock(lock_info);
 
@@ -4558,7 +4599,7 @@ mod tests {
 
         let mut lock_info =
             LockWithPriorityInheritanceInfo::new(KProcessAddress::new(0x5000), false);
-        lock_info.add_waiter(3, 2);
+        lock_info.add_waiter(3, 2, 0);
         thread.add_held_lock(lock_info);
 
         thread.remove_waiter_by_thread_id(2);
@@ -4666,18 +4707,19 @@ mod tests {
 
         let mut lock_info =
             LockWithPriorityInheritanceInfo::new(KProcessAddress::new(0x5000), false);
-        lock_info.add_waiter(3, 2);
-        lock_info.add_waiter(5, 3);
+        lock_info.add_waiter(3, 2, 0x1234);
+        lock_info.add_waiter(5, 3, 0x5678);
         owner.add_held_lock(lock_info);
 
         let mut has_waiters = false;
         let result =
             owner.remove_waiter_by_key(KProcessAddress::new(0x5000), false, &mut has_waiters);
 
-        let (next_owner_thread_id, next_owner_priority, transfer_lock_info) =
+        let (next_owner_thread_id, next_owner_priority, next_owner_thread_ptr, transfer_lock_info) =
             result.expect("expected next owner");
         assert_eq!(next_owner_thread_id, 2);
         assert_eq!(next_owner_priority, 3);
+        assert_eq!(next_owner_thread_ptr, 0x1234);
         assert!(has_waiters);
         assert!(transfer_lock_info.is_some());
         assert!(

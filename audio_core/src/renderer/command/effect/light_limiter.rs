@@ -5,7 +5,45 @@ use crate::renderer::command::util::write_copy;
 use crate::renderer::effect::effect_info_base::ParameterState;
 use crate::renderer::effect::light_limiter;
 use crate::renderer::effect::light_limiter::{ProcessingMode, StatisticsInternal};
+use common::fixed_point::FixedPoint;
 use std::fmt::Write;
+use std::sync::OnceLock;
+
+type Fixed49_15 = FixedPoint<49, 15>;
+
+fn initialized_light_limiter_states(
+) -> &'static parking_lot::Mutex<std::collections::HashSet<usize>> {
+    static INITIALIZED: OnceLock<parking_lot::Mutex<std::collections::HashSet<usize>>> =
+        OnceLock::new();
+    INITIALIZED.get_or_init(|| parking_lot::Mutex::new(std::collections::HashSet::new()))
+}
+
+pub(crate) fn drop_light_limiter_state_if_initialized(addr: CpuAddr) {
+    if addr == 0 {
+        return;
+    }
+    if initialized_light_limiter_states()
+        .lock()
+        .remove(&(addr as usize))
+    {
+        unsafe { std::ptr::drop_in_place(addr as *mut LightLimiterState) };
+    }
+}
+
+fn mark_light_limiter_state_initialized(addr: CpuAddr) {
+    if addr != 0 {
+        initialized_light_limiter_states()
+            .lock()
+            .insert(addr as usize);
+    }
+}
+
+#[cfg(test)]
+fn light_limiter_state_is_initialized(addr: CpuAddr) -> bool {
+    initialized_light_limiter_states()
+        .lock()
+        .contains(&(addr as usize))
+}
 
 #[derive(Debug, Clone, Copy)]
 #[repr(C)]
@@ -81,27 +119,27 @@ impl LightLimiterVersion2Payload {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 #[repr(C)]
 pub struct LightLimiterState {
-    pub samples_average: [f32; MAX_CHANNELS as usize],
-    pub compression_gain: [f32; MAX_CHANNELS as usize],
-    pub look_ahead_sample_offsets: [u32; MAX_CHANNELS as usize],
-    pub look_ahead_samples_max: u32,
-    pub _padding0: [u8; 0x4f0],
+    pub samples_average: [Fixed49_15; MAX_CHANNELS as usize],
+    pub compression_gain: [Fixed49_15; MAX_CHANNELS as usize],
+    pub look_ahead_sample_offsets: [i32; MAX_CHANNELS as usize],
+    pub look_ahead_sample_buffers: [Vec<Fixed49_15>; MAX_CHANNELS as usize],
 }
 
 impl Default for LightLimiterState {
     fn default() -> Self {
         Self {
-            samples_average: [0.0; MAX_CHANNELS as usize],
-            compression_gain: [1.0; MAX_CHANNELS as usize],
+            samples_average: [Fixed49_15::from_base(0); MAX_CHANNELS as usize],
+            compression_gain: [Fixed49_15::from_int(1); MAX_CHANNELS as usize],
             look_ahead_sample_offsets: [0; MAX_CHANNELS as usize],
-            look_ahead_samples_max: 0,
-            _padding0: [0; 0x4f0],
+            look_ahead_sample_buffers: std::array::from_fn(|_| Vec::new()),
         }
     }
 }
+
+const _: () = assert!(std::mem::size_of::<LightLimiterState>() <= 0x500);
 
 pub fn write_light_limiter_v1_payload(
     cmd: &LightLimiterVersion1Command,
@@ -290,29 +328,32 @@ pub fn update_light_limiter_effect_parameter(
 pub fn initialize_light_limiter_effect(
     parameter: &light_limiter::ParameterVersion2,
     state: &mut LightLimiterState,
-    memory: &MemoryHandle,
-    workbuffer_addr: CpuAddr,
+    _memory: &MemoryHandle,
+    _workbuffer_addr: CpuAddr,
 ) {
-    *state = LightLimiterState::default();
+    let state_addr = state as *mut LightLimiterState as CpuAddr;
+    drop_light_limiter_state_if_initialized(state_addr);
+    unsafe { std::ptr::write(state, LightLimiterState::default()) };
+    mark_light_limiter_state_initialized(state_addr);
+
     let channel_count = parameter.channel_count.max(0) as usize;
-    state.look_ahead_samples_max = parameter.look_ahead_samples_max.max(0) as u32;
-    let sample_count = channel_count.saturating_mul(state.look_ahead_samples_max as usize);
-    if sample_count != 0 {
-        let zeroes = vec![0; sample_count.saturating_mul(std::mem::size_of::<f32>())];
-        let _ = memory.write_block(workbuffer_addr as u64, &zeroes);
+    let look_ahead_samples_max = parameter.look_ahead_samples_max.max(0) as usize;
+    for channel in 0..channel_count.min(MAX_CHANNELS as usize) {
+        state.look_ahead_sample_buffers[channel]
+            .resize(look_ahead_samples_max, Fixed49_15::from_base(0));
     }
 }
 
 pub fn apply_light_limiter_effect(
     parameter: &light_limiter::ParameterVersion2,
     state: &mut LightLimiterState,
-    memory: &MemoryHandle,
+    _memory: &MemoryHandle,
     enabled: bool,
     inputs: &[i16; MAX_CHANNELS as usize],
     outputs: &[i16; MAX_CHANNELS as usize],
     mix_buffers: &mut [i32],
     sample_count: usize,
-    workbuffer_addr: CpuAddr,
+    _workbuffer_addr: CpuAddr,
     result_state_addr: CpuAddr,
 ) {
     let channel_count = parameter.channel_count.max(0) as usize;
@@ -323,18 +364,13 @@ pub fn apply_light_limiter_effect(
 
     if !enabled {
         for channel in 0..active_channels {
-            copy_mix_buffer(mix_buffers, sample_count, outputs[channel], inputs[channel]);
+            if parameter.inputs[channel] != parameter.outputs[channel] {
+                copy_mix_buffer(mix_buffers, sample_count, outputs[channel], inputs[channel]);
+            }
         }
         return;
     }
 
-    let lookahead_len = parameter.look_ahead_samples_max.max(0) as usize;
-    let mut lookahead_storage = read_f32_buffer(
-        memory,
-        workbuffer_addr,
-        active_channels.saturating_mul(lookahead_len),
-    );
-    let mut lookahead_buffers = lookahead_storage.as_deref_mut();
     let mut statistics = if parameter.statistics_enabled {
         read_statistics_internal_mut(result_state_addr)
     } else {
@@ -343,86 +379,82 @@ pub fn apply_light_limiter_effect(
 
     if let Some(stats) = statistics.as_deref_mut() {
         if parameter.statistics_reset_required {
-            stats.channel_compression_gain_min = [1.0; MAX_CHANNELS as usize];
-            stats.channel_max_sample = [0.0; MAX_CHANNELS as usize];
+            for channel in 0..active_channels {
+                stats.channel_compression_gain_min[channel] = 1.0;
+                stats.channel_max_sample[channel] = 0.0;
+            }
         }
     }
 
     for sample_index in 0..sample_count {
         for channel in 0..active_channels {
-            let mut sample =
-                mix_buffer_sample(mix_buffers, inputs[channel], sample_count, sample_index) as f32;
-            sample *= parameter.input_gain;
-            let abs_sample = sample.abs();
-            let coeff = if abs_sample > state.samples_average[channel] {
-                parameter.attack_coeff
+            let input = mix_buffer_sample(mix_buffers, inputs[channel], sample_count, sample_index);
+            let sample =
+                Fixed49_15::from_base(input as i64) * Fixed49_15::from_f32(parameter.input_gain);
+            let abs_sample = if sample < Fixed49_15::from_base(0) {
+                -sample
             } else {
-                parameter.release_coeff
+                sample
             };
-            state.samples_average[channel] += (abs_sample - state.samples_average[channel]) * coeff;
+            let coeff = if abs_sample > state.samples_average[channel] {
+                Fixed49_15::from_f32(parameter.attack_coeff)
+            } else {
+                Fixed49_15::from_f32(parameter.release_coeff)
+            };
+            state.samples_average[channel] += Fixed49_15::from_f32(
+                ((abs_sample - state.samples_average[channel]) * coeff).to_f32(),
+            );
 
             let average = state.samples_average[channel];
-            let mut new_average_sample = recip_estimate_f32(average.max(f32::MIN_POSITIVE));
+            let mut new_average_sample = Fixed49_15::from_f64(recip_estimate(average.to_f64()));
             if !matches!(parameter.processing_mode, ProcessingMode::Mode1) {
-                let temp = 2.0 - (average * new_average_sample);
-                new_average_sample = 2.0 - (average * temp);
+                let temp = Fixed49_15::from_int(2) - (average * new_average_sample);
+                new_average_sample = Fixed49_15::from_int(2) - (average * temp);
             }
 
-            let attenuation = if average > parameter.threshold {
-                parameter.threshold * new_average_sample
+            let threshold = Fixed49_15::from_f32(parameter.threshold);
+            let attenuation = if average > threshold {
+                threshold * new_average_sample
             } else {
-                1.0
+                Fixed49_15::from_int(1)
             };
             let coeff = if attenuation < state.compression_gain[channel] {
-                parameter.attack_coeff
+                Fixed49_15::from_f32(parameter.attack_coeff)
             } else {
-                parameter.release_coeff
+                Fixed49_15::from_f32(parameter.release_coeff)
             };
             state.compression_gain[channel] +=
                 (attenuation - state.compression_gain[channel]) * coeff;
 
-            let lookahead_sample = if let Some(buffers) = lookahead_buffers.as_deref_mut() {
-                if lookahead_len == 0 {
-                    sample
-                } else {
-                    let channel_base = channel.saturating_mul(lookahead_len);
-                    let offset = (state.look_ahead_sample_offsets[channel] as usize)
-                        .min(lookahead_len.saturating_sub(1));
-                    let previous = buffers[channel_base + offset];
-                    buffers[channel_base + offset] = sample;
-                    let modulo = parameter.look_ahead_samples_min.max(1) as u32;
-                    state.look_ahead_sample_offsets[channel] =
-                        (state.look_ahead_sample_offsets[channel] + 1) % modulo;
-                    previous
-                }
-            } else {
-                sample
-            };
+            let lookahead_buffer = &mut state.look_ahead_sample_buffers[channel];
+            let offset = state.look_ahead_sample_offsets[channel] as usize;
+            let lookahead_sample = lookahead_buffer[offset];
+            lookahead_buffer[offset] = sample;
+            state.look_ahead_sample_offsets[channel] =
+                (state.look_ahead_sample_offsets[channel] + 1) % parameter.look_ahead_samples_min;
 
-            let output_sample =
-                lookahead_sample * state.compression_gain[channel] * parameter.output_gain;
+            let output_sample = lookahead_sample
+                * state.compression_gain[channel]
+                * Fixed49_15::from_f32(parameter.output_gain)
+                * Fixed49_15::from_int(Fixed49_15::ONE);
             set_mix_buffer_sample(
                 mix_buffers,
                 outputs[channel],
                 sample_count,
                 sample_index,
                 output_sample
-                    .clamp(i32::MIN as f32, i32::MAX as f32)
-                    .round() as i32,
+                    .to_long()
+                    .clamp(i32::MIN as i64, i32::MAX as i64) as i32,
             );
 
             if let Some(stats) = statistics.as_deref_mut() {
                 stats.channel_max_sample[channel] =
-                    stats.channel_max_sample[channel].max(abs_sample);
+                    stats.channel_max_sample[channel].max(abs_sample.to_f32());
                 stats.channel_compression_gain_min[channel] = stats.channel_compression_gain_min
                     [channel]
-                    .min(state.compression_gain[channel]);
+                    .min(state.compression_gain[channel].to_f32());
             }
         }
-    }
-
-    if let Some(buffer) = lookahead_storage.as_deref() {
-        write_f32_buffer(memory, workbuffer_addr, buffer);
     }
 }
 
@@ -450,38 +482,11 @@ fn read_statistics_internal_mut(addr: CpuAddr) -> Option<&'static mut Statistics
     Some(unsafe { &mut *(addr as *mut StatisticsInternal) })
 }
 
-fn read_f32_buffer(memory: &MemoryHandle, addr: CpuAddr, len: usize) -> Option<Vec<f32>> {
-    if addr == 0 || len == 0 {
-        return None;
-    }
-    let mut bytes = vec![0; len.checked_mul(std::mem::size_of::<f32>())?];
-    if !memory.read_block(addr as u64, &mut bytes) {
-        return None;
-    }
-    Some(
-        bytes
-            .chunks_exact(4)
-            .map(|word| f32::from_le_bytes(word.try_into().expect("four-byte chunk")))
-            .collect(),
-    )
-}
-
-fn write_f32_buffer(memory: &MemoryHandle, addr: CpuAddr, values: &[f32]) {
-    if addr == 0 || values.is_empty() {
-        return;
-    }
-    let mut bytes = Vec::with_capacity(values.len() * std::mem::size_of::<f32>());
-    for value in values {
-        bytes.extend_from_slice(&value.to_le_bytes());
-    }
-    let _ = memory.write_block(addr as u64, &bytes);
-}
-
-fn recip_estimate_f32(value: f32) -> f32 {
-    let q = (value as f64 * 512.0).floor() as i32;
+fn recip_estimate(value: f64) -> f64 {
+    let q = (value * 512.0) as i32;
     let r = 1.0 / (((q as f64) + 0.5) / 512.0);
     let s = (256.0 * r + 0.5) as i32;
-    (s as f64 / 256.0) as f32
+    s as f64 / 256.0
 }
 
 fn mix_buffer_sample(
@@ -513,5 +518,38 @@ fn set_mix_buffer_sample(
     let buffer_index = buffer_index as usize;
     if let Some(sample) = mix_buffers.get_mut(buffer_index * sample_count + sample_index) {
         *sample = value;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::renderer::effect::effect_info_base::{EffectInfoBase, EffectType};
+
+    fn parameter() -> light_limiter::ParameterVersion2 {
+        light_limiter::ParameterVersion2 {
+            channel_count_max: 1,
+            channel_count: 1,
+            look_ahead_samples_min: 1,
+            look_ahead_samples_max: 4,
+            state: ParameterState::Initialized,
+            ..light_limiter::ParameterVersion2::default()
+        }
+    }
+
+    #[test]
+    fn effect_info_cleanup_drops_registered_light_limiter_state() {
+        let mut effect = EffectInfoBase::default();
+        effect.set_type(EffectType::LightLimiter);
+        let state =
+            unsafe { &mut *(effect.get_state_buffer().as_mut_ptr() as *mut LightLimiterState) };
+        let address = state as *mut LightLimiterState as CpuAddr;
+
+        initialize_light_limiter_effect(&parameter(), state, &MemoryHandle::default(), 0);
+        assert!(light_limiter_state_is_initialized(address));
+        assert_eq!(state.look_ahead_sample_buffers[0].len(), 4);
+
+        effect.cleanup();
+        assert!(!light_limiter_state_is_initialized(address));
     }
 }

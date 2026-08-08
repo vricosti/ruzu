@@ -26,6 +26,16 @@ pub const VI_SERVICE_NAMES: &[&str] = &["vi:m", "vi:s", "vi:u"];
 pub fn loop_process(system: crate::core::SystemRef) {
     let container = Container::new(system);
 
+    // Upstream keeps this callback alive on the VI service thread's stack and
+    // calls Container::OnTerminate as soon as System requests shutdown, before
+    // KernelCore::CloseServices waits for the server loop to exit.
+    let container_for_stop = Arc::downgrade(&container);
+    let _stop_callback = system.get().register_stop_callback(move || {
+        if let Some(container) = container_for_stop.upgrade() {
+            container.on_terminate();
+        }
+    });
+
     let server_manager = crate::hle::service::server_manager::ServerManager::new_shared(system);
 
     {

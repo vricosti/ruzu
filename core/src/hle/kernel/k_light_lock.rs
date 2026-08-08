@@ -172,38 +172,44 @@ impl KLightLock {
         let next_owner = owner_thread.remove_waiter_by_key(key, true, &mut has_waiters);
 
         let mut next_tag = 0;
-        if let Some((next_owner_id, _priority, transfer_lock_info)) = next_owner {
-            let next_owner = find_thread(next_owner_id)
-                .expect("KLightLock waiter disappeared while scheduler lock was held");
-            let next_owner_ptr = next_owner.as_ref().as_ptr() as usize;
+        if let Some((next_owner_id, _priority, next_owner_ptr, transfer_lock_info)) = next_owner {
+            assert_ne!(
+                next_owner_ptr, 0,
+                "KLightLock waiter has no stable KThread pointer"
+            );
+
+            // SAFETY: the intrusive waiter tree retains the stable KThread
+            // address, and all accesses are serialized by the scheduler lock.
+            // This matches upstream, which returns `KThread*` directly from
+            // RemoveKernelWaiterByKey rather than resolving an identifier.
+            let next_owner = unsafe { &mut *(next_owner_ptr as *mut KThread) };
 
             if let Some(lock_info) = transfer_lock_info {
                 let remaining_waiters = lock_info.waiter_keys();
                 let waiter_count = lock_info.get_waiter_count();
-                {
-                    let mut next = next_owner.lock().unwrap();
-                    next.add_held_lock(lock_info);
-                    next.add_transferred_kernel_waiters(waiter_count);
-                }
+                next_owner.add_held_lock(lock_info);
+                next_owner.add_transferred_kernel_waiters(waiter_count);
                 for waiter in remaining_waiters {
-                    if let Some(waiter_thread) = find_thread(waiter.thread_id) {
-                        waiter_thread
-                            .lock()
-                            .unwrap()
-                            .set_waiting_lock_owner_thread_id(Some(next_owner_id), next_owner_ptr);
+                    if waiter.thread_ptr != 0 {
+                        // SAFETY: remaining waiters are retained by the same
+                        // intrusive lock tree for the duration of the wait.
+                        unsafe {
+                            (*(waiter.thread_ptr as *mut KThread))
+                                .set_waiting_lock_owner_thread_id(
+                                    Some(next_owner_id),
+                                    next_owner_ptr,
+                                );
+                        }
                     }
                 }
             }
 
-            {
-                let mut next = next_owner.lock().unwrap();
-                next.end_wait(RESULT_SUCCESS.get_inner_value());
-                if next.is_suspended() {
-                    next.continue_if_has_kernel_waiters();
-                }
-                if next.is_dummy_thread() {
-                    next.dummy_thread_end_wait();
-                }
+            next_owner.end_wait(RESULT_SUCCESS.get_inner_value());
+            if next_owner.is_suspended() {
+                next_owner.continue_if_has_kernel_waiters();
+            }
+            if next_owner.is_dummy_thread() {
+                next_owner.dummy_thread_end_wait();
             }
 
             next_tag = next_owner_ptr | usize::from(has_waiters);
@@ -251,14 +257,6 @@ fn cancel_light_lock_wait(waiting_thread: &mut KThread) {
     unsafe {
         (*owner_ptr).remove_waiter(waiter_id, waiter_priority, true, address_key);
     }
-}
-
-fn find_thread(thread_id: u64) -> Option<Arc<KThreadLock>> {
-    let gsc = super::kernel::get_kernel_ref()?
-        .global_scheduler_context()?
-        .clone();
-    let thread = gsc.lock().unwrap().get_thread_by_thread_id(thread_id);
-    thread
 }
 
 fn current_host_tag() -> usize {

@@ -855,6 +855,13 @@ impl CpuManager {
             Some(scheduler) => scheduler.clone(),
             None => return,
         };
+
+        // The guest KThread is a property of this fiber. Fibers that run on
+        // the same host core share OS-thread TLS, so restore the identity at
+        // the execution boundary before scheduler callbacks or an SVC can
+        // consult GetCurrentThreadPointer. Upstream gets this invariant from
+        // SetCurrentThread immediately before yielding to the target fiber.
+        Self::restore_current_emu_thread(thread_arc);
         let scheduler_current_thread = scheduler.lock().unwrap().get_scheduler_current_thread();
         let scheduler_current = scheduler_current_thread
             .as_ref()
@@ -921,7 +928,6 @@ impl CpuManager {
                     scheduler_host_context,
                 );
             }
-            super::hle::kernel::kernel::set_current_emu_thread(Some(thread_arc));
             Self::force_reschedule_current_core_raw(kernel);
             if (n < 200 || n % 1000 == 0)
                 && common::trace::is_enabled(common::trace::cat::SCHED_STATE)

@@ -533,7 +533,7 @@ impl KConditionVariable {
             }
 
             // If there are remaining waiters, transfer the lock info to the next owner.
-            next_owner_thread = if let Some((next_owner_id, _priority, transfer_lock_info)) =
+            next_owner_thread = if let Some((next_owner_id, _priority, _, transfer_lock_info)) =
                 next_owner_result
             {
                 let remaining_waiter_count = transfer_lock_info
@@ -1225,7 +1225,7 @@ impl KConditionVariable {
             log::trace!(
                 "KConditionVariable::wait_locked tid={} after remove_waiter_by_key next_owner={:?} has_waiters={}",
                 current_thread_id,
-                next_owner_result.as_ref().map(|(tid, _, _)| *tid),
+                next_owner_result.as_ref().map(|(tid, _, _, _)| *tid),
                 has_waiters
             );
 
@@ -1233,7 +1233,9 @@ impl KConditionVariable {
             // Matches upstream: next_value = next_owner_thread->GetAddressKeyValue();
             let mut next_value = 0u32;
             let mut trace_next_owner_id = 0u64;
-            if let Some((next_owner_thread_id, _priority, transfer_lock_info)) = next_owner_result {
+            if let Some((next_owner_thread_id, _priority, _, transfer_lock_info)) =
+                next_owner_result
+            {
                 trace_next_owner_id = next_owner_thread_id;
                 let Some(next_owner_thread) =
                     process_guard.get_thread_by_thread_id(next_owner_thread_id)
@@ -2100,7 +2102,7 @@ mod tests {
             false,
             &mut has_waiters,
         );
-        let (next_owner_id, _priority, transfer_lock_info) = next_owner_result.unwrap();
+        let (next_owner_id, _priority, _, transfer_lock_info) = next_owner_result.unwrap();
         assert_eq!(next_owner_id, 2);
         assert!(has_waiters);
 

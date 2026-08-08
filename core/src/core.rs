@@ -34,7 +34,7 @@ use hid_core::hid_core::HIDCore;
 
 use crate::hle::kernel::k_process::ProcessLock;
 use parking_lot::Mutex;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 
@@ -62,6 +62,85 @@ pub enum SystemResultStatus {
 /// Type used for the frontend to designate a callback for System to re-launch
 /// the application using a specified program index.
 pub type ExecuteProgramCallback = Box<dyn Fn(usize) + Send>;
+
+type StopCallbackFn = Arc<dyn Fn() + Send + Sync>;
+
+#[derive(Default)]
+struct StopEventState {
+    stop_requested: bool,
+    next_callback_id: u64,
+    callbacks: HashMap<u64, StopCallbackFn>,
+}
+
+/// Rust counterpart of upstream `System::Impl::stop_event`.
+///
+/// Upstream passes a `std::stop_token` to the VI service and requests it before
+/// suspending the kernel. The callback lifetime is scoped to the service loop.
+#[derive(Default)]
+struct StopEvent {
+    state: StdMutex<StopEventState>,
+}
+
+impl StopEvent {
+    fn register(self: &Arc<Self>, callback: StopCallbackFn) -> StopCallback {
+        let callback_id = {
+            let mut state = self.state.lock().unwrap();
+            if state.stop_requested {
+                None
+            } else {
+                let id = state.next_callback_id;
+                state.next_callback_id = state.next_callback_id.wrapping_add(1);
+                state.callbacks.insert(id, Arc::clone(&callback));
+                Some(id)
+            }
+        };
+
+        if callback_id.is_none() {
+            callback();
+        }
+
+        StopCallback {
+            event: Arc::downgrade(self),
+            callback_id,
+        }
+    }
+
+    fn request_stop(&self) {
+        let callbacks = {
+            let mut state = self.state.lock().unwrap();
+            if state.stop_requested {
+                return;
+            }
+            state.stop_requested = true;
+            state.callbacks.values().cloned().collect::<Vec<_>>()
+        };
+
+        for callback in callbacks {
+            callback();
+        }
+    }
+
+    fn reset(&self) {
+        let mut state = self.state.lock().unwrap();
+        state.stop_requested = false;
+        state.callbacks.clear();
+    }
+}
+
+/// Scoped registration matching `std::stop_callback`.
+pub struct StopCallback {
+    event: std::sync::Weak<StopEvent>,
+    callback_id: Option<u64>,
+}
+
+impl Drop for StopCallback {
+    fn drop(&mut self) {
+        let (Some(event), Some(callback_id)) = (self.event.upgrade(), self.callback_id) else {
+            return;
+        };
+        event.state.lock().unwrap().callbacks.remove(&callback_id);
+    }
+}
 
 /// A non-owning reference to System, mirroring upstream's `Core::System&`.
 ///
@@ -978,6 +1057,8 @@ pub struct System {
     is_paused: AtomicBool,
     /// Whether the system is shutting down.
     is_shutting_down: AtomicBool,
+    /// Upstream `System::Impl::stop_event`, used by VI termination cleanup.
+    stop_event: Arc<StopEvent>,
     /// Whether the system is powered on (all subsystems initialized).
     is_powered_on: AtomicBool,
 
@@ -1129,6 +1210,7 @@ impl System {
             suspend_guard: Mutex::new(()),
             is_paused: AtomicBool::new(false),
             is_shutting_down: AtomicBool::new(false),
+            stop_event: Arc::new(StopEvent::default()),
             is_powered_on: AtomicBool::new(false),
             exit_locked: Arc::new(AtomicBool::new(false)),
             exit_requested: AtomicBool::new(false),
@@ -1835,6 +1917,7 @@ impl System {
             gpu_core.notify_shutdown();
         }
 
+        self.stop_event.request_stop();
         self.core_timing.sync_pause(false);
         crate::internal_network::network::cancel_pending_socket_operations();
         if let Some(ref kernel) = self.kernel {
@@ -1871,6 +1954,7 @@ impl System {
         if let Some(ref mut kernel) = self.kernel {
             kernel.shutdown();
         }
+        self.stop_event.reset();
         crate::internal_network::network::restart_socket_operations();
 
         log::info!("System: shutdown complete");
@@ -1885,6 +1969,17 @@ impl System {
     pub fn set_shutting_down(&self, shutting_down: bool) {
         self.is_shutting_down
             .store(shutting_down, Ordering::Relaxed);
+    }
+
+    /// Register a callback scoped to the current emulation stop event.
+    ///
+    /// This is the Rust ownership equivalent of constructing an upstream
+    /// `std::stop_callback` from `Services`' stop token.
+    pub fn register_stop_callback<F>(&self, callback: F) -> StopCallback
+    where
+        F: Fn() + Send + Sync + 'static,
+    {
+        self.stop_event.register(Arc::new(callback))
     }
 
     /// Stall the application (pause with lock held).
@@ -2726,6 +2821,7 @@ impl Default for System {
 #[cfg(test)]
 mod exit_state_tests {
     use super::*;
+    use std::sync::atomic::AtomicUsize;
     use std::time::{Duration, Instant};
 
     #[test]
@@ -2757,5 +2853,35 @@ mod exit_state_tests {
         drop(system);
 
         assert!(!core_timing.has_started());
+    }
+
+    #[test]
+    fn stop_callback_runs_once_when_stop_is_requested() {
+        let stop_event = Arc::new(StopEvent::default());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_for_callback = Arc::clone(&calls);
+        let _callback = stop_event.register(Arc::new(move || {
+            calls_for_callback.fetch_add(1, Ordering::Relaxed);
+        }));
+
+        stop_event.request_stop();
+        stop_event.request_stop();
+
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn dropping_stop_callback_unregisters_it() {
+        let stop_event = Arc::new(StopEvent::default());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_for_callback = Arc::clone(&calls);
+        let callback = stop_event.register(Arc::new(move || {
+            calls_for_callback.fetch_add(1, Ordering::Relaxed);
+        }));
+
+        drop(callback);
+        stop_event.request_stop();
+
+        assert_eq!(calls.load(Ordering::Relaxed), 0);
     }
 }

@@ -12,11 +12,8 @@
 //! service thread on a kernel-readable wakeup event instead of keeping it
 //! runnable in a round-robin yield loop.
 //!
-//! IPC dispatch in ruzu is being migrated toward upstream's
-//! `KClientSession::SendSyncRequest` → `KServerSession::OnRequest` →
-//! `ServerManager::OnSessionEvent` flow. Binder and explicit host-thread
-//! routes use this event loop; non-routed services still keep a temporary
-//! inline fallback in `svc_ipc.rs`.
+//! IPC dispatch follows upstream's `KClientSession::SendSyncRequest` →
+//! `KServerSession::OnRequest` → `ServerManager::OnSessionEvent` flow.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
@@ -281,78 +278,6 @@ impl ServerManager {
         server_session.lock().unwrap().get_parent_id()
     }
 
-    fn host_thread_session_consumption_enabled_from_flags(all: bool) -> bool {
-        all
-    }
-
-    fn host_thread_session_consumption_enabled() -> bool {
-        Self::host_thread_session_consumption_enabled_from_flags(
-            std::env::var_os("RUZU_SERVER_THREAD_IPC_ALL").is_some(),
-        )
-    }
-
-    fn host_thread_service_filter_matches(service_name: &str) -> bool {
-        let Some(spec) = std::env::var_os("RUZU_SERVER_THREAD_IPC_SERVICE") else {
-            return false;
-        };
-        spec.to_string_lossy().split(',').any(|raw| {
-            let value = raw.trim();
-            !value.is_empty() && (value == "*" || value == service_name)
-        })
-    }
-
-    fn should_link_session_holder_for_host_thread(
-        server_session: &Arc<Mutex<KServerSession>>,
-        manager: &Arc<Mutex<SessionRequestManager>>,
-    ) -> bool {
-        if Self::host_thread_session_consumption_enabled() {
-            return true;
-        }
-
-        // Per-handle host-thread routing wires this wakeup immediately before
-        // queueing the exact target session for registration. Link only that
-        // prepared session, not every session created while the env var exists.
-        if server_session.lock().unwrap().manager_wakeup.is_some() {
-            return true;
-        }
-
-        if std::env::var_os("RUZU_SERVER_THREAD_IPC_SERVICE").is_none() {
-            return false;
-        }
-
-        let service_name = manager
-            .lock()
-            .unwrap()
-            .session_handler()
-            .map(|handler| handler.service_name().to_string());
-        let Some(service_name) = service_name else {
-            return false;
-        };
-
-        if Self::default_host_thread_service_matches(&service_name) {
-            return true;
-        }
-
-        Self::host_thread_service_filter_matches(&service_name)
-    }
-
-    fn default_host_thread_service_matches(service_name: &str) -> bool {
-        Self::default_host_thread_service_matches_from_flags(
-            service_name,
-            std::env::var_os("RUZU_INLINE_IPC").is_some(),
-            std::env::var_os("RUZU_DISABLE_SERVER_THREAD_IPC_BINDER").is_some(),
-        )
-    }
-
-    pub(crate) fn default_host_thread_service_matches_from_flags(
-        service_name: &str,
-        inline: bool,
-        disable_binder: bool,
-    ) -> bool {
-        let _ = (service_name, inline, disable_binder);
-        false
-    }
-
     fn trace_ipc(&self, stage: &str) {
         if std::env::var_os("RUZU_TRACE_SERVER_MANAGER_IPC").is_some() {
             eprintln!("[SERVER_MANAGER_IPC] manager={} stage={stage}", self.name);
@@ -518,10 +443,9 @@ impl ServerManager {
         }
     }
 
-    /// Consume endpoint-close notifications from sessions handled by the
-    /// temporary inline IPC path. Upstream observes the same closures directly
-    /// through `MultiWait`; this queue avoids linking a second request consumer
-    /// while preserving ServerManager ownership of session destruction.
+    /// Consume endpoint-close notifications without taking the ServerManager
+    /// mutex from the notifying thread. Upstream observes the same closures
+    /// directly through `MultiWait`.
     fn drain_pending_session_closures(&mut self) {
         let closed_parent_ids = {
             let mut queue = self.pending_session_closures.lock().unwrap();
@@ -600,14 +524,9 @@ impl ServerManager {
         }
         for session in &mut self.sessions {
             session.holder.reset_multi_wait_linkage_for_owner_move();
-            if Self::should_link_session_holder_for_host_thread(
-                &session.server_session,
-                &session.manager,
-            ) {
-                session
-                    .holder
-                    .link_to_multi_wait(deferred_list as *mut MultiWait);
-            }
+            session
+                .holder
+                .link_to_multi_wait(deferred_list as *mut MultiWait);
         }
     }
 
@@ -725,18 +644,12 @@ impl ServerManager {
                 Arc::downgrade(&self.pending_session_closures),
                 Arc::downgrade(&self.wakeup_event),
             );
-        // Reactive session consumption is only safe when svc_ipc.rs routes the
-        // same session through the host-thread path. Non-routed sessions still
-        // use the inline fallback, where linking this holder would create a
-        // second receive_request_hle consumer. Upstream has a single consumer
-        // (ServerManager); ruzu links only sessions whose routing policy has
-        // already moved to that path.
-        if Self::should_link_session_holder_for_host_thread(
-            &session.server_session,
-            &session.manager,
-        ) {
-            self.link_to_deferred_list_holder(&mut session.holder);
-        }
+        session
+            .server_session
+            .lock()
+            .unwrap()
+            .set_manager_wakeup(Arc::downgrade(&self.wakeup_event));
+        self.link_to_deferred_list_holder(&mut session.holder);
         self.sessions.push(session);
         RESULT_SUCCESS
     }
@@ -1047,26 +960,110 @@ impl ServerManager {
     /// Only the main `LoopProcess` caller runs the prepare/finish wrapper.
     fn loop_process_impl_shared(manager: &Arc<Mutex<ServerManager>>) -> ResultCode {
         loop {
-            let selected = {
-                let mut guard = manager.lock().unwrap();
-                if guard.stop_requested.load(Ordering::Relaxed) {
+            let Some(selected_holder) = Self::wait_signaled_shared(manager) else {
+                if manager
+                    .lock()
+                    .unwrap()
+                    .stop_requested
+                    .load(Ordering::Relaxed)
+                {
                     return RESULT_SUCCESS;
                 }
-                guard
-                    .wait_signaled()
-                    .map(|holder| guard.prepare_shared_event(holder))
+                continue;
             };
+            let selected = manager
+                .lock()
+                .unwrap()
+                .prepare_shared_event(selected_holder);
 
             match selected {
-                Some(SelectedSharedEvent::Session(event)) => {
+                SelectedSharedEvent::Session(event) => {
                     Self::process_session_event_shared(manager, event);
                 }
-                Some(SelectedSharedEvent::Locked(holder)) => {
+                SelectedSharedEvent::Locked(holder) => {
                     let mut guard = manager.lock().unwrap();
                     guard.process(holder);
                 }
-                None => {}
             }
+        }
+    }
+
+    /// Shared-owner adaptation of upstream `ServerManager::WaitSignaled`.
+    ///
+    /// `m_selection_mutex` serializes selection, but upstream does not hold a
+    /// mutex covering the whole `ServerManager` while `MultiWait::WaitAny`
+    /// blocks. Request workers must remain able to send their reply and link
+    /// the processed session to `m_deferred_list` during that wait.
+    fn wait_signaled_shared(manager: &Arc<Mutex<ServerManager>>) -> Option<*mut MultiWaitHolder> {
+        let selection_mutex = Arc::clone(&manager.lock().unwrap().selection_mutex);
+        let _selection_guard = selection_mutex.lock().unwrap();
+
+        loop {
+            let (multi_wait, kernel, wakeup_event) = {
+                let mut owner = manager.lock().unwrap();
+
+                if std::env::var_os("RUZU_TRACE_SERVER_MANAGER_LOOP").is_some() {
+                    let pending = owner.pending_registrations.lock().unwrap().len();
+                    eprintln!(
+                        "[SERVER_MANAGER_LOOP] manager={} stage=iter pending_q={} wakeup_signaled={}",
+                        owner.name,
+                        pending,
+                        owner.wakeup_event.is_signaled()
+                    );
+                }
+
+                owner.ensure_kernel_port_registrations();
+                owner.drain_pending_registrations();
+                owner.drain_pending_session_closures();
+                owner.link_deferred();
+
+                if owner.stop_requested.load(Ordering::Relaxed) {
+                    return None;
+                }
+
+                let kernel = if owner.system.is_null() {
+                    None
+                } else {
+                    owner
+                        .system
+                        .get()
+                        .kernel()
+                        .map(|kernel| kernel as *const crate::hle::kernel::kernel::KernelCore)
+                };
+                (
+                    &owner.multi_wait as *const MultiWait,
+                    kernel,
+                    Arc::clone(&owner.wakeup_event),
+                )
+            };
+
+            // The manager is stable behind Arc<Mutex<_>> and selection_mutex
+            // prevents another waiter from mutating m_multi_wait. Other workers
+            // only add holders to m_deferred_list while this call is blocked.
+            let selected = if let Some(kernel) = kernel {
+                unsafe { (&*multi_wait).wait_any(&*kernel) }
+            } else {
+                let selected = unsafe { (&*multi_wait).try_wait_any_local() };
+                if selected.is_some() {
+                    selected
+                } else {
+                    wakeup_event.wait_timeout(Duration::from_millis(100));
+                    continue;
+                }
+            };
+            let Some(selected) = selected else {
+                continue;
+            };
+
+            let mut owner = manager.lock().unwrap();
+            unsafe {
+                (*selected).unlink_from_multi_wait();
+            }
+            if owner.is_wakeup_holder(selected) {
+                owner.consume_wakeup_holder(selected);
+                continue;
+            }
+            return Some(selected);
         }
     }
 
@@ -1152,7 +1149,15 @@ impl ServerManager {
                 }
                 if self.is_wakeup_holder(selected) {
                     self.consume_wakeup_holder(selected);
-                    continue;
+                    // Upstream can restart this loop while retaining only
+                    // m_selection_mutex: session processing and deferred-list
+                    // relinking use independent synchronization. Ruzu's
+                    // shared-owner adaptation enters wait_signaled() while
+                    // holding Mutex<ServerManager>. Return to the outer loop
+                    // after consuming the internal wakeup so that a worker
+                    // which just finished a request can reacquire that mutex
+                    // and relink its session before we block again.
+                    return None;
                 }
                 return Some(selected);
             }
@@ -1678,10 +1683,8 @@ impl ServerManager {
     /// 3. If deferred: add to deferred_sessions, return
     /// 4. Else: `server_session->SendReplyHLE()`, re-link session
     ///
-    /// Binder and explicit host-thread IPC routes reach this method through
-    /// the ServerManager event loop. Non-routed services still use the
-    /// temporary inline fallback in `svc_ipc.rs` until they can be promoted
-    /// without creating a second request consumer.
+    /// Registered sessions reach this method through the ServerManager event
+    /// loop.
     fn complete_sync_request(&mut self, session_index: usize) {
         let mut phase_last = ipc_phase_timer();
         self.trace_ipc("complete_sync_request");
@@ -2010,6 +2013,34 @@ mod tests {
     }
 
     #[test]
+    fn shared_wait_does_not_hold_the_manager_lock() {
+        let manager = ServerManager::new_shared(SystemRef::null());
+        manager.lock().unwrap().prepare_loop_process();
+
+        let waiter_manager = Arc::clone(&manager);
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            ServerManager::wait_signaled_shared(&waiter_manager).is_none()
+        });
+        started_rx.recv().unwrap();
+        std::thread::sleep(Duration::from_millis(20));
+
+        let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+        let locker_manager = Arc::clone(&manager);
+        std::thread::spawn(move || {
+            let owner = locker_manager.lock().unwrap();
+            owner.request_stop();
+            locked_tx.send(()).unwrap();
+        });
+
+        locked_rx
+            .recv_timeout(Duration::from_millis(50))
+            .expect("shared WaitAny retained Mutex<ServerManager>");
+        assert!(waiter.join().unwrap());
+    }
+
+    #[test]
     fn start_additional_host_threads_records_pending_threads() {
         let mut manager = ServerManager::new(SystemRef::null());
 
@@ -2019,77 +2050,6 @@ mod tests {
             manager.pending_additional_host_threads,
             vec![("bsdsocket".to_string(), 2)]
         );
-    }
-
-    #[test]
-    fn host_thread_session_consumption_requires_explicit_gate() {
-        assert!(!ServerManager::host_thread_session_consumption_enabled_from_flags(false));
-        assert!(ServerManager::host_thread_session_consumption_enabled_from_flags(true));
-    }
-
-    #[test]
-    fn default_host_thread_session_services_are_not_promoted_implicitly() {
-        for service_name in [
-            "IHOSBinderDriver",
-            "pl:s",
-            "pl:u",
-            "audren:u",
-            "IAudioRenderer",
-            "IAudioDevice",
-            "vi:m",
-            "vi:s",
-            "vi:u",
-            "IApplicationDisplayService",
-            "vi::IManagerDisplayService",
-            "vi::ISystemDisplayService",
-            "apm",
-            "apm:am",
-            "apm:sys",
-            "set",
-            "set:cal",
-            "set:fd",
-            "set:sys",
-            "lm",
-            "aoc:u",
-            "time:u",
-            "time:a",
-            "time:r",
-            "time:s",
-            "time:m",
-            "time:su",
-            "time:al",
-            "pctl",
-            "pctl:a",
-            "pctl:r",
-            "pctl:s",
-            "prepo:a",
-            "prepo:a2",
-            "prepo:m",
-            "prepo:s",
-            "prepo:u",
-            "friend:a",
-            "friend:m",
-            "friend:s",
-            "friend:u",
-            "friend:v",
-        ] {
-            assert!(
-                !ServerManager::default_host_thread_service_matches_from_flags(
-                    service_name,
-                    false,
-                    false
-                ),
-                "{service_name}"
-            );
-            assert!(
-                !ServerManager::default_host_thread_service_matches_from_flags(
-                    service_name,
-                    false,
-                    true
-                ),
-                "{service_name}"
-            );
-        }
     }
 
     #[test]
@@ -2137,7 +2097,7 @@ mod tests {
     }
 
     #[test]
-    fn register_session_keeps_default_inline_session_holder_unlinked() {
+    fn register_session_links_session_holder_and_wakeup() {
         let mut manager = ServerManager::new(SystemRef::null());
         let server_session = Arc::new(Mutex::new(KServerSession::new()));
         server_session.lock().unwrap().initialize(0x1000);
@@ -2149,11 +2109,12 @@ mod tests {
         );
 
         assert_eq!(manager.sessions.len(), 1);
-        assert!(!manager.sessions[0].holder.is_linked());
+        assert!(manager.sessions[0].holder.is_linked());
+        assert!(server_session.lock().unwrap().manager_wakeup.is_some());
     }
 
     #[test]
-    fn inline_session_close_returns_to_server_manager_for_destruction() {
+    fn session_close_returns_to_server_manager_for_destruction() {
         let mut manager = ServerManager::new(SystemRef::null());
         let server_session = Arc::new(Mutex::new(KServerSession::new()));
         server_session.lock().unwrap().initialize(0x1000);
@@ -2163,7 +2124,7 @@ mod tests {
             manager.register_session(Arc::clone(&server_session), request_manager),
             RESULT_SUCCESS
         );
-        assert!(!manager.sessions[0].holder.is_linked());
+        assert!(manager.sessions[0].holder.is_linked());
 
         server_session.lock().unwrap().on_client_closed();
         assert!(manager.wakeup_event.is_signaled());
@@ -2217,6 +2178,7 @@ mod tests {
             manager.register_session(server_session, request_manager),
             RESULT_SUCCESS
         );
+        manager.wakeup_event.clear();
 
         let destroyed_id = manager.sessions[0].id;
         manager.deferred_sessions.push(destroyed_id);
@@ -2391,7 +2353,7 @@ mod tests {
     }
 
     #[test]
-    fn wait_holder_rebuild_keeps_default_inline_session_holder_unlinked() {
+    fn wait_holder_rebuild_relinks_session_holder() {
         let mut manager = ServerManager::new(SystemRef::null());
         let server_session = Arc::new(Mutex::new(KServerSession::new()));
         server_session.lock().unwrap().initialize(0x1000);
@@ -2404,7 +2366,7 @@ mod tests {
         manager.rebuild_wait_holder_linkage_after_move();
 
         assert_eq!(manager.sessions.len(), 1);
-        assert!(!manager.sessions[0].holder.is_linked());
+        assert!(manager.sessions[0].holder.is_linked());
     }
 
     #[test]

@@ -39,16 +39,10 @@ pub struct BufferQueueCore {
     pub is_allocating_condition: Condvar,
     /// Guest threads parked in `wait_for_dequeue_condition`.
     ///
-    /// Ruzu divergence (documented): upstream runs `DequeueBuffer` on a
-    /// dedicated nvnflinger service host thread, so blocking on
-    /// `dequeue_condition` only blocks that host thread. Ruzu's default IPC
-    /// path runs the handler inline on the calling guest core's fiber;
-    /// blocking the host condvar there freezes every other guest fiber
-    /// core 1 alongside the graphics producer, and the frozen core stretched
-    /// the first logo from ~3-4s to ~80s — see TODO.md 2026-07-05 ROOT
-    /// CAUSE). Guest callers therefore park in the kernel (`begin_wait` +
-    /// fiber reschedule) instead, and `signal_dequeue_condition` ends their
-    /// wait here in addition to notifying the host condvar.
+    /// Compatibility path for direct guest-core callers. Normal IPC dispatch
+    /// runs `DequeueBuffer` on the owning ServerManager host thread, matching
+    /// upstream. A direct caller must park in the kernel rather than block the
+    /// OS thread shared by the core's guest fibers.
     dequeue_parked_threads: Mutex<Vec<Weak<KThreadLock>>>,
 }
 

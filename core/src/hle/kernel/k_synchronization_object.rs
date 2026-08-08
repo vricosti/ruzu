@@ -331,9 +331,18 @@ enum WaitableObject {
         is_signaled: *const std::sync::atomic::AtomicBool,
         sync_state: *mut SynchronizationObjectState,
     },
-    ClientPort(Arc<Mutex<KPort>>),
-    ServerPort(Arc<Mutex<KPort>>),
-    ServerSession(Arc<Mutex<KServerSession>>),
+    ClientPort {
+        _port: Arc<Mutex<KPort>>,
+        port: *mut KPort,
+    },
+    ServerPort {
+        _port: Arc<Mutex<KPort>>,
+        port: *mut KPort,
+    },
+    ServerSession {
+        _session: Arc<Mutex<KServerSession>>,
+        session: *mut KServerSession,
+    },
     Thread(Arc<KThreadLock>),
     Process(Arc<ProcessLock>),
 }
@@ -344,9 +353,9 @@ impl WaitableObject {
             Self::ReadableEvent { is_signaled, .. } => unsafe {
                 (**is_signaled).load(std::sync::atomic::Ordering::Relaxed)
             },
-            Self::ClientPort(port) => port.lock().unwrap().client.is_signaled(),
-            Self::ServerPort(port) => port.lock().unwrap().server.is_signaled(),
-            Self::ServerSession(session) => session.lock().unwrap().is_signaled(),
+            Self::ClientPort { port, .. } => unsafe { (&(**port).client).is_signaled() },
+            Self::ServerPort { port, .. } => unsafe { (&(**port).server).is_signaled() },
+            Self::ServerSession { session, .. } => unsafe { (&**session).is_signaled() },
             Self::Thread(thread) => thread.lock().unwrap().is_signaled(),
             Self::Process(process) => process.lock().unwrap().is_signaled(),
         }
@@ -361,18 +370,15 @@ impl WaitableObject {
     fn sync_state_ptr(&self) -> *mut SynchronizationObjectState {
         match self {
             Self::ReadableEvent { sync_state, .. } => *sync_state,
-            Self::ClientPort(port) => {
-                let mut guard = port.lock().unwrap();
-                &mut guard.client.sync_object as *mut SynchronizationObjectState
-            }
-            Self::ServerPort(port) => {
-                let mut guard = port.lock().unwrap();
-                &mut guard.server.sync_object as *mut SynchronizationObjectState
-            }
-            Self::ServerSession(session) => {
-                let mut guard = session.lock().unwrap();
-                &mut guard.sync_object as *mut SynchronizationObjectState
-            }
+            Self::ClientPort { port, .. } => unsafe {
+                &mut (**port).client.sync_object as *mut SynchronizationObjectState
+            },
+            Self::ServerPort { port, .. } => unsafe {
+                &mut (**port).server.sync_object as *mut SynchronizationObjectState
+            },
+            Self::ServerSession { session, .. } => unsafe {
+                &mut (**session).sync_object as *mut SynchronizationObjectState
+            },
             Self::Thread(thread) => {
                 let mut guard = thread.lock().unwrap();
                 &mut guard.sync_object as *mut SynchronizationObjectState
@@ -391,10 +397,24 @@ fn resolve_waitable_object(
     object_id: u64,
 ) -> Option<WaitableObject> {
     if let Some(port) = process_guard.get_server_port_by_object_id(object_id) {
-        return Some(WaitableObject::ServerPort(port));
+        let port_ptr = {
+            let mut guard = port.lock().unwrap();
+            &mut *guard as *mut KPort
+        };
+        return Some(WaitableObject::ServerPort {
+            _port: port,
+            port: port_ptr,
+        });
     }
     if let Some(port) = process_guard.get_client_port_by_object_id(object_id) {
-        return Some(WaitableObject::ClientPort(port));
+        let port_ptr = {
+            let mut guard = port.lock().unwrap();
+            &mut *guard as *mut KPort
+        };
+        return Some(WaitableObject::ClientPort {
+            _port: port,
+            port: port_ptr,
+        });
     }
     if let Some(event) = process_guard.get_readable_event_by_object_id(object_id) {
         let (is_signaled, sync_state) = {
@@ -411,7 +431,14 @@ fn resolve_waitable_object(
         });
     }
     if let Some(session) = process_guard.get_server_session_by_object_id(object_id) {
-        return Some(WaitableObject::ServerSession(session));
+        let session_ptr = {
+            let mut guard = session.lock().unwrap();
+            &mut *guard as *mut KServerSession
+        };
+        return Some(WaitableObject::ServerSession {
+            _session: session,
+            session: session_ptr,
+        });
     }
     if let Some(thread) = process_guard.get_thread_by_object_id(object_id) {
         return Some(WaitableObject::Thread(thread));
@@ -723,6 +750,29 @@ mod tests {
             state.unlink_node(&mut node);
             assert!(state.is_empty());
         }
+    }
+
+    #[test]
+    fn server_session_waitable_access_does_not_relock_wrapper() {
+        let session = Arc::new(Mutex::new(KServerSession::new()));
+        let session_ptr = {
+            let mut guard = session.lock().unwrap();
+            &mut *guard as *mut KServerSession
+        };
+        let waitable = WaitableObject::ServerSession {
+            _session: Arc::clone(&session),
+            session: session_ptr,
+        };
+
+        // Upstream accesses IsSignaled and the synchronization-object state
+        // under the scheduler lock without reacquiring KServerSession::m_lock.
+        // Holding the Rust wrapper here catches a regression to the former
+        // scheduler -> session-mutex lock inversion.
+        let _wrapper_guard = session.lock().unwrap();
+        assert!(!waitable.is_signaled());
+        assert_eq!(waitable.sync_state_ptr(), unsafe {
+            &mut (*session_ptr).sync_object as *mut SynchronizationObjectState
+        });
     }
 
     #[test]
