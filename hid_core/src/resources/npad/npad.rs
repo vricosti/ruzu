@@ -463,9 +463,10 @@ impl NPad {
                     self.npad_resource
                         .signal_style_set_update_event(aruid, npad_id);
                     Self::write_empty_entry(npad);
-                    if let Some(hid_core) = self.hid_core.as_ref() {
-                        hid_core.lock().set_last_active_controller(npad_id);
-                    }
+                    // Defer the HIDCore update until the emulated-controller guard is
+                    // released. HIDCore methods acquire controller guards in the
+                    // opposite order, so locking it here would create an ABBA deadlock.
+                    last_active_controller = Some(npad_id);
                     self.abstracted_pads[hid_util::npad_id_type_to_index(npad_id)].update();
                 } else {
                     if events

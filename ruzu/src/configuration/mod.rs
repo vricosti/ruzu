@@ -11,7 +11,6 @@
 // Upstream files with no counterpart yet (each is a separate dialog reached
 // from a Configure button rather than a tab of the main dialog):
 //   configure_camera, configure_debug_controller, configure_input_per_game,
-//   configure_input_profile_dialog,
 //   configure_per_game, configure_per_game_addons,
 //   configure_ringcon,
 //   configure_touchscreen_advanced, configure_touch_widget.
@@ -35,6 +34,7 @@ pub mod configure_hotkeys;
 pub mod configure_input;
 pub mod configure_input_advanced;
 pub mod configure_input_player;
+pub mod configure_input_profile_dialog;
 pub mod configure_linux_tab;
 pub mod configure_motion_touch;
 pub mod configure_mouse_panning;

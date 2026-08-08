@@ -242,24 +242,45 @@ impl ControllerSelectorDialog {
             .modal(true)
             .resizable(true)
             .default_width(839)
-            .default_height(630)
             .build();
-        dialog.add_button(&crate::i18n::tr("Cancel"), ResponseType::Cancel);
-        let ok_button = dialog.add_button(&crate::i18n::tr("OK"), ResponseType::Accept);
-        dialog.set_default_response(ResponseType::Accept);
+        // Upstream keeps `closeButtons` (the error label plus the button box) inside
+        // `bottomControllerApplet`, not in a separate action row, so the buttons are
+        // built here and appended to the footer further down.
+        let cancel_button = gtk::Button::with_label(&crate::i18n::tr("Cancel"));
+        let ok_button = gtk::Button::with_label(&crate::i18n::tr("OK"));
+        cancel_button.connect_clicked(glib::clone!(
+            #[weak]
+            dialog,
+            move |_| dialog.response(ResponseType::Cancel)
+        ));
+        ok_button.connect_clicked(glib::clone!(
+            #[weak]
+            dialog,
+            move |_| dialog.response(ResponseType::Accept)
+        ));
+        // Upstream marks the button box's OK button as the dialog default, so Return
+        // confirms. `set_default_response` cannot be used here: it resolves the action
+        // widget registered for a response id, and these buttons live in the footer
+        // rather than in the dialog's action area. The default widget is set directly
+        // instead, once the tree is built.
+        ok_button.set_receives_default(true);
 
-        let content = gtk::Box::new(gtk::Orientation::Vertical, 10);
-        content.set_margin_top(10);
-        content.set_margin_bottom(10);
-        content.set_margin_start(20);
-        content.set_margin_end(20);
+        // Upstream `verticalLayout` has zero margins and no spacing: each of the three
+        // bands (`topControllerApplet`, `middleControllerApplet`, `bottomControllerApplet`)
+        // carries its own padding and they are flush against each other.
+        let content = gtk::Box::new(gtk::Orientation::Vertical, 0);
 
         let player_range = player_range(&parameters);
 
         // Upstream `topControllerApplet`: label, five fixed controller images,
         // then the accepted player count.
         let supported_row = gtk::Box::new(gtk::Orientation::Horizontal, 10);
-        supported_row.set_halign(gtk::Align::Center);
+        // Upstream `horizontalLayout` has zero left/right margins and centres its
+        // content between `controllerAppletHorizontalSpacer2` and `...Spacer3`, so the
+        // band itself spans the full dialog width.
+        let leading_spacer = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        leading_spacer.set_hexpand(true);
+        supported_row.append(&leading_spacer);
         let supported_label =
             gtk::Label::new(Some(&crate::i18n::tr("Supported Controller Types:")));
         supported_label.set_width_chars(11);
@@ -299,7 +320,12 @@ impl ControllerSelectorDialog {
         players_box.append(&players_label);
         players_box.append(&players_value);
         supported_row.append(&players_box);
+        let trailing_spacer = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        trailing_spacer.set_hexpand(true);
+        supported_row.append(&trailing_spacer);
+        supported_row.add_css_class("controller-applet-band");
         content.append(&supported_row);
+        content.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
 
         let style_tag = hid_core.lock().get_supported_style_tag();
         let players_grid = gtk::Grid::new();
@@ -328,15 +354,17 @@ impl ControllerSelectorDialog {
             card_content.set_margin_start(8);
             card_content.set_margin_end(8);
 
-            let connected = gtk::CheckButton::with_label(&format!("P{}", index + 1));
+            // Upstream `groupPlayerNConnected` is a checkable group box with an empty
+            // title: the player number is shown only by the centred `labelPlayerN`.
+            let connected = gtk::CheckButton::new();
             connected.set_halign(gtk::Align::Start);
             card_content.append(&connected);
 
             let overlay = gtk::Overlay::new();
-            overlay.set_size_request(112, 72);
-            let icon = controller_icon(NpadStyleIndex::Fullkey, 112, 72, true);
+            overlay.set_size_request(96, 56);
+            let icon = controller_icon(NpadStyleIndex::Fullkey, 96, 56, true);
+            // Upstream `labelPlayerN` is a plain QLabel with no font override.
             let player_label = gtk::Label::new(Some(&format!("P{}", index + 1)));
-            player_label.add_css_class("title-3");
             player_label.set_halign(gtk::Align::Center);
             player_label.set_valign(gtk::Align::Center);
             overlay.set_child(Some(&icon));
@@ -385,10 +413,19 @@ impl ControllerSelectorDialog {
                 controller_types,
             });
         }
+        // Upstream `verticalLayout_2` uses stretch="0,3,0": only the middle band grows,
+        // which keeps the footer pinned to the bottom edge of the dialog.
+        players_grid.set_vexpand(true);
+        players_grid.set_valign(gtk::Align::Center);
+        players_grid.set_margin_top(10);
+        players_grid.set_margin_bottom(10);
+        players_grid.set_margin_start(20);
+        players_grid.set_margin_end(20);
         content.append(&players_grid);
+        content.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
 
         let footer = gtk::Box::new(gtk::Orientation::Horizontal, 10);
-        footer.set_halign(gtk::Align::Center);
+        footer.add_css_class("controller-applet-band");
 
         let console = gtk::Frame::new(Some(&crate::i18n::tr("Console Mode")));
         let console_modes = gtk::Box::new(gtk::Orientation::Horizontal, 8);
@@ -410,6 +447,20 @@ impl ControllerSelectorDialog {
         let (motion_box, motion, motion_button) =
             toggle_action(&crate::i18n::tr("Motion"), &crate::i18n::tr("Configure"));
         footer.append(&motion_box);
+
+        // Upstream `inputConfigGroup`: a non-checkable group box whose single button
+        // opens `ConfigureInputProfileDialog`.
+        let profiles_group = gtk::Frame::new(Some(&crate::i18n::tr("Profiles")));
+        let profiles_content = gtk::Box::new(gtk::Orientation::Vertical, 4);
+        profiles_content.set_margin_top(5);
+        profiles_content.set_margin_bottom(5);
+        profiles_content.set_margin_start(6);
+        profiles_content.set_margin_end(6);
+        profiles_content.set_valign(gtk::Align::Center);
+        let profiles_button = gtk::Button::with_label(&crate::i18n::tr("Create"));
+        profiles_content.append(&profiles_button);
+        profiles_group.set_child(Some(&profiles_content));
+        footer.append(&profiles_group);
 
         let connected_grid = gtk::Grid::new();
         connected_grid.set_column_spacing(4);
@@ -437,15 +488,33 @@ impl ControllerSelectorDialog {
             );
             connected_grid.attach(&row.connected_strip, index as i32 + 1, 1, 1, 1);
         }
+        connected_grid.set_valign(gtk::Align::Center);
+        connected_grid.set_hexpand(true);
+        connected_grid.set_halign(gtk::Align::End);
         footer.append(&connected_grid);
-        content.append(&footer);
 
+        // Upstream `closeButtons`: `labelError` stacked directly above the button box,
+        // both anchored to the right end of the bottom band.
+        let close_buttons = gtk::Box::new(gtk::Orientation::Vertical, 4);
+        close_buttons.set_valign(gtk::Align::Center);
         let error = gtk::Label::new(Some(&crate::i18n::tr("Not enough controllers")));
         error.add_css_class("error");
-        error.set_xalign(0.0);
+        error.set_xalign(1.0);
         error.set_visible(false);
-        content.append(&error);
+        close_buttons.append(&error);
+        let button_box = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        button_box.set_halign(gtk::Align::End);
+        button_box.append(&cancel_button);
+        button_box.append(&ok_button);
+        close_buttons.append(&button_box);
+        footer.append(&close_buttons);
+
+        content.append(&footer);
+        content.set_vexpand(true);
         dialog.content_area().append(&content);
+        // Now that OK is inside the dialog's widget tree, make it the default so
+        // Return activates it, matching upstream's default `QDialogButtonBox` button.
+        dialog.set_default_widget(Some(&ok_button));
 
         let state = Rc::new(Self {
             parameters,
@@ -492,6 +561,27 @@ impl ControllerSelectorDialog {
                 crate::configuration::configure_vibration::present(button, Arc::clone(&hid_core));
             });
         }
+        // Upstream `CallConfigureInputProfileDialog`. `QtControllerSelectorDialog` owns
+        // one `InputProfiles` member (`qt_controller.cpp:68`) shared by every profile
+        // dialog it opens, so the context is built once here rather than per click.
+        {
+            let hid_core = Arc::clone(&state.hid_core);
+            let input_subsystem = Rc::clone(&input_subsystem);
+            let profile_context = Rc::new(
+                crate::configuration::configure_input_player::InputProfileContext::new(
+                    crate::configuration::input_profiles::InputProfiles::new(),
+                ),
+            );
+            profiles_button.connect_clicked(move |button| {
+                crate::configuration::configure_input_profile_dialog::present(
+                    button,
+                    Rc::clone(&input_subsystem),
+                    Arc::clone(&hid_core),
+                    Rc::clone(&profile_context),
+                );
+            });
+        }
+
         motion_button.connect_clicked(move |button| {
             crate::configuration::configure_motion_touch::present(
                 button,
@@ -791,7 +881,9 @@ fn configure_controller_icon(
     controller_type: NpadStyleIndex,
     enabled: bool,
 ) {
-    area.set_opacity(if enabled { 1.0 } else { 0.22 });
+    // Upstream's `*_disabled` artwork is the full-strength outline plus a diagonal
+    // stroke, not a faded copy, so only the stroke below marks an unsupported type.
+    area.set_opacity(1.0);
     area.set_draw_func(move |widget, cr, width, height| {
         let controller_type = settings_controller_type(controller_type);
         let (art_width, art_height) = match controller_type {
@@ -803,6 +895,7 @@ fn configure_controller_icon(
             _ => (400.0, 300.0),
         };
         let scale = (width as f64 / art_width).min(height as f64 / art_height) * 0.9;
+        let dark = widget.settings().is_gtk_application_prefer_dark_theme();
         let _ = cr.save();
         cr.translate(width as f64 / 2.0, height as f64 / 2.0);
         cr.scale(scale, scale);
@@ -810,10 +903,25 @@ fn configure_controller_icon(
             cr,
             (0.0, 0.0),
             controller_type,
-            widget.settings().is_gtk_application_prefer_dark_theme(),
+            dark,
             &crate::configuration::controller_preview::Input::released(),
         );
         let _ = cr.restore();
+
+        // Upstream swaps in the `*_disabled` artwork for unsupported types: the same
+        // outline crossed out by a diagonal stroke.
+        if !enabled {
+            let inset = f64::from(width.min(height)) * 0.1;
+            if dark {
+                cr.set_source_rgba(0.87, 0.87, 0.87, 0.95);
+            } else {
+                cr.set_source_rgba(0.1, 0.1, 0.1, 0.95);
+            }
+            cr.set_line_width(3.0);
+            cr.move_to(inset, f64::from(height) - inset);
+            cr.line_to(f64::from(width) - inset, inset);
+            let _ = cr.stroke();
+        }
     });
     area.queue_draw();
 }
@@ -858,11 +966,15 @@ fn explain_text(parameters: &ControllerParameters, index: usize) -> String {
 
 fn install_controller_applet_style(parameters: &ControllerParameters) {
     let mut css = String::from(
-        "frame.controller-applet-card > border { min-width: 126px; min-height: 112px; \
+        // Upstream pins `groupPlayerNConnected` to a fixed 100x100 via matching
+        // minimumSize/maximumSize.
+        "frame.controller-applet-card > border { min-width: 100px; min-height: 100px; \
          border: 1px solid alpha(currentColor, 0.22); border-radius: 3px; } \
          frame.controller-applet-card.connected > border { \
          border-color: @accent_color; border-width: 2px; } \
-         checkbutton.controller-applet-led { padding: 0; min-width: 10px; min-height: 10px; }",
+         checkbutton.controller-applet-led { padding: 0; min-width: 10px; min-height: 10px; } \
+         box.controller-applet-band { background-color: alpha(currentColor, 0.04); \
+         padding: 10px 20px; }",
     );
     if parameters.enable_border_color {
         for (index, color) in parameters
