@@ -2235,34 +2235,6 @@ impl KernelCore {
                 name, thread_id, SERVICE_THREAD_CORE, SERVICE_THREAD_PRIORITY, front
             );
         }
-
-        // Match zuyu: just after spawning the FIRST TWO guest services (sm and
-        // account), zuyu also allocates a Dummy thread per service. This comes
-        // from host service threads (audio/nvservices/etc.) that were spawned
-        // earlier finally getting OS-scheduled and registering child host
-        // threads. The 2 extras land at zuyu tids 24 and 26. Without these,
-        // Allocate matching dummies for the first 2 services only.
-        let is_sm_or_account = name == "sm" || name == "account";
-        if is_sm_or_account {
-            let dummy = Arc::new(KThreadLock::new(super::k_thread::KThread::new()));
-            let dummy_tid = self.create_new_thread_id();
-            let dummy_oid = self.create_new_object_id() as u64;
-            {
-                let mut g = dummy.lock().unwrap();
-                let rc = g.initialize_dummy_thread(Some(&process), dummy_tid, dummy_oid);
-                assert_eq!(rc, crate::hle::result::RESULT_SUCCESS.get_inner_value());
-                g.bind_self_reference(&dummy);
-            }
-            process
-                .lock()
-                .unwrap()
-                .register_thread_object(Arc::clone(&dummy));
-            log::info!(
-                "[THREAD_ID_NAME] tid={} name=process_dummy:{}",
-                dummy_tid,
-                name
-            );
-        }
     }
 
     /// Run a service function on a host thread with a dummy KThread for tracking.
@@ -2657,7 +2629,6 @@ impl KernelCore {
                 let process = process.lock().unwrap();
                 process.thread_objects.values().cloned().collect::<Vec<_>>()
             };
-
             for thread in threads {
                 let (thread_id, object_id, global_scheduler_context) = {
                     let thread = thread.lock().unwrap();
@@ -3855,6 +3826,44 @@ mod tests {
         kernel.shutdown();
 
         assert!(weak_owner.upgrade().is_none());
+    }
+
+    #[test]
+    fn guest_service_thread_reservation_is_balanced_at_shutdown() {
+        use super::super::k_resource_limit::LimitableResource;
+
+        let mut kernel = KernelCore::new();
+        kernel.initialize();
+        kernel.initialize_system_resource_limit(16 * 1024 * 1024, 0);
+
+        kernel.run_on_guest_core_process("sm", Box::new(|| {}));
+
+        let process = kernel.service_processes.lock().unwrap()[0].clone();
+        assert_eq!(process.lock().unwrap().thread_objects.len(), 1);
+        assert_eq!(
+            kernel
+                .get_system_resource_limit()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .get_current_value(LimitableResource::ThreadCountMax),
+            1
+        );
+
+        kernel.shutdown_cores();
+        kernel.finalize_services_after_cpu_shutdown();
+        kernel.finalize_terminated_processes_after_cpu_shutdown();
+
+        assert_eq!(
+            kernel
+                .get_system_resource_limit()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .get_current_value(LimitableResource::ThreadCountMax),
+            0
+        );
+        kernel.shutdown();
     }
 
     #[test]

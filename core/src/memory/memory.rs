@@ -436,6 +436,15 @@ impl Memory {
         }
     }
 
+    /// Return the non-owning system reference held by this memory instance.
+    ///
+    /// `KPageTableBase` owns the same `Core::System&` upstream and uses it
+    /// during finalization to tear down fastmem mappings directly through
+    /// `DeviceMemory`.
+    pub fn system_ref(&self) -> SystemRef {
+        self.system
+    }
+
     /// Upstream: `Memory::SetGPUDirtyManagers(std::span<Core::GPUDirtyMemoryManager>)`.
     pub fn set_gpu_dirty_managers(&mut self, managers: Vec<Arc<GpuDirtyMemoryManager>>) {
         self.gpu_dirty_managers = managers;

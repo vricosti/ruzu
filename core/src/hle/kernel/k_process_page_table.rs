@@ -768,6 +768,7 @@ impl KProcessPageTable {
         // signature.
         let slab = crate::hle::kernel::kernel::get_kernel_ref()
             .and_then(|k| k.get_memory_block_slab_manager());
+        base.m_memory_block_slab_manager = slab.clone();
         let slab_ref = slab.as_deref();
         let _ = base.m_memory_block_manager.initialize(
             base.m_address_space_start,

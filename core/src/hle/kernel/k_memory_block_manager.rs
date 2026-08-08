@@ -11,6 +11,7 @@
 //! Upstream uses an intrusive red-black tree; we use a BTreeMap<usize, KMemoryBlock>
 //! keyed by block start address, which gives the same O(log N) guarantees.
 
+use super::k_dynamic_resource_manager::KMemoryBlockSlabManager;
 use super::k_memory_block::*;
 use std::collections::BTreeMap;
 
@@ -82,11 +83,28 @@ impl KMemoryBlockManager {
         Ok(())
     }
 
-    /// Finalize the manager: clear all blocks.
+    /// Erase every block, invoke the page-table cleanup callback, and return
+    /// slab-owned nodes to their allocator.
     ///
-    /// Upstream: KMemoryBlockManager::Finalize(slab_manager, callback).
-    pub fn finalize(&mut self) {
-        self.memory_block_tree.clear();
+    /// Port of `KMemoryBlockManager::Finalize(slab_manager, block_callback)`.
+    /// `None` is retained for unit-only managers initialized without a slab;
+    /// runtime page tables always provide the kernel-owned slab manager.
+    pub fn finalize<F>(
+        &mut self,
+        slab_manager: Option<&KMemoryBlockSlabManager>,
+        mut block_callback: F,
+    ) where
+        F: FnMut(usize, usize),
+    {
+        let blocks = std::mem::take(&mut self.memory_block_tree);
+        for (_, block) in blocks {
+            block_callback(block.get_address(), block.get_size());
+            if let Some(slab_manager) = slab_manager {
+                slab_manager.free(block);
+            }
+        }
+
+        debug_assert!(self.memory_block_tree.is_empty());
     }
 
     /// Find the block containing the given address.
@@ -902,6 +920,28 @@ mod tests {
     }
 
     #[test]
+    fn finalize_invokes_callback_and_returns_blocks_to_slab() {
+        let slab = Arc::new({
+            let mut slab = KMemoryBlockSlabManager::new();
+            slab.initialize(1024);
+            slab
+        });
+        let mut mgr = KMemoryBlockManager::new();
+        mgr.initialize(0x200000, 0x400000, Some(slab.as_ref()))
+            .unwrap();
+        assert_eq!(slab.get_used(), 1);
+
+        let mut finalized_ranges = Vec::new();
+        mgr.finalize(Some(slab.as_ref()), |address, size| {
+            finalized_ranges.push((address, size));
+        });
+
+        assert_eq!(finalized_ranges, vec![(0x200000, 0x200000)]);
+        assert_eq!(mgr.block_count(), 0);
+        assert_eq!(slab.get_used(), 0);
+    }
+
+    #[test]
     fn test_update_splits_and_changes_state() {
         let mut mgr = KMemoryBlockManager::new();
         mgr.initialize(0x200000, 0x400000, None).unwrap();
@@ -1102,7 +1142,7 @@ mod tests {
     #[test]
     fn test_coalesce_for_update_merges_past_first_right_neighbor() {
         let mut mgr = KMemoryBlockManager::new();
-        mgr.initialize(0x40000000, 0x4000, None).unwrap();
+        mgr.initialize(0x40000000, 0x40004000, None).unwrap();
 
         mgr.split_at(0x40001000);
         mgr.split_at(0x40002000);
@@ -1119,10 +1159,15 @@ mod tests {
             KMemoryBlockDisableMergeAttribute::NONE,
         );
 
-        assert_eq!(mgr.block_count(), 1);
+        // Upstream stops after the merged block extends past the updated
+        // range, so the final right-hand block remains separate.
+        assert_eq!(mgr.block_count(), 2);
         let block = mgr.find_block(0x40000000).unwrap();
         assert_eq!(block.get_address(), 0x40000000);
-        assert_eq!(block.get_size(), 0x4000);
+        assert_eq!(block.get_size(), 0x3000);
+        let tail = mgr.find_block(0x40003000).unwrap();
+        assert_eq!(tail.get_address(), 0x40003000);
+        assert_eq!(tail.get_size(), 0x1000);
     }
 
     #[test]

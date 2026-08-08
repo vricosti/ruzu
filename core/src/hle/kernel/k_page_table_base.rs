@@ -15,6 +15,7 @@ use bitflags::bitflags;
 use std::sync::{Arc, Mutex};
 
 use super::k_address_space_info::{AddressSpaceInfoType, KAddressSpaceInfo};
+use super::k_dynamic_resource_manager::KMemoryBlockSlabManager;
 use super::k_light_lock::{KLightLock, KScopedLightLock};
 use super::k_memory_block::*;
 use super::k_memory_block_manager::KMemoryBlockManager;
@@ -24,6 +25,7 @@ use super::k_memory_region_type::K_MEMORY_REGION_ATTR_LINEAR_MAPPED;
 use super::k_resource_limit::{KResourceLimit, LimitableResource};
 use super::svc::svc_types::PageInfo;
 use super::svc_types::{CreateProcessFlag, MemoryState as SvcMemoryState, ADDRESS_SPACE_MASK};
+use crate::core::SystemRef;
 use crate::hle::kernel::svc::svc_results;
 use crate::hle::result::ResultCode;
 use crate::memory::memory::Memory;
@@ -338,6 +340,8 @@ const _: () = assert!(REGION_ALIGNMENT == KERNEL_ASLR_ALIGNMENT);
 /// Owns the Rust page-table state corresponding to upstream `KPageTableBase`.
 /// Remaining behavioral gaps are tracked in `DIFF.md`.
 pub struct KPageTableBase {
+    /// Upstream: `Core::System& m_system`.
+    pub(crate) m_system: SystemRef,
     /// The page table implementation used by dynarmic.
     /// Upstream: `std::unique_ptr<Common::PageTable> m_impl`
     pub(crate) m_impl: Option<Box<common::page_table::PageTable>>,
@@ -378,6 +382,8 @@ pub struct KPageTableBase {
     pub(crate) m_is_kernel: bool,
     pub(crate) m_enable_aslr: bool,
     pub(crate) m_enable_device_address_space_merge: bool,
+    /// Upstream: `KMemoryBlockSlabManager* m_memory_block_slab_manager`.
+    pub(crate) m_memory_block_slab_manager: Option<Arc<KMemoryBlockSlabManager>>,
     pub(crate) m_heap_fill_value: MemoryFillValue,
     pub(crate) m_ipc_fill_value: MemoryFillValue,
     pub(crate) m_stack_fill_value: MemoryFillValue,
@@ -389,6 +395,7 @@ pub struct KPageTableBase {
 impl KPageTableBase {
     pub fn new() -> Self {
         Self {
+            m_system: SystemRef::null(),
             m_impl: None,
             m_memory: None,
             m_address_space_start: 0,
@@ -420,6 +427,7 @@ impl KPageTableBase {
             m_is_kernel: false,
             m_enable_aslr: false,
             m_enable_device_address_space_merge: false,
+            m_memory_block_slab_manager: None,
             m_heap_fill_value: MemoryFillValue::Zero,
             m_ipc_fill_value: MemoryFillValue::Zero,
             m_stack_fill_value: MemoryFillValue::Zero,
@@ -464,48 +472,76 @@ impl KPageTableBase {
         }
     }
 
+    /// Port of upstream `KPageTableBase::FinalizeProcess`.
+    pub fn finalize_process(&mut self) -> u32 {
+        debug_assert!(!self.is_kernel());
+        0
+    }
+
     /// Finalize the page table, releasing all resources.
     /// Port of upstream `KPageTableBase::Finalize`.
-    ///
-    /// Upstream flow:
-    /// 1. FinalizeProcess() — calls unknown Nintendo OnFinalize hooks
-    /// 2. Iterates all memory blocks via m_memory_block_manager.Finalize(callback):
-    ///    - For each block with mapped physical pages, creates a KPageGroup
-    ///    - Calls CloseAndReset to decrement physical page reference counts
-    ///    - Unmaps fastmem arena mappings via DeviceMemory buffer
-    /// 3. Releases unsafe/insecure mapped memory resource limits
     pub fn finalize(&mut self) {
-        // Iterate all memory blocks and unmap their pages from the page table.
-        // Upstream: m_memory_block_manager.Finalize(slab_manager, block_callback)
-        // where block_callback does:
-        //   1. Unmap from fastmem arena: buffer.Unmap(addr, size, false)
-        //   2. Create KPageGroup from physical pages via MakePageGroup
-        //   3. Call pg.CloseAndReset() to decrement physical page reference counts
-        if let Some(ref mut impl_) = self.m_impl {
-            // Collect block addresses first to avoid borrow conflict.
-            let blocks: Vec<(u64, u64)> = self
-                .m_memory_block_manager
-                .iter()
-                .map(|block| (block.get_address() as u64, block.get_size() as u64))
-                .collect();
+        let _ = self.finalize_process();
 
-            for (addr, size) in blocks {
-                if size > 0 {
-                    // Unmap pages from the page table (sets entries to Unmapped).
-                    impl_.unmap_region(addr, size);
+        let has_fastmem_arena = self
+            .m_impl
+            .as_ref()
+            .is_some_and(|page_table| !page_table.fastmem_arena.is_null());
+        let slab_manager = self.m_memory_block_slab_manager.clone();
+        let mut block_manager = std::mem::take(&mut self.m_memory_block_manager);
+
+        {
+            let general_lock = Arc::clone(&self.m_general_lock);
+            let _lock_guard = KScopedLightLock::new(general_lock.as_ref());
+            block_manager.finalize(slab_manager.as_deref(), |addr, size| {
+                if has_fastmem_arena && !self.m_system.is_null() {
+                    self.m_system
+                        .get()
+                        .device_memory()
+                        .buffer
+                        .unmap(addr, size, false);
                 }
-            }
 
-            // Release the page table backing memory.
-            impl_.resize(0, 0);
+                let mut page_group = super::k_page_group::KPageGroup::new();
+                let _ = self.make_page_group(&mut page_group, addr, size / PAGE_SIZE);
+                page_group.close_and_reset();
+            });
         }
+        self.m_memory_block_manager = block_manager;
+
+        if std::mem::take(&mut self.m_mapped_unsafe_physical_memory) != 0 {
+            log::warn!("KPageTableBase::finalize: unsafe mapped memory cleanup is unimplemented");
+        }
+
+        let mapped_insecure_memory = std::mem::take(&mut self.m_mapped_insecure_memory);
+        if mapped_insecure_memory != 0 {
+            if let Some(resource_limit) = crate::hle::kernel::kernel::get_kernel_ref()
+                .and_then(super::board::k_system_control::get_insecure_memory_resource_limit)
+            {
+                resource_limit.lock().unwrap().release(
+                    LimitableResource::PhysicalMemoryMax,
+                    mapped_insecure_memory as i64,
+                );
+            }
+        }
+
+        let mapped_ipc_server_memory = std::mem::take(&mut self.m_mapped_ipc_server_memory);
+        if mapped_ipc_server_memory != 0 {
+            if let Some(resource_limit) = &self.m_resource_limit {
+                resource_limit.lock().unwrap().release(
+                    LimitableResource::PhysicalMemoryMax,
+                    mapped_ipc_server_memory as i64,
+                );
+            }
+        }
+
+        // Upstream resets the unique_ptr directly. Its VirtualBuffer
+        // destructors release the reserved arrays without walking every 4 KiB
+        // entry in the process address space.
         self.m_impl = None;
-
-        // Finalize the memory block manager — iterates all blocks and frees them.
-        self.m_memory_block_manager.finalize();
-
-        // Clear the memory reference.
         self.m_memory = None;
+        self.m_memory_block_slab_manager = None;
+        self.m_system = SystemRef::null();
     }
 
     pub fn is_aslr_enabled(&self) -> bool {
@@ -1002,6 +1038,10 @@ impl KPageTableBase {
         // Store resource limit and memory references.
         // Upstream stores these for use in heap operations, mapping, etc.
         self.m_resource_limit = resource_limit;
+        self.m_system = memory
+            .as_ref()
+            .map(|memory| memory.lock().unwrap().system_ref())
+            .unwrap_or_else(SystemRef::null);
         self.m_memory = memory;
         let as_width = Self::get_address_space_width_from_flags(as_flags) as u32;
         let start: usize = 0;
@@ -1235,6 +1275,7 @@ impl KPageTableBase {
         // update will use.
         let slab = crate::hle::kernel::kernel::get_kernel_ref()
             .and_then(|k| k.get_memory_block_slab_manager());
+        self.m_memory_block_slab_manager = slab.clone();
         let slab_ref = slab.as_deref();
         if self
             .m_memory_block_manager
@@ -1275,6 +1316,7 @@ impl KPageTableBase {
     /// Set the Memory bridge and initialize the page table implementation.
     /// Must be called after InitializeForProcess.
     pub fn set_memory(&mut self, memory: Arc<Mutex<Memory>>) {
+        self.m_system = memory.lock().unwrap().system_ref();
         self.m_memory = Some(memory);
     }
 
@@ -7796,6 +7838,24 @@ mod tests {
                 .unwrap()
                 .set_current_page_table(page_table_impl.as_mut() as *mut _);
         }
+    }
+
+    #[test]
+    fn finalize_large_free_address_space_releases_page_table_directly() {
+        let mut page_table = KPageTableBase::new();
+        page_table.m_address_space_start = 0;
+        page_table.m_address_space_end = 1usize << 39;
+        page_table.m_address_space_width = 39;
+        page_table
+            .m_memory_block_manager
+            .initialize(0, 1usize << 39, None)
+            .unwrap();
+        page_table.initialize_impl();
+
+        page_table.finalize();
+
+        assert!(page_table.m_impl.is_none());
+        assert_eq!(page_table.m_memory_block_manager.block_count(), 0);
     }
 
     fn map_source_pages_for_test(
