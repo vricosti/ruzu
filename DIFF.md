@@ -8,12 +8,6 @@ procedures are intentionally omitted.
 
 ### Unintentional differences (to fix)
 
-- `core/src/hle/kernel/k_device_address_space.rs` does not own a `KDevicePageTable`.
-  `initialize_static` and `finalize` are empty, while upstream initializes and finalizes the
-  device page table and routes mapping through it.
-- `core/src/hle/kernel/k_thread.rs` omits upstream's `m_activity_pause_lock` and still uses
-  `restore_priority_simplified` on paths that do not have access to the complete process thread
-  graph. Upstream always performs the full priority-inheritance owner-chain walk.
 - `core/src/hle/kernel/k_process.rs` still represents thread-local pages, thread ownership, and
   shared-memory ownership with Rust side vectors instead of upstream's intrusive kernel-object
   structures.
@@ -30,8 +24,6 @@ procedures are intentionally omitted.
 
 - The following handlers are registered with `None` even though the matching upstream command
   table connects a real implementation:
-  - `ssl/ssl.rs`: `GetCertificates`, `GetCertificateBufSize`.
-  - `nvdrv/nvmemp.rs`: `Open`, `GetAruid`.
   - `ldn/user_local_communication_service.rs`: `GetState`, `GetNetworkInfo`, `GetIpv4Address`,
     `GetDisconnectReason`, `GetSecurityParameter`, `GetNetworkConfig`, `AttachStateChangeEvent`,
     `GetNetworkInfoLatestUpdate`, `Scan`, `ScanPrivate`, `SetWirelessControllerRestriction`,
@@ -39,28 +31,16 @@ procedures are intentionally omitted.
     `DestroyNetwork`, `SetAdvertiseData`, `SetStationAcceptPolicy`, `AddAcceptFilterEntry`,
     `OpenStation`, `CloseStation`, `Connect`, `Disconnect`, `Initialize`, `Finalize`, and
     `Initialize2`.
-  - `nfc/nfc.rs`: `Initialize`, `Finalize`.
-  - `btm/btm_system.rs` and `btm/btm_user.rs`: `GetCore`.
-  - `btm/btm_user_core.rs`: the four BLE event-acquisition commands.
   - `btm/btm_system_core.rs`: gamepad pairing, radio control/event, connected/paired audio-device
     queries, and audio-device connection-rejection commands.
-  - `caps/caps_ss.rs`: `SaveScreenShotEx0`, `SaveEditedScreenShotEx1`.
-  - `caps/caps_su.rs`: `SetShimLibraryVersion`, `SaveScreenShotEx0`, `SaveScreenShotEx1`.
-  - `caps/caps_u.rs`: `SetShimLibraryVersion`, `GetAlbumFileList0AafeAruidDeprecated`,
-    `GetAlbumFileList3AaeAruid`.
-  - `caps/caps_c.rs`: `SetShimLibraryVersion`.
-  - `acc/async_context.rs`: `GetSystemEvent`, `Cancel`, `HasDone`, `GetResult`.
-  - `acc/acc_su.rs` and `acc/acc_u1.rs`: `GetBaasAccountManagerForSystemService`,
-    `StoreSaveDataThumbnail`.
-  - `spl/csrng.rs`: `GenerateRandomBytes`.
+  - `acc/acc_su.rs` and `acc/acc_u1.rs`: `GetBaasAccountManagerForSystemService`; its upstream
+    `IManagerForSystemService` prerequisite is not ported.
   - `am/service/application_creator.rs`: `CreateApplication`.
   - `am/service/application_accessor.rs`: `GetAppletStateChangedEvent`, `GetResult`,
     `RequestForApplicationToGetForeground`, `GetCurrentLibraryApplet`, `PushLaunchParameter`,
     `GetApplicationControlProperty`, and `SetUsers`.
 - `hid/hid_server.rs` returns placeholder success/zero results for GameCube ERM and N64 boolean
   vibration commands instead of routing them through upstream's vibration-device objects.
-- `frontend/applets/profile_select.rs` always returns the zero UUID because the upstream
-  `ProfileManager` lookup is not ported.
 
 ## Network and web services
 
@@ -74,6 +54,19 @@ procedures are intentionally omitted.
   disconnected as listed above and it does not own upstream's event and network lifecycle.
 
 ## Input and frontends
+
+## 2026-08-09 — `ruzu/src/configuration/qt_config.rs`, `configure_dialog.rs`, and `main.rs` vs `src/frontend_common/config.cpp` and `src/yuzu/configuration/qt_config.cpp`
+
+### Intentional differences
+
+- Rust keeps generic settings, Qt-compatible controls, and GTK UI values in separate writers over
+  the same INI file. They execute in upstream order: generic `ReadValues`/`SaveValues` first, then
+  frontend-owned controls and UI values.
+
+### Binary layout verification
+
+- Not applicable. A focused regression test verifies that the global `[Renderer]` category is read
+  and that `backend=0` selects OpenGL instead of retaining the Vulkan default.
 
 ### Missing items
 
@@ -89,35 +82,166 @@ procedures are intentionally omitted.
 
 ## Video core
 
-### Unintentional differences (to fix)
+## 2026-08-09 — `ruzu/src/boot.rs`, `main_window.rs`, and `render_window_x11.rs` vs `src/video_core/video_core.cpp` and `src/yuzu/bootmanager.{h,cpp}`
 
-- `renderer_opengl/gl_rasterizer.rs` drops indirect byte-count draws and indirect-count-buffer
-  draws. Upstream emits the corresponding `glMultiDraw*Indirect` and
-  `glMultiDraw*IndirectCount` calls.
-- OpenGL asynchronous shader compilation falls back to synchronous compilation because the
-  upstream `ShaderWorker` owner is absent. `renderer_opengl/gl_shader_context.rs` also has empty
-  object pools and no shared frontend graphics context, unlike upstream's per-worker context.
-- Vulkan texture blits still reject multisampled depth/stencil helper blits and
-  non-MSAA-to-MSAA copies that upstream routes through its runtime copy helpers.
-- Vulkan turbo mode owns a simplified keep-alive thread rather than upstream's complete control
-  loop.
+### Intentional differences
 
+- GTK4 does not expose a native child render widget, so the Linux frontend creates an X11 child
+  with a GLX-compatible visual and retains an `Arc`-owned root share group. Renderer and shader
+  worker contexts share that root, matching upstream `OpenGLSharedContext` ownership and thread
+  behavior without Qt objects.
 ### Missing items
 
-- `host1x/codecs/vp8.rs` and `vp9.rs` return empty frame bitstreams; their upstream frame
-  composition and memory-manager integration are missing.
+- The GTK frontend's shared OpenGL context bridge currently exists only for Linux/X11. The macOS
+  and Windows GTK render-window adapters still provide Vulkan surfaces only.
+
+### Unintentional differences (to fix)
+
+- Renderer-construction failures still terminate through the existing CLI-style hard-error path.
+  Upstream propagates renderer creation failure through `CreateGPU`, allowing the frontend to show
+  an error without terminating the process; Rust's current `System::subsystem_factory` callback
+  cannot return a `Result` yet.
+
+### Binary layout verification
+
+- Not applicable. This slice changes frontend native-context ownership and renderer dispatch; no
+  guest-visible structure or raw payload layout changes.
+
+## 2026-08-09 — `video_core/src/renderer_vulkan/turbo_mode.rs`, `renderer_vulkan/texture_cache.rs`, and `host_shaders/vulkan_turbo_mode.comp` vs `src/video_core/renderer_vulkan/vk_turbo_mode.{h,cpp}`, `vk_texture_cache.cpp`, and `host_shaders/vulkan_turbo_mode.comp`
+
+### Intentional differences
+
+- `TurboMode` moves a separately owned `TurboResources` bundle into its worker thread and exposes
+  an `Arc` callback to `Scheduler`; upstream captures the containing object from a `std::jthread`.
+  The device, workload, 100 ms idle predicate, queue-submit notification, and destruction ordering
+  are unchanged.
+- `TextureCacheRuntime` receives `cant_blit_msaa` during construction instead of retaining the full
+  Vulkan `Device` wrapper. It uses the same predicate as upstream `Image::NeedsScaleHelper` and the
+  same color or combined depth/stencil helper blits.
+
+### Binary layout verification
+
+- The turbo compute shader is byte-for-byte identical to upstream. This slice introduces no
+  guest-visible raw-memory structure.
+
+## 2026-08-09 — `video_core/src/host1x/codecs/vp8.rs`, `vp9.rs`, and `vp9_types.rs` vs `src/video_core/host1x/codecs/vp8.{h,cpp}`, `vp9.{h,cpp}`, and `vp9_types.h`
+
+### Intentional differences
+
+- Decoder methods receive the current `NvdecRegisters` explicitly through the existing Rust
+  `DecoderImpl` trait; upstream retains the register owner in the decoder base class.
+- Rust `Vec<u8>` values replace upstream `ScratchBuffer` and `Stream` owners without changing the
+  emitted VP8/VP9 byte order or frame buffering lifecycle.
+
+### Binary layout verification
+
+- `Vp8PictureInfo` is `0xc0` bytes. `PictureInfo`, `EntropyProbs`, and `Vp9EntropyProbs` are
+  respectively `0x100`, `0xea0`, and `0x7b4` bytes; compile-time offset assertions cover the fields
+  read from NVDEC memory. Focused tests verify VP8 frame tags and VP9 range/bitstream encoder bytes.
+
+## 2026-08-09 — `common/src/thread_worker.rs`, `video_core/src/rasterizer_interface.rs`, and renderer disk-cache loaders vs `src/common/thread_worker.h`, `src/video_core/rasterizer_interface.h`, and renderer shader caches
+
+### Intentional differences
+
+- Rust passes an `Arc<AtomicBool>` through `RasterizerInterface::load_disk_resources` instead of a
+  copied `std::stop_token`. `StatefulThreadWorker::wait_for_requests_or_stop` polls that state while
+  blocked because `std::sync::Condvar` has no stop-callback integration; observing cancellation
+  permanently stops every worker and abandons queued work, matching upstream `request_stop()`
+  semantics.
+- The command-line frontend supplies a never-signaled cancellation owner because it has no loading
+  dialog. The GTK frontend forwards the same stop state that owns its launch lifecycle.
+
+### Binary layout verification
+
+- Not applicable: this slice changes synchronization and owner propagation only.
+
+## 2026-08-09 — `video_core/src/renderer_opengl/gl_state_tracker.rs` and `gl_rasterizer.rs` vs `src/video_core/renderer_opengl/gl_state_tracker.{h,cpp}` and `gl_rasterizer.cpp`
+
+### Intentional differences
+
+- `StateTracker` stores the active channel dirty flags as `NonNull<[bool; 256]>` and clears that
+  borrowed pointer in `release_channel`; upstream stores a raw C++ pointer whose lifetime follows
+  the channel owner implicitly.
+- The scoped lock over the buffer and texture caches uses the existing retrying dual-lock helper
+  because `parking_lot::ReentrantMutex` has no direct `std::scoped_lock` equivalent.
+
+### Binary layout verification
+
+- Not applicable: this slice changes owner references and lifecycle ordering only; no guest-visible
+  structure is serialized or copied as raw bytes.
+
+## 2026-08-09 — `video_core/src/texture_cache/texture_cache_base.rs` vs `src/video_core/texture_cache/texture_cache_base.h` and `control/channel_state_cache.inc`
+
+### Intentional differences
+
+- `channel_gpu_memory` is a Rust shared-owner mirror of upstream's live
+  `channel_state->gpu_memory` reference. It is resynchronized after channel erasure so releasing an
+  inactive channel preserves the active memory owner and releasing the active channel clears it.
+
+### Binary layout verification
+
+- Not applicable: this slice only updates channel ownership state.
+
+## 2026-08-09 — `video_core/src/renderer_opengl/` vs `src/video_core/renderer_opengl/`
+
+### Intentional differences
+
+- Every upstream OpenGL header/implementation basename has a matching Rust module. Rust-only
+  `mod.rs` files provide module declarations and do not own upstream behavior.
+- `RendererOpenGL` boxes the single `StateTracker`, while `RasterizerOpenGL`, the texture runtime,
+  and blit helpers hold stable non-owning pointers to it. This preserves upstream's single shared
+  owner graph without creating movable Rust self-references.
+- `QueryCache` receives `RasterizerOpenGL::any_command_queued()` immediately before the four query
+  synchronization entry points instead of storing a back-reference to its containing rasterizer.
+  The observable predicate and call ordering match upstream while avoiding another self-reference.
+- Render-target and descriptor helpers receive register projections created from the production
+  `Maxwell3DDrawView::Live` owner. Upstream dereferences `maxwell3d` directly inside the cache; the
+  Rust projection avoids overlapping mutable borrows while reading the same live registers at the
+  operation boundary.
+- Backend `Image` state is stored separately from generic `ImageBase` state. Methods such as
+  scaling therefore receive the paired base image explicitly instead of using C++ inheritance.
+
+### Binary layout verification
+
+- `ComputePipelineKey` is 24 bytes, `GraphicsPipelineKey` is 624 bytes, the GLASM bindless SSBO
+  payload is 16 bytes, and `ScreenRectVertex` is four contiguous `GLfloat` values. Focused tests
+  verify these raw-byte contracts.
 
 ## Shader recompiler and JIT
 
+## 2026-08-09 — `externals/rdynarmic/src/backend/arm64/emit_arm64_floating_point.rs`, `emit_arm64_vector_floating_point.rs`, and x64 exclusive-memory emitters vs Dynarmic `backend/arm64/emit_arm64_{floating_point,vector_floating_point}.cpp` and `backend/x64/emit_x64_memory.cpp.inc`
+
+### Intentional differences
+
+- ARM64 instruction words are emitted through rdynarmic's local encoder instead of Oaknut. The
+  scalar half/fixed-16 conversions, reciprocal operations, `FMULX`, and vector half conversions
+  preserve upstream register widths, FPCR/FPSR handling, and instruction ordering.
+- x64 fastmem fallback addresses are offsets in rdynarmic's generated fallback table rather than
+  Xbyak function pointers. Exclusive monitor locking, reservation invalidation, `cmpxchg` widths,
+  and the `0` success / `1` failure status follow upstream.
+- The x64 exception layer exposes upstream's `SupportsFastmem` capability as a compile-target
+  predicate. A32 and A64 emitters disable direct fastmem when no native exception handler exists,
+  while Linux/x86-64 and Windows/x86-64 retain fault redirection.
+- The 128-bit exclusive-write split uses runtime SSE4.1 detection. Its fallback reproduces
+  upstream's `movaps`/`movq`/`punpckhqdq` sequence on hosts without `pextrq`.
+- A64 exclusive accesses emit upstream `EmitCheckMemoryAbort`; exclusive reads record the resume
+  address immediately after the faulting load and only emit an explicit bounds-abort block when
+  `EmitFastmemVAddr` requests one. Exclusive writes retain upstream's unconditional deferred fault
+  stub and post-callback resume point.
+
+### Binary layout verification
+
+- No guest payload layout changes. Focused x64 tests cover 8/16/32/64/128-bit fallback generation,
+  successful `LDAXR`/`STLXR` and `LDXP` return paths, host exception-handler capability, and a
+  fault redirected to the raw exclusive callback.
+- The ARM64 scalar/vector FP routing and half/fixed-16 conversion tests compile for
+  `aarch64-unknown-linux-gnu` and pass under QEMU. This also verifies that the former cross-target
+  exception-handler build failure is no longer present.
+
 ### Unintentional differences (to fix)
 
-- `shader_recompiler/src/backend/glasm/glasm_emit_context.rs` omits upstream GLASM image
-  descriptor binding construction.
-- rdynarmic's ARM64 backend rejects FP-to-fixed combinations with nonzero fractional bits or
-  `ToOdd` rounding that upstream Dynarmic emits, and its vector backend has the same gap.
-- rdynarmic's ARM64 backend still has a catch-all error for unported IR opcodes and rejects large
-  cycle-count immediates; upstream emits both cases.
-- rdynarmic's x64 backend does not implement dynamic `ExtractRegister32` and
-  `ExtractRegister64`, although upstream emits them.
-- rdynarmic's x64 exclusive-inline fastmem helpers remain `unimplemented!()` while upstream
-  generates exclusive read/write fastmem paths.
+- rdynarmic's ARM64 backend still has a catch-all error for unported IR opcodes. Implemented
+  upstream families still absent from the Rust dispatcher include packed arithmetic, scalar and
+  vector saturation, AES/SHA/CRC/SM4 cryptography, and selected integer vector reductions,
+  min/max, halving, rounding, and broadcast operations. Upstream's 16-bit FP specializations that
+  themselves terminate with `ASSERT_FALSE("Unimplemented")` are not counted as port debt.
