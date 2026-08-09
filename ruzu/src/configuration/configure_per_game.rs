@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2020 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-//! GTK counterpart of `yuzu/configuration/configure_per_game.{h,cpp,ui}`.
+//! GTK counterpart of Eden `yuzu/configuration/configure_per_game.{h,cpp,ui}`.
 
 use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;

@@ -5,8 +5,14 @@
 
 use std::collections::BTreeMap;
 
+use super::card_image::XCI;
 use super::content_archive::{NCAContentType, NCA};
+use super::control_metadata::NACP;
 use super::nca_metadata::{ContentRecord, ContentRecordType, TitleType, CNMT};
+use super::partition_filesystem::ResultStatus;
+use super::romfs::extract_romfs;
+use super::submission_package::NSP;
+use super::vfs::vfs::VfsDirectory;
 use super::vfs::vfs_concat::ConcatenatedVfsFile;
 use super::vfs::vfs_types::{VirtualDir, VirtualFile};
 
@@ -982,16 +988,118 @@ impl Default for ContentProviderUnion {
 // ManualContentProvider
 // ============================================================================
 
+const CONTENT_RECORD_TYPE_COUNT: usize = ContentRecordType::DeltaFragment as usize + 1;
+
+/// One externally discovered update version and its content files.
+/// Corresponds to upstream `ExternalUpdateEntry`.
+#[derive(Clone)]
+pub struct ExternalUpdateEntry {
+    pub title_id: u64,
+    pub version: u32,
+    pub version_string: String,
+    pub files: [Option<VirtualFile>; CONTENT_RECORD_TYPE_COUNT],
+}
+
+fn title_type_from_raw(value: u8) -> Option<TitleType> {
+    Some(match value {
+        0x01 => TitleType::SystemProgram,
+        0x02 => TitleType::SystemDataArchive,
+        0x03 => TitleType::SystemUpdate,
+        0x04 => TitleType::FirmwarePackageA,
+        0x05 => TitleType::FirmwarePackageB,
+        0x80 => TitleType::Application,
+        0x81 => TitleType::Update,
+        0x82 => TitleType::AOC,
+        0x83 => TitleType::DeltaTitle,
+        _ => return None,
+    })
+}
+
+fn content_record_type_from_raw(value: u8) -> Option<ContentRecordType> {
+    Some(match value {
+        0 => ContentRecordType::Meta,
+        1 => ContentRecordType::Program,
+        2 => ContentRecordType::Data,
+        3 => ContentRecordType::Control,
+        4 => ContentRecordType::HtmlDocument,
+        5 => ContentRecordType::LegalInformation,
+        6 => ContentRecordType::DeltaFragment,
+        _ => return None,
+    })
+}
+
+/// Eden `OpenContainerAsNsp`, including the direct-parser fallback.
+fn open_container_as_nsp(file: VirtualFile) -> Option<std::sync::Arc<NSP>> {
+    let nsp = std::sync::Arc::new(NSP::new(file.clone(), 0, 0));
+    if nsp.get_status() == ResultStatus::Success {
+        return Some(nsp);
+    }
+
+    let xci = XCI::new(file, 0, 0);
+    if xci.get_status() == ResultStatus::Success {
+        return xci.get_secure_partition_nsp();
+    }
+    None
+}
+
+fn container_versions(nsp: &NSP) -> (BTreeMap<u64, u32>, BTreeMap<u64, String>) {
+    let mut versions = BTreeMap::new();
+    let mut version_strings = BTreeMap::new();
+
+    for (&title_id, nca_map) in nsp.get_ncas() {
+        for (&(title_type_raw, content_type_raw), nca) in nca_map {
+            let Some(title_type) = title_type_from_raw(title_type_raw) else {
+                continue;
+            };
+            let Some(content_type) = content_record_type_from_raw(content_type_raw) else {
+                continue;
+            };
+
+            if content_type == ContentRecordType::Meta {
+                if let Some(cnmt_file) = nca.get_subdirectories().first().and_then(|directory| {
+                    directory
+                        .get_files()
+                        .into_iter()
+                        .find(|file| file.get_extension() == "cnmt")
+                }) {
+                    let cnmt = CNMT::from_file(&cnmt_file);
+                    versions.insert(cnmt.get_title_id(), cnmt.get_title_version());
+                }
+            }
+
+            if title_type == TitleType::Update && content_type == ContentRecordType::Control {
+                let version = nca
+                    .get_romfs()
+                    .and_then(|romfs| extract_romfs(Some(romfs)))
+                    .and_then(|directory| {
+                        directory
+                            .get_file("control.nacp")
+                            .or_else(|| directory.get_file("Control.nacp"))
+                    })
+                    .map(|file| NACP::from_file(&file).get_version_string())
+                    .unwrap_or_default();
+                if !version.is_empty() {
+                    version_strings.insert(title_id, version);
+                }
+            }
+        }
+    }
+
+    (versions, version_strings)
+}
+
 /// Manually registered content provider.
 /// Corresponds to upstream `ManualContentProvider`.
 pub struct ManualContentProvider {
     entries: BTreeMap<(TitleType, ContentRecordType, u64), VirtualFile>,
+    multi_version_entries: Vec<ExternalUpdateEntry>,
 }
 
 impl ManualContentProvider {
     pub fn new() -> Self {
         Self {
             entries: BTreeMap::new(),
+            multi_version_entries: Vec::new(),
         }
     }
 
@@ -1006,8 +1114,132 @@ impl ManualContentProvider {
             .insert((title_type, content_type, title_id), file);
     }
 
+    pub fn add_entry_with_version(
+        &mut self,
+        title_type: TitleType,
+        content_type: ContentRecordType,
+        title_id: u64,
+        version: u32,
+        version_string: &str,
+        file: VirtualFile,
+    ) {
+        if title_type != TitleType::Update {
+            self.add_entry(title_type, content_type, title_id, file);
+            return;
+        }
+
+        if let Some(entry) = self
+            .multi_version_entries
+            .iter_mut()
+            .find(|entry| entry.title_id == title_id && entry.version == version)
+        {
+            entry.files[content_type as usize] = Some(file.clone());
+            if !version_string.is_empty() {
+                entry.version_string = version_string.to_owned();
+            }
+        } else {
+            let mut files = std::array::from_fn(|_| None);
+            files[content_type as usize] = Some(file.clone());
+            self.multi_version_entries.push(ExternalUpdateEntry {
+                title_id,
+                version,
+                version_string: version_string.to_owned(),
+                files,
+            });
+        }
+
+        let key = (title_type, content_type, title_id);
+        if self.entries.contains_key(&key)
+            && self
+                .multi_version_entries
+                .iter()
+                .any(|entry| entry.title_id == title_id && entry.version > version)
+        {
+            return;
+        }
+        self.entries.insert(key, file);
+    }
+
+    /// Add every content entry found in an NSP/XCI container.
+    /// Corresponds to upstream `ManualContentProvider::AddEntriesFromContainer`.
+    pub fn add_entries_from_container(
+        &mut self,
+        file: VirtualFile,
+        only_content: bool,
+        base_program_id: Option<u64>,
+    ) -> bool {
+        let Some(nsp) = open_container_as_nsp(file) else {
+            return false;
+        };
+        if nsp.get_ncas().is_empty() {
+            return false;
+        }
+
+        let (versions, version_strings) = container_versions(&nsp);
+        let mut added_entries = false;
+        for (&title_id, nca_map) in nsp.get_ncas() {
+            if base_program_id.is_some_and(|base| get_base_title_id(title_id) != base) {
+                continue;
+            }
+            for (&(title_type_raw, content_type_raw), nca) in nca_map {
+                let Some(title_type) = title_type_from_raw(title_type_raw) else {
+                    continue;
+                };
+                let Some(content_type) = content_record_type_from_raw(content_type_raw) else {
+                    continue;
+                };
+                if only_content && title_type != TitleType::Update && title_type != TitleType::AOC {
+                    continue;
+                }
+
+                let entry_file = nca.get_base_file();
+                if title_type == TitleType::Update {
+                    self.add_entry_with_version(
+                        title_type,
+                        content_type,
+                        title_id,
+                        versions.get(&title_id).copied().unwrap_or(0),
+                        version_strings
+                            .get(&title_id)
+                            .map(String::as_str)
+                            .unwrap_or_default(),
+                        entry_file,
+                    );
+                } else {
+                    self.add_entry(title_type, content_type, title_id, entry_file);
+                }
+                added_entries = true;
+            }
+        }
+        added_entries
+    }
+
     pub fn clear_all_entries(&mut self) {
         self.entries.clear();
+        self.multi_version_entries.clear();
+    }
+
+    pub fn list_update_versions(&self, title_id: u64) -> Vec<ExternalUpdateEntry> {
+        let mut versions: Vec<_> = self
+            .multi_version_entries
+            .iter()
+            .filter(|entry| entry.title_id == title_id)
+            .cloned()
+            .collect();
+        versions.sort_by(|left, right| right.version.cmp(&left.version));
+        versions
+    }
+
+    pub fn get_entry_for_version(
+        &self,
+        title_id: u64,
+        content_type: ContentRecordType,
+        version: u32,
+    ) -> Option<VirtualFile> {
+        self.multi_version_entries
+            .iter()
+            .find(|entry| entry.title_id == title_id && entry.version == version)
+            .and_then(|entry| entry.files[content_type as usize].clone())
     }
 }
 
@@ -1065,5 +1297,78 @@ impl ContentProvider for ManualContentProvider {
 impl Default for ManualContentProvider {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod manual_content_provider_tests {
+    use std::sync::Arc;
+
+    use super::*;
+    use crate::file_sys::vfs::vfs_vector::VectorVfsFile;
+
+    fn file(name: &str) -> VirtualFile {
+        Arc::new(VectorVfsFile::new(Vec::new(), name.to_owned(), None))
+    }
+
+    #[test]
+    fn highest_update_version_owns_the_active_entry() {
+        let mut provider = ManualContentProvider::new();
+        let old = file("old.nca");
+        let new = file("new.nca");
+        let title_id = 0x0100_0000_0000_0800;
+
+        provider.add_entry_with_version(
+            TitleType::Update,
+            ContentRecordType::Program,
+            title_id,
+            1,
+            "1.0.0",
+            old.clone(),
+        );
+        provider.add_entry_with_version(
+            TitleType::Update,
+            ContentRecordType::Program,
+            title_id,
+            2,
+            "2.0.0",
+            new.clone(),
+        );
+        provider.add_entry_with_version(
+            TitleType::Update,
+            ContentRecordType::Program,
+            title_id,
+            1,
+            "1.0.0",
+            old,
+        );
+
+        let selected = provider
+            .get_entry_raw(title_id, ContentRecordType::Program)
+            .unwrap();
+        assert!(Arc::ptr_eq(&selected, &new));
+        let versions = provider.list_update_versions(title_id);
+        assert_eq!(versions.len(), 2);
+        assert_eq!(versions[0].version, 2);
+        assert_eq!(versions[0].version_string, "2.0.0");
+        assert_eq!(versions[1].version, 1);
+    }
+
+    #[test]
+    fn clearing_manual_entries_also_clears_versioned_updates() {
+        let mut provider = ManualContentProvider::new();
+        provider.add_entry_with_version(
+            TitleType::Update,
+            ContentRecordType::Program,
+            0x800,
+            1,
+            "1.0.0",
+            file("update.nca"),
+        );
+
+        provider.clear_all_entries();
+
+        assert!(!provider.has_entry(0x800, ContentRecordType::Program));
+        assert!(provider.list_update_versions(0x800).is_empty());
     }
 }

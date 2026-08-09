@@ -1,14 +1,14 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //
-// In-process game boot — the launcher counterpart of upstream yuzu's
-// `GMainWindow::BootGame` (`main.cpp`) + the emulation-thread setup. It drives
+// In-process game boot — the launcher counterpart of Eden's
+// `MainWindow::BootGame` (`main_window.cpp`) + the emulation-thread setup. It drives
 // the same `ruzu_core::core::System` lifecycle that `ruzu_cmd` drives, but with
 // a GTK-owned native child surface instead of an SDL window, and without
 // SDL's event loop (GTK owns the main loop).
 //
 // Boot runs on a dedicated background thread so `System::load` (heavy: ROM
 // parse + shader/pipeline cache build) never blocks the GTK main thread — the
-// same split yuzu uses (its emulation/GPU thread does the heavy work and posts
+// same split Eden uses (its emulation/GPU thread does the heavy work and posts
 // progress to the GUI thread via `Qt::QueuedConnection`). Presentation runs on
 // the GPU thread inside `video_core`, reading `shown_state` / `framebuffer_layout`
 // directly, so frames land in the native child surface with no per-frame work
@@ -96,6 +96,9 @@ pub enum LoadingEvent {
         value: usize,
         total: usize,
     },
+    Started {
+        program_id: u64,
+    },
     FirstFrame,
     Failed {
         message: String,
@@ -154,6 +157,12 @@ impl EmulationSession {
         self.running
             .load(Ordering::Acquire)
             .then(|| self.program_id.load(Ordering::Acquire))
+    }
+
+    /// Return the application id as soon as `System::Load` publishes it.
+    pub fn loaded_program_id(&self) -> Option<u64> {
+        let program_id = self.program_id.load(Ordering::Acquire);
+        (program_id != 0).then_some(program_id)
     }
 
     /// Whether the running application requested that frontend exits be
@@ -779,6 +788,9 @@ fn run_boot(
 
     // Run the guest (upstream `system.Run()`): starts CPU threads in background.
     system.run();
+    loading_event(LoadingEvent::Started {
+        program_id: system.runtime_program_id(),
+    });
 
     // GTK owns the main event loop. The boot thread retains ownership of
     // `System`, samples the same counters as upstream's 500 ms GUI timer, and

@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //
-// Game list view — counterpart of upstream `GameList` / `GameListWorker`
-// (`/home/vricosti/Dev/emulators/zuyu/src/yuzu/game_list*.cpp`). It reads the
+// Game list view — counterpart of Eden `GameList` / `GameListWorker`
+// (`~/Dev/emulators/eden/src/yuzu/game/` and `src/qt_common/game_list/`). It reads the
 // configured game directories from ruzu's own config, scans them for Switch
 // executables, and shows them grouped under one expandable row per directory.
 // Activating a game row (double-click / Enter) boots it.
 //
-// Divergence from upstream, deliberate: yuzu exposes "add a game directory" as
+// Divergence from upstream, deliberate: Eden exposes "add a game directory" as
 // a fake row appended *inside* the tree, which reads as an item belonging to
 // the scanned folder. Here that action lives in a toolbar above the list, while
 // the tree contains upstream's Favorites root plus real directories and games.
@@ -16,7 +16,8 @@
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::rc::{Rc, Weak};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{mpsc, Arc, Mutex};
 
 use gtk::prelude::*;
 use gtk::subclass::prelude::*;
@@ -24,7 +25,10 @@ use gtk::{gdk, gio, glib};
 
 use ruzu_core::file_sys::control_metadata::NACP;
 use ruzu_core::file_sys::fs_filesystem::OpenMode;
-use ruzu_core::file_sys::registered_cache::ContentProviderUnion;
+use ruzu_core::file_sys::patch_manager::{Patch, PatchManager};
+use ruzu_core::file_sys::registered_cache::{
+    ContentProviderUnion, ContentProviderUnionSlot, ManualContentProvider,
+};
 use ruzu_core::file_sys::vfs::vfs_real::RealVfsFilesystem;
 use ruzu_core::hle::service::filesystem::filesystem::FileSystemController;
 use ruzu_core::loader::loader::{get_loader, FileType, ResultStatus, System as LoaderSystem};
@@ -68,6 +72,8 @@ mod imp {
         pub version: RefCell<String>,
         pub kind: RefCell<String>,
         pub size: RefCell<String>,
+        pub play_time: RefCell<String>,
+        pub add_ons: RefCell<String>,
         pub path: RefCell<String>,
         pub icon: RefCell<Option<gtk::gdk::Texture>>,
         /// Application program id. Zero for homebrew without a title id.
@@ -104,6 +110,8 @@ impl GameEntry {
         version: &str,
         kind: &str,
         size: &str,
+        play_time: &str,
+        add_ons: &str,
         path: &str,
         icon: Option<gdk::Texture>,
         program_id: u64,
@@ -115,6 +123,8 @@ impl GameEntry {
         *imp.version.borrow_mut() = version.to_owned();
         *imp.kind.borrow_mut() = kind.to_owned();
         *imp.size.borrow_mut() = size.to_owned();
+        *imp.play_time.borrow_mut() = play_time.to_owned();
+        *imp.add_ons.borrow_mut() = add_ons.to_owned();
         *imp.path.borrow_mut() = path.to_owned();
         *imp.icon.borrow_mut() = icon;
         imp.program_id.set(program_id);
@@ -158,6 +168,8 @@ impl GameEntry {
             &self.version(),
             &self.kind(),
             &self.size(),
+            &self.play_time(),
+            &self.add_ons(),
             &self.path(),
             self.icon(),
             self.program_id(),
@@ -178,6 +190,12 @@ impl GameEntry {
     }
     fn size(&self) -> String {
         self.imp().size.borrow().clone()
+    }
+    fn play_time(&self) -> String {
+        self.imp().play_time.borrow().clone()
+    }
+    fn add_ons(&self) -> String {
+        self.imp().add_ons.borrow().clone()
     }
     fn path(&self) -> String {
         self.imp().path.borrow().clone()
@@ -213,6 +231,10 @@ struct GameListView {
     filter_entry: gtk::SearchEntry,
     filter_result: gtk::Label,
     column_view: gtk::ColumnView,
+    file_type_column: gtk::ColumnViewColumn,
+    size_column: gtk::ColumnViewColumn,
+    play_time_column: gtk::ColumnViewColumn,
+    add_ons_column: gtk::ColumnViewColumn,
     store: gio::ListStore,
     /// Children and root item for upstream's first `GameListFavorites` row.
     /// The root is removed while filtering or when no favorite id is configured.
@@ -228,9 +250,27 @@ struct GameListView {
     selection: gtk::SingleSelection,
     controller_navigation: ControllerNavigation,
     hid_core: Arc<parking_lot::Mutex<hid_core::hid_core::HIDCore>>,
+    play_time_manager: Arc<frontend_common::play_time_manager::PlayTimeManager>,
     on_activate: Rc<dyn Fn(String, StartGameType)>,
     property_dialog:
         RefCell<Option<Rc<crate::configuration::configure_per_game::ConfigurePerGame>>>,
+    /// Eden runs `GameListWorker` outside the UI thread. The generation makes
+    /// a result from an older refresh harmless when a newer scan supersedes it.
+    scan_generation: Arc<AtomicU64>,
+    scan_result_sender: mpsc::Sender<GameListScanResult>,
+    scan_result_receiver: RefCell<mpsc::Receiver<GameListScanResult>>,
+}
+
+struct ScannedDirectory {
+    path: String,
+    deep_scan: bool,
+    games: Vec<GameFile>,
+}
+
+struct GameListScanResult {
+    generation: u64,
+    directories: Vec<ScannedDirectory>,
+    directory_to_select: Option<String>,
 }
 
 type ContextMenuHandler = Rc<dyn Fn(GameEntry, gtk::Widget, u32, f64, f64)>;
@@ -268,6 +308,7 @@ impl GameListHandle {
 /// when a game row is activated (double-click / Enter).
 pub fn build<F: Fn(String, StartGameType) + 'static>(
     hid_core: &Arc<parking_lot::Mutex<hid_core::hid_core::HIDCore>>,
+    play_time_manager: &Arc<frontend_common::play_time_manager::PlayTimeManager>,
     on_activate: F,
 ) -> (gtk::Widget, GameListHandle) {
     install_list_css();
@@ -317,12 +358,34 @@ pub fn build<F: Fn(String, StartGameType) + 'static>(
     };
 
     column_view.append_column(&make_name_column(Rc::clone(&on_context_menu)));
-    column_view.append_column(&make_text_column(
-        "File type",
+    let file_type_column = make_text_column(
+        &crate::i18n::tr("File type"),
         GameEntry::kind,
         Rc::clone(&on_context_menu),
-    ));
-    column_view.append_column(&make_text_column("Size", GameEntry::size, on_context_menu));
+    );
+    let size_column = make_text_column(
+        &crate::i18n::tr("Size"),
+        GameEntry::size,
+        Rc::clone(&on_context_menu),
+    );
+    let play_time_column = make_text_column(
+        &crate::i18n::tr("Play time"),
+        GameEntry::play_time,
+        Rc::clone(&on_context_menu),
+    );
+    let add_ons_column = make_text_column(
+        &crate::i18n::tr("Add-ons"),
+        GameEntry::add_ons,
+        on_context_menu,
+    );
+    for column in [
+        &file_type_column,
+        &size_column,
+        &play_time_column,
+        &add_ons_column,
+    ] {
+        column_view.append_column(column);
+    }
 
     let scroller = gtk::ScrolledWindow::builder()
         .hexpand(true)
@@ -387,6 +450,8 @@ pub fn build<F: Fn(String, StartGameType) + 'static>(
     root.append(&stack);
     root.append(&filter_bar);
 
+    let (scan_result_sender, scan_result_receiver) = mpsc::channel();
+
     let view = Rc::new(GameListView {
         root: root.clone(),
         stack,
@@ -394,6 +459,10 @@ pub fn build<F: Fn(String, StartGameType) + 'static>(
         filter_entry: filter_entry.clone(),
         filter_result,
         column_view: column_view.clone(),
+        file_type_column,
+        size_column,
+        play_time_column,
+        add_ons_column,
         store,
         favorites,
         favorites_root,
@@ -401,8 +470,12 @@ pub fn build<F: Fn(String, StartGameType) + 'static>(
         selection: selection.clone(),
         controller_navigation: ControllerNavigation::new(hid_core),
         hid_core: Arc::clone(hid_core),
+        play_time_manager: Arc::clone(play_time_manager),
         on_activate,
         property_dialog: RefCell::new(None),
+        scan_generation: Arc::new(AtomicU64::new(0)),
+        scan_result_sender,
+        scan_result_receiver: RefCell::new(scan_result_receiver),
     });
     *context_view.borrow_mut() = Rc::downgrade(&view);
 
@@ -457,6 +530,19 @@ pub fn build<F: Fn(String, StartGameType) + 'static>(
             } else {
                 view.controller_navigation.discard_pending_keys();
             }
+            glib::ControlFlow::Continue
+        }
+    });
+
+    // `GameListWorker::ProcessEvents`: transfer plain scan results back to
+    // GTK, where GObjects and textures must be created.
+    glib::timeout_add_local(std::time::Duration::from_millis(16), {
+        let view = Rc::downgrade(&view);
+        move || {
+            let Some(view) = view.upgrade() else {
+                return glib::ControlFlow::Break;
+            };
+            view.process_scan_results();
             glib::ControlFlow::Continue
         }
     });
@@ -963,7 +1049,7 @@ impl GameListView {
 
         let properties_section = gio::Menu::new();
         properties_section.append(
-            Some(&crate::i18n::tr("Properties")),
+            Some(&crate::i18n::tr("Configure Game")),
             Some("game-list.properties"),
         );
         menu.append_section(None, &properties_section);
@@ -1049,6 +1135,18 @@ impl GameListView {
             actions.add_action(&copy_title_id);
         }
 
+        let remove_play_time = gio::SimpleAction::new("remove-play-time", None);
+        {
+            let view = Rc::downgrade(self);
+            remove_play_time.connect_activate(move |_, _| {
+                if let Some(view) = view.upgrade() {
+                    view.play_time_manager.reset_program_play_time(program_id);
+                    view.reload();
+                }
+            });
+        }
+        actions.add_action(&remove_play_time);
+
         for (name, detail) in [
             (
                 "remove-update",
@@ -1058,10 +1156,6 @@ impl GameListView {
             (
                 "remove-custom-config",
                 "Removing custom configurations is not available yet.",
-            ),
-            (
-                "remove-play-time",
-                "Removing play-time data is not available yet.",
             ),
             (
                 "remove-cache-storage",
@@ -1334,6 +1428,8 @@ impl GameListView {
     /// Rescan every configured directory and rebuild the tree — upstream
     /// re-runs `GameListWorker` after the directory list changes.
     fn reload(&self) {
+        self.update_column_visibility();
+
         // Rebuilding the store drops the selection; remember which directory
         // was picked so it can be restored afterwards.
         let previously_selected = selected_directory_path(&self.selection);
@@ -1348,17 +1444,87 @@ impl GameListView {
 
         self.store.remove_all();
         self.all_games.borrow_mut().clear();
+        for dir in &scannable {
+            self.store.append(&GameEntry::new_folder(
+                &dir.path,
+                dir.deep_scan,
+                gio::ListStore::new::<GameEntry>(),
+            ));
+        }
+        self.rebuild_favorites();
+
+        self.stack.set_visible_child_name(if scannable.is_empty() {
+            PAGE_EMPTY
+        } else {
+            PAGE_LIST
+        });
+
+        if let Some(path) = directory_to_select.as_deref() {
+            self.select_directory(path);
+        }
+        self.apply_filter(&self.filter_entry.text());
+
+        let generation = self.scan_generation.fetch_add(1, Ordering::AcqRel) + 1;
+        let current_generation = Arc::clone(&self.scan_generation);
+        let sender = self.scan_result_sender.clone();
+        let spawn_result = std::thread::Builder::new()
+            .name("GameListWorker".to_string())
+            .spawn(move || {
+                let mut metadata_reader = MetadataReader::new();
+                populate_manual_content_provider(
+                    &metadata_reader.vfs,
+                    &mut metadata_reader.manual_content_provider,
+                    &scannable,
+                );
+                if current_generation.load(Ordering::Acquire) != generation {
+                    return;
+                }
+
+                let mut directories = Vec::with_capacity(scannable.len());
+                for directory in scannable {
+                    if current_generation.load(Ordering::Acquire) != generation {
+                        return;
+                    }
+                    let games = scan_dir_games(
+                        Path::new(&directory.path),
+                        directory.deep_scan,
+                        &mut metadata_reader,
+                    );
+                    directories.push(ScannedDirectory {
+                        path: directory.path,
+                        deep_scan: directory.deep_scan,
+                        games,
+                    });
+                }
+
+                if current_generation.load(Ordering::Acquire) == generation {
+                    let _ = sender.send(GameListScanResult {
+                        generation,
+                        directories,
+                        directory_to_select,
+                    });
+                }
+            });
+        if let Err(error) = spawn_result {
+            log::error!("Failed to start GameListWorker: {error}");
+        }
+    }
+
+    /// Drain `GameListWorker` results and materialize their GTK rows.
+    fn process_scan_results(&self) {
+        let generation = self.scan_generation.load(Ordering::Acquire);
+        let result = take_current_scan_result(&self.scan_result_receiver.borrow(), generation);
+        let Some(result) = result else { return };
+
+        self.store.remove_all();
+        self.all_games.borrow_mut().clear();
 
         let mut total = 0;
-        for dir in &scannable {
-            let games = scan_dir_games(Path::new(&dir.path), dir.deep_scan);
-            total += games.len();
-
+        for directory in result.directories {
+            total += directory.games.len();
             let children = gio::ListStore::new::<GameEntry>();
-            let mut all_games = Vec::with_capacity(games.len());
-            for game in games {
-                // Decode the control-data icon (JPEG) into a texture on the
-                // main thread.
+            let mut all_games = Vec::with_capacity(directory.games.len());
+            for game in directory.games {
                 let icon = game.icon.as_ref().and_then(|bytes| {
                     gdk::Texture::from_bytes(&glib::Bytes::from(bytes.as_slice())).ok()
                 });
@@ -1368,6 +1534,10 @@ impl GameListView {
                     &game.version,
                     &game.kind,
                     &human_size(game.size),
+                    &frontend_common::play_time_manager::PlayTimeManager::get_readable_play_time(
+                        self.play_time_manager.get_play_time(game.program_id),
+                    ),
+                    &game.add_ons,
                     &game.path.to_string_lossy(),
                     icon,
                     game.program_id,
@@ -1376,26 +1546,35 @@ impl GameListView {
                 all_games.push(entry);
             }
             self.all_games.borrow_mut().push(all_games);
-            self.store
-                .append(&GameEntry::new_folder(&dir.path, dir.deep_scan, children));
+            self.store.append(&GameEntry::new_folder(
+                &directory.path,
+                directory.deep_scan,
+                children,
+            ));
         }
         self.rebuild_favorites();
 
         log::info!(
             "Game list: found {total} game(s) across {} directory(ies)",
-            scannable.len()
+            self.all_games.borrow().len()
         );
-
-        self.stack.set_visible_child_name(if scannable.is_empty() {
-            PAGE_EMPTY
-        } else {
-            PAGE_LIST
-        });
-
-        if let Some(path) = directory_to_select {
+        if let Some(path) = result.directory_to_select {
             self.select_directory(&path);
         }
         self.apply_filter(&self.filter_entry.text());
+    }
+
+    /// Eden `GameTree::UpdateColumnVisibility`.
+    fn update_column_visibility(&self) {
+        uisettings::with(|values| {
+            self.file_type_column
+                .set_visible(*values.show_types.get_value());
+            self.size_column.set_visible(*values.show_size.get_value());
+            self.play_time_column
+                .set_visible(*values.show_play_time.get_value());
+            self.add_ons_column
+                .set_visible(*values.show_add_ons.get_value());
+        });
     }
 
     /// Re-select the directory row for `path` after a rescan.
@@ -1689,7 +1868,7 @@ fn make_name_column(on_context_menu: ContextMenuHandler) -> gtk::ColumnViewColum
         label.set_label(&entry.name());
     });
 
-    let column = gtk::ColumnViewColumn::new(Some("Name"), Some(factory));
+    let column = gtk::ColumnViewColumn::new(Some(&crate::i18n::tr("Name")), Some(factory));
     column.set_expand(true);
     column.set_resizable(true);
     column
@@ -1885,8 +2064,22 @@ struct GameFile {
     size: u64,
     path: PathBuf,
     program_id: u64,
+    add_ons: String,
     /// Icon JPEG bytes from the control data, if any.
     icon: Option<Vec<u8>>,
+}
+
+/// `GameListWorker::ProcessEvents` equivalent for the channel adaptation.
+/// Drain every completed scan so an obsolete result can never be applied
+/// after the most recent refresh.
+fn take_current_scan_result(
+    receiver: &mpsc::Receiver<GameListScanResult>,
+    generation: u64,
+) -> Option<GameListScanResult> {
+    receiver
+        .try_iter()
+        .filter(|result| result.generation == generation)
+        .last()
 }
 
 /// Scan one directory and return the games it holds, sorted by title.
@@ -1904,14 +2097,13 @@ struct GameFile {
 ///     return true;   // skip
 /// }
 /// ```
-fn scan_dir_games(dir: &Path, deep_scan: bool) -> Vec<GameFile> {
+fn scan_dir_games(dir: &Path, deep_scan: bool, reader: &mut MetadataReader) -> Vec<GameFile> {
     let mut candidates = Vec::new();
     collect_candidates(dir, deep_scan, &mut candidates);
 
     // Load each candidate once, keeping only what the loader accepts, and take
     // its title + icon from the same loader (upstream reuses the one loader for
     // `GetFileType` / `ReadTitle` / `ReadIcon` too).
-    let mut reader = MetadataReader::new();
     let mut games = Vec::with_capacity(candidates.len());
     for mut game in candidates {
         let Some(metadata) = reader.read(&game.path.to_string_lossy()) else {
@@ -1928,11 +2120,43 @@ fn scan_dir_games(dir: &Path, deep_scan: bool) -> Vec<GameFile> {
         game.version = metadata.version;
         game.icon = metadata.icon;
         game.program_id = metadata.program_id;
+        game.add_ons = metadata.add_ons;
         games.push(game);
     }
 
     games.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
     games
+}
+
+/// Eden `ScanTarget::FillManualContentProvider` pass over every configured
+/// filesystem game directory.
+pub(crate) fn populate_manual_content_provider(
+    vfs: &Arc<RealVfsFilesystem>,
+    provider: &mut ManualContentProvider,
+    directories: &[GameDir],
+) {
+    if !*common::settings::values()
+        .ext_content_from_game_dirs
+        .get_value()
+    {
+        return;
+    }
+
+    for directory in directories {
+        let mut candidates = Vec::new();
+        collect_candidates(
+            Path::new(&directory.path),
+            directory.deep_scan,
+            &mut candidates,
+        );
+        for candidate in candidates {
+            let Some(file) = vfs.arc_open_file(&candidate.path.to_string_lossy(), OpenMode::READ)
+            else {
+                continue;
+            };
+            provider.add_entries_from_container(file, false, None);
+        }
+    }
 }
 
 /// Collect candidate game files under `dir`, recursively when `deep_scan` is set.
@@ -1972,6 +2196,7 @@ fn collect_candidates(dir: &Path, deep_scan: bool, games: &mut Vec<GameFile>) {
             size: metadata.len(),
             path,
             program_id: 0,
+            add_ons: String::new(),
             icon: None,
         });
     }
@@ -1985,6 +2210,9 @@ fn collect_candidates(dir: &Path, deep_scan: bool, games: &mut Vec<GameFile>) {
 /// emulation `Core::System`. Keys come from the global `KeyManager` singleton.
 struct MetadataReader {
     vfs: Arc<RealVfsFilesystem>,
+    content_provider: Arc<Mutex<ContentProviderUnion>>,
+    controller: Arc<Mutex<FileSystemController>>,
+    manual_content_provider: Box<ManualContentProvider>,
     loader_system: LoaderSystem,
 }
 
@@ -1995,11 +2223,31 @@ impl MetadataReader {
         let mut controller = FileSystemController::new();
         controller.set_content_provider(content_provider.clone());
         controller.create_factories(vfs.clone(), false);
+        let mut manual_content_provider = Box::new(ManualContentProvider::new());
+        {
+            let mut provider = content_provider
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            unsafe {
+                provider.set_slot(
+                    ContentProviderUnionSlot::FrontendManual,
+                    (&mut *manual_content_provider as *mut ManualContentProvider)
+                        as *mut dyn ruzu_core::file_sys::registered_cache::ContentProvider,
+                );
+            }
+        }
+        let controller = Arc::new(Mutex::new(controller));
         let loader_system = LoaderSystem {
-            content_provider: Some(content_provider),
-            filesystem_controller: Some(Arc::new(Mutex::new(controller))),
+            content_provider: Some(Arc::clone(&content_provider)),
+            filesystem_controller: Some(Arc::clone(&controller)),
         };
-        Self { vfs, loader_system }
+        Self {
+            vfs,
+            content_provider,
+            controller,
+            manual_content_provider,
+            loader_system,
+        }
     }
 
     /// Metadata for a game the loader accepted; `None` when the file is not a
@@ -2042,12 +2290,31 @@ impl MetadataReader {
                 (String::new(), "1.0.0".to_string())
             };
 
+        let mut update_raw = None;
+        loader.read_update_raw(&mut update_raw);
+        let patches = {
+            let controller = self
+                .controller
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            let content_provider = self
+                .content_provider
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            PatchManager::new(program_id, &controller, &*content_provider).get_patches(update_raw)
+        };
+        let rom_fs_updatable = loader.is_rom_fs_updatable();
+        let add_ons = get_game_list_cached_string(program_id, "pv.txt", || {
+            format_patch_name_versions(&patches, file_type, rom_fs_updatable)
+        });
+
         Some(GameMetadata {
             title,
             icon,
             program_id,
             developer,
             version,
+            add_ons,
         })
     }
 }
@@ -2059,6 +2326,67 @@ struct GameMetadata {
     program_id: u64,
     developer: String,
     version: String,
+    add_ons: String,
+}
+
+/// Eden `FormatPatchNameVersions` used by the game-list Add-ons column.
+fn format_patch_name_versions(
+    patches: &[Patch],
+    file_type: FileType,
+    rom_fs_updatable: bool,
+) -> String {
+    patches
+        .iter()
+        .filter(|patch| rom_fs_updatable || patch.name != "Update")
+        .map(|patch| {
+            let name = if patch.enabled {
+                patch.name.clone()
+            } else {
+                format!("[D] {}", patch.name)
+            };
+            if patch.version.is_empty() {
+                name
+            } else {
+                let version = if patch.name == "Update" && patch.version == "PACKED" {
+                    ruzu_core::loader::loader::get_file_type_string(file_type).to_owned()
+                } else {
+                    patch.version.clone()
+                };
+                format!("{name} ({version})")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Eden `GetGameListCachedObject(QString)` specialization.
+fn get_game_list_cached_string(
+    program_id: u64,
+    extension: &str,
+    generator: impl FnOnce() -> String,
+) -> String {
+    if !uisettings::with(|values| *values.cache_game_list.get_value()) || program_id == 0 {
+        return generator();
+    }
+
+    let path = common::fs::path_util::get_ruzu_path(common::fs::path_util::RuzuPath::CacheDir)
+        .join("game_list")
+        .join(format!("{program_id:016X}.{extension}"));
+    if let Ok(bytes) = std::fs::read(&path) {
+        return String::from_utf8_lossy(&bytes).into_owned();
+    }
+
+    let value = generator();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Err(error) = std::fs::write(&path, value.as_bytes()) {
+        log::error!(
+            "Failed to write game-list cache {}: {error}",
+            path.display()
+        );
+    }
+    value
 }
 
 /// Upstream `ContainsAllWords` plus the title-id branch in
@@ -2159,6 +2487,24 @@ mod tests {
     }
 
     #[test]
+    fn scan_result_discards_obsolete_refresh_generations() {
+        let (sender, receiver) = mpsc::channel();
+        for generation in [1, 3, 2] {
+            sender
+                .send(GameListScanResult {
+                    generation,
+                    directories: Vec::new(),
+                    directory_to_select: None,
+                })
+                .unwrap();
+        }
+
+        let result = take_current_scan_result(&receiver, 3).unwrap();
+        assert_eq!(result.generation, 3);
+        assert!(take_current_scan_result(&receiver, 3).is_none());
+    }
+
+    #[test]
     fn favorites_clone_first_matching_games_in_configured_order() {
         let first = GameEntry::new_game(
             "First copy",
@@ -2166,6 +2512,8 @@ mod tests {
             "1.0.0",
             "NSP",
             "1 B",
+            "",
+            "",
             "/games/first.nsp",
             None,
             1,
@@ -2176,6 +2524,8 @@ mod tests {
             "1.0.0",
             "NSP",
             "1 B",
+            "",
+            "",
             "/games/duplicate.nsp",
             None,
             1,
@@ -2186,6 +2536,8 @@ mod tests {
             "1.0.0",
             "XCI",
             "2 B",
+            "",
+            "",
             "/games/second.xci",
             None,
             2,
@@ -2335,5 +2687,35 @@ mod tests {
             -1
         ));
         assert!(!move_filesystem_directory(&mut directories, "/missing", 1));
+    }
+
+    #[test]
+    fn patch_versions_match_eden_game_list_format() {
+        let patches = vec![
+            Patch {
+                enabled: true,
+                name: "Update".to_owned(),
+                version: "1.2.3".to_owned(),
+                patch_type: ruzu_core::file_sys::patch_manager::PatchType::Update,
+                program_id: 1,
+                title_id: 1,
+            },
+            Patch {
+                enabled: false,
+                name: "Example Mod".to_owned(),
+                version: String::new(),
+                patch_type: ruzu_core::file_sys::patch_manager::PatchType::Mod,
+                program_id: 1,
+                title_id: 1,
+            },
+        ];
+        assert_eq!(
+            format_patch_name_versions(&patches, FileType::NSP, true),
+            "Update (1.2.3)\n[D] Example Mod"
+        );
+        assert_eq!(
+            format_patch_name_versions(&patches, FileType::NRO, false),
+            "[D] Example Mod"
+        );
     }
 }

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //
-// Rust/GTK4 counterpart of the upstream `GMainWindow` class defined in
-// `/home/vricosti/Dev/emulators/zuyu/src/yuzu/main.cpp` + `main.h`, whose
+// Rust/GTK4 counterpart of Eden's `MainWindow` class defined in
+// `~/Dev/emulators/eden/src/yuzu/main_window.cpp` + `main_window.h`, whose
 // widget tree is described declaratively in `main.ui`.
 //
 // The upstream window layout is:
@@ -165,6 +165,8 @@ pub struct GMainWindow {
     /// Handle to the game list, so it can be rescanned when the configured
     /// directories change.
     game_list: RefCell<Option<crate::game_list::GameListHandle>>,
+    /// Eden `MainWindow::play_time_manager`, shared with the game-list worker.
+    play_time_manager: Arc<frontend_common::play_time_manager::PlayTimeManager>,
     /// Input drivers. Upstream `GMainWindow` owns the `InputSubsystem` and
     /// passes it to `GRenderWindow`, which forwards events into it.
     ///
@@ -359,6 +361,7 @@ mod loading_event_mailbox_tests {
             value: 0,
             total: 0,
         });
+        mailbox.push(LoadingEvent::Started { program_id: 42 });
         mailbox.push(LoadingEvent::FirstFrame);
         mailbox.push(LoadingEvent::FirstFrame);
 
@@ -375,6 +378,10 @@ mod loading_event_mailbox_tests {
                 stage: LoadStage::Complete,
                 ..
             })
+        ));
+        assert!(matches!(
+            mailbox.pop(),
+            Some(LoadingEvent::Started { program_id: 42 })
         ));
         assert!(matches!(mailbox.pop(), Some(LoadingEvent::FirstFrame)));
         assert!(mailbox.pop().is_none());
@@ -769,6 +776,8 @@ impl GMainWindow {
         }
 
         let hid_core = Arc::new(parking_lot::Mutex::new(hid_core::hid_core::HIDCore::new()));
+        let play_time_manager =
+            Arc::new(frontend_common::play_time_manager::PlayTimeManager::new());
         let input_subsystem = Rc::new(RefCell::new(input_common::InputSubsystem::new()));
         let (controller_applet, controller_applet_requests) =
             crate::applets::controller::GtkControllerSelector::new();
@@ -798,6 +807,7 @@ impl GMainWindow {
             render_size: Cell::new((0, 0)),
             configure_dialog: RefCell::new(None),
             game_list: RefCell::new(None),
+            play_time_manager,
             input_subsystem,
             hid_core,
             controller_applet,
@@ -817,6 +827,7 @@ impl GMainWindow {
         // Game list page: activating a row boots that game in-process.
         let (game_list, game_list_handle) = crate::game_list::build(
             &this.hid_core,
+            &this.play_time_manager,
             glib::clone!(
                 #[weak(rename_to = w)]
                 this,
@@ -2423,6 +2434,7 @@ impl GMainWindow {
         }
 
         // Stop any existing session first (upstream stops before re-booting).
+        self.play_time_manager.stop();
         if let Some(mut session) = self.session.borrow_mut().take() {
             session.stop();
         }
@@ -2502,6 +2514,10 @@ impl GMainWindow {
                     value,
                     total,
                 }) => loading.on_load_progress(stage, value, total),
+                Some(LoadingEvent::Started { program_id }) => {
+                    this.play_time_manager.set_program_id(program_id);
+                    this.play_time_manager.start();
+                }
                 Some(LoadingEvent::FirstFrame) => {
                     let stack = stack.clone();
                     loading.on_load_complete(move || {
@@ -2597,6 +2613,7 @@ impl GMainWindow {
         }
 
         // Stop any existing session first (upstream stops before re-booting).
+        self.play_time_manager.stop();
         if let Some(mut session) = self.session.borrow_mut().take() {
             session.stop();
         }
@@ -2682,6 +2699,10 @@ impl GMainWindow {
                     value,
                     total,
                 }) => loading.on_load_progress(stage, value, total),
+                Some(LoadingEvent::Started { program_id }) => {
+                    this.play_time_manager.set_program_id(program_id);
+                    this.play_time_manager.start();
+                }
                 Some(LoadingEvent::FirstFrame) => {
                     let stack = stack.clone();
                     loading.on_load_complete(move || {
@@ -2775,6 +2796,7 @@ impl GMainWindow {
 
         // Upstream releases the previous render target before initializing the
         // next one. Stop the session first so Vulkan no longer owns its HWND.
+        self.play_time_manager.stop();
         if let Some(mut session) = self.session.borrow_mut().take() {
             session.stop();
         }
@@ -2850,6 +2872,10 @@ impl GMainWindow {
                     value,
                     total,
                 }) => loading.on_load_progress(stage, value, total),
+                Some(LoadingEvent::Started { program_id }) => {
+                    this.play_time_manager.set_program_id(program_id);
+                    this.play_time_manager.start();
+                }
                 Some(LoadingEvent::FirstFrame) => {
                     let stack = stack.clone();
                     loading.on_load_complete(move || {
@@ -3049,6 +3075,7 @@ impl GMainWindow {
             log::error!("Failed to resume the emulation thread");
             return;
         }
+        self.start_play_time_for_session();
         if let Some(app) = self.window.application() {
             update_menu_state(&app, true, false);
         }
@@ -3067,6 +3094,7 @@ impl GMainWindow {
             log::error!("Failed to pause the emulation thread");
             return;
         }
+        self.play_time_manager.stop();
         if let Some(app) = self.window.application() {
             update_menu_state(&app, true, true);
         }
@@ -3205,6 +3233,7 @@ impl GMainWindow {
     /// thread requests guest exit, applies the upstream timeout, and reports
     /// `StopComplete` after forced teardown if necessary.
     fn begin_stop_game(self: &Rc<Self>) -> bool {
+        self.play_time_manager.stop();
         let requested = self
             .session
             .borrow_mut()
@@ -3230,9 +3259,6 @@ impl GMainWindow {
                 }
             }
         }
-        if let Some(game_list) = self.game_list.borrow().as_ref() {
-            game_list.reload();
-        }
         true
     }
 
@@ -3242,6 +3268,7 @@ impl GMainWindow {
     /// before releasing the native render target, clear the loading assets,
     /// restore the game list, and then report an error when applicable.
     fn on_emulation_stopped(self: &Rc<Self>, failure: Option<(String, String)>) {
+        self.play_time_manager.stop();
         let close_after_stop = self.close_confirmed.get();
         let restart_path = restart_path_after_shutdown(
             self.pending_restart_path.borrow_mut().take(),
@@ -3272,6 +3299,9 @@ impl GMainWindow {
         self.loading_screen.clear();
         self.current_game_path.borrow_mut().take();
         self.show_game_list();
+        if let Some(game_list) = self.game_list.borrow().as_ref() {
+            game_list.reload();
+        }
         self.status_bar.update_performance(None, None);
         self.refresh_tas_ui();
         if let Some(app) = self.window.application() {
@@ -3288,6 +3318,20 @@ impl GMainWindow {
         } else if let Some(path) = restart_path {
             self.boot_game(path);
         }
+    }
+
+    /// Tail of Eden `MainWindow::OnStartGame`.
+    fn start_play_time_for_session(&self) {
+        let Some(program_id) = self
+            .session
+            .borrow()
+            .as_ref()
+            .and_then(EmulationSession::loaded_program_id)
+        else {
+            return;
+        };
+        self.play_time_manager.set_program_id(program_id);
+        self.play_time_manager.start();
     }
 
     /// Animate fake shader-build progress to exercise the loading-screen UI.

@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2016 Citra Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-//! GTK counterpart of `yuzu/configuration/configure_per_game_addons.{h,cpp,ui}`.
+//! GTK counterpart of Eden `yuzu/configuration/configure_per_game_addons.{h,cpp,ui}`.
 
 use std::cell::Cell;
 use std::cmp::Ordering;
@@ -11,7 +11,9 @@ use std::sync::{Arc, Mutex};
 use gtk::prelude::*;
 use gtk::{gio, glib};
 use ruzu_core::file_sys::patch_manager::PatchManager;
-use ruzu_core::file_sys::registered_cache::ContentProviderUnion;
+use ruzu_core::file_sys::registered_cache::{
+    ContentProvider, ContentProviderUnion, ContentProviderUnionSlot, ManualContentProvider,
+};
 use ruzu_core::file_sys::vfs::vfs_real::RealVfsFilesystem;
 use ruzu_core::hle::service::filesystem::filesystem::FileSystemController;
 use ruzu_core::loader::loader::{get_loader, System as LoaderSystem};
@@ -45,6 +47,32 @@ pub fn load_from_file(title_id: u64, path: &Path) -> Vec<AddOn> {
     let mut controller = FileSystemController::new();
     controller.set_content_provider(content_provider.clone());
     controller.create_factories(vfs.clone(), false);
+    let mut manual_content_provider = Box::new(ManualContentProvider::new());
+    {
+        let mut provider = content_provider
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        unsafe {
+            provider.set_slot(
+                ContentProviderUnionSlot::FrontendManual,
+                (&mut *manual_content_provider as *mut ManualContentProvider)
+                    as *mut dyn ContentProvider,
+            );
+        }
+    }
+    let directories = crate::uisettings::with(|values| {
+        values
+            .game_dirs
+            .iter()
+            .filter(|directory| directory.is_filesystem_path())
+            .cloned()
+            .collect::<Vec<_>>()
+    });
+    crate::game_list::populate_manual_content_provider(
+        &vfs,
+        &mut manual_content_provider,
+        &directories,
+    );
     let controller = Arc::new(Mutex::new(controller));
     let mut loader_system = LoaderSystem {
         content_provider: Some(content_provider.clone()),

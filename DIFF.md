@@ -299,3 +299,85 @@ and persisted under upstream's `UIGameList\\favorites_expanded` key.
   vector saturation, AES/SHA/CRC/SM4 cryptography, and selected integer vector reductions,
   min/max, halving, rounding, and broadcast operations. Upstream's 16-bit FP specializations that
   themselves terminate with `ASSERT_FALSE("Unimplemented")` are not counted as port debt.
+
+## 2026-08-09 — `frontend_common/src/play_time_manager.rs` vs Eden `src/frontend_common/play_time_manager.{h,cpp}`
+
+### Intentional differences
+
+- Rust uses a channel and `JoinHandle` in place of `std::jthread` and its stop token. Stop still
+  wakes and joins the worker, accounts the final whole-second interval, then persists the database.
+- A mutex protects the database because GTK can read it while the timestamp worker updates it.
+
+### Binary layout verification
+
+- PASS: each entry is two consecutive little-endian `u64` values and occupies 16 bytes, matching
+  Eden's raw `PlayTimeElement` array in `playtime.bin`.
+
+## 2026-08-09 — `ruzu/src/game_list.rs` vs Eden `src/yuzu/game/game_list.{h,cpp}` and `src/qt_common/game_list/{model,worker}.{h,cpp}`
+
+### Intentional differences
+
+- GTK `ColumnView` factories replace Qt `QStandardItem` subclasses while preserving Eden's Name,
+  File type, Size, Play time, and Add-ons column order, values, and visibility settings.
+- Eden transfers worker results with Qt signals. Ruzu transfers plain scan results over a channel
+  and materializes GTK objects on the main context. A generation counter provides Eden's stale-work
+  cancellation guarantee when a newer refresh supersedes an older scan.
+- The metadata worker builds a filesystem controller and provider union because ruzu has no
+  persistent frontend `Core::System`; NAND, SDMC, and game-directory manual content are mounted
+  before `PatchManager` is queried.
+- The internal action identifier remains `properties`, while its visible label is Eden's
+  `Configure Game`.
+
+### Binary layout verification
+
+- Not applicable to the GTK model; the shared play-time file layout is verified separately.
+
+## 2026-08-09 — `ruzu/src/{boot,main_window}.rs` vs Eden `src/yuzu/main_window.{h,cpp}`
+
+### Intentional differences
+
+- Eden starts play-time accounting directly in `OnStartGame`. Ruzu's boot thread emits a lossless
+  `Started { program_id }` event so GTK performs the equivalent transition. Pause, resume, stop,
+  restart, and guest-driven exit retain Eden's ordering.
+
+### Binary layout verification
+
+- Not applicable: this changes frontend lifecycle events only.
+
+## 2026-08-09 — `ruzu/src/configuration/configure_per_game_addons.rs` vs Eden `src/yuzu/configuration/configure_per_game_addons.{h,cpp,ui}`
+
+### Intentional differences
+
+- Eden reuses its persistent frontend `Core::System`. Ruzu rebuilds NAND, SDMC, and configured game
+  directory providers while Configure Game is open, then queries the same `PatchManager` data.
+- GTK uses a `gio::ListStore` rather than `QStandardItemModel`; patch name, version, enabled state,
+  sorting, and disabled-addon persistence retain their upstream roles.
+
+### Binary layout verification
+
+- Not applicable: this is host frontend state.
+
+## 2026-08-09 — `common/src/settings.rs` vs Eden `src/common/settings.h`
+
+### Intentional differences
+
+- `ext_content_from_game_dirs` participates in ruzu's generic category visitor instead of Eden's
+  C++ settings linkage, preserving the same default and persisted value.
+
+### Binary layout verification
+
+- Not applicable: this setting is not guest-visible.
+
+## 2026-08-09 — `core/src/file_sys/registered_cache.rs` vs Eden `src/core/file_sys/registered_cache.{h,cpp}`
+
+### Intentional differences
+
+- `ExternalUpdateEntry::files` uses seven `Option<VirtualFile>` elements in place of nullable C++
+  handles. The raw `ContentRecordType` index and seven-entry contract are unchanged.
+- `open_container_as_nsp` probes NSP and then XCI directly, preserving Eden's final parser fallback
+  without introducing a reverse dependency from `file_sys` to the loader dispatcher.
+
+### Binary layout verification
+
+- Not applicable: manual-provider entries are host-only. Focused tests cover highest-version
+  selection, descending update order, and clearing versioned entries.

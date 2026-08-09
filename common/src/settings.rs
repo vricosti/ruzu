@@ -282,6 +282,7 @@ pub struct Values {
     pub gamecard_inserted: Setting<bool>,
     pub gamecard_current_game: Setting<bool>,
     pub gamecard_path: Setting<String>,
+    pub ext_content_from_game_dirs: Setting<bool>,
 
     // ── Debugging ───────────────────────────────────────────────────────
     pub record_frame_times: bool,
@@ -438,6 +439,13 @@ impl Values {
                 use_docked_mode,
             ),
             Category::SystemAudio => visit!(sound_index),
+            Category::DataStorage => visit!(
+                use_virtual_sd,
+                gamecard_inserted,
+                gamecard_current_game,
+                gamecard_path,
+                ext_content_from_game_dirs,
+            ),
             Category::Linux => visit!(enable_gamemode),
             Category::Controls => visit!(
                 vibration_enabled,
@@ -1103,6 +1111,11 @@ impl Default for Values {
             gamecard_inserted: Setting::new(false, "gamecard_inserted", DataStorage),
             gamecard_current_game: Setting::new(false, "gamecard_current_game", DataStorage),
             gamecard_path: Setting::new(String::new(), "gamecard_path", DataStorage),
+            ext_content_from_game_dirs: Setting::new(
+                true,
+                "ext_content_from_game_dirs",
+                DataStorage,
+            ),
 
             // Debugging
             record_frame_times: false,
