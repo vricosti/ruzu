@@ -128,6 +128,7 @@ fn main() -> glib::ExitCode {
     // pass that fills `game_dirs`.
     let favorited_ids = configuration::qt_config::load_favorited_ids();
     uisettings::with_mut(|v| v.favorited_ids = favorited_ids);
+    configuration::qt_config::load_favorites_expanded();
 
     configuration::qt_config::load_ui_language();
     configuration::qt_config::load_view_values();

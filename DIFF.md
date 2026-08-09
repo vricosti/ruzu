@@ -55,6 +55,44 @@ procedures are intentionally omitted.
 
 ## Input and frontends
 
+## 2026-08-09 — `ruzu/{src/game_list.rs,src/uisettings.rs,src/configuration/qt_config.rs,src/main.rs,i18n/catalogs.json}` vs `src/yuzu/{game_list.cpp,game_list_p.h,uisettings.h,configuration/qt_config.cpp}` and `dist/languages/*.ts` (`GameListFavorites`, `ToggleFavorite`, `AddFavorite`, `RemoveFavorite`, and `AddFavoritesPopup`)
+
+### Intentional differences
+
+- Qt represents Favorites with a `GameListFavorites` `QStandardItem` subclass and hides its row
+  through `QTreeView::setRowHidden`. GTK has no hidden-row API for `TreeListModel`, so ruzu gives
+  `GameEntry` an explicit Favorites kind and removes/reinserts that root at position zero. Its child
+  store remains alive, preserving the same visible behavior and ordering. Synthetic collapse
+  notifications emitted while that root is absent are ignored, and inserting the first favorite
+  explicitly expands the new GTK row to reproduce Qt revealing its still-expanded hidden row.
+- The upstream colorful-theme `folder.png` and `star.png` assets are embedded into ruzu rather than
+  resolved from the host GTK icon theme. This preserves the upstream 48 px artwork while keeping
+  ruzu independent of both the desktop theme and the zuyu source tree at runtime.
+- Upstream incrementally clones or removes one `QStandardItem` row. Ruzu rebuilds the small Favorites
+  child store from already-scanned immutable `GameEntry` metadata after each toggle; no directory is
+  rescanned, and first-match/configured-id ordering remains identical.
+
+The `favorites_expanded` setting is loaded, applied to the GTK tree row, updated on expansion changes,
+and persisted under upstream's `UIGameList\\favorites_expanded` key.
+
+### Binary layout verification
+
+- Not applicable. The changed state is GTK frontend model data only.
+
+## 2026-08-09 — `ruzu/src/game_list.rs` vs `src/yuzu/game_list.cpp` (`GameList::PopupContextMenu` and `AddGamePopup`)
+
+### Intentional differences
+
+- Upstream fully configures each `QAction`, including the checkable Favorite state, before
+  `QMenu::exec` materializes and displays the menu. GTK resolves stateful `GMenu` rows through an
+  action group, so ruzu installs that group and parents/styles the empty `GtkPopoverMenu` before
+  assigning its menu model. This preserves upstream's single layout pass and avoids initially
+  rendering Favorite as a stateless row before rebuilding it as a checkbox.
+
+### Binary layout verification
+
+- Not applicable. This only changes GTK context-menu construction order.
+
 ## 2026-08-09 — `ruzu/src/main_window.rs` vs `src/yuzu/main.{h,cpp}` (`GMainWindow::OnRestartGame`)
 
 ### Intentional differences

@@ -8,9 +8,9 @@
 //
 // Divergence from upstream, deliberate: yuzu exposes "add a game directory" as
 // a fake row appended *inside* the tree, which reads as an item belonging to
-// the scanned folder. Here that action lives in a toolbar above the list, so
-// the tree contains only real directories and real games. Directory and game
-// actions otherwise live in per-row context menus, matching
+// the scanned folder. Here that action lives in a toolbar above the list, while
+// the tree contains upstream's Favorites root plus real directories and games.
+// Directory and game actions otherwise live in per-row context menus, matching
 // `GameList::PopupContextMenu`.
 
 use std::cell::RefCell;
@@ -39,6 +39,11 @@ const ICON_SIZE: i32 = 64;
 
 /// Pixel size of the folder icon on a directory row.
 const FOLDER_ICON_SIZE: i32 = 48;
+
+/// Upstream's colorful-theme `folder` and `star` icons. Keep local copies so
+/// the game list does not depend on the host icon theme or the zuyu tree.
+const FOLDER_ICON_PNG: &[u8] = include_bytes!("../assets/game-list-folder.png");
+const FAVORITES_ICON_PNG: &[u8] = include_bytes!("../assets/game-list-star.png");
 
 /// Ruzu-specific default requested for newly added filesystem directories.
 const NEW_DIRECTORY_DEEP_SCAN: bool = true;
@@ -69,6 +74,9 @@ mod imp {
         pub program_id: Cell<u64>,
         /// Directory rows group the games found beneath them.
         pub is_folder: Cell<bool>,
+        /// The first group is upstream's `GameListFavorites`, not a filesystem
+        /// directory even though it is expandable like one.
+        pub is_favorites: Cell<bool>,
         /// Whether this directory is scanned recursively (directory rows only).
         pub deep_scan: Cell<bool>,
         /// Child rows, for directory rows.
@@ -111,6 +119,7 @@ impl GameEntry {
         *imp.icon.borrow_mut() = icon;
         imp.program_id.set(program_id);
         imp.is_folder.set(false);
+        imp.is_favorites.set(false);
         obj
     }
 
@@ -120,10 +129,39 @@ impl GameEntry {
         let imp = obj.imp();
         *imp.name.borrow_mut() = path.to_owned();
         *imp.path.borrow_mut() = path.to_owned();
+        *imp.icon.borrow_mut() = embedded_icon(FOLDER_ICON_PNG);
         imp.is_folder.set(true);
+        imp.is_favorites.set(false);
         imp.deep_scan.set(deep_scan);
         *imp.children.borrow_mut() = Some(children);
         obj
+    }
+
+    /// Upstream `GameListFavorites`: an expandable, non-filesystem root row.
+    fn new_favorites(children: gio::ListStore) -> Self {
+        let obj: Self = glib::Object::new();
+        let imp = obj.imp();
+        *imp.name.borrow_mut() = crate::i18n::tr("Favorites");
+        *imp.icon.borrow_mut() = embedded_icon(FAVORITES_ICON_PNG);
+        imp.is_folder.set(true);
+        imp.is_favorites.set(true);
+        *imp.children.borrow_mut() = Some(children);
+        obj
+    }
+
+    /// Upstream clones every column item when adding a game to Favorites.
+    fn clone_game(&self) -> Self {
+        debug_assert!(!self.is_folder());
+        Self::new_game(
+            &self.name(),
+            &self.developer(),
+            &self.version(),
+            &self.kind(),
+            &self.size(),
+            &self.path(),
+            self.icon(),
+            self.program_id(),
+        )
     }
 
     fn name(&self) -> String {
@@ -153,6 +191,9 @@ impl GameEntry {
     fn is_folder(&self) -> bool {
         self.imp().is_folder.get()
     }
+    fn is_favorites(&self) -> bool {
+        self.imp().is_favorites.get()
+    }
     fn deep_scan(&self) -> bool {
         self.imp().deep_scan.get()
     }
@@ -173,6 +214,10 @@ struct GameListView {
     filter_result: gtk::Label,
     column_view: gtk::ColumnView,
     store: gio::ListStore,
+    /// Children and root item for upstream's first `GameListFavorites` row.
+    /// The root is removed while filtering or when no favorite id is configured.
+    favorites: gio::ListStore,
+    favorites_root: GameEntry,
     /// Unfiltered children for every directory in `store`, in matching order.
     /// Upstream hides rows in its item model; GTK's tree list has no row-hidden
     /// API, so the visible child stores are rebuilt from this retained source.
@@ -228,6 +273,8 @@ pub fn build<F: Fn(String, StartGameType) + 'static>(
     install_list_css();
 
     let store = gio::ListStore::new::<GameEntry>();
+    let favorites = gio::ListStore::new::<GameEntry>();
+    let favorites_root = GameEntry::new_favorites(favorites.clone());
 
     // --- Tree ------------------------------------------------------------
     // One expandable row per configured directory; its games are the children.
@@ -348,6 +395,8 @@ pub fn build<F: Fn(String, StartGameType) + 'static>(
         filter_result,
         column_view: column_view.clone(),
         store,
+        favorites,
+        favorites_root,
         all_games: RefCell::new(Vec::new()),
         selection: selection.clone(),
         controller_navigation: ControllerNavigation::new(hid_core),
@@ -517,15 +566,18 @@ impl GameListView {
     /// Upstream `GameList::OnTextChanged`.
     fn apply_filter(&self, text: &str) {
         let query = text.to_lowercase();
+        // Upstream hides the complete Favorites group while filtering, then
+        // restores it only when at least one favorite remains.
+        let has_configured_favorites = uisettings::with(|values| !values.favorited_ids.is_empty());
+        self.set_favorites_visible(query.is_empty() && has_configured_favorites);
+
         let all_games = self.all_games.borrow();
         let total = all_games.iter().map(Vec::len).sum::<usize>();
         let mut visible = 0usize;
 
         for (directory_index, games) in all_games.iter().enumerate() {
             let Some(children) = self
-                .store
-                .item(directory_index as u32)
-                .and_downcast::<GameEntry>()
+                .directory_root(directory_index)
                 .and_then(|entry| entry.children())
             else {
                 continue;
@@ -636,11 +688,36 @@ impl GameListView {
         y: f64,
         on_activate: Rc<dyn Fn(String, StartGameType)>,
     ) {
-        if entry.is_folder() {
+        if entry.is_favorites() {
+            self.popup_favorites_context_menu(anchor, x, y);
+        } else if entry.is_folder() {
             self.popup_directory_context_menu(entry, anchor, x, y);
         } else {
             self.popup_game_context_menu(entry, anchor, x, y, on_activate);
         }
+    }
+
+    /// Upstream `GameList::AddFavoritesPopup`.
+    fn popup_favorites_context_menu(self: &Rc<Self>, anchor: &gtk::Widget, x: f64, y: f64) {
+        let menu = gio::Menu::new();
+        menu.append(
+            Some(&crate::i18n::tr("Clear")),
+            Some("game-list.clear-favorites"),
+        );
+
+        let actions = gio::SimpleActionGroup::new();
+        let clear = gio::SimpleAction::new("clear-favorites", None);
+        clear.connect_activate({
+            let view = Rc::downgrade(self);
+            move |_, _| {
+                if let Some(view) = view.upgrade() {
+                    view.clear_favorites();
+                }
+            }
+        });
+        actions.add_action(&clear);
+
+        show_context_menu(anchor, &menu, &actions, x, y);
     }
 
     /// `GameList::AddPermDirPopup` followed by `AddCustomDirPopup`.
@@ -913,23 +990,19 @@ impl GameListView {
             let favorite = gio::SimpleAction::new_stateful(
                 "toggle-favorite",
                 None,
-                &crate::configuration::qt_config::load_favorited_ids()
-                    .contains(&program_id)
-                    .to_variant(),
+                &uisettings::with(|values| values.favorited_ids.contains(&program_id)).to_variant(),
             );
-            favorite.connect_activate(move |action, _| {
-                let enabled = !action
-                    .state()
-                    .and_then(|value| value.get::<bool>())
-                    .unwrap_or(false);
-                action.set_state(&enabled.to_variant());
-                let mut ids = crate::configuration::qt_config::load_favorited_ids();
-                ids.retain(|id| *id != program_id);
-                if enabled {
-                    ids.push(program_id);
-                }
-                if let Err(error) = crate::configuration::qt_config::save_favorited_ids(&ids) {
-                    log::error!("Failed to save favorite title: {error}");
+            favorite.connect_activate({
+                let view = Rc::downgrade(self);
+                move |action, _| {
+                    let enabled = !action
+                        .state()
+                        .and_then(|value| value.get::<bool>())
+                        .unwrap_or(false);
+                    action.set_state(&enabled.to_variant());
+                    if let Some(view) = view.upgrade() {
+                        view.set_favorite(program_id, enabled);
+                    }
                 }
             });
             actions.add_action(&favorite);
@@ -1148,6 +1221,116 @@ impl GameListView {
         self.root.root().and_downcast::<gtk::Window>()
     }
 
+    /// Return the Nth configured-directory root independently of whether the
+    /// optional Favorites row currently occupies position zero.
+    fn directory_root(&self, directory_index: usize) -> Option<GameEntry> {
+        (0..self.store.n_items())
+            .filter_map(|position| self.store.item(position).and_downcast::<GameEntry>())
+            .filter(|entry| !entry.is_favorites())
+            .nth(directory_index)
+    }
+
+    fn favorites_root_position(&self) -> Option<u32> {
+        (0..self.store.n_items()).find(|position| {
+            self.store
+                .item(*position)
+                .and_downcast::<GameEntry>()
+                .is_some_and(|entry| entry.is_favorites())
+        })
+    }
+
+    /// Upstream hides Favorites when empty or while a filter is active.
+    fn set_favorites_visible(&self, visible: bool) {
+        match (visible, self.favorites_root_position()) {
+            (true, None) => {
+                self.store.insert(0, &self.favorites_root);
+                let Some(row) = self
+                    .selection
+                    .model()
+                    .and_then(|model| model.item(0))
+                    .and_downcast::<gtk::TreeListRow>()
+                else {
+                    return;
+                };
+                row.set_expanded(uisettings::with(|values| {
+                    *values.favorites_expanded.get_value()
+                }));
+                let store = self.store.clone();
+                let favorites_root = self.favorites_root.clone();
+                row.connect_expanded_notify(move |row| {
+                    // Removing the GTK root to emulate Qt's hidden row emits a
+                    // synthetic collapse. It is not a user action and must not
+                    // overwrite upstream's persistent expanded state.
+                    let root_is_visible = store_contains_entry(&store, &favorites_root);
+                    if !root_is_visible {
+                        return;
+                    }
+                    uisettings::with_mut(|values| {
+                        values.favorites_expanded.set_value(row.is_expanded())
+                    });
+                    if let Err(error) = qt_config::save_favorites_expanded() {
+                        log::error!("Failed to save Favorites expanded state: {error}");
+                    }
+                });
+            }
+            (false, Some(position)) => self.store.remove(position),
+            _ => {}
+        }
+    }
+
+    /// Upstream `GameList::AddFavorite`: rebuild cloned rows in configured-id
+    /// order from the already scanned directory entries.
+    fn rebuild_favorites(&self) {
+        let ids = uisettings::with(|values| values.favorited_ids.clone());
+        let favorites = favorite_entries(&ids, &self.all_games.borrow());
+        self.favorites.remove_all();
+        for game in favorites {
+            self.favorites.append(&game);
+        }
+    }
+
+    /// Upstream `GameList::ToggleFavorite` plus `SaveConfig`.
+    fn set_favorite(&self, program_id: u64, enabled: bool) {
+        let (ids, reveal_first_favorite) = uisettings::with_mut(|values| {
+            let reveal_first_favorite = enabled && values.favorited_ids.is_empty();
+            if enabled {
+                if !values.favorited_ids.contains(&program_id) {
+                    values.favorited_ids.push(program_id);
+                }
+            } else if let Some(position) =
+                values.favorited_ids.iter().position(|id| *id == program_id)
+            {
+                values.favorited_ids.remove(position);
+            }
+            if reveal_first_favorite {
+                // Qt keeps a hidden root alive and expanded. GTK has to insert
+                // a new visible row, so explicitly reproduce that reveal.
+                values.favorites_expanded.set_value(true);
+            }
+            (values.favorited_ids.clone(), reveal_first_favorite)
+        });
+        if let Err(error) = qt_config::save_favorited_ids(&ids) {
+            log::error!("Failed to save favorite title: {error}");
+        }
+        if reveal_first_favorite {
+            if let Err(error) = qt_config::save_favorites_expanded() {
+                log::error!("Failed to reveal the first favorite: {error}");
+            }
+        }
+        self.rebuild_favorites();
+        self.apply_filter(&self.filter_entry.text());
+    }
+
+    /// Upstream `GameList::AddFavoritesPopup` clear action.
+    fn clear_favorites(&self) {
+        uisettings::with_mut(|values| values.favorited_ids.clear());
+        if let Err(error) = qt_config::save_favorited_ids(&[]) {
+            log::error!("Failed to clear favorite titles: {error}");
+        }
+        self.rebuild_favorites();
+        self.apply_filter(&self.filter_entry.text());
+    }
+
     /// Rescan every configured directory and rebuild the tree — upstream
     /// re-runs `GameListWorker` after the directory list changes.
     fn reload(&self) {
@@ -1196,6 +1379,7 @@ impl GameListView {
             self.store
                 .append(&GameEntry::new_folder(&dir.path, dir.deep_scan, children));
         }
+        self.rebuild_favorites();
 
         log::info!(
             "Game list: found {total} game(s) across {} directory(ies)",
@@ -1329,8 +1513,31 @@ fn selected_directory_path(selection: &gtk::SingleSelection) -> Option<String> {
         .and_downcast::<gtk::TreeListRow>()
         .and_then(|row| row.item())
         .and_downcast::<GameEntry>()
-        .filter(|entry| entry.is_folder())
+        .filter(|entry| entry.is_folder() && !entry.is_favorites())
         .map(|entry| entry.path())
+}
+
+/// Find each configured favorite in the scanned directories and clone its row,
+/// matching upstream `GameList::AddFavorite`'s first-match behavior.
+fn favorite_entries(ids: &[u64], directories: &[Vec<GameEntry>]) -> Vec<GameEntry> {
+    ids.iter()
+        .filter_map(|program_id| {
+            directories
+                .iter()
+                .flatten()
+                .find(|game| game.program_id() == *program_id)
+                .map(GameEntry::clone_game)
+        })
+        .collect()
+}
+
+fn store_contains_entry(store: &gio::ListStore, expected: &GameEntry) -> bool {
+    (0..store.n_items()).any(|position| {
+        store
+            .item(position)
+            .and_downcast::<GameEntry>()
+            .is_some_and(|entry| entry == *expected)
+    })
 }
 
 /// Preserve the selected directory across a reload. If there was no usable
@@ -1474,9 +1681,7 @@ fn make_name_column(on_context_menu: ContextMenuHandler) -> gtk::ColumnViewColum
 
         if entry.is_folder() {
             picture.set_size_request(FOLDER_ICON_SIZE, FOLDER_ICON_SIZE);
-            picture.set_paintable(gtk::gdk::Paintable::NONE);
-            // A themed folder icon rather than control-data artwork.
-            picture.set_paintable(folder_paintable().as_ref());
+            picture.set_paintable(entry.icon().as_ref());
         } else {
             picture.set_size_request(ICON_SIZE, ICON_SIZE);
             picture.set_paintable(entry.icon().as_ref());
@@ -1490,22 +1695,9 @@ fn make_name_column(on_context_menu: ContextMenuHandler) -> gtk::ColumnViewColum
     column
 }
 
-/// The themed folder icon used on directory rows.
-fn folder_paintable() -> Option<gdk::Paintable> {
-    let display = gdk::Display::default()?;
-    let theme = gtk::IconTheme::for_display(&display);
-    Some(
-        theme
-            .lookup_icon(
-                "folder",
-                &[],
-                FOLDER_ICON_SIZE,
-                1,
-                gtk::TextDirection::None,
-                gtk::IconLookupFlags::empty(),
-            )
-            .upcast(),
-    )
+/// Decode one of the embedded upstream game-list icons.
+fn embedded_icon(png: &'static [u8]) -> Option<gdk::Texture> {
+    gdk::Texture::from_bytes(&glib::Bytes::from_static(png)).ok()
 }
 
 /// Build one plain-text column bound to a `GameEntry` string getter.
@@ -1577,7 +1769,12 @@ fn show_context_menu(
     x: f64,
     y: f64,
 ) {
-    let popover = gtk::PopoverMenu::from_model(Some(menu));
+    // Install the action group before materializing the menu model. Otherwise
+    // GTK initially builds stateful rows such as Favorite without resolving
+    // their boolean action, then rebuilds the indicator after the group is
+    // attached. That produces a visible one-frame relayout when the popover
+    // opens.
+    let popover = gtk::PopoverMenu::from_model(Option::<&gio::Menu>::None);
     // Upstream `QMenu` uses straight edges with the default Fusion style.
     // Override GTK themes that round popovers so the title menu matches it.
     popover.add_css_class("ruzu-context-menu");
@@ -1585,6 +1782,7 @@ fn show_context_menu(
     popover.insert_action_group("game-list", Some(actions));
     popover.set_parent(anchor);
     popover.set_pointing_to(Some(&gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
+    popover.set_menu_model(Some(menu));
     popover.connect_closed(|popover| {
         let popover = popover.clone();
         glib::idle_add_local_once(move || popover.unparent());
@@ -1958,6 +2156,69 @@ mod tests {
     #[test]
     fn newly_added_directories_scan_subfolders_by_default() {
         assert!(NEW_DIRECTORY_DEEP_SCAN);
+    }
+
+    #[test]
+    fn favorites_clone_first_matching_games_in_configured_order() {
+        let first = GameEntry::new_game(
+            "First copy",
+            "",
+            "1.0.0",
+            "NSP",
+            "1 B",
+            "/games/first.nsp",
+            None,
+            1,
+        );
+        let duplicate = GameEntry::new_game(
+            "Duplicate",
+            "",
+            "1.0.0",
+            "NSP",
+            "1 B",
+            "/games/duplicate.nsp",
+            None,
+            1,
+        );
+        let second = GameEntry::new_game(
+            "Second",
+            "",
+            "1.0.0",
+            "XCI",
+            "2 B",
+            "/games/second.xci",
+            None,
+            2,
+        );
+        let directories = vec![vec![first.clone(), second], vec![duplicate]];
+
+        let favorites = favorite_entries(&[2, 1, 3], &directories);
+
+        assert_eq!(favorites.len(), 2);
+        assert_eq!(favorites[0].program_id(), 2);
+        assert_eq!(favorites[1].name(), "First copy");
+        assert_ne!(favorites[1], first, "favorite rows must be cloned");
+    }
+
+    #[test]
+    fn favorites_root_is_expandable_but_not_a_directory() {
+        let children = gio::ListStore::new::<GameEntry>();
+        let favorites = GameEntry::new_favorites(children);
+
+        assert!(favorites.is_folder());
+        assert!(favorites.is_favorites());
+        assert!(favorites.path().is_empty());
+    }
+
+    #[test]
+    fn removed_favorites_root_is_not_treated_as_user_visible() {
+        let store = gio::ListStore::new::<GameEntry>();
+        let favorites = GameEntry::new_favorites(gio::ListStore::new::<GameEntry>());
+
+        store.append(&favorites);
+        assert!(store_contains_entry(&store, &favorites));
+        store.remove(0);
+        assert!(!store_contains_entry(&store, &favorites));
     }
 
     #[test]

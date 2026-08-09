@@ -92,6 +92,7 @@ pub struct Values {
     pub row_1_text_id: Setting<u8>,
     pub row_2_text_id: Setting<u8>,
     pub cache_game_list: Setting<bool>,
+    pub favorites_expanded: Setting<bool>,
 }
 
 impl Default for Values {
@@ -133,6 +134,7 @@ impl Default for Values {
             row_1_text_id: Setting::new(3, "row_1_text_id", UiGameList),
             row_2_text_id: Setting::new(2, "row_2_text_id", UiGameList),
             cache_game_list: Setting::new(true, "cache_game_list", UiGameList),
+            favorites_expanded: Setting::new(true, "favorites_expanded", UiGameList),
         }
     }
 }
@@ -208,6 +210,7 @@ mod tests {
         assert_eq!(*v.folder_icon_size.get_value(), 48);
         assert_eq!(*v.row_1_text_id.get_value(), 3);
         assert_eq!(*v.row_2_text_id.get_value(), 2);
+        assert!(*v.favorites_expanded.get_value());
     }
 
     #[test]

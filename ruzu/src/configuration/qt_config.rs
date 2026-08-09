@@ -408,6 +408,43 @@ pub fn load_favorited_ids() -> Vec<u64> {
     }
 }
 
+/// Read upstream `UISettings::values.favorites_expanded` from UiGameList.
+pub fn load_favorites_expanded() {
+    let contents = std::fs::read_to_string(config_path()).unwrap_or_default();
+    let ui = parse_section_values(&contents, UI_SECTION);
+    uisettings::with_mut(|values| {
+        let default = *values.favorites_expanded.get_default();
+        values.favorites_expanded.set_value(read_ui_bool_setting(
+            &ui,
+            "UIGameList\\favorites_expanded",
+            default,
+        ));
+    });
+}
+
+/// Persist upstream `UISettings::values.favorites_expanded` in UiGameList.
+pub fn save_favorites_expanded() -> io::Result<()> {
+    let path = config_path();
+    let contents = std::fs::read_to_string(&path).unwrap_or_default();
+    let (value, default) = uisettings::with(|values| {
+        (
+            *values.favorites_expanded.get_value(),
+            *values.favorites_expanded.get_default(),
+        )
+    });
+    let updated = replace_section_setting(
+        &contents,
+        "UI",
+        "UIGameList\\favorites_expanded",
+        &value.to_string(),
+        value == default,
+    );
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, updated)
+}
+
 /// Persist `ids` back into ruzu's config — upstream `QtConfig::SaveUIGamelistValues`.
 ///
 /// As with [`save_game_dirs`], every other key is preserved byte-for-byte and the
@@ -1122,6 +1159,17 @@ mod tests {
         assert!(updated.contains("[UI]"));
         assert!(updated.contains("showFilterBar\\default=false"));
         assert!(updated.contains("showFilterBar=false"));
+    }
+
+    #[test]
+    fn favorites_expanded_uses_upstream_game_list_key() {
+        let key = "UIGameList\\favorites_expanded";
+        let updated = replace_section_setting("", "UI", key, "false", false);
+        let values = parse_section_values(&updated, "UI");
+
+        assert!(!read_ui_bool_setting(&values, key, true));
+        assert!(updated.contains("UIGameList\\favorites_expanded\\default=false"));
+        assert!(updated.contains("UIGameList\\favorites_expanded=false"));
     }
 
     #[test]

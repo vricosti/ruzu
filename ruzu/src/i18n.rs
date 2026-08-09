@@ -325,6 +325,7 @@ mod tests {
         set_language("fr");
         assert_eq!(tr("Cancel"), "Annuler");
         assert_eq!(tr("Add Game Directory"), "Ajouter un répertoire de jeux");
+        assert_eq!(tr("Favorites"), "Favoris");
         let quickstart = tr(
             "Encryption keys are missing. <br>Please follow <a href='https://github.com/vricosti/ruzu/blob/main/docs/quickstart.md'>the ruzu quickstart guide</a> to install your keys and firmware, then add your games.",
         );
