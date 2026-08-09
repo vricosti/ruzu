@@ -12,7 +12,7 @@ applies even when the work is complete and tests pass.
 
 ## Purpose
 
-This document defines how a ChatGPT/Codex-style agent must port C++ code from `/home/vricosti/shared/zuyu/src/` into `/home/vricosti/shared/ruzu/`.
+This document defines how a ChatGPT/Codex-style agent must port C++ code from `~/Dev/emulators/eden/src/` into `~/Dev/emulators/ruzu/`.
 
 It is written as a handoff contract for another instance.
 
@@ -38,7 +38,7 @@ This document exists because earlier progress proved that a crate can be "substa
 
 The C++ source of truth is:
 
-- `/home/vricosti/Dev/emulators/zuyu/src/`
+- `~/Dev/emulators/eden/src/`
 
 That tree is read-only.
 
@@ -59,7 +59,7 @@ Always treat it as authoritative for:
 
 The Rust destination is:
 
-- `/home/vricosti/Dev/emulators/ruzu/`
+- `~/Dev/emulators/ruzu/`
 
 The Rust port should be judged against the C++ tree, not against whether the Rust design looks idiomatic in isolation.
 
@@ -487,15 +487,15 @@ That is the right mindset for finishing this port.
 
 The same porting philosophy applies to the companion projects:
 
-- **rdynarmic** (`/home/vricosti/Dev/emulators/rdynarmic/`) — Rust port of the Dynarmic ARM JIT compiler
-  - Upstream: `/home/vricosti/Dev/emulators/zuyu/externals/dynarmic/`
+- **rdynarmic** (`~/Dev/emulators/rdynarmic/`) — Rust port of the Dynarmic ARM JIT compiler
+  - Upstream: `~/Dev/emulators/eden/src/dynarmic/`
   - Must follow the same file structure, method ownership, and behavioral parity rules as ruzu
   - IR opcodes, emitter methods, backend emit handlers, and register allocator must match upstream naming and semantics
   - Pseudo-operation handling (GetCarryFromOp, GetOverflowFromOp, GetNZCVFromOp) must use the same `GetAssociatedPseudoOperation` pattern as upstream — the producing instruction emits flag capture inline, not as a separate standalone handler
-  - ARM32 instruction translation must produce identical results to upstream for all valid encodings (verified via differential fuzzing against the C++ dynarmic oracle at `/home/vricosti/Dev/emulators/zuyu/build/a32_oracle`)
+  - ARM32 instruction translation must produce identical results to upstream for all valid encodings (verified via differential fuzzing against an oracle built from `~/Dev/emulators/eden/src/dynarmic/`)
 
-- **rxbyak** (`/home/vricosti/Dev/emulators/rxbyak/`) — Rust port of the Xbyak x86-64 assembler library
-  - Upstream: `/home/vricosti/Dev/emulators/zuyu/externals/dynarmic/externals/xbyak/`
+- **rxbyak** (`~/Dev/emulators/rxbyak/`) — Rust port of the Xbyak x86-64 assembler library
+  - Upstream: the Xbyak 7 source resolved by Eden's `find_package(xbyak 7 CONFIG)` in `~/Dev/emulators/eden/src/dynarmic/CMakeLists.txt` (the local CPM checkout is under `~/Dev/emulators/eden/.cache/cpm/xbyak/`)
   - Instruction encoding must be bit-identical to upstream Xbyak
   - Method names should match upstream where possible (e.g., `mul`, `imul`, `div`, `idiv` for single-operand forms)
 
@@ -507,9 +507,9 @@ When fixing bugs in rdynarmic or rxbyak, always check the upstream C++ implement
 
 Each section below lists C++ files that have no meaningful Rust counterpart for a specific upstream folder. These omissions are intentional and should not be flagged as missing files during parity audits.
 
-### `audio_core` — `/home/vricosti/shared/zuyu/src/audio_core`
+### `audio_core` — `~/Dev/emulators/eden/src/audio_core`
 
-**Rust crate:** `audio_core` at `/home/vricosti/shared/ruzu/audio_core`
+**Rust crate:** `audio_core` at `~/Dev/emulators/ruzu/audio_core`
 
 **Status:** Ported.
 
@@ -517,9 +517,9 @@ Each section below lists C++ files that have no meaningful Rust counterpart for 
 
 - `precompiled_headers.h` — precompiled headers are a C++ build optimization; Rust has no equivalent concept.
 
-### `common` — `/home/vricosti/shared/zuyu/src/common`
+### `common` — `~/Dev/emulators/eden/src/common`
 
-**Rust crate:** `common` at `/home/vricosti/shared/ruzu/common`
+**Rust crate:** `common` at `~/Dev/emulators/ruzu/common`
 
 **Status:** Ported.
 
@@ -557,9 +557,9 @@ Each section below lists C++ files that have no meaningful Rust counterpart for 
 - `algorithm.h` — small generic iterator helpers (`BinaryFind`, `FoldRight`); Rust iterators provide this natively.
 - `socket_types.h` — C++ network socket type aliases; Rust `std::net` handles this.
 
-### `core` — `/home/vricosti/shared/zuyu/src/core`
+### `core` — `~/Dev/emulators/eden/src/core`
 
-**Rust crate:** `core` at `/home/vricosti/shared/ruzu/core`
+**Rust crate:** `core` at `~/Dev/emulators/ruzu/core`
 
 **Status:** Ported.
 
@@ -572,9 +572,9 @@ Each section below lists C++ files that have no meaningful Rust counterpart for 
 - `arm/dynarmic/` — JIT backend files are ported as stubs; full implementation depends on `rdynarmic` integration.
 - `arm/nce/` — Native code execution backend is ported structurally; full implementation depends on platform-specific signal handling.
 
-### `video_core` — `/home/vricosti/shared/zuyu/src/video_core`
+### `video_core` — `~/Dev/emulators/eden/src/video_core`
 
-**Rust crate:** `video_core` at `/home/vricosti/shared/ruzu/video_core`
+**Rust crate:** `video_core` at `~/Dev/emulators/ruzu/video_core`
 
 **Status:** In progress.
 
@@ -584,11 +584,11 @@ Each section below lists C++ files that have no meaningful Rust counterpart for 
 
 The following upstream directories are **intentionally not ported** and should never be flagged as missing during parity audits.
 
-### `yuzu` — `/home/vricosti/shared/zuyu/src/yuzu`
+### `yuzu` — `~/Dev/emulators/eden/src/yuzu`
 
-**Not ported.** This is the Qt-based GUI frontend application. The ruzu project will implement its own frontend using a different UI library (not Qt). This directory should not be ported.
+**Not ported.** This is the Qt-based GUI frontend application. The ruzu project implements its own frontend using a different UI library (not Qt). This directory should not be ported.
 
-### `tests` — `/home/vricosti/shared/zuyu/src/tests`
+### `tests` — `~/Dev/emulators/eden/src/tests`
 
 **Not ported.** Upstream C++ test suite. Rust tests are written natively alongside each crate using `#[cfg(test)]` modules and `cargo test`.
 

@@ -3,7 +3,7 @@ STRICT MODE ON
 <system_instructions>
 
 <purpose>
-This document defines how an LLM agent must port C++ code from `/home/vricosti/Dev/emulators/zuyu/src/` into `/home/vricosti/Dev/emulators/ruzu/`.
+This document defines how an LLM agent must port C++ code from `~/Dev/emulators/eden/src/` into `~/Dev/emulators/ruzu/`.
 
 It is written as a binding execution contract. Deviation from these instructions is a failure state.
 
@@ -24,13 +24,13 @@ This document exists because earlier progress proved that a crate can be "substa
 
 <source_of_truth>
   <upstream>
-    Path: `/home/vricosti/Dev/emulators/zuyu/src/`
+    Path: `~/Dev/emulators/eden/src/`
     Access: READ-ONLY. Never edit.
     Authority: absolute for file layout, class/module boundaries, constants, method names and responsibilities, state ownership, control flow, validation behavior, data structure invariants.
   </upstream>
 
   <target>
-    Path: `/home/vricosti/Dev/emulators/ruzu/`
+    Path: `~/Dev/emulators/ruzu/`
     Judgement criterion: the Rust port is judged against the C++ tree, NOT against whether the Rust design looks idiomatic in isolation.
   </target>
 </source_of_truth>
@@ -369,11 +369,11 @@ This document exists because earlier progress proved that a crate can be "substa
 
 <exceptions>
 
-<folder name="audio_core" upstream="/home/vricosti/Dev/emulators/zuyu/src/audio_core" crate="audio_core" crate_path="/home/vricosti/Dev/emulators/ruzu/audio_core" status="ported">
+<folder name="audio_core" upstream="~/Dev/emulators/eden/src/audio_core" crate="audio_core" crate_path="~/Dev/emulators/ruzu/audio_core" status="ported">
   - `precompiled_headers.h` — C++ build optimization; no Rust equivalent.
 </folder>
 
-<folder name="common" upstream="/home/vricosti/Dev/emulators/zuyu/src/common" crate="common" crate_path="/home/vricosti/Dev/emulators/ruzu/common" status="ported">
+<folder name="common" upstream="~/Dev/emulators/eden/src/common" crate="common" crate_path="~/Dev/emulators/ruzu/common" status="ported">
   - `precompiled_headers.h`, `common_precompiled_headers.h` — C++ build optimization; no Rust equivalent.
   - `common_types.h` — defines `u8`, `u16`, `u32`, `u64`, `s8`, `s16`, `s32`, `s64`, `f32`, `f64`; Rust has these as built-in primitive types.
   - `common_funcs.h` — C++ utility macros; Rust handles via `bitflags`, derives, etc.
@@ -407,7 +407,7 @@ This document exists because earlier progress proved that a crate can be "substa
   - `socket_types.h` — C++ socket type aliases; Rust `std::net` handles this.
 </folder>
 
-<folder name="core" upstream="/home/vricosti/Dev/emulators/zuyu/src/core" crate="core" crate_path="/home/vricosti/Dev/emulators/ruzu/core" status="ported">
+<folder name="core" upstream="~/Dev/emulators/eden/src/core" crate="core" crate_path="~/Dev/emulators/ruzu/core" status="ported">
   - `precompiled_headers.h` — C++ build optimization; no Rust equivalent.
   - `memory.h/cpp` — ported as `guest_memory.rs`; the top-level `memory.h` is a thin wrapper integrated into `guest_memory.rs`.
   - `file_sys/fssystem_bucket_tree_template_impl.h`, `file_sys/fssystem_bucket_tree_utils.h` — C++ template headers; logic folded into `fssystem/bucket_tree.rs`.
@@ -416,15 +416,15 @@ This document exists because earlier progress proved that a crate can be "substa
   - `arm/nce/` — NCE backend; ported structurally pending platform signal handling.
 </folder>
 
-<folder name="video_core" upstream="/home/vricosti/Dev/emulators/zuyu/src/video_core" crate="video_core" crate_path="/home/vricosti/Dev/emulators/ruzu/video_core" status="in_progress">
+<folder name="video_core" upstream="~/Dev/emulators/eden/src/video_core" crate="video_core" crate_path="~/Dev/emulators/ruzu/video_core" status="in_progress">
   Exceptions to be filled as the port progresses.
 </folder>
 
 <excluded_directories>
-  <directory name="yuzu" path="/home/vricosti/Dev/emulators/zuyu/src/yuzu">
+  <directory name="yuzu" path="~/Dev/emulators/eden/src/yuzu">
     NOT ported. Qt-based GUI frontend. ruzu uses a different UI library.
   </directory>
-  <directory name="tests" path="/home/vricosti/Dev/emulators/zuyu/src/tests">
+  <directory name="tests" path="~/Dev/emulators/eden/src/tests">
     NOT ported. C++ test suite. Rust tests are written natively with `#[cfg(test)]` and `cargo test`.
   </directory>
 </excluded_directories>
