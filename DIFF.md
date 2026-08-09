@@ -55,6 +55,22 @@ procedures are intentionally omitted.
 
 ## Input and frontends
 
+## 2026-08-09 — `ruzu/src/main_window.rs` vs `src/yuzu/main.{h,cpp}` (`GMainWindow::OnRestartGame`)
+
+### Intentional differences
+
+- Upstream calls `ShutdownGame()` and immediately continues to `BootGame()` after its Qt shutdown
+  synchronization. The GTK frontend requests the same confirmed shutdown non-blockingly, retains a
+  copy of `current_game_path`, and calls `boot_game` only after `LoadingEvent::StopComplete` has
+  joined the emulation thread and released the native render target.
+- A pending restart is discarded when teardown reports a failure or the application window is
+  closing, preventing a shutdown callback from launching a new session behind an error or close.
+
+### Binary layout verification
+
+- Not applicable. This changes frontend action wiring and lifecycle state only. A focused regression
+  test verifies that the retained restart path survives only a successful non-closing shutdown.
+
 ## 2026-08-09 — `ruzu/src/configuration/qt_config.rs`, `configure_dialog.rs`, and `main.rs` vs `src/frontend_common/config.cpp` and `src/yuzu/configuration/qt_config.cpp`
 
 ### Intentional differences

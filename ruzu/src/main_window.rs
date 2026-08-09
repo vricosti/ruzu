@@ -105,6 +105,16 @@ fn should_warn_about_missing_keys(keys_present: bool) -> bool {
     !keys_present
 }
 
+fn restart_path_after_shutdown(
+    pending_restart_path: Option<String>,
+    shutdown_failed: bool,
+    close_after_stop: bool,
+) -> Option<String> {
+    (!shutdown_failed && !close_after_stop)
+        .then_some(pending_restart_path)
+        .flatten()
+}
+
 /// The main launcher window.
 ///
 /// Upstream `GMainWindow` derives from `QMainWindow`; here we wrap a
@@ -124,6 +134,10 @@ pub struct GMainWindow {
     /// The active emulation session, if a game is running (upstream keeps the
     /// `System` + emu thread on `GMainWindow`).
     session: RefCell<Option<EmulationSession>>,
+    /// Upstream `GMainWindow::current_game_path` and the copy retained by
+    /// `OnRestartGame` while `ShutdownGame` clears the current path.
+    current_game_path: RefCell<Option<String>>,
+    pending_restart_path: RefCell<Option<String>>,
     /// GTK close requests are asynchronous when confirmation is required.
     /// These flags prevent duplicate dialogs and retain an accepted close until
     /// asynchronous emulation teardown has released the native render target.
@@ -506,6 +520,17 @@ mod stop_confirmation_tests {
             StopConfirmation::None
         );
     }
+
+    #[test]
+    fn restart_only_survives_a_successful_non_closing_shutdown() {
+        let path = Some("title.nsp".to_owned());
+        assert_eq!(
+            restart_path_after_shutdown(path.clone(), false, false),
+            path
+        );
+        assert_eq!(restart_path_after_shutdown(path.clone(), true, false), None);
+        assert_eq!(restart_path_after_shutdown(path, false, true), None);
+    }
 }
 
 #[cfg(test)]
@@ -760,6 +785,8 @@ impl GMainWindow {
             stack,
             loading_screen,
             session: RefCell::new(None),
+            current_game_path: RefCell::new(None),
+            pending_restart_path: RefCell::new(None),
             close_confirmation_pending: Cell::new(false),
             close_confirmed: Cell::new(false),
             stop_confirmation_pending: Cell::new(false),
@@ -957,6 +984,17 @@ impl GMainWindow {
         ));
         app.add_action(&stop);
         app.set_accels_for_action("app.stop", &["F5"]);
+
+        // Upstream `connect_menu(action_Restart, OnRestartGame)` and the
+        // default "Restart Emulation" hotkey.
+        let restart = gio::SimpleAction::new("restart", None);
+        restart.connect_activate(glib::clone!(
+            #[weak(rename_to = this)]
+            self,
+            move |_, _| this.on_restart_game()
+        ));
+        app.add_action(&restart);
+        app.set_accels_for_action("app.restart", &["F6"]);
 
         // Upstream `connect_menu(action_Configure, OnConfigure)`. Overrides the
         // startup stub, since the dialog is parented to this window.
@@ -2500,6 +2538,7 @@ impl GMainWindow {
             glib::ControlFlow::Continue
         });
 
+        *self.current_game_path.borrow_mut() = Some(filepath.clone());
         let session = crate::boot::boot_game(
             window_info,
             drawable_size,
@@ -2676,6 +2715,7 @@ impl GMainWindow {
             glib::ControlFlow::Continue
         });
 
+        *self.current_game_path.borrow_mut() = Some(filepath.clone());
         let session = crate::boot::boot_game(
             window_info,
             drawable_size,
@@ -2843,6 +2883,7 @@ impl GMainWindow {
             glib::ControlFlow::Continue
         });
 
+        *self.current_game_path.borrow_mut() = Some(filepath.clone());
         let session = crate::boot::boot_game(
             window_info,
             drawable_size,
@@ -3099,10 +3140,71 @@ impl GMainWindow {
         );
     }
 
+    /// Upstream `GMainWindow::OnRestartGame`: retain the current path, perform
+    /// the normal confirmed asynchronous shutdown, then boot it again after the
+    /// emulation thread has completed teardown.
+    fn on_restart_game(self: &Rc<Self>) {
+        let Some((current_game_path, exit_locked)) =
+            self.session.borrow().as_ref().and_then(|session| {
+                self.current_game_path
+                    .borrow()
+                    .clone()
+                    .map(|path| (path, session.exit_locked()))
+            })
+        else {
+            return;
+        };
+
+        let setting = crate::uisettings::with(|values| *values.confirm_before_stopping.get_value());
+        let confirmation = stop_confirmation(setting, exit_locked);
+        if confirmation == StopConfirmation::None {
+            self.begin_restart_game(current_game_path);
+            return;
+        }
+        if self.stop_confirmation_pending.replace(true) {
+            return;
+        }
+
+        let detail = match confirmation {
+            StopConfirmation::ChangeGame => {
+                "Are you sure you want to restart the emulation? Any unsaved progress will be lost."
+            }
+            StopConfirmation::ForceLockedExit => {
+                "The currently running application has requested ruzu to not exit.\n\n\
+                 Would you like to bypass this and restart anyway?"
+            }
+            StopConfirmation::None => unreachable!(),
+        };
+        crate::gtk_compat::ask_question(
+            Some(&self.window),
+            "ruzu",
+            detail,
+            "No",
+            "Yes",
+            glib::clone!(
+                #[weak(rename_to = this)]
+                self,
+                move |accepted| {
+                    this.stop_confirmation_pending.set(false);
+                    if accepted {
+                        this.begin_restart_game(current_game_path);
+                    }
+                }
+            ),
+        );
+    }
+
+    fn begin_restart_game(self: &Rc<Self>, current_game_path: String) {
+        *self.pending_restart_path.borrow_mut() = Some(current_game_path);
+        if !self.begin_stop_game() {
+            self.pending_restart_path.borrow_mut().take();
+        }
+    }
+
     /// Begin the non-blocking half of upstream `OnShutdownBegin`. The boot
     /// thread requests guest exit, applies the upstream timeout, and reports
     /// `StopComplete` after forced teardown if necessary.
-    fn begin_stop_game(self: &Rc<Self>) {
+    fn begin_stop_game(self: &Rc<Self>) -> bool {
         let requested = self
             .session
             .borrow_mut()
@@ -3110,7 +3212,7 @@ impl GMainWindow {
             .map(EmulationSession::request_stop)
             .unwrap_or(false);
         if !requested {
-            return;
+            return false;
         }
 
         if let Some(app) = self.window.application() {
@@ -3131,6 +3233,7 @@ impl GMainWindow {
         if let Some(game_list) = self.game_list.borrow().as_ref() {
             game_list.reload();
         }
+        true
     }
 
     /// Finish a session after a load failure or guest-requested exit.
@@ -3140,6 +3243,11 @@ impl GMainWindow {
     /// restore the game list, and then report an error when applicable.
     fn on_emulation_stopped(self: &Rc<Self>, failure: Option<(String, String)>) {
         let close_after_stop = self.close_confirmed.get();
+        let restart_path = restart_path_after_shutdown(
+            self.pending_restart_path.borrow_mut().take(),
+            failure.is_some(),
+            close_after_stop,
+        );
         self.stop_confirmation_pending.set(false);
         if let Some(mut session) = self.session.borrow_mut().take() {
             session.stop();
@@ -3162,6 +3270,7 @@ impl GMainWindow {
         }
 
         self.loading_screen.clear();
+        self.current_game_path.borrow_mut().take();
         self.show_game_list();
         self.status_bar.update_performance(None, None);
         self.refresh_tas_ui();
@@ -3176,6 +3285,8 @@ impl GMainWindow {
         if close_after_stop {
             self.close_confirmed.set(false);
             self.window.close();
+        } else if let Some(path) = restart_path {
+            self.boot_game(path);
         }
     }
 
