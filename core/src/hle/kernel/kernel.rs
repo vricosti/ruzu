@@ -1,4 +1,4 @@
-//! Port of zuyu/src/core/hle/kernel/kernel.h/.cpp
+//! Port of Eden src/core/hle/kernel/kernel.h/.cpp
 //! Status: COMPLET (stub — runtime dependencies not yet available)
 //! Derniere synchro: 2026-03-11
 //!
@@ -1794,8 +1794,11 @@ pub fn get_hardware_timer_arc() -> Option<Arc<KHardwareTimer>> {
 }
 
 /// Constants from the upstream KernelCore::Impl.
-const APPLICATION_MEMORY_BLOCK_SLAB_HEAP_SIZE: usize = 20000;
-const SYSTEM_MEMORY_BLOCK_SLAB_HEAP_SIZE: usize = 10000;
+pub const APPLICATION_MEMORY_BLOCK_SLAB_HEAP_SIZE: usize = 20_000;
+pub const SYSTEM_MEMORY_BLOCK_SLAB_HEAP_SIZE: usize = 10_000;
+/// Combined capacity used until ruzu owns separate application/system managers.
+pub const MEMORY_BLOCK_SLAB_HEAP_SIZE: usize =
+    APPLICATION_MEMORY_BLOCK_SLAB_HEAP_SIZE + SYSTEM_MEMORY_BLOCK_SLAB_HEAP_SIZE;
 const BLOCK_INFO_SLAB_HEAP_SIZE: usize = 4000;
 const RESERVED_DYNAMIC_PAGE_COUNT: usize = 64;
 
@@ -3320,7 +3323,7 @@ impl KernelCore {
 
     /// Get the kernel-wide KMemoryBlock slab manager. Upstream stores this
     /// alongside the application/system memory block managers; ruzu uses
-    /// one shared slab.
+    /// one shared slab whose capacity is the sum of the two upstream heaps.
     pub fn get_memory_block_slab_manager(
         &self,
     ) -> Option<Arc<super::k_dynamic_resource_manager::KMemoryBlockSlabManager>> {
@@ -3329,11 +3332,9 @@ impl KernelCore {
 
     /// Initialize the kernel-wide KMemoryBlock slab. Upstream creates
     /// separate application / system slabs sized from
-    /// `KernelApplicationMemoryBlockSlabHeapSize` and
-    /// `KernelSystemMemoryBlockSlabHeapSize` in kernel.cpp:1070-71. ruzu
-    /// uses a single slab; capacity covers worst-case concurrent block
-    /// updates (4096 entries is far above the two-per-update upper bound
-    /// for any practical guest workload).
+    /// `ApplicationMemoryBlockSlabHeapSize` and
+    /// `SystemMemoryBlockSlabHeapSize` in `kernel.cpp`. Ruzu currently uses a
+    /// single manager, so callers pass their combined capacity.
     pub fn initialize_memory_block_slab_manager(&mut self, capacity: usize) {
         let mut slab = super::k_dynamic_resource_manager::KMemoryBlockSlabManager::new();
         slab.initialize(capacity);
@@ -4164,6 +4165,13 @@ mod tests {
             let scheduler = scheduler.lock().unwrap();
             assert_eq!(scheduler.physical_cores.len(), kernel.cores.len());
         }
+    }
+
+    #[test]
+    fn memory_block_slab_capacity_matches_upstream_heaps() {
+        assert_eq!(APPLICATION_MEMORY_BLOCK_SLAB_HEAP_SIZE, 20_000);
+        assert_eq!(SYSTEM_MEMORY_BLOCK_SLAB_HEAP_SIZE, 10_000);
+        assert_eq!(MEMORY_BLOCK_SLAB_HEAP_SIZE, 30_000);
     }
 }
 

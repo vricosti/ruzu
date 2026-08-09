@@ -363,6 +363,9 @@ and persisted under upstream's `UIGameList\\favorites_expanded` key.
 
 - `ext_content_from_game_dirs` participates in ruzu's generic category visitor instead of Eden's
   C++ settings linkage, preserving the same default and persisted value.
+- `gpu_fence_behavior` uses ruzu's generic switchable-setting visitor and GTK combo-row frontend
+  instead of Eden's C++ linkage and Qt widget. The five enum values, persisted key, default, range,
+  per-game switchability, and helper predicates match Eden.
 
 ### Binary layout verification
 
@@ -390,15 +393,14 @@ and persisted under upstream's `UIGameList\\favorites_expanded` key.
   exposing the packed register union. `size` and `start_offset` remain signed `s32` values, and the
   buffer cache preserves their raw two's-complement bit patterns when forming GPU addresses and
   sizes.
-
-### Unintentional differences (to fix)
-
-- The transform-feedback byte-count path is present, but the dependent primitives-succeeded
-  streamer is not yet available to consume the retained per-stream strides.
-
-### Missing items
-
-- Eden's `PrimitivesSucceededStreamer` integration and its per-stream last-query bookkeeping.
+- `PrimitivesSucceededStreamer` owns the same dependency on the transform-feedback byte counter,
+  but the Rust query owner retains the dependent host report directly instead of storing an index
+  into Eden's generic `SimpleStreamer` pool. Topology conversion, tessellation-output remapping,
+  patch-vertex handling, per-stream stride selection, reset forwarding, and zero-stride handling
+  remain identical.
+- The external recursive buffer-cache mutex is held in an `Arc`. This keeps the mutex owned by the
+  cache while allowing Vulkan query operations to clone the lock before mutating the cache, instead
+  of creating an aliased raw pointer to a field of the active mutable reference.
 
 ### Binary layout verification
 
@@ -420,22 +422,74 @@ and persisted under upstream's `UIGameList\\favorites_expanded` key.
   clearing follow `RasterizerVulkan::UpdateVertexInput`.
 - `report_device_loss` is a module helper so query-bank owners that retain an `ash::Device` rather
   than the complete `Device` can execute Eden's same error-and-delay behavior.
-
-### Unintentional differences (to fix)
-
-- Host conditional rendering tracks pause/resume state but does not yet emit Eden's conditional
-  rendering resolve commands.
-- Query aggregation resolves on the CPU; Eden's GPU prefix-scan path is not yet ported.
-
-### Missing items
-
-- `PrimitivesSucceededStreamer`, including topology-aware primitive conversion.
-- GPU prefix-scan query aggregation and the host conditional-rendering resolve pass.
-- The configurable `GpuFenceBehavior` policy. Ruzu currently follows Eden's default policy using
-  GPU accuracy to decide whether fence callbacks are delayed.
+- Vulkan buffers retained by the allocator are represented by raw `vk::Buffer` handles rather than
+  Eden's RAII wrappers. Their lifetime remains bounded by the renderer-owned allocator, which
+  outlives the boxed query cache and its compute passes.
+- Channel-bound guest-address translation uses a boxed adapter because the generic Rust query cache
+  stores trait-object pointers. Conditional rendering is stopped before that adapter is released.
+- Multi-slot occlusion reports feed Eden's exact prefix-scan shaders and push constants directly
+  into the tracked common buffer-cache destination. The Rust query owner retains cumulative query
+  leases instead of reproducing Eden's `HostSyncValues` staging vectors; reset and accumulation
+  boundaries produce the same prefix value. Resolve and intermediary buffers use Eden's lazy
+  power-of-two size classes with the same 2048-slot minimum and are reused for the renderer
+  lifetime.
+- The direct guest-buffer path copies Eden's complete 8-byte query value. A producer-specific
+  barrier orders either query-pool transfer writes or prefix-scan compute writes before the final
+  transfer read.
+- Host conditional rendering uses the same direct-buffer and compute-resolve paths, extension
+  commands, driver fallbacks, comparison inversion, and transfer/host barriers. Rust stores the
+  active Vulkan setup in scheduler-shared state so render-pass transitions can pause it without a
+  raw `QueryCacheRuntime*`.
 
 ### Binary layout verification
 
-- Not applicable to Vulkan host objects. Focused tests cover slot ordering, cumulative ZPass
-  reports, unsynchronized fence rejection, TFB stream mapping, query payload/timestamp writes, and
-  draw preparation ordering.
+- PASS: the compute push-constant structs are `repr(C)` and verified as 4 bytes for conditional
+  rendering and 16 bytes for prefix scan. The three GLSL sources are byte-identical to Eden.
+  Focused tests cover slot ordering, cumulative ZPass reports, primitive topology conversion,
+  unsynchronized fence rejection, empty ZPass reports, scan size classes and producer barriers,
+  TFB stream mapping, query payload/timestamp writes, and draw preparation ordering.
+
+## 2026-08-09 — `video_core/src/renderer_vulkan/compute_pass.rs`, `descriptor_pool.rs`, and `update_descriptor.rs` vs Eden `src/video_core/renderer_vulkan/vk_compute_pass.{h,cpp}`, `vk_descriptor_pool.{h,cpp}`, and `vk_update_descriptor.{h,cpp}`
+
+### Intentional differences
+
+- `DescriptorAllocator` clones share allocator state through `Arc<Mutex<_>>` so Rust's `Send +
+  'static` scheduler closures can perform Eden's descriptor-set commit on the worker. The resource
+  pool, bank, layout and tick-based reuse remain shared by the same compute-pass owner.
+- Raw descriptor payload pointers are wrapped in a `Send` newtype. The queue owns one fixed
+  allocation for the renderer lifetime, and its frame ring waits for the worker before recycling a
+  slice, matching Eden's recorded `const DescriptorUpdateEntry*` lifetime.
+
+### Binary layout verification
+
+- PASS: compute descriptor templates use `size_of::<DescriptorUpdateEntry>()` as Eden does. Unit
+  tests verify the union size/alignment and the two- and three-buffer template strides.
+
+## 2026-08-09 — `core/src/core.rs` and `core/src/hle/kernel/kernel.rs` vs Eden `src/core/hle/kernel/kernel.cpp`
+
+### Intentional differences
+
+- Ruzu still owns one shared `KMemoryBlockSlabManager` instead of Eden's separate application and
+  system managers. Its runtime capacity is now the exact sum of Eden's 20000-entry application and
+  10000-entry system heaps, so the adaptation no longer lowers the available resource limit.
+
+### Missing items
+
+- Separate application and system `KSystemResource` ownership remains to be ported before the two
+  memory-block slab managers can be represented independently.
+
+### Binary layout verification
+
+- PASS: no guest-visible binary layout is changed; the regression test verifies both upstream
+  capacities and their combined runtime value.
+
+## 2026-08-09 — `core/src/hle/kernel/k_shared_memory.rs` vs Eden `src/core/hle/kernel/k_shared_memory.{h,cpp}`
+
+### Unintentional differences (fixed)
+
+- Allocation failure now returns `Kernel::ResultOutOfMemory` (`0xD001`) as Eden does; the previous
+  raw `0xCE01` encoded `Kernel::ResultOutOfResource`.
+
+### Binary layout verification
+
+- PASS: no structure layout changed.

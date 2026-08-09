@@ -18,8 +18,9 @@ use crate::settings_setting::BasicSetting;
 pub use crate::settings_enums::{
     AnisotropyMode, AntiAliasing, AppletMode, AspectRatio, AstcDecodeMode, AstcRecompression,
     AudioEngine, AudioMode, Category, ConfirmStop, ConsoleMode, CpuAccuracy, CpuBackend,
-    FullscreenMode, GpuAccuracy, Language, MemoryLayout, NvdecEmulation, Region, RendererBackend,
-    ResolutionSetup, ScalingFilter, ShaderBackend, TimeZone, VSyncMode, VramUsageMode,
+    FullscreenMode, GpuAccuracy, GpuFenceBehavior, Language, MemoryLayout, NvdecEmulation, Region,
+    RendererBackend, ResolutionSetup, ScalingFilter, ShaderBackend, TimeZone, VSyncMode,
+    VramUsageMode,
 };
 pub use crate::settings_input::{
     AnalogsRaw, ButtonsRaw, PlayerInput, RingconRaw, TouchFromButtonMap, TouchscreenInput,
@@ -192,6 +193,7 @@ pub struct Values {
     // ── Renderer Advanced ───────────────────────────────────────────────
     pub gpu_accuracy: SwitchableSetting<GpuAccuracy>,
     pub current_gpu_accuracy: GpuAccuracy,
+    pub gpu_fence_behavior: SwitchableSetting<GpuFenceBehavior>,
     pub max_anisotropy: SwitchableSetting<AnisotropyMode>,
     pub astc_recompression: SwitchableSetting<AstcRecompression>,
     pub vram_usage_mode: SwitchableSetting<VramUsageMode>,
@@ -404,6 +406,7 @@ impl Values {
             ),
             Category::RendererAdvanced => visit!(
                 gpu_accuracy,
+                gpu_fence_behavior,
                 max_anisotropy,
                 astc_recompression,
                 vram_usage_mode,
@@ -826,6 +829,16 @@ impl Default for Values {
                 true,
             ),
             current_gpu_accuracy: GpuAccuracy::High,
+            gpu_fence_behavior: SwitchableSetting::ranged_with_options(
+                GpuFenceBehavior::Default,
+                GpuFenceBehavior::Default,
+                GpuFenceBehavior::Strict,
+                "gpu_fence_behavior",
+                RendererAdvanced,
+                Specialization::DEFAULT,
+                true,
+                true,
+            ),
             max_anisotropy: SwitchableSetting::ranged(
                 AnisotropyMode::Automatic,
                 AnisotropyMode::Automatic,
@@ -1218,6 +1231,22 @@ pub fn is_gpu_level_high(values: &Values) -> bool {
         || values.current_gpu_accuracy == GpuAccuracy::High
 }
 
+pub fn is_gpu_fence_behavior_default(values: &Values) -> bool {
+    *values.gpu_fence_behavior.get_value() == GpuFenceBehavior::Default
+}
+
+pub fn is_gpu_fence_behavior_balanced(values: &Values) -> bool {
+    *values.gpu_fence_behavior.get_value() == GpuFenceBehavior::Balanced
+}
+
+pub fn is_gpu_fence_behavior_accurate(values: &Values) -> bool {
+    *values.gpu_fence_behavior.get_value() == GpuFenceBehavior::Accurate
+}
+
+pub fn is_gpu_fence_behavior_strict(values: &Values) -> bool {
+    *values.gpu_fence_behavior.get_value() == GpuFenceBehavior::Strict
+}
+
 /// Returns true if fastmem is effectively enabled.
 pub fn is_fastmem_enabled(values: &Values) -> bool {
     if *values.cpu_debug_mode.get_value() {
@@ -1371,6 +1400,7 @@ pub fn restore_global_state(values: &mut Values, is_powered_on: bool) {
     values.bg_green.set_global(true);
     values.bg_blue.set_global(true);
     values.gpu_accuracy.set_global(true);
+    values.gpu_fence_behavior.set_global(true);
     values.max_anisotropy.set_global(true);
     values.astc_recompression.set_global(true);
     values.vram_usage_mode.set_global(true);
@@ -1423,6 +1453,10 @@ pub fn log_settings(values: &Values) {
     info!("  shader_backend: {:?}", values.shader_backend.get_value());
     info!("  vulkan_device: {}", values.vulkan_device.get_value());
     info!("  gpu_accuracy: {:?}", values.gpu_accuracy.get_value());
+    info!(
+        "  gpu_fence_behavior: {:?}",
+        values.gpu_fence_behavior.get_value()
+    );
     info!(
         "  resolution_setup: {:?}",
         values.resolution_setup.get_value()

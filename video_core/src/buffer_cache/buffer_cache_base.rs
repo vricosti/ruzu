@@ -582,6 +582,19 @@ pub trait BufferCacheRuntime {
     /// Upstream: `Runtime::Finish()`
     fn finish(&mut self);
 
+    /// Tick assigned to the current command submission.
+    fn current_tick(&self) -> u64 {
+        0
+    }
+
+    /// Last tick completed by the host GPU.
+    fn known_gpu_tick(&self) -> u64 {
+        0
+    }
+
+    /// Wait until the host GPU reaches `tick`.
+    fn wait(&mut self, _tick: u64) {}
+
     // -- Staging buffers --
 
     /// Allocate a staging buffer for CPU→GPU upload.

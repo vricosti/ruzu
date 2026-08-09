@@ -192,7 +192,16 @@ impl<F: FenceBase + Send + 'static> FenceManager<F> {
     {
         let trace_id = next_fence_trace_id();
         trace_fence_flow(trace_id, "signal_fence begin");
-        let delay_fence = settings::is_gpu_level_high(&settings::values());
+        let delay_fence = {
+            let values = settings::values();
+            if settings::is_gpu_fence_behavior_default(&values) {
+                settings::is_gpu_level_high(&values)
+            } else {
+                settings::is_gpu_fence_behavior_balanced(&values)
+                    || settings::is_gpu_fence_behavior_accurate(&values)
+                    || settings::is_gpu_fence_behavior_strict(&values)
+            }
+        };
 
         if !self.has_async_check {
             self.try_release_pending_fences(false, |pending_fence, force_wait| {

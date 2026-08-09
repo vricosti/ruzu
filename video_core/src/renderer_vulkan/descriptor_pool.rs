@@ -154,12 +154,13 @@ struct DescriptorAllocatorState {
 /// Each pipeline owns one allocator. The allocator reserves descriptor sets
 /// in groups of `SETS_GROW_RATE` and tags every set with the scheduler tick
 /// that references it.
+#[derive(Clone)]
 pub struct DescriptorAllocator {
     device: ash::Device,
     bank: Arc<Mutex<DescriptorBank>>,
     layout: vk::DescriptorSetLayout,
     sets_per_pool: u32,
-    state: Mutex<DescriptorAllocatorState>,
+    state: Arc<Mutex<DescriptorAllocatorState>>,
 }
 
 impl DescriptorAllocator {
@@ -174,10 +175,10 @@ impl DescriptorAllocator {
             bank,
             layout,
             sets_per_pool,
-            state: Mutex::new(DescriptorAllocatorState {
+            state: Arc::new(Mutex::new(DescriptorAllocatorState {
                 resource_pool: ResourcePool::new_with_external_ticks(SETS_GROW_RATE),
                 sets: Vec::new(),
-            }),
+            })),
         }
     }
 

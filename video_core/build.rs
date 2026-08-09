@@ -153,6 +153,18 @@ fn compile_vulkan_present_shaders(manifest_dir: &std::path::Path) {
         ("ASTC_DECODER_COMP_SPV", "astc_decoder.comp"),
         ("VULKAN_QUAD_INDEXED_COMP_SPV", "vulkan_quad_indexed.comp"),
         ("VULKAN_UINT8_COMP_SPV", "vulkan_uint8.comp"),
+        (
+            "QUERIES_PREFIX_SCAN_SUM_COMP_SPV",
+            "queries_prefix_scan_sum.comp",
+        ),
+        (
+            "QUERIES_PREFIX_SCAN_SUM_NOSUBGROUPS_COMP_SPV",
+            "queries_prefix_scan_sum_nosubgroups.comp",
+        ),
+        (
+            "RESOLVE_CONDITIONAL_RENDER_COMP_SPV",
+            "resolve_conditional_render.comp",
+        ),
         ("VULKAN_TURBO_MODE_COMP_SPV", "vulkan_turbo_mode.comp"),
         (
             "VULKAN_FIDELITYFX_FSR_VERT_SPV",

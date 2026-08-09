@@ -22,8 +22,8 @@
 use common::settings_enums::{
     AnisotropyMode, AntiAliasing, AppletMode, AspectRatio, AstcDecodeMode, AstcRecompression,
     AudioMode, ConfirmStop, ConsoleMode, CpuAccuracy, CpuBackend, FullscreenMode, GpuAccuracy,
-    Language, MemoryLayout, NvdecEmulation, Region, RendererBackend, ResolutionSetup,
-    ScalingFilter, ShaderBackend, VramUsageMode,
+    GpuFenceBehavior, Language, MemoryLayout, NvdecEmulation, Region, RendererBackend,
+    ResolutionSetup, ScalingFilter, ShaderBackend, VramUsageMode,
 };
 
 /// Split a `&[(T, &str)]` table into its label column, for feeding a combo box.
@@ -91,6 +91,14 @@ pub const GPU_ACCURACY: &[(GpuAccuracy, &str)] = &[
     (GpuAccuracy::Normal, "Normal"),
     (GpuAccuracy::High, "High"),
     (GpuAccuracy::Extreme, "Extreme"),
+];
+
+pub const GPU_FENCE_BEHAVIOR: &[(GpuFenceBehavior, &str)] = &[
+    (GpuFenceBehavior::Default, "Default"),
+    (GpuFenceBehavior::Immediate, "Immediate"),
+    (GpuFenceBehavior::Balanced, "Balanced"),
+    (GpuFenceBehavior::Accurate, "Accurate"),
+    (GpuFenceBehavior::Strict, "Strict"),
 ];
 
 pub const CPU_ACCURACY: &[(CpuAccuracy, &str)] = &[

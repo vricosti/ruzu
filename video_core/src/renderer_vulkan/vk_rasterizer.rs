@@ -577,9 +577,9 @@ pub struct RasterizerVulkan {
     shader_cache: crate::shader_cache::ShaderCache,
     pipeline_cache: VulkanPipelineCache,
     buffer_cache: DirectBufferCache,
-    common_buffer_cache: VulkanCommonBufferCache,
-    texture_cache: TextureCache,
     query_cache: VulkanQueryCache,
+    common_buffer_cache: Box<VulkanCommonBufferCache>,
+    texture_cache: TextureCache,
     fence_manager: GenericFenceManager<VkFence>,
     fence_backend: VkFenceBackend,
     wfi_event: vk::Event,
@@ -722,6 +722,8 @@ impl RasterizerVulkan {
         extended_dynamic_state_supported: bool,
         transform_feedback_supported: bool,
         host_query_reset_supported: bool,
+        subgroup_scan_supported: bool,
+        conditional_rendering_supported: bool,
         extended_dynamic_state2_supported: bool,
         extended_dynamic_state2_extra_supported: bool,
         extended_dynamic_state3_blending_supported: bool,
@@ -849,7 +851,8 @@ impl RasterizerVulkan {
         // MemoryTrackerBase<Tegra::MaxwellDeviceMemoryManager>. Keep the
         // tracker connected to the shared device-memory manager so tracked
         // pages are protected and later CPU writes reach OnCPUWrite.
-        let mut common_buffer_cache = VulkanCommonBufferCache::new(device_memory.as_ref());
+        let mut common_buffer_cache =
+            Box::new(VulkanCommonBufferCache::new(device_memory.as_ref()));
         let buffer_runtime = BufferCacheRuntime::new(
             device.clone(),
             instance.clone(),
@@ -904,6 +907,13 @@ impl RasterizerVulkan {
             device.clone(),
             scheduler,
             memory_allocator,
+            common_buffer_cache.as_mut(),
+            descriptor_pool.as_ref(),
+            compute_pass_desc_queue.as_mut(),
+            Arc::clone(&device_memory),
+            driver_id,
+            subgroup_scan_supported,
+            conditional_rendering_supported,
             transform_feedback_supported,
             host_query_reset_supported,
         )
@@ -3045,6 +3055,13 @@ impl RasterizerVulkan {
 }
 
 impl RasterizerInterface for RasterizerVulkan {
+    fn accelerate_conditional_rendering(&mut self) -> bool {
+        if let Some(memory_manager) = self.channel_memory_manager.as_ref() {
+            memory_manager.lock().flush_caching();
+        }
+        self.query_cache.accelerate_host_conditional_rendering()
+    }
+
     fn load_disk_resources(
         &mut self,
         title_id: u64,

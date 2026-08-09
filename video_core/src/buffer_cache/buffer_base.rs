@@ -74,6 +74,10 @@ pub struct BufferBase {
     ///
     /// Mirrors upstream `OpenGL::Buffer::current_residency_access`.
     pub current_residency_access: u32,
+    /// Tick of the most recent GPU write.
+    ///
+    /// Port of Vulkan `Buffer::write_tick`.
+    write_tick: u64,
 }
 
 impl BufferBase {
@@ -88,6 +92,7 @@ impl BufferBase {
             gpu_handle: 0,
             host_gpu_addr: 0,
             current_residency_access: gl::NONE,
+            write_tick: 0,
         }
     }
 
@@ -102,6 +107,7 @@ impl BufferBase {
             gpu_handle: 0,
             host_gpu_addr: 0,
             current_residency_access: gl::NONE,
+            write_tick: 0,
         }
     }
 
@@ -227,6 +233,16 @@ impl BufferBase {
     #[inline]
     pub fn size_bytes(&self) -> usize {
         self.size_bytes
+    }
+
+    #[inline]
+    pub fn set_write_tick(&mut self, tick: u64) {
+        self.write_tick = tick;
+    }
+
+    #[inline]
+    pub fn write_tick(&self) -> u64 {
+        self.write_tick
     }
 }
 

@@ -36,7 +36,7 @@ pub type GPUVAddr = u64;
 /// Lookup result used by conditional rendering acceleration.
 ///
 /// Maps to C++ `LookupData`.
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub struct LookupData {
     pub address: VAddr,
     pub found_query: Option<*const QueryBase>,

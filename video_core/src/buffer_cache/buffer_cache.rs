@@ -13,6 +13,7 @@
 //! method implementations live here.
 
 use std::collections::VecDeque;
+use std::sync::Arc;
 
 use common::div_ceil::div_ceil;
 use common::lru_cache::LeastRecentlyUsedCache;
@@ -80,7 +81,7 @@ const AS_BITS: u32 = 34;
 /// `P` is the backend policy (see `BufferCacheParams` trait).
 pub struct BufferCache<P: BufferCacheParams, DT: DeviceTracker> {
     /// Recursive mutex for external synchronization.
-    pub mutex: ReentrantMutex<()>,
+    pub mutex: Arc<ReentrantMutex<()>>,
 
     // -- Channel state (upstream inherits from ChannelSetupCaches) --
     pub channel_caches: ChannelSetupCaches<BufferCacheChannelInfo>,
@@ -191,7 +192,7 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
         let _null_id = slot_buffers.insert(BufferBase::null(super::buffer_base::NullBufferParams));
 
         Self {
-            mutex: ReentrantMutex::new(()),
+            mutex: Arc::new(ReentrantMutex::new(())),
             channel_caches: ChannelSetupCaches::new(),
             runtime: None,
             gpu_memory: None,
@@ -3160,7 +3161,12 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
     /// Mark a buffer region as GPU-written.
     ///
     /// Upstream: `BufferCache<P>::MarkWrittenBuffer`
-    fn mark_written_buffer(&mut self, _buffer_id: BufferId, device_addr: VAddr, size: u32) {
+    fn mark_written_buffer(&mut self, buffer_id: BufferId, device_addr: VAddr, size: u32) {
+        if !P::IS_OPENGL {
+            if let Some(runtime) = self.runtime.as_ref() {
+                self.slot_buffers[buffer_id].set_write_tick(runtime.current_tick());
+            }
+        }
         self.memory_tracker
             .mark_region_as_gpu_modified(device_addr, size as u64);
         self.gpu_modified_ranges.add(device_addr, size as usize);
@@ -3180,10 +3186,37 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
         if !buffer_id.is_valid() {
             return self.create_buffer(device_addr, size);
         }
+        self.wait_for_gpu_fence_if_needed(buffer_id);
         if self.slot_buffers[buffer_id].is_in_bounds(device_addr, size as u64) {
             return buffer_id;
         }
         self.create_buffer(device_addr, size)
+    }
+
+    /// Port of `BufferCache<P>::WaitForGpuFenceIfNeeded`.
+    fn wait_for_gpu_fence_if_needed(&mut self, buffer_id: BufferId) {
+        if P::IS_OPENGL {
+            return;
+        }
+        let (accurate, strict) = {
+            let values = common::settings::values();
+            (
+                common::settings::is_gpu_fence_behavior_accurate(&values),
+                common::settings::is_gpu_fence_behavior_strict(&values),
+            )
+        };
+        if !accurate && !strict {
+            return;
+        }
+        let Some(runtime) = self.runtime.as_mut() else {
+            return;
+        };
+        let gpu_tick_delay = if strict { 0 } else { 3 };
+        let buffer_tick = self.slot_buffers[buffer_id].write_tick();
+        let gpu_tick = runtime.known_gpu_tick();
+        if buffer_tick > gpu_tick.wrapping_add(gpu_tick_delay) {
+            runtime.wait(buffer_tick);
+        }
     }
 
     /// Collect all buffers that overlap `[device_addr, device_addr+wanted_size)`.
@@ -4253,6 +4286,16 @@ mod tests {
         let cache = BufferCache::<TestParams, DummyTracker>::new(&tracker);
         let _lock_a = cache.mutex.lock();
         let _lock_b = cache.mutex.lock();
+    }
+
+    #[test]
+    fn test_buffer_cache_mutex_can_be_held_during_mutation() {
+        let tracker = DummyTracker;
+        let mut cache = BufferCache::<TestParams, DummyTracker>::new(&tracker);
+        let mutex = Arc::clone(&cache.mutex);
+        let _lock = mutex.lock();
+
+        cache.set_draw_indirect(None);
     }
 
     #[test]

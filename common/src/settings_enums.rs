@@ -281,6 +281,16 @@ settings_enum! {
 }
 
 settings_enum! {
+    pub enum GpuFenceBehavior {
+        Default,
+        Immediate,
+        Balanced,
+        Accurate,
+        Strict,
+    }
+}
+
+settings_enum! {
     pub enum CpuBackend {
         Dynarmic,
         Nce,

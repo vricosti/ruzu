@@ -39,6 +39,14 @@ pub fn page() -> BuildResult {
     );
     content.append(&accuracy_row);
 
+    let fence_behavior_value = *common::settings::values().gpu_fence_behavior.get_value();
+    let (fence_behavior_row, fence_behavior) = w::combo_row(
+        "GPU Fence Behavior:",
+        &tr::labels(tr::GPU_FENCE_BEHAVIOR),
+        tr::index_of(tr::GPU_FENCE_BEHAVIOR, &fence_behavior_value),
+    );
+    content.append(&fence_behavior_row);
+
     let aniso_value = *common::settings::values().max_anisotropy.get_value();
     let (aniso_row, aniso) = w::combo_row(
         "Anisotropic Filtering:",
@@ -133,6 +141,7 @@ pub fn page() -> BuildResult {
     let expose_compute_pipelines = compute_pipelines.clone();
     let page = Page::new("Adv. Graphics", scroller, move || {
         let accuracy_value = tr::value_at(tr::GPU_ACCURACY, accuracy.selected());
+        let fence_behavior_value = tr::value_at(tr::GPU_FENCE_BEHAVIOR, fence_behavior.selected());
         let aniso_value = tr::value_at(tr::ANISOTROPY_MODE, aniso.selected());
         let recompression_value = tr::value_at(tr::ASTC_RECOMPRESSION, recompression.selected());
         let vram_value = tr::value_at(tr::VRAM_USAGE_MODE, vram.selected());
@@ -148,6 +157,7 @@ pub fn page() -> BuildResult {
 
         let mut values = common::settings::values_mut();
         values.gpu_accuracy.set_value(accuracy_value);
+        values.gpu_fence_behavior.set_value(fence_behavior_value);
         values.max_anisotropy.set_value(aniso_value);
         values.astc_recompression.set_value(recompression_value);
         values.vram_usage_mode.set_value(vram_value);

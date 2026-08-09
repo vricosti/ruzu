@@ -648,6 +648,18 @@ impl base::BufferCacheRuntime for BufferCacheRuntime {
 
     fn tick_frame(&mut self) {}
 
+    fn current_tick(&self) -> u64 {
+        unsafe { self.scheduler.as_ref() }.current_tick()
+    }
+
+    fn known_gpu_tick(&self) -> u64 {
+        unsafe { self.scheduler.as_ref() }.known_gpu_tick()
+    }
+
+    fn wait(&mut self, tick: u64) {
+        self.scheduler().wait(tick);
+    }
+
     fn can_report_memory_usage(&self) -> bool {
         false
     }

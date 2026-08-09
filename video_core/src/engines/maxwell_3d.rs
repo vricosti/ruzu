@@ -2590,6 +2590,11 @@ impl Maxwell3D {
         ((self.regs[TESSELLATION_PARAMS as usize] >> 8) & 0x3) == 2
     }
 
+    /// Upstream reads `regs.tessellation.params.output_primitives.Value()`.
+    pub fn tessellation_output_primitives(&self) -> u32 {
+        (self.regs[TESSELLATION_PARAMS as usize] >> 8) & 0x3
+    }
+
     /// Upstream reads `regs.transform_feedback_enabled != 0` directly.
     pub fn transform_feedback_enabled(&self) -> bool {
         self.regs[TRANSFORM_FEEDBACK_ENABLED as usize] != 0

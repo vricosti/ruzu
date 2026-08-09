@@ -907,8 +907,13 @@ impl Scheduler {
         if let Some(state) = self.samples_query_state.as_ref().cloned() {
             state.lock().pause_counter(self);
         }
-        if let Some(state) = self.query_runtime_state.as_ref() {
-            state.lock().pause_host_conditional_rendering();
+        if let Some(state) = self.query_runtime_state.as_ref().cloned() {
+            let conditional_rendering = state.lock().pause_host_conditional_rendering();
+            if let Some(conditional_rendering) = conditional_rendering {
+                self.record(move |cmdbuf| unsafe {
+                    (conditional_rendering.cmd_end_conditional_rendering_ext)(cmdbuf);
+                });
+            }
         }
         let images = std::mem::take(&mut self.rp_state.images);
         let image_ranges = std::mem::take(&mut self.rp_state.image_ranges);

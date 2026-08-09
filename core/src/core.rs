@@ -1428,14 +1428,11 @@ impl System {
             let kernel_size = APPLICATION_POOL_OFFSET as i64;
             kernel.initialize_system_resource_limit(total_size, kernel_size);
 
-            // Initialize the kernel-wide KMemoryBlock slab. Upstream sizes
-            // this from `KernelApplicationMemoryBlockSlabHeapSize` and
-            // `KernelSystemMemoryBlockSlabHeapSize` (kernel.cpp:1070-71)
-            // — typically several thousand entries. STK only needs a
-            // handful at peak (each MapPages/SetHeapSize update consumes
-            // up to 2), so ruzu uses a 4096 capacity which leaves plenty
-            // of headroom.
-            kernel.initialize_memory_block_slab_manager(4096);
+            // Ruzu currently shares one manager, so reserve the sum of Eden's
+            // application and system memory-block slab capacities.
+            kernel.initialize_memory_block_slab_manager(
+                crate::hle::kernel::kernel::MEMORY_BLOCK_SLAB_HEAP_SIZE,
+            );
 
             // Initialize the kernel-wide page-table-page allocator.
             // Upstream sizes this from `KernelPageTableHeapSize` (kernel.cpp:1067).

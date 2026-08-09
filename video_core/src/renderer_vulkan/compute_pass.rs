@@ -12,11 +12,12 @@ use std::ptr::NonNull;
 use super::descriptor_pool::{DescriptorAllocator, DescriptorBankInfo, DescriptorPool};
 use super::scheduler::Scheduler;
 use super::staging_buffer_pool::StagingBufferPool;
-use super::update_descriptor::ComputePassDescriptorQueue;
+use super::update_descriptor::{ComputePassDescriptorQueue, DescriptorUpdateEntry};
 use crate::engines::maxwell_3d::IndexFormat;
 use crate::host_shaders::spirv_shaders::{
     ASTC_DECODER_COMP_SPV, CONVERT_MSAA_TO_NON_MSAA_COMP_SPV, CONVERT_NON_MSAA_TO_MSAA_COMP_SPV,
-    VULKAN_QUAD_INDEXED_COMP_SPV, VULKAN_UINT8_COMP_SPV,
+    QUERIES_PREFIX_SCAN_SUM_COMP_SPV, QUERIES_PREFIX_SCAN_SUM_NOSUBGROUPS_COMP_SPV,
+    RESOLVE_CONDITIONAL_RENDER_COMP_SPV, VULKAN_QUAD_INDEXED_COMP_SPV, VULKAN_UINT8_COMP_SPV,
 };
 use crate::texture_cache::accelerated_swizzle::make_block_linear_swizzle_2d_params;
 use crate::texture_cache::image_info::ImageInfo;
@@ -35,6 +36,19 @@ const DISPATCH_SIZE: u32 = 1024;
 
 /// Port of `DISPATCH_SIZE` used in QueriesPrefixScanPass.
 const QUERIES_DISPATCH_SIZE: usize = 2048;
+
+#[derive(Clone, Copy)]
+struct DescriptorData(*const DescriptorUpdateEntry);
+
+// The queue owns a fixed-capacity payload for the renderer lifetime. Eden
+// likewise captures `DescriptorUpdateEntry*` for consumption by the worker.
+unsafe impl Send for DescriptorData {}
+
+impl DescriptorData {
+    fn as_raw_data(self) -> *const std::ffi::c_void {
+        self.0.cast()
+    }
+}
 
 /// Port of `AstcPushConstants` from anonymous namespace.
 #[repr(C)]
@@ -56,6 +70,12 @@ pub struct QueriesPrefixScanPushConstants {
     pub max_accumulation_base: u32,
     pub accumulation_limit: u32,
     pub buffer_offset: u32,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ConditionalRenderingResolvePushConstants {
+    pub compare_to_zero: u32,
 }
 
 /// Memory barrier for shader write -> vertex attribute read.
@@ -106,7 +126,28 @@ fn input_output_descriptor_template() -> [vk::DescriptorUpdateTemplateEntry; 1] 
         descriptor_count: 2,
         descriptor_type: vk::DescriptorType::STORAGE_BUFFER,
         offset: 0,
-        stride: std::mem::size_of::<vk::DescriptorBufferInfo>(),
+        stride: std::mem::size_of::<DescriptorUpdateEntry>(),
+    }]
+}
+
+fn queries_scan_bindings() -> [vk::DescriptorSetLayoutBinding; 3] {
+    [0, 1, 2].map(|binding| vk::DescriptorSetLayoutBinding {
+        binding,
+        descriptor_type: vk::DescriptorType::STORAGE_BUFFER,
+        descriptor_count: 1,
+        stage_flags: vk::ShaderStageFlags::COMPUTE,
+        p_immutable_samplers: std::ptr::null(),
+    })
+}
+
+fn queries_scan_descriptor_template() -> [vk::DescriptorUpdateTemplateEntry; 1] {
+    [vk::DescriptorUpdateTemplateEntry {
+        dst_binding: 0,
+        dst_array_element: 0,
+        descriptor_count: 3,
+        descriptor_type: vk::DescriptorType::STORAGE_BUFFER,
+        offset: 0,
+        stride: std::mem::size_of::<DescriptorUpdateEntry>(),
     }]
 }
 
@@ -325,41 +366,31 @@ impl Uint8Pass {
         let staging = unsafe { self.staging_buffer_pool.as_mut() }
             .request_device_local_buffer(staging_size)
             .expect("Uint8Pass device-local staging allocation failed");
-        let descriptor_buffers = [
-            vk::DescriptorBufferInfo {
-                buffer: src_buffer,
-                offset: u64::from(src_offset),
-                range: u64::from(num_vertices),
-            },
-            vk::DescriptorBufferInfo {
-                buffer: staging.buffer,
-                offset: staging.offset,
-                range: staging_size,
-            },
-        ];
-        unsafe {
+        let descriptor_data = unsafe {
             let queue = self.compute_pass_descriptor_queue.as_mut();
             queue.acquire();
             queue.add_buffer(src_buffer, u64::from(src_offset), u64::from(num_vertices));
             queue.add_buffer(staging.buffer, staging.offset, staging_size);
-        }
+            DescriptorData(queue.update_data())
+        };
         let num_workgroups = (num_vertices + DISPATCH_SIZE - 1) / DISPATCH_SIZE;
         let scheduler = unsafe { self.scheduler.as_mut() };
-        let descriptor_set = self
-            .base
-            .descriptor_allocator
-            .commit(scheduler.known_gpu_tick(), scheduler.pending_tick())
-            .expect("Uint8Pass descriptor allocation failed");
+        let known_gpu_tick = scheduler.known_gpu_tick();
+        let pending_tick = scheduler.pending_tick();
+        let descriptor_allocator = self.base.descriptor_allocator.clone();
         scheduler.request_outside_renderpass();
         let device = self.base.device.clone();
         let descriptor_template = self.base.descriptor_template;
         let pipeline = self.base.pipeline;
         let layout = self.base.layout;
         scheduler.record(move |cmdbuf| unsafe {
+            let descriptor_set = descriptor_allocator
+                .commit(known_gpu_tick, pending_tick)
+                .expect("Uint8Pass descriptor allocation failed");
             device.update_descriptor_set_with_template(
                 descriptor_set,
                 descriptor_template,
-                descriptor_buffers.as_ptr().cast(),
+                descriptor_data.as_raw_data(),
             );
             device.cmd_bind_pipeline(cmdbuf, vk::PipelineBindPoint::COMPUTE, pipeline);
             device.cmd_bind_descriptor_sets(
@@ -459,42 +490,32 @@ impl QuadIndexedPass {
         let staging = unsafe { self.staging_buffer_pool.as_mut() }
             .request_device_local_buffer(staging_size)
             .expect("QuadIndexedPass device-local staging allocation failed");
-        let descriptor_buffers = [
-            vk::DescriptorBufferInfo {
-                buffer: src_buffer,
-                offset: u64::from(src_offset),
-                range: u64::from(input_size),
-            },
-            vk::DescriptorBufferInfo {
-                buffer: staging.buffer,
-                offset: staging.offset,
-                range: staging_size,
-            },
-        ];
-        unsafe {
+        let descriptor_data = unsafe {
             let queue = self.compute_pass_descriptor_queue.as_mut();
             queue.acquire();
             queue.add_buffer(src_buffer, u64::from(src_offset), u64::from(input_size));
             queue.add_buffer(staging.buffer, staging.offset, staging_size);
-        }
+            DescriptorData(queue.update_data())
+        };
         let push_constants: [u32; 3] = [base_vertex, index_shift, if is_strip { 1 } else { 0 }];
         let num_workgroups = (num_tri_vertices + DISPATCH_SIZE - 1) / DISPATCH_SIZE;
         let scheduler = unsafe { self.scheduler.as_mut() };
-        let descriptor_set = self
-            .base
-            .descriptor_allocator
-            .commit(scheduler.known_gpu_tick(), scheduler.pending_tick())
-            .expect("QuadIndexedPass descriptor allocation failed");
+        let known_gpu_tick = scheduler.known_gpu_tick();
+        let pending_tick = scheduler.pending_tick();
+        let descriptor_allocator = self.base.descriptor_allocator.clone();
         scheduler.request_outside_renderpass();
         let device = self.base.device.clone();
         let descriptor_template = self.base.descriptor_template;
         let pipeline = self.base.pipeline;
         let layout = self.base.layout;
         scheduler.record(move |cmdbuf| unsafe {
+            let descriptor_set = descriptor_allocator
+                .commit(known_gpu_tick, pending_tick)
+                .expect("QuadIndexedPass descriptor allocation failed");
             device.update_descriptor_set_with_template(
                 descriptor_set,
                 descriptor_template,
-                descriptor_buffers.as_ptr().cast(),
+                descriptor_data.as_raw_data(),
             );
             device.cmd_bind_pipeline(cmdbuf, vk::PipelineBindPoint::COMPUTE, pipeline);
             device.cmd_bind_descriptor_sets(
@@ -547,42 +568,116 @@ impl QuadIndexedPass {
 /// Resolves conditional rendering predicates via compute.
 pub struct ConditionalRenderingResolvePass {
     base: ComputePass,
+    scheduler: NonNull<Scheduler>,
+    compute_pass_descriptor_queue: NonNull<ComputePassDescriptorQueue>,
 }
 
 impl ConditionalRenderingResolvePass {
     /// Port of `ConditionalRenderingResolvePass::ConditionalRenderingResolvePass`.
-    pub fn new_with_pass(base: ComputePass) -> Self {
-        ConditionalRenderingResolvePass { base }
+    pub fn new(
+        device: &ash::Device,
+        scheduler: &mut Scheduler,
+        descriptor_pool: &DescriptorPool,
+        compute_pass_descriptor_queue: &mut ComputePassDescriptorQueue,
+    ) -> Result<Self, vk::Result> {
+        let bindings = input_output_bindings();
+        let templates = input_output_descriptor_template();
+        let push_constants = [vk::PushConstantRange {
+            stage_flags: vk::ShaderStageFlags::COMPUTE,
+            offset: 0,
+            size: std::mem::size_of::<ConditionalRenderingResolvePushConstants>() as u32,
+        }];
+        let base = ComputePass::new(
+            device,
+            descriptor_pool,
+            &bindings,
+            &templates,
+            &INPUT_OUTPUT_BANK_INFO,
+            &push_constants,
+            RESOLVE_CONDITIONAL_RENDER_COMP_SPV,
+            None,
+        )?;
+        Ok(Self {
+            base,
+            scheduler: NonNull::from(scheduler),
+            compute_pass_descriptor_queue: NonNull::from(compute_pass_descriptor_queue),
+        })
     }
 
     /// Port of `ConditionalRenderingResolvePass::Resolve`.
     ///
     /// Dispatches the conditional rendering resolve compute shader.
-    pub fn resolve(&self, device: &ash::Device, cmdbuf: vk::CommandBuffer) {
-        let read_barrier = vk::MemoryBarrier {
-            s_type: vk::StructureType::MEMORY_BARRIER,
-            p_next: std::ptr::null(),
-            src_access_mask: vk::AccessFlags::TRANSFER_WRITE | vk::AccessFlags::SHADER_WRITE,
-            dst_access_mask: vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE,
+    pub fn resolve(
+        &mut self,
+        dst_buffer: vk::Buffer,
+        src_buffer: vk::Buffer,
+        src_offset: u32,
+        compare_to_zero: bool,
+    ) {
+        let compare_size = if compare_to_zero { 8 } else { 24 };
+        let descriptor_data = unsafe {
+            let queue = self.compute_pass_descriptor_queue.as_mut();
+            queue.acquire();
+            queue.add_buffer(src_buffer, u64::from(src_offset), compare_size);
+            queue.add_buffer(dst_buffer, 0, std::mem::size_of::<u32>() as u64);
+            DescriptorData(queue.update_data())
         };
-        let write_barrier = vk::MemoryBarrier {
-            s_type: vk::StructureType::MEMORY_BARRIER,
-            p_next: std::ptr::null(),
-            src_access_mask: vk::AccessFlags::SHADER_WRITE,
-            dst_access_mask: vk::AccessFlags::CONDITIONAL_RENDERING_READ_EXT,
+        let scheduler = unsafe { self.scheduler.as_mut() };
+        let known_gpu_tick = scheduler.known_gpu_tick();
+        let pending_tick = scheduler.pending_tick();
+        let descriptor_allocator = self.base.descriptor_allocator.clone();
+        scheduler.request_outside_renderpass();
+        let device = self.base.device.clone();
+        let descriptor_template = self.base.descriptor_template;
+        let pipeline = self.base.pipeline;
+        let layout = self.base.layout;
+        let uniforms = ConditionalRenderingResolvePushConstants {
+            compare_to_zero: u32::from(compare_to_zero),
         };
-
-        unsafe {
+        scheduler.record(move |cmdbuf| unsafe {
+            let descriptor_set = descriptor_allocator
+                .commit(known_gpu_tick, pending_tick)
+                .expect("conditional rendering descriptor allocation failed");
+            let read_barrier = vk::MemoryBarrier::builder()
+                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE | vk::AccessFlags::SHADER_WRITE)
+                .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE)
+                .build();
+            let write_barrier = vk::MemoryBarrier::builder()
+                .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                .dst_access_mask(vk::AccessFlags::CONDITIONAL_RENDERING_READ_EXT)
+                .build();
+            device.update_descriptor_set_with_template(
+                descriptor_set,
+                descriptor_template,
+                descriptor_data.as_raw_data(),
+            );
             device.cmd_pipeline_barrier(
                 cmdbuf,
-                vk::PipelineStageFlags::ALL_COMMANDS,
+                vk::PipelineStageFlags::ALL_GRAPHICS
+                    | vk::PipelineStageFlags::COMPUTE_SHADER
+                    | vk::PipelineStageFlags::TRANSFER,
                 vk::PipelineStageFlags::COMPUTE_SHADER,
                 vk::DependencyFlags::empty(),
                 &[read_barrier],
                 &[],
                 &[],
             );
-            device.cmd_bind_pipeline(cmdbuf, vk::PipelineBindPoint::COMPUTE, self.base.pipeline);
+            device.cmd_bind_pipeline(cmdbuf, vk::PipelineBindPoint::COMPUTE, pipeline);
+            device.cmd_bind_descriptor_sets(
+                cmdbuf,
+                vk::PipelineBindPoint::COMPUTE,
+                layout,
+                0,
+                &[descriptor_set],
+                &[],
+            );
+            device.cmd_push_constants(
+                cmdbuf,
+                layout,
+                vk::ShaderStageFlags::COMPUTE,
+                0,
+                bytemuck::bytes_of(&uniforms),
+            );
             device.cmd_dispatch(cmdbuf, 1, 1, 1);
             device.cmd_pipeline_barrier(
                 cmdbuf,
@@ -593,7 +688,7 @@ impl ConditionalRenderingResolvePass {
                 &[],
                 &[],
             );
-        }
+        });
     }
 }
 
@@ -606,46 +701,65 @@ impl ConditionalRenderingResolvePass {
 /// Performs prefix sum scan over query results via compute.
 pub struct QueriesPrefixScanPass {
     base: ComputePass,
+    scheduler: NonNull<Scheduler>,
+    compute_pass_descriptor_queue: NonNull<ComputePassDescriptorQueue>,
+    conditional_rendering_supported: bool,
 }
 
 impl QueriesPrefixScanPass {
     /// Port of `QueriesPrefixScanPass::QueriesPrefixScanPass`.
-    pub fn new_with_pass(base: ComputePass) -> Self {
-        QueriesPrefixScanPass { base }
+    pub fn new(
+        device: &ash::Device,
+        scheduler: &mut Scheduler,
+        descriptor_pool: &DescriptorPool,
+        compute_pass_descriptor_queue: &mut ComputePassDescriptorQueue,
+        subgroup_scan_supported: bool,
+        conditional_rendering_supported: bool,
+    ) -> Result<Self, vk::Result> {
+        let bindings = queries_scan_bindings();
+        let templates = queries_scan_descriptor_template();
+        let push_constants = [vk::PushConstantRange {
+            stage_flags: vk::ShaderStageFlags::COMPUTE,
+            offset: 0,
+            size: std::mem::size_of::<QueriesPrefixScanPushConstants>() as u32,
+        }];
+        let code = if subgroup_scan_supported {
+            QUERIES_PREFIX_SCAN_SUM_COMP_SPV
+        } else {
+            QUERIES_PREFIX_SCAN_SUM_NOSUBGROUPS_COMP_SPV
+        };
+        let base = ComputePass::new(
+            device,
+            descriptor_pool,
+            &bindings,
+            &templates,
+            &QUERIES_SCAN_BANK_INFO,
+            &push_constants,
+            code,
+            None,
+        )?;
+        Ok(Self {
+            base,
+            scheduler: NonNull::from(scheduler),
+            compute_pass_descriptor_queue: NonNull::from(compute_pass_descriptor_queue),
+            conditional_rendering_supported,
+        })
     }
 
     /// Port of `QueriesPrefixScanPass::Run`.
     ///
     /// Runs the prefix scan in batches of up to DISPATCH_SIZE (2048) elements.
     pub fn run(
-        &self,
-        device: &ash::Device,
-        cmdbuf: vk::CommandBuffer,
+        &mut self,
+        accumulation_buffer: vk::Buffer,
+        dst_buffer: vk::Buffer,
+        src_buffer: vk::Buffer,
         number_of_sums: usize,
         min_accumulation_limit: usize,
         max_accumulation_limit: usize,
     ) {
         let mut current_runs = number_of_sums;
         let mut offset: usize = 0;
-
-        let read_barrier = vk::MemoryBarrier {
-            s_type: vk::StructureType::MEMORY_BARRIER,
-            p_next: std::ptr::null(),
-            src_access_mask: vk::AccessFlags::TRANSFER_WRITE,
-            dst_access_mask: vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE,
-        };
-        let write_barrier = vk::MemoryBarrier {
-            s_type: vk::StructureType::MEMORY_BARRIER,
-            p_next: std::ptr::null(),
-            src_access_mask: vk::AccessFlags::SHADER_WRITE,
-            dst_access_mask: vk::AccessFlags::SHADER_READ
-                | vk::AccessFlags::TRANSFER_READ
-                | vk::AccessFlags::VERTEX_ATTRIBUTE_READ
-                | vk::AccessFlags::INDIRECT_COMMAND_READ
-                | vk::AccessFlags::INDEX_READ
-                | vk::AccessFlags::UNIFORM_READ
-                | vk::AccessFlags::CONDITIONAL_RENDERING_READ_EXT,
-        };
 
         while current_runs != 0 {
             let runs_to_do = current_runs.min(QUERIES_DISPATCH_SIZE);
@@ -659,25 +773,75 @@ impl QueriesPrefixScanPass {
                 accumulation_limit: (runs_to_do - 1) as u32,
                 buffer_offset: used_offset as u32,
             };
-
-            unsafe {
+            let descriptor_data = unsafe {
+                let queue = self.compute_pass_descriptor_queue.as_mut();
+                queue.acquire();
+                let query_range = (number_of_sums * std::mem::size_of::<u64>()) as u64;
+                queue.add_buffer(src_buffer, 0, query_range);
+                queue.add_buffer(dst_buffer, 0, query_range);
+                queue.add_buffer(accumulation_buffer, 0, std::mem::size_of::<u64>() as u64);
+                DescriptorData(queue.update_data())
+            };
+            let scheduler = unsafe { self.scheduler.as_mut() };
+            let known_gpu_tick = scheduler.known_gpu_tick();
+            let pending_tick = scheduler.pending_tick();
+            let descriptor_allocator = self.base.descriptor_allocator.clone();
+            scheduler.request_outside_renderpass();
+            let device = self.base.device.clone();
+            let descriptor_template = self.base.descriptor_template;
+            let pipeline = self.base.pipeline;
+            let layout = self.base.layout;
+            let conditional_rendering_supported = self.conditional_rendering_supported;
+            scheduler.record(move |cmdbuf| unsafe {
+                let descriptor_set = descriptor_allocator
+                    .commit(known_gpu_tick, pending_tick)
+                    .expect("query prefix-scan descriptor allocation failed");
+                let read_barrier = vk::MemoryBarrier::builder()
+                    .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                    .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE)
+                    .build();
+                let write_barrier = vk::MemoryBarrier::builder()
+                    .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                    .dst_access_mask(
+                        vk::AccessFlags::SHADER_READ
+                            | vk::AccessFlags::TRANSFER_READ
+                            | vk::AccessFlags::VERTEX_ATTRIBUTE_READ
+                            | vk::AccessFlags::INDIRECT_COMMAND_READ
+                            | vk::AccessFlags::INDEX_READ
+                            | vk::AccessFlags::UNIFORM_READ
+                            | if conditional_rendering_supported {
+                                vk::AccessFlags::CONDITIONAL_RENDERING_READ_EXT
+                            } else {
+                                vk::AccessFlags::empty()
+                            },
+                    )
+                    .build();
+                device.update_descriptor_set_with_template(
+                    descriptor_set,
+                    descriptor_template,
+                    descriptor_data.as_raw_data(),
+                );
                 device.cmd_pipeline_barrier(
                     cmdbuf,
-                    vk::PipelineStageFlags::ALL_COMMANDS,
+                    vk::PipelineStageFlags::TRANSFER,
                     vk::PipelineStageFlags::COMPUTE_SHADER,
                     vk::DependencyFlags::empty(),
                     &[read_barrier],
                     &[],
                     &[],
                 );
-                device.cmd_bind_pipeline(
+                device.cmd_bind_pipeline(cmdbuf, vk::PipelineBindPoint::COMPUTE, pipeline);
+                device.cmd_bind_descriptor_sets(
                     cmdbuf,
                     vk::PipelineBindPoint::COMPUTE,
-                    self.base.pipeline,
+                    layout,
+                    0,
+                    &[descriptor_set],
+                    &[],
                 );
                 device.cmd_push_constants(
                     cmdbuf,
-                    self.base.layout,
+                    layout,
                     vk::ShaderStageFlags::COMPUTE,
                     0,
                     bytemuck::bytes_of(&uniforms),
@@ -686,13 +850,13 @@ impl QueriesPrefixScanPass {
                 device.cmd_pipeline_barrier(
                     cmdbuf,
                     vk::PipelineStageFlags::COMPUTE_SHADER,
-                    vk::PipelineStageFlags::CONDITIONAL_RENDERING_EXT,
+                    vk::PipelineStageFlags::ALL_GRAPHICS | vk::PipelineStageFlags::COMPUTE_SHADER,
                     vk::DependencyFlags::empty(),
                     &[write_barrier],
                     &[],
                     &[],
                 );
-            }
+            });
         }
     }
 }
@@ -1228,6 +1392,8 @@ unsafe impl bytemuck::Zeroable for AstcPushConstants {}
 unsafe impl bytemuck::Pod for AstcPushConstants {}
 unsafe impl bytemuck::Zeroable for QueriesPrefixScanPushConstants {}
 unsafe impl bytemuck::Pod for QueriesPrefixScanPushConstants {}
+unsafe impl bytemuck::Zeroable for ConditionalRenderingResolvePushConstants {}
+unsafe impl bytemuck::Pod for ConditionalRenderingResolvePushConstants {}
 
 #[cfg(test)]
 mod tests {
@@ -1282,7 +1448,7 @@ mod tests {
         assert_eq!(templates[0].descriptor_count, 2);
         assert_eq!(
             templates[0].stride,
-            std::mem::size_of::<vk::DescriptorBufferInfo>()
+            std::mem::size_of::<DescriptorUpdateEntry>()
         );
     }
 }

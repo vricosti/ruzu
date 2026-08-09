@@ -1,4 +1,4 @@
-//! Port of zuyu/src/core/hle/kernel/k_shared_memory.h/.cpp
+//! Port of Eden src/core/hle/kernel/k_shared_memory.h/.cpp
 //! Status: Ported — backed by DeviceMemory + KPageGroup matching upstream.
 //! Derniere synchro: 2026-03-19
 //!
@@ -12,7 +12,9 @@ use crate::hle::kernel::k_memory_manager::KMemoryManager;
 use crate::hle::kernel::k_page_group::KPageGroup;
 use crate::hle::kernel::k_process_page_table::KProcessPageTable;
 use crate::hle::kernel::k_typed_address::KProcessAddress;
-use crate::hle::kernel::svc::svc_results::RESULT_INVALID_NEW_MEMORY_PERMISSION;
+use crate::hle::kernel::svc::svc_results::{
+    RESULT_INVALID_NEW_MEMORY_PERMISSION, RESULT_OUT_OF_MEMORY,
+};
 use crate::hle::result::ResultCode;
 
 /// Memory permission for shared memory mapping.
@@ -173,7 +175,7 @@ impl KSharedMemory {
                 "KSharedMemory::initialize: failed to allocate {} pages from Secure pool",
                 num_pages
             );
-            return ResultCode::new(0xCE01); // ResultOutOfMemory
+            return RESULT_OUT_OF_MEMORY;
         }
 
         // Create page group tracking the allocated pages.
