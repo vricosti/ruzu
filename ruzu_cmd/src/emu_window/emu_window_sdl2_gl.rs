@@ -190,6 +190,9 @@ pub struct EmuWindowSdl2Gl {
     /// The core (GPU-thread) OpenGL context.
     /// Maps to C++ `core_context`.
     core_context: Option<Box<SdlGlContext>>,
+
+    /// Whether this SDL video driver requires all GL compilation on one context.
+    strict_context_required: bool,
 }
 
 impl EmuWindowSdl2Gl {
@@ -254,6 +257,9 @@ impl EmuWindowSdl2Gl {
             std::process::exit(1);
         }
 
+        let video_driver = unsafe { sdl::SDL_GetCurrentVideoDriver() };
+        let strict_context_required = !video_driver.is_null()
+            && unsafe { CStr::from_ptr(video_driver) }.to_bytes() == b"wayland";
         base.render_window = render_window;
 
         // Maps to: SetWindowIcon()
@@ -304,6 +310,7 @@ impl EmuWindowSdl2Gl {
             base,
             window_context,
             core_context: Some(Box::new(core_context_raw)),
+            strict_context_required,
         };
 
         if !instance.supports_required_gl_extensions() {
@@ -349,6 +356,11 @@ impl EmuWindowSdl2Gl {
     pub fn create_shared_context(&self) -> Box<SdlGlContext> {
         // Maps to: return std::make_unique<SDLGLContext>(render_window)
         Box::new(SdlGlContext::new(self.base.render_window))
+    }
+
+    /// Matches `Core::Frontend::EmuWindow::StrictContextRequired()`.
+    pub fn strict_context_required(&self) -> bool {
+        self.strict_context_required
     }
 
     /// Returns `true` if the current GL driver supports all extensions that

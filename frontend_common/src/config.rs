@@ -792,6 +792,8 @@ mod tests {
     use super::*;
     use common::settings_common::SwitchableSetting;
 
+    static SETTINGS_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn test_adjust_key() {
         assert_eq!(adjust_key("some/path"), "some\\path");
@@ -896,6 +898,58 @@ mod tests {
             *values.sound_index.get_value(),
             common::settings_enums::AudioMode::Surround
         );
+    }
+
+    #[test]
+    fn read_values_loads_the_renderer_category() {
+        use common::settings_enums::RendererBackend;
+
+        let _guard = SETTINGS_TEST_LOCK.lock().unwrap();
+        let previous = {
+            let values = common::settings::values();
+            *values.renderer_backend.get_value_global()
+        };
+        let mut cfg = BaseConfig::new(ConfigType::GlobalConfig);
+        cfg.load_ini("[Renderer]\nbackend\\default=false\nbackend=0\n");
+
+        cfg.read_values();
+
+        assert_eq!(
+            *common::settings::values()
+                .renderer_backend
+                .get_value_global(),
+            RendererBackend::OpenGL
+        );
+        common::settings::values_mut()
+            .renderer_backend
+            .set_value(previous);
+    }
+
+    #[test]
+    fn save_values_writes_the_renderer_category() {
+        use common::settings_enums::RendererBackend;
+
+        let _guard = SETTINGS_TEST_LOCK.lock().unwrap();
+        let previous = {
+            let values = common::settings::values();
+            *values.renderer_backend.get_value_global()
+        };
+        common::settings::values_mut()
+            .renderer_backend
+            .set_value(RendererBackend::OpenGL);
+        let mut cfg = BaseConfig::new(ConfigType::GlobalConfig);
+
+        cfg.save_values();
+
+        let renderer = cfg.ini.get("Renderer").unwrap();
+        assert_eq!(
+            renderer.get("backend\\default").map(String::as_str),
+            Some("false")
+        );
+        assert_eq!(renderer.get("backend").map(String::as_str), Some("OpenGL"));
+        common::settings::values_mut()
+            .renderer_backend
+            .set_value(previous);
     }
 
     #[test]

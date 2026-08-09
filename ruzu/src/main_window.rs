@@ -177,6 +177,9 @@ struct RenderHandles {
     /// Linux: the X11 `Display*`.
     #[cfg(target_os = "linux")]
     display: usize,
+    /// Linux: colormap paired with the GLX-compatible visual.
+    #[cfg(target_os = "linux")]
+    colormap: usize,
     /// Shared frame layout the renderer reads; updated so the frame is rendered
     /// at the new native resolution on resize (upstream `OnFramebufferSizeChanged`).
     framebuffer_layout: Arc<RwLock<FramebufferLayout>>,
@@ -277,6 +280,29 @@ impl LoadingEventMailbox {
                     self.events.push_back(LoadingEvent::Assets(assets));
                 }
             }
+            LoadingEvent::Progress {
+                stage: LoadStage::Complete,
+                value,
+                total,
+            } => {
+                // Qt may process a hot cache's queued Build and Complete
+                // callbacks before repainting. Avoid forcing an already-finished
+                // Build stage to remain visible for one GTK polling interval.
+                if matches!(
+                    self.events.back(),
+                    Some(LoadingEvent::Progress {
+                        stage: LoadStage::Build,
+                        ..
+                    })
+                ) {
+                    self.events.pop_back();
+                }
+                self.events.push_back(LoadingEvent::Progress {
+                    stage: LoadStage::Complete,
+                    value,
+                    total,
+                });
+            }
             LoadingEvent::FirstFrame => {
                 if !self
                     .events
@@ -300,7 +326,7 @@ mod loading_event_mailbox_tests {
     use super::*;
 
     #[test]
-    fn build_updates_are_coalesced_without_losing_stage_transitions() {
+    fn completed_hot_cache_does_not_force_build_stage_visible() {
         let mut mailbox = LoadingEventMailbox::default();
         mailbox.push(LoadingEvent::Progress {
             stage: LoadStage::Prepare,
@@ -332,11 +358,42 @@ mod loading_event_mailbox_tests {
         assert!(matches!(
             mailbox.pop(),
             Some(LoadingEvent::Progress {
+                stage: LoadStage::Complete,
+                ..
+            })
+        ));
+        assert!(matches!(mailbox.pop(), Some(LoadingEvent::FirstFrame)));
+        assert!(mailbox.pop().is_none());
+    }
+
+    #[test]
+    fn active_build_stage_remains_visible_until_consumed() {
+        let mut mailbox = LoadingEventMailbox::default();
+        mailbox.push(LoadingEvent::Progress {
+            stage: LoadStage::Build,
+            value: 100,
+            total: 929,
+        });
+        mailbox.push(LoadingEvent::Progress {
+            stage: LoadStage::Build,
+            value: 200,
+            total: 929,
+        });
+
+        assert!(matches!(
+            mailbox.pop(),
+            Some(LoadingEvent::Progress {
                 stage: LoadStage::Build,
-                value: 929,
+                value: 200,
                 total: 929,
             })
         ));
+
+        mailbox.push(LoadingEvent::Progress {
+            stage: LoadStage::Complete,
+            value: 0,
+            total: 0,
+        });
         assert!(matches!(
             mailbox.pop(),
             Some(LoadingEvent::Progress {
@@ -344,8 +401,6 @@ mod loading_event_mailbox_tests {
                 ..
             })
         ));
-        assert!(matches!(mailbox.pop(), Some(LoadingEvent::FirstFrame)));
-        assert!(mailbox.pop().is_none());
     }
 
     #[test]
@@ -2386,8 +2441,7 @@ impl GMainWindow {
 
         // Loading events are produced on the boot and Vulkan worker threads,
         // then consumed on GTK's main thread. Adjacent Build events are
-        // coalesced while stage transitions remain queued, so a hot cache still
-        // visibly passes through `Loading Shaders` before `Launching`.
+        // coalesced; Complete supersedes an unpainted Build from a hot cache.
         let mailbox = Arc::new(Mutex::new(LoadingEventMailbox::default()));
         let producer = Arc::clone(&mailbox);
         let loading_event: crate::boot::LoadingEventFn = Arc::new(move |event| {
@@ -2451,6 +2505,7 @@ impl GMainWindow {
             drawable_size,
             shown_state,
             framebuffer_layout,
+            None,
             Arc::clone(&self.hid_core),
             self.controller_applet_for_boot(),
             self.input_subsystem.borrow().get_tas(),
@@ -2556,6 +2611,7 @@ impl GMainWindow {
         *self.render.borrow_mut() = Some(RenderHandles {
             display: embedded.display as usize,
             child_window: embedded.window as usize,
+            colormap: embedded.colormap,
             framebuffer_layout: Arc::clone(&framebuffer_layout),
         });
         self.render_size
@@ -2625,6 +2681,9 @@ impl GMainWindow {
             drawable_size,
             shown_state,
             framebuffer_layout,
+            embedded
+                .glx_context_source
+                .map(crate::boot::OpenGLContextSource::from_glx),
             Arc::clone(&self.hid_core),
             self.controller_applet_for_boot(),
             self.input_subsystem.borrow().get_tas(),
@@ -2789,6 +2848,7 @@ impl GMainWindow {
             drawable_size,
             shown_state,
             framebuffer_layout,
+            None,
             Arc::clone(&self.hid_core),
             self.controller_applet_for_boot(),
             self.input_subsystem.borrow().get_tas(),
@@ -3093,6 +3153,7 @@ impl GMainWindow {
             crate::render_window_x11::destroy_render_window(
                 handles.display as *mut _,
                 handles.child_window as u64,
+                handles.colormap,
             );
             #[cfg(target_os = "macos")]
             crate::render_window::set_render_view_hidden(handles.child_window as *mut _, true);

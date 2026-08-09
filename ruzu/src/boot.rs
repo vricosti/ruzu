@@ -3,22 +3,16 @@
 // In-process game boot — the launcher counterpart of upstream yuzu's
 // `GMainWindow::BootGame` (`main.cpp`) + the emulation-thread setup. It drives
 // the same `ruzu_core::core::System` lifecycle that `ruzu_cmd` drives, but with
-// the GTK-embedded `CAMetalLayer` as the render surface instead of an SDL
-// window, and without SDL's event loop (GTK owns the main loop).
+// a GTK-owned native child surface instead of an SDL window, and without
+// SDL's event loop (GTK owns the main loop).
 //
 // Boot runs on a dedicated background thread so `System::load` (heavy: ROM
 // parse + shader/pipeline cache build) never blocks the GTK main thread — the
 // same split yuzu uses (its emulation/GPU thread does the heavy work and posts
 // progress to the GUI thread via `Qt::QueuedConnection`). Presentation runs on
 // the GPU thread inside `video_core`, reading `shown_state` / `framebuffer_layout`
-// directly, so frames land in the window's Metal layer with no per-frame work
-// here.
-//
-// This mirrors `ruzu_cmd/src/main.rs`'s Vulkan boot path (macOS is Vulkan/
-// MoltenVK only, so the OpenGL/Null branches are omitted). It is intentionally
-// launcher-local rather than shared with `ruzu_cmd`, to avoid editing the
-// concurrently-modified `ruzu_cmd`/`frontend_common` trees; unifying the two is
-// deferred tech debt.
+// directly, so frames land in the native child surface with no per-frame work
+// here. Renderer selection follows upstream's OpenGL/Vulkan/Null switch.
 
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, SyncSender};
@@ -31,6 +25,21 @@ use ruzu_core::frontend::framebuffer_layout::FramebufferLayout;
 use ruzu_core::perf_stats::PerfStatsResults;
 
 use crate::loading_screen::LoadStage;
+
+/// Frontend-owned OpenGL context source. Upstream keeps this state in
+/// `GRenderWindow::main_context` and creates shared contexts from it.
+#[derive(Clone)]
+pub struct OpenGLContextSource {
+    #[cfg(target_os = "linux")]
+    glx: crate::render_window_x11::GlxContextSource,
+}
+
+impl OpenGLContextSource {
+    #[cfg(target_os = "linux")]
+    pub fn from_glx(glx: crate::render_window_x11::GlxContextSource) -> Self {
+        Self { glx }
+    }
+}
 
 #[derive(Debug, Clone, Copy)]
 pub struct BootParameters {
@@ -238,14 +247,16 @@ impl Drop for EmulationSession {
 
 /// Boot `filepath` into a new emulation session using the given render surface.
 ///
-/// `window_info` carries the `CAMetalLayer` (Cocoa) the Vulkan renderer presents
-/// into; `shown_state` / `framebuffer_layout` are the shared handles the
-/// renderer reads each present (updated by the window on visibility/resize).
+/// `window_info` carries the native presentation surface. On Linux,
+/// `opengl_context_source` owns the root GLX share group used by the renderer
+/// and asynchronous shader workers. `shown_state` / `framebuffer_layout` are
+/// updated by the window on visibility and resize.
 pub fn boot_game(
     window_info: WindowSystemInfo,
     drawable_size: (u32, u32),
     shown_state: Arc<AtomicBool>,
     framebuffer_layout: Arc<RwLock<FramebufferLayout>>,
+    opengl_context_source: Option<OpenGLContextSource>,
     hid_core: Arc<parking_lot::Mutex<hid_core::hid_core::HIDCore>>,
     controller_applet: Option<Arc<dyn ruzu_core::frontend::applets::controller::ControllerApplet>>,
     tas: Option<Arc<parking_lot::Mutex<input_common::drivers::tas_input::Tas>>>,
@@ -275,6 +286,7 @@ pub fn boot_game(
                 drawable_size,
                 shown_state,
                 framebuffer_layout,
+                opengl_context_source,
                 hid_core,
                 controller_applet,
                 tas,
@@ -309,12 +321,14 @@ pub fn boot_game(
     }
 }
 
-/// The boot body, run on the boot thread. Faithful to `ruzu_cmd`'s Vulkan path.
+/// The boot body, run on the boot thread. Faithful to upstream's selected
+/// renderer factory and to the corresponding `ruzu_cmd` backend paths.
 fn run_boot(
     window_info: WindowSystemInfo,
     drawable_size: (u32, u32),
     shown_state: Arc<AtomicBool>,
     framebuffer_layout: Arc<RwLock<FramebufferLayout>>,
+    opengl_context_source: Option<OpenGLContextSource>,
     hid_core: Arc<parking_lot::Mutex<hid_core::hid_core::HIDCore>>,
     controller_applet: Option<Arc<dyn ruzu_core::frontend::applets::controller::ControllerApplet>>,
     tas: Option<Arc<parking_lot::Mutex<input_common::drivers::tas_input::Tas>>>,
@@ -387,7 +401,8 @@ fn run_boot(
     }
 
     // Subsystem factory (upstream SetupForApplicationProcess): Host1x + GPU +
-    // Vulkan renderer + AudioCore. Called during `system.load()`.
+    // selected renderer + AudioCore. Called during `system.load()`.
+    let renderer_backend = *common::settings::values().renderer_backend.get_value();
     let frame_loading_event = Arc::clone(&loading_event);
     let frame_displayed = Arc::clone(&first_frame_displayed);
     system.set_subsystem_factory(Box::new(move |system| {
@@ -429,20 +444,7 @@ fn run_boot(
             }) as *const ruzu_core::memory::memory::Memory
         }
 
-        // Vulkan renderer (macOS: MoltenVK).
-        let Some(host1x_core) = system.host1x_core() else {
-            log::error!("Vulkan renderer selected before Host1x initialization");
-            return;
-        };
-        let Some(host1x) = host1x_core
-            .as_any()
-            .downcast_ref::<video_core::host1x::host1x::Host1x>()
-        else {
-            log::error!("Vulkan renderer could not resolve Host1x memory manager");
-            return;
-        };
-        let renderer_device_memory = Arc::clone(host1x.memory_manager());
-        let frame_displayed_notify = Arc::new(move || {
+        let frame_displayed_notify: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
             if let Some(tas) = tas.as_ref() {
                 use hid_core::hid_types::NpadIdType;
                 use input_common::drivers::tas_input::TasAnalog;
@@ -478,30 +480,125 @@ fn run_boot(
                 frame_loading_event(LoadingEvent::FirstFrame);
             }
         });
-        let frame_end_notify = Arc::new(move || unsafe {
+        let frame_end_notify: Arc<dyn Fn() + Send + Sync> = Arc::new(move || unsafe {
             let gpu_ref = &*(gpu_ptr as *const video_core::gpu::Gpu);
             gpu_ref.renderer_frame_end_notify();
         });
-        let renderer: Box<dyn video_core::renderer_base::RendererBase> = Box::new(
-            video_core::renderer_vulkan::renderer_vulkan::RendererVulkan::new(
-                system.telemetry_session_mut(),
-                // SAFETY: this renderer is immediately bound to `gpu` below;
-                // `Gpu` drops the renderer before its shader notifier.
-                unsafe { gpu.shader_notify_handle() },
-                &window_info,
-                drawable_size,
-                Arc::clone(&shown_state),
-                Arc::clone(&framebuffer_layout),
-                frame_displayed_notify,
-                frame_end_notify,
-                syncpoints.clone(),
-                renderer_device_memory,
-            )
-            .unwrap_or_else(|e| {
-                log::error!("Failed to create Vulkan renderer: {e}");
-                std::process::exit(1);
-            }),
-        );
+        let renderer: Box<dyn video_core::renderer_base::RendererBase> = match renderer_backend {
+            common::settings_enums::RendererBackend::OpenGL => {
+                #[cfg(target_os = "linux")]
+                {
+                    let source = opengl_context_source.as_ref().unwrap_or_else(|| {
+                        log::error!("OpenGL renderer selected without a GLX context source");
+                        std::process::exit(1);
+                    });
+                    let context = Box::new(source.glx.create_context().unwrap_or_else(|error| {
+                        log::error!("Failed to create OpenGL renderer context: {error}");
+                        std::process::exit(1);
+                    }));
+                    let worker_source = source.glx.clone();
+                    let shared_context_factory: video_core::renderer_opengl::gl_shader_context::SharedContextFactory =
+                        Arc::new(move || {
+                            Box::new(worker_source.create_context().unwrap_or_else(|error| {
+                                panic!("failed to create shared OpenGL shader context: {error}")
+                            }))
+                        });
+                    let mut renderer = video_core::renderer_opengl::RendererOpenGL::new(
+                        system.telemetry_session_mut(),
+                        crate::render_window_x11::GlxContextSource::get_proc_address,
+                        syncpoints.clone(),
+                        Arc::clone(&device_memory),
+                        // SAFETY: this renderer is immediately bound to `gpu` below;
+                        // `Gpu` drops the renderer and shader workers first.
+                        unsafe { gpu.shader_notify_handle() },
+                        false,
+                        context,
+                        Some(shared_context_factory),
+                        Arc::clone(&frame_end_notify),
+                        Arc::clone(&frame_displayed_notify),
+                    )
+                    .unwrap_or_else(|error| {
+                        log::error!("Failed to create OpenGL renderer: {error}");
+                        std::process::exit(1);
+                    });
+                    renderer.rasterizer_mut().set_invalidate_gpu_cache_callback(
+                        Arc::new(move || unsafe {
+                            (&*(gpu_ptr as *const video_core::gpu::Gpu)).invalidate_gpu_cache();
+                        }),
+                    );
+
+                    // The shader cache consumes GPU virtual addresses. Route
+                    // them through the bound channel's GMMU, using the same
+                    // mutex-free CPU/device reader as the general GPU path.
+                    let system_ref_gpu = SystemRef::from_ref(&system);
+                    let memory_raw_shader = Arc::clone(&memory_raw);
+                    renderer.rasterizer_mut().set_gpu_memory_reader(Arc::new(
+                        move |gpu_va, destination: &mut [u8]| {
+                            let cpu_reader = |address: u64, output: &mut [u8]| {
+                                let system = system_ref_gpu.get();
+                                if let Some(memory) = system.memory_shared() {
+                                    let memory = unsafe {
+                                        &*memory_raw_of(&memory_raw_shader, &memory)
+                                    };
+                                    if memory.read_block(address, output) {
+                                        return;
+                                    }
+                                }
+                                let device_memory = system.device_memory();
+                                let base = ruzu_core::device_memory::dram_memory_map::BASE;
+                                if address >= base {
+                                    let offset = (address - base) as usize;
+                                    let backing = device_memory.buffer.backing_base_pointer();
+                                    unsafe {
+                                        std::ptr::copy_nonoverlapping(
+                                            backing.add(offset),
+                                            output.as_mut_ptr(),
+                                            output.len(),
+                                        );
+                                    }
+                                }
+                            };
+                            unsafe {
+                                (&*(gpu_ptr as *const video_core::gpu::Gpu)).read_gpu_memory(
+                                    gpu_va,
+                                    destination,
+                                    &cpu_reader,
+                                );
+                            }
+                        },
+                    ));
+                    Box::new(renderer)
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    log::error!("The GTK OpenGL context bridge is not available on this platform");
+                    std::process::exit(1);
+                }
+            }
+            common::settings_enums::RendererBackend::Vulkan => Box::new(
+                video_core::renderer_vulkan::renderer_vulkan::RendererVulkan::new(
+                    system.telemetry_session_mut(),
+                    // SAFETY: this renderer is immediately bound to `gpu` below;
+                    // `Gpu` drops the renderer before its shader notifier.
+                    unsafe { gpu.shader_notify_handle() },
+                    &window_info,
+                    drawable_size,
+                    Arc::clone(&shown_state),
+                    Arc::clone(&framebuffer_layout),
+                    frame_displayed_notify,
+                    frame_end_notify,
+                    syncpoints.clone(),
+                    Arc::clone(&device_memory),
+                )
+                .unwrap_or_else(|error| {
+                    log::error!("Failed to create Vulkan renderer: {error}");
+                    std::process::exit(1);
+                }),
+            ),
+            common::settings_enums::RendererBackend::Null => Box::new(
+                video_core::renderer_null::renderer_null::RendererNull::new(syncpoints.clone()),
+            ),
+        };
         gpu.bind_renderer(renderer);
 
         // GPU-side guest memory reader (SMMU → page table → DRAM-direct).
@@ -647,7 +744,11 @@ fn run_boot(
                                         total,
                                     });
                                 });
-                            rasterizer.load_disk_resources(system.runtime_program_id(), callback);
+                            rasterizer.load_disk_resources(
+                                system.runtime_program_id(),
+                                Arc::clone(&frontend_stop_requested),
+                                callback,
+                            );
                         }
                     }
                 }

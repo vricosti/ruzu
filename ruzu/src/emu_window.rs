@@ -19,11 +19,13 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 
-use ruzu_core::frontend::emu_window::{WindowSystemInfo, WindowSystemType};
+use ruzu_core::frontend::emu_window::WindowSystemInfo;
 use ruzu_core::frontend::framebuffer_layout::{default_frame_layout, FramebufferLayout};
 
 #[cfg(target_os = "macos")]
 use crate::render_window::EmbeddedMetalLayer;
+#[cfg(target_os = "macos")]
+use ruzu_core::frontend::emu_window::WindowSystemType;
 
 /// Native render-window state shared with the Vulkan renderer.
 ///

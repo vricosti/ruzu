@@ -101,6 +101,9 @@ fn configure_linux_gdk_backend() -> bool {
 
 fn main() -> glib::ExitCode {
     #[cfg(target_os = "linux")]
+    let _xlib_threading = crate::render_window_x11::initialize_xlib_threads();
+
+    #[cfg(target_os = "linux")]
     let forced_x11 = configure_linux_gdk_backend();
 
     env_logger::init();
@@ -134,8 +137,8 @@ fn main() -> glib::ExitCode {
     // Upstream's `Config` constructor reads every category, controls included,
     // before the window is built. Without this the Controls page would open on
     // an empty mapping even though one was saved last session.
+    configuration::qt_config::load_global_values();
     configuration::qt_config::load_control_values();
-    configuration::qt_config::load_system_values();
 
     // Upstream constructs `QApplication app(argc, argv)`. We register handling
     // of file arguments ourselves later (open a game passed on the command

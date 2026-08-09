@@ -878,6 +878,10 @@ fn main() {
         EmuWindow::Vk(w) => w.raw_window() as usize,
         EmuWindow::Null(w) => w.raw_window() as usize,
     };
+    let strict_gl_context_required = match &emu_window {
+        EmuWindow::Gl(w) => w.strict_context_required(),
+        _ => false,
+    };
     let vulkan_window_info = match &emu_window {
         EmuWindow::Vk(w) => Some((
             w.window_info().clone(),
@@ -947,7 +951,21 @@ fn main() {
                     let context = Box::new(emu_window::emu_window_sdl2_gl::SdlGlContext::new(
                         window_ptr,
                     ));
+                    let shared_context_factory: video_core::renderer_opengl::gl_shader_context::SharedContextFactory =
+                        Arc::new(move || {
+                            Box::new(
+                                emu_window::emu_window_sdl2_gl::SdlGlContext::new(
+                                    sdl_window_ptr_usize as *mut sdl2::sys::SDL_Window,
+                                ),
+                            )
+                        });
+                    let frame_end_notify = Arc::new(move || unsafe {
+                        let gpu_ref = &*(gpu_ptr as *const video_core::gpu::Gpu);
+                        gpu_ref.renderer_frame_end_notify();
+                    });
+                    let frame_displayed_notify = Arc::new(|| {});
                     let mut renderer = video_core::renderer_opengl::RendererOpenGL::new(
+                        system.telemetry_session_mut(),
                         |s| {
                             let cs = std::ffi::CString::new(s).unwrap();
                             unsafe {
@@ -957,7 +975,14 @@ fn main() {
                         },
                         syncpoints.clone(),
                         device_memory.clone(),
+                        // SAFETY: this renderer is immediately bound to `gpu` below;
+                        // `Gpu` drops the renderer and its shader workers first.
+                        unsafe { gpu.shader_notify_handle() },
+                        strict_gl_context_required,
                         context,
+                        Some(shared_context_factory),
+                        frame_end_notify,
+                        frame_displayed_notify,
                     )
                     .unwrap_or_else(|e| {
                         log::error!("Failed to create OpenGL renderer: {}", e);
@@ -1271,6 +1296,7 @@ fn main() {
                         if let Some(rasterizer) = rasterizer.as_mut() {
                             rasterizer.load_disk_resources(
                                 system.runtime_program_id(),
+                                std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
                                 std::sync::Arc::new(|_, _, _| {}),
                             );
                         }

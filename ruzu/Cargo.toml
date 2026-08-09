@@ -73,7 +73,7 @@ core-foundation = "0.9"
 # The `xlib` feature exposes `X11Display::xdisplay()`, the `Display*` that
 # `WindowSystemInfo::display_connection` needs for `VkXlibSurfaceCreateInfoKHR`.
 gdk4-x11 = { version = "0.9", features = ["xlib"] }
-x11 = { version = "2", features = ["xlib"] }
+x11 = { version = "2", features = ["glx", "xlib"] }
 
 # Windows: create the same native child render window that upstream gets from
 # `RenderWidget::setAttribute(Qt::WA_NativeWindow)`, then hand its HWND to

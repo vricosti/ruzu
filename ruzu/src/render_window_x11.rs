@@ -33,11 +33,245 @@
 // which GTK4 does not expose; running with `GDK_BACKEND=x11` (XWayland) works
 // on a Wayland session in the meantime.
 
-use std::ffi::c_void;
+use std::ffi::{c_void, CString};
+use std::os::raw::c_int;
+use std::sync::Arc;
 
 use gtk::prelude::*;
 
-use x11::xlib;
+use x11::{glx, xlib};
+
+use ruzu_core::frontend::graphics_context::GraphicsContext;
+
+type GlxCreateContextAttribsArb = unsafe extern "C" fn(
+    *mut xlib::Display,
+    glx::GLXFBConfig,
+    glx::GLXContext,
+    xlib::Bool,
+    *const c_int,
+) -> glx::GLXContext;
+
+type GlxSwapIntervalExt = unsafe extern "C" fn(*mut xlib::Display, glx::GLXDrawable, c_int);
+
+/// Initialize Xlib's cross-thread locking before GTK/GDK opens the display.
+/// OpenGL shader workers make GLX contexts current from background threads,
+/// matching upstream's `QOpenGLContext::supportsThreadedOpenGL()` contract.
+pub fn initialize_xlib_threads() -> bool {
+    unsafe { xlib::XInitThreads() != 0 }
+}
+
+/// Root GLX context retained for the lifetime of every shared renderer context.
+/// This mirrors upstream `GRenderWindow::main_context`.
+struct GlxShareGroup {
+    display: usize,
+    context: usize,
+}
+
+unsafe impl Send for GlxShareGroup {}
+unsafe impl Sync for GlxShareGroup {}
+
+impl Drop for GlxShareGroup {
+    fn drop(&mut self) {
+        if self.display == 0 || self.context == 0 {
+            return;
+        }
+        unsafe {
+            glx::glXDestroyContext(
+                self.display as *mut xlib::Display,
+                self.context as glx::GLXContext,
+            );
+        }
+    }
+}
+
+/// Copyable frontend source for renderer and shader-worker GLX contexts.
+/// The root share group is reference counted; each produced context is tied to
+/// the same X11 child drawable.
+#[derive(Clone)]
+pub struct GlxContextSource {
+    display: usize,
+    window: glx::GLXDrawable,
+    fb_config: usize,
+    share_group: Arc<GlxShareGroup>,
+}
+
+unsafe impl Send for GlxContextSource {}
+unsafe impl Sync for GlxContextSource {}
+
+impl GlxContextSource {
+    fn new(
+        display: *mut xlib::Display,
+        window: glx::GLXDrawable,
+        fb_config: glx::GLXFBConfig,
+    ) -> Result<Self, String> {
+        let context = create_glx_context(display, fb_config, std::ptr::null_mut())?;
+        Ok(Self {
+            display: display as usize,
+            window,
+            fb_config: fb_config as usize,
+            share_group: Arc::new(GlxShareGroup {
+                display: display as usize,
+                context: context as usize,
+            }),
+        })
+    }
+
+    /// Create one renderer/worker context sharing objects with the root.
+    pub fn create_context(&self) -> Result<GlxContext, String> {
+        let context = create_glx_context(
+            self.display as *mut xlib::Display,
+            self.fb_config as glx::GLXFBConfig,
+            self.share_group.context as glx::GLXContext,
+        )?;
+        Ok(GlxContext {
+            source: self.clone(),
+            context: context as usize,
+            swap_interval_initialized: false,
+        })
+    }
+
+    /// Resolve an OpenGL entry point through GLX.
+    pub fn get_proc_address(name: &'static str) -> *const c_void {
+        let Ok(name) = CString::new(name) else {
+            return std::ptr::null();
+        };
+        unsafe {
+            glx::glXGetProcAddressARB(name.as_ptr().cast()).map_or(std::ptr::null(), |function| {
+                function as *const () as *const c_void
+            })
+        }
+    }
+}
+
+/// GLX implementation of upstream `OpenGLSharedContext`.
+pub struct GlxContext {
+    source: GlxContextSource,
+    context: usize,
+    swap_interval_initialized: bool,
+}
+
+unsafe impl Send for GlxContext {}
+
+impl GraphicsContext for GlxContext {
+    fn swap_buffers(&mut self) {
+        unsafe {
+            glx::glXSwapBuffers(
+                self.source.display as *mut xlib::Display,
+                self.source.window,
+            );
+        }
+    }
+
+    fn make_current(&mut self) {
+        let context = self.context as glx::GLXContext;
+        unsafe {
+            if glx::glXGetCurrentContext() != context
+                && glx::glXMakeCurrent(
+                    self.source.display as *mut xlib::Display,
+                    self.source.window,
+                    context,
+                ) == 0
+            {
+                log::error!("glXMakeCurrent failed for the embedded render window");
+                return;
+            }
+        }
+        if !self.swap_interval_initialized {
+            set_swap_interval(
+                self.source.display as *mut xlib::Display,
+                self.source.window,
+            );
+            self.swap_interval_initialized = true;
+        }
+    }
+
+    fn done_current(&mut self) {
+        unsafe {
+            if glx::glXGetCurrentContext() == self.context as glx::GLXContext {
+                glx::glXMakeCurrent(
+                    self.source.display as *mut xlib::Display,
+                    0,
+                    std::ptr::null_mut(),
+                );
+            }
+        }
+    }
+}
+
+impl Drop for GlxContext {
+    fn drop(&mut self) {
+        self.done_current();
+        if self.context != 0 {
+            unsafe {
+                glx::glXDestroyContext(
+                    self.source.display as *mut xlib::Display,
+                    self.context as glx::GLXContext,
+                );
+            }
+        }
+    }
+}
+
+fn create_glx_context(
+    display: *mut xlib::Display,
+    fb_config: glx::GLXFBConfig,
+    share_context: glx::GLXContext,
+) -> Result<glx::GLXContext, String> {
+    let create = unsafe {
+        glx::glXGetProcAddressARB(c"glXCreateContextAttribsARB".as_ptr().cast()).map(|function| {
+            std::mem::transmute::<unsafe extern "C" fn(), GlxCreateContextAttribsArb>(function)
+        })
+    }
+    .ok_or_else(|| "GLX_ARB_create_context is unavailable".to_owned())?;
+    let flags = if *common::settings::values().renderer_debug.get_value() {
+        glx::arb::GLX_CONTEXT_DEBUG_BIT_ARB
+    } else {
+        0
+    };
+    let attributes = [
+        glx::arb::GLX_CONTEXT_MAJOR_VERSION_ARB,
+        4,
+        glx::arb::GLX_CONTEXT_MINOR_VERSION_ARB,
+        6,
+        glx::arb::GLX_CONTEXT_PROFILE_MASK_ARB,
+        glx::arb::GLX_CONTEXT_COMPATIBILITY_PROFILE_BIT_ARB,
+        glx::arb::GLX_CONTEXT_FLAGS_ARB,
+        flags,
+        0,
+    ];
+    let context = unsafe {
+        create(
+            display,
+            fb_config,
+            share_context,
+            xlib::True,
+            attributes.as_ptr(),
+        )
+    };
+    if context.is_null() {
+        Err("unable to create an OpenGL 4.6 compatibility context".to_owned())
+    } else {
+        Ok(context)
+    }
+}
+
+fn set_swap_interval(display: *mut xlib::Display, drawable: glx::GLXDrawable) {
+    let Some(function) =
+        (unsafe { glx::glXGetProcAddressARB(c"glXSwapIntervalEXT".as_ptr().cast()) })
+    else {
+        return;
+    };
+    let function =
+        unsafe { std::mem::transmute::<unsafe extern "C" fn(), GlxSwapIntervalExt>(function) };
+    let interval = if *common::settings::values().vsync_mode.get_value()
+        == common::settings_enums::VSyncMode::Immediate
+    {
+        0
+    } else {
+        1
+    };
+    unsafe { function(display, drawable, interval) };
+}
 
 /// A native X11 child window covering the render area.
 ///
@@ -52,6 +286,10 @@ pub struct EmbeddedX11Window {
     pub drawable_size: (u32, u32),
     /// Scale factor, for `render_surface_scale`.
     pub scale: f32,
+    /// GLX context source for OpenGL renderer and shader workers.
+    pub glx_context_source: Option<GlxContextSource>,
+    /// Colormap paired with the GLX visual. Freed after the child window.
+    pub colormap: usize,
 }
 
 /// Create the child render window inside `window`, covering `gtk_render_rect`
@@ -85,8 +323,52 @@ pub fn attach_render_window(
     let width = (width.max(1.0) * scale as f64) as u32;
     let height = (height.max(1.0) * scale as f64) as u32;
 
-    let child = unsafe {
-        let child = xlib::XCreateSimpleWindow(
+    let screen = unsafe { xlib::XDefaultScreen(xdisplay) };
+    let attributes = [
+        glx::GLX_X_RENDERABLE,
+        xlib::True,
+        glx::GLX_DRAWABLE_TYPE,
+        glx::GLX_WINDOW_BIT,
+        glx::GLX_RENDER_TYPE,
+        glx::GLX_RGBA_BIT,
+        glx::GLX_X_VISUAL_TYPE,
+        glx::GLX_TRUE_COLOR,
+        glx::GLX_RED_SIZE,
+        8,
+        glx::GLX_GREEN_SIZE,
+        8,
+        glx::GLX_BLUE_SIZE,
+        8,
+        glx::GLX_ALPHA_SIZE,
+        8,
+        glx::GLX_DOUBLEBUFFER,
+        xlib::True,
+        0,
+    ];
+    let mut config_count = 0;
+    let configs =
+        unsafe { glx::glXChooseFBConfig(xdisplay, screen, attributes.as_ptr(), &mut config_count) };
+    if configs.is_null() || config_count == 0 {
+        log::error!("Cannot create embedded OpenGL surface: no suitable GLX FBConfig");
+        return None;
+    }
+    let fb_config = unsafe { *configs };
+    let visual_info = unsafe { glx::glXGetVisualFromFBConfig(xdisplay, fb_config) };
+    unsafe { xlib::XFree(configs.cast()) };
+    if visual_info.is_null() {
+        log::error!("Cannot create embedded OpenGL surface: GLX FBConfig has no X11 visual");
+        return None;
+    }
+
+    let (child, colormap) = unsafe {
+        let root = xlib::XRootWindow(xdisplay, screen);
+        let colormap =
+            xlib::XCreateColormap(xdisplay, root, (*visual_info).visual, xlib::AllocNone);
+        let mut window_attributes: xlib::XSetWindowAttributes = std::mem::zeroed();
+        window_attributes.background_pixel = xlib::XBlackPixel(xdisplay, screen);
+        window_attributes.border_pixel = 0;
+        window_attributes.colormap = colormap;
+        let child = xlib::XCreateWindow(
             xdisplay,
             parent_xid,
             (x * scale as f64) as i32,
@@ -94,12 +376,15 @@ pub fn attach_render_window(
             width,
             height,
             0,
-            0,
-            // Black background, so an unpainted frame matches the render page's
-            // backdrop rather than flashing white.
-            xlib::XBlackPixel(xdisplay, xlib::XDefaultScreen(xdisplay)),
+            (*visual_info).depth,
+            xlib::InputOutput as u32,
+            (*visual_info).visual,
+            xlib::CWBackPixel | xlib::CWBorderPixel | xlib::CWColormap,
+            &mut window_attributes,
         );
+        xlib::XFree(visual_info.cast());
         if child == 0 {
+            xlib::XFreeColormap(xdisplay, colormap);
             return None;
         }
         // The renderer paints this window; X must not send it Expose events we
@@ -107,7 +392,15 @@ pub fn attach_render_window(
         // screen shows through until `set_render_window_hidden(.., false)`.
         xlib::XSelectInput(xdisplay, child, 0);
         xlib::XFlush(xdisplay);
-        child
+        (child, colormap)
+    };
+
+    let glx_context_source = match GlxContextSource::new(xdisplay, child, fb_config) {
+        Ok(source) => Some(source),
+        Err(error) => {
+            log::error!("Cannot initialize embedded OpenGL contexts: {error}");
+            None
+        }
     };
 
     log::info!(
@@ -120,6 +413,8 @@ pub fn attach_render_window(
         window: child,
         drawable_size: (width, height),
         scale,
+        glx_context_source,
+        colormap: colormap as usize,
     })
 }
 
@@ -181,13 +476,16 @@ pub fn resize_render_window(
 
 /// Destroy the child window. Called when emulation stops, so a subsequent boot
 /// starts from a fresh surface rather than reusing one whose swapchain is gone.
-pub fn destroy_render_window(display: *mut c_void, window: u64) {
+pub fn destroy_render_window(display: *mut c_void, window: u64, colormap: usize) {
     if display.is_null() || window == 0 {
         return;
     }
     let xdisplay = display as *mut xlib::Display;
     unsafe {
         xlib::XDestroyWindow(xdisplay, window);
+        if colormap != 0 {
+            xlib::XFreeColormap(xdisplay, colormap as xlib::Colormap);
+        }
         xlib::XFlush(xdisplay);
     }
 }

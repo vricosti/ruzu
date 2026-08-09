@@ -289,6 +289,9 @@ impl ConfigureDialog {
         // Upstream `GMainWindow::OnConfigure` calls `config->Save()` once the
         // dialog is accepted; without it the new bindings would live only in
         // this process and be gone next launch.
+        if let Err(error) = super::qt_config::save_global_values() {
+            log::error!("Failed to save global settings: {error}");
+        }
         if let Err(error) = super::qt_config::save_control_values() {
             log::error!("Failed to save control settings: {error}");
         }

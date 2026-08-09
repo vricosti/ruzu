@@ -48,12 +48,14 @@ pub fn config_path() -> PathBuf {
     get_ruzu_path(RuzuPath::ConfigDir).join("qt-config.ini")
 }
 
-/// Read the shared System categories through upstream's `Config` owner.
-pub fn load_system_values() {
+/// Read the generic global categories through upstream's `Config::ReadValues`
+/// owner. Qt-owned controls are loaded separately after this pass, matching
+/// `QtConfig::ReadQtValues` ordering.
+pub fn load_global_values() {
     let path = config_path();
     let mut config = BaseConfig::new(ConfigType::GlobalConfig);
     config.initialize(&path);
-    config.read_system_values();
+    config.read_values();
 
     let contents = std::fs::read_to_string(path).unwrap_or_default();
     let storage = parse_section_values(&contents, "Data%20Storage");
@@ -68,6 +70,17 @@ pub fn load_system_values() {
             );
         }
     }
+}
+
+/// Persist the generic global categories through upstream's
+/// `Config::SaveValues` owner. Qt-owned controls and UI values are written by
+/// their specialized writers after this pass.
+pub fn save_global_values() -> io::Result<()> {
+    let path = config_path();
+    let mut config = BaseConfig::new(ConfigType::GlobalConfig);
+    config.initialize(&path);
+    config.save_values();
+    config.write_to_ini()
 }
 
 /// Persist the three settings owned by upstream `ConfigureTasDialog`.
