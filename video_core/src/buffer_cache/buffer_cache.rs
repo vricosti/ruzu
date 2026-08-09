@@ -240,6 +240,20 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
         }
     }
 
+    /// Port of OpenGL `BufferCacheRuntime::BindTransformFeedbackObject`.
+    pub fn bind_transform_feedback_object(&mut self, tfb_object_addr: u64) {
+        if let Some(ref mut runtime) = self.runtime {
+            runtime.bind_transform_feedback_object(tfb_object_addr);
+        }
+    }
+
+    /// Port of OpenGL `BufferCacheRuntime::GetTransformFeedbackObject`.
+    pub fn get_transform_feedback_object(&self, tfb_object_addr: u64) -> u32 {
+        self.runtime.as_ref().map_or(0, |runtime| {
+            runtime.get_transform_feedback_object(tfb_object_addr)
+        })
+    }
+
     pub fn index_offset(&self) -> usize {
         self.runtime
             .as_ref()
@@ -251,6 +265,11 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
     /// Upstream: `gpu_memory` is set per-channel via channel setup caches.
     pub fn set_gpu_memory(&mut self, gpu_memory: Box<dyn GpuMemoryAccess>) {
         self.gpu_memory = Some(gpu_memory);
+    }
+
+    /// Clear the per-channel GPU-memory owner when the bound channel is released.
+    pub fn clear_gpu_memory(&mut self) {
+        self.gpu_memory = None;
     }
 
     /// Set the device memory accessor for reading/writing guest physical memory.
@@ -1793,18 +1812,9 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
         } else {
             offset
         };
-        let gpu_handle = self.slot_buffers[buffer_id].gpu_handle;
         if let Some(ref mut rt) = self.runtime {
-            rt.bind_index_buffer(
-                topology,
-                index_format,
-                first,
-                count,
-                buffer_id,
-                gpu_handle,
-                offset,
-                size,
-            );
+            let buffer = &mut self.slot_buffers[buffer_id];
+            rt.bind_index_buffer(topology, index_format, first, count, buffer, offset, size);
         }
     }
 
@@ -2266,7 +2276,7 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
             host_bindings.max_index = host_bindings.max_index.max(index as u32);
         }
         if let Some(ref mut rt) = self.runtime {
-            rt.bind_transform_feedback_buffers(&host_bindings);
+            rt.bind_transform_feedback_buffers(&host_bindings, &mut self.slot_buffers);
         }
     }
 

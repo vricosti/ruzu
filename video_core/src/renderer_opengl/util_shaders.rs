@@ -18,9 +18,10 @@ use crate::texture_cache::accelerated_swizzle::{
 };
 use crate::texture_cache::image_info::{ImageInfo, TilingMode};
 use crate::texture_cache::types::{ImageCopy, SwizzleParameters};
+use crate::textures::decoders::make_swizzle_table;
 
-/// Swizzle table dimensions (64x8 = 512 bytes).
-const SWIZZLE_TABLE_SIZE: usize = 512;
+/// Swizzle table dimensions (64x8 `u32` entries).
+const SWIZZLE_TABLE_ENTRIES: usize = 512;
 
 /// Utility shaders collection.
 ///
@@ -39,22 +40,18 @@ pub struct UtilShaders {
 }
 
 impl UtilShaders {
-    /// Create utility shaders.
-    ///
-    /// Port of `UtilShaders::UtilShaders()`.
-    /// In the full implementation, this compiles compute shaders from host shader
-    /// sources and creates the swizzle table buffer.
+    /// Create the upstream utility compute programs and swizzle table buffer.
     pub fn new(program_manager: ProgramManagerHandle) -> Self {
         let mut swizzle_table_buffer: u32 = 0;
 
         // Create and fill the swizzle table buffer
         // The swizzle table maps (x, y) positions to linear offsets within a GOB
-        let swizzle_table = Self::build_swizzle_table();
+        let swizzle_table = make_swizzle_table();
         unsafe {
             gl::CreateBuffers(1, &mut swizzle_table_buffer);
             gl::NamedBufferStorage(
                 swizzle_table_buffer,
-                SWIZZLE_TABLE_SIZE as isize,
+                std::mem::size_of_val(&swizzle_table) as isize,
                 swizzle_table.as_ptr() as *const _,
                 0,
             );
@@ -92,18 +89,20 @@ impl UtilShaders {
         }
     }
 
-    /// Build the GOB swizzle table matching the hardware layout.
-    /// The table maps (x, y) within a 64x8 GOB to a linear byte offset.
-    fn build_swizzle_table() -> [u8; SWIZZLE_TABLE_SIZE] {
-        let mut table = [0u8; SWIZZLE_TABLE_SIZE];
-        for y in 0u32..8 {
-            for x in 0u32..64 {
-                // NV block linear swizzle: interleave bits of x and y
-                let offset = ((x & 0x3F) | ((y & 0x01) << 6) | ((y & 0x06) << 1)) as u8;
-                table[(y * 64 + x) as usize] = offset;
-            }
+    #[cfg(test)]
+    pub(crate) fn new_for_test(program_manager: ProgramManagerHandle) -> Self {
+        Self {
+            program_manager,
+            swizzle_table_buffer: 0,
+            astc_decoder_program: 0,
+            block_linear_unswizzle_2d_program: 0,
+            block_linear_unswizzle_3d_program: 0,
+            pitch_unswizzle_program: 0,
+            copy_bc4_program: 0,
+            convert_s8d24_program: 0,
+            convert_ms_to_nonms_program: 0,
+            convert_nonms_to_ms_program: 0,
         }
-        table
     }
 
     /// Port of `UtilShaders::ASTCDecode`.
@@ -132,25 +131,14 @@ impl UtilShaders {
                 guest_size_bytes as isize,
             );
             gl::Uniform2ui(1, tile_width, tile_height);
+            gl::Flush();
             for swizzle in swizzles {
                 let input_offset = buffer_offset + swizzle.buffer_offset;
-                let range_size = guest_size_bytes.saturating_sub(swizzle.buffer_offset);
+                let range_size = guest_size_bytes - swizzle.buffer_offset;
                 let params = make_block_linear_swizzle_2d_params(swizzle, info);
-                if params.origin != [0, 0, 0] || params.destination != [0, 0, 0] {
-                    log::warn!(
-                        "UtilShaders::astc_decode: unsupported swizzle origin/destination {:?}/{:?}",
-                        params.origin,
-                        params.destination
-                    );
-                    continue;
-                }
-                if params.bytes_per_block_log2 != 4 {
-                    log::warn!(
-                        "UtilShaders::astc_decode: unexpected bytes_per_block_log2={}",
-                        params.bytes_per_block_log2
-                    );
-                    continue;
-                }
+                debug_assert_eq!(params.origin, [0, 0, 0]);
+                debug_assert_eq!(params.destination, [0, 0, 0]);
+                debug_assert_eq!(params.bytes_per_block_log2, 4);
                 gl::Uniform1ui(2, params.layer_stride);
                 gl::Uniform1ui(3, params.block_size);
                 gl::Uniform1ui(4, params.x_shift);
@@ -217,7 +205,7 @@ impl UtilShaders {
             gl::BindBufferBase(gl::SHADER_STORAGE_BUFFER, 0, self.swizzle_table_buffer);
             for swizzle in swizzles {
                 let input_offset = buffer_offset + swizzle.buffer_offset;
-                let range_size = guest_size_bytes.saturating_sub(swizzle.buffer_offset);
+                let range_size = guest_size_bytes - swizzle.buffer_offset;
                 let params = make_block_linear_swizzle_2d_params(swizzle, info);
                 gl::Uniform3uiv(0, 1, params.origin.as_ptr());
                 gl::Uniform3iv(1, 1, params.destination.as_ptr());
@@ -279,7 +267,7 @@ impl UtilShaders {
             gl::BindBufferBase(gl::SHADER_STORAGE_BUFFER, 0, self.swizzle_table_buffer);
             for swizzle in swizzles {
                 let input_offset = buffer_offset + swizzle.buffer_offset;
-                let range_size = guest_size_bytes.saturating_sub(swizzle.buffer_offset);
+                let range_size = guest_size_bytes - swizzle.buffer_offset;
                 let params = make_block_linear_swizzle_3d_params(swizzle, info);
                 gl::Uniform3uiv(0, 1, params.origin.as_ptr());
                 gl::Uniform3iv(1, 1, params.destination.as_ptr());
@@ -332,6 +320,9 @@ impl UtilShaders {
             return;
         }
         let bytes_per_block = bytes_per_block(info.format);
+        if !bytes_per_block.is_power_of_two() {
+            log::warn!("Non-power of two images are not implemented");
+        }
         let store_fmt = store_format(bytes_per_block);
         let pitch = match info.tiling {
             TilingMode::PitchLinear(pitch) => pitch,
@@ -355,7 +346,7 @@ impl UtilShaders {
             gl::BindImageTexture(0, dst_image, 0, gl::FALSE, 0, gl::WRITE_ONLY, store_fmt);
             for swizzle in swizzles {
                 let input_offset = buffer_offset + swizzle.buffer_offset;
-                let range_size = guest_size_bytes.saturating_sub(swizzle.buffer_offset);
+                let range_size = guest_size_bytes - swizzle.buffer_offset;
                 gl::BindBufferRange(
                     gl::SHADER_STORAGE_BUFFER,
                     0,
@@ -383,20 +374,10 @@ impl UtilShaders {
         program_manager.bind_compute_program(self.copy_bc4_program);
         unsafe {
             for copy in copies {
-                if copy.src_subresource.base_layer != 0
-                    || copy.src_subresource.num_layers != 1
-                    || copy.dst_subresource.base_layer != 0
-                    || copy.dst_subresource.num_layers != 1
-                {
-                    log::warn!(
-                        "UtilShaders::copy_bc4: unsupported layer copy src_base={} src_layers={} dst_base={} dst_layers={}",
-                        copy.src_subresource.base_layer,
-                        copy.src_subresource.num_layers,
-                        copy.dst_subresource.base_layer,
-                        copy.dst_subresource.num_layers
-                    );
-                    continue;
-                }
+                debug_assert_eq!(copy.src_subresource.base_layer, 0);
+                debug_assert_eq!(copy.src_subresource.num_layers, 1);
+                debug_assert_eq!(copy.dst_subresource.base_layer, 0);
+                debug_assert_eq!(copy.dst_subresource.num_layers, 1);
 
                 gl::Uniform3ui(
                     0,
@@ -430,7 +411,6 @@ impl UtilShaders {
                 );
                 gl::DispatchCompute(copy.extent.width, copy.extent.height, copy.extent.depth);
             }
-            gl::MemoryBarrier(gl::TEXTURE_FETCH_BARRIER_BIT | gl::SHADER_IMAGE_ACCESS_BARRIER_BIT);
         }
         program_manager.restore_guest_compute();
     }
@@ -445,20 +425,10 @@ impl UtilShaders {
         program_manager.bind_compute_program(self.convert_s8d24_program);
         unsafe {
             for copy in copies {
-                if copy.src_subresource.base_layer != 0
-                    || copy.src_subresource.num_layers != 1
-                    || copy.dst_subresource.base_layer != 0
-                    || copy.dst_subresource.num_layers != 1
-                {
-                    log::warn!(
-                        "UtilShaders::convert_s8d24: unsupported layer copy src_base={} src_layers={} dst_base={} dst_layers={}",
-                        copy.src_subresource.base_layer,
-                        copy.src_subresource.num_layers,
-                        copy.dst_subresource.base_layer,
-                        copy.dst_subresource.num_layers
-                    );
-                    continue;
-                }
+                debug_assert_eq!(copy.src_subresource.base_layer, 0);
+                debug_assert_eq!(copy.src_subresource.num_layers, 1);
+                debug_assert_eq!(copy.dst_subresource.base_layer, 0);
+                debug_assert_eq!(copy.dst_subresource.num_layers, 1);
 
                 gl::Uniform3ui(0, copy.extent.width, copy.extent.height, copy.extent.depth);
                 gl::BindImageTexture(
@@ -476,7 +446,6 @@ impl UtilShaders {
                     copy.extent.depth,
                 );
             }
-            gl::MemoryBarrier(gl::TEXTURE_FETCH_BARRIER_BIT | gl::SHADER_IMAGE_ACCESS_BARRIER_BIT);
         }
         program_manager.restore_guest_compute();
     }
@@ -504,20 +473,10 @@ impl UtilShaders {
         program_manager.bind_compute_program(program);
         unsafe {
             for copy in copies {
-                if copy.src_subresource.base_layer != 0
-                    || copy.src_subresource.num_layers != 1
-                    || copy.dst_subresource.base_layer != 0
-                    || copy.dst_subresource.num_layers != 1
-                {
-                    log::warn!(
-                        "UtilShaders::copy_msaa: unsupported layer copy src_base={} src_layers={} dst_base={} dst_layers={}",
-                        copy.src_subresource.base_layer,
-                        copy.src_subresource.num_layers,
-                        copy.dst_subresource.base_layer,
-                        copy.dst_subresource.num_layers
-                    );
-                    continue;
-                }
+                debug_assert_eq!(copy.src_subresource.base_layer, 0);
+                debug_assert_eq!(copy.src_subresource.num_layers, 1);
+                debug_assert_eq!(copy.dst_subresource.base_layer, 0);
+                debug_assert_eq!(copy.dst_subresource.num_layers, 1);
 
                 gl::BindImageTexture(
                     0,
@@ -542,7 +501,6 @@ impl UtilShaders {
                 let groups_y = copy.extent.height.div_ceil(8);
                 gl::DispatchCompute(groups_x, groups_y, copy.extent.depth);
             }
-            gl::MemoryBarrier(gl::TEXTURE_FETCH_BARRIER_BIT | gl::SHADER_IMAGE_ACCESS_BARRIER_BIT);
         }
         program_manager.restore_guest_compute();
     }
@@ -604,6 +562,13 @@ mod tests {
 
     #[test]
     fn swizzle_table_size() {
-        assert_eq!(SWIZZLE_TABLE_SIZE, 512);
+        let table = make_swizzle_table();
+        assert_eq!(SWIZZLE_TABLE_ENTRIES, table.len() * table[0].len());
+        assert_eq!(
+            std::mem::size_of_val(&table),
+            512 * std::mem::size_of::<u32>()
+        );
+        assert_eq!(table[0][32], 256);
+        assert_eq!(table[7][63], 511);
     }
 }

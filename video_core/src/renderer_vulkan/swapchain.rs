@@ -284,21 +284,18 @@ impl Swapchain {
         Ok(())
     }
 
-    /// Recreates the swapchain using the currently owned surface.
-    ///
-    /// Rust equivalent of callers invoking upstream `Swapchain::Create(*surface, width, height)`
-    /// when the `PresentManager` does not need to replace the surface handle.
-    pub fn recreate(&mut self, width: u32, height: u32) -> Result<(), VulkanError> {
-        self.create(self.surface, width, height)
-    }
-
     /// Port of `Swapchain::AcquireNextImage`.
     ///
     /// Returns `true` if the swapchain is suboptimal or outdated.
-    pub fn acquire_next_image(&mut self, scheduler: Option<&mut Scheduler>) -> bool {
+    /// Surface loss is returned to `PresentManager`, which owns the upstream
+    /// surface-recreation lifecycle.
+    pub fn acquire_next_image(
+        &mut self,
+        scheduler: Option<&mut Scheduler>,
+    ) -> Result<bool, vk::Result> {
         if self.swapchain == vk::SwapchainKHR::null() || self.present_semaphores.is_empty() {
             self.is_outdated = true;
-            return true;
+            return Ok(true);
         }
         let semaphore = self.present_semaphores[self.frame_index as usize];
         match unsafe {
@@ -317,7 +314,7 @@ impl Swapchain {
                 self.is_outdated = true;
             }
             Err(vk::Result::ERROR_SURFACE_LOST_KHR) => {
-                panic!("vkAcquireNextImageKHR returned ERROR_SURFACE_LOST_KHR");
+                return Err(vk::Result::ERROR_SURFACE_LOST_KHR);
             }
             Err(result) => {
                 log::error!("vkAcquireNextImageKHR returned {:?}", result);
@@ -340,14 +337,14 @@ impl Swapchain {
                 }
             }
         }
-        self.is_suboptimal || self.is_outdated
+        Ok(self.is_suboptimal || self.is_outdated)
     }
 
     /// Port of `Swapchain::Present`.
-    pub fn present(&mut self, render_semaphore: vk::Semaphore) {
+    pub fn present(&mut self, render_semaphore: vk::Semaphore) -> Result<(), vk::Result> {
         if self.swapchain == vk::SwapchainKHR::null() {
             self.is_outdated = true;
-            return;
+            return Ok(());
         }
         let wait_semaphores = [render_semaphore];
         let swapchains = [self.swapchain];
@@ -376,7 +373,7 @@ impl Swapchain {
                 self.is_outdated = true;
             }
             Err(vk::Result::ERROR_SURFACE_LOST_KHR) => {
-                panic!("vkQueuePresentKHR returned ERROR_SURFACE_LOST_KHR");
+                return Err(vk::Result::ERROR_SURFACE_LOST_KHR);
             }
             Err(result) => {
                 log::error!("Failed to present with error {:?}", result);
@@ -386,6 +383,7 @@ impl Swapchain {
         if self.frame_index as usize >= self.image_count {
             self.frame_index = 0;
         }
+        Ok(())
     }
 
     /// Port of `Swapchain::NeedsRecreation`.

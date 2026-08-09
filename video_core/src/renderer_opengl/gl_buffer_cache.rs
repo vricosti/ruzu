@@ -14,7 +14,7 @@ use crate::buffer_cache::buffer_base::BufferBase;
 use crate::buffer_cache::buffer_cache_base::DEFAULT_SKIP_CACHE_SIZE;
 use shader_recompiler::backend::glasm::PROGRAM_LOCAL_PARAMETER_STORAGE_BUFFER_BASE;
 
-use super::gl_staging_buffer_pool::{StagingBufferPool, StreamBuffer};
+use super::gl_staging_buffer_pool::{SharedStagingBufferPool, StreamBuffer};
 use common::slot_vector::SlotVector;
 
 type GlGetNamedBufferParameterui64vNv = unsafe extern "system" fn(
@@ -37,6 +37,20 @@ type GlBufferAddressRangeNv = unsafe extern "system" fn(
     address: u64,
     length: gl::types::GLsizeiptr,
 );
+type GlBindBufferRangeNv = unsafe extern "system" fn(
+    target: gl::types::GLenum,
+    index: gl::types::GLuint,
+    buffer: gl::types::GLuint,
+    offset: gl::types::GLintptr,
+    size: gl::types::GLsizeiptr,
+);
+type GlProgramBufferParametersIuivNv = unsafe extern "system" fn(
+    target: gl::types::GLenum,
+    binding_index: gl::types::GLuint,
+    word_index: gl::types::GLuint,
+    count: gl::types::GLsizei,
+    params: *const gl::types::GLuint,
+);
 
 static GL_GET_NAMED_BUFFER_PARAMETER_UI64V_NV: OnceLock<Option<GlGetNamedBufferParameterui64vNv>> =
     OnceLock::new();
@@ -47,6 +61,9 @@ static GL_MAKE_NAMED_BUFFER_NON_RESIDENT_NV: OnceLock<Option<GlMakeNamedBufferNo
 static GL_PROGRAM_LOCAL_PARAMETERS_I4UIV_NV: OnceLock<Option<GlProgramLocalParametersI4uivNv>> =
     OnceLock::new();
 static GL_BUFFER_ADDRESS_RANGE_NV: OnceLock<Option<GlBufferAddressRangeNv>> = OnceLock::new();
+static GL_BIND_BUFFER_RANGE_NV: OnceLock<Option<GlBindBufferRangeNv>> = OnceLock::new();
+static GL_PROGRAM_BUFFER_PARAMETERS_IUIV_NV: OnceLock<Option<GlProgramBufferParametersIuivNv>> =
+    OnceLock::new();
 
 const GL_BUFFER_GPU_ADDRESS_NV: u32 = 0x8F1D;
 const GL_VERTEX_ATTRIB_ARRAY_ADDRESS_NV: u32 = 0x8F20;
@@ -85,6 +102,11 @@ where
     ));
     let _ = GL_BUFFER_ADDRESS_RANGE_NV
         .set(load_optional_gl_function(load_fn, "glBufferAddressRangeNV"));
+    let _ = GL_BIND_BUFFER_RANGE_NV.set(load_optional_gl_function(load_fn, "glBindBufferRangeNV"));
+    let _ = GL_PROGRAM_BUFFER_PARAMETERS_IUIV_NV.set(load_optional_gl_function(
+        load_fn,
+        "glProgramBufferParametersIuivNV",
+    ));
 }
 
 /// NV program stage LUT for assembly shader parameter buffer bindings.
@@ -107,6 +129,8 @@ const PROGRAM_LUT: [u32; 5] = [
     0x8870, // GL_FRAGMENT_PROGRAM_NV
 ];
 const GL_COMPUTE_PROGRAM_NV: u32 = 0x90FB;
+const GL_COMPUTE_PROGRAM_PARAMETER_BUFFER_NV: u32 = 0x90FC;
+const GL_ELEMENT_ARRAY_ADDRESS_NV: u32 = 0x8F29;
 
 /// Number of graphics uniform buffers per stage.
 pub const NUM_GRAPHICS_UNIFORM_BUFFERS: usize = 18;
@@ -305,12 +329,16 @@ pub struct BufferCacheRuntime {
 
     pub index_buffer_offset: u32,
     pub device_access_memory: u64,
+    can_report_memory_usage: bool,
     texture_handles: *mut u32,
     image_handles: *mut u32,
     buffer_views: HashMap<BufferViewKey, u32>,
-    staging_buffer_pool: StagingBufferPool,
+    transform_feedback_objects: HashMap<u64, u32>,
+    staging_buffer_pool: SharedStagingBufferPool,
     stream_buffer: Option<StreamBuffer>,
     fast_uniforms: [[u32; NUM_GRAPHICS_UNIFORM_BUFFERS]; NUM_STAGES],
+    copy_uniforms: [[u32; NUM_GRAPHICS_UNIFORM_BUFFERS]; NUM_STAGES],
+    copy_compute_uniforms: [u32; NUM_COMPUTE_UNIFORM_BUFFERS],
 }
 
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
@@ -331,7 +359,10 @@ impl BufferCacheRuntime {
     /// 512 MiB` so the subsequent `GetDeviceMemoryUsage` subtraction stays
     /// non-negative. Otherwise it falls back to a hard-coded 2 GiB
     /// minimum.
-    pub fn new(device: &super::gl_device::Device) -> Self {
+    pub fn new(
+        device: &super::gl_device::Device,
+        staging_buffer_pool: SharedStagingBufferPool,
+    ) -> Self {
         let mut max_attributes: i32 = 16;
         unsafe {
             gl::GetIntegerv(gl::MAX_VERTEX_ATTRIBS, &mut max_attributes);
@@ -364,6 +395,35 @@ impl BufferCacheRuntime {
             }
         }
 
+        let mut copy_uniforms = [[0u32; NUM_GRAPHICS_UNIFORM_BUFFERS]; NUM_STAGES];
+        let mut copy_compute_uniforms = [0u32; NUM_COMPUTE_UNIFORM_BUFFERS];
+        if device.use_assembly_shaders() {
+            for stage_uniforms in &mut copy_uniforms {
+                unsafe {
+                    gl::CreateBuffers(
+                        NUM_GRAPHICS_UNIFORM_BUFFERS as i32,
+                        stage_uniforms.as_mut_ptr(),
+                    );
+                }
+                for handle in stage_uniforms {
+                    unsafe {
+                        gl::NamedBufferData(*handle, 0x10_000, std::ptr::null(), gl::STREAM_COPY);
+                    }
+                }
+            }
+            unsafe {
+                gl::CreateBuffers(
+                    NUM_COMPUTE_UNIFORM_BUFFERS as i32,
+                    copy_compute_uniforms.as_mut_ptr(),
+                );
+            }
+            for handle in &copy_compute_uniforms {
+                unsafe {
+                    gl::NamedBufferData(*handle, 0x10_000, std::ptr::null(), gl::STREAM_COPY);
+                }
+            }
+        }
+
         Self {
             has_fast_buffer_sub_data: device.has_fast_buffer_sub_data(),
             use_assembly_shaders: device.use_assembly_shaders(),
@@ -374,16 +434,20 @@ impl BufferCacheRuntime {
             graphics_base_storage_bindings: [0; NUM_STAGES],
             index_buffer_offset: 0,
             device_access_memory,
+            can_report_memory_usage: device.can_report_memory(),
             texture_handles: std::ptr::null_mut(),
             image_handles: std::ptr::null_mut(),
             buffer_views: HashMap::new(),
-            staging_buffer_pool: StagingBufferPool::new(),
+            transform_feedback_objects: HashMap::new(),
+            staging_buffer_pool,
             stream_buffer: if device.has_fast_buffer_sub_data() {
                 None
             } else {
                 Some(StreamBuffer::new())
             },
             fast_uniforms,
+            copy_uniforms,
+            copy_compute_uniforms,
         }
     }
 
@@ -561,17 +625,11 @@ impl BufferCacheRuntime {
     ///
     /// The 2 GiB fallback (no NVX) matches upstream returning `2_GiB`.
     pub fn get_device_memory_usage(&self) -> u64 {
-        const GL_GPU_MEMORY_INFO_TOTAL_AVAILABLE_MEMORY_NVX: u32 = 0x9048;
-        let mut total_kb: i32 = 0;
-        unsafe {
-            gl::GetIntegerv(GL_GPU_MEMORY_INFO_TOTAL_AVAILABLE_MEMORY_NVX, &mut total_kb);
+        if !self.can_report_memory_usage {
+            return 2 * 1024 * 1024 * 1024;
         }
-        if total_kb > 0 {
-            self.device_access_memory
-                .saturating_sub((total_kb as u64) * 1024)
-        } else {
-            2 * 1024 * 1024 * 1024
-        }
+        self.device_access_memory
+            .wrapping_sub(super::gl_device::current_dedicated_video_memory())
     }
 
     /// Get device local memory.
@@ -593,6 +651,57 @@ impl BufferCacheRuntime {
     pub fn index_offset(&self) -> usize {
         self.index_buffer_offset as usize
     }
+
+    /// Port of upstream `BufferCacheRuntime::BindVertexBuffer`.
+    pub fn bind_vertex_buffer(
+        &mut self,
+        index: u32,
+        buffer: &mut BufferBase,
+        offset: u32,
+        size: u32,
+        stride: u32,
+    ) {
+        if index >= self.max_attributes {
+            return;
+        }
+        unsafe {
+            if self.has_unified_vertex_buffers {
+                Self::make_buffer_resident(buffer, gl::READ_ONLY);
+                gl::BindVertexBuffer(index, 0, 0, stride as i32);
+                let buffer_address_range = GL_BUFFER_ADDRESS_RANGE_NV
+                    .get()
+                    .and_then(|function| *function)
+                    .expect("glBufferAddressRangeNV must be loaded for unified vertex buffers");
+                buffer_address_range(
+                    GL_VERTEX_ATTRIB_ARRAY_ADDRESS_NV,
+                    index,
+                    buffer.host_gpu_addr + u64::from(offset),
+                    size as isize,
+                );
+            } else {
+                gl::BindVertexBuffer(index, buffer.gpu_handle, offset as isize, stride as i32);
+            }
+        }
+    }
+
+    /// Port of upstream `BufferCacheRuntime::BindTransformFeedbackBuffer`.
+    pub fn bind_transform_feedback_buffer(
+        &self,
+        index: u32,
+        buffer: &BufferBase,
+        offset: u32,
+        size: u32,
+    ) {
+        unsafe {
+            gl::BindBufferRange(
+                gl::TRANSFORM_FEEDBACK_BUFFER,
+                index,
+                buffer.gpu_handle,
+                offset as isize,
+                size as isize,
+            );
+        }
+    }
 }
 
 impl Drop for BufferCacheRuntime {
@@ -608,10 +717,35 @@ impl Drop for BufferCacheRuntime {
                 gl::DeleteTextures(textures.len() as i32, textures.as_ptr());
             }
         }
+        let transform_feedback_objects: Vec<u32> = self
+            .transform_feedback_objects
+            .values()
+            .copied()
+            .filter(|&object| object != 0)
+            .collect();
+        if !transform_feedback_objects.is_empty() {
+            unsafe {
+                gl::DeleteTransformFeedbacks(
+                    transform_feedback_objects.len() as i32,
+                    transform_feedback_objects.as_ptr(),
+                );
+            }
+        }
         for stage_uniforms in &self.fast_uniforms {
             unsafe {
                 gl::DeleteBuffers(NUM_GRAPHICS_UNIFORM_BUFFERS as i32, stage_uniforms.as_ptr());
             }
+        }
+        for stage_uniforms in &self.copy_uniforms {
+            unsafe {
+                gl::DeleteBuffers(NUM_GRAPHICS_UNIFORM_BUFFERS as i32, stage_uniforms.as_ptr());
+            }
+        }
+        unsafe {
+            gl::DeleteBuffers(
+                NUM_COMPUTE_UNIFORM_BUFFERS as i32,
+                self.copy_compute_uniforms.as_ptr(),
+            );
         }
     }
 }
@@ -655,6 +789,7 @@ impl base::BufferCacheRuntime for BufferCacheRuntime {
     fn upload_staging_buffer(&mut self, size: u64) -> StagingBufferRef {
         let map = self
             .staging_buffer_pool
+            .lock()
             .request_upload_buffer(size as usize)
             .into_raw_parts();
         unsafe {
@@ -673,6 +808,7 @@ impl base::BufferCacheRuntime for BufferCacheRuntime {
     fn download_staging_buffer(&mut self, size: u64, deferred: bool) -> StagingBufferRef {
         let map = self
             .staging_buffer_pool
+            .lock()
             .request_download_buffer(size as usize, deferred)
             .into_raw_parts();
         unsafe {
@@ -690,6 +826,7 @@ impl base::BufferCacheRuntime for BufferCacheRuntime {
 
     fn free_deferred_staging_buffer(&mut self, buffer: &mut StagingBufferRef) {
         self.staging_buffer_pool
+            .lock()
             .free_deferred_staging_buffer_by_index(buffer.index);
     }
 
@@ -782,16 +919,29 @@ impl base::BufferCacheRuntime for BufferCacheRuntime {
         _index_format: crate::engines::maxwell_3d::IndexFormat,
         _base_vertex: u32,
         _num_indices: u32,
-        _buffer: BufferId,
-        gpu_handle: u32,
+        buffer: &mut BufferBase,
         offset: u32,
-        _size: u32,
+        size: u32,
     ) {
-        self.index_buffer_offset = offset;
-        if gpu_handle != 0 {
+        if self.has_unified_vertex_buffers {
+            Self::make_buffer_resident(buffer, gl::READ_ONLY);
+            let buffer_address_range = GL_BUFFER_ADDRESS_RANGE_NV
+                .get()
+                .and_then(|function| *function)
+                .expect("glBufferAddressRangeNV must be loaded for unified index buffers");
             unsafe {
-                gl::BindBuffer(gl::ELEMENT_ARRAY_BUFFER, gpu_handle);
+                buffer_address_range(
+                    GL_ELEMENT_ARRAY_ADDRESS_NV,
+                    0,
+                    buffer.host_gpu_addr + u64::from(offset),
+                    common::alignment::align_up(u64::from(size), 4) as isize,
+                );
             }
+        } else {
+            unsafe {
+                gl::BindBuffer(gl::ELEMENT_ARRAY_BUFFER, buffer.gpu_handle);
+            }
+            self.index_buffer_offset = offset;
         }
     }
 
@@ -886,13 +1036,23 @@ impl base::BufferCacheRuntime for BufferCacheRuntime {
         offset: u32,
         size: u32,
     ) {
-        if self.use_assembly_shaders || gpu_handle == 0 {
-            log::trace!(
-                "GL bind_uniform_buffer skipped stage={} binding={} handle={}",
-                stage,
-                binding_index,
+        if self.use_assembly_shaders {
+            let handle = if offset != 0 {
+                let copy = self.copy_uniforms[stage][binding_index as usize];
+                unsafe {
+                    gl::CopyNamedBufferSubData(gpu_handle, copy, offset as isize, 0, size as isize);
+                }
+                copy
+            } else {
                 gpu_handle
-            );
+            };
+            let bind_buffer_range = GL_BIND_BUFFER_RANGE_NV
+                .get()
+                .and_then(|function| *function)
+                .expect("glBindBufferRangeNV must be loaded for GLASM uniform buffers");
+            unsafe {
+                bind_buffer_range(PABO_LUT[stage], binding_index, handle, 0, size as isize);
+            }
             return;
         }
         let base_binding = self.graphics_base_uniform_bindings[stage];
@@ -906,14 +1066,6 @@ impl base::BufferCacheRuntime for BufferCacheRuntime {
                 size as isize,
             );
         }
-        log::trace!(
-            "GL bind_uniform_buffer stage={} binding={} handle={} offset=0x{:X} size=0x{:X}",
-            stage,
-            binding,
-            gpu_handle,
-            offset,
-            size
-        );
     }
 
     fn set_base_uniform_bindings(&mut self, bindings: &[u32; NUM_STAGES]) {
@@ -1002,16 +1154,94 @@ impl base::BufferCacheRuntime for BufferCacheRuntime {
             }
         }
     }
-    fn bind_transform_feedback_buffers(&mut self, _bindings: &HostBindings) {}
+
+    fn bind_transform_feedback_buffers(
+        &mut self,
+        bindings: &HostBindings,
+        buffers: &mut SlotVector<BufferBase>,
+    ) {
+        let buffer_handles: Vec<u32> = bindings
+            .buffer_ids
+            .iter()
+            .map(|&buffer_id| buffers[buffer_id].gpu_handle)
+            .collect();
+        unsafe {
+            gl::BindBuffersRange(
+                gl::TRANSFORM_FEEDBACK_BUFFER,
+                0,
+                buffer_handles.len() as i32,
+                buffer_handles.as_ptr(),
+                bindings.offsets.as_ptr().cast(),
+                bindings.sizes.as_ptr().cast(),
+            );
+        }
+    }
+
+    fn bind_transform_feedback_object(&mut self, tfb_object_addr: u64) {
+        let object = self
+            .transform_feedback_objects
+            .entry(tfb_object_addr)
+            .or_insert_with(|| {
+                let mut object = 0;
+                unsafe {
+                    gl::CreateTransformFeedbacks(1, &mut object);
+                }
+                object
+            });
+        unsafe {
+            gl::BindTransformFeedback(gl::TRANSFORM_FEEDBACK, *object);
+        }
+    }
+
+    fn get_transform_feedback_object(&self, tfb_object_addr: u64) -> u32 {
+        *self
+            .transform_feedback_objects
+            .get(&tfb_object_addr)
+            .expect("transform-feedback object must be registered before drawing")
+    }
 
     fn bind_compute_uniform_buffer(
         &mut self,
-        _binding: u32,
+        binding: u32,
         _buffer: BufferId,
-        _gpu_handle: u32,
-        _offset: u32,
-        _size: u32,
+        gpu_handle: u32,
+        offset: u32,
+        size: u32,
     ) {
+        if self.use_assembly_shaders {
+            let handle = if offset != 0 {
+                let copy = self.copy_compute_uniforms[binding as usize];
+                unsafe {
+                    gl::CopyNamedBufferSubData(gpu_handle, copy, offset as isize, 0, size as isize);
+                }
+                copy
+            } else {
+                gpu_handle
+            };
+            let bind_buffer_range = GL_BIND_BUFFER_RANGE_NV
+                .get()
+                .and_then(|function| *function)
+                .expect("glBindBufferRangeNV must be loaded for GLASM compute uniform buffers");
+            unsafe {
+                bind_buffer_range(
+                    GL_COMPUTE_PROGRAM_PARAMETER_BUFFER_NV,
+                    binding,
+                    handle,
+                    0,
+                    size as isize,
+                );
+            }
+        } else {
+            unsafe {
+                gl::BindBufferRange(
+                    gl::UNIFORM_BUFFER,
+                    binding,
+                    gpu_handle,
+                    offset as isize,
+                    size as isize,
+                );
+            }
+        }
     }
 
     fn bind_compute_storage_buffer(
@@ -1057,10 +1287,17 @@ impl base::BufferCacheRuntime for BufferCacheRuntime {
     }
 
     fn bind_fast_uniform_buffer(&mut self, stage: usize, binding_index: u32, size: u32) {
+        let handle = self.fast_uniforms[stage][binding_index as usize];
         if self.use_assembly_shaders {
+            let bind_buffer_range = GL_BIND_BUFFER_RANGE_NV
+                .get()
+                .and_then(|function| *function)
+                .expect("glBindBufferRangeNV must be loaded for GLASM fast uniform buffers");
+            unsafe {
+                bind_buffer_range(PABO_LUT[stage], binding_index, handle, 0, size as isize);
+            }
             return;
         }
-        let handle = self.fast_uniforms[stage][binding_index as usize];
         let base_binding = self.graphics_base_uniform_bindings[stage];
         let binding = base_binding + binding_index;
         unsafe {
@@ -1070,6 +1307,19 @@ impl base::BufferCacheRuntime for BufferCacheRuntime {
 
     fn push_fast_uniform_buffer(&mut self, stage: usize, binding_index: u32, data: &[u8]) {
         if self.use_assembly_shaders {
+            let program_buffer_parameters = GL_PROGRAM_BUFFER_PARAMETERS_IUIV_NV
+                .get()
+                .and_then(|function| *function)
+                .expect("glProgramBufferParametersIuivNV must be loaded for GLASM fast uniforms");
+            unsafe {
+                program_buffer_parameters(
+                    PABO_LUT[stage],
+                    binding_index,
+                    0,
+                    (data.len() / std::mem::size_of::<u32>()) as i32,
+                    data.as_ptr().cast(),
+                );
+            }
             return;
         }
         let handle = self.fast_uniforms[stage][binding_index as usize];
@@ -1147,6 +1397,8 @@ mod tests {
         assert_eq!(NUM_GRAPHICS_UNIFORM_BUFFERS, 18);
         assert_eq!(NUM_COMPUTE_UNIFORM_BUFFERS, 8);
         assert_eq!(NUM_STAGES, 5);
+        assert_eq!(GL_COMPUTE_PROGRAM_PARAMETER_BUFFER_NV, 0x90FC);
+        assert_eq!(GL_ELEMENT_ARRAY_ADDRESS_NV, 0x8F29);
     }
 
     #[test]
@@ -1172,5 +1424,16 @@ mod tests {
         assert!(source.contains("stream_buffer.request(data.len())"));
         assert!(source.contains("std::ptr::copy_nonoverlapping"));
         assert!(source.contains("gl::BindBufferRange"));
+    }
+
+    #[test]
+    fn glasm_parameter_buffer_path_owns_upstream_resources_and_entry_points() {
+        let source = include_str!("gl_buffer_cache.rs");
+        assert!(source.contains("copy_uniforms: [[u32; NUM_GRAPHICS_UNIFORM_BUFFERS]; NUM_STAGES]"));
+        assert!(source.contains("copy_compute_uniforms: [u32; NUM_COMPUTE_UNIFORM_BUFFERS]"));
+        assert!(source.contains("\"glBindBufferRangeNV\""));
+        assert!(source.contains("\"glProgramBufferParametersIuivNV\""));
+        assert!(source.contains("gl::CopyNamedBufferSubData"));
+        assert!(source.contains("GL_ELEMENT_ARRAY_ADDRESS_NV"));
     }
 }

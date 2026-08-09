@@ -9,28 +9,9 @@ use super::gl_shader_manager::ProgramManager;
 use super::gl_shader_util::create_program_from_source;
 use crate::host_shaders::fragment_shaders::BLIT_COLOR_FLOAT_FRAG;
 use crate::host_shaders::vertex_shaders::FULL_SCREEN_TRIANGLE_VERT;
+use crate::texture_cache::types::{Extent3D, Region2D};
 
-/// Offset2D for region specification.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct Offset2D {
-    pub x: i32,
-    pub y: i32,
-}
-
-/// Region2D for blit source/destination.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct Region2D {
-    pub start: Offset2D,
-    pub end: Offset2D,
-}
-
-/// Extent3D for source image dimensions.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct Extent3D {
-    pub width: u32,
-    pub height: u32,
-    pub depth: u32,
-}
+const GL_ALPHA_TEST: u32 = 0x0BC0;
 
 /// Blit image helper.
 ///
@@ -79,6 +60,7 @@ impl BlitImageHelper {
             gl::Disable(gl::STENCIL_TEST);
             gl::Disable(gl::POLYGON_OFFSET_FILL);
             gl::Disable(gl::RASTERIZER_DISCARD);
+            gl::Disable(GL_ALPHA_TEST);
             gl::Disablei(gl::BLEND, 0);
             gl::PolygonMode(gl::FRONT_AND_BACK, gl::FILL);
             gl::FrontFace(gl::CW);

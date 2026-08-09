@@ -44,9 +44,8 @@ impl SMAA {
     ///
     /// Corresponds to `SMAA::SMAA()`.
     ///
-    /// In the full implementation, this compiles all six SMAA shaders (3 vert + 3 frag),
-    /// uploads the SMAA area and search lookup textures, and creates intermediate
-    /// edge/blend textures plus the final output texture + framebuffer.
+    /// Compiles all six SMAA shaders, uploads both lookup textures, and creates
+    /// the upstream edge, blend, and output targets.
     pub fn new(width: u32, height: u32) -> Self {
         let edge_detection_vert = smaa_shader(SMAA_EDGE_DETECTION_VERT, gl::VERTEX_SHADER);
         let edge_detection_frag = smaa_shader(SMAA_EDGE_DETECTION_FRAG, gl::FRAGMENT_SHADER);

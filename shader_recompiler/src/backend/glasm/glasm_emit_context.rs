@@ -13,6 +13,7 @@ use crate::runtime_info::RuntimeInfo;
 use crate::stage::Stage;
 
 use super::reg_alloc::RegAlloc;
+use super::PROGRAM_LOCAL_PARAMETER_STORAGE_BUFFER_BASE;
 
 /// GLASM emission context.
 ///
@@ -93,11 +94,37 @@ impl<'a> EmitContext<'a> {
             }
         }
 
-        // Emit constant buffer declarations
-        for desc in &program.info.constant_buffer_descriptors {
+        // Upstream maps descriptor order, rather than the guest cbuf index,
+        // onto the sequential GL program-buffer namespace.
+        for (cbuf_index, desc) in program.info.constant_buffer_descriptors.iter().enumerate() {
+            assert_eq!(desc.count, 1, "GLASM constant-buffer descriptor array");
             ctx.add_line(&format!(
                 "CBUFFER c{}[]={{program.buffer[{}]}};",
-                desc.index, desc.index
+                desc.index, cbuf_index
+            ));
+        }
+
+        let mut ssbo_index = 0;
+        for desc in &program.info.storage_buffers_descriptors {
+            assert_eq!(desc.count, 1, "GLASM storage-buffer descriptor array");
+            if runtime_info.glasm_use_storage_buffers {
+                ctx.add_line(&format!(
+                    "STORAGE ssbo{}[]={{program.storage[{}]}};",
+                    ssbo_index, bindings.storage_buffer
+                ));
+                bindings.storage_buffer += 1;
+                ssbo_index += 1;
+            }
+        }
+        if !runtime_info.glasm_use_storage_buffers
+            && !program.info.storage_buffers_descriptors.is_empty()
+        {
+            let index = program.info.storage_buffers_descriptors.len() as u32
+                + PROGRAM_LOCAL_PARAMETER_STORAGE_BUFFER_BASE;
+            ctx.add_line(&format!(
+                "PARAM c[{}]={{program.local[0..{}]}};",
+                index,
+                index - 1
             ));
         }
 
@@ -106,13 +133,21 @@ impl<'a> EmitContext<'a> {
             ctx.add_line("OUTPUT frag_color0=result.color;");
         }
 
-        // Set up texture bindings
-        // Note: upstream has texture_buffer_descriptors, image_buffer_descriptors, and
-        // image_descriptors on ShaderInfo, but those are not yet ported.
-        // For now we bind texture_descriptors with one binding each.
-        for _desc in &program.info.texture_descriptors {
+        for desc in &program.info.image_buffer_descriptors {
+            ctx.image_buffer_bindings.push(bindings.image);
+            bindings.image += desc.count;
+        }
+        for desc in &program.info.image_descriptors {
+            ctx.image_bindings.push(bindings.image);
+            bindings.image += desc.count;
+        }
+        for desc in &program.info.texture_buffer_descriptors {
+            ctx.texture_buffer_bindings.push(bindings.texture);
+            bindings.texture += desc.count;
+        }
+        for desc in &program.info.texture_descriptors {
             ctx.texture_bindings.push(bindings.texture);
-            bindings.texture += 1;
+            bindings.texture += desc.count;
         }
 
         ctx
@@ -128,5 +163,127 @@ impl<'a> EmitContext<'a> {
     pub fn add_fmt(&mut self, text: String) {
         self.code.push_str(&text);
         self.code.push('\n');
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ir::types::ShaderStage;
+    use crate::ir::Program;
+    use crate::shader_info::{
+        ConstantBufferDescriptor, ImageBufferDescriptor, ImageDescriptor, ImageFormat,
+        StorageBufferDescriptor, TextureBufferDescriptor, TextureDescriptor, TextureType,
+    };
+
+    fn image_buffer(count: u32) -> ImageBufferDescriptor {
+        ImageBufferDescriptor {
+            format: ImageFormat::Typeless,
+            is_written: false,
+            is_read: true,
+            is_integer: false,
+            cbuf_index: 0,
+            cbuf_offset: 0,
+            count,
+            size_shift: 0,
+        }
+    }
+
+    fn image(count: u32) -> ImageDescriptor {
+        ImageDescriptor {
+            texture_type: TextureType::Color2D,
+            format: ImageFormat::Typeless,
+            is_written: false,
+            is_read: true,
+            is_integer: false,
+            cbuf_index: 0,
+            cbuf_offset: 0,
+            count,
+            size_shift: 0,
+        }
+    }
+
+    fn texture_buffer(count: u32) -> TextureBufferDescriptor {
+        TextureBufferDescriptor {
+            has_secondary: false,
+            cbuf_index: 0,
+            cbuf_offset: 0,
+            shift_left: 0,
+            secondary_cbuf_index: 0,
+            secondary_cbuf_offset: 0,
+            secondary_shift_left: 0,
+            count,
+            size_shift: 0,
+        }
+    }
+
+    fn texture(count: u32) -> TextureDescriptor {
+        TextureDescriptor {
+            texture_type: TextureType::Color2D,
+            is_depth: false,
+            is_multisample: false,
+            has_secondary: false,
+            cbuf_index: 0,
+            cbuf_offset: 0,
+            shift_left: 0,
+            secondary_cbuf_index: 0,
+            secondary_cbuf_offset: 0,
+            secondary_shift_left: 0,
+            count,
+            size_shift: 0,
+        }
+    }
+
+    #[test]
+    fn descriptor_bindings_follow_upstream_order_and_counts() {
+        let mut program = Program::new(ShaderStage::Fragment);
+        program.info.image_buffer_descriptors = vec![image_buffer(2)];
+        program.info.image_descriptors = vec![image(3), image(1)];
+        program.info.texture_buffer_descriptors = vec![texture_buffer(4)];
+        program.info.texture_descriptors = vec![texture(2), texture(1)];
+        let mut bindings = Bindings {
+            image: 7,
+            texture: 11,
+            ..Bindings::default()
+        };
+        let profile = Profile::default();
+        let runtime_info = RuntimeInfo::default();
+
+        let context = EmitContext::new(&program, &mut bindings, &profile, &runtime_info);
+
+        assert_eq!(context.image_buffer_bindings, vec![7]);
+        assert_eq!(context.image_bindings, vec![9, 12]);
+        assert_eq!(context.texture_buffer_bindings, vec![11]);
+        assert_eq!(context.texture_bindings, vec![15, 17]);
+        assert_eq!(bindings.image, 13);
+        assert_eq!(bindings.texture, 18);
+    }
+
+    #[test]
+    fn cbuffer_and_storage_declarations_match_upstream_namespaces() {
+        let mut program = Program::new(ShaderStage::Fragment);
+        program.info.constant_buffer_descriptors = vec![
+            ConstantBufferDescriptor { index: 5, count: 1 },
+            ConstantBufferDescriptor { index: 2, count: 1 },
+        ];
+        program.info.storage_buffers_descriptors = vec![StorageBufferDescriptor {
+            cbuf_index: 0,
+            cbuf_offset: 0,
+            count: 1,
+            is_written: false,
+        }];
+        let mut bindings = Bindings::default();
+        let profile = Profile::default();
+        let mut runtime_info = RuntimeInfo::default();
+        runtime_info.glasm_use_storage_buffers = true;
+
+        let context = EmitContext::new(&program, &mut bindings, &profile, &runtime_info);
+
+        assert!(context.code.contains("CBUFFER c5[]={program.buffer[0]};"));
+        assert!(context.code.contains("CBUFFER c2[]={program.buffer[1]};"));
+        assert!(context
+            .code
+            .contains("STORAGE ssbo0[]={program.storage[0]};"));
+        assert_eq!(bindings.storage_buffer, 1);
     }
 }

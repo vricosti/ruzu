@@ -6,6 +6,16 @@
 //!
 //! OpenGL staging buffer pool -- manages persistent mapped buffers for CPU-GPU transfers.
 
+use std::sync::Arc;
+
+use parking_lot::Mutex;
+
+pub type SharedStagingBufferPool = Arc<Mutex<StagingBufferPool>>;
+
+pub fn make_shared_staging_buffer_pool() -> SharedStagingBufferPool {
+    Arc::new(Mutex::new(StagingBufferPool::new()))
+}
+
 /// Stream buffer size (64 MiB).
 pub const STREAM_BUFFER_SIZE: usize = 64 * 1024 * 1024;
 
@@ -95,10 +105,11 @@ impl Drop for StagingBufferMap {
             return;
         }
         unsafe {
-            if !(*self.sync).is_null() {
-                gl::DeleteSync(*self.sync);
+            // OGLSync::Create is idempotent upstream. A live fence must never be
+            // replaced because it still protects the allocation from reuse.
+            if (*self.sync).is_null() {
+                *self.sync = gl::FenceSync(gl::SYNC_GPU_COMMANDS_COMPLETE, 0);
             }
-            *self.sync = gl::FenceSync(gl::SYNC_GPU_COMMANDS_COMPLETE, 0);
         }
     }
 }
@@ -251,8 +262,9 @@ impl StagingBuffers {
                 if sync_index >= known_unsignaled_index {
                     continue;
                 }
-                let status = unsafe { gl::ClientWaitSync(sync, gl::SYNC_FLUSH_COMMANDS_BIT, 0) };
-                if status == gl::TIMEOUT_EXPIRED || status == gl::WAIT_FAILED {
+                let status = unsafe { gl::ClientWaitSync(sync, 0, 0) };
+                assert_ne!(status, gl::WAIT_FAILED);
+                if status == gl::TIMEOUT_EXPIRED {
                     known_unsignaled_index = known_unsignaled_index.min(sync_index);
                     continue;
                 }
@@ -346,10 +358,9 @@ impl StreamBuffer {
         let region_end = Self::region(self.iterator);
         for region in region_start..region_end {
             unsafe {
-                if !self.fences[region].is_null() {
-                    gl::DeleteSync(self.fences[region]);
+                if self.fences[region].is_null() {
+                    self.fences[region] = gl::FenceSync(gl::SYNC_GPU_COMMANDS_COMPLETE, 0);
                 }
-                self.fences[region] = gl::FenceSync(gl::SYNC_GPU_COMMANDS_COMPLETE, 0);
             }
         }
         self.used_iterator = self.iterator;
@@ -374,10 +385,9 @@ impl StreamBuffer {
         if self.iterator + size > STREAM_BUFFER_SIZE {
             for region in Self::region(self.used_iterator)..NUM_SYNCS {
                 unsafe {
-                    if !self.fences[region].is_null() {
-                        gl::DeleteSync(self.fences[region]);
+                    if self.fences[region].is_null() {
+                        self.fences[region] = gl::FenceSync(gl::SYNC_GPU_COMMANDS_COMPLETE, 0);
                     }
-                    self.fences[region] = gl::FenceSync(gl::SYNC_GPU_COMMANDS_COMPLETE, 0);
                 }
             }
             self.used_iterator = 0;
@@ -435,6 +445,10 @@ pub struct StagingBufferPool {
     upload_buffers: StagingBuffers,
     download_buffers: StagingBuffers,
 }
+
+// The rasterizer transfers this GL-thread-owned pool with the renderer. Access
+// by the texture and buffer runtimes is serialized by SharedStagingBufferPool.
+unsafe impl Send for StagingBufferPool {}
 
 impl StagingBufferPool {
     /// Create a new staging buffer pool.
@@ -507,5 +521,15 @@ mod tests {
         assert_eq!(next_pow2(5), 8);
         assert_eq!(next_pow2(256), 256);
         assert_eq!(next_pow2(257), 512);
+    }
+
+    #[test]
+    fn shared_pool_clones_retain_one_rasterizer_owner() {
+        let pool = make_shared_staging_buffer_pool();
+        let texture_runtime_pool = Arc::clone(&pool);
+        let buffer_runtime_pool = Arc::clone(&pool);
+
+        assert!(Arc::ptr_eq(&pool, &texture_runtime_pool));
+        assert!(Arc::ptr_eq(&pool, &buffer_runtime_pool));
     }
 }

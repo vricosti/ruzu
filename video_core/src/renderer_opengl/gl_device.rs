@@ -2,8 +2,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 //! Port of zuyu/src/video_core/renderer_opengl/gl_device.h and gl_device.cpp
-//! Status: EN COURS
-//!
 //! Queries OpenGL device capabilities and exposes them as boolean flags.
 
 use common::settings_enums::ShaderBackend;
@@ -63,7 +61,6 @@ pub struct Device {
     is_intel: bool,
     is_nvidia: bool,
     can_report_memory: bool,
-    must_emulate_bgr565: bool,
     strict_context_required: bool,
     supports_conditional_barriers: bool,
     has_lmem_perf_bug: bool,
@@ -71,7 +68,14 @@ pub struct Device {
 
 impl Device {
     /// Create a new Device by querying GL state. Must be called with a current GL context.
-    pub fn new() -> Self {
+    pub fn new(strict_context_required: bool) -> Result<Self, String> {
+        let major_version = gl_get_integer(gl::MAJOR_VERSION);
+        let minor_version = gl_get_integer(gl::MINOR_VERSION);
+        if major_version < 4 || (major_version == 4 && minor_version < 6) {
+            log::error!("OpenGL 4.6 is not available");
+            return Err("OpenGL 4.6 is not available".to_string());
+        }
+
         let vendor_name = gl_string(gl::VENDOR);
         let renderer_name = gl_string(gl::RENDERER);
         let gl_version = gl_string(gl::VERSION);
@@ -143,13 +147,14 @@ impl Device {
         let has_precise_bug = test_precise_bug();
         let has_broken_texture_view_formats = cfg!(not(target_family = "unix")) && is_intel;
         let disable_fast_buffer_sub_data = is_nvidia && gl_version == "4.6.0 NVIDIA 443.24";
+        if disable_fast_buffer_sub_data {
+            warn!("Beta driver 443.24 is known to have issues. There might be performance issues.");
+        }
         let has_fast_buffer_sub_data = is_nvidia && !disable_fast_buffer_sub_data;
-        let version_major = nvidia_driver_major_version(&gl_version);
-        let has_cbuf_ftou_bug = is_nvidia && version_major.is_some_and(|major| major >= 495);
-        let has_bool_ref_bug = has_cbuf_ftou_bug;
         let has_debugging_tool_attached = std::env::var_os("NVTX_INJECTION64_PATH").is_some()
             || std::env::var_os("NSIGHT_LAUNCHED").is_some()
-            || has_ext("GL_EXT_debug_tool");
+            || has_ext("GL_EXT_debug_tool")
+            || *common::settings::values().renderer_debug.get_value();
         let warp_size_potentially_larger_than_guest = !is_nvidia && !is_intel;
         let needs_fastmath_off = is_nvidia;
 
@@ -163,26 +168,20 @@ impl Device {
             log::error!("Assembly shaders enabled but not supported");
             shader_backend = ShaderBackend::Glsl;
         }
+        let has_cbuf_ftou_bug = shader_backend == ShaderBackend::Glsl
+            && is_nvidia
+            && nvidia_driver_major_version(&gl_version).is_some_and(|major| major >= 495);
+        let has_bool_ref_bug = has_cbuf_ftou_bug;
         let use_driver_cache = is_nvidia;
 
         let can_report_memory = has_ext("GL_NVX_gpu_memory_info");
-        let must_emulate_bgr565 = is_intel;
-        let strict_context_required = false; // Set by window code if on Wayland
         let blacklist_async_shaders =
-            (is_intel && !cfg!(target_os = "linux")) || strict_context_required;
+            (is_intel && !cfg!(target_family = "unix")) || strict_context_required;
         let requested_async_shaders = *common::settings::values()
             .use_asynchronous_shaders
             .get_value();
-        let mut use_asynchronous_shaders = requested_async_shaders && !blacklist_async_shaders;
-        if use_asynchronous_shaders {
-            // Upstream backs this mode with OpenGL ShaderWorker compilation.
-            // Ruzu does not port that worker yet; enabling async here makes
-            // ShaderCache::built_pipeline skip non-small/depth draws forever.
-            warn!(
-                "Asynchronous shader compilation enabled but OpenGL ShaderWorker is not ported; using synchronous compilation"
-            );
-            use_asynchronous_shaders = false;
-        } else if requested_async_shaders && !use_asynchronous_shaders {
+        let use_asynchronous_shaders = requested_async_shaders && !blacklist_async_shaders;
+        if requested_async_shaders && !use_asynchronous_shaders {
             warn!("Asynchronous shader compilation enabled but not supported");
         }
         let supports_conditional_barriers = !is_intel;
@@ -205,7 +204,7 @@ impl Device {
             use_assembly_shaders
         );
 
-        Device {
+        Ok(Device {
             vendor_name,
             renderer_name,
             gl_version,
@@ -252,17 +251,16 @@ impl Device {
             is_intel,
             is_nvidia,
             can_report_memory,
-            must_emulate_bgr565,
             strict_context_required,
             supports_conditional_barriers,
             has_lmem_perf_bug,
-        }
+        })
     }
 
     // --- Accessors ---
 
     pub fn vendor_name(&self) -> &str {
-        &self.vendor_name
+        normalized_vendor_name(&self.vendor_name)
     }
     pub fn renderer_name(&self) -> &str {
         &self.renderer_name
@@ -271,7 +269,7 @@ impl Device {
         &self.gl_version
     }
     pub fn max_uniform_buffers(&self, stage: usize) -> u32 {
-        self.max_uniform_buffers.get(stage).copied().unwrap_or(0)
+        self.max_uniform_buffers[stage]
     }
     pub fn uniform_buffer_alignment(&self) -> u32 {
         self.uniform_buffer_alignment
@@ -404,24 +402,8 @@ impl Device {
     /// (gl_device.cpp:331-335). Queries
     /// `GL_GPU_MEMORY_INFO_TOTAL_AVAILABLE_MEMORY_NVX = 0x9048` (the
     /// NVX-extension total-available query) and returns it as bytes.
-    /// Returns 0 if the NVX extension is absent or the query fails.
     pub fn get_current_dedicated_video_memory(&self) -> u64 {
-        const GL_GPU_MEMORY_INFO_TOTAL_AVAILABLE_MEMORY_NVX: u32 = 0x9048;
-        if !self.can_report_memory {
-            return 0;
-        }
-        let mut total_kb: i32 = 0;
-        unsafe {
-            gl::GetIntegerv(GL_GPU_MEMORY_INFO_TOTAL_AVAILABLE_MEMORY_NVX, &mut total_kb);
-        }
-        if total_kb <= 0 {
-            0
-        } else {
-            (total_kb as u64) * 1024
-        }
-    }
-    pub fn must_emulate_bgr565(&self) -> bool {
-        self.must_emulate_bgr565
+        current_dedicated_video_memory()
     }
     pub fn strict_context_required(&self) -> bool {
         self.strict_context_required
@@ -432,10 +414,15 @@ impl Device {
     pub fn has_lmem_perf_bug(&self) -> bool {
         self.has_lmem_perf_bug
     }
+}
 
-    pub fn set_strict_context_required(&mut self, val: bool) {
-        self.strict_context_required = val;
+pub(crate) fn current_dedicated_video_memory() -> u64 {
+    const GL_GPU_MEMORY_INFO_TOTAL_AVAILABLE_MEMORY_NVX: u32 = 0x9048;
+    let mut total_kb: i32 = 0;
+    unsafe {
+        gl::GetIntegerv(GL_GPU_MEMORY_INFO_TOTAL_AVAILABLE_MEMORY_NVX, &mut total_kb);
     }
+    (total_kb as u64).wrapping_mul(1024)
 }
 
 // --- GL helper functions ---
@@ -626,4 +613,47 @@ fn nvidia_driver_major_version(gl_version: &str) -> Option<u32> {
     let driver = gl_version.strip_prefix("4.6.0 NVIDIA ")?;
     let major = driver.split('.').next()?;
     major.parse().ok()
+}
+
+fn normalized_vendor_name(vendor_name: &str) -> &str {
+    match vendor_name {
+        "NVIDIA Corporation" => "NVIDIA",
+        "ATI Technologies Inc." => "AMD",
+        "Intel" => "Intel",
+        "Intel Open Source Technology Center" => "i965",
+        "Mesa Project" => "i915",
+        "Mesa/X.org" => "Mesa",
+        "AMD" => "RadeonSI",
+        "nouveau" => "Nouveau",
+        "X.Org" => "R600",
+        "Collabora Ltd" => "Zink",
+        "Intel Corporation" => "OpenSWR",
+        "Microsoft Corporation" => "D3D12",
+        "NVIDIA" => "Tegra",
+        other => other,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn vendor_names_match_upstream_driver_names() {
+        assert_eq!(normalized_vendor_name("NVIDIA Corporation"), "NVIDIA");
+        assert_eq!(normalized_vendor_name("ATI Technologies Inc."), "AMD");
+        assert_eq!(normalized_vendor_name("AMD"), "RadeonSI");
+        assert_eq!(normalized_vendor_name("Mesa/X.org"), "Mesa");
+        assert_eq!(normalized_vendor_name("NVIDIA"), "Tegra");
+        assert_eq!(normalized_vendor_name("Unknown Driver"), "Unknown Driver");
+    }
+
+    #[test]
+    fn nvidia_driver_version_parser_matches_upstream_prefix() {
+        assert_eq!(
+            nvidia_driver_major_version("4.6.0 NVIDIA 495.44"),
+            Some(495)
+        );
+        assert_eq!(nvidia_driver_major_version("4.6 Mesa 24.1"), None);
+    }
 }

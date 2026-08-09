@@ -7,7 +7,7 @@
 //! This is the final stage of the OpenGL rendering pipeline.
 
 use crate::framebuffer_config::FramebufferConfig;
-use crate::present::{PresentFilters, PRESENT_FILTERS_FOR_DISPLAY};
+use crate::present::PresentFilters;
 use ruzu_core::frontend::framebuffer_layout::FramebufferLayout;
 
 use super::gl_shader_manager::ProgramManagerHandle;
@@ -64,10 +64,11 @@ impl BlitScreen {
         state_tracker: *mut StateTracker,
         device: *const Device,
         device_memory: DeviceMemoryReader,
+        filters: &'static PresentFilters,
     ) -> Result<Self, String> {
         log::info!("BlitScreen: OpenGL blit pipeline created");
         Ok(Self {
-            filters: &PRESENT_FILTERS_FOR_DISPLAY,
+            filters,
             program_manager,
             rasterizer,
             state_tracker,

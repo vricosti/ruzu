@@ -7,6 +7,8 @@
 
 use std::sync::{Arc, Condvar, Mutex};
 
+use common::cityhash::city_hash64;
+
 use crate::buffer_cache::buffer_cache::BufferCache;
 use crate::buffer_cache::buffer_cache_base::BufferCacheParams;
 use crate::buffer_cache::word_manager::DeviceTracker;
@@ -53,9 +55,7 @@ pub struct ComputePipelineKey {
 }
 
 impl ComputePipelineKey {
-    /// Hash the key using FNV-1a over the raw bytes.
-    ///
-    /// Port of the CityHash64 call in upstream (using FNV-1a as placeholder).
+    /// Hash the complete key byte representation, matching upstream.
     pub fn hash_key(&self) -> u64 {
         let bytes: &[u8] = unsafe {
             std::slice::from_raw_parts(
@@ -63,12 +63,57 @@ impl ComputePipelineKey {
                 std::mem::size_of::<Self>(),
             )
         };
-        let mut h: u64 = 0xcbf29ce484222325;
-        for &b in bytes {
-            h ^= b as u64;
-            h = h.wrapping_mul(0x100000001b3);
+        city_hash64(bytes)
+    }
+
+    pub fn to_cache_bytes(&self) -> &[u8] {
+        unsafe {
+            std::slice::from_raw_parts(
+                (self as *const Self).cast::<u8>(),
+                std::mem::size_of::<Self>(),
+            )
         }
-        h
+    }
+
+    pub fn read_from_file(file: &mut std::fs::File) -> std::io::Result<Self> {
+        use std::io::Read;
+
+        let mut key = Self::default();
+        let bytes = unsafe {
+            std::slice::from_raw_parts_mut(
+                (&mut key as *mut Self).cast::<u8>(),
+                std::mem::size_of::<Self>(),
+            )
+        };
+        file.read_exact(bytes)?;
+        Ok(key)
+    }
+}
+
+#[cfg(test)]
+mod key_tests {
+    use super::*;
+    use std::io::Write;
+
+    #[test]
+    fn pipeline_key_cache_layout_round_trips() {
+        assert_eq!(std::mem::size_of::<ComputePipelineKey>(), 24);
+        let key = ComputePipelineKey {
+            unique_hash: 0x0123_4567_89AB_CDEF,
+            shared_memory_size: 0x1122_3344,
+            workgroup_size: [7, 11, 13],
+        };
+        let path = std::env::temp_dir().join(format!(
+            "ruzu-gl-compute-key-{}-{}.bin",
+            std::process::id(),
+            key.unique_hash
+        ));
+        let mut file = std::fs::File::create(&path).unwrap();
+        file.write_all(key.to_cache_bytes()).unwrap();
+        drop(file);
+        let mut file = std::fs::File::open(&path).unwrap();
+        assert_eq!(ComputePipelineKey::read_from_file(&mut file).unwrap(), key);
+        std::fs::remove_file(path).unwrap();
     }
 }
 
@@ -150,7 +195,7 @@ pub struct ComputePipeline {
     // Build synchronization
     built_mutex: Mutex<bool>,
     built_condvar: Condvar,
-    built_fence: u32,
+    built_fence: gl::types::GLsync,
     is_built: bool,
 }
 
@@ -177,7 +222,7 @@ impl ComputePipeline {
         info: Info,
         _code: &str,
         _code_v: &[u32],
-        _force_context_flush: bool,
+        force_context_flush: bool,
     ) -> Self {
         Self::new_with_backend_state(
             info,
@@ -192,7 +237,7 @@ impl ComputePipeline {
                 }
             },
             device.max_glasm_storage_buffer_blocks(),
-            _force_context_flush,
+            force_context_flush,
         )
     }
 
@@ -206,7 +251,7 @@ impl ComputePipeline {
         _code_v: &[u32],
         backend: ComputeProgramBackend,
         max_glasm_storage_buffer_blocks: u32,
-        _force_context_flush: bool,
+        force_context_flush: bool,
     ) -> Self {
         let use_assembly_shaders = backend == ComputeProgramBackend::Glasm;
         let state = Self::info_state(&info, use_assembly_shaders, max_glasm_storage_buffer_blocks);
@@ -237,6 +282,16 @@ impl ComputePipeline {
             }
         };
 
+        let built_fence = if force_context_flush {
+            unsafe {
+                let fence = gl::FenceSync(gl::SYNC_GPU_COMMANDS_COMPLETE, 0);
+                gl::Flush();
+                fence
+            }
+        } else {
+            std::ptr::null()
+        };
+
         Self {
             info,
             source_program,
@@ -251,8 +306,8 @@ impl ComputePipeline {
             gpu_memory: None,
             built_mutex: Mutex::new(false),
             built_condvar: Condvar::new(),
-            built_fence: 0,
-            is_built: true,
+            built_fence,
+            is_built: !force_context_flush,
         }
     }
 
@@ -273,31 +328,9 @@ impl ComputePipeline {
             gpu_memory: None,
             built_mutex: Mutex::new(false),
             built_condvar: Condvar::new(),
-            built_fence: 0,
+            built_fence: std::ptr::null(),
             is_built: true,
         }
-    }
-
-    /// Configure the compute pipeline for dispatch.
-    ///
-    /// Port of `ComputePipeline::Configure()`.
-    ///
-    /// In the full implementation, this:
-    /// 1. Waits for async build if needed
-    /// 2. Binds the program (source or assembly)
-    /// 3. Fills uniform buffer descriptors
-    /// 4. Fills storage buffer descriptors
-    /// 5. Fills texture/image descriptors
-    /// 6. Dispatches the compute shader
-    pub fn configure(&mut self) {
-        self.wait_for_build();
-
-        if self.source_program != 0 {
-            unsafe {
-                gl::UseProgram(self.source_program);
-            }
-        }
-        // Full implementation requires buffer_cache and texture_cache integration
     }
 
     /// Port of upstream `ComputePipeline::SetEngine`.
@@ -453,14 +486,12 @@ impl ComputePipeline {
         }
     }
 
-    /// Port of the resource-state front half of upstream
-    /// `ComputePipeline::Configure()`.
+    /// Port of upstream `ComputePipeline::Configure()`.
     ///
-    /// This covers the ordering through `FillComputeImageViews`: compute UBO
-    /// state, storage-buffer masks/bindings, compute descriptor
-    /// synchronization, QMD handle collection, sampler-id resolution, and
-    /// backend image-view preparation.
-    pub fn configure_resource_state<P, DT>(
+    /// Rust passes the cache owners explicitly because they are fields of the
+    /// rasterizer that owns this pipeline. The operation ordering matches the
+    /// upstream method.
+    pub fn configure<P, DT>(
         &mut self,
         buffer_cache: &mut BufferCache<P, DT>,
         texture_cache: &mut TextureCache,
@@ -822,13 +853,14 @@ impl ComputePipeline {
         if self.is_built {
             return;
         }
-        if self.built_fence != 0 {
+        if !self.built_fence.is_null() {
             unsafe {
-                let sync = gl::FenceSync(gl::SYNC_GPU_COMMANDS_COMPLETE, 0);
-                if !sync.is_null() {
-                    gl::ClientWaitSync(sync, gl::SYNC_FLUSH_COMMANDS_BIT, u64::MAX);
-                    gl::DeleteSync(sync);
-                }
+                let status = gl::ClientWaitSync(self.built_fence, 0, gl::TIMEOUT_IGNORED);
+                assert_ne!(
+                    status,
+                    gl::WAIT_FAILED,
+                    "OpenGL compute build fence wait failed"
+                );
             }
             self.is_built = true;
             return;
@@ -840,6 +872,28 @@ impl ComputePipeline {
             .wait_while(lock, |built| !*built)
             .unwrap();
         self.is_built = true;
+    }
+}
+
+// SAFETY: GL object names and sync handles are transferred from a worker's
+// shared context to the render thread. The contexts share one object namespace,
+// and the pipeline is not accessed concurrently during that transfer.
+unsafe impl Send for ComputePipeline {}
+
+impl Drop for ComputePipeline {
+    fn drop(&mut self) {
+        if !self.built_fence.is_null() {
+            unsafe { gl::DeleteSync(self.built_fence) };
+            self.built_fence = std::ptr::null();
+        }
+        if self.source_program != 0 {
+            unsafe { gl::DeleteProgram(self.source_program) };
+            self.source_program = 0;
+        }
+        if self.assembly_program != 0 {
+            super::gl_shader_util::delete_assembly_program(self.assembly_program);
+            self.assembly_program = 0;
+        }
     }
 }
 
@@ -1019,6 +1073,13 @@ mod tests {
         let h1 = key.hash_key();
         let h2 = key.hash_key();
         assert_eq!(h1, h2);
+        let bytes = unsafe {
+            std::slice::from_raw_parts(
+                (&key as *const ComputePipelineKey).cast::<u8>(),
+                std::mem::size_of::<ComputePipelineKey>(),
+            )
+        };
+        assert_eq!(h1, city_hash64(bytes));
 
         let key2 = ComputePipelineKey {
             unique_hash: 0x5678,

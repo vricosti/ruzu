@@ -17,6 +17,8 @@ type GlSpecializeShader = unsafe extern "system" fn(
 );
 type GlGenProgramsArb =
     unsafe extern "system" fn(n: gl::types::GLsizei, programs: *mut gl::types::GLuint);
+type GlDeleteProgramsArb =
+    unsafe extern "system" fn(n: gl::types::GLsizei, programs: *const gl::types::GLuint);
 type GlNamedProgramStringExt = unsafe extern "system" fn(
     program: gl::types::GLuint,
     target: gl::types::GLenum,
@@ -37,6 +39,7 @@ type GlProgramLocalParameter4fArb = unsafe extern "system" fn(
 
 static GL_SPECIALIZE_SHADER: OnceLock<Option<GlSpecializeShader>> = OnceLock::new();
 static GL_GEN_PROGRAMS_ARB: OnceLock<Option<GlGenProgramsArb>> = OnceLock::new();
+static GL_DELETE_PROGRAMS_ARB: OnceLock<Option<GlDeleteProgramsArb>> = OnceLock::new();
 static GL_NAMED_PROGRAM_STRING_EXT: OnceLock<Option<GlNamedProgramStringExt>> = OnceLock::new();
 static GL_BIND_PROGRAM_ARB: OnceLock<Option<GlBindProgramArb>> = OnceLock::new();
 static GL_PROGRAM_LOCAL_PARAMETER_4F_ARB: OnceLock<Option<GlProgramLocalParameter4fArb>> =
@@ -69,6 +72,7 @@ where
 {
     let _ = GL_SPECIALIZE_SHADER.set(load_optional_gl_function(load_fn, "glSpecializeShader"));
     let _ = GL_GEN_PROGRAMS_ARB.set(load_optional_gl_function(load_fn, "glGenProgramsARB"));
+    let _ = GL_DELETE_PROGRAMS_ARB.set(load_optional_gl_function(load_fn, "glDeleteProgramsARB"));
     let _ = GL_NAMED_PROGRAM_STRING_EXT.set(load_optional_gl_function(
         load_fn,
         "glNamedProgramStringEXT",
@@ -80,16 +84,23 @@ where
     ));
 }
 
+pub fn delete_assembly_program(program: u32) {
+    let delete_programs = GL_DELETE_PROGRAMS_ARB
+        .get()
+        .and_then(|f| *f)
+        .expect("glDeleteProgramsARB must be loaded for GLASM shader programs");
+    unsafe {
+        delete_programs(1, &program);
+    }
+}
+
 pub fn bind_assembly_program(target: u32, program: u32) {
-    if let Some(bind_program) = GL_BIND_PROGRAM_ARB.get().and_then(|f| *f) {
-        unsafe {
-            bind_program(target, program);
-        }
-    } else {
-        log::warn!(
-            "glBindProgramARB is unavailable; cannot bind assembly program {}",
-            program
-        );
+    let bind_program = GL_BIND_PROGRAM_ARB
+        .get()
+        .and_then(|f| *f)
+        .expect("glBindProgramARB must be loaded for GLASM shader programs");
+    unsafe {
+        bind_program(target, program);
     }
 }
 
@@ -224,18 +235,20 @@ fn link_separable_program(shader: u32) -> u32 {
 
         let mut link_status: gl::types::GLint = 0;
         gl::GetProgramiv(program, gl::LINK_STATUS, &mut link_status);
-        if link_status == gl::FALSE as i32 {
-            let mut log_length: gl::types::GLint = 0;
-            gl::GetProgramiv(program, gl::INFO_LOG_LENGTH, &mut log_length);
-            if log_length > 0 {
-                let mut log = vec![0u8; log_length as usize];
-                gl::GetProgramInfoLog(
-                    program,
-                    log_length,
-                    std::ptr::null_mut(),
-                    log.as_mut_ptr() as *mut _,
-                );
+        let mut log_length: gl::types::GLint = 0;
+        gl::GetProgramiv(program, gl::INFO_LOG_LENGTH, &mut log_length);
+        if log_length > 0 {
+            let mut log = vec![0u8; log_length as usize];
+            gl::GetProgramInfoLog(
+                program,
+                log_length,
+                std::ptr::null_mut(),
+                log.as_mut_ptr() as *mut _,
+            );
+            if link_status == gl::FALSE as i32 {
                 log::error!("Shader link error: {}", String::from_utf8_lossy(&log));
+            } else {
+                log::warn!("{}", String::from_utf8_lossy(&log));
             }
         }
 

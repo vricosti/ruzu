@@ -35,6 +35,7 @@ use super::present_manager::{Frame, PresentManager};
 use super::scheduler::Scheduler;
 use super::state_tracker::StateTracker;
 use super::swapchain::Swapchain;
+use super::turbo_mode::TurboMode;
 
 // ---------------------------------------------------------------------------
 // Constants (from renderer_vulkan.cpp anonymous namespace)
@@ -191,8 +192,8 @@ pub struct RendererVulkan {
     // resources, device, surface, then instance.
     /// Applet capture frame. Its raw Vulkan handles are released in `Drop`.
     applet_frame: Frame,
-    /// Whether turbo mode is enabled.
-    turbo_mode_enabled: bool,
+    /// Optional maximum-clock workload owner.
+    turbo_mode: Option<TurboMode>,
     /// Vulkan rasterizer owner.
     rasterizer: super::RasterizerVulkan,
     /// Applet capture blit/composition owner.
@@ -223,7 +224,7 @@ pub struct RendererVulkan {
     /// Physical/logical Vulkan device owner.
     device: Device,
     /// Presentation surface owner.
-    surface: OwnedSurface,
+    surface: Arc<std::sync::Mutex<OwnedSurface>>,
     debug_messenger: vk::DebugUtilsMessengerEXT,
     /// Vulkan instance owner.
     instance: Instance,
@@ -250,14 +251,27 @@ unsafe impl Send for RendererVulkan {}
 ///
 /// It is a separate owner so Rust can destroy the surface after the logical
 /// device and before the instance, matching the effective C++ member order.
-struct OwnedSurface {
+pub(super) struct OwnedSurface {
     loader: ash::extensions::khr::Surface,
     handle: vk::SurfaceKHR,
 }
 
 impl OwnedSurface {
-    fn new(loader: ash::extensions::khr::Surface, handle: vk::SurfaceKHR) -> Self {
+    pub(super) fn new(loader: ash::extensions::khr::Surface, handle: vk::SurfaceKHR) -> Self {
         Self { loader, handle }
+    }
+
+    pub(super) fn handle(&self) -> vk::SurfaceKHR {
+        self.handle
+    }
+
+    pub(super) fn replace(&mut self, handle: vk::SurfaceKHR) {
+        if self.handle != vk::SurfaceKHR::null() {
+            unsafe {
+                self.loader.destroy_surface(self.handle, None);
+            }
+        }
+        self.handle = handle;
     }
 }
 
@@ -314,7 +328,10 @@ impl RendererVulkan {
         };
         let surface_loader =
             ash::extensions::khr::Surface::new(&instance.entry, &instance.instance);
-        let surface = OwnedSurface::new(surface_loader, surface_handle);
+        let surface = Arc::new(std::sync::Mutex::new(OwnedSurface::new(
+            surface_loader,
+            surface_handle,
+        )));
 
         let physical_device = select_physical_device(&instance.instance)?;
         let memory_properties = unsafe {
@@ -328,7 +345,7 @@ impl RendererVulkan {
                 .get_physical_device_properties(physical_device)
         };
 
-        let device = create_device(&instance, physical_device, surface.handle)?;
+        let device = create_device(&instance, physical_device, surface.lock().unwrap().handle())?;
         let mut memory_allocator = Box::new(MemoryAllocator::new(
             device.get_logical().clone(),
             memory_properties,
@@ -358,10 +375,14 @@ impl RendererVulkan {
         );
         scheduler.set_state_tracker(std::ptr::NonNull::from(state_tracker.as_mut()));
         let submit_mutex = scheduler.submit_mutex();
+        let (surface_loader, surface_handle) = {
+            let surface = surface.lock().unwrap();
+            (surface.loader.clone(), surface.handle())
+        };
         let swapchain = Swapchain::new(
             &instance.instance,
-            surface.loader.clone(),
-            surface.handle,
+            surface_loader,
+            surface_handle,
             &device,
             submit_mutex.clone(),
             drawable_size.0.max(1),
@@ -374,6 +395,10 @@ impl RendererVulkan {
         // Upstream gates the present thread on `Settings::values.async_presentation`.
         let use_present_thread = *common::settings::values().async_presentation.get_value();
         let present_manager = PresentManager::new(
+            instance.entry.clone(),
+            instance.instance.clone(),
+            surface_info,
+            Arc::clone(&surface),
             device.get_logical().clone(),
             memory_properties,
             frame_image_format,
@@ -426,6 +451,8 @@ impl RendererVulkan {
             device.get_physical(),
             device.get_logical().clone(),
             driver_id,
+            device.has_broken_parallel_shader_compiling(),
+            device.cant_blit_msaa(),
             CAPTURE_IMAGE_WIDTH,
             CAPTURE_IMAGE_HEIGHT,
             shader_profile,
@@ -436,6 +463,7 @@ impl RendererVulkan {
             device.is_ext_index_type_uint8_supported(),
             device.has_null_descriptor(),
             device.is_ext_extended_dynamic_state_supported(),
+            device.is_ext_transform_feedback_supported(),
             device.is_ext_extended_dynamic_state2_supported(),
             device.is_ext_extended_dynamic_state2_extras_supported(),
             device.is_ext_extended_dynamic_state3_blending_supported(),
@@ -469,9 +497,22 @@ impl RendererVulkan {
             VulkanError::new(vk::Result::ERROR_INITIALIZATION_FAILED)
         })?;
 
+        let turbo_mode = if *common::settings::values()
+            .renderer_force_max_clock
+            .get_value()
+            && device.should_boost_clocks()
+        {
+            let turbo_mode =
+                TurboMode::new(&instance.entry, &instance.instance, device.get_physical())?;
+            scheduler.register_on_submit(Some(turbo_mode.submit_callback()));
+            Some(turbo_mode)
+        } else {
+            None
+        };
+
         let renderer = RendererVulkan {
             applet_frame: Frame::default(),
-            turbo_mode_enabled: false,
+            turbo_mode,
             rasterizer,
             blit_applet,
             blit_capture,
@@ -846,6 +887,7 @@ impl Drop for RendererVulkan {
     /// Upstream: clears the scheduler on-submit callback, then waits for
     /// the device to become idle before destruction.
     fn drop(&mut self) {
+        self.scheduler.register_on_submit(None);
         unsafe {
             self.device.get_logical().device_wait_idle().ok();
             if self.applet_frame.framebuffer != vk::Framebuffer::null() {

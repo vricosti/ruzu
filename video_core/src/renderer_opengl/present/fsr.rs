@@ -36,10 +36,8 @@ impl FSR {
     ///
     /// Corresponds to `FSR::FSR()`.
     ///
-    /// In the full implementation, this compiles the FSR EASU and RCAS fragment
-    /// shaders (with included ffx_a.h and ffx_fsr1.h sources), creates the
-    /// bilinear sampler, framebuffer, and two RGBA16F intermediate textures
-    /// at the output resolution.
+    /// Compiles the EASU/RCAS programs with their upstream includes and creates
+    /// the sampler, framebuffer, and two RGBA16F targets.
     pub fn new(output_width: u32, output_height: u32) -> Self {
         let mut framebuffer: u32 = 0;
         let mut easu_tex: u32 = 0;

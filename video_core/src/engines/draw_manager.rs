@@ -1735,6 +1735,10 @@ impl<'a> Maxwell3DIndirectView<'a> {
         self.indirect_params
     }
 
+    pub fn into_draw_view(self) -> Maxwell3DDrawView<'a> {
+        self.draw_view
+    }
+
     pub fn draw_call_snapshot(&self) -> DrawCall {
         self.draw_view.draw_call_snapshot(1)
     }
@@ -1745,6 +1749,10 @@ impl<'a> Maxwell3DIndirectView<'a> {
 
     pub fn clear_dirty_flag(&mut self, index: u8) {
         self.draw_view.clear_dirty_flag(index);
+    }
+
+    pub fn draw_view_mut(&mut self) -> &mut Maxwell3DDrawView<'a> {
+        &mut self.draw_view
     }
 }
 
@@ -1844,6 +1852,10 @@ impl<'a> Maxwell3DDrawTextureView<'a> {
 
     pub fn dirty_flags(&self) -> [bool; 256] {
         self.draw_view.dirty_flags()
+    }
+
+    pub fn draw_view_mut(&mut self) -> &mut Maxwell3DDrawView<'a> {
+        &mut self.draw_view
     }
 
     pub fn dirty_flags_ptr(&mut self) -> Option<std::ptr::NonNull<[bool; 256]>> {

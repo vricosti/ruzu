@@ -18,6 +18,8 @@ use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use super::command_pool::CommandPool;
 use super::state_tracker::StateTracker;
 
+pub(crate) type SubmitCallback = Arc<dyn Fn() + Send + Sync>;
+
 const COMMAND_CHUNK_CAPACITY: usize = 0x8000;
 const NO_COMMAND: usize = usize::MAX;
 
@@ -289,6 +291,9 @@ pub struct Scheduler {
     /// Port of upstream `Scheduler::submit_mutex`.
     submit_mutex: Arc<Mutex<()>>,
 
+    /// Port of upstream `Scheduler::on_submit`.
+    on_submit: Arc<Mutex<Option<SubmitCallback>>>,
+
     /// Upstream `Scheduler` owns a `StateTracker&` and invalidates command
     /// buffer state after helper draws. Some Rust construction paths still
     /// build a scheduler before a rasterizer state tracker exists, so this is
@@ -377,6 +382,7 @@ struct WorkerContext {
     submit_mutex: Arc<Mutex<()>>,
     current_tick: Arc<AtomicU64>,
     submitted_tick: Arc<AtomicU64>,
+    on_submit: Arc<Mutex<Option<SubmitCallback>>>,
     pending_trace_locations: Vec<CommandTraceLocation>,
 }
 
@@ -600,6 +606,11 @@ impl WorkerContext {
             self.device.end_command_buffer(self.current_cmdbuf)?;
         }
 
+        let callback = self.on_submit.lock().unwrap().clone();
+        if let Some(callback) = callback {
+            callback();
+        }
+
         let cmd_buffers = [self.upload_cmdbuf, self.current_cmdbuf];
         if let Some(timeline) = self.timeline_semaphore {
             let mut all_signals = Vec::with_capacity(1 + submit.signal_semaphores.len());
@@ -705,6 +716,7 @@ impl Scheduler {
         let submit_mutex = Arc::new(Mutex::new(()));
         let current_tick = Arc::new(AtomicU64::new(0));
         let submitted_tick = Arc::new(AtomicU64::new(0));
+        let on_submit = Arc::new(Mutex::new(None));
         let worker = Arc::new(SchedulerWorker::new());
         let mut worker_context = WorkerContext {
             device: device.clone(),
@@ -719,6 +731,7 @@ impl Scheduler {
             submit_mutex: Arc::clone(&submit_mutex),
             current_tick: Arc::clone(&current_tick),
             submitted_tick: Arc::clone(&submitted_tick),
+            on_submit: Arc::clone(&on_submit),
             pending_trace_locations: Vec::new(),
         };
         worker_context.allocate_worker_command_buffer()?;
@@ -738,6 +751,7 @@ impl Scheduler {
             fence,
             timeline_semaphore,
             submit_mutex,
+            on_submit,
             state_tracker: None,
             worker: Some(worker),
             worker_thread: Some(worker_thread),
@@ -746,6 +760,11 @@ impl Scheduler {
 
     pub fn submit_mutex(&self) -> Arc<Mutex<()>> {
         Arc::clone(&self.submit_mutex)
+    }
+
+    /// Port of upstream `Scheduler::RegisterOnSubmit`.
+    pub(crate) fn register_on_submit(&mut self, callback: Option<SubmitCallback>) {
+        *self.on_submit.lock().unwrap() = callback;
     }
 
     pub(crate) fn wait_handle(&self) -> SchedulerWaitHandle {

@@ -1,16 +1,14 @@
 // SPDX-FileCopyrightText: 2025 ruzu contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! Port of zuyu/src/video_core/renderer_opengl/gl_rasterizer.h and gl_rasterizer.cpp
-//! Status: EN COURS
+//! Port of zuyu/src/video_core/renderer_opengl/gl_rasterizer.h and gl_rasterizer.cpp.
 //!
-//! OpenGL rasterizer — processes Maxwell 3D draw commands using OpenGL.
-//! Implements [`RasterizerInterface`]. Currently delegates actual rendering
-//! to the software rasterizer; GL-accelerated rendering will be added as
-//! buffer/texture/shader caches are ported from zuyu.
+//! OpenGL rasterizer — processes Maxwell 3D draw commands using OpenGL and
+//! implements [`RasterizerInterface`].
 
 use log::{debug, error, info, warn};
 use std::ffi::c_void;
+use std::ptr::NonNull;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::sync::OnceLock;
@@ -18,6 +16,7 @@ use std::time::Instant;
 
 use common::settings;
 
+use super::blit_image::BlitImageHelper;
 use super::gl_buffer_cache::BufferCacheParams as OpenGLBufferCacheParams;
 use super::gl_compute_pipeline::ComputePipeline;
 use super::gl_device::Device;
@@ -25,6 +24,7 @@ use super::gl_fence_manager::{Fence, FenceManagerOpenGL};
 use super::gl_query_cache::QueryCache;
 use super::gl_shader_cache::ShaderCache as OpenGLShaderCache;
 use super::gl_shader_manager::{ProgramManager, ProgramManagerHandle};
+use super::gl_staging_buffer_pool::{make_shared_staging_buffer_pool, SharedStagingBufferPool};
 use super::gl_state_tracker::{dirty as GlDirty, StateTracker};
 use super::gl_texture_cache::{RenderTargetDirtyFlagAccess, TextureCache as OpenGLTextureCache};
 use crate::buffer_cache::buffer_cache::BufferCache as CommonBufferCache;
@@ -32,8 +32,10 @@ use crate::buffer_cache::buffer_cache_base::{
     ObtainBufferOperation, ObtainBufferSynchronize, NULL_BUFFER_ID,
 };
 use crate::buffer_cache::word_manager::DeviceTracker;
+use crate::control::channel_state_cache::{ChannelCacheAccessor, ChannelInfo, ChannelSetupCaches};
 use crate::engines::draw_manager::{
-    DrawState, Maxwell3DClearView, Maxwell3DDrawView, Maxwell3DIndirectView,
+    DrawState, IndirectParams, Maxwell3DClearView, Maxwell3DDrawTextureView, Maxwell3DDrawView,
+    Maxwell3DIndirectView,
 };
 use crate::engines::kepler_compute::DispatchCall;
 use crate::engines::maxwell_3d::{
@@ -53,7 +55,7 @@ use crate::renderer_base::GuestMemoryWriter;
 use crate::renderer_opengl::gl_graphics_pipeline::GraphicsTextureImageBindingState;
 use crate::renderer_opengl::present::layer::FramebufferTextureInfo;
 use crate::shader_cache::ShaderCache;
-use crate::texture_cache::types::NULL_IMAGE_ID;
+use crate::texture_cache::types::{Extent3D, Offset2D, Region2D, NULL_IMAGE_ID};
 
 macro_rules! lock_two_reentrant_mutexes {
     ($first_mutex:expr, $second_mutex:expr, $first_guard:ident, $second_guard:ident) => {
@@ -207,11 +209,22 @@ type GlDepthRangeIndexeddNV = unsafe extern "system" fn(u32, f64, f64);
 type GlViewportSwizzleNV = unsafe extern "system" fn(u32, u32, u32, u32, u32);
 type GlPolygonOffsetClamp = unsafe extern "system" fn(f32, f32, f32);
 type GlAlphaFunc = unsafe extern "system" fn(u32, f32);
+type GlMultiDrawArraysIndirectCount =
+    unsafe extern "system" fn(u32, *const c_void, isize, i32, i32);
+type GlMultiDrawElementsIndirectCount =
+    unsafe extern "system" fn(u32, u32, *const c_void, isize, i32, i32);
+type GlDrawTextureNV =
+    unsafe extern "system" fn(u32, u32, f32, f32, f32, f32, f32, f32, f32, f32, f32);
 
 static GL_DEPTH_RANGE_INDEXEDDNV: OnceLock<Option<GlDepthRangeIndexeddNV>> = OnceLock::new();
 static GL_VIEWPORT_SWIZZLE_NV: OnceLock<Option<GlViewportSwizzleNV>> = OnceLock::new();
 static GL_POLYGON_OFFSET_CLAMP: OnceLock<Option<GlPolygonOffsetClamp>> = OnceLock::new();
 static GL_ALPHA_FUNC: OnceLock<Option<GlAlphaFunc>> = OnceLock::new();
+static GL_MULTI_DRAW_ARRAYS_INDIRECT_COUNT: OnceLock<Option<GlMultiDrawArraysIndirectCount>> =
+    OnceLock::new();
+static GL_MULTI_DRAW_ELEMENTS_INDIRECT_COUNT: OnceLock<Option<GlMultiDrawElementsIndirectCount>> =
+    OnceLock::new();
+static GL_DRAW_TEXTURE_NV: OnceLock<Option<GlDrawTextureNV>> = OnceLock::new();
 static GL_ALPHA_FUNC_MISSING_LOGGED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
@@ -238,7 +251,18 @@ where
     let _ = GL_VIEWPORT_SWIZZLE_NV.set(load_optional_gl_function(load_fn, "glViewportSwizzleNV"));
     let _ = GL_POLYGON_OFFSET_CLAMP.set(load_optional_gl_function(load_fn, "glPolygonOffsetClamp"));
     let _ = GL_ALPHA_FUNC.set(load_optional_gl_function(load_fn, "glAlphaFunc"));
+    let arrays_indirect_count =
+        load_optional_gl_function(load_fn, "glMultiDrawArraysIndirectCount")
+            .or_else(|| load_optional_gl_function(load_fn, "glMultiDrawArraysIndirectCountARB"));
+    let elements_indirect_count =
+        load_optional_gl_function(load_fn, "glMultiDrawElementsIndirectCount")
+            .or_else(|| load_optional_gl_function(load_fn, "glMultiDrawElementsIndirectCountARB"));
+    let _ = GL_MULTI_DRAW_ARRAYS_INDIRECT_COUNT.set(arrays_indirect_count);
+    let _ = GL_MULTI_DRAW_ELEMENTS_INDIRECT_COUNT.set(elements_indirect_count);
+    let _ = GL_DRAW_TEXTURE_NV.set(load_optional_gl_function(load_fn, "glDrawTextureNV"));
 }
+
+const GL_PARAMETER_BUFFER: u32 = 0x80EE;
 
 struct OpenGLDeviceTracker;
 static OPENGL_DEVICE_TRACKER: OpenGLDeviceTracker = OpenGLDeviceTracker;
@@ -300,6 +324,7 @@ impl crate::buffer_cache::buffer_cache_base::GpuMemoryAccess for GpuMemoryAccess
 /// reading/writing through the CPU memory reader/writer callbacks.
 struct DeviceMemoryAccessAdapter {
     device_reader: crate::renderer_base::DeviceMemoryReader,
+    guest_writer: Option<crate::renderer_base::GuestMemoryWriter>,
 }
 
 impl crate::buffer_cache::buffer_cache_base::DeviceMemoryAccess for DeviceMemoryAccessAdapter {
@@ -312,10 +337,9 @@ impl crate::buffer_cache::buffer_cache_base::DeviceMemoryAccess for DeviceMemory
     }
 
     fn write_block_unsafe(&self, device_addr: u64, src: &[u8]) {
-        // DeviceMemoryAccess only exposes a reader shape today. Upstream
-        // writes through `device_memory.WriteBlockUnsafe`; the Rust writer is
-        // still wired separately through TextureCache / RendererBase.
-        let _ = (device_addr, src);
+        if let Some(writer) = self.guest_writer.as_ref() {
+            writer(device_addr, src);
+        }
     }
 }
 
@@ -367,6 +391,102 @@ fn index_format_to_gl(format: crate::engines::draw_manager::IndexFormat) -> u32 
         UnsignedByte => gl::UNSIGNED_BYTE,
         UnsignedShort => gl::UNSIGNED_SHORT,
         UnsignedInt => gl::UNSIGNED_INT,
+    }
+}
+
+/// Emit the callback body passed to upstream `PrepareDraw` by
+/// `RasterizerOpenGL::DrawIndirect`.
+fn emit_indirect_draw(
+    buffer_cache: &mut CommonBufferCache<OpenGLBufferCacheParams, OpenGLDeviceTracker>,
+    draw_state: &DrawState,
+    params: IndirectParams,
+    primitive_mode: u32,
+) {
+    if params.is_byte_count {
+        let tfb_object_base_addr = params.indirect_start_address.wrapping_sub(4);
+        let tfb_object = buffer_cache.get_transform_feedback_object(tfb_object_base_addr);
+        unsafe {
+            gl::DrawTransformFeedback(primitive_mode, tfb_object);
+        }
+        return;
+    }
+
+    let (buffer_id, offset) = buffer_cache.get_draw_indirect_buffer();
+    let handle = buffer_cache.get_buffer_gpu_handle(buffer_id);
+    if handle == 0 {
+        log::warn!("RasterizerOpenGL::draw_indirect skipped: missing GL indirect buffer");
+        return;
+    }
+    unsafe {
+        gl::BindBuffer(gl::DRAW_INDIRECT_BUFFER, handle);
+    }
+    let gl_offset = offset as usize as *const c_void;
+    if params.include_count {
+        let (count_buffer_id, count_offset) = buffer_cache.get_draw_indirect_count();
+        let count_handle = buffer_cache.get_buffer_gpu_handle(count_buffer_id);
+        if count_handle == 0 {
+            log::warn!("RasterizerOpenGL::draw_indirect skipped: missing GL count buffer");
+            return;
+        }
+        unsafe {
+            gl::BindBuffer(GL_PARAMETER_BUFFER, count_handle);
+        }
+        if params.is_indexed {
+            let function = GL_MULTI_DRAW_ELEMENTS_INDIRECT_COUNT
+                .get()
+                .and_then(|function| *function);
+            if let Some(function) = function {
+                unsafe {
+                    function(
+                        primitive_mode,
+                        index_format_to_gl(draw_state.index_buffer.format),
+                        gl_offset,
+                        count_offset as isize,
+                        params.max_draw_counts as i32,
+                        params.stride as i32,
+                    );
+                }
+            } else {
+                log::error!("glMultiDrawElementsIndirectCount is unavailable");
+            }
+        } else {
+            let function = GL_MULTI_DRAW_ARRAYS_INDIRECT_COUNT
+                .get()
+                .and_then(|function| *function);
+            if let Some(function) = function {
+                unsafe {
+                    function(
+                        primitive_mode,
+                        gl_offset,
+                        count_offset as isize,
+                        params.max_draw_counts as i32,
+                        params.stride as i32,
+                    );
+                }
+            } else {
+                log::error!("glMultiDrawArraysIndirectCount is unavailable");
+            }
+        }
+        return;
+    }
+
+    unsafe {
+        if params.is_indexed {
+            gl::MultiDrawElementsIndirect(
+                primitive_mode,
+                index_format_to_gl(draw_state.index_buffer.format),
+                gl_offset,
+                params.max_draw_counts as i32,
+                params.stride as i32,
+            );
+        } else {
+            gl::MultiDrawArraysIndirect(
+                primitive_mode,
+                gl_offset,
+                params.max_draw_counts as i32,
+                params.stride as i32,
+            );
+        }
     }
 }
 
@@ -788,6 +908,16 @@ impl RenderTargetDirtyFlagAccess for Maxwell3DClearView<'_> {
 
     fn set_rt_dirty_flag(&mut self, flag: u8) {
         self.set_dirty_flag(flag);
+    }
+}
+
+impl RenderTargetDirtyFlagAccess for Maxwell3DDrawTextureView<'_> {
+    fn clear_rt_dirty_flag(&mut self, flag: u8) {
+        self.clear_dirty_flag(flag);
+    }
+
+    fn set_rt_dirty_flag(&mut self, flag: u8) {
+        self.draw_view_mut().set_dirty_flag(flag);
     }
 }
 
@@ -1731,6 +1861,7 @@ fn sync_vertex_instances(
 /// Processes draw calls from the Maxwell 3D engine using OpenGL.
 pub struct RasterizerOpenGL {
     syncpoints: Arc<SyncpointManager>,
+    channel_caches: ChannelSetupCaches<ChannelInfo>,
     fence_backend: FenceManagerOpenGL,
     fence_manager: FenceManager<Fence>,
     frame_count: u64,
@@ -1740,6 +1871,7 @@ pub struct RasterizerOpenGL {
     /// command flushing but ambiguous for cross-log correlation.
     total_draw_count: u64,
     has_written_global_memory: bool,
+    staging_buffer_pool: SharedStagingBufferPool,
     buffer_cache: CommonBufferCache<OpenGLBufferCacheParams, OpenGLDeviceTracker>,
     /// Shared OpenGL program manager reference.
     ///
@@ -1756,19 +1888,20 @@ pub struct RasterizerOpenGL {
     /// objects and is the entry point for the draw hot path.
     gl_shader_cache: OpenGLShaderCache,
     query_cache: QueryCache,
-    /// State tracker owned by the rasterizer.
-    ///
-    /// Upstream stores `StateTracker& state_tracker` as a member reference in
-    /// `RasterizerOpenGL`, with the concrete `StateTracker` owned by value in
-    /// `RendererOpenGL`. Rust cannot express member references; instead the
-    /// rasterizer owns the tracker directly and `RendererOpenGL` accesses it
-    /// via [`Self::state_tracker_mut`]. This avoids the ABBA deadlock that the
-    /// previous `Arc<Mutex<StateTracker>>` introduced against `texture_cache`
-    /// (present took state_tracker -> texture_cache; draw took the reverse).
-    state_tracker: Box<StateTracker>,
+    /// Non-owning equivalent of upstream `StateTracker& state_tracker`.
+    /// `RendererOpenGL` owns the heap-stable tracker and outlives the
+    /// rasterizer. OpenGL renderer operations serialize mutable access on the
+    /// renderer thread, as upstream does without a tracker mutex.
+    state_tracker: NonNull<StateTracker>,
+    /// Unit tests construct a rasterizer without its renderer owner.
+    #[cfg(test)]
+    #[allow(dead_code)]
+    owned_state_tracker: Option<Box<StateTracker>>,
     has_depth_buffer_float: bool,
     has_viewport_swizzle: bool,
     has_fill_rectangle: bool,
+    has_draw_texture: bool,
+    blit_image: Option<BlitImageHelper>,
     invalidate_gpu_cache_callback: Option<Arc<dyn Fn() + Send + Sync>>,
     /// Per-channel GPU memory manager, extracted from `ChannelState` in
     /// `bind_channel`. Used to build the `GpuMemoryAccess` adapter for the
@@ -1784,6 +1917,7 @@ pub struct RasterizerOpenGL {
     /// for shader fetches, while buffer-cache `DeviceMemoryAccess` receives
     /// already-resolved device/CPU addresses.
     device_memory_reader: Option<crate::renderer_base::DeviceMemoryReader>,
+    guest_memory_writer: Option<crate::renderer_base::GuestMemoryWriter>,
     /// GPU tick getter used for timestamped query writes.
     gpu_ticks_getter: Option<Arc<dyn Fn() -> u64 + Send + Sync>>,
     /// Callback to process pending GPU sync work from draw paths.
@@ -1802,6 +1936,11 @@ pub struct RasterizerOpenGL {
     /// path would skip the GL call because the placeholder pipeline has
     /// no GL programs attached.
     transient_vao: u32,
+    /// Rust callback adapter for upstream `PrepareDraw(is_indexed, draw_func)`.
+    /// The trait exposes direct and indirect draws as separate methods, so the
+    /// indirect method records the callback payload while reusing `draw`'s
+    /// shared pipeline/state preparation.
+    pending_indirect_draw: Option<IndirectParams>,
 }
 
 // The OpenGL rasterizer is owned and used from the renderer thread. The newly restored
@@ -1809,6 +1948,16 @@ pub struct RasterizerOpenGL {
 // this slice does not populate them yet. Matching the existing renderer ownership model,
 // we keep the type movable to the renderer thread.
 unsafe impl Send for RasterizerOpenGL {}
+
+struct GpuTickGuard(Option<Arc<dyn Fn() + Send + Sync>>);
+
+impl Drop for GpuTickGuard {
+    fn drop(&mut self) {
+        if let Some(callback) = self.0.as_ref() {
+            callback();
+        }
+    }
+}
 
 impl Drop for RasterizerOpenGL {
     fn drop(&mut self) {
@@ -2881,8 +3030,24 @@ const GL_VERTEX_BINDING_OFFSET: u32 = 0x82D7;
 const GL_VERTEX_BINDING_STRIDE: u32 = 0x82D8;
 
 impl RasterizerOpenGL {
+    fn must_flush_region_with(
+        gpu_level_high: bool,
+        is_buffer_modified: impl FnOnce() -> bool,
+        is_texture_modified: impl FnOnce() -> bool,
+    ) -> bool {
+        if is_buffer_modified() {
+            return true;
+        }
+        gpu_level_high && is_texture_modified()
+    }
+
     pub fn total_draw_count(&self) -> u64 {
         self.total_draw_count
+    }
+
+    /// Port of upstream `RasterizerOpenGL::AnyCommandQueued`.
+    pub fn any_command_queued(&self) -> bool {
+        self.num_queued_commands != 0
     }
 
     fn sync_state(
@@ -2934,6 +3099,9 @@ impl RasterizerOpenGL {
         syncpoints: Arc<SyncpointManager>,
         device_memory: Arc<crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager>,
         program_manager: ProgramManagerHandle,
+        state_tracker: &mut StateTracker,
+        shared_context_factory: Option<super::gl_shader_context::SharedContextFactory>,
+        shader_notify: crate::shader_notify::ShaderNotifyHandle,
     ) -> Self {
         let mut transient_vao: u32 = 0;
         unsafe {
@@ -2941,41 +3109,54 @@ impl RasterizerOpenGL {
             gl::BindVertexArray(transient_vao);
         }
         let mut buffer_cache = CommonBufferCache::new(&OPENGL_DEVICE_TRACKER);
+        let staging_buffer_pool = make_shared_staging_buffer_pool();
         // Install the OpenGL buffer-cache runtime so `bind_host_*` methods
         // can issue GL calls once channel_state is populated.
-        let gl_runtime = super::gl_buffer_cache::BufferCacheRuntime::new(device);
+        let gl_runtime = super::gl_buffer_cache::BufferCacheRuntime::new(
+            device,
+            Arc::clone(&staging_buffer_pool),
+        );
         buffer_cache.set_runtime(Box::new(gl_runtime));
-        let mut state_tracker = Box::new(StateTracker::new());
+        let blit_image = Some(BlitImageHelper::new(&program_manager.lock()));
         Self {
             syncpoints,
+            channel_caches: ChannelSetupCaches::new(),
             fence_backend: FenceManagerOpenGL::new(),
             fence_manager: FenceManager::new(false),
             frame_count: 0,
             num_queued_commands: 0,
             total_draw_count: 0,
             has_written_global_memory: false,
+            staging_buffer_pool: Arc::clone(&staging_buffer_pool),
             buffer_cache,
             program_manager: program_manager.clone(),
             texture_cache: OpenGLTextureCache::new(
                 device_memory.clone(),
                 device,
                 program_manager,
-                state_tracker.as_mut(),
+                state_tracker,
+                staging_buffer_pool,
             ),
             shader_cache: ShaderCache::new(device_memory),
-            gl_shader_cache: OpenGLShaderCache::new(device),
+            gl_shader_cache: OpenGLShaderCache::new(device, shared_context_factory, shader_notify),
             query_cache: QueryCache::new(),
-            state_tracker,
+            state_tracker: NonNull::from(&mut *state_tracker),
+            #[cfg(test)]
+            owned_state_tracker: None,
             has_depth_buffer_float: device.has_depth_buffer_float(),
             has_viewport_swizzle: device.has_viewport_swizzle(),
             has_fill_rectangle: device.has_fill_rectangle(),
+            has_draw_texture: device.has_draw_texture(),
+            blit_image,
             invalidate_gpu_cache_callback: None,
             channel_memory_manager: None,
             cpu_memory_reader: None,
             device_memory_reader: None,
+            guest_memory_writer: None,
             gpu_ticks_getter: None,
             gpu_tick_callback: None,
             transient_vao,
+            pending_indirect_draw: None,
         }
     }
 
@@ -2986,14 +3167,18 @@ impl RasterizerOpenGL {
         );
         let program_manager = ProgramManager::new_shared_for_test();
         let mut state_tracker = Box::new(StateTracker::new());
+        let state_tracker_ptr = NonNull::from(state_tracker.as_mut());
+        let staging_buffer_pool = make_shared_staging_buffer_pool();
         Self {
             syncpoints,
+            channel_caches: ChannelSetupCaches::new(),
             fence_backend: FenceManagerOpenGL::new_for_test(),
             fence_manager: FenceManager::new(false),
             frame_count: 0,
             num_queued_commands: 0,
             total_draw_count: 0,
             has_written_global_memory: false,
+            staging_buffer_pool: Arc::clone(&staging_buffer_pool),
             buffer_cache: CommonBufferCache::new(&OPENGL_DEVICE_TRACKER),
             program_manager: program_manager.clone(),
             texture_cache: OpenGLTextureCache::new_with_caps(
@@ -3004,21 +3189,27 @@ impl RasterizerOpenGL {
                 false,
                 program_manager,
                 state_tracker.as_mut(),
+                staging_buffer_pool,
             ),
             shader_cache: ShaderCache::default(),
             gl_shader_cache: OpenGLShaderCache::new_for_test(),
-            query_cache: QueryCache::new(),
-            state_tracker,
+            query_cache: QueryCache::new_for_test(),
+            state_tracker: state_tracker_ptr,
+            owned_state_tracker: Some(state_tracker),
             has_depth_buffer_float: false,
             has_viewport_swizzle: false,
             has_fill_rectangle: false,
+            has_draw_texture: false,
+            blit_image: None,
             invalidate_gpu_cache_callback: None,
             channel_memory_manager: None,
             cpu_memory_reader: None,
             device_memory_reader: None,
+            guest_memory_writer: None,
             gpu_ticks_getter: None,
             gpu_tick_callback: None,
             transient_vao: 0,
+            pending_indirect_draw: None,
         }
     }
 
@@ -3047,11 +3238,11 @@ impl RasterizerOpenGL {
         self.buffer_cache
             .set_device_memory(Box::new(DeviceMemoryAccessAdapter {
                 device_reader: reader,
+                guest_writer: self.guest_memory_writer.clone(),
             }));
     }
 
     pub fn set_gpu_ticks_getter(&mut self, getter: Arc<dyn Fn() -> u64 + Send + Sync>) {
-        self.query_cache.set_gpu_ticks_getter(Arc::clone(&getter));
         self.gpu_ticks_getter = Some(getter);
     }
 
@@ -3128,13 +3319,15 @@ impl RasterizerOpenGL {
     }
 
     pub fn set_guest_memory_writer(&mut self, writer: GuestMemoryWriter) {
+        self.guest_memory_writer = Some(Arc::clone(&writer));
         self.texture_cache.set_guest_memory_writer(writer);
-    }
-
-    /// Mutable access to the rasterizer-owned state tracker. Matches upstream
-    /// `RendererOpenGL`'s direct access to `rasterizer.state_tracker` member.
-    pub fn state_tracker_mut(&mut self) -> &mut StateTracker {
-        &mut self.state_tracker
+        if let Some(device_reader) = self.device_memory_reader.as_ref().cloned() {
+            self.buffer_cache
+                .set_device_memory(Box::new(DeviceMemoryAccessAdapter {
+                    device_reader,
+                    guest_writer: self.guest_memory_writer.clone(),
+                }));
+        }
     }
 
     /// Diagnostic-only present-time readback for GPU addresses selected by
@@ -3461,11 +3654,8 @@ impl RasterizerOpenGL {
         })
     }
 
-    /// Process draw calls and produce a framebuffer.
-    ///
-    /// Currently delegates to the software rasterizer. As more GL pipeline
-    /// infrastructure is ported from zuyu (buffer cache, texture cache,
-    /// shader cache, etc.), this will transition to GPU-accelerated rendering.
+    /// Compatibility entry point for callers that still submit collected
+    /// software `DrawCall` values instead of Maxwell engine views.
     pub fn render_draw_calls(
         &mut self,
         draw_calls: &[DrawCall],
@@ -3557,6 +3747,16 @@ impl RasterizerOpenGL {
 }
 
 impl RasterizerInterface for RasterizerOpenGL {
+    fn load_disk_resources(
+        &mut self,
+        title_id: u64,
+        stop_loading: crate::rasterizer_interface::DiskResourceLoadStop,
+        callback: crate::rasterizer_interface::DiskResourceLoadCallback,
+    ) {
+        self.gl_shader_cache
+            .load_disk_resources(title_id, stop_loading, callback);
+    }
+
     /// Port of `RasterizerOpenGL::Draw(bool is_indexed, u32 instance_count)`
     /// (cpp:267) + `RasterizerOpenGL::PrepareDraw` (cpp:230).
     ///
@@ -3569,18 +3769,6 @@ impl RasterizerInterface for RasterizerOpenGL {
     ///   → read `maxwell3d->draw_manager->GetDrawState()` for topology and
     ///     vertex/index buffer bindings
     ///   → `glDrawElements{Instanced,BaseVertex,...}` or `glDrawArrays{Instanced,BaseInstance,...}`
-    ///
-    /// Current Rust state (steps 1–3 in the scoping plan):
-    /// * `gl_shader_cache::ShaderCache::current_graphics_pipeline` returns a
-    ///   placeholder `GraphicsPipeline` on miss, so the pipeline lookup path
-    ///   is live at the control-flow level.
-    /// * `DrawState` is now restricted to upstream `DrawManager::State`
-    ///   fields. Maxwell3D register access comes through `Maxwell3DDrawView`
-    ///   until the rasterizer can own a live channel/Maxwell3D reference.
-    /// * Buffer-cache / texture-cache binding (`buffer_cache.mutex`,
-    ///   `texture_cache.base.mutex`, `SyncState`, `SetEngine`) and the actual
-    ///   `glDraw*` family are still deferred to step 4+. They require real
-    ///   buffer/texture caches and a compiled GL program.
     ///
     /// The `MaxwellToGL::PrimitiveTopology` mapping is intentionally kept
     /// here (not on the pipeline) because upstream re-reads topology on
@@ -3675,10 +3863,8 @@ impl RasterizerInterface for RasterizerOpenGL {
             profile_pipeline_us = trace_elapsed_us(step);
         }
 
-        // Lazy GL-program build (gap 4). The shader cache stages GLSL
-        // sources but never calls into GL itself, so the very first time
-        // we hit this pipeline with a real GL context we materialise the
-        // separable per-stage programs here. Failures are logged once and
+        // Materialize the staged GLSL programs on first use with a current GL
+        // context. Failures are logged once and
         // leave the pipeline in its placeholder state so we don't retry
         // every frame.
         let pipeline_handle_before_build = pipeline.program_pipeline_handle();
@@ -3696,7 +3882,10 @@ impl RasterizerInterface for RasterizerOpenGL {
                 });
         let mut pipeline_build_attempted = false;
         let mut pipeline_build_failed = false;
-        if !pipeline.has_gl_programs() && pipeline_sources_mask != 0 {
+        if !pipeline.has_gl_programs()
+            && !pipeline.has_pending_build()
+            && pipeline_sources_mask != 0
+        {
             pipeline_build_attempted = true;
             let step = profile_draw_timing.then(Instant::now);
             record_gl_draw_stage(draw_seq, 6);
@@ -3914,7 +4103,7 @@ impl RasterizerInterface for RasterizerOpenGL {
                             draw_seq
                         );
                     },
-                    &mut self.state_tracker,
+                    unsafe { self.state_tracker.as_mut() },
                     num_shader_stages,
                     MAX_DESC_COUNT,
                     via_header_index,
@@ -5116,7 +5305,7 @@ impl RasterizerInterface for RasterizerOpenGL {
             };
             Self::sync_state(
                 &mut draw_view,
-                &mut self.state_tracker,
+                unsafe { self.state_tracker.as_mut() },
                 self.transient_vao,
                 self.has_depth_buffer_float,
                 self.has_viewport_swizzle,
@@ -6220,15 +6409,24 @@ impl RasterizerInterface for RasterizerOpenGL {
                                 );
                             }
                         }
-                        gl::DrawElementsInstancedBaseVertexBaseInstance(
-                            primitive_mode,
-                            num_vertices as i32,
-                            index_format,
-                            index_offset as *const _,
-                            num_instances as i32,
-                            base_vertex,
-                            base_instance,
-                        );
+                        if let Some(params) = self.pending_indirect_draw {
+                            emit_indirect_draw(
+                                &mut self.buffer_cache,
+                                draw_state,
+                                params,
+                                primitive_mode,
+                            );
+                        } else {
+                            gl::DrawElementsInstancedBaseVertexBaseInstance(
+                                primitive_mode,
+                                num_vertices as i32,
+                                index_format,
+                                index_offset as *const _,
+                                num_instances as i32,
+                                base_vertex,
+                                base_instance,
+                            );
+                        }
                         if let Some((framebuffer, width, height)) = bound_draw_framebuffer {
                             let rt0 = draw_view.render_targets().render_targets[0];
                             if rt0.address != 0 {
@@ -6390,13 +6588,22 @@ impl RasterizerInterface for RasterizerOpenGL {
                                 );
                             }
                         }
-                        gl::DrawArraysInstancedBaseInstance(
-                            primitive_mode,
-                            base_vertex,
-                            num_vertices as i32,
-                            num_instances as i32,
-                            base_instance,
-                        );
+                        if let Some(params) = self.pending_indirect_draw {
+                            emit_indirect_draw(
+                                &mut self.buffer_cache,
+                                draw_state,
+                                params,
+                                primitive_mode,
+                            );
+                        } else {
+                            gl::DrawArraysInstancedBaseInstance(
+                                primitive_mode,
+                                base_vertex,
+                                num_vertices as i32,
+                                num_instances as i32,
+                                base_instance,
+                            );
+                        }
                         if let Some((framebuffer, width, height)) = bound_draw_framebuffer {
                             let rt0 = draw_view.render_targets().render_targets[0];
                             if rt0.address != 0 {
@@ -7399,6 +7606,7 @@ impl RasterizerInterface for RasterizerOpenGL {
         }
         self.num_queued_commands = self.num_queued_commands.saturating_add(1);
         self.total_draw_count = self.total_draw_count.saturating_add(1);
+        self.has_written_global_memory |= pipeline.writes_global_memory();
         record_gl_draw_stage(draw_seq, 13);
         let profile_total_us = draw_start.map(trace_elapsed_us).unwrap_or(0);
         if trace_draw_profile_ring && profile_total_us >= gl_draw_profile_min_us() {
@@ -7443,7 +7651,6 @@ impl RasterizerInterface for RasterizerOpenGL {
     /// Port of `RasterizerOpenGL::DrawIndirect`.
     fn draw_indirect(&mut self, indirect_view: Maxwell3DIndirectView<'_>) {
         let params = *indirect_view.params();
-        let draw_state = indirect_view.draw_state();
         let cache_params = crate::buffer_cache::buffer_cache_base::DrawIndirectParams {
             indirect_start_address: params.indirect_start_address,
             count_start_address: params.count_start_address,
@@ -7454,68 +7661,142 @@ impl RasterizerInterface for RasterizerOpenGL {
         };
 
         self.buffer_cache.set_draw_indirect(Some(cache_params));
-
-        if params.is_byte_count {
-            log::warn!("RasterizerOpenGL::draw_indirect byte-count path is not ported yet");
-            self.buffer_cache.set_draw_indirect(None);
-            return;
-        }
-        if params.include_count {
-            log::warn!("RasterizerOpenGL::draw_indirect count-buffer path is not ported yet");
-            self.buffer_cache.set_draw_indirect(None);
-            return;
-        }
-
-        self.buffer_cache.update_graphics_buffers(params.is_indexed);
-        self.buffer_cache
-            .bind_host_geometry_buffers(params.is_indexed);
-        for stage in 0..crate::buffer_cache::buffer_cache_base::NUM_STAGES as usize {
-            self.buffer_cache.bind_host_stage_buffers(stage);
-        }
-
-        let (buffer_id, offset) = self.buffer_cache.get_draw_indirect_buffer();
-        let handle = self.buffer_cache.get_buffer_gpu_handle(buffer_id);
-        if handle == 0 {
-            log::warn!("RasterizerOpenGL::draw_indirect skipped: missing GL indirect buffer");
-            self.buffer_cache.set_draw_indirect(None);
-            return;
-        }
-
-        let primitive_mode = primitive_topology_to_gl(draw_state.topology);
-        unsafe {
-            gl::BindBuffer(gl::DRAW_INDIRECT_BUFFER, handle);
-            let gl_offset = offset as usize as *const c_void;
-            if params.is_indexed {
-                let format = index_format_to_gl(draw_state.index_buffer.format);
-                gl::MultiDrawElementsIndirect(
-                    primitive_mode,
-                    format,
-                    gl_offset,
-                    params.max_draw_counts as i32,
-                    params.stride as i32,
-                );
-            } else {
-                gl::MultiDrawArraysIndirect(
-                    primitive_mode,
-                    gl_offset,
-                    params.max_draw_counts as i32,
-                    params.stride as i32,
-                );
-            }
-        }
-
+        self.pending_indirect_draw = Some(params);
+        self.draw(indirect_view.into_draw_view(), 1);
+        self.pending_indirect_draw = None;
         self.buffer_cache.set_draw_indirect(None);
-        self.num_queued_commands = self.num_queued_commands.saturating_add(1);
-        self.total_draw_count = self.total_draw_count.saturating_add(1);
-        self.tick_gpu_work();
     }
 
     fn draw_texture(
         &mut self,
-        _draw_texture_view: crate::engines::draw_manager::Maxwell3DDrawTextureView<'_>,
+        mut draw_texture_view: crate::engines::draw_manager::Maxwell3DDrawTextureView<'_>,
     ) {
-        debug!("RasterizerOpenGL::draw_texture");
-        self.tick_gpu_work();
+        let _gpu_tick_guard = GpuTickGuard(self.gpu_tick_callback.clone());
+        let draw_texture_state = draw_texture_view.draw_texture_state();
+        let render_targets = draw_texture_view.render_targets();
+        let descriptor_sync_regs = draw_texture_view.descriptor_sync_regs();
+        let dirty_flags = draw_texture_view.dirty_flags();
+        let fallback_size = crate::texture_cache::types::Extent2D {
+            width: render_targets.surface_clip.width,
+            height: render_targets.surface_clip.height,
+        };
+
+        let texture_cache: *mut OpenGLTextureCache = &mut self.texture_cache;
+        let _texture_guard = unsafe { (*texture_cache).base.mutex.lock() };
+        let framebuffer = unsafe {
+            (*texture_cache)
+                .base
+                .synchronize_graphics_descriptors(descriptor_sync_regs);
+            (*texture_cache).update_render_targets_and_get_framebuffer_from_snapshot(
+                &render_targets,
+                &dirty_flags,
+                &mut draw_texture_view,
+                false,
+                None,
+                fallback_size,
+            )
+        };
+        let Some((framebuffer, _, _)) = framebuffer else {
+            return;
+        };
+
+        let viewport_scale = if unsafe { (*texture_cache).base.is_rescaling } {
+            settings::values().resolution_info.up_factor
+        } else {
+            1.0
+        };
+        Self::sync_state(
+            draw_texture_view.draw_view_mut(),
+            unsafe { self.state_tracker.as_mut() },
+            self.transient_vao,
+            self.has_depth_buffer_float,
+            self.has_viewport_swizzle,
+            self.has_fill_rectangle,
+            viewport_scale,
+        );
+
+        let sampler_id = unsafe {
+            (*texture_cache)
+                .base
+                .get_graphics_sampler_id(draw_texture_state.src_sampler)
+        };
+        unsafe {
+            (*texture_cache).materialize_samplers(&[sampler_id]);
+        }
+        let sampler = unsafe { (*texture_cache).get_sampler(sampler_id) }.map(|s| s.handle());
+        let source =
+            unsafe { (*texture_cache).draw_texture_source(draw_texture_state.src_texture) };
+        let (Some(sampler), Some((texture, source_size))) = (sampler, source) else {
+            return;
+        };
+
+        let resolution = settings::values().resolution_info.clone();
+        let scale = |value: f32| resolution.scale_up_i32(value as i32);
+        let dst_region = Region2D {
+            start: Offset2D {
+                x: scale(draw_texture_state.dst_x0),
+                y: scale(draw_texture_state.dst_y0),
+            },
+            end: Offset2D {
+                x: scale(draw_texture_state.dst_x1),
+                y: scale(draw_texture_state.dst_y1),
+            },
+        };
+        let src_region = Region2D {
+            start: Offset2D {
+                x: scale(draw_texture_state.src_x0),
+                y: scale(draw_texture_state.src_y0),
+            },
+            end: Offset2D {
+                x: scale(draw_texture_state.src_x1),
+                y: scale(draw_texture_state.src_y1),
+            },
+        };
+        let src_size = Extent3D {
+            width: resolution.scale_up_u32(source_size.width),
+            height: resolution.scale_up_u32(source_size.height),
+            depth: source_size.depth,
+        };
+
+        if self.has_draw_texture {
+            if let Some(draw_texture) = GL_DRAW_TEXTURE_NV.get().and_then(|entry| *entry) {
+                unsafe { self.state_tracker.as_mut() }.bind_framebuffer(framebuffer);
+                unsafe {
+                    draw_texture(
+                        texture,
+                        sampler,
+                        dst_region.start.x as f32,
+                        dst_region.start.y as f32,
+                        dst_region.end.x as f32,
+                        dst_region.end.y as f32,
+                        0.0,
+                        draw_texture_state.src_x0 / source_size.width as f32,
+                        draw_texture_state.src_y0 / source_size.height as f32,
+                        draw_texture_state.src_x1 / source_size.width as f32,
+                        draw_texture_state.src_y1 / source_size.height as f32,
+                    );
+                }
+            } else {
+                self.has_draw_texture = false;
+            }
+        }
+        if !self.has_draw_texture {
+            let mut program_manager = self.program_manager.lock();
+            let Some(blit_image) = self.blit_image.as_ref() else {
+                return;
+            };
+            blit_image.blit_color(
+                &mut program_manager,
+                framebuffer,
+                texture,
+                sampler,
+                &dst_region,
+                &src_region,
+                &src_size,
+            );
+            unsafe { self.state_tracker.as_mut() }.invalidate_state();
+        }
+        self.num_queued_commands = self.num_queued_commands.saturating_add(1);
     }
 
     fn clear(&mut self, mut clear_view: Maxwell3DClearView<'_>, layer_count: u32) {
@@ -7576,11 +7857,11 @@ impl RasterizerInterface for RasterizerOpenGL {
             return;
         };
         unsafe {
-            self.state_tracker.bind_framebuffer(framebuffer);
-            self.state_tracker.notify_viewport0();
+            unsafe { self.state_tracker.as_mut() }.bind_framebuffer(framebuffer);
+            unsafe { self.state_tracker.as_mut() }.notify_viewport0();
             gl::Viewport(0, 0, width as i32, height as i32);
             if clear_view.use_scissor() {
-                self.state_tracker.notify_scissor0();
+                unsafe { self.state_tracker.as_mut() }.notify_scissor0();
                 let scissor = clear_view.scissor(0);
                 if scissor.enabled && scissor.max_x > scissor.min_x && scissor.max_y > scissor.min_y
                 {
@@ -7596,12 +7877,12 @@ impl RasterizerInterface for RasterizerOpenGL {
                     gl::Disablei(gl::SCISSOR_TEST, 0);
                 }
             } else {
-                self.state_tracker.notify_scissor0();
+                unsafe { self.state_tracker.as_mut() }.notify_scissor0();
                 gl::Disablei(gl::SCISSOR_TEST, 0);
             }
             if use_color {
                 let rt = render_targets.render_targets[rt_index];
-                self.state_tracker.notify_color_mask(rt_index);
+                unsafe { self.state_tracker.as_mut() }.notify_color_mask(rt_index);
                 gl::ColorMaski(
                     rt_index as u32,
                     if clear_r { gl::TRUE } else { gl::FALSE },
@@ -7609,7 +7890,7 @@ impl RasterizerInterface for RasterizerOpenGL {
                     if clear_b { gl::TRUE } else { gl::FALSE },
                     if clear_a { gl::TRUE } else { gl::FALSE },
                 );
-                self.state_tracker.notify_framebuffer_srgb();
+                unsafe { self.state_tracker.as_mut() }.notify_framebuffer_srgb();
                 if clear_view.framebuffer_srgb() {
                     gl::Enable(gl::FRAMEBUFFER_SRGB);
                 } else {
@@ -7653,7 +7934,7 @@ impl RasterizerInterface for RasterizerOpenGL {
                 );
             }
             if use_depth {
-                self.state_tracker.notify_depth_mask();
+                unsafe { self.state_tracker.as_mut() }.notify_depth_mask();
                 gl::DepthMask(gl::TRUE);
             }
             if use_depth && use_stencil {
@@ -7746,7 +8027,7 @@ impl RasterizerInterface for RasterizerOpenGL {
             return;
         };
         pipeline.set_engine(dispatch.clone(), Arc::clone(&mm));
-        pipeline.configure_resource_state(
+        pipeline.configure(
             &mut self.buffer_cache,
             &mut self.texture_cache,
             &mut self.program_manager.lock(),
@@ -7814,7 +8095,7 @@ impl RasterizerInterface for RasterizerOpenGL {
             return;
         };
         self.query_cache
-            .set_commands_queued(self.num_queued_commands != 0);
+            .set_commands_queued(self.any_command_queued());
         self.query_cache.reset_counter(mapped_query_type as u32);
     }
 
@@ -7859,7 +8140,7 @@ impl RasterizerInterface for RasterizerOpenGL {
                 .unwrap_or(0)
         });
         self.query_cache
-            .set_commands_queued(self.num_queued_commands != 0);
+            .set_commands_queued(self.any_command_queued());
         self.query_cache.query(
             gpu_addr,
             mapped_query_type,
@@ -7993,11 +8274,7 @@ impl RasterizerInterface for RasterizerOpenGL {
         );
     }
 
-    fn flush_all(&mut self) {
-        unsafe {
-            gl::Flush();
-        }
-    }
+    fn flush_all(&mut self) {}
 
     fn flush_region(&mut self, addr: u64, size: u64) {
         if addr == 0 || size == 0 {
@@ -8014,15 +8291,27 @@ impl RasterizerInterface for RasterizerOpenGL {
             self.buffer_cache.download_memory(addr, size);
         }
         self.query_cache
-            .set_commands_queued(self.num_queued_commands != 0);
+            .set_commands_queued(self.any_command_queued());
         self.query_cache.flush_region(addr, size as usize);
     }
 
-    fn must_flush_region(&self, _addr: u64, _size: u64) -> bool {
-        // The Rust OpenGL port does not yet own the upstream lock/runtime graph needed
-        // for exact texture-cache flush area tracking. Keep the method conservative
-        // until `TextureCache` channel/runtime ownership reaches parity.
-        false
+    fn must_flush_region(&self, addr: u64, size: u64) -> bool {
+        Self::must_flush_region_with(
+            common::settings::is_gpu_level_high(&common::settings::values()),
+            || {
+                let _lo_buf = common::lock_order::guard("buffer_cache");
+                let _buffer_guard = self.buffer_cache.mutex.lock();
+                self.buffer_cache
+                    .is_region_gpu_modified(addr, size as usize)
+            },
+            || {
+                let _lo_tex = common::lock_order::guard("texture_cache");
+                let _texture_guard = self.texture_cache.base.mutex.lock();
+                self.texture_cache
+                    .base
+                    .is_region_gpu_modified(addr, size as usize)
+            },
+        )
     }
 
     fn get_flush_area(&self, addr: u64, size: u64) -> RasterizerDownloadArea {
@@ -8073,7 +8362,7 @@ impl RasterizerInterface for RasterizerOpenGL {
         }
         self.shader_cache.invalidate_region(addr, size as usize);
         self.query_cache
-            .set_commands_queued(self.num_queued_commands != 0);
+            .set_commands_queued(self.any_command_queued());
         self.query_cache.invalidate_region(addr, size as usize);
     }
 
@@ -8173,7 +8462,16 @@ impl RasterizerInterface for RasterizerOpenGL {
         self.shader_cache.on_cache_invalidation(addr, size as usize);
     }
 
-    fn modify_gpu_memory(&mut self, _as_id: usize, _addr: u64, _size: u64) {}
+    fn modify_gpu_memory(&mut self, as_id: usize, addr: u64, size: u64) {
+        let _lo_tex = common::lock_order::guard("texture_cache");
+        let texture_cache: *mut OpenGLTextureCache = &mut self.texture_cache;
+        let _texture_guard = unsafe { (*texture_cache).base.mutex.lock() };
+        unsafe {
+            (*texture_cache)
+                .base
+                .unmap_gpu_memory(as_id, addr, size as usize);
+        }
+    }
 
     fn flush_and_invalidate_region(&mut self, addr: u64, size: u64) {
         if settings::is_gpu_level_extreme(&settings::values()) {
@@ -8262,6 +8560,22 @@ impl RasterizerInterface for RasterizerOpenGL {
             )
         };
         accelerated
+    }
+
+    fn accelerate_conditional_rendering_with_address(
+        &mut self,
+        condition_address: u64,
+        compare_size: u64,
+    ) -> bool {
+        let Some(memory_manager) = self.channel_memory_manager.as_ref().cloned() else {
+            return false;
+        };
+        let mut memory_manager = memory_manager.lock();
+        memory_manager.flush_caching();
+        if settings::is_gpu_level_high(&settings::values()) {
+            return false;
+        }
+        memory_manager.is_memory_dirty(condition_address, compare_size)
     }
 
     fn accelerate_dma_buffer_copy(
@@ -8434,51 +8748,80 @@ impl RasterizerInterface for RasterizerOpenGL {
     }
 
     fn initialize_channel(&mut self, channel: &mut crate::control::channel_state::ChannelState) {
-        if let Some(maxwell_3d) = channel.maxwell_3d.as_mut() {
-            super::gl_state_tracker::StateTracker::setup_tables(maxwell_3d.dirty_tables_mut());
+        self.channel_caches.create_channel(channel);
+        {
+            let buffer_mutex: *const _ = &self.buffer_cache.mutex;
+            let texture_mutex: *const _ = &self.texture_cache.base.mutex;
+            lock_two_reentrant_mutexes!(buffer_mutex, texture_mutex, _buffer_guard, _texture_guard);
+            self.texture_cache.base.create_channel(channel);
+            self.buffer_cache.create_channel(channel);
         }
         self.shader_cache.create_channel(channel);
         self.query_cache.create_channel(channel);
-        self.texture_cache.base.create_channel(channel);
-        self.buffer_cache.create_channel(channel);
+        unsafe { self.state_tracker.as_mut() }.setup_tables(channel);
     }
 
     fn bind_channel(&mut self, channel: &mut crate::control::channel_state::ChannelState) {
-        self.buffer_cache.bind_to_channel(channel.bind_id);
+        self.channel_caches.bind_to_channel(channel.bind_id);
+        {
+            let buffer_mutex: *const _ = &self.buffer_cache.mutex;
+            let texture_mutex: *const _ = &self.texture_cache.base.mutex;
+            lock_two_reentrant_mutexes!(buffer_mutex, texture_mutex, _buffer_guard, _texture_guard);
+            self.texture_cache.base.bind_to_channel(channel.bind_id);
+            self.buffer_cache.bind_to_channel(channel.bind_id);
+        }
         self.shader_cache.bind_to_channel(channel.bind_id);
         self.query_cache.bind_to_channel(channel.bind_id);
-        self.texture_cache.base.bind_to_channel(channel.bind_id);
-        // Extract the channel's MemoryManager and store it so subsequent
-        // draws can build GpuMemoryAccess adapters.
-        if let Some(ref mm) = channel.memory_manager {
-            if std::env::var_os("RUZU_TRACE_GL_QUERY").is_some() {
-                log::info!(
-                    "RasterizerOpenGL::bind_channel channel_id={} memory_manager={:p}",
-                    channel.bind_id,
-                    Arc::as_ptr(mm)
-                );
-            }
-            self.channel_memory_manager = Some(Arc::clone(mm));
-
-            // The buffer cache reads through the channel's upstream-shaped
-            // MemoryManager owner.
+        unsafe { self.state_tracker.as_mut() }.change_channel(channel);
+        unsafe { self.state_tracker.as_mut() }.invalidate_state();
+        self.channel_memory_manager = self
+            .channel_caches
+            .current_channel_state()
+            .and_then(ChannelCacheAccessor::gpu_memory_arc);
+        if let Some(mm) = self.channel_memory_manager.as_ref() {
             self.buffer_cache
                 .set_gpu_memory(Box::new(GpuMemoryAccessAdapter { mm: Arc::clone(mm) }));
             if let Some(ref device_reader) = self.device_memory_reader {
                 self.buffer_cache
                     .set_device_memory(Box::new(DeviceMemoryAccessAdapter {
                         device_reader: Arc::clone(device_reader),
+                        guest_writer: self.guest_memory_writer.clone(),
                     }));
             }
         }
     }
 
     fn release_channel(&mut self, channel_id: i32) {
-        self.buffer_cache.erase_channel(channel_id);
+        unsafe { self.state_tracker.as_mut() }.release_channel(channel_id);
+        self.channel_caches.erase_channel(channel_id);
+        {
+            let buffer_mutex: *const _ = &self.buffer_cache.mutex;
+            let texture_mutex: *const _ = &self.texture_cache.base.mutex;
+            lock_two_reentrant_mutexes!(buffer_mutex, texture_mutex, _buffer_guard, _texture_guard);
+            self.texture_cache.base.erase_channel(channel_id);
+            self.buffer_cache.erase_channel(channel_id);
+        }
         self.shader_cache.erase_channel(channel_id);
         self.query_cache.erase_channel(channel_id);
-        self.channel_memory_manager = None;
-        self.texture_cache.base.clear_channel_gpu_memory();
+        self.channel_memory_manager = self
+            .channel_caches
+            .current_channel_state()
+            .and_then(ChannelCacheAccessor::gpu_memory_arc);
+        if let Some(mm) = self.channel_memory_manager.as_ref() {
+            self.buffer_cache
+                .set_gpu_memory(Box::new(GpuMemoryAccessAdapter { mm: Arc::clone(mm) }));
+        } else {
+            self.buffer_cache.clear_gpu_memory();
+        }
+    }
+
+    fn register_transform_feedback(&mut self, tfb_object_addr: u64) {
+        self.buffer_cache
+            .bind_transform_feedback_object(tfb_object_addr);
+    }
+
+    fn has_draw_transform_feedback(&self) -> bool {
+        true
     }
 }
 
@@ -8513,6 +8856,19 @@ mod tests {
         fn drop(&mut self) {
             settings::values_mut().current_gpu_accuracy = self.previous;
         }
+    }
+
+    #[test]
+    fn test_rasterizer_retains_one_stable_state_tracker_owner() {
+        let syncpoints = Arc::new(SyncpointManager::new());
+        let mut rasterizer = RasterizerOpenGL::new_for_test(syncpoints);
+        let referenced = unsafe { rasterizer.state_tracker.as_mut() } as *mut StateTracker;
+        let owned = rasterizer
+            .owned_state_tracker
+            .as_deref_mut()
+            .expect("test rasterizer state tracker owner") as *mut StateTracker;
+
+        assert_eq!(referenced, owned);
     }
 
     #[test]
@@ -8914,6 +9270,52 @@ mod tests",
     }
 
     #[test]
+    fn indirect_draw_reuses_common_prepare_draw_path() {
+        let source = include_str!("gl_rasterizer.rs");
+        let indirect_start = source
+            .find("fn draw_indirect(&mut self")
+            .expect("indirect draw implementation");
+        let indirect_end = source[indirect_start..]
+            .find("\n    fn draw_texture(")
+            .expect("next rasterizer method")
+            + indirect_start;
+        let indirect = &source[indirect_start..indirect_end];
+        let set_cache = indirect
+            .find("self.buffer_cache.set_draw_indirect(Some(cache_params))")
+            .expect("indirect buffer cache arm");
+        let set_callback = indirect
+            .find("self.pending_indirect_draw = Some(params)")
+            .expect("indirect callback arm");
+        let prepare_draw = indirect
+            .find("self.draw(indirect_view.into_draw_view(), 1)")
+            .expect("shared draw preparation");
+        let clear_callback = indirect
+            .find("self.pending_indirect_draw = None")
+            .expect("indirect callback clear");
+        let clear_cache = indirect
+            .find("self.buffer_cache.set_draw_indirect(None)")
+            .expect("indirect buffer cache clear");
+        assert!(set_cache < set_callback);
+        assert!(set_callback < prepare_draw);
+        assert!(prepare_draw < clear_callback);
+        assert!(clear_callback < clear_cache);
+
+        let begin_xfb = source
+            .find("gl::BeginTransformFeedback")
+            .expect("transform feedback begin");
+        let emit_indirect = source[begin_xfb..]
+            .find("emit_indirect_draw(")
+            .expect("indirect callback inside prepared draw")
+            + begin_xfb;
+        let end_xfb = source[emit_indirect..]
+            .find("gl::EndTransformFeedback")
+            .expect("transform feedback end after indirect draw")
+            + emit_indirect;
+        assert!(begin_xfb < emit_indirect);
+        assert!(emit_indirect < end_xfb);
+    }
+
+    #[test]
     fn compute_engine_adapter_feeds_compute_storage_buffer_binding() {
         let mut qmd = QueueMetaData::default();
         qmd.const_buffer_enable_mask = 1;
@@ -8952,6 +9354,35 @@ mod tests",
     }
 
     #[test]
+    fn device_memory_adapter_forwards_download_writes_to_guest_owner() {
+        let writes = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let writes_for_callback = Arc::clone(&writes);
+        let adapter = DeviceMemoryAccessAdapter {
+            device_reader: Arc::new(|_, out| {
+                out.fill(0);
+                true
+            }),
+            guest_writer: Some(Arc::new(move |addr, data| {
+                writes_for_callback
+                    .lock()
+                    .unwrap()
+                    .push((addr, data.to_vec()));
+            })),
+        };
+
+        crate::buffer_cache::buffer_cache_base::DeviceMemoryAccess::write_block_unsafe(
+            &adapter,
+            0x1234,
+            &[1, 2, 3, 4],
+        );
+
+        assert_eq!(
+            writes.lock().unwrap().as_slice(),
+            &[(0x1234, vec![1, 2, 3, 4])]
+        );
+    }
+
+    #[test]
     fn query_fence_defers_guest_write_until_release() {
         let syncpoints = Arc::new(SyncpointManager::new());
         let mut rast = RasterizerOpenGL::new_for_test(syncpoints);
@@ -8965,6 +9396,40 @@ mod tests",
         rast.release_fences(true);
 
         assert_eq!(&backing[0..4], &0x1234_5678u32.to_le_bytes());
+    }
+
+    #[test]
+    fn must_flush_region_matches_upstream_cache_order_and_accuracy_gate() {
+        let texture_queries = std::cell::Cell::new(0);
+        assert!(RasterizerOpenGL::must_flush_region_with(
+            false,
+            || true,
+            || {
+                texture_queries.set(texture_queries.get() + 1);
+                false
+            },
+        ));
+        assert_eq!(texture_queries.get(), 0);
+
+        assert!(!RasterizerOpenGL::must_flush_region_with(
+            false,
+            || false,
+            || {
+                texture_queries.set(texture_queries.get() + 1);
+                true
+            },
+        ));
+        assert_eq!(texture_queries.get(), 0);
+
+        assert!(RasterizerOpenGL::must_flush_region_with(
+            true,
+            || false,
+            || {
+                texture_queries.set(texture_queries.get() + 1);
+                true
+            },
+        ));
+        assert_eq!(texture_queries.get(), 1);
     }
 
     #[derive(Clone)]

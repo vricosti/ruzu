@@ -11,6 +11,7 @@ use std::ptr::NonNull;
 
 use ash::vk;
 use ash::vk::Handle;
+use common::slot_vector::SlotVector;
 use log::{debug, trace};
 use smallvec::SmallVec;
 
@@ -217,6 +218,7 @@ pub struct BufferCacheRuntime {
     null_buffer_size: vk::DeviceSize,
     has_null_descriptor: bool,
     extended_dynamic_state_supported: bool,
+    transform_feedback: Option<vk::ExtTransformFeedbackFn>,
     max_vertex_input_bindings: u32,
 }
 
@@ -234,6 +236,7 @@ impl BufferCacheRuntime {
         index_type_uint8_supported: bool,
         has_null_descriptor: bool,
         extended_dynamic_state_supported: bool,
+        transform_feedback_supported: bool,
         max_vertex_input_bindings: u32,
     ) -> Result<Self, vk::Result> {
         let quad_index_pass = QuadIndexedPass::new(
@@ -254,6 +257,11 @@ impl BufferCacheRuntime {
         } else {
             None
         };
+        let transform_feedback = transform_feedback_supported.then(|| {
+            vk::ExtTransformFeedbackFn::load(|name| unsafe {
+                std::mem::transmute(instance.get_device_proc_addr(device.handle(), name.as_ptr()))
+            })
+        });
         Ok(Self {
             device,
             instance,
@@ -274,6 +282,7 @@ impl BufferCacheRuntime {
             null_buffer_size: 4,
             has_null_descriptor,
             extended_dynamic_state_supported,
+            transform_feedback,
             max_vertex_input_bindings,
         })
     }
@@ -856,12 +865,11 @@ impl base::BufferCacheRuntime for BufferCacheRuntime {
         index_format: IndexFormat,
         base_vertex: u32,
         num_indices: u32,
-        _buffer: BufferId,
-        gpu_handle: u32,
+        buffer: &mut BufferBase,
         offset: u32,
         _size: u32,
     ) {
-        let mut buffer = self.resolve_buffer(gpu_handle);
+        let mut buffer = self.resolve_buffer(buffer.gpu_handle);
         let mut vk_offset = u64::from(offset);
         let mut index_type = match index_format {
             IndexFormat::UnsignedByte => vk::IndexType::UINT8_EXT,
@@ -1034,15 +1042,31 @@ impl base::BufferCacheRuntime for BufferCacheRuntime {
         self.guest_descriptor_queue().add_texel_buffer(view);
     }
 
-    fn bind_transform_feedback_buffers(&mut self, _bindings: &HostBindings) {
-        // Upstream `BindTransformFeedbackBuffers` returns early unless
-        // VK_EXT_transform_feedback is supported (already logged in the
-        // rasterizer). That extension is not available on the MoltenVK target,
-        // so this is a no-op — matching upstream's behaviour there. Recording
-        // vkCmdBindTransformFeedbackBuffersEXT would additionally require the
-        // per-binding VkBuffer handles, which this signature does not carry
-        // (HostBindings holds BufferIds, resolved by the caller); wire both when
-        // a transform-feedback-capable device is targeted.
+    fn bind_transform_feedback_buffers(
+        &mut self,
+        bindings: &HostBindings,
+        buffers: &mut SlotVector<BufferBase>,
+    ) {
+        let Some(transform_feedback) = self.transform_feedback.clone() else {
+            return;
+        };
+        let buffer_handles: Vec<vk::Buffer> = bindings
+            .buffer_ids
+            .iter()
+            .map(|&buffer_id| self.resolve_buffer(buffers[buffer_id].gpu_handle))
+            .collect();
+        let offsets: Vec<vk::DeviceSize> = bindings.offsets.iter().copied().collect();
+        let sizes: Vec<vk::DeviceSize> = bindings.sizes.iter().copied().collect();
+        self.scheduler().record(move |command_buffer| unsafe {
+            (transform_feedback.cmd_bind_transform_feedback_buffers_ext)(
+                command_buffer,
+                0,
+                buffer_handles.len() as u32,
+                buffer_handles.as_ptr(),
+                offsets.as_ptr(),
+                sizes.as_ptr(),
+            );
+        });
     }
 
     fn bind_compute_uniform_buffer(

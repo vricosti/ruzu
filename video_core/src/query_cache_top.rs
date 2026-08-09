@@ -84,7 +84,7 @@ impl<H: CounterHandle> HostCounterBase<H> {
         }
         let mut value = blocking_query(r#async) + self.base_result;
         if let Some(dep) = self.dependency.take() {
-            value += dep.query(r#async);
+            value += dep.query(false);
         }
         self.result = Some(value);
         value
@@ -351,5 +351,20 @@ mod tests {
         assert_eq!(value, 12);
         assert_eq!(*queried.lock().unwrap(), vec![false]);
         assert_eq!(base.depth(), 0);
+    }
+
+    #[test]
+    fn host_counter_dependencies_are_queried_synchronously() {
+        let ended = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let queried = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let dependency = TestCounter {
+            ended,
+            queried: queried.clone(),
+            value: 9,
+            depth: 0,
+        };
+        let mut base = HostCounterBase::new(Some(dependency));
+        assert_eq!(base.query(true, |_| 3), 12);
+        assert_eq!(*queried.lock().unwrap(), vec![false]);
     }
 }

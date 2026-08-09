@@ -9,6 +9,7 @@ use std::sync::Arc;
 
 use parking_lot::Mutex;
 
+use super::gl_resource_manager::OGLQuery;
 use crate::control::channel_state::ChannelState;
 use crate::control::channel_state_cache::ChannelCacheAccessor;
 use crate::query_cache_top::{
@@ -33,9 +34,8 @@ pub fn get_target(query_type: QueryType) -> u32 {
 /// Corresponds to `OpenGL::QueryCache`.
 pub struct QueryCache {
     /// Per-type pool of reusable query objects.
-    query_pools: [Vec<u32>; NUM_QUERY_TYPES],
+    query_pools: Arc<Mutex<[Vec<OGLQuery>; NUM_QUERY_TYPES]>>,
     channel_memory_manager: Option<Arc<parking_lot::Mutex<crate::memory_manager::MemoryManager>>>,
-    gpu_ticks_getter: Option<Arc<dyn Fn() -> u64 + Send + Sync>>,
     legacy: QueryCacheLegacy<CachedQuery, HostCounterHandle>,
     commands_queued: bool,
 }
@@ -46,9 +46,8 @@ impl QueryCache {
     /// Corresponds to `QueryCache::QueryCache()`.
     pub fn new() -> Self {
         let mut cache = Self {
-            query_pools: [Vec::new(), Vec::new(), Vec::new()],
+            query_pools: Arc::new(Mutex::new(std::array::from_fn(|_| Vec::new()))),
             channel_memory_manager: None,
-            gpu_ticks_getter: None,
             legacy: QueryCacheLegacy::new(),
             commands_queued: false,
         };
@@ -61,27 +60,20 @@ impl QueryCache {
     /// Allocate a query object for the given type.
     ///
     /// Corresponds to `QueryCache::AllocateQuery()`.
-    pub fn allocate_query(&mut self, query_type: QueryType) -> u32 {
-        let pool = &mut self.query_pools[query_type as usize];
-        if let Some(query) = pool.pop() {
+    pub fn allocate_query(&mut self, query_type: QueryType) -> OGLQuery {
+        if let Some(query) = self.query_pools.lock()[query_type as usize].pop() {
             return query;
         }
-        let mut query: u32 = 0;
-        unsafe {
-            gl::GenQueries(1, &mut query);
-        }
+        let mut query = OGLQuery::new();
+        query.create(get_target(query_type));
         query
     }
 
     /// Return a query object to the pool.
     ///
     /// Corresponds to `QueryCache::Reserve()`.
-    pub fn reserve(&mut self, query_type: QueryType, query: u32) {
-        self.query_pools[query_type as usize].push(query);
-    }
-
-    pub fn set_gpu_ticks_getter(&mut self, getter: Arc<dyn Fn() -> u64 + Send + Sync>) {
-        self.gpu_ticks_getter = Some(getter);
+    pub fn reserve(&mut self, query_type: QueryType, query: OGLQuery) {
+        self.query_pools.lock()[query_type as usize].push(query);
     }
 
     /// Port of `QueryCacheLegacy::CreateChannel`.
@@ -102,7 +94,11 @@ impl QueryCache {
     /// Port of `QueryCacheLegacy::EraseChannel`.
     pub fn erase_channel(&mut self, channel_id: i32) {
         self.legacy.erase_channel(channel_id);
-        self.channel_memory_manager = None;
+        self.channel_memory_manager = self
+            .legacy
+            .channel_caches
+            .current_channel_state()
+            .and_then(ChannelCacheAccessor::gpu_memory_arc);
     }
 
     pub fn reset_counter(&mut self, query_type: u32) {
@@ -176,24 +172,8 @@ impl QueryCache {
         invalidate_query_cache_writeback: impl FnOnce(u64, u64) + Send + 'static,
     ) {
         let Some(memory_manager) = self.channel_memory_manager.as_ref().cloned() else {
-            if std::env::var_os("RUZU_TRACE_GL_QUERY").is_some() {
-                log::info!(
-                    "GLQueryCache::query drop gpu=0x{:X} type={:?} timestamp={:?}",
-                    gpu_addr,
-                    query_type,
-                    timestamp
-                );
-            }
             return;
         };
-        if std::env::var_os("RUZU_TRACE_GL_QUERY").is_some() {
-            log::info!(
-                "GLQueryCache::query gpu=0x{:X} type={:?} timestamp={:?}",
-                gpu_addr,
-                query_type,
-                timestamp
-            );
-        }
         let cpu_addr = {
             let mm = memory_manager.lock();
             mm.gpu_to_cpu_address(gpu_addr)
@@ -342,15 +322,18 @@ impl QueryCache {
                 if cache_begin < addr_end && addr_begin < cache_end {
                     let async_job_id = query.base.assigned_async_job;
                     let value = query.flush(self, r#async);
-                    if async_job_id != AsyncJobId(0) {
-                        if let Some(async_job) =
-                            self.legacy.slot_async_jobs.lock().get_mut(&async_job_id)
-                        {
-                            async_job.collected = true;
-                            async_job.value = value;
-                        }
-                        query.base.assigned_async_job = AsyncJobId(0);
+                    assert_ne!(
+                        async_job_id,
+                        AsyncJobId(0),
+                        "flushed cached queries must own an async job"
+                    );
+                    if let Some(async_job) =
+                        self.legacy.slot_async_jobs.lock().get_mut(&async_job_id)
+                    {
+                        async_job.collected = true;
+                        async_job.value = value;
                     }
+                    query.base.assigned_async_job = AsyncJobId(0);
                 } else {
                     kept.push(query);
                 }
@@ -364,11 +347,10 @@ impl QueryCache {
 
 #[cfg(test)]
 impl QueryCache {
-    fn new_for_test() -> Self {
+    pub(crate) fn new_for_test() -> Self {
         Self {
-            query_pools: [Vec::new(), Vec::new(), Vec::new()],
+            query_pools: Arc::new(Mutex::new(std::array::from_fn(|_| Vec::new()))),
             channel_memory_manager: None,
-            gpu_ticks_getter: None,
             legacy: QueryCacheLegacy::new(),
             commands_queued: false,
         }
@@ -400,7 +382,8 @@ impl CounterHandle for HostCounterHandle {
 /// Corresponds to `OpenGL::HostCounter`.
 pub struct HostCounter {
     pub query_type: QueryType,
-    pub query: u32,
+    query: Option<OGLQuery>,
+    query_pools: Arc<Mutex<[Vec<OGLQuery>; NUM_QUERY_TYPES]>>,
     base: HostCounterBase<HostCounterHandle>,
 }
 
@@ -413,11 +396,12 @@ impl HostCounter {
     ) -> Self {
         let query = cache.allocate_query(query_type);
         unsafe {
-            gl::BeginQuery(get_target(query_type), query);
+            gl::BeginQuery(get_target(query_type), query.handle);
         }
         Self {
             query_type,
-            query,
+            query: Some(query),
+            query_pools: Arc::clone(&cache.query_pools),
             base: HostCounterBase::new(dependency),
         }
     }
@@ -438,13 +422,17 @@ impl HostCounter {
     pub fn blocking_query(&self, _async: bool) -> u64 {
         let mut value: i64 = 0;
         unsafe {
-            gl::GetQueryObjecti64v(self.query, gl::QUERY_RESULT, &mut value);
+            gl::GetQueryObjecti64v(
+                self.query.as_ref().expect("query must be allocated").handle,
+                gl::QUERY_RESULT,
+                &mut value,
+            );
         }
         value as u64
     }
 
     pub fn query(&mut self, r#async: bool) -> u64 {
-        let query = self.query;
+        let query = self.query.as_ref().expect("query must be allocated").handle;
         self.base.query(r#async, move |_async_query| {
             let mut value: i64 = 0;
             unsafe {
@@ -460,6 +448,14 @@ impl HostCounter {
 
     pub fn depth(&self) -> u64 {
         self.base.depth()
+    }
+}
+
+impl Drop for HostCounter {
+    fn drop(&mut self) {
+        if let Some(query) = self.query.take() {
+            self.query_pools.lock()[self.query_type as usize].push(query);
+        }
     }
 }
 
@@ -600,6 +596,28 @@ mod tests {
     }
 
     #[test]
+    fn erasing_an_unbound_channel_preserves_bound_memory_manager() {
+        let mut cache = QueryCache::new_for_test();
+        let bound_mm = Arc::new(ParkingMutex::new(MemoryManager::new(17)));
+        let other_mm = Arc::new(ParkingMutex::new(MemoryManager::new(18)));
+        let mut bound_channel = ChannelState::new(5);
+        bound_channel.memory_manager = Some(Arc::clone(&bound_mm));
+        let mut other_channel = ChannelState::new(6);
+        other_channel.memory_manager = Some(other_mm);
+
+        cache.create_channel(&bound_channel);
+        cache.create_channel(&other_channel);
+        cache.bind_to_channel(bound_channel.bind_id);
+        cache.erase_channel(other_channel.bind_id);
+
+        let current = cache
+            .channel_memory_manager
+            .as_ref()
+            .expect("bound memory manager must survive another channel's release");
+        assert!(Arc::ptr_eq(current, &bound_mm));
+    }
+
+    #[test]
     fn async_flush_queue_tracks_pending_and_collects_query_values() {
         let mut cache = QueryCache::new_for_test();
         let cpu_addr = 0x5510_6000u64;
@@ -683,11 +701,16 @@ mod tests {
         let cold_page = 0x6610_6000u64 >> 12;
         cache.legacy.cached_queries.insert(
             hit_page,
-            vec![CachedQuery::new(
-                QueryType::SamplesPassed,
-                0x5510_6000,
-                0x5038_50000,
-            )],
+            vec![CachedQuery {
+                query_type: QueryType::SamplesPassed,
+                base: CachedQueryBase {
+                    cpu_addr: 0x5510_6000,
+                    gpu_addr: 0x5038_50000,
+                    counter: None,
+                    timestamp: None,
+                    assigned_async_job: AsyncJobId(7),
+                },
+            }],
         );
         cache.legacy.cached_queries.insert(
             cold_page,

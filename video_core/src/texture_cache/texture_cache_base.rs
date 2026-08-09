@@ -501,6 +501,10 @@ impl TextureCacheBase {
 
     pub fn erase_channel(&mut self, channel_id: i32) {
         self.channel_caches.erase_channel(channel_id);
+        self.channel_gpu_memory = self
+            .channel_caches
+            .current_channel_state()
+            .and_then(|channel| channel.channel_info.gpu_memory.as_ref().map(Arc::clone));
     }
 
     pub(crate) fn current_channel_state(&self) -> &TextureCacheChannelInfo {
@@ -1143,6 +1147,33 @@ mod tests {
         let cache = TextureCacheBase::new(Arc::new(MaxwellDeviceMemoryManager::default()));
         let _lock_a = cache.mutex.lock();
         let _lock_b = cache.mutex.lock();
+    }
+
+    #[test]
+    fn erasing_an_unbound_channel_preserves_bound_gpu_memory() {
+        use crate::control::channel_state::ChannelState;
+        use crate::memory_manager::MemoryManager;
+        use parking_lot::Mutex;
+
+        let mut cache = TextureCacheBase::new(Arc::new(MaxwellDeviceMemoryManager::default()));
+        let first_memory = Arc::new(Mutex::new(MemoryManager::new(41)));
+        let second_memory = Arc::new(Mutex::new(MemoryManager::new(42)));
+        let mut first = ChannelState::new(1);
+        first.memory_manager = Some(Arc::clone(&first_memory));
+        let mut second = ChannelState::new(2);
+        second.memory_manager = Some(second_memory);
+
+        cache.create_channel(&first);
+        cache.create_channel(&second);
+        cache.bind_to_channel(1);
+        cache.erase_channel(2);
+        assert_eq!(
+            cache.channel_gpu_memory.as_ref().unwrap().lock().get_id(),
+            41
+        );
+
+        cache.erase_channel(1);
+        assert!(cache.channel_gpu_memory.is_none());
     }
 
     #[test]

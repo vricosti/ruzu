@@ -2843,6 +2843,63 @@ impl TextureCacheBase {
         });
         is_modified
     }
+
+    /// Port of `TextureCache<P>::UnmapGPUMemory`.
+    pub fn unmap_gpu_memory(&mut self, as_id: usize, gpu_addr: u64, size: usize) {
+        let Some(storage_id) = self.channel_caches.get_storage_id(as_id) else {
+            return;
+        };
+        let table_index = storage_id * 2;
+        let Some(table) = self.gpu_page_table_storage.get(table_index) else {
+            return;
+        };
+        let mut image_ids = Vec::new();
+        let slot_images = &mut self.slot_images;
+        Self::for_each_gpu_page(gpu_addr, size, |page| {
+            let Some(ids) = table.get(&page) else {
+                return;
+            };
+            for &image_id in ids {
+                let image = &mut slot_images[image_id];
+                if image.flags.contains(ImageFlagBits::PICKED)
+                    || !image.overlaps_gpu(gpu_addr, size)
+                {
+                    continue;
+                }
+                image.flags.insert(ImageFlagBits::PICKED);
+                image_ids.push(image_id);
+            }
+        });
+        for &image_id in &image_ids {
+            slot_images[image_id].flags.remove(ImageFlagBits::PICKED);
+        }
+
+        for image_id in image_ids {
+            if !self.slot_images[image_id]
+                .flags
+                .contains(ImageFlagBits::CPU_MODIFIED)
+            {
+                self.slot_images[image_id]
+                    .flags
+                    .insert(ImageFlagBits::CPU_MODIFIED);
+                if self.slot_images[image_id]
+                    .flags
+                    .contains(ImageFlagBits::TRACKED)
+                {
+                    self.untrack_image(image_id);
+                }
+            }
+            if self.slot_images[image_id]
+                .flags
+                .contains(ImageFlagBits::REMAPPED)
+            {
+                continue;
+            }
+            self.slot_images[image_id]
+                .flags
+                .insert(ImageFlagBits::REMAPPED);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -4479,6 +4536,48 @@ mod tests {
         assert!(cache.slot_images[image_id]
             .flags
             .contains(ImageFlagBits::GPU_MODIFIED));
+    }
+
+    #[test]
+    fn unmap_gpu_memory_marks_overlapping_images_cpu_modified_and_remapped() {
+        use crate::control::channel_state::ChannelState;
+        use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
+        use crate::memory_manager::MemoryManager;
+        use parking_lot::Mutex as ParkingMutex;
+        use std::sync::Arc;
+
+        let mut cache = TextureCacheBase::new(Arc::new(MaxwellDeviceMemoryManager::default()));
+        let gpu_memory = Arc::new(ParkingMutex::new(MemoryManager::new(17)));
+        let other_gpu_memory = Arc::new(ParkingMutex::new(MemoryManager::new(23)));
+        let mut channel = ChannelState::new(10);
+        channel.memory_manager = Some(gpu_memory);
+        let mut other_channel = ChannelState::new(11);
+        other_channel.memory_manager = Some(other_gpu_memory);
+        cache.create_channel(&channel);
+        cache.create_channel(&other_channel);
+        cache.bind_to_channel(10);
+
+        let info = test_color_info(16, 16);
+        let image_id = cache.insert_image(&info, 0x4000);
+        cache.slot_images[image_id]
+            .flags
+            .remove(ImageFlagBits::CPU_MODIFIED);
+        cache.track_image(image_id);
+        assert!(cache.slot_images[image_id]
+            .flags
+            .contains(ImageFlagBits::TRACKED));
+
+        cache.unmap_gpu_memory(23, 0x4000, 0x100);
+        assert!(!cache.slot_images[image_id]
+            .flags
+            .contains(ImageFlagBits::REMAPPED));
+
+        cache.unmap_gpu_memory(17, 0x4000, 0x100);
+
+        let flags = cache.slot_images[image_id].flags;
+        assert!(flags.contains(ImageFlagBits::CPU_MODIFIED));
+        assert!(flags.contains(ImageFlagBits::REMAPPED));
+        assert!(!flags.contains(ImageFlagBits::TRACKED));
     }
 
     #[test]

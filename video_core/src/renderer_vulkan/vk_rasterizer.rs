@@ -706,6 +706,8 @@ impl RasterizerVulkan {
         physical_device: vk::PhysicalDevice,
         device: ash::Device,
         driver_id: vk::DriverId,
+        has_broken_parallel_shader_compiling: bool,
+        cant_blit_msaa: bool,
         width: u32,
         height: u32,
         profile: Profile,
@@ -716,6 +718,7 @@ impl RasterizerVulkan {
         index_type_uint8_supported: bool,
         has_null_descriptor: bool,
         extended_dynamic_state_supported: bool,
+        transform_feedback_supported: bool,
         extended_dynamic_state2_supported: bool,
         extended_dynamic_state2_extra_supported: bool,
         extended_dynamic_state3_blending_supported: bool,
@@ -812,6 +815,7 @@ impl RasterizerVulkan {
             shader_notify,
             use_asynchronous_shaders,
             use_vulkan_pipeline_cache,
+            has_broken_parallel_shader_compiling,
             shader_cache,
             profile,
             host_info,
@@ -855,6 +859,7 @@ impl RasterizerVulkan {
             index_type_uint8_supported,
             has_null_descriptor,
             extended_dynamic_state_supported,
+            transform_feedback_supported,
             max_vertex_input_bindings,
         )
         .map_err(|e| RendererError::InitFailed(format!("buffer cache runtime: {:?}", e)))?;
@@ -878,6 +883,7 @@ impl RasterizerVulkan {
             render_pass_cache.as_mut(),
             descriptor_pool.as_mut(),
             compute_pass_desc_queue.as_mut(),
+            cant_blit_msaa,
             image_format_list_supported,
             optimal_astc_supported,
             must_emulate_bgr565,
@@ -3000,12 +3006,13 @@ impl RasterizerInterface for RasterizerVulkan {
     fn load_disk_resources(
         &mut self,
         title_id: u64,
+        stop_loading: crate::rasterizer_interface::DiskResourceLoadStop,
         callback: crate::rasterizer_interface::DiskResourceLoadCallback,
     ) {
         let shader_dir =
             common::fs::path_util::get_ruzu_path(common::fs::path_util::RuzuPath::ShaderDir);
         self.pipeline_cache
-            .load_disk_resources(title_id, &shader_dir, callback);
+            .load_disk_resources(title_id, &shader_dir, stop_loading, callback);
     }
 
     fn draw(

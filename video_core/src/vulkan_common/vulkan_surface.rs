@@ -17,6 +17,7 @@ use super::vulkan_wrapper::VulkanError;
 /// Platform-specific window system info needed to create a surface.
 ///
 /// Port of `Core::Frontend::EmuWindow::WindowSystemInfo`.
+#[derive(Clone, Copy)]
 pub struct WindowSystemInfo {
     pub window_type: WindowSystemType,
     /// Platform-specific display connection (e.g., `*mut xlib::Display` on X11,

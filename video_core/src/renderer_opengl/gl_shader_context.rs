@@ -1,71 +1,76 @@
 // SPDX-FileCopyrightText: 2025 ruzu contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! Port of zuyu/src/video_core/renderer_opengl/gl_shader_context.h
-//!
-//! Shader compilation context — provides per-thread GL context and object pools
-//! for parallel shader compilation.
+//! Port of `video_core/renderer_opengl/gl_shader_context.h`.
 
-/// Shader object pools for reuse during compilation.
-///
-/// Corresponds to `OpenGL::ShaderContext::ShaderPools`.
-///
-/// Upstream holds three pools:
-///   - `Shader::ObjectPool<Shader::IR::Inst>` (capacity 8192)
-///   - `Shader::ObjectPool<Shader::IR::Block>` (capacity 32)
-///   - `Shader::ObjectPool<Shader::Maxwell::Flow::Block>` (capacity 32)
-///
-/// These depend on the shader_recompiler crate (`Shader::IR` / `Shader::Maxwell::Flow`)
-/// which is not yet ported. The pools will be added here once that crate is available.
+use std::mem::ManuallyDrop;
+use std::sync::Arc;
+
+use ruzu_core::frontend::graphics_context::GraphicsContext;
+use shader_recompiler::frontend::control_flow::FlowBlock;
+use shader_recompiler::ir::basic_block::Block;
+use shader_recompiler::ir::instruction::Inst;
+use shader_recompiler::object_pool::ObjectPool;
+
+/// Frontend-owned factory used by each shader worker to create its shared GL context.
+pub type SharedContextFactory =
+    Arc<dyn Fn() -> Box<dyn GraphicsContext + Send> + Send + Sync + 'static>;
+
+/// Shader object pools reused by one compilation thread.
 pub struct ShaderPools {
-    // Fields will be added when the shader_recompiler crate is ported:
-    //   inst: ObjectPool<IR::Inst>,
-    //   block: ObjectPool<IR::Block>,
-    //   flow_block: ObjectPool<Flow::Block>,
+    pub inst: ObjectPool<Inst>,
+    pub block: ObjectPool<Block>,
+    pub flow_block: ObjectPool<FlowBlock>,
 }
 
 impl ShaderPools {
-    /// Create new shader pools.
     pub fn new() -> Self {
-        Self {}
+        Self {
+            inst: ObjectPool::new(8192),
+            block: ObjectPool::new(32),
+            flow_block: ObjectPool::new(32),
+        }
     }
 
-    /// Release all contents back to the pools.
-    ///
-    /// Corresponds to `ShaderPools::ReleaseContents()`.
-    /// Upstream calls `flow_block.ReleaseContents()`, `block.ReleaseContents()`,
-    /// and `inst.ReleaseContents()` in that order. Currently a no-op because
-    /// the pools depend on the shader_recompiler crate which is not yet ported.
+    /// Upstream releases the flow, IR block, then instruction pools.
     pub fn release_contents(&mut self) {
-        // Will call pool.release_contents() on each pool once shader_recompiler is ported.
+        self.flow_block.release_contents();
+        self.block.release_contents();
+        self.inst.release_contents();
     }
 }
 
-/// Per-thread shader compilation context.
-///
-/// Corresponds to `OpenGL::ShaderContext::Context`.
-///
-/// Upstream holds:
-///   - `gl_context`: a `unique_ptr<Core::Frontend::GraphicsContext>` created via
-///     `emu_window.CreateSharedContext()`
-///   - `scoped`: a `GraphicsContext::Scoped` RAII guard that makes the context current
-///   - `pools`: `ShaderPools`
-///
-/// The GL context fields depend on `Core::Frontend::EmuWindow` and
-/// `Core::Frontend::GraphicsContext` which are not yet integrated into the
-/// OpenGL renderer pipeline. The pools field is present but empty (see `ShaderPools`).
+impl Default for ShaderPools {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Per-worker shared OpenGL context and shader allocation pools.
 pub struct Context {
-    pub pools: ShaderPools,
-    // Fields will be added when the frontend graphics context integration is available:
-    //   gl_context: Box<dyn GraphicsContext>,
-    //   scoped: ScopedContext (RAII activation of gl_context),
+    gl_context: Box<dyn GraphicsContext + Send>,
+    pub pools: ManuallyDrop<ShaderPools>,
 }
 
 impl Context {
-    /// Create a new shader compilation context.
-    pub fn new() -> Self {
+    pub fn new(factory: &SharedContextFactory) -> Self {
+        let mut gl_context = factory();
+        gl_context.make_current();
         Self {
-            pools: ShaderPools::new(),
+            gl_context,
+            pools: ManuallyDrop::new(ShaderPools::new()),
         }
+    }
+}
+
+impl Drop for Context {
+    fn drop(&mut self) {
+        // C++ field destruction is reverse declaration order: pools are
+        // released while the shared context is current, then Scoped releases
+        // the context, and finally the context object itself is destroyed.
+        unsafe {
+            ManuallyDrop::drop(&mut self.pools);
+        }
+        self.gl_context.done_current();
     }
 }

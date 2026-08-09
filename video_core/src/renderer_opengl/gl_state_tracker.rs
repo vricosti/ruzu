@@ -8,10 +8,12 @@
 //! re-apply state per draw call.
 
 use std::ffi::c_void;
+use std::ptr::NonNull;
 use std::sync::OnceLock;
 
 use gl::types::{GLenum, GLuint};
 
+use crate::control::channel_state::ChannelState;
 use crate::dirty_flags::{fill_block, setup_dirty_flags, DirtyTables};
 use crate::engines::maxwell_3d::{
     ALPHA_TEST_ENABLED, ALPHA_TEST_FUNC, ALPHA_TEST_REF, ANTI_ALIAS_ALPHA_CONTROL, BLEND_BASE,
@@ -450,7 +452,8 @@ pub type DirtyFlags = [bool; 256];
 /// and Y-negate flag to skip redundant GL calls when state hasn't changed.
 pub struct StateTracker {
     flags: DirtyFlags,
-    default_flags: DirtyFlags,
+    channel_flags: Option<NonNull<DirtyFlags>>,
+    bound_channel_id: Option<i32>,
     framebuffer: GLuint,
     index_buffer: GLuint,
     origin: GLenum,
@@ -461,14 +464,10 @@ pub struct StateTracker {
 impl StateTracker {
     /// Port of `StateTracker::StateTracker`.
     pub fn new() -> Self {
-        let mut flags = [false; 256];
-        // Start with all flags dirty
-        for i in 0..(dirty::LAST as usize) {
-            flags[i] = true;
-        }
         Self {
-            flags,
-            default_flags: [false; 256],
+            flags: [false; 256],
+            channel_flags: None,
+            bound_channel_id: None,
             framebuffer: 0,
             index_buffer: 0,
             origin: gl::LOWER_LEFT,
@@ -494,7 +493,12 @@ impl StateTracker {
     }
 
     /// Port of `StateTracker::SetupTables`.
-    pub fn setup_tables(tables: &mut DirtyTables) {
+    pub fn setup_tables(&mut self, channel_state: &mut ChannelState) {
+        self.bound_channel_id = Some(channel_state.bind_id);
+        let Some(maxwell_3d) = channel_state.maxwell_3d.as_mut() else {
+            return;
+        };
+        let tables = maxwell_3d.dirty_tables_mut();
         for table in tables.iter_mut() {
             table.fill(crate::dirty_flags::flags::NULL_ENTRY);
         }
@@ -582,143 +586,182 @@ impl StateTracker {
 
     /// Port of `StateTracker::NotifyScreenDrawVertexArray`.
     pub fn notify_screen_draw_vertex_array(&mut self) {
-        self.flags[dirty::VERTEX_FORMATS as usize] = true;
-        self.flags[(dirty::VERTEX_FORMAT_0) as usize] = true;
-        self.flags[(dirty::VERTEX_FORMAT_0 + 1) as usize] = true;
+        let flags = self.active_flags_mut();
+        flags[dirty::VERTEX_FORMATS as usize] = true;
+        flags[dirty::VERTEX_FORMAT_0 as usize] = true;
+        flags[(dirty::VERTEX_FORMAT_0 + 1) as usize] = true;
 
-        self.flags[dirty::VERTEX_BUFFERS as usize] = true;
-        self.flags[dirty::VERTEX_BUFFER_0 as usize] = true;
+        flags[dirty::VERTEX_BUFFERS as usize] = true;
+        flags[dirty::VERTEX_BUFFER_0 as usize] = true;
 
-        self.flags[dirty::VERTEX_INSTANCES as usize] = true;
-        self.flags[(dirty::VERTEX_INSTANCE_0) as usize] = true;
-        self.flags[(dirty::VERTEX_INSTANCE_0 + 1) as usize] = true;
+        flags[dirty::VERTEX_INSTANCES as usize] = true;
+        flags[dirty::VERTEX_INSTANCE_0 as usize] = true;
+        flags[(dirty::VERTEX_INSTANCE_0 + 1) as usize] = true;
     }
 
     /// Port of `StateTracker::NotifyPolygonModes`.
     pub fn notify_polygon_modes(&mut self) {
-        self.flags[dirty::POLYGON_MODES as usize] = true;
-        self.flags[dirty::POLYGON_MODE_FRONT as usize] = true;
-        self.flags[dirty::POLYGON_MODE_BACK as usize] = true;
+        let flags = self.active_flags_mut();
+        flags[dirty::POLYGON_MODES as usize] = true;
+        flags[dirty::POLYGON_MODE_FRONT as usize] = true;
+        flags[dirty::POLYGON_MODE_BACK as usize] = true;
     }
 
     /// Port of `StateTracker::NotifyViewport0`.
     pub fn notify_viewport0(&mut self) {
-        self.flags[dirty::VIEWPORTS as usize] = true;
-        self.flags[dirty::VIEWPORT_0 as usize] = true;
+        let flags = self.active_flags_mut();
+        flags[dirty::VIEWPORTS as usize] = true;
+        flags[dirty::VIEWPORT_0 as usize] = true;
     }
 
     /// Port of `StateTracker::NotifyScissor0`.
     pub fn notify_scissor0(&mut self) {
-        self.flags[dirty::SCISSORS as usize] = true;
-        self.flags[dirty::SCISSOR_0 as usize] = true;
+        let flags = self.active_flags_mut();
+        flags[dirty::SCISSORS as usize] = true;
+        flags[dirty::SCISSOR_0 as usize] = true;
     }
 
     /// Port of `StateTracker::NotifyColorMask`.
     pub fn notify_color_mask(&mut self, index: usize) {
-        self.flags[dirty::COLOR_MASKS as usize] = true;
-        self.flags[(dirty::COLOR_MASK_0 as usize) + index] = true;
+        let flags = self.active_flags_mut();
+        flags[dirty::COLOR_MASKS as usize] = true;
+        flags[dirty::COLOR_MASK_0 as usize + index] = true;
     }
 
     /// Port of `StateTracker::NotifyBlend0`.
     pub fn notify_blend0(&mut self) {
-        self.flags[dirty::BLEND_STATES as usize] = true;
-        self.flags[dirty::BLEND_STATE_0 as usize] = true;
+        let flags = self.active_flags_mut();
+        flags[dirty::BLEND_STATES as usize] = true;
+        flags[dirty::BLEND_STATE_0 as usize] = true;
     }
 
     /// Port of `StateTracker::NotifyFramebuffer`.
     pub fn notify_framebuffer(&mut self) {
-        self.flags[dirty::RENDER_TARGETS as usize] = true;
-        self.framebuffer = GLuint::MAX;
+        self.active_flags_mut()[dirty::RENDER_TARGETS as usize] = true;
     }
 
     /// Port of `StateTracker::NotifyFrontFace`.
     pub fn notify_front_face(&mut self) {
-        self.flags[dirty::FRONT_FACE as usize] = true;
+        self.active_flags_mut()[dirty::FRONT_FACE as usize] = true;
     }
 
     /// Port of `StateTracker::NotifyCullTest`.
     pub fn notify_cull_test(&mut self) {
-        self.flags[dirty::CULL_TEST as usize] = true;
+        self.active_flags_mut()[dirty::CULL_TEST as usize] = true;
     }
 
     /// Port of `StateTracker::NotifyDepthMask`.
     pub fn notify_depth_mask(&mut self) {
-        self.flags[dirty::DEPTH_MASK as usize] = true;
+        self.active_flags_mut()[dirty::DEPTH_MASK as usize] = true;
     }
 
     /// Port of `StateTracker::NotifyDepthTest`.
     pub fn notify_depth_test(&mut self) {
-        self.flags[dirty::DEPTH_TEST as usize] = true;
+        self.active_flags_mut()[dirty::DEPTH_TEST as usize] = true;
     }
 
     /// Port of `StateTracker::NotifyStencilTest`.
     pub fn notify_stencil_test(&mut self) {
-        self.flags[dirty::STENCIL_TEST as usize] = true;
+        self.active_flags_mut()[dirty::STENCIL_TEST as usize] = true;
     }
 
     /// Port of `StateTracker::NotifyPolygonOffset`.
     pub fn notify_polygon_offset(&mut self) {
-        self.flags[dirty::POLYGON_OFFSET as usize] = true;
+        self.active_flags_mut()[dirty::POLYGON_OFFSET as usize] = true;
     }
 
     /// Port of `StateTracker::NotifyRasterizeEnable`.
     pub fn notify_rasterize_enable(&mut self) {
-        self.flags[dirty::RASTERIZE_ENABLE as usize] = true;
+        self.active_flags_mut()[dirty::RASTERIZE_ENABLE as usize] = true;
     }
 
     /// Port of `StateTracker::NotifyFramebufferSRGB`.
     pub fn notify_framebuffer_srgb(&mut self) {
-        self.flags[dirty::FRAMEBUFFER_SRGB as usize] = true;
+        self.active_flags_mut()[dirty::FRAMEBUFFER_SRGB as usize] = true;
     }
 
     /// Port of `StateTracker::NotifyLogicOp`.
     pub fn notify_logic_op(&mut self) {
-        self.flags[dirty::LOGIC_OP as usize] = true;
+        self.active_flags_mut()[dirty::LOGIC_OP as usize] = true;
     }
 
     /// Port of `StateTracker::NotifyClipControl`.
     pub fn notify_clip_control(&mut self) {
-        self.flags[dirty::CLIP_CONTROL as usize] = true;
+        self.active_flags_mut()[dirty::CLIP_CONTROL as usize] = true;
     }
 
     /// Port of `StateTracker::NotifyAlphaTest`.
     pub fn notify_alpha_test(&mut self) {
-        self.flags[dirty::ALPHA_TEST as usize] = true;
+        self.active_flags_mut()[dirty::ALPHA_TEST as usize] = true;
     }
 
     /// Port of `StateTracker::NotifyRange`.
     pub fn notify_range(&mut self, start: u8, end: u8) {
+        let flags = self.active_flags_mut();
         for flag in start..=end {
-            self.flags[flag as usize] = true;
+            flags[flag as usize] = true;
+        }
+    }
+
+    fn active_flags(&self) -> &DirtyFlags {
+        match self.channel_flags {
+            Some(flags) => unsafe { flags.as_ref() },
+            None => &self.flags,
+        }
+    }
+
+    fn active_flags_mut(&mut self) -> &mut DirtyFlags {
+        match self.channel_flags {
+            Some(mut flags) => unsafe { flags.as_mut() },
+            None => &mut self.flags,
+        }
+    }
+
+    /// Port of `StateTracker::ChangeChannel`.
+    pub fn change_channel(&mut self, channel_state: &mut ChannelState) {
+        self.bound_channel_id = Some(channel_state.bind_id);
+        self.channel_flags = channel_state
+            .maxwell_3d
+            .as_mut()
+            .map(|maxwell| NonNull::from(maxwell.dirty_flags_mut()));
+    }
+
+    /// Clear the borrowed dirty-flag pointer before its channel is released.
+    pub fn release_channel(&mut self, channel_id: i32) {
+        if self.bound_channel_id == Some(channel_id) {
+            self.channel_flags = None;
+            self.bound_channel_id = None;
+            self.flags.fill(true);
         }
     }
 
     /// Port of `StateTracker::InvalidateState`.
     pub fn invalidate_state(&mut self) {
-        for flag in self.flags.iter_mut() {
+        for flag in self.active_flags_mut().iter_mut() {
             *flag = true;
         }
     }
 
     /// Access the dirty flags array directly.
     pub fn flags_mut(&mut self) -> &mut DirtyFlags {
-        &mut self.flags
+        self.active_flags_mut()
     }
 
     /// Read-only access to dirty flags.
     pub fn flags(&self) -> &DirtyFlags {
-        &self.flags
+        self.active_flags()
     }
 
     /// Check if a flag is dirty.
     pub fn is_dirty(&self, flag: u8) -> bool {
-        self.flags[flag as usize]
+        self.active_flags()[flag as usize]
     }
 
     /// Check if a flag is dirty, and clear it. Returns true if it was dirty.
     pub fn exchange(&mut self, flag: u8) -> bool {
-        let is_dirty = self.flags[flag as usize];
-        self.flags[flag as usize] = false;
+        let flags = self.active_flags_mut();
+        let is_dirty = flags[flag as usize];
+        flags[flag as usize] = false;
         is_dirty
     }
 }
@@ -734,17 +777,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_new_all_dirty() {
+    fn test_new_matches_upstream_clean_default_flags() {
         let tracker = StateTracker::new();
-        assert!(tracker.is_dirty(dirty::VIEWPORTS));
-        assert!(tracker.is_dirty(dirty::SCISSORS));
-        assert!(tracker.is_dirty(dirty::FRONT_FACE));
-        assert!(tracker.is_dirty(dirty::DEPTH_TEST));
+        assert!(!tracker.is_dirty(dirty::VIEWPORTS));
+        assert!(!tracker.is_dirty(dirty::SCISSORS));
+        assert!(!tracker.is_dirty(dirty::FRONT_FACE));
+        assert!(!tracker.is_dirty(dirty::DEPTH_TEST));
     }
 
     #[test]
     fn test_exchange_clears_flag() {
         let mut tracker = StateTracker::new();
+        tracker.notify_viewport0();
         assert!(tracker.exchange(dirty::VIEWPORTS));
         assert!(!tracker.exchange(dirty::VIEWPORTS));
     }
@@ -787,12 +831,11 @@ mod tests {
 
     #[test]
     fn setup_tables_marks_upstream_opengl_dirty_ranges() {
-        let mut tables = [
-            vec![crate::dirty_flags::flags::NULL_ENTRY; crate::engines::ENGINE_REG_COUNT],
-            vec![crate::dirty_flags::flags::NULL_ENTRY; crate::engines::ENGINE_REG_COUNT],
-        ];
-
-        StateTracker::setup_tables(&mut tables);
+        let mut tracker = StateTracker::new();
+        let mut channel = ChannelState::new(7);
+        channel.maxwell_3d = Some(Box::new(crate::engines::maxwell_3d::Maxwell3D::new()));
+        tracker.setup_tables(&mut channel);
+        let tables = channel.maxwell_3d.as_ref().unwrap().dirty_tables();
 
         assert_eq!(dirty::FIRST, crate::dirty_flags::flags::LAST_COMMON_ENTRY);
         assert_eq!(dirty::VERTEX_FORMATS, dirty::FIRST + 1);
@@ -895,5 +938,26 @@ mod tests {
         assert_eq!(tables[0][USER_CLIP_ENABLE as usize], dirty::CLIP_DISTANCES);
         assert_eq!(tables[0][FRONT_FACE as usize], dirty::FRONT_FACE);
         assert_eq!(tables[0][CULL_TEST_ENABLE as usize], dirty::CULL_TEST);
+    }
+
+    #[test]
+    fn change_channel_uses_live_maxwell_dirty_flags() {
+        let mut tracker = StateTracker::new();
+        let mut channel = ChannelState::new(11);
+        channel.maxwell_3d = Some(Box::new(crate::engines::maxwell_3d::Maxwell3D::new()));
+        channel
+            .maxwell_3d
+            .as_mut()
+            .unwrap()
+            .dirty_flags_mut()
+            .fill(false);
+
+        tracker.change_channel(&mut channel);
+        channel.maxwell_3d.as_mut().unwrap().dirty_flags_mut()[dirty::VIEWPORTS as usize] = true;
+        assert!(tracker.exchange(dirty::VIEWPORTS));
+        assert!(!channel.maxwell_3d.as_mut().unwrap().dirty_flags_mut()[dirty::VIEWPORTS as usize]);
+
+        tracker.release_channel(11);
+        assert!(tracker.is_dirty(dirty::VIEWPORTS));
     }
 }

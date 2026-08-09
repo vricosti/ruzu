@@ -14,7 +14,9 @@ use common::settings;
 use common::slot_vector::SlotVector;
 
 use super::gl_shader_manager::{ProgramManager, ProgramManagerHandle};
-use super::gl_staging_buffer_pool::{StagingBufferMap, StagingBufferPool};
+use super::gl_staging_buffer_pool::{
+    make_shared_staging_buffer_pool, SharedStagingBufferPool, StagingBufferMap,
+};
 use super::gl_state_tracker::dirty as GlDirty;
 use super::gl_state_tracker::StateTracker;
 use super::util_shaders::UtilShaders;
@@ -305,7 +307,7 @@ fn requeue_pending_join_tail(
     *queue = deferred;
 }
 
-fn readerless_refresh_requires_stop(
+fn readerless_refresh_requires_bound_gpu_memory(
     base: &CommonTextureCache,
     image_id: ImageId,
     invalidate: bool,
@@ -626,12 +628,8 @@ impl FormatConversionPass {
         }
     }
 
-    /// Convert between image formats using a PBO intermediate.
-    ///
-    /// Port of `FormatConversionPass::ConvertImage`.
-    /// In the full implementation, this creates a PBO if needed, copies the source
-    /// texture into the PBO, then copies the PBO into the destination texture with
-    /// the target format.
+    /// Port of `FormatConversionPass::ConvertImage`: reinterpret through a
+    /// reusable PBO using the source and destination GL formats.
     pub fn convert_image(
         &mut self,
         dst_texture: u32,
@@ -746,7 +744,7 @@ pub struct TextureCacheRuntime {
     // the tracker allocation in Rust, and this non-null pointer has the same
     // lifetime as the texture cache runtime field.
     state_tracker: NonNull<StateTracker>,
-    staging_buffer_pool: StagingBufferPool,
+    staging_buffer_pool: SharedStagingBufferPool,
     util_shaders: UtilShaders,
     format_conversion_pass: FormatConversionPass,
     format_properties: [HashMap<u32, FormatProperties>; 3],
@@ -767,6 +765,7 @@ impl TextureCacheRuntime {
         device: &super::gl_device::Device,
         program_manager: ProgramManagerHandle,
         state_tracker: &mut StateTracker,
+        staging_buffer_pool: SharedStagingBufferPool,
     ) -> Self {
         const HALF_GIB: u64 = 512 * 1024 * 1024;
         let device_access_memory = if device.can_report_memory() {
@@ -782,6 +781,7 @@ impl TextureCacheRuntime {
             device.has_debugging_tool_attached(),
             program_manager,
             state_tracker,
+            staging_buffer_pool,
         )
     }
 
@@ -793,6 +793,7 @@ impl TextureCacheRuntime {
         has_debugging_tool_attached: bool,
         program_manager: ProgramManagerHandle,
         state_tracker: &mut StateTracker,
+        staging_buffer_pool: SharedStagingBufferPool,
     ) -> Self {
         let (null_image_handles, null_image_views) =
             create_null_image_views(has_debugging_tool_attached);
@@ -802,7 +803,7 @@ impl TextureCacheRuntime {
             can_report_memory_usage,
             has_native_astc,
             state_tracker: NonNull::from(state_tracker),
-            staging_buffer_pool: StagingBufferPool::new(),
+            staging_buffer_pool,
             util_shaders: UtilShaders::new(program_manager),
             format_conversion_pass: FormatConversionPass::new(),
             format_properties: create_format_properties(),
@@ -820,6 +821,31 @@ impl TextureCacheRuntime {
         runtime
     }
 
+    #[cfg(test)]
+    fn new_for_test(
+        has_broken_texture_view_formats: bool,
+        has_native_astc: bool,
+        program_manager: ProgramManagerHandle,
+        state_tracker: &mut StateTracker,
+        staging_buffer_pool: SharedStagingBufferPool,
+    ) -> Self {
+        Self {
+            has_broken_texture_view_formats,
+            device_access_memory: 2 * 1024 * 1024 * 1024,
+            can_report_memory_usage: false,
+            has_native_astc,
+            state_tracker: NonNull::from(state_tracker),
+            staging_buffer_pool,
+            util_shaders: UtilShaders::new_for_test(program_manager),
+            format_conversion_pass: FormatConversionPass::new(),
+            format_properties: std::array::from_fn(|_| HashMap::new()),
+            null_image_handles: [0; 7],
+            null_image_views: [0; NUM_TEXTURE_TYPES],
+            rescale_draw_fbos: [0; 4],
+            rescale_read_fbos: [0; 4],
+        }
+    }
+
     pub fn finish(&self) {
         unsafe {
             gl::Finish();
@@ -827,16 +853,18 @@ impl TextureCacheRuntime {
     }
 
     pub fn upload_staging_buffer(&mut self, size: usize) -> StagingBufferMap {
-        self.staging_buffer_pool.request_upload_buffer(size)
+        self.staging_buffer_pool.lock().request_upload_buffer(size)
     }
 
     pub fn download_staging_buffer(&mut self, size: usize, deferred: bool) -> StagingBufferMap {
         self.staging_buffer_pool
+            .lock()
             .request_download_buffer(size, deferred)
     }
 
     pub fn free_deferred_staging_buffer(&mut self, buffer: &StagingBufferMap) {
         self.staging_buffer_pool
+            .lock()
             .free_deferred_staging_buffer(buffer);
     }
 
@@ -981,17 +1009,8 @@ impl TextureCacheRuntime {
         if !self.can_report_memory_usage {
             return 2 * 1024 * 1024 * 1024;
         }
-        const GL_GPU_MEMORY_INFO_TOTAL_AVAILABLE_MEMORY_NVX: u32 = 0x9048;
-        let mut total_kb: i32 = 0;
-        unsafe {
-            gl::GetIntegerv(GL_GPU_MEMORY_INFO_TOTAL_AVAILABLE_MEMORY_NVX, &mut total_kb);
-        }
-        if total_kb > 0 {
-            self.device_access_memory
-                .saturating_sub((total_kb as u64) * 1024)
-        } else {
-            2 * 1024 * 1024 * 1024
-        }
+        self.device_access_memory
+            .wrapping_sub(super::gl_device::current_dedicated_video_memory())
     }
 
     pub fn can_report_memory_usage(&self) -> bool {
@@ -1108,8 +1127,12 @@ impl Drop for TextureCacheRuntime {
                     gl::DeleteTextures(1, &handle);
                 }
             }
-            gl::DeleteFramebuffers(4, self.rescale_draw_fbos.as_ptr());
-            gl::DeleteFramebuffers(4, self.rescale_read_fbos.as_ptr());
+            if self.rescale_draw_fbos.iter().any(|&handle| handle != 0) {
+                gl::DeleteFramebuffers(4, self.rescale_draw_fbos.as_ptr());
+            }
+            if self.rescale_read_fbos.iter().any(|&handle| handle != 0) {
+                gl::DeleteFramebuffers(4, self.rescale_read_fbos.as_ptr());
+            }
         }
     }
 }
@@ -2689,6 +2712,10 @@ impl ImageView {
         self.image_id
     }
 
+    pub fn size(&self) -> Extent3D {
+        self.size
+    }
+
     /// Port of
     /// `ImageView::ImageView(TextureCacheRuntime&, const ImageViewInfo&, ImageId, Image&, ...)`
     /// for the currently ported Color2D render-target path.
@@ -3937,16 +3964,18 @@ impl TextureCache {
         device: &super::gl_device::Device,
         program_manager: ProgramManagerHandle,
         state_tracker: &mut StateTracker,
+        staging_buffer_pool: SharedStagingBufferPool,
     ) -> Self {
         Self::new_with_runtime(
             device_memory,
             device.has_astc(),
             device.has_broken_texture_view_formats(),
             false,
-            TextureCacheRuntime::new(device, program_manager, state_tracker),
+            TextureCacheRuntime::new(device, program_manager, state_tracker, staging_buffer_pool),
         )
     }
 
+    #[cfg(test)]
     pub(crate) fn new_with_caps(
         device_memory: std::sync::Arc<
             crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager,
@@ -3954,23 +3983,22 @@ impl TextureCache {
         has_native_astc: bool,
         has_broken_texture_view_formats: bool,
         has_native_bgr: bool,
-        has_debugging_tool_attached: bool,
+        _has_debugging_tool_attached: bool,
         program_manager: ProgramManagerHandle,
         state_tracker: &mut StateTracker,
+        staging_buffer_pool: SharedStagingBufferPool,
     ) -> Self {
         Self::new_with_runtime(
             device_memory,
             has_native_astc,
             has_broken_texture_view_formats,
             has_native_bgr,
-            TextureCacheRuntime::new_with_caps(
+            TextureCacheRuntime::new_for_test(
                 has_broken_texture_view_formats,
-                2 * 1024 * 1024 * 1024,
-                false,
                 has_native_astc,
-                has_debugging_tool_attached,
                 program_manager,
                 state_tracker,
+                staging_buffer_pool,
             ),
         )
     }
@@ -4840,12 +4868,10 @@ impl TextureCache {
         if self.prepare_image_with_bound_gpu_reader(image_id, is_modification, invalidate) {
             return;
         }
-        if readerless_refresh_requires_stop(&self.base, image_id, invalidate) {
-            self.stop_unimplemented_readerless_refresh(
-                "TextureCache::PrepareImage reader-less fallback",
-                image_id,
-                is_modification,
-                invalidate,
+        if readerless_refresh_requires_bound_gpu_memory(&self.base, image_id, invalidate) {
+            panic!(
+                "TextureCache::PrepareImage requires bound channel GPU memory: image_id={} gpu=0x{:X}",
+                image_id.index, self.base.slot_images[image_id].gpu_addr,
             );
         }
         self.ensure_backend_image_flags(image_id);
@@ -4874,71 +4900,6 @@ impl TextureCache {
             self.base.mark_modification_by_id(image_id);
         }
         self.base.touch_image(image_id);
-    }
-
-    fn stop_unimplemented_readerless_refresh(
-        &self,
-        caller: &str,
-        image_id: ImageId,
-        is_modification: bool,
-        invalidate: bool,
-    ) -> ! {
-        self.record_unimplemented_readerless_refresh(caller, image_id, is_modification, invalidate);
-        panic!(
-            "{} cannot continue without RefreshContents: image_id={} gpu=0x{:X}",
-            caller, image_id.index, self.base.slot_images[image_id].gpu_addr
-        );
-    }
-
-    fn record_unimplemented_readerless_refresh(
-        &self,
-        caller: &str,
-        image_id: ImageId,
-        is_modification: bool,
-        invalidate: bool,
-    ) {
-        #[cfg(not(test))]
-        {
-            let image = &self.base.slot_images[image_id];
-            let path = std::path::Path::new(".agents/texture_cache_unimplemented_state.md");
-            if let Some(parent) = path.parent() {
-                let _ = std::fs::create_dir_all(parent);
-            }
-            let entry = format!(
-                "\n## TextureCache::PrepareImage unsupported reader-less RefreshContents path\n\
-                 - caller: {}\n\
-                 - upstream: video_core/texture_cache/texture_cache.h TextureCache<P>::PrepareImage calls RefreshContents(image, image_id) before SynchronizeAliases when invalidate is false\n\
-                 - is_modification: {}\n\
-                 - invalidate: {}\n\
-                 - image_id: {}\n\
-                 - gpu_addr: 0x{:X}\n\
-                 - cpu_addr: 0x{:X}\n\
-                 - format: {:?}\n\
-                 - size: {}x{}x{}\n\
-                 - guest_size: {}\n\
-                 - flags: 0x{:X}\n",
-                caller,
-                is_modification,
-                invalidate,
-                image_id.index,
-                image.gpu_addr,
-                image.cpu_addr,
-                image.info.format,
-                image.info.size.width,
-                image.info.size.height,
-                image.info.size.depth,
-                image.guest_size_bytes,
-                image.flags.bits(),
-            );
-            let _ = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(path)
-                .and_then(|mut file| {
-                    use std::io::Write;
-                    file.write_all(entry.as_bytes())
-                });
-        }
     }
 
     fn prepare_image_with_bound_gpu_reader(
@@ -5084,7 +5045,9 @@ impl TextureCache {
         }
 
         if base_image.info.num_samples > 1 && !self.runtime.can_upload_msaa() {
-            self.stop_unimplemented_msaa_upload(image_id, &base_image);
+            log::warn!("MSAA image uploads are not implemented");
+            self.runtime.transition_image_layout(&base_image);
+            return;
         }
 
         if base_image
@@ -5142,55 +5105,6 @@ impl TextureCache {
         );
     }
 
-    fn stop_unimplemented_msaa_upload(&self, image_id: ImageId, image: &ImageBase) -> ! {
-        self.record_unimplemented_msaa_upload(image_id, image);
-        panic!(
-            "TextureCache::RefreshContents MSAA upload is unimplemented: image_id={} gpu=0x{:X} samples={}",
-            image_id.index, image.gpu_addr, image.info.num_samples
-        );
-    }
-
-    fn record_unimplemented_msaa_upload(&self, image_id: ImageId, image: &ImageBase) {
-        #[cfg(not(test))]
-        {
-            let path = std::path::Path::new(".agents/texture_cache_unimplemented_state.md");
-            if let Some(parent) = path.parent() {
-                let _ = std::fs::create_dir_all(parent);
-            }
-            let entry = format!(
-                "\n## TextureCache::RefreshContents unsupported MSAA upload\n\
-                 - upstream: video_core/texture_cache/texture_cache.h TextureCache<P>::RefreshContents logs \"MSAA image uploads are not implemented\", transitions layout, and returns when runtime.CanUploadMSAA() is false\n\
-                 - local policy: stop instead of consuming CPU_MODIFIED as if the missing upload path completed\n\
-                 - image_id: {}\n\
-                 - gpu_addr: 0x{:X}\n\
-                 - cpu_addr: 0x{:X}\n\
-                 - format: {:?}\n\
-                 - samples: {}\n\
-                 - size: {}x{}x{}\n\
-                 - guest_size: {}\n\
-                 - flags: 0x{:X}\n",
-                image_id.index,
-                image.gpu_addr,
-                image.cpu_addr,
-                image.info.format,
-                image.info.num_samples,
-                image.info.size.width,
-                image.info.size.height,
-                image.info.size.depth,
-                image.guest_size_bytes,
-                image.flags.bits(),
-            );
-            let _ = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(path)
-                .and_then(|mut file| {
-                    use std::io::Write;
-                    file.write_all(entry.as_bytes())
-                });
-        }
-    }
-
     fn mark_refresh_contents_consumed(&mut self, image_id: ImageId) {
         self.base.slot_images[image_id]
             .flags
@@ -5212,10 +5126,8 @@ impl TextureCache {
 
     /// Port of upstream `TextureCache<P>::SynchronizeAliases`.
     ///
-    /// This Rust OpenGL specialization implements the direct-copy path used
-    /// when aliased images share the same surface type. The remaining upstream
-    /// rescale/reinterpret/convert branches stay documented in `DIFF.md`
-    /// because ruzu has not ported the corresponding runtime passes yet.
+    /// Copies newer aliases in modification order and applies the same
+    /// scale-up/scale-down decisions as the upstream generic texture cache.
     fn synchronize_aliases(&mut self, image_id: ImageId) {
         if !image_id.is_valid() {
             return;
@@ -6906,6 +6818,24 @@ impl TextureCache {
         self.image_views.get_mut(&view_id)
     }
 
+    /// Resolve the TIC index consumed by upstream `DrawTexture` into its
+    /// prepared OpenGL image view.
+    pub fn draw_texture_source(&mut self, index: u32) -> Option<(u32, Extent3D)> {
+        let mut selected = [crate::texture_cache::texture_cache_base::ImageViewInOut {
+            index,
+            blacklist: false,
+            id: NULL_IMAGE_VIEW_ID,
+        }];
+        self.fill_graphics_image_views(&mut selected, false);
+        let view_id = selected[0].id;
+        if !view_id.is_valid() || view_id == NULL_IMAGE_VIEW_ID {
+            return None;
+        }
+        self.materialize_views(&selected);
+        let view = self.get_image_view(view_id)?;
+        Some((view.default_handle(), view.size()))
+    }
+
     /// Port of upstream `ImageView::GpuAddr()` for ruzu's split
     /// base/backend image-view storage.
     pub fn image_view_gpu_addr(&self, view_id: ImageViewId) -> Option<u64> {
@@ -7477,39 +7407,7 @@ impl TextureCache {
             if let Some(reader) = readers.as_deref_mut() {
                 self.prepare_image_with_gpu_readers(image_id, true, invalidate, reader);
             } else {
-                if self.prepare_image_with_bound_gpu_reader(image_id, true, invalidate) {
-                    continue;
-                }
-                if readerless_refresh_requires_stop(&self.base, image_id, invalidate) {
-                    self.stop_unimplemented_readerless_refresh(
-                        "TextureCache::UpdateRenderTargets reader-less PrepareImageView fallback",
-                        image_id,
-                        true,
-                        invalidate,
-                    );
-                }
-                if invalidate {
-                    let image = &mut self.base.slot_images[image_id];
-                    image
-                        .flags
-                        .remove(ImageFlagBits::CPU_MODIFIED | ImageFlagBits::GPU_MODIFIED);
-                    if !self.base.slot_images[image_id]
-                        .flags
-                        .contains(ImageFlagBits::TRACKED)
-                    {
-                        self.base.track_image(image_id);
-                    }
-                } else {
-                    // Upstream `PrepareImage(image_id, true, false)` always
-                    // synchronizes aliases before marking the render target as
-                    // modified. The reader-less Rust path cannot refresh CPU
-                    // writes, so only run alias copies when RefreshContents
-                    // would be a no-op.
-                    if self.can_synchronize_aliases_without_refresh(image_id) {
-                        self.synchronize_aliases(image_id);
-                    }
-                }
-                self.base.mark_modification_by_id(image_id);
+                self.prepare_image_without_gpu_reader(image_id, true, invalidate);
             }
         }
         // Upstream performs the JoinImages copy/delete tail after
@@ -8988,6 +8886,7 @@ impl TextureCache {
     }
 }
 
+#[cfg(test)]
 impl Default for TextureCache {
     /// Standalone default for tests / fallback paths. Production
     /// construction goes through `RasterizerOpenGL::new`, which threads
@@ -9004,6 +8903,7 @@ impl Default for TextureCache {
             false,
             ProgramManager::new_shared_with_caps(false, false),
             state_tracker.as_mut(),
+            make_shared_staging_buffer_pool(),
         );
         cache.standalone_state_tracker = Some(state_tracker);
         cache
@@ -9029,7 +8929,7 @@ mod tests {
     }
 
     #[test]
-    fn refresh_contents_consumes_cpu_modified_before_msaa_upload_stop() {
+    fn refresh_contents_matches_upstream_unsupported_msaa_return_order() {
         let source = include_str!("gl_texture_cache.rs");
         let method = source
             .find("pub fn refresh_contents_with_gpu_reader")
@@ -9043,16 +8943,25 @@ mod tests {
         let msaa_check = body
             .find("base_image.info.num_samples > 1 && !self.runtime.can_upload_msaa()")
             .expect("MSAA upload capability check");
-        let stop = body[msaa_check..]
-            .find("self.stop_unimplemented_msaa_upload(image_id, &base_image)")
-            .expect("MSAA upload stop guard")
+        let warning = body[msaa_check..]
+            .find("log::warn!(\"MSAA image uploads are not implemented\")")
+            .expect("MSAA upload warning")
             + msaa_check;
+        let transition = body[warning..]
+            .find("self.runtime.transition_image_layout(&base_image)")
+            .expect("MSAA layout transition")
+            + warning;
+        let early_return = body[transition..]
+            .find("return;")
+            .expect("MSAA early return")
+            + transition;
         let consumed = body
             .find("self.mark_refresh_contents_consumed(image_id)")
             .expect("refresh consumed path");
         assert!(consumed < msaa_check);
-        assert!(msaa_check < stop);
-        assert!(!body.contains("log::warn!(\"MSAA image uploads are not implemented\")"));
+        assert!(msaa_check < warning);
+        assert!(warning < transition);
+        assert!(transition < early_return);
     }
 
     #[test]
@@ -9626,7 +9535,7 @@ mod tests {
     }
 
     #[test]
-    fn readerless_refresh_stop_only_when_refresh_contents_is_required() {
+    fn readerless_refresh_requires_gpu_memory_only_for_cpu_modified_images() {
         use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
         use crate::texture_cache::format_lookup_table::PixelFormat;
         use crate::texture_cache::image_info::ImageInfo;
@@ -9650,14 +9559,20 @@ mod tests {
             .flags
             .remove(ImageFlagBits::CPU_MODIFIED);
 
-        assert!(!readerless_refresh_requires_stop(&base, image_id, false));
+        assert!(!readerless_refresh_requires_bound_gpu_memory(
+            &base, image_id, false
+        ));
 
         base.slot_images[image_id]
             .flags
             .insert(ImageFlagBits::CPU_MODIFIED);
 
-        assert!(readerless_refresh_requires_stop(&base, image_id, false));
-        assert!(!readerless_refresh_requires_stop(&base, image_id, true));
+        assert!(readerless_refresh_requires_bound_gpu_memory(
+            &base, image_id, false
+        ));
+        assert!(!readerless_refresh_requires_bound_gpu_memory(
+            &base, image_id, true
+        ));
     }
 
     #[test]

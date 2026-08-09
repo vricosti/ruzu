@@ -520,10 +520,12 @@ impl Drop for StagingBufferRef {
             return;
         }
         unsafe {
-            if !(*self.sync).is_null() {
-                gl::DeleteSync(*self.sync);
+            // Matches OpenGL::OGLSync::Create: keep an existing fence alive.
+            // Replacing it would allow the staging allocation to be reused
+            // before the commands protected by the original fence complete.
+            if (*self.sync).is_null() {
+                *self.sync = gl::FenceSync(gl::SYNC_GPU_COMMANDS_COMPLETE, 0);
             }
-            *self.sync = gl::FenceSync(gl::SYNC_GPU_COMMANDS_COMPLETE, 0);
         }
     }
 }
@@ -645,18 +647,14 @@ pub trait BufferCacheRuntime {
     /// Bind an index buffer for draw calls.
     ///
     /// Upstream: `Runtime::BindIndexBuffer(buffer, offset, size)`.
-    /// `gpu_handle` is the backend buffer name (GL buffer name / Vulkan
-    /// buffer handle) extracted from the slot vector by the caller. Upstream
-    /// receives the whole `Buffer&` object; the Rust port passes the handle
-    /// separately because `BufferBase` is backend-agnostic.
+    /// The runtime receives the backend buffer object, matching upstream.
     fn bind_index_buffer(
         &mut self,
         topology: PrimitiveTopology,
         index_format: IndexFormat,
         base_vertex: u32,
         num_indices: u32,
-        buffer: BufferId,
-        gpu_handle: u32,
+        buffer: &mut BufferBase,
         offset: u32,
         size: u32,
     );
@@ -785,7 +783,25 @@ pub trait BufferCacheRuntime {
     /// Bind transform feedback buffers.
     ///
     /// Upstream: `Runtime::BindTransformFeedbackBuffers(host_bindings)`
-    fn bind_transform_feedback_buffers(&mut self, bindings: &HostBindings);
+    fn bind_transform_feedback_buffers(
+        &mut self,
+        bindings: &HostBindings,
+        buffers: &mut SlotVector<BufferBase>,
+    );
+
+    /// Create and bind the backend transform-feedback object associated with
+    /// a guest address.
+    ///
+    /// Upstream OpenGL: `BufferCacheRuntime::BindTransformFeedbackObject`.
+    fn bind_transform_feedback_object(&mut self, _tfb_object_addr: u64) {}
+
+    /// Return the backend transform-feedback object associated with a guest
+    /// address.
+    ///
+    /// Upstream OpenGL: `BufferCacheRuntime::GetTransformFeedbackObject`.
+    fn get_transform_feedback_object(&self, _tfb_object_addr: u64) -> u32 {
+        0
+    }
 
     // -- Compute buffer binding --
 

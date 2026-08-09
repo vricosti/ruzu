@@ -5,9 +5,10 @@
 //!
 //! OpenGL graphics pipeline management -- compiles and configures vertex/fragment/etc shaders.
 
+use std::ffi::c_void;
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
 use crate::buffer_cache::buffer_cache::BufferCache;
 use crate::buffer_cache::buffer_cache_base::{BufferCacheParams, UniformBufferSizes};
@@ -15,16 +16,22 @@ use crate::buffer_cache::word_manager::DeviceTracker;
 use crate::engines::draw_manager::Maxwell3DRenderTargets;
 use crate::engines::maxwell_3d::SurfaceClipInfo;
 use crate::engines::maxwell_3d::{ConstBufferBinding, MAX_CB_SLOTS};
+use crate::renderer_opengl::gl_shader_context::Context as ShaderContext;
 use crate::renderer_opengl::gl_shader_manager::ProgramManager;
-use crate::renderer_opengl::gl_shader_util::program_local_parameter_4f_arb;
+use crate::renderer_opengl::gl_shader_util::{
+    compile_assembly_program, create_program_from_spirv, delete_assembly_program,
+    program_local_parameter_4f_arb,
+};
 use crate::renderer_opengl::gl_state_tracker::StateTracker;
 use crate::renderer_opengl::gl_texture_cache::{
     RenderTargetDirtyFlagAccess, TextureCache as OpenGLTextureCache,
 };
+use crate::shader_notify::ShaderNotifyHandle;
 use crate::texture_cache::texture_cache_base::{DescriptorSyncRegs, ImageViewInOut};
 use crate::texture_cache::types::{Extent2D, ImageViewId, SamplerId};
 use crate::textures::texture::texture_pair;
 use crate::transform_feedback::TransformFeedbackState;
+use common::thread_worker::StatefulThreadWorker;
 use common::{cityhash::city_hash64, settings, trace};
 use shader_recompiler::shader_info::{num_descriptors, Info as ShaderInfo};
 
@@ -43,8 +50,37 @@ pub const NUM_TRANSFORM_FEEDBACK_BUFFERS: usize = 4;
 /// Stride of each XFB attribute entry (token, count, attrib).
 pub const XFB_ENTRY_STRIDE: usize = 3;
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum GraphicsProgramBackend {
+    #[default]
+    Glsl,
+    Glasm,
+    SpirV,
+}
+
 static GLSL_ERROR_DUMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 static GL_PIPELINE_BUILD_TRACE_SEQ: AtomicU64 = AtomicU64::new(0);
+
+type GlTransformFeedbackAttribsNv = unsafe extern "system" fn(
+    count: gl::types::GLsizei,
+    attribs: *const gl::types::GLint,
+    buffer_mode: gl::types::GLenum,
+);
+
+static GL_TRANSFORM_FEEDBACK_ATTRIBS_NV: OnceLock<Option<GlTransformFeedbackAttribsNv>> =
+    OnceLock::new();
+
+/// Load the NV transform-feedback entry point omitted by the generated bindings.
+pub fn load_extra_functions<F>(load_fn: &mut F)
+where
+    F: FnMut(&'static str) -> *const c_void,
+{
+    let ptr = load_fn("glTransformFeedbackAttribsNV");
+    let function = (!ptr.is_null()).then(|| unsafe {
+        std::mem::transmute_copy::<*const c_void, GlTransformFeedbackAttribsNv>(&ptr)
+    });
+    let _ = GL_TRANSFORM_FEEDBACK_ATTRIBS_NV.set(function);
+}
 
 macro_rules! trace_gl_pipeline_stall {
     ($($arg:tt)*) => {
@@ -138,10 +174,9 @@ pub struct GraphicsPipelineKey {
     pub unique_hashes: [u64; 6],
     /// Packed bitfield: xfb_enabled(1), early_z(1), gs_input_topology(4),
     /// tessellation_primitive(2), tessellation_spacing(2), tessellation_clockwise(1),
-    /// app_stage(3), alpha_test_func(3).
+    /// app_stage(3).
     pub raw: u32,
-    pub alpha_test_ref: u32,
-    pub padding: [u32; 2],
+    pub padding: [u32; 3],
     pub xfb_state: TransformFeedbackState,
 }
 
@@ -153,7 +188,6 @@ impl GraphicsPipelineKey {
     const TESSELLATION_SPACING_SHIFT: u32 = 8;
     const TESSELLATION_CLOCKWISE_SHIFT: u32 = 10;
     const APP_STAGE_SHIFT: u32 = 11;
-    const ALPHA_TEST_FUNC_SHIFT: u32 = 14;
 
     const XFB_ENABLED_MASK: u32 = 0x1 << Self::XFB_ENABLED_SHIFT;
     const EARLY_Z_MASK: u32 = 0x1 << Self::EARLY_Z_SHIFT;
@@ -162,7 +196,6 @@ impl GraphicsPipelineKey {
     const TESSELLATION_SPACING_MASK: u32 = 0x3 << Self::TESSELLATION_SPACING_SHIFT;
     const TESSELLATION_CLOCKWISE_MASK: u32 = 0x1 << Self::TESSELLATION_CLOCKWISE_SHIFT;
     const APP_STAGE_MASK: u32 = 0x7 << Self::APP_STAGE_SHIFT;
-    const ALPHA_TEST_FUNC_MASK: u32 = 0x7 << Self::ALPHA_TEST_FUNC_SHIFT;
 
     /// Hash the key, considering only relevant bytes (smaller if xfb not enabled).
     pub fn hash_key(&self) -> u64 {
@@ -170,6 +203,31 @@ impl GraphicsPipelineKey {
         let bytes: &[u8] =
             unsafe { std::slice::from_raw_parts(self as *const Self as *const u8, size) };
         city_hash64(bytes)
+    }
+
+    pub fn to_cache_bytes(&self) -> &[u8] {
+        unsafe {
+            std::slice::from_raw_parts(
+                (self as *const Self).cast::<u8>(),
+                std::mem::size_of::<Self>(),
+            )
+        }
+    }
+
+    pub fn read_from_file(file: &mut std::fs::File) -> std::io::Result<Self> {
+        use std::io::Read;
+
+        let mut key = Self::default();
+        let bytes = unsafe {
+            std::slice::from_raw_parts_mut(
+                (&mut key as *mut Self).cast::<u8>(),
+                std::mem::size_of::<Self>(),
+            )
+        };
+        file.read_exact(bytes)?;
+        key.raw &= (1 << 14) - 1;
+        key.padding = [0; 3];
+        Ok(key)
     }
 
     /// Returns the xfb_enabled bit.
@@ -232,15 +290,6 @@ impl GraphicsPipelineKey {
             (self.raw & !Self::APP_STAGE_MASK) | ((app_stage & 0x7) << Self::APP_STAGE_SHIFT);
     }
 
-    pub fn alpha_test_func(&self) -> u32 {
-        (self.raw & Self::ALPHA_TEST_FUNC_MASK) >> Self::ALPHA_TEST_FUNC_SHIFT
-    }
-
-    pub fn set_alpha_test_func(&mut self, func: u32) {
-        self.raw = (self.raw & !Self::ALPHA_TEST_FUNC_MASK)
-            | ((func & 0x7) << Self::ALPHA_TEST_FUNC_SHIFT);
-    }
-
     /// Returns the effective size in bytes for hashing/comparison.
     ///
     /// If xfb is enabled, the full key (including xfb_state) is used;
@@ -261,20 +310,54 @@ impl Hash for GraphicsPipelineKey {
     }
 }
 
+struct ProgramBuild {
+    source_programs: [u32; NUM_STAGES],
+    assembly_programs: [u32; NUM_STAGES],
+    program_pipeline: u32,
+    fence: gl::types::GLsync,
+}
+
+unsafe impl Send for ProgramBuild {}
+
+impl Drop for ProgramBuild {
+    fn drop(&mut self) {
+        if !self.fence.is_null() {
+            unsafe { gl::DeleteSync(self.fence) };
+        }
+        if self.program_pipeline != 0 {
+            unsafe { gl::DeleteProgramPipelines(1, &self.program_pipeline) };
+        }
+        for program in self.source_programs {
+            if program != 0 {
+                unsafe { gl::DeleteProgram(program) };
+            }
+        }
+        for program in self.assembly_programs {
+            if program != 0 {
+                delete_assembly_program(program);
+            }
+        }
+    }
+}
+
+type AsyncBuildResult = Result<ProgramBuild, (usize, String)>;
+type AsyncBuildSlot = Arc<(Mutex<Option<AsyncBuildResult>>, Condvar)>;
+
 /// OpenGL graphics pipeline.
 ///
 /// Corresponds to `OpenGL::GraphicsPipeline`.
 pub struct GraphicsPipeline {
     pub key: GraphicsPipelineKey,
 
-    /// Per-stage GLSL source produced by the recompiler. Stages with no
-    /// shader (and the placeholder pipeline created when no GPU memory
-    /// reader is installed) leave the corresponding entry as `None`.
-    ///
-    /// Gap (4) consumes these strings to call `glCreateShader` /
-    /// `glShaderSource` / `glCompileShader` / `glLinkProgram` and fill
-    /// `source_programs` with the resulting GL handles.
+    /// Per-stage GLSL source produced by the recompiler. Stages with no shader
+    /// leave the corresponding entry as `None`.
     pub glsl_sources: [Option<String>; NUM_STAGES],
+
+    /// Per-stage SPIR-V binaries produced by the recompiler.
+    pub spirv_sources: [Option<Vec<u32>>; NUM_STAGES],
+
+    program_backend: GraphicsProgramBackend,
+    max_glasm_storage_buffer_blocks: u32,
 
     /// Source program handles per stage (GLSL or SPIR-V).
     pub source_programs: [u32; NUM_STAGES],
@@ -306,17 +389,16 @@ pub struct GraphicsPipeline {
     pub xfb_attribs: Vec<i32>,
 
     // Build synchronization
-    built_mutex: Mutex<bool>,
-    built_condvar: Condvar,
+    shader_notify: Option<ShaderNotifyHandle>,
+    pending_build: Option<AsyncBuildSlot>,
     built_fence: gl::types::GLsync,
     is_built: bool,
 
     /// GL program pipeline object that aggregates the per-stage separable
     /// programs in `source_programs`. `0` means uninitialised.
     ///
-    /// Created lazily in `build_from_sources` and bound by `configure()`
-    /// (gap 5). Mirrors upstream `OpenGL::ProgramManager::BindGraphicsPipeline`'s
-    /// per-pipeline `OGLPipeline` object.
+    /// Created lazily in `build_from_sources` and bound by `configure()`,
+    /// matching upstream's per-pipeline `OGLPipeline` object.
     program_pipeline: u32,
 
     /// Per-stage shader translation result. Mirrors upstream
@@ -328,7 +410,8 @@ pub struct GraphicsPipeline {
     pub stage_infos: [Option<ShaderInfo>; NUM_STAGES],
 }
 
-// SAFETY: The GL sync handle is only accessed while the built_mutex is held.
+// SAFETY: pipeline fields stay on the render thread. Worker threads publish a
+// complete build through `pending_build` and never access the pipeline itself.
 unsafe impl Send for GraphicsPipeline {}
 unsafe impl Sync for GraphicsPipeline {}
 
@@ -359,10 +442,13 @@ impl GraphicsPipeline {
     /// Create a new graphics pipeline.
     ///
     /// Corresponds to `GraphicsPipeline::GraphicsPipeline()`.
-    pub fn new(key: GraphicsPipelineKey) -> Self {
+    pub fn new(key: GraphicsPipelineKey, shader_notify: Option<ShaderNotifyHandle>) -> Self {
         Self {
             key,
             glsl_sources: Default::default(),
+            spirv_sources: Default::default(),
+            program_backend: GraphicsProgramBackend::Glsl,
+            max_glasm_storage_buffer_blocks: 0,
             source_programs: [0; NUM_STAGES],
             assembly_programs: [0; NUM_STAGES],
             enabled_stages_mask: 0,
@@ -380,13 +466,22 @@ impl GraphicsPipeline {
             num_xfb_attribs: 0,
             num_xfb_buffers_active: 0,
             xfb_attribs: vec![0i32; 128 * XFB_ENTRY_STRIDE * NUM_TRANSFORM_FEEDBACK_BUFFERS],
-            built_mutex: Mutex::new(true),
-            built_condvar: Condvar::new(),
+            shader_notify,
+            pending_build: None,
             built_fence: std::ptr::null(),
             is_built: true,
             program_pipeline: 0,
             stage_infos: Default::default(),
         }
+    }
+
+    pub(crate) fn set_program_backend(
+        &mut self,
+        backend: GraphicsProgramBackend,
+        max_glasm_storage_buffer_blocks: u32,
+    ) {
+        self.program_backend = backend;
+        self.max_glasm_storage_buffer_blocks = max_glasm_storage_buffer_blocks;
     }
 
     /// Populate per-stage descriptor metadata from translated shader infos.
@@ -414,6 +509,8 @@ impl GraphicsPipeline {
         // stores these inside `GraphicsPipeline` as `stage_infos`.
         self.stage_infos = std::array::from_fn(|stage| infos[stage].clone());
 
+        let mut num_textures = 0u32;
+        let mut num_images = 0u32;
         let mut num_storage_buffers = 0u32;
         for stage in 0..NUM_STAGES {
             if let Some(info) = infos[stage].as_ref() {
@@ -422,6 +519,10 @@ impl GraphicsPipeline {
                 self.uniform_buffer_sizes[stage].copy_from_slice(&info.constant_buffer_used_sizes);
                 self.num_texture_buffers[stage] = num_descriptors(&info.texture_buffer_descriptors);
                 self.num_image_buffers[stage] = num_descriptors(&info.image_buffer_descriptors);
+                num_textures +=
+                    self.num_texture_buffers[stage] + num_descriptors(&info.texture_descriptors);
+                num_images +=
+                    self.num_image_buffers[stage] + num_descriptors(&info.image_descriptors);
                 num_storage_buffers += num_descriptors(&info.storage_buffers_descriptors);
                 self.writes_global_memory |= info
                     .storage_buffers_descriptors
@@ -442,10 +543,11 @@ impl GraphicsPipeline {
             }
         }
 
-        // Ruzu currently emits GLSL, not GLASM, for graphics pipelines. Match
-        // upstream's non-assembly path by using real GL shader-storage-buffer
-        // bindings whenever storage descriptors exist.
-        self.use_storage_buffers = num_storage_buffers != 0;
+        assert!(num_textures <= MAX_TEXTURES);
+        assert!(num_images <= MAX_IMAGES);
+
+        self.use_storage_buffers = self.program_backend != GraphicsProgramBackend::Glasm
+            || num_storage_buffers <= self.max_glasm_storage_buffer_blocks;
         if self.use_storage_buffers {
             self.writes_global_memory = false;
         }
@@ -460,9 +562,8 @@ impl GraphicsPipeline {
     pub fn bind_graphics_programs_for_configure(&mut self) {
         self.wait_for_build();
 
-        // Gap (5): bind the per-pipeline program-pipeline object so the
-        // next `glDraw*` call uses the per-stage separable programs that
-        // `build_from_sources` (gap 4) compiled and aggregated. Mirrors
+        // Bind the per-pipeline object so the next draw uses the separable
+        // programs that `build_from_sources` compiled and aggregated. Mirrors
         // upstream `OpenGL::ProgramManager::BindGraphicsPipeline`.
         if self.program_pipeline != 0 {
             unsafe {
@@ -472,10 +573,6 @@ impl GraphicsPipeline {
                 gl::BindProgramPipeline(self.program_pipeline);
             }
         }
-
-        // Full implementation also requires buffer_cache / texture_cache
-        // bindings (uniform/storage/texture/image descriptors); those are
-        // separate gaps.
     }
 
     /// Bind graphics programs through the upstream `ProgramManager` owner.
@@ -494,14 +591,6 @@ impl GraphicsPipeline {
         } else {
             program_manager.bind_source_programs(&self.source_programs);
         }
-    }
-
-    /// Configure the pipeline for a draw call.
-    ///
-    /// Compatibility wrapper while the full upstream-shaped `ConfigureImpl`
-    /// body is being rebuilt as smaller owner-correct helpers.
-    pub fn configure(&mut self, _is_indexed: bool) {
-        self.bind_graphics_programs_for_configure();
     }
 
     /// Configure the buffer-cache base state owned by upstream
@@ -2266,6 +2355,7 @@ impl GraphicsPipeline {
     /// Whether any compiled GL program has been attached to this pipeline.
     pub fn has_gl_programs(&self) -> bool {
         self.source_programs.iter().any(|h| *h != 0)
+            || self.assembly_programs.iter().any(|h| *h != 0)
     }
 
     pub fn program_pipeline_handle(&self) -> u32 {
@@ -2281,7 +2371,7 @@ impl GraphicsPipeline {
     /// followed by `glLinkProgram` (with `GL_PROGRAM_SEPARABLE`) to
     /// produce a separable single-stage program. The resulting GL
     /// handles land in `source_programs[stage_index]`, ready for
-    /// `configure()` (gap 5) to bind via `glUseProgramStages`.
+    /// `configure()` to bind via `glUseProgramStages`.
     ///
     /// Returns `Ok(())` on full success, or `Err(stage_index, message)`
     /// for the first stage that failed to compile or link. On error the
@@ -2292,69 +2382,51 @@ impl GraphicsPipeline {
     /// never invokes this directly — `RasterizerOpenGL::draw` calls it
     /// lazily on first use, where a GL context is guaranteed.
     pub fn build_from_sources(&mut self) -> Result<(), (usize, String)> {
+        self.build_from_sources_impl(false)
+    }
+
+    /// Build in a worker-owned shared context and publish a fence for the
+    /// render context, matching upstream's `force_context_flush` path used by
+    /// `ShaderCache::LoadDiskResources`.
+    pub(crate) fn build_from_sources_for_shared_context(&mut self) -> Result<(), (usize, String)> {
+        self.build_from_sources_impl(true)
+    }
+
+    fn build_from_sources_impl(&mut self, create_fence: bool) -> Result<(), (usize, String)> {
         // Already built — nothing to do.
         if self.has_gl_programs() {
             return Ok(());
         }
 
+        if let Some(shader_notify) = self.shader_notify {
+            shader_notify.mark_shader_building();
+        }
+        let build = build_programs(
+            &self.glsl_sources,
+            &self.spirv_sources,
+            self.program_backend,
+            create_fence,
+        );
+        if let Some(shader_notify) = self.shader_notify {
+            shader_notify.mark_shader_complete();
+        }
+        let build = build?;
+        self.accept_program_build(build);
+        self.is_built = !create_fence;
+
         for (stage_index, source) in self.glsl_sources.iter().enumerate() {
             let Some(source) = source else { continue };
-            if source.is_empty() {
+            let program = self.source_programs[stage_index];
+            if program == 0 {
                 continue;
             }
-            match unsafe { compile_link_separable(stage_index, source) } {
-                Ok(program) => {
-                    self.source_programs[stage_index] = program;
-                    self.enabled_stages_mask |= 1 << stage_index;
-                    trace_pipeline_build(
-                        12,
-                        &self.key,
-                        stage_index as u64,
-                        program as u64,
-                        source.len() as u64,
-                    );
-                    if std::env::var_os("RUZU_TRACE_PIPELINE_BUILD").is_some() {
-                        let hash = city_hash64(source.as_bytes());
-                        log::info!(
-                            "[PIPELINE_BUILD] pipeline_key=0x{:016X} stage={} program={} source_hash=0x{:016X} source_bytes={}",
-                            self.key.hash_key(),
-                            stage_name(stage_index),
-                            program,
-                            hash,
-                            source.len()
-                        );
-                        if std::env::var_os("RUZU_TRACE_PIPELINE_BUILD_SOURCE").is_some() {
-                            eprintln!(
-                                "[PIPELINE_BUILD_SOURCE stage={} program={} hash=0x{:016X}]\n{}",
-                                stage_name(stage_index),
-                                program,
-                                hash,
-                                source
-                            );
-                        }
-                    }
-                }
-                Err(msg) => {
-                    trace_pipeline_build(13, &self.key, stage_index as u64, 0, source.len() as u64);
-                    dump_glsl_on_error(self.key.hash_key(), stage_index, source, &msg);
-                    // Roll back any handles we already created.
-                    self.delete_gl_programs();
-                    return Err((stage_index, msg));
-                }
-            }
-        }
-
-        // Aggregate the per-stage separable programs into a single
-        // program-pipeline object. Mirrors upstream's `OGLPipeline` setup.
-        unsafe {
-            gl::GenProgramPipelines(1, &mut self.program_pipeline);
-            for stage_index in 0..NUM_STAGES {
-                let prog = self.source_programs[stage_index];
-                if prog == 0 {
-                    continue;
-                }
-                gl::UseProgramStages(self.program_pipeline, stage_bit(stage_index), prog);
-            }
+            trace_pipeline_build(
+                12,
+                &self.key,
+                stage_index as u64,
+                program as u64,
+                source.len() as u64,
+            );
         }
         if std::env::var_os("RUZU_TRACE_PIPELINE_BUILD").is_some() {
             log::info!(
@@ -2381,6 +2453,82 @@ impl GraphicsPipeline {
         Ok(())
     }
 
+    /// Queue host program creation on an upstream-shaped shader worker.
+    pub fn build_async(&mut self, worker: &StatefulThreadWorker<ShaderContext>) {
+        if self.has_gl_programs() || self.pending_build.is_some() {
+            return;
+        }
+        let sources = self.glsl_sources.clone();
+        let spirv_sources = self.spirv_sources.clone();
+        let backend = self.program_backend;
+        let shader_notify = self.shader_notify;
+        let slot: AsyncBuildSlot = Arc::new((Mutex::new(None), Condvar::new()));
+        let worker_slot = Arc::clone(&slot);
+        self.pending_build = Some(slot);
+        self.is_built = false;
+        if let Some(shader_notify) = shader_notify {
+            shader_notify.mark_shader_building();
+        }
+        worker.queue_work(move |_context| {
+            let result = build_programs(&sources, &spirv_sources, backend, true);
+            if let Some(shader_notify) = shader_notify {
+                shader_notify.mark_shader_complete();
+            }
+            let (lock, condvar) = &*worker_slot;
+            *lock.lock().unwrap() = Some(result);
+            condvar.notify_one();
+        });
+    }
+
+    pub fn has_pending_build(&self) -> bool {
+        self.pending_build.is_some()
+    }
+
+    fn accept_program_build(&mut self, mut build: ProgramBuild) {
+        self.source_programs = std::mem::take(&mut build.source_programs);
+        self.assembly_programs = std::mem::take(&mut build.assembly_programs);
+        self.program_pipeline = std::mem::take(&mut build.program_pipeline);
+        self.built_fence = std::mem::replace(&mut build.fence, std::ptr::null());
+        self.enabled_stages_mask =
+            self.source_programs
+                .iter()
+                .enumerate()
+                .fold(0u32, |mask, (stage, &program)| {
+                    let enabled = program != 0 || self.assembly_programs[stage] != 0;
+                    mask | if enabled { 1 << stage } else { 0 }
+                });
+    }
+
+    fn receive_pending_build(&mut self, wait: bool) -> bool {
+        let Some(slot) = self.pending_build.as_ref().cloned() else {
+            return false;
+        };
+        let (lock, condvar) = &*slot;
+        let mut result = lock.lock().unwrap();
+        if wait {
+            result = condvar
+                .wait_while(result, |result| result.is_none())
+                .unwrap();
+        } else if result.is_none() {
+            return false;
+        }
+        let completed = result.take().expect("pending shader build completed");
+        drop(result);
+        self.pending_build = None;
+        match completed {
+            Ok(build) => self.accept_program_build(build),
+            Err((stage, message)) => {
+                log::error!(
+                    "OpenGL asynchronous shader build failed at stage {}: {}",
+                    stage_name(stage),
+                    message
+                );
+                self.is_built = true;
+            }
+        }
+        true
+    }
+
     /// Delete every per-stage program handle this pipeline owns and the
     /// program-pipeline object aggregating them.
     /// Called both on `build_from_sources` rollback and on drop.
@@ -2395,6 +2543,12 @@ impl GraphicsPipeline {
                 *handle = 0;
             }
         }
+        for handle in self.assembly_programs.iter_mut() {
+            if *handle != 0 {
+                delete_assembly_program(*handle);
+                *handle = 0;
+            }
+        }
         self.enabled_stages_mask = 0;
     }
 
@@ -2402,6 +2556,10 @@ impl GraphicsPipeline {
     ///
     /// Port of `GraphicsPipeline::IsBuilt()`.
     pub fn is_built(&mut self) -> bool {
+        if self.is_built {
+            return true;
+        }
+        self.receive_pending_build(false);
         if self.is_built {
             return true;
         }
@@ -2430,35 +2588,85 @@ impl GraphicsPipeline {
     ///
     /// Port of `GraphicsPipeline::ConfigureTransformFeedbackImpl()`.
     fn configure_transform_feedback_impl(&self) {
-        // In the full implementation, this would call:
-        // glTransformFeedbackVaryings or glTransformFeedbackBufferRange
-        // based on the xfb_attribs and num_xfb_buffers_active
+        let buffer_mode = if self.num_xfb_buffers_active == 1 {
+            gl::INTERLEAVED_ATTRIBS
+        } else {
+            gl::SEPARATE_ATTRIBS
+        };
+        let transform_feedback_attribs = GL_TRANSFORM_FEEDBACK_ATTRIBS_NV
+            .get()
+            .and_then(|function| *function)
+            .expect("glTransformFeedbackAttribsNV is required by the GLASM backend");
         unsafe {
-            for i in 0..self.num_xfb_buffers_active {
-                // glBindBufferRange for each active XFB buffer
-                let _ = i;
-            }
+            transform_feedback_attribs(
+                self.num_xfb_attribs,
+                self.xfb_attribs.as_ptr(),
+                buffer_mode,
+            );
         }
     }
 
     /// Generate transform feedback state from the pipeline key.
     ///
     /// Port of `GraphicsPipeline::GenerateTransformFeedbackState()`.
-    fn generate_transform_feedback_state(&mut self) {
-        // In the full implementation, this reads XFB state from the key
-        // and populates xfb_attribs and num_xfb_buffers_active
+    pub(crate) fn generate_transform_feedback_state(&mut self) {
         if !self.key.xfb_enabled() {
             self.num_xfb_attribs = 0;
             self.num_xfb_buffers_active = 0;
             return;
         }
-        // XFB state parsing requires the full TransformFeedbackState type
+
+        let mut cursor = 0usize;
+        self.num_xfb_buffers_active = 0;
+        for feedback in 0..NUM_TRANSFORM_FEEDBACK_BUFFERS {
+            let layout = self.key.xfb_state.layouts[feedback];
+            if layout.stride != layout.varying_count * 4 {
+                log::warn!(
+                    "OpenGL transform feedback stride padding is not implemented: stride={} varying_count={}",
+                    layout.stride,
+                    layout.varying_count
+                );
+            }
+            if layout.varying_count == 0 {
+                continue;
+            }
+            self.num_xfb_buffers_active += 1;
+
+            let locations = &self.key.xfb_state.varyings[feedback];
+            let mut current_index = None;
+            for offset in 0..layout.varying_count {
+                let location = locations[(offset / 4) as usize];
+                let attribute = match offset % 4 {
+                    0 => location.attribute0(),
+                    1 => location.attribute1(),
+                    2 => location.attribute2(),
+                    3 => location.attribute3(),
+                    _ => unreachable!(),
+                };
+                let index = attribute / 4;
+                if current_index == Some(index) {
+                    self.xfb_attribs[cursor - 2] += 1;
+                    continue;
+                }
+                current_index = Some(index);
+                let (token, attribute_index) = transform_feedback_enum(attribute);
+                self.xfb_attribs[cursor] = token;
+                self.xfb_attribs[cursor + 1] = 1;
+                self.xfb_attribs[cursor + 2] = attribute_index;
+                cursor += XFB_ENTRY_STRIDE;
+            }
+        }
+        self.num_xfb_attribs = (cursor / XFB_ENTRY_STRIDE) as i32;
     }
 
     /// Wait for the pipeline build to complete.
     ///
     /// Port of `GraphicsPipeline::WaitForBuild()`.
     fn wait_for_build(&mut self) {
+        if self.is_built {
+            return;
+        }
+        self.receive_pending_build(true);
         if self.is_built {
             return;
         }
@@ -2471,14 +2679,73 @@ impl GraphicsPipeline {
             self.is_built = true;
             return;
         }
-        // Wait on condvar for async build thread
-        let lock = self.built_mutex.lock().unwrap();
-        let _guard = self
-            .built_condvar
-            .wait_while(lock, |built| !*built)
-            .unwrap();
         self.is_built = true;
     }
+}
+
+fn build_programs(
+    sources: &[Option<String>; NUM_STAGES],
+    spirv_sources: &[Option<Vec<u32>>; NUM_STAGES],
+    backend: GraphicsProgramBackend,
+    create_fence: bool,
+) -> Result<ProgramBuild, (usize, String)> {
+    let mut build = ProgramBuild {
+        source_programs: [0; NUM_STAGES],
+        assembly_programs: [0; NUM_STAGES],
+        program_pipeline: 0,
+        fence: std::ptr::null(),
+    };
+    for stage_index in 0..NUM_STAGES {
+        match backend {
+            GraphicsProgramBackend::Glsl => {
+                let Some(source) = sources[stage_index].as_ref() else {
+                    continue;
+                };
+                if source.is_empty() {
+                    continue;
+                }
+                match unsafe { compile_link_separable(stage_index, source) } {
+                    Ok(program) => build.source_programs[stage_index] = program,
+                    Err(message) => return Err((stage_index, message)),
+                }
+            }
+            GraphicsProgramBackend::Glasm => {
+                let Some(source) = sources[stage_index].as_ref() else {
+                    continue;
+                };
+                if !source.is_empty() {
+                    build.assembly_programs[stage_index] =
+                        compile_assembly_program(source, gl_assembly_stage(stage_index));
+                }
+            }
+            GraphicsProgramBackend::SpirV => {
+                let Some(source) = spirv_sources[stage_index].as_ref() else {
+                    continue;
+                };
+                if !source.is_empty() {
+                    build.source_programs[stage_index] =
+                        create_program_from_spirv(source, gl_stage(stage_index));
+                }
+            }
+        }
+    }
+    if backend != GraphicsProgramBackend::Glasm {
+        unsafe {
+            gl::GenProgramPipelines(1, &mut build.program_pipeline);
+            for (stage_index, &program) in build.source_programs.iter().enumerate() {
+                if program != 0 {
+                    gl::UseProgramStages(build.program_pipeline, stage_bit(stage_index), program);
+                }
+            }
+        }
+    }
+    if create_fence {
+        unsafe {
+            build.fence = gl::FenceSync(gl::SYNC_GPU_COMMANDS_COMPLETE, 0);
+            gl::Flush();
+        }
+    }
+    Ok(build)
 }
 
 /// Map a `glsl_sources` slot index to the corresponding
@@ -2849,6 +3116,9 @@ pub fn transform_feedback_enum(location: u32) -> (i32, i32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::transform_feedback::{StreamOutLayout, TransformFeedbackLayout};
+    use shader_recompiler::shader_info::StorageBufferDescriptor;
+    use std::io::Write;
 
     #[test]
     fn pipeline_key_xfb_bits() {
@@ -2862,19 +3132,6 @@ mod tests {
     }
 
     #[test]
-    fn pipeline_key_alpha_test_bits_are_hashed_without_xfb() {
-        let mut key = GraphicsPipelineKey::default();
-        let baseline = key.hash_key();
-
-        key.set_alpha_test_func(4);
-        key.alpha_test_ref = 0x3F00_0000;
-
-        assert_eq!(key.alpha_test_func(), 4);
-        assert_ne!(key.hash_key(), baseline);
-        assert!(key.size() >= std::mem::offset_of!(GraphicsPipelineKey, padding));
-    }
-
-    #[test]
     fn pipeline_key_size_varies_by_xfb() {
         let mut key = GraphicsPipelineKey::default();
         let size_no_xfb = key.size();
@@ -2884,6 +3141,68 @@ mod tests {
 
         assert!(size_xfb > size_no_xfb);
         assert_eq!(size_xfb, std::mem::size_of::<GraphicsPipelineKey>());
+    }
+
+    #[test]
+    fn pipeline_key_cache_layout_round_trips() {
+        assert_eq!(std::mem::size_of::<TransformFeedbackLayout>(), 12);
+        assert_eq!(std::mem::size_of::<StreamOutLayout>(), 4);
+        assert_eq!(std::mem::size_of::<TransformFeedbackState>(), 560);
+        assert_eq!(std::mem::size_of::<GraphicsPipelineKey>(), 624);
+
+        let mut key = GraphicsPipelineKey::default();
+        key.unique_hashes = [1, 2, 3, 4, 5, 6];
+        key.raw = 0x5A5;
+        key.xfb_state.layouts[0] = TransformFeedbackLayout {
+            stream: 3,
+            varying_count: 17,
+            stride: 64,
+        };
+        key.xfb_state.varyings[0][0] = StreamOutLayout::from_raw(0x4433_2211);
+
+        let path = std::env::temp_dir().join(format!(
+            "ruzu-gl-graphics-key-{}-{}.bin",
+            std::process::id(),
+            key.hash_key()
+        ));
+        let mut file = std::fs::File::create(&path).unwrap();
+        file.write_all(key.to_cache_bytes()).unwrap();
+        drop(file);
+        let mut file = std::fs::File::open(&path).unwrap();
+        assert_eq!(GraphicsPipelineKey::read_from_file(&mut file).unwrap(), key);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn glasm_storage_buffer_selection_matches_upstream_limit() {
+        let mut info = ShaderInfo::default();
+        info.storage_buffers_descriptors = (0..3)
+            .map(|index| StorageBufferDescriptor {
+                cbuf_index: index,
+                cbuf_offset: 0,
+                count: 1,
+                is_written: true,
+            })
+            .collect();
+        let infos = [Some(info), None, None, None, None];
+
+        let mut glsl = GraphicsPipeline::new(GraphicsPipelineKey::default(), None);
+        glsl.set_program_backend(GraphicsProgramBackend::Glsl, 0);
+        glsl.apply_shader_infos(&infos);
+        assert!(glsl.use_storage_buffers);
+        assert!(!glsl.writes_global_memory);
+
+        let mut glasm_bindless = GraphicsPipeline::new(GraphicsPipelineKey::default(), None);
+        glasm_bindless.set_program_backend(GraphicsProgramBackend::Glasm, 2);
+        glasm_bindless.apply_shader_infos(&infos);
+        assert!(!glasm_bindless.use_storage_buffers);
+        assert!(glasm_bindless.writes_global_memory);
+
+        let mut glasm_storage = GraphicsPipeline::new(GraphicsPipelineKey::default(), None);
+        glasm_storage.set_program_backend(GraphicsProgramBackend::Glasm, 3);
+        glasm_storage.apply_shader_infos(&infos);
+        assert!(glasm_storage.use_storage_buffers);
+        assert!(!glasm_storage.writes_global_memory);
     }
 
     #[test]
@@ -2935,13 +3254,30 @@ mod tests {
     }
 
     #[test]
+    fn generate_transform_feedback_state_groups_components_like_upstream() {
+        let mut key = GraphicsPipelineKey::default();
+        key.set_xfb_enabled(true);
+        key.xfb_state.layouts[0].varying_count = 4;
+        key.xfb_state.layouts[0].stride = 16;
+        key.xfb_state.varyings[0][0] =
+            crate::transform_feedback::StreamOutLayout::from_raw(0x2422_2120);
+
+        let mut pipeline = GraphicsPipeline::new(key, None);
+        pipeline.generate_transform_feedback_state();
+
+        assert_eq!(pipeline.num_xfb_buffers_active, 1);
+        assert_eq!(pipeline.num_xfb_attribs, 2);
+        assert_eq!(&pipeline.xfb_attribs[..6], &[0x8C7D, 3, 0, 0x8C7D, 1, 1]);
+    }
+
+    #[test]
     fn transform_feedback_position() {
         let (token, _) = transform_feedback_enum(7 * 4);
         assert_eq!(token, 0x1203); // GL_POSITION
     }
 
     #[test]
-    fn configure_does_not_configure_transform_feedback() {
+    fn graphics_program_binding_does_not_configure_transform_feedback() {
         let source = include_str!("gl_graphics_pipeline.rs");
         let bind_programs = source
             .find("pub fn bind_graphics_programs_for_configure")
@@ -2949,24 +3285,21 @@ mod tests {
         let bind_programs_with_manager = source
             .find("pub fn bind_graphics_programs_for_configure_with_program_manager")
             .expect("GraphicsPipeline::bind_graphics_programs_for_configure_with_program_manager");
-        let configure = source
-            .find("pub fn configure(&mut self")
-            .expect("GraphicsPipeline::configure");
-        let transform_feedback = source[configure..]
+        let transform_feedback = source[bind_programs_with_manager..]
             .find("/// Configure transform feedback")
             .expect("ConfigureTransformFeedback boundary")
-            + configure;
-        let configure_body = &source[configure..transform_feedback];
+            + bind_programs_with_manager;
         let bind_programs_body = &source[bind_programs..bind_programs_with_manager];
-        let bind_programs_with_manager_body = &source[bind_programs_with_manager..configure];
+        let bind_programs_with_manager_body =
+            &source[bind_programs_with_manager..transform_feedback];
 
         assert!(bind_programs_body.contains("wait_for_build()"));
         assert!(bind_programs_body.contains("gl::BindProgramPipeline(self.program_pipeline)"));
         assert!(bind_programs_with_manager_body.contains("program_manager"));
         assert!(bind_programs_with_manager_body.contains("bind_assembly_programs"));
         assert!(bind_programs_with_manager_body.contains("program_manager.bind_source_programs"));
-        assert!(configure_body.contains("self.bind_graphics_programs_for_configure()"));
-        assert!(!configure_body.contains("configure_transform_feedback"));
+        assert!(!bind_programs_body.contains("configure_transform_feedback"));
+        assert!(!bind_programs_with_manager_body.contains("configure_transform_feedback"));
 
         let rasterizer = include_str!("gl_rasterizer.rs");
         let rasterizer_runtime = rasterizer
@@ -2980,7 +3313,6 @@ mod tests",
         assert!(rasterizer_runtime.contains(
             "pipeline.configure_buffers_programs_then_prepare_and_bind_graphics_resources"
         ));
-        assert!(!rasterizer_runtime.contains("pipeline.configure(is_indexed)"));
     }
 
     #[test]
@@ -4001,8 +4333,9 @@ mod tests",
         assert!(!body.contains("gl::BindFramebuffer"));
 
         let rasterizer = include_str!("gl_rasterizer.rs");
-        assert!(rasterizer.contains(
-            "fill_graphics_image_views_then_update_render_targets_and_bind_framebuffer("
+        assert!(rasterizer.contains(".synchronize_then_configure_graphics_framebuffer("));
+        assert!(!rasterizer.contains(
+            "pipeline.fill_graphics_image_views_then_update_render_targets_and_bind_framebuffer("
         ));
         assert!(!rasterizer.contains("gl::BindFramebuffer(gl::DRAW_FRAMEBUFFER, framebuffer)"));
     }
@@ -4034,8 +4367,9 @@ mod tests",
         assert!(is_clear_false < bind);
 
         let rasterizer = include_str!("gl_rasterizer.rs");
-        assert!(rasterizer.contains(
-            "fill_graphics_image_views_then_update_render_targets_and_bind_framebuffer("
+        assert!(rasterizer.contains(".synchronize_then_configure_graphics_framebuffer("));
+        assert!(!rasterizer.contains(
+            "pipeline.fill_graphics_image_views_then_update_render_targets_and_bind_framebuffer("
         ));
     }
 

@@ -27,9 +27,8 @@ impl FXAA {
     ///
     /// Corresponds to `FXAA::FXAA()`.
     ///
-    /// In the full implementation, this compiles the FXAA vertex and fragment
-    /// shaders from host shader sources, creates a bilinear sampler, and
-    /// allocates a RGBA16F texture + framebuffer at the given dimensions.
+    /// Compiles the host shaders and creates the upstream sampler, RGBA16F
+    /// target, and framebuffer.
     pub fn new(width: u32, height: u32) -> Self {
         let mut framebuffer: u32 = 0;
         let mut texture: u32 = 0;

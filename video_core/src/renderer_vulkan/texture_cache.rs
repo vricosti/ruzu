@@ -1115,6 +1115,7 @@ pub struct TextureCacheRuntime {
     current_tick: u64,
     optimal_bcn_supported: bool,
     optimal_astc_supported: bool,
+    cant_blit_msaa: bool,
     image_format_list_supported: bool,
     must_emulate_bgr565: bool,
     ext_4444_formats_supported: bool,
@@ -1137,6 +1138,7 @@ impl TextureCacheRuntime {
         render_pass_cache: &mut RenderPassCache,
         descriptor_pool: &mut DescriptorPool,
         compute_pass_descriptor_queue: &mut ComputePassDescriptorQueue,
+        cant_blit_msaa: bool,
         image_format_list_supported: bool,
         optimal_astc_supported: bool,
         must_emulate_bgr565: bool,
@@ -1211,6 +1213,7 @@ impl TextureCacheRuntime {
             current_tick: 0,
             optimal_bcn_supported,
             optimal_astc_supported,
+            cant_blit_msaa,
             image_format_list_supported,
             must_emulate_bgr565,
             ext_4444_formats_supported,
@@ -2056,12 +2059,10 @@ impl TextureCacheRuntime {
         wanted_format
     }
 
-    fn needs_scale_helper(&self, _info: &ImageInfo, format: vk::Format) -> bool {
-        // Upstream also checks `device.CantBlitMSAA()` here. The Rust runtime
-        // currently owns only ash device handles, not the full Vulkan Device
-        // wrapper where that driver quirk is tracked, so this slice preserves
-        // the format-feature gate and documents the remaining MSAA-device gap
-        // in DIFF.md.
+    fn needs_scale_helper(&self, info: &ImageInfo, format: vk::Format) -> bool {
+        if info.num_samples > 1 && self.cant_blit_msaa {
+            return true;
+        }
         let blit_usage = vk::FormatFeatureFlags::BLIT_SRC | vk::FormatFeatureFlags::BLIT_DST;
         !self.is_format_supported(format, blit_usage, true)
     }
@@ -2965,6 +2966,7 @@ impl TextureCache {
         render_pass_cache: &mut RenderPassCache,
         descriptor_pool: &mut DescriptorPool,
         compute_pass_descriptor_queue: &mut ComputePassDescriptorQueue,
+        cant_blit_msaa: bool,
         image_format_list_supported: bool,
         optimal_astc_supported: bool,
         must_emulate_bgr565: bool,
@@ -2986,6 +2988,7 @@ impl TextureCache {
             render_pass_cache,
             descriptor_pool,
             compute_pass_descriptor_queue,
+            cant_blit_msaa,
             image_format_list_supported,
             optimal_astc_supported,
             must_emulate_bgr565,

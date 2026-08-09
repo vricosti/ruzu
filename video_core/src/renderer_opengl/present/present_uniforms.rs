@@ -39,3 +39,24 @@ impl ScreenRectVertex {
 pub fn make_orthographic_matrix(width: f32, height: f32) -> [f32; 6] {
     [2.0 / width, 0.0, 0.0, -2.0 / height, -1.0, 1.0]
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn screen_rect_vertex_matches_upstream_glfloat_layout() {
+        assert_eq!(
+            std::mem::size_of::<ScreenRectVertex>(),
+            4 * std::mem::size_of::<f32>()
+        );
+        assert_eq!(
+            std::mem::align_of::<ScreenRectVertex>(),
+            std::mem::align_of::<f32>()
+        );
+
+        let vertex = ScreenRectVertex::new(3, 5, 0.25, 0.75);
+        assert_eq!(vertex.position, [3.0, 5.0]);
+        assert_eq!(vertex.tex_coord, [0.25, 0.75]);
+    }
+}

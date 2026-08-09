@@ -624,6 +624,7 @@ pub struct GraphicsEnvironment {
     base: GenericEnvironment,
     maxwell3d: *const Maxwell3D,
     stage_index: usize,
+    file_backed: bool,
     /// Rust-only fallback state for tests. Upstream live-owner paths read
     /// these values directly from `maxwell3d`.
     #[cfg(test)]
@@ -645,6 +646,7 @@ impl GraphicsEnvironment {
             base: GenericEnvironment::new(),
             maxwell3d: std::ptr::null(),
             stage_index: 0,
+            file_backed: false,
             #[cfg(test)]
             detached_state: GraphicsEnvironmentDetachedState {
                 const_buffers: [ConstBufferBinding::default(); 18],
@@ -729,6 +731,22 @@ impl GraphicsEnvironment {
         env
     }
 
+    pub fn from_file_environment(env: FileEnvironment) -> Self {
+        let stage = env.stage;
+        let mut result = Self::new();
+        result.stage_index = match stage {
+            ShaderStage::VertexA | ShaderStage::VertexB => 0,
+            ShaderStage::TessellationControl => 1,
+            ShaderStage::TessellationEval => 2,
+            ShaderStage::Geometry => 3,
+            ShaderStage::Fragment => 4,
+            ShaderStage::Compute => 0,
+        };
+        result.base = env.into_generic_environment();
+        result.file_backed = true;
+        result
+    }
+
     fn maxwell3d(&self) -> &Maxwell3D {
         unsafe { self.maxwell3d.as_ref() }
             .expect("GraphicsEnvironment requires a live Maxwell3D owner outside tests")
@@ -772,6 +790,14 @@ impl GraphicsEnvironment {
     }
 
     pub fn read_cbuf_value(&mut self, cbuf_index: u32, cbuf_offset: u32) -> u32 {
+        if self.file_backed {
+            return self
+                .base
+                .cbuf_values
+                .get(&make_cbuf_key(cbuf_index, cbuf_offset))
+                .copied()
+                .expect("file environment must contain every referenced cbuf value");
+        }
         #[cfg(test)]
         let binding = self.graphics_const_buffer_binding_for_test(cbuf_index);
         #[cfg(not(test))]
@@ -813,6 +839,14 @@ impl GraphicsEnvironment {
     }
 
     pub fn read_texture_type(&mut self, handle: u32) -> TextureType {
+        if self.file_backed {
+            return self
+                .base
+                .texture_types
+                .get(&handle)
+                .copied()
+                .expect("file environment must contain every referenced texture type");
+        }
         #[cfg(test)]
         let (tex_header_pool_addr, tex_header_pool_limit, via_header_binding) =
             self.texture_header_state_for_test();
@@ -836,6 +870,14 @@ impl GraphicsEnvironment {
     }
 
     pub fn read_texture_pixel_format(&mut self, handle: u32) -> TexturePixelFormat {
+        if self.file_backed {
+            return self
+                .base
+                .texture_pixel_formats
+                .get(&handle)
+                .copied()
+                .expect("file environment must contain every referenced texture format");
+        }
         #[cfg(test)]
         let (tex_header_pool_addr, tex_header_pool_limit, via_header_binding) =
             self.texture_header_state_for_test();
@@ -863,11 +905,21 @@ impl GraphicsEnvironment {
     }
 
     pub fn read_viewport_transform_state(&mut self) -> u32 {
+        if self.file_backed {
+            return self.base.viewport_transform_state;
+        }
         self.base.viewport_transform_state = self.maxwell3d().viewport_transform_state();
         self.base.viewport_transform_state
     }
 
     pub fn get_replace_const_buffer(&mut self, bank: u32, offset: u32) -> Option<ReplaceConstant> {
+        if self.file_backed {
+            return self
+                .base
+                .cbuf_replacements
+                .get(&make_cbuf_key(bank, offset))
+                .copied();
+        }
         if !self.base.has_hle_engine_state {
             return None;
         }
@@ -1000,6 +1052,7 @@ impl shader_recompiler::environment::Environment for GraphicsEnvironment {
 pub struct ComputeEnvironment {
     base: GenericEnvironment,
     kepler_compute: *const KeplerCompute,
+    file_backed: bool,
     /// Rust-only fallback state for tests. Upstream live-owner paths read
     /// these values directly from `kepler_compute`.
     #[cfg(test)]
@@ -1023,6 +1076,7 @@ impl ComputeEnvironment {
         Self {
             base,
             kepler_compute: std::ptr::null(),
+            file_backed: false,
             #[cfg(test)]
             detached_state: ComputeEnvironmentDetachedState {
                 const_buffer_enable_mask: 0,
@@ -1052,6 +1106,13 @@ impl ComputeEnvironment {
         env.base.shared_memory_size = qmd.shared_alloc;
         env.base.workgroup_size = [qmd.block_dim_x, qmd.block_dim_y, qmd.block_dim_z];
         env
+    }
+
+    pub fn from_file_environment(env: FileEnvironment) -> Self {
+        let mut result = Self::new();
+        result.base = env.into_generic_environment();
+        result.file_backed = true;
+        result
     }
 
     fn kepler_compute(&self) -> &KeplerCompute {
@@ -1084,6 +1145,14 @@ impl ComputeEnvironment {
     }
 
     pub fn read_cbuf_value(&mut self, cbuf_index: u32, cbuf_offset: u32) -> u32 {
+        if self.file_backed {
+            return self
+                .base
+                .cbuf_values
+                .get(&make_cbuf_key(cbuf_index, cbuf_offset))
+                .copied()
+                .expect("file environment must contain every referenced cbuf value");
+        }
         #[cfg(test)]
         let (enable_mask, cbufs, _, _, _) = self
             .qmd_for_test()
@@ -1117,6 +1186,14 @@ impl ComputeEnvironment {
     }
 
     pub fn read_texture_type(&mut self, handle: u32) -> TextureType {
+        if self.file_backed {
+            return self
+                .base
+                .texture_types
+                .get(&handle)
+                .copied()
+                .expect("file environment must contain every referenced texture type");
+        }
         #[cfg(test)]
         let (_, _, tic_address, tic_limit, linked_tsc) = self
             .qmd_for_test()
@@ -1138,6 +1215,14 @@ impl ComputeEnvironment {
     }
 
     pub fn read_texture_pixel_format(&mut self, handle: u32) -> TexturePixelFormat {
+        if self.file_backed {
+            return self
+                .base
+                .texture_pixel_formats
+                .get(&handle)
+                .copied()
+                .expect("file environment must contain every referenced texture format");
+        }
         #[cfg(test)]
         let (_, _, tic_address, tic_limit, linked_tsc) = self
             .qmd_for_test()
@@ -1475,6 +1560,42 @@ impl FileEnvironment {
         self.code.get(first_word..).unwrap_or(&[])
     }
 
+    pub fn cached_instruction_start(&self) -> u32 {
+        self.read_lowest.saturating_add(self.initial_offset)
+    }
+
+    fn into_generic_environment(self) -> GenericEnvironment {
+        let has_hle_engine_state = !self.cbuf_replacements.is_empty();
+        GenericEnvironment {
+            program_base: 0,
+            start_address: self.start_address,
+            stage: self.stage,
+            code: self.code,
+            texture_types: self.texture_types,
+            texture_pixel_formats: self.texture_pixel_formats,
+            cbuf_values: self.cbuf_values,
+            cbuf_replacements: self.cbuf_replacements,
+            local_memory_size: self.local_memory_size,
+            texture_bound: self.texture_bound,
+            shared_memory_size: self.shared_memory_size,
+            workgroup_size: self.workgroup_size,
+            read_lowest: self.read_lowest,
+            read_highest: self.read_highest,
+            cached_lowest: self.read_lowest,
+            cached_highest: self.read_highest,
+            initial_offset: self.initial_offset,
+            viewport_transform_state: self.viewport_transform_state,
+            sph: self.sph,
+            gp_passthrough_mask: self.gp_passthrough_mask,
+            has_unbound_instructions: false,
+            has_hle_engine_state,
+            is_proprietary_driver: self.is_proprietary_driver,
+            gpu_memory: None,
+            #[cfg(test)]
+            gpu_read: None,
+        }
+    }
+
     pub fn has_hle_macro_state(&self) -> bool {
         !self.cbuf_replacements.is_empty()
     }
@@ -1799,12 +1920,14 @@ pub fn load_pipelines<'a, FStop>(
 
     if let Err(e) = load_result {
         log::error!("load_pipelines: {}", e);
-        // Upstream deletes the cache on an iostream failure because the C++
-        // reader and writer are the same implementation. The Rust Vulkan
-        // cache reader is still being brought to binary parity with upstream;
-        // deleting a cache here can destroy a valid upstream/yuzu cache after
-        // a Rust-side deserialization bug. Keep the file until the serialized
-        // key/environment layout is fully verified.
+        drop(file);
+        if let Err(remove_error) = std::fs::remove_file(filename) {
+            log::error!(
+                "Failed to delete invalid pipeline cache file {:?}: {}",
+                filename,
+                remove_error
+            );
+        }
     }
 }
 
@@ -2582,5 +2705,37 @@ mod tests {
         load_pipelines(|| false, &path, 7, Box::new(|_, _| {}), Box::new(|_, _| {}));
 
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn file_environment_adapters_use_serialized_values_without_live_engines() {
+        let mut file = FileEnvironment::new();
+        file.stage = ShaderStage::Fragment;
+        file.code = vec![0xDEAD_BEEF_CAFE_BABE];
+        file.read_lowest = 0;
+        file.read_highest = INST_SIZE as u32;
+        file.initial_offset = 0;
+        file.cbuf_values.insert(make_cbuf_key(2, 0x30), 0x1234_5678);
+        file.texture_types.insert(9, TextureType::ColorCube);
+        file.texture_pixel_formats
+            .insert(9, TexturePixelFormat::A8B8G8R8Unorm);
+
+        let mut env = GraphicsEnvironment::from_file_environment(file);
+        assert_eq!(
+            shader_recompiler::environment::Environment::read_instruction(&mut env, 0),
+            0xDEAD_BEEF_CAFE_BABE
+        );
+        assert_eq!(
+            shader_recompiler::environment::Environment::read_cbuf_value(&mut env, 2, 0x30),
+            0x1234_5678
+        );
+        assert_eq!(
+            shader_recompiler::environment::Environment::read_texture_type(&mut env, 9),
+            TextureType::ColorCube
+        );
+        assert_eq!(
+            shader_recompiler::environment::Environment::read_texture_pixel_format(&mut env, 9),
+            TexturePixelFormat::A8B8G8R8Unorm
+        );
     }
 }

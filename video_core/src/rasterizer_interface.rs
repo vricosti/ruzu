@@ -7,6 +7,7 @@
 //! Abstract interface for GPU rasterizer backends. Each renderer
 //! (Null, OpenGL, Vulkan) provides its own implementation.
 
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 use crate::control::channel_state::ChannelState;
@@ -27,6 +28,11 @@ pub enum LoadCallbackStage {
 /// Callback for disk resource loading progress.
 pub type DiskResourceLoadCallback =
     Arc<dyn Fn(LoadCallbackStage, usize, usize) + Send + Sync + 'static>;
+
+/// Cancellation state for disk resource loading.
+///
+/// This is the Rust owner-equivalent of upstream's copied `std::stop_token`.
+pub type DiskResourceLoadStop = Arc<AtomicBool>;
 
 /// Non-owning rasterizer pointer matching upstream `VideoCore::RasterizerInterface*`.
 ///
@@ -241,6 +247,16 @@ pub trait RasterizerInterface {
         false
     }
 
+    /// Rust ownership adapter for backends whose upstream implementation reads
+    /// the condition address from its live Maxwell3D owner.
+    fn accelerate_conditional_rendering_with_address(
+        &mut self,
+        _condition_address: u64,
+        _compare_size: u64,
+    ) -> bool {
+        self.accelerate_conditional_rendering()
+    }
+
     /// Attempt to use a faster method to perform a surface copy.
     fn accelerate_surface_copy(
         &mut self,
@@ -297,7 +313,13 @@ pub trait RasterizerInterface {
     // ── Disk resources ──────────────────────────────────────────────────
 
     /// Initialize disk cached resources for the game being emulated.
-    fn load_disk_resources(&mut self, _title_id: u64, _callback: DiskResourceLoadCallback) {}
+    fn load_disk_resources(
+        &mut self,
+        _title_id: u64,
+        _stop_loading: DiskResourceLoadStop,
+        _callback: DiskResourceLoadCallback,
+    ) {
+    }
 
     // ── Channel management ──────────────────────────────────────────────
 

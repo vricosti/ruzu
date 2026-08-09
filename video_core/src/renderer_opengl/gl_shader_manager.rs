@@ -5,6 +5,7 @@
 //!
 //! OpenGL program manager — manages binding of shader programs and assembly programs.
 
+use super::gl_resource_manager::{OGLPipeline, OGLProgram};
 use super::gl_shader_util::{bind_assembly_program, create_program_from_source};
 use crate::host_shaders::compute_shaders::OPENGL_LMEM_WARMUP_COMP;
 use std::sync::Arc;
@@ -36,13 +37,13 @@ const STAGE_ENUMS: [u32; NUM_STAGES] = [
 ///
 /// Corresponds to `OpenGL::ProgramManager`.
 pub struct ProgramManager {
-    pipeline: u32,
+    pipeline: OGLPipeline,
     is_pipeline_bound: bool,
     is_compute_bound: bool,
     current_stage_mask: u32,
     current_programs: [u32; NUM_STAGES],
     current_assembly_compute_program: u32,
-    lmem_warmup_program: u32,
+    lmem_warmup_program: OGLProgram,
 }
 
 impl ProgramManager {
@@ -54,14 +55,10 @@ impl ProgramManager {
     }
 
     pub fn new_with_caps(use_assembly_shaders: bool, has_lmem_perf_bug: bool) -> Self {
-        let mut pipeline: u32 = 0;
+        let mut pipeline = OGLPipeline::new();
         unsafe {
-            gl::CreateProgramPipelines(1, &mut pipeline);
+            gl::CreateProgramPipelines(1, &mut pipeline.handle);
         }
-        // Upstream: if (device.UseAssemblyShaders()) { glEnable(GL_COMPUTE_PROGRAM_NV); }
-        // GL_COMPUTE_PROGRAM_NV (0x90FB) is an NV extension enum not exposed by the gl crate.
-        // Assembly shader support requires NV-specific function pointers (see gl_shader_util.rs).
-        // Until those are loaded via runtime GetProcAddress, this is a no-op.
         if use_assembly_shaders {
             const GL_COMPUTE_PROGRAM_NV: u32 = 0x90FB;
             unsafe {
@@ -69,11 +66,11 @@ impl ProgramManager {
             }
         }
 
-        let lmem_warmup_program = if has_lmem_perf_bug {
-            create_program_from_source(OPENGL_LMEM_WARMUP_COMP, gl::COMPUTE_SHADER)
-        } else {
-            0
-        };
+        let mut lmem_warmup_program = OGLProgram::new();
+        if has_lmem_perf_bug {
+            lmem_warmup_program.handle =
+                create_program_from_source(OPENGL_LMEM_WARMUP_COMP, gl::COMPUTE_SHADER);
+        }
 
         Self {
             pipeline,
@@ -103,13 +100,13 @@ impl ProgramManager {
     #[cfg(test)]
     pub fn new_shared_for_test() -> ProgramManagerHandle {
         Arc::new(parking_lot::Mutex::new(Self {
-            pipeline: 0,
+            pipeline: OGLPipeline::new(),
             is_pipeline_bound: false,
             is_compute_bound: false,
             current_stage_mask: 0,
             current_programs: [0; NUM_STAGES],
             current_assembly_compute_program: 0,
-            lmem_warmup_program: 0,
+            lmem_warmup_program: OGLProgram::new(),
         }))
     }
 
@@ -143,7 +140,7 @@ impl ProgramManager {
             if self.current_programs[stage] != programs[stage] {
                 self.current_programs[stage] = programs[stage];
                 unsafe {
-                    gl::UseProgramStages(self.pipeline, STAGE_ENUMS[stage], programs[stage]);
+                    gl::UseProgramStages(self.pipeline.handle, STAGE_ENUMS[stage], programs[stage]);
                 }
             }
         }
@@ -157,18 +154,18 @@ impl ProgramManager {
         if self.current_programs[0] != vertex {
             self.current_programs[0] = vertex;
             unsafe {
-                gl::UseProgramStages(self.pipeline, gl::VERTEX_SHADER_BIT, vertex);
+                gl::UseProgramStages(self.pipeline.handle, gl::VERTEX_SHADER_BIT, vertex);
             }
         }
         if self.current_programs[4] != fragment {
             self.current_programs[4] = fragment;
             unsafe {
-                gl::UseProgramStages(self.pipeline, gl::FRAGMENT_SHADER_BIT, fragment);
+                gl::UseProgramStages(self.pipeline.handle, gl::FRAGMENT_SHADER_BIT, fragment);
             }
         }
         unsafe {
             gl::UseProgramStages(
-                self.pipeline,
+                self.pipeline.handle,
                 gl::TESS_CONTROL_SHADER_BIT
                     | gl::TESS_EVALUATION_SHADER_BIT
                     | gl::GEOMETRY_SHADER_BIT,
@@ -226,8 +223,8 @@ impl ProgramManager {
 
     /// Warm up local memory with a compute dispatch.
     pub fn local_memory_warmup(&mut self) {
-        if self.lmem_warmup_program != 0 {
-            self.bind_compute_program(self.lmem_warmup_program);
+        if self.lmem_warmup_program.handle != 0 {
+            self.bind_compute_program(self.lmem_warmup_program.handle);
             unsafe {
                 gl::DispatchCompute(1, 1, 1);
             }
@@ -235,9 +232,11 @@ impl ProgramManager {
     }
 
     fn bind_pipeline(&mut self) {
-        self.is_pipeline_bound = true;
-        unsafe {
-            gl::BindProgramPipeline(self.pipeline);
+        if !self.is_pipeline_bound {
+            self.is_pipeline_bound = true;
+            unsafe {
+                gl::BindProgramPipeline(self.pipeline.handle);
+            }
         }
         self.unbind_compute();
     }
@@ -257,16 +256,6 @@ impl ProgramManager {
             self.is_compute_bound = false;
             unsafe {
                 gl::UseProgram(0);
-            }
-        }
-    }
-}
-
-impl Drop for ProgramManager {
-    fn drop(&mut self) {
-        if self.pipeline != 0 {
-            unsafe {
-                gl::DeleteProgramPipelines(1, &self.pipeline);
             }
         }
     }

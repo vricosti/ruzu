@@ -13,6 +13,7 @@ use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
+use std::time::Duration;
 
 /// Internal shared state between the pool and its workers.
 struct SharedState<S: Send + 'static> {
@@ -126,6 +127,34 @@ impl<S: Send + 'static> StatefulThreadWorker<S> {
             })
             .unwrap();
     }
+
+    /// Block until all queued work has completed, or permanently stop this
+    /// worker when the caller requests cancellation.
+    ///
+    /// This mirrors upstream `WaitForRequests(std::stop_token)`: cancellation
+    /// requests stop on every worker thread, so queued requests that have not
+    /// started are abandoned and the worker must not be reused afterwards.
+    pub fn wait_for_requests_or_stop(&self, stop_requested: &AtomicBool) {
+        let mut queue = self.shared.queue.lock().unwrap();
+        loop {
+            if stop_requested.load(Ordering::Acquire) {
+                self.shared.stop.store(true, Ordering::Release);
+                self.shared.condition.notify_all();
+            }
+            let stopped = self.shared.workers_stopped.load(Ordering::Acquire);
+            let done = self.shared.work_done.load(Ordering::Acquire);
+            let scheduled = self.shared.work_scheduled.load(Ordering::Acquire);
+            if stopped >= self.shared.workers_queued || done >= scheduled {
+                break;
+            }
+            let (next_queue, _) = self
+                .shared
+                .wait_condition
+                .wait_timeout(queue, Duration::from_millis(10))
+                .unwrap();
+            queue = next_queue;
+        }
+    }
 }
 
 impl<S: Send + 'static> Drop for StatefulThreadWorker<S> {
@@ -175,6 +204,43 @@ mod tests {
 
         worker.wait_for_requests();
         assert_eq!(counter.load(Ordering::SeqCst), 100);
+    }
+
+    #[test]
+    fn cancellation_stops_workers_without_draining_queued_requests() {
+        let stop = AtomicBool::new(false);
+        let task_started = Arc::new(AtomicBool::new(false));
+        let release_task = Arc::new(AtomicBool::new(false));
+        let counter = Arc::new(AtomicU32::new(0));
+        let worker = ThreadWorker::new_stateless(1, "cancelled-worker".to_string());
+        let started = Arc::clone(&task_started);
+        let release = Arc::clone(&release_task);
+        worker.queue_stateless_work(move || {
+            started.store(true, Ordering::Release);
+            while !release.load(Ordering::Acquire) {
+                std::thread::yield_now();
+            }
+        });
+        while !task_started.load(Ordering::Acquire) {
+            std::thread::yield_now();
+        }
+        for _ in 0..8 {
+            let counter = Arc::clone(&counter);
+            worker.queue_stateless_work(move || {
+                counter.fetch_add(1, Ordering::SeqCst);
+            });
+        }
+
+        stop.store(true, Ordering::Release);
+        let release = Arc::clone(&release_task);
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(20));
+            release.store(true, Ordering::Release);
+        });
+        worker.wait_for_requests_or_stop(&stop);
+        releaser.join().unwrap();
+
+        assert_eq!(counter.load(Ordering::SeqCst), 0);
     }
 
     #[test]

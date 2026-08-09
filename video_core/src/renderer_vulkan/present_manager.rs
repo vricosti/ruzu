@@ -11,8 +11,10 @@ use std::sync::{Arc, Condvar, Mutex};
 
 use ash::vk;
 
+use super::renderer_vulkan::OwnedSurface;
 use super::scheduler::Scheduler;
 use super::swapchain::Swapchain;
+use crate::vulkan_common::vulkan_surface;
 
 // ---------------------------------------------------------------------------
 // Helper functions (port of anonymous namespace)
@@ -142,6 +144,10 @@ pub struct PresentManager {
 /// Present-thread-side owner: everything `PresentManager::CopyToSwapchain`
 /// needs, shared between the render thread and the present thread.
 pub(crate) struct PresentThreadContext {
+    entry: ash::Entry,
+    instance: ash::Instance,
+    window_info: vulkan_surface::WindowSystemInfo,
+    surface: Arc<Mutex<OwnedSurface>>,
     device: ash::Device,
     submit_mutex: Arc<Mutex<()>>,
     blit_supported: bool,
@@ -168,9 +174,9 @@ pub(crate) struct PresentThreadContext {
 /// Port of `PresentManager::PresentThread`.
 fn present_thread_main(ctx: &PresentThreadContext) {
     loop {
-        let (frame_index, frame) = {
+        let (frame_index, frame, mut swapchain) = {
             let mut queue = ctx.present_queue.lock().unwrap();
-            loop {
+            let (frame_index, frame) = loop {
                 if ctx.stop.load(Ordering::Acquire) {
                     return;
                 }
@@ -178,12 +184,19 @@ fn present_thread_main(ctx: &PresentThreadContext) {
                     break job;
                 }
                 queue = ctx.frame_cv.wait(queue).unwrap();
-            }
+            };
+
+            // Match upstream's queue-lock -> swapchain-lock handoff. Keeping
+            // the queue locked until the swapchain lock is held prevents
+            // WaitPresent from observing an empty queue before this frame has
+            // actually entered the presentation critical section.
+            ctx.frame_cv.notify_one();
+            let swapchain = ctx.swapchain.lock().unwrap();
+            (frame_index, frame, swapchain)
         };
-        ctx.copy_to_swapchain(frame_index, &frame, None);
+        ctx.copy_to_swapchain_locked(frame_index, &frame, None, &mut swapchain);
+        drop(swapchain);
         ctx.release_frame(frame_index);
-        // Wake WaitPresent watchers blocked on the queue-empty check.
-        ctx.frame_cv.notify_all();
     }
 }
 
@@ -194,7 +207,11 @@ const MAX_IMAGES_IN_FLIGHT: usize = 7;
 impl PresentManager {
     /// Port of `PresentManager::PresentManager`.
     #[allow(clippy::too_many_arguments)]
-    pub fn new(
+    pub(super) fn new(
+        entry: ash::Entry,
+        instance: ash::Instance,
+        window_info: vulkan_surface::WindowSystemInfo,
+        surface: Arc<Mutex<OwnedSurface>>,
         device: ash::Device,
         memory_properties: vk::PhysicalDeviceMemoryProperties,
         frame_image_format: vk::Format,
@@ -270,6 +287,10 @@ impl PresentManager {
 
         let initial_image_view_format = swapchain.lock().unwrap().get_image_view_format();
         let ctx = Arc::new(PresentThreadContext {
+            entry,
+            instance,
+            window_info,
+            surface,
             device: device.clone(),
             submit_mutex,
             blit_supported,
@@ -586,28 +607,60 @@ impl PresentThreadContext {
     /// the `render_ready` semaphore chain instead.
     fn copy_to_swapchain(
         &self,
+        frame_index: usize,
+        frame: &Frame,
+        scheduler: Option<&mut Scheduler>,
+    ) {
+        let mut swapchain = self.swapchain.lock().unwrap();
+        self.copy_to_swapchain_locked(frame_index, frame, scheduler, &mut swapchain);
+    }
+
+    fn copy_to_swapchain_locked(
+        &self,
         _frame_index: usize,
         frame: &Frame,
         mut scheduler: Option<&mut Scheduler>,
+        swapchain: &mut Swapchain,
     ) {
-        let mut swapchain = self.swapchain.lock().unwrap();
+        let mut requires_surface_recreation = false;
+        loop {
+            let result = if requires_surface_recreation {
+                self.recreate_surface(frame, swapchain)
+            } else {
+                self.copy_to_swapchain_once(frame, scheduler.as_deref_mut(), swapchain)
+            };
+
+            match result {
+                Ok(()) if requires_surface_recreation => {
+                    requires_surface_recreation = false;
+                }
+                Ok(()) => return,
+                Err(vk::Result::ERROR_SURFACE_LOST_KHR) => {
+                    requires_surface_recreation = true;
+                }
+                Err(result) => {
+                    log::error!("Vulkan presentation failed: {:?}", result);
+                    return;
+                }
+            }
+        }
+    }
+
+    fn copy_to_swapchain_once(
+        &self,
+        frame: &Frame,
+        mut scheduler: Option<&mut Scheduler>,
+        swapchain: &mut Swapchain,
+    ) -> Result<(), vk::Result> {
         let needs_recreation = swapchain.needs_recreation()
             || swapchain.get_width() != frame.width
             || swapchain.get_height() != frame.height;
-        if needs_recreation && !self.recreate_swapchain(frame, &mut swapchain) {
-            return;
+        if needs_recreation {
+            self.recreate_swapchain(frame, swapchain)?;
         }
 
-        let mut recreate_attempts = 0;
-        while swapchain.acquire_next_image(scheduler.as_deref_mut()) {
-            if !self.recreate_swapchain(frame, &mut swapchain) {
-                return;
-            }
-            recreate_attempts += 1;
-            if recreate_attempts >= 8 {
-                log::warn!("Vulkan swapchain acquisition remained stale after recreation");
-                return;
-            }
+        while swapchain.acquire_next_image(scheduler.as_deref_mut())? {
+            self.recreate_swapchain(frame, swapchain)?;
         }
 
         let swapchain_image = swapchain.current_image();
@@ -622,22 +675,31 @@ impl PresentThreadContext {
             render_semaphore,
             self.graphics_queue,
         );
-        swapchain.present(render_semaphore);
+        swapchain.present(render_semaphore)
     }
 
     /// Port of `PresentManager::RecreateSwapchain`.
-    fn recreate_swapchain(&self, frame: &Frame, swapchain: &mut Swapchain) -> bool {
-        match swapchain.recreate(frame.width, frame.height) {
-            Ok(()) => {
-                self.set_image_count(swapchain.get_image_count());
-                self.set_image_view_format(swapchain.get_image_view_format());
-                true
-            }
-            Err(err) => {
-                log::error!("Failed to recreate Vulkan swapchain: {}", err);
-                false
-            }
-        }
+    fn recreate_swapchain(
+        &self,
+        frame: &Frame,
+        swapchain: &mut Swapchain,
+    ) -> Result<(), vk::Result> {
+        let surface = self.surface.lock().unwrap().handle();
+        swapchain
+            .create(surface, frame.width, frame.height)
+            .map_err(|err| err.result)?;
+        self.set_image_count(swapchain.get_image_count());
+        self.set_image_view_format(swapchain.get_image_view_format());
+        Ok(())
+    }
+
+    fn recreate_surface(&self, frame: &Frame, swapchain: &mut Swapchain) -> Result<(), vk::Result> {
+        let new_surface = unsafe {
+            vulkan_surface::create_surface(&self.entry, &self.instance, &self.window_info)
+                .map_err(|err| err.result)?
+        };
+        self.surface.lock().unwrap().replace(new_surface);
+        self.recreate_swapchain(frame, swapchain)
     }
 
     /// Port of `PresentManager::CopyToSwapchainImpl`.

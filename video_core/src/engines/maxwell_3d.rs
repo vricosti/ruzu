@@ -4920,8 +4920,12 @@ impl Maxwell3D {
 
     /// Handle render enable / query condition. Matches upstream `ProcessQueryCondition`.
     fn process_query_condition(&mut self) {
+        let condition_address = ((self.regs[RENDER_ENABLE_BASE as usize] as u64) << 32)
+            | self.regs[(RENDER_ENABLE_BASE + 1) as usize] as u64;
         let accelerated = self
-            .with_rasterizer_mut(|rasterizer| rasterizer.accelerate_conditional_rendering())
+            .with_rasterizer_mut(|rasterizer| {
+                rasterizer.accelerate_conditional_rendering_with_address(condition_address, 24)
+            })
             .unwrap_or(false);
         if accelerated {
             self.execute_on = true;
@@ -4936,9 +4940,6 @@ impl Maxwell3D {
                     0 => self.execute_on = false,
                     1 => self.execute_on = true,
                     2..=4 => {
-                        let condition_address = ((self.regs[RENDER_ENABLE_BASE as usize] as u64)
-                            << 32)
-                            | self.regs[(RENDER_ENABLE_BASE + 1) as usize] as u64;
                         let mut compare_bytes = [0u8; 24];
                         if !self.read_gpu_block(condition_address, &mut compare_bytes) {
                             self.execute_on = true;

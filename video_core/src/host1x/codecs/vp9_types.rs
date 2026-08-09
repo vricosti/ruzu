@@ -140,6 +140,11 @@ pub struct Vp9EntropyProbs {
 }
 
 const _: () = assert!(std::mem::size_of::<Vp9EntropyProbs>() == 0x7B4);
+const _: () = assert!(std::mem::offset_of!(Vp9EntropyProbs, partition_prob) == 0x24);
+const _: () = assert!(std::mem::offset_of!(Vp9EntropyProbs, switchable_interp_prob) == 0x724);
+const _: () = assert!(std::mem::offset_of!(Vp9EntropyProbs, sign) == 0x772);
+const _: () = assert!(std::mem::offset_of!(Vp9EntropyProbs, class_0_fr) == 0x79e);
+const _: () = assert!(std::mem::offset_of!(Vp9EntropyProbs, high_precision) == 0x7b2);
 
 impl Default for Vp9EntropyProbs {
     fn default() -> Self {
@@ -226,6 +231,11 @@ pub struct PictureInfo {
 }
 
 const _: () = assert!(std::mem::size_of::<PictureInfo>() == 0x100);
+const _: () = assert!(std::mem::offset_of!(PictureInfo, bitstream_size) == 0x30);
+const _: () = assert!(std::mem::offset_of!(PictureInfo, last_frame_size) == 0x48);
+const _: () = assert!(std::mem::offset_of!(PictureInfo, first_level) == 0x70);
+const _: () = assert!(std::mem::offset_of!(PictureInfo, segmentation) == 0x80);
+const _: () = assert!(std::mem::offset_of!(PictureInfo, loop_filter) == 0xe4);
 
 impl Default for PictureInfo {
     fn default() -> Self {
@@ -319,6 +329,12 @@ pub struct EntropyProbs {
 }
 
 const _: () = assert!(std::mem::size_of::<EntropyProbs>() == 0xEA0);
+const _: () = assert!(std::mem::offset_of!(EntropyProbs, inter_mode_prob) == 0x400);
+const _: () = assert!(std::mem::offset_of!(EntropyProbs, tx_8x8_prob) == 0x470);
+const _: () = assert!(std::mem::offset_of!(EntropyProbs, partition_prob) == 0x4e0);
+const _: () = assert!(std::mem::offset_of!(EntropyProbs, class_0) == 0x540);
+const _: () = assert!(std::mem::offset_of!(EntropyProbs, class_0_fr) == 0x560);
+const _: () = assert!(std::mem::offset_of!(EntropyProbs, coef_probs) == 0x5a0);
 
 impl Default for EntropyProbs {
     fn default() -> Self {

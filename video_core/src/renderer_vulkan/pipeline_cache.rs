@@ -21,7 +21,9 @@ use common::thread_worker::ThreadWorker;
 use crate::control::channel_state::ChannelState;
 use crate::control::channel_state_cache::{ChannelInfo, ChannelSetupCaches};
 use crate::engines::maxwell_3d::DrawCall;
-use crate::rasterizer_interface::{DiskResourceLoadCallback, LoadCallbackStage};
+use crate::rasterizer_interface::{
+    DiskResourceLoadCallback, DiskResourceLoadStop, LoadCallbackStage,
+};
 use crate::shader_cache::{GraphicsEnvironments, ShaderCache as SharedShaderCache};
 use crate::shader_environment::{
     load_pipelines, serialize_pipeline, ComputeEnvironment, FileEnvironment,
@@ -486,11 +488,32 @@ fn pipeline_cache_paths(
 
 /// Port of upstream `GetTotalPipelineWorkers`.
 fn get_total_pipeline_workers() -> usize {
-    std::thread::available_parallelism()
+    let max_core_threads = std::thread::available_parallelism()
         .map(|threads| threads.get())
         .unwrap_or(2)
         .max(2)
-        - 1
+        - 1;
+
+    #[cfg(target_os = "android")]
+    {
+        const FREE_CORES: usize = 3;
+        if max_core_threads <= FREE_CORES {
+            1
+        } else {
+            max_core_threads - FREE_CORES
+        }
+    }
+
+    #[cfg(not(target_os = "android"))]
+    max_core_threads
+}
+
+fn get_pipeline_worker_count(has_broken_parallel_shader_compiling: bool) -> usize {
+    if has_broken_parallel_shader_compiling {
+        1
+    } else {
+        get_total_pipeline_workers()
+    }
 }
 
 /// Port of `PipelineCache` class.
@@ -552,6 +575,7 @@ impl PipelineCache {
         shader_notify: crate::shader_notify::ShaderNotifyHandle,
         use_asynchronous_shaders: bool,
         use_vulkan_pipeline_cache: bool,
+        has_broken_parallel_shader_compiling: bool,
         shader_cache: shader_recompiler::PipelineCache,
         profile: Profile,
         host_info: HostTranslateInfo,
@@ -613,7 +637,7 @@ impl PipelineCache {
             vulkan_pipeline_cache: vk::PipelineCache::null(),
             compute_cache: HashMap::new(),
             workers: ThreadWorker::new_stateless(
-                get_total_pipeline_workers(),
+                get_pipeline_worker_count(has_broken_parallel_shader_compiling),
                 "VkPipelineBuilder".to_string(),
             ),
             serialization_thread: ThreadWorker::new_stateless(
@@ -1069,6 +1093,7 @@ impl PipelineCache {
         &mut self,
         title_id: u64,
         pipeline_cache_dir: &std::path::Path,
+        stop_loading: DiskResourceLoadStop,
         callback: DiskResourceLoadCallback,
     ) {
         let Some((pipeline_cache_filename, vulkan_pipeline_cache_filename)) =
@@ -1161,7 +1186,7 @@ impl PipelineCache {
             }
         };
         load_pipelines(
-            || false,
+            || stop_loading.load(Ordering::Acquire),
             &self.pipeline_cache_filename,
             CACHE_VERSION,
             Box::new(load_compute),
@@ -1175,6 +1200,9 @@ impl PipelineCache {
 
         let loaded_compute = loaded_compute.into_inner();
         for (key, env) in loaded_compute {
+            if stop_loading.load(Ordering::Acquire) {
+                break;
+            }
             if self.compute_cache.contains_key(&key) {
                 skipped.set(skipped.get() + 1);
                 continue;
@@ -1214,6 +1242,9 @@ impl PipelineCache {
 
         let loaded_graphics = loaded_graphics.into_inner();
         for (key, envs) in loaded_graphics {
+            if stop_loading.load(Ordering::Acquire) {
+                break;
+            }
             if let Err(reason) = graphics_key_supported_for_disk_rebuild(&key) {
                 skipped.set(skipped.get() + 1);
                 log::debug!(
@@ -1270,7 +1301,7 @@ impl PipelineCache {
             callback(LoadCallbackStage::Build, 0, state.total);
             state.has_loaded = true;
         }
-        self.workers.wait_for_requests();
+        self.workers.wait_for_requests_or_stop(&stop_loading);
 
         let mut skipped_count = skipped.get() + job_skipped.load(Ordering::Relaxed);
         for result in build_results.lock().unwrap().drain(..) {
@@ -1430,6 +1461,15 @@ mod tests {
         RtControlInfo, SamplerBinding, ScissorInfo, ShaderStageInfo, StencilFaceInfo, ViewportInfo,
         ZetaInfo,
     };
+
+    #[test]
+    fn broken_parallel_shader_compiling_uses_one_worker() {
+        assert_eq!(get_pipeline_worker_count(true), 1);
+        assert_eq!(
+            get_pipeline_worker_count(false),
+            get_total_pipeline_workers()
+        );
+    }
 
     #[test]
     fn gather_subpixel_offset_matches_upstream_driver_list() {
