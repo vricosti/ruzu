@@ -381,3 +381,61 @@ and persisted under upstream's `UIGameList\\favorites_expanded` key.
 
 - Not applicable: manual-provider entries are host-only. Focused tests cover highest-version
   selection, descending update order, and clearing versioned entries.
+
+## 2026-08-09 — `video_core/src/engines/maxwell_3d.rs` and `video_core/src/buffer_cache/buffer_cache.rs` vs Eden `src/video_core/engines/maxwell_3d.h` and `src/video_core/buffer_cache/buffer_cache.h`
+
+### Intentional differences
+
+- Rust reads transform-feedback registers through `transform_feedback_buffer_info` rather than
+  exposing the packed register union. `size` and `start_offset` remain signed `s32` values, and the
+  buffer cache preserves their raw two's-complement bit patterns when forming GPU addresses and
+  sizes.
+
+### Unintentional differences (to fix)
+
+- The transform-feedback byte-count path is present, but the dependent primitives-succeeded
+  streamer is not yet available to consume the retained per-stream strides.
+
+### Missing items
+
+- Eden's `PrimitivesSucceededStreamer` integration and its per-stream last-query bookkeeping.
+
+### Binary layout verification
+
+- PASS: focused register tests verify that `0xffff_fff0` and `0xffff_ffe0` are exposed as `-16`
+  and `-32`; consumers cast back to unsigned values without clamping or normalization.
+
+## 2026-08-09 — `video_core/src/renderer_vulkan/query_cache.rs`, `scheduler.rs`, `vk_rasterizer.rs`, `renderer_vulkan.rs`, and `video_core/src/vulkan_common/vulkan_device.rs` vs Eden `src/video_core/renderer_vulkan/vk_query_cache.{h,cpp}`, `vk_scheduler.{h,cpp}`, `vk_rasterizer.{h,cpp}`, `renderer_vulkan.{h,cpp}`, and `vk_device.{h,cpp}`
+
+### Intentional differences
+
+- Query banks use Rust leases and shared state handles instead of Eden's `BankPool` and raw
+  `QueryCache*`. Slot reuse, render-pass close ordering, query reset ordering, and final-value
+  synchronization follow the upstream lifecycle.
+- Transform-feedback query banks retain a non-owning allocator pointer because the renderer owns
+  the allocator for longer than the rasterizer and query cache. Readback uses a mapped mirror while
+  preserving Eden's begin/end/copy ordering and four-stream contract.
+- Dynamic vertex input is rebuilt from the complete Maxwell description through Vulkan dynamic
+  state. Attribute and binding limits, constant-attribute filtering, divisors, and dirty-state
+  clearing follow `RasterizerVulkan::UpdateVertexInput`.
+- `report_device_loss` is a module helper so query-bank owners that retain an `ash::Device` rather
+  than the complete `Device` can execute Eden's same error-and-delay behavior.
+
+### Unintentional differences (to fix)
+
+- Host conditional rendering tracks pause/resume state but does not yet emit Eden's conditional
+  rendering resolve commands.
+- Query aggregation resolves on the CPU; Eden's GPU prefix-scan path is not yet ported.
+
+### Missing items
+
+- `PrimitivesSucceededStreamer`, including topology-aware primitive conversion.
+- GPU prefix-scan query aggregation and the host conditional-rendering resolve pass.
+- The configurable `GpuFenceBehavior` policy. Ruzu currently follows Eden's default policy using
+  GPU accuracy to decide whether fence callbacks are delayed.
+
+### Binary layout verification
+
+- Not applicable to Vulkan host objects. Focused tests cover slot ordering, cumulative ZPass
+  reports, unsynchronized fence rejection, TFB stream mapping, query payload/timestamp writes, and
+  draw preparation ordering.

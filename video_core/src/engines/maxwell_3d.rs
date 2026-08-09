@@ -1688,8 +1688,8 @@ pub struct VertexStreamInfo {
 pub struct TransformFeedbackBufferInfo {
     pub enable: u32,
     pub address: u64,
-    pub size: u32,
-    pub start_offset: u32,
+    pub size: i32,
+    pub start_offset: i32,
 }
 
 /// Number of hardware viewports/scissors.
@@ -2624,8 +2624,8 @@ impl Maxwell3D {
         TransformFeedbackBufferInfo {
             enable: self.regs[base],
             address: ((self.regs[base + 1] as u64) << 32) | self.regs[base + 2] as u64,
-            size: self.regs[base + 3],
-            start_offset: self.regs[base + TRANSFORM_FEEDBACK_BUFFER_START_OFFSET as usize],
+            size: self.regs[base + 3] as i32,
+            start_offset: self.regs[base + TRANSFORM_FEEDBACK_BUFFER_START_OFFSET as usize] as i32,
         }
     }
 
@@ -8418,6 +8418,19 @@ mod tests {
                 start_offset: 0x20,
             }
         );
+    }
+
+    #[test]
+    fn transform_feedback_buffer_info_preserves_signed_fields() {
+        let mut engine = Maxwell3D::new();
+        let base = TRANSFORM_FEEDBACK_BUFFERS_BASE as usize;
+        engine.regs[base + 3] = 0xffff_fff0;
+        engine.regs[base + TRANSFORM_FEEDBACK_BUFFER_START_OFFSET as usize] = 0xffff_ffe0;
+
+        let info = engine.transform_feedback_buffer_info(0);
+
+        assert_eq!(info.size, -16);
+        assert_eq!(info.start_offset, -32);
     }
 
     #[test]

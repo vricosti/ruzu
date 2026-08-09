@@ -630,6 +630,8 @@ pub struct RasterizerVulkan {
     draw_indirect_count: Option<ash::extensions::khr::DrawIndirectCount>,
     push_descriptor: Option<ash::extensions::khr::PushDescriptor>,
     max_viewports: u32,
+    max_vertex_input_attributes: u32,
+    max_vertex_input_bindings: u32,
 
     // Channel-bound GPU memory manager, matching upstream rasterizer access to
     // the active channel's Tegra::MemoryManager.
@@ -719,6 +721,7 @@ impl RasterizerVulkan {
         has_null_descriptor: bool,
         extended_dynamic_state_supported: bool,
         transform_feedback_supported: bool,
+        host_query_reset_supported: bool,
         extended_dynamic_state2_supported: bool,
         extended_dynamic_state2_extra_supported: bool,
         extended_dynamic_state3_blending_supported: bool,
@@ -735,6 +738,7 @@ impl RasterizerVulkan {
         custom_border_color_supported: bool,
         sampler_filter_minmax_supported: bool,
         max_viewports: u32,
+        max_vertex_input_attributes: u32,
         max_vertex_input_bindings: u32,
         vertex_attribute_divisor_supported: bool,
         provoking_vertex_supported: bool,
@@ -895,7 +899,15 @@ impl RasterizerVulkan {
         .map_err(|e| RendererError::InitFailed(format!("texture cache: {:?}", e)))?;
 
         // Create query cache
-        let query_cache = VulkanQueryCache::new();
+        let query_cache = VulkanQueryCache::new(
+            &instance,
+            device.clone(),
+            scheduler,
+            memory_allocator,
+            transform_feedback_supported,
+            host_query_reset_supported,
+        )
+        .map_err(|e| RendererError::InitFailed(format!("query cache: {e:?}")))?;
 
         let wfi_event_info = vk::EventCreateInfo::default();
         let wfi_event = unsafe {
@@ -1011,6 +1023,8 @@ impl RasterizerVulkan {
             draw_indirect_count,
             push_descriptor,
             max_viewports: max_viewports.min(NUM_VIEWPORTS as u32).max(1),
+            max_vertex_input_attributes,
+            max_vertex_input_bindings,
             channel_memory_manager: None,
             gpu_tick_callback: None,
             invalidate_gpu_cache_callback: None,
@@ -1049,6 +1063,7 @@ impl RasterizerVulkan {
     fn draw_prepared(
         &mut self,
         draw: &DrawCall,
+        zpass_pixel_count_enabled: bool,
         indirect_params: Option<crate::engines::draw_manager::IndirectParams>,
         dirty_flags: &mut [bool; 256],
         engine_dirty_flags: Option<std::ptr::NonNull<[bool; 256]>>,
@@ -1260,15 +1275,6 @@ impl RasterizerVulkan {
             offset: vk::Offset2D { x: 0, y: 0 },
             extent,
         };
-        // 5. The common geometry path was bound by
-        // `bind_graphics_descriptors` in upstream ConfigureImpl order.
-        dirty_flags[crate::dirty_flags::flags::INDEX_BUFFER as usize] = false;
-        dirty_flags[crate::dirty_flags::flags::VERTEX_BUFFERS as usize] = false;
-        for index in
-            crate::dirty_flags::flags::VERTEX_BUFFER0..=crate::dirty_flags::flags::VERTEX_BUFFER31
-        {
-            dirty_flags[index as usize] = false;
-        }
         let indirect_binding = indirect_params.map(|params| {
             let (buffer_id, offset) = self.common_buffer_cache.get_draw_indirect_buffer();
             let buffer = vk::Buffer::from_raw(
@@ -1352,10 +1358,30 @@ impl RasterizerVulkan {
             uses_render_area,
         );
 
+        // `bind_graphics_descriptors` has just run the common buffer cache's
+        // `UpdateGraphicsBuffers`, which consumes these live Maxwell dirty
+        // flags before Eden calls `UpdateDynamicStates`.
+        dirty_flags[crate::dirty_flags::flags::INDEX_BUFFER as usize] = false;
+        dirty_flags[crate::dirty_flags::flags::VERTEX_BUFFERS as usize] = false;
+        for index in
+            crate::dirty_flags::flags::VERTEX_BUFFER0..=crate::dirty_flags::flags::VERTEX_BUFFER31
+        {
+            dirty_flags[index as usize] = false;
+        }
+
         // 6. Update dynamic states via dirty flags. Upstream requests the
         // render pass in `GraphicsPipeline::ConfigureDraw` before
         // `RasterizerVulkan::UpdateDynamicStates`.
         self.update_dynamic_states(draw, dirty_flags, engine_dirty_flags);
+
+        self.query_cache.notify_segment(true);
+        self.query_cache
+            .handle_transform_feedback(&mut self.scheduler);
+        self.query_cache.counter_enable(
+            &mut self.scheduler,
+            QueryType::ZPassPixelCount64 as u32,
+            zpass_pixel_count_enabled,
+        );
 
         // 7. Issue draw call
         if trace_draw {
@@ -1376,7 +1402,22 @@ impl RasterizerVulkan {
                 return;
             }
             if params.is_byte_count {
-                warn!("RasterizerVulkan::draw_indirect byte-count path requires VK_EXT_transform_feedback");
+                let Some(transform_feedback) = self.query_cache.transform_feedback_dispatch()
+                else {
+                    warn!("RasterizerVulkan::draw_indirect byte-count path requires VK_EXT_transform_feedback");
+                    return;
+                };
+                self.scheduler.record(move |cmdbuf| unsafe {
+                    (transform_feedback.cmd_draw_indirect_byte_count_ext)(
+                        cmdbuf,
+                        1,
+                        0,
+                        buffer,
+                        offset as vk::DeviceSize,
+                        0,
+                        params.stride as u32,
+                    );
+                });
                 return;
             }
             if let Some((count_buffer, count_offset)) = count {
@@ -1758,6 +1799,7 @@ impl RasterizerVulkan {
             let mut dirty_flags = draw.dirty_flags;
             self.draw_prepared(
                 draw,
+                false,
                 None,
                 &mut dirty_flags,
                 None,
@@ -1943,50 +1985,50 @@ impl RasterizerVulkan {
     ) {
         use super::state_tracker::dirty;
 
-        if !dirty_flags[dirty::VERTEX_INPUT as usize] {
+        let vertex_input_dirty = dirty_flags[dirty::VERTEX_INPUT as usize];
+        let vertex_buffers_dirty = dirty_flags[crate::dirty_flags::flags::VERTEX_BUFFERS as usize];
+        if !vertex_input_dirty && !vertex_buffers_dirty {
             return;
         }
         dirty_flags[dirty::VERTEX_INPUT as usize] = false;
 
         let mut bindings = Vec::with_capacity(32);
         let mut attributes = Vec::with_capacity(32);
-        let mut highest_dirty_attr = 0usize;
-        for index in 0..32 {
-            if dirty_flags[dirty::VERTEX_ATTRIBUTE_0 as usize + index] {
-                highest_dirty_attr = index;
-            }
-        }
-        for index in 0..highest_dirty_attr {
+        let max_attributes = 32usize.min(self.max_vertex_input_attributes as usize);
+        let max_bindings = 32usize.min(self.max_vertex_input_bindings as usize);
+
+        for index in 0..max_attributes {
             let attribute = draw.vertex_attribs[index];
-            let binding = attribute.buffer_index;
-            dirty_flags[dirty::VERTEX_ATTRIBUTE_0 as usize + index] = false;
-            dirty_flags[dirty::VERTEX_BINDING_0 as usize + binding as usize] = true;
-            if !attribute.constant {
-                attributes.push((
-                    index as u32,
-                    binding,
-                    maxwell_to_vk::vertex_format(
-                        self.must_emulate_scaled_formats,
-                        attribute.attrib_type,
-                        attribute.size,
-                    ),
-                    attribute.offset,
-                ));
-            }
-        }
-        for index in 0..32 {
-            if !dirty_flags[dirty::VERTEX_BINDING_0 as usize + index] {
+            let binding = attribute.buffer_index as usize;
+            if attribute.constant || binding >= max_bindings {
                 continue;
             }
-            dirty_flags[dirty::VERTEX_BINDING_0 as usize + index] = false;
-            let stream = draw.vertex_streams[index];
-            let is_instanced = draw.vertex_stream_instances[index] != 0;
-            bindings.push((
+            attributes.push((
                 index as u32,
+                binding as u32,
+                maxwell_to_vk::vertex_format(
+                    self.must_emulate_scaled_formats,
+                    attribute.attrib_type,
+                    attribute.size,
+                ),
+                attribute.offset,
+            ));
+        }
+
+        for binding in 0..max_bindings {
+            let stream = draw.vertex_streams[binding];
+            let is_instanced = draw.vertex_stream_instances[binding] != 0;
+            bindings.push((
+                binding as u32,
                 stream.stride,
                 is_instanced,
                 if is_instanced { stream.frequency } else { 1 },
             ));
+        }
+
+        for index in 0..32 {
+            dirty_flags[dirty::VERTEX_ATTRIBUTE_0 as usize + index] = false;
+            dirty_flags[dirty::VERTEX_BINDING_0 as usize + index] = false;
         }
         if let Some(mut flags) = engine_dirty_flags {
             unsafe {
@@ -3037,6 +3079,7 @@ impl RasterizerInterface for RasterizerVulkan {
             return;
         };
         let engine_dirty_flags = draw_view.dirty_flags_ptr();
+        let zpass_pixel_count_enabled = draw_view.zpass_pixel_count_enabled();
         let draw_call = draw_view.draw_call_snapshot(instance_count);
         let read_gpu = |gpu_va: u64, output: &mut [u8]| {
             memory_manager.lock().read_block(gpu_va, output);
@@ -3050,6 +3093,7 @@ impl RasterizerInterface for RasterizerVulkan {
         let mut dirty_flags = draw_call.dirty_flags;
         self.draw_prepared(
             &draw_call,
+            zpass_pixel_count_enabled,
             None,
             &mut dirty_flags,
             engine_dirty_flags,
@@ -3090,6 +3134,7 @@ impl RasterizerInterface for RasterizerVulkan {
 
         self.draw_sequence = self.draw_sequence.wrapping_add(1);
         let engine_dirty_flags = indirect_view.dirty_flags_ptr();
+        let zpass_pixel_count_enabled = indirect_view.draw_view_mut().zpass_pixel_count_enabled();
         let draw_call = indirect_view.draw_call_snapshot();
         let read_gpu = |gpu_va: u64, output: &mut [u8]| {
             memory_manager.lock().read_block(gpu_va, output);
@@ -3113,6 +3158,7 @@ impl RasterizerInterface for RasterizerVulkan {
         let mut dirty_flags = draw_call.dirty_flags;
         self.draw_prepared(
             &draw_call,
+            zpass_pixel_count_enabled,
             Some(params),
             &mut dirty_flags,
             engine_dirty_flags,
@@ -3137,8 +3183,6 @@ impl RasterizerInterface for RasterizerVulkan {
     ) {
         let _gpu_tick_guard = GpuTickGuard(self.gpu_tick_callback.clone());
         self.flush_work();
-
-        self.query_cache.notify_segment(true);
 
         let draw_texture_state = draw_texture_view.draw_texture_state();
         let dynamic_state = draw_texture_view.draw_call_snapshot();
@@ -3177,12 +3221,14 @@ impl RasterizerInterface for RasterizerVulkan {
             return;
         };
         self.update_dynamic_states(&dynamic_state, &mut dirty_flags, engine_dirty_flags);
+        self.query_cache.notify_segment(true);
         for (index, dirty) in dirty_flags.iter().enumerate() {
             if !dirty && original_dirty_flags[index] {
                 draw_texture_view.clear_dirty_flag(index as u8);
             }
         }
         self.query_cache.counter_enable(
+            &mut self.scheduler,
             QueryType::ZPassPixelCount64 as u32,
             draw_texture_view.zpass_pixel_count_enabled(),
         );
@@ -3510,22 +3556,26 @@ impl RasterizerInterface for RasterizerVulkan {
             );
             return;
         }
-        self.query_cache.reset_counter(query_type);
+        self.query_cache
+            .reset_counter(&mut self.scheduler, query_type);
     }
 
     fn query(
         &mut self,
         gpu_addr: u64,
-        _query_type: u32,
+        query_type: u32,
         flags: QueryPropertiesFlags,
         payload: u32,
-        _subreport: u32,
+        subreport: u32,
     ) {
         let this = self as *mut Self;
         self.query_cache.query(
+            &mut self.scheduler,
             gpu_addr,
+            query_type,
             flags,
             payload,
+            subreport,
             move |func| unsafe { (*this).signal_fence(func) },
             move |func| unsafe { (*this).sync_operation(func) },
         );
@@ -4685,6 +4735,56 @@ mod tests {
             update < feedback,
             "feedback loops require current render targets"
         );
+    }
+
+    #[test]
+    fn prepare_draw_orders_query_segments_like_upstream() {
+        let source = include_str!("vk_rasterizer.rs");
+        let function = source
+            .split("fn draw_prepared")
+            .nth(1)
+            .expect("draw_prepared must exist")
+            .split("fn push_graphics_push_constants")
+            .next()
+            .expect("draw_prepared boundary must exist");
+        let clear_geometry = function
+            .find("dirty_flags[crate::dirty_flags::flags::VERTEX_BUFFERS")
+            .expect("buffer-cache geometry dirty state must be consumed");
+        let dynamic = function
+            .find("self.update_dynamic_states")
+            .expect("dynamic state update must exist");
+        let segment = function
+            .find("self.query_cache.notify_segment(true)")
+            .expect("draw segment notification must exist");
+        let transform_feedback = function
+            .find(".handle_transform_feedback")
+            .expect("transform-feedback handling must exist");
+        let zpass = function
+            .find("QueryType::ZPassPixelCount64")
+            .expect("ZPass enable must exist");
+
+        assert!(clear_geometry < dynamic);
+        assert!(dynamic < segment);
+        assert!(segment < transform_feedback);
+        assert!(transform_feedback < zpass);
+    }
+
+    #[test]
+    fn dynamic_vertex_input_rebuilds_the_complete_description() {
+        let source = include_str!("vk_rasterizer.rs");
+        let function = source
+            .split("fn update_vertex_input")
+            .nth(1)
+            .expect("update_vertex_input must exist")
+            .split("fn update_primitive_restart_enable")
+            .next()
+            .expect("update_vertex_input boundary must exist");
+
+        assert!(function.contains("for index in 0..max_attributes"));
+        assert!(function.contains("for binding in 0..max_bindings"));
+        assert!(function.contains("attribute.constant || binding >= max_bindings"));
+        assert!(function.contains("VERTEX_BUFFERS"));
+        assert!(!function.contains("highest_dirty_attr"));
     }
 
     #[test]

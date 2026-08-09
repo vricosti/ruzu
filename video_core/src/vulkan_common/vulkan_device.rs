@@ -319,6 +319,8 @@ pub struct Device {
     /// Whether `VkPhysicalDeviceTimelineSemaphoreFeatures::timelineSemaphore`
     /// is supported and enabled (backs the scheduler's MasterSemaphore).
     pub timeline_semaphore_supported: bool,
+    /// Feature bit from `VkPhysicalDeviceHostQueryResetFeatures`.
+    pub host_query_reset_supported: bool,
     /// Feature bit from `VkPhysicalDeviceShaderFloat16Int8Features`.
     pub shader_int8_supported: bool,
     /// Feature bit from `VkPhysicalDevicePrimitiveTopologyListRestartFeaturesEXT`.
@@ -1396,6 +1398,7 @@ impl Device {
             device_features,
             shader_float16_supported: supports_shader_float16,
             timeline_semaphore_supported,
+            host_query_reset_supported: host_query_reset_features.host_query_reset != 0,
             shader_int8_supported: supports_shader_int8,
             primitive_topology_list_restart_supported: supports_primitive_topology_list_restart,
             primitive_topology_patch_list_restart_supported:
@@ -1528,8 +1531,7 @@ impl Device {
     ///
     /// Port of `Device::ReportLoss`.
     pub fn report_loss(&self) {
-        log::error!("Device loss occurred!");
-        std::thread::sleep(std::time::Duration::from_secs(15));
+        report_device_loss();
     }
 
     /// Reports a shader to Nsight Aftermath.
@@ -1721,6 +1723,13 @@ impl Device {
     /// Returns true if timeline semaphores are supported and enabled.
     pub fn is_timeline_semaphore_supported(&self) -> bool {
         self.timeline_semaphore_supported
+    }
+
+    /// Returns true if host-side `vkResetQueryPool` is supported.
+    ///
+    /// Port of upstream `Device::IsHostQueryResetSupported`.
+    pub fn is_host_query_reset_supported(&self) -> bool {
+        self.host_query_reset_supported
     }
 
     /// Returns true if the device supports VK_EXT_primitive_topology_list_restart.
@@ -2090,6 +2099,13 @@ impl Device {
     pub fn is_ext_4444_formats_supported(&self) -> bool {
         self.format_a4b4g4r4_supported
     }
+}
+
+/// Shared implementation of `Device::ReportLoss` for Vulkan owners which only
+/// retain the logical device handle.
+pub(crate) fn report_device_loss() {
+    log::error!("Device loss occurred!");
+    std::thread::sleep(std::time::Duration::from_secs(15));
 }
 
 fn physical_memory_properties(

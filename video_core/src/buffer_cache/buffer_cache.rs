@@ -3021,7 +3021,7 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
         };
 
         let gpu_addr = tfb_info.address.wrapping_add(tfb_info.start_offset as u64);
-        let size = tfb_info.size;
+        let size = tfb_info.size as u32;
         let device_addr = self
             .gpu_memory
             .as_ref()

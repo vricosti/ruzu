@@ -10,7 +10,8 @@
 //! internal state including query pool banks, streamers, and host conditional
 //! rendering state.
 
-use std::sync::Arc;
+use std::ptr::NonNull;
+use std::sync::{Arc, Once};
 
 use ash::vk;
 
@@ -18,7 +19,10 @@ use crate::control::channel_state::ChannelState;
 use crate::control::channel_state_cache::ChannelCacheAccessor;
 use crate::query_cache::query_cache::QueryCacheRuntimeHandle;
 use crate::query_cache::query_cache_base::{LookupData, QueryCacheBase};
-use crate::query_cache::types::QueryPropertiesFlags;
+use crate::query_cache::types::{QueryPropertiesFlags, QueryType};
+use crate::vulkan_common::vulkan_memory_allocator::{MappedBuffer, MemoryAllocator, MemoryUsage};
+
+use super::scheduler::Scheduler;
 
 // ---------------------------------------------------------------------------
 // Constants (from vk_query_cache.cpp)
@@ -31,6 +35,845 @@ pub const SAMPLES_QUERY_BANK_SIZE: usize = 256;
 /// Size of each query result in bytes.
 /// Port of `SamplesQueryBank::QUERY_SIZE`.
 pub const SAMPLES_QUERY_SIZE: usize = 8;
+
+struct SamplesQueryBank {
+    device: ash::Device,
+    pool: vk::QueryPool,
+    slots: parking_lot::Mutex<SamplesQueryBankSlots>,
+    host_access: parking_lot::Mutex<()>,
+}
+
+struct SamplesQueryBankSlots {
+    free: Vec<u32>,
+    in_use: usize,
+    last_used_tick: u64,
+    resetting: bool,
+}
+
+impl SamplesQueryBank {
+    fn new(
+        device: ash::Device,
+        scheduler: &mut Scheduler,
+        host_query_reset_supported: bool,
+    ) -> Result<Arc<Self>, vk::Result> {
+        let create_info = vk::QueryPoolCreateInfo::builder()
+            .query_type(vk::QueryType::OCCLUSION)
+            .query_count(SAMPLES_QUERY_BANK_SIZE as u32)
+            .build();
+        let pool = unsafe { device.create_query_pool(&create_info, None)? };
+        if host_query_reset_supported {
+            unsafe {
+                device.reset_query_pool(pool, 0, SAMPLES_QUERY_BANK_SIZE as u32);
+            }
+        } else {
+            scheduler.request_outside_renderpass();
+            let reset_device = device.clone();
+            scheduler.record(move |cmdbuf| unsafe {
+                reset_device.cmd_reset_query_pool(cmdbuf, pool, 0, SAMPLES_QUERY_BANK_SIZE as u32);
+            });
+        }
+        Ok(Arc::new(Self {
+            device,
+            pool,
+            slots: parking_lot::Mutex::new(SamplesQueryBankSlots {
+                free: (0..SAMPLES_QUERY_BANK_SIZE as u32).rev().collect(),
+                in_use: 0,
+                last_used_tick: 0,
+                resetting: false,
+            }),
+            host_access: parking_lot::Mutex::new(()),
+        }))
+    }
+
+    fn reserve(&self, scheduler: &mut Scheduler, host_query_reset_supported: bool) -> Option<u32> {
+        loop {
+            {
+                let mut slots = self.slots.lock();
+                if let Some(slot) = slots.free.pop() {
+                    slots.in_use += 1;
+                    // Eden's BankBase records Scheduler::CurrentTick in AddReference and
+                    // requires IsFree(last_used_tick) before recycling the bank.
+                    slots.last_used_tick = scheduler.pending_tick();
+                    return Some(slot);
+                }
+                if slots.in_use != 0 || slots.resetting || !scheduler.is_free(slots.last_used_tick)
+                {
+                    return None;
+                }
+                slots.resetting = true;
+            }
+
+            // Do not hold `slots` while requesting work from the scheduler:
+            // scheduler reset paths release query leases and take this lock.
+            if host_query_reset_supported {
+                let _host_access = self.host_access.lock();
+                unsafe {
+                    self.device
+                        .reset_query_pool(self.pool, 0, SAMPLES_QUERY_BANK_SIZE as u32);
+                }
+            } else {
+                scheduler.request_outside_renderpass();
+                let device = self.device.clone();
+                let pool = self.pool;
+                scheduler.record(move |cmdbuf| unsafe {
+                    device.cmd_reset_query_pool(cmdbuf, pool, 0, SAMPLES_QUERY_BANK_SIZE as u32);
+                });
+            }
+            let mut slots = self.slots.lock();
+            slots.free = (0..SAMPLES_QUERY_BANK_SIZE as u32).rev().collect();
+            slots.resetting = false;
+        }
+    }
+
+    fn release(&self) {
+        let mut slots = self.slots.lock();
+        slots.in_use = slots
+            .in_use
+            .checked_sub(1)
+            .expect("samples query bank reference count underflow");
+    }
+}
+
+impl Drop for SamplesQueryBank {
+    fn drop(&mut self) {
+        unsafe {
+            self.device.destroy_query_pool(self.pool, None);
+        }
+    }
+}
+
+struct SamplesQueryLease {
+    bank: Arc<SamplesQueryBank>,
+    slot: u32,
+}
+
+impl Drop for SamplesQueryLease {
+    fn drop(&mut self) {
+        self.bank.release();
+    }
+}
+
+#[derive(Clone)]
+struct SamplesQuerySlot(Arc<SamplesQueryLease>);
+
+impl SamplesQuerySlot {
+    fn new(bank: Arc<SamplesQueryBank>, slot: u32) -> Self {
+        Self(Arc::new(SamplesQueryLease { bank, slot }))
+    }
+
+    fn bank(&self) -> &SamplesQueryBank {
+        &self.0.bank
+    }
+
+    fn slot(&self) -> u32 {
+        self.0.slot
+    }
+}
+
+pub(crate) struct SamplesQueryState {
+    current: Option<SamplesQuerySlot>,
+    history: Vec<SamplesQuerySlot>,
+}
+
+impl SamplesQueryState {
+    pub(crate) fn pause_counter(&mut self, scheduler: &mut Scheduler) {
+        let Some(query) = self.current.take() else {
+            return;
+        };
+        let pool = query.bank().pool;
+        let slot = query.slot();
+        let device = query.bank().device.clone();
+        scheduler.record(move |cmdbuf| unsafe {
+            device.cmd_end_query(cmdbuf, pool, slot);
+        });
+        self.history.push(query);
+    }
+
+    pub(crate) fn reset_counter(&mut self, scheduler: &mut Scheduler) {
+        self.pause_counter(scheduler);
+        self.history.clear();
+    }
+}
+
+struct SamplesStreamer {
+    device: ash::Device,
+    banks: Vec<Arc<SamplesQueryBank>>,
+    host_query_reset_supported: bool,
+    state: Arc<parking_lot::Mutex<SamplesQueryState>>,
+}
+
+impl SamplesStreamer {
+    fn new(device: ash::Device, host_query_reset_supported: bool) -> Self {
+        Self {
+            device,
+            banks: Vec::new(),
+            host_query_reset_supported,
+            state: Arc::new(parking_lot::Mutex::new(SamplesQueryState {
+                current: None,
+                history: Vec::new(),
+            })),
+        }
+    }
+
+    fn shared_state(&self) -> Arc<parking_lot::Mutex<SamplesQueryState>> {
+        Arc::clone(&self.state)
+    }
+
+    fn reserve(&mut self, scheduler: &mut Scheduler) -> Result<SamplesQuerySlot, vk::Result> {
+        if let Some(query) = self.banks.iter().find_map(|bank| {
+            bank.reserve(scheduler, self.host_query_reset_supported)
+                .map(|slot| SamplesQuerySlot::new(Arc::clone(bank), slot))
+        }) {
+            return Ok(query);
+        }
+        let bank = SamplesQueryBank::new(
+            self.device.clone(),
+            scheduler,
+            self.host_query_reset_supported,
+        )?;
+        let slot = bank
+            .reserve(scheduler, self.host_query_reset_supported)
+            .expect("a new samples query bank must have a free slot");
+        self.banks.push(Arc::clone(&bank));
+        Ok(SamplesQuerySlot::new(bank, slot))
+    }
+
+    fn start_counter(&mut self, scheduler: &mut Scheduler) {
+        if self.state.lock().current.is_some() {
+            return;
+        }
+        let query = match self.reserve(scheduler) {
+            Ok(query) => query,
+            Err(error) => {
+                log::error!("Failed to allocate a Vulkan occlusion query bank: {error:?}");
+                return;
+            }
+        };
+        let pool = query.bank().pool;
+        let slot = query.slot();
+        let device = query.bank().device.clone();
+        scheduler.record(move |cmdbuf| unsafe {
+            let use_precise = common::settings::is_gpu_level_high(&common::settings::values());
+            device.cmd_begin_query(
+                cmdbuf,
+                pool,
+                slot,
+                if use_precise {
+                    vk::QueryControlFlags::PRECISE
+                } else {
+                    vk::QueryControlFlags::empty()
+                },
+            );
+        });
+        self.state.lock().current = Some(query);
+    }
+
+    fn reset_counter(&mut self, scheduler: &mut Scheduler) {
+        self.state.lock().reset_counter(scheduler);
+    }
+
+    fn take_report(&mut self, scheduler: &mut Scheduler) -> Option<SamplesReport> {
+        let mut state = self.state.lock();
+        state.pause_counter(scheduler);
+        (!state.history.is_empty()).then(|| SamplesReport {
+            measured: state.history.clone(),
+        })
+    }
+}
+
+struct SamplesReport {
+    measured: Vec<SamplesQuerySlot>,
+}
+
+impl SamplesReport {
+    fn resolve(self) -> u64 {
+        let mut total = 0u64;
+        for query in &self.measured {
+            let mut value = [0u64; 1];
+            // Vulkan host access to a query pool is externally synchronized.
+            // `host_access` serializes result reads against the host-side
+            // whole-pool reset performed by `reserve`.
+            let _query_pool_guard = query.bank().host_access.lock();
+            let result = unsafe {
+                query.bank().device.get_query_pool_results(
+                    query.bank().pool,
+                    query.slot(),
+                    1,
+                    &mut value,
+                    vk::QueryResultFlags::TYPE_64 | vk::QueryResultFlags::WAIT,
+                )
+            };
+            if let Err(error) = result {
+                if error == vk::Result::ERROR_DEVICE_LOST {
+                    crate::vulkan_common::vulkan_device::report_device_loss();
+                }
+                log::error!("vkGetQueryPoolResults failed for occlusion query: {error:?}");
+            } else {
+                total = total.wrapping_add(value[0]);
+            }
+        }
+        total
+    }
+}
+
+enum HostQueryReport {
+    Samples(SamplesReport),
+    TransformFeedback(TfbReport),
+    #[cfg(test)]
+    Test(u64),
+}
+
+fn is_host_query_report_synchronized(is_fence: bool, gpu_level_high: bool) -> bool {
+    !is_fence || gpu_level_high
+}
+
+fn unsupported_query_payload(query_type: u32) -> u32 {
+    if query_type == QueryType::StreamingPrimitivesNeededMinusSucceeded as u32 {
+        0
+    } else {
+        1
+    }
+}
+
+impl HostQueryReport {
+    fn resolve(self) -> u64 {
+        match self {
+            Self::Samples(report) => report.resolve(),
+            Self::TransformFeedback(report) => report.resolve(),
+            #[cfg(test)]
+            Self::Test(value) => value,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Transform-feedback counter streamer
+// ---------------------------------------------------------------------------
+
+const TFB_QUERY_BANK_SIZE: usize = 1024;
+const TFB_QUERY_SIZE: vk::DeviceSize = 4;
+const NUM_TFB_STREAMS: usize = 4;
+const NUM_TRANSFORM_FEEDBACK_BUFFERS: usize = 4;
+const INVALID_TFB_SLOT: usize = NUM_TFB_STREAMS;
+
+struct TfbQueryBankSlots {
+    free: Vec<u32>,
+    in_use: usize,
+    last_used_tick: u64,
+}
+
+/// Port of upstream `TFBQueryBank`.
+///
+/// Eden copies transform-feedback counter values into a device-local bank and
+/// later stages that bank for host access. The Rust owner keeps a matching
+/// device-local bank plus a persistently mapped readback mirror so the fence
+/// callback can resolve one slot without retaining a mutable staging-pool
+/// borrow across the asynchronous operation.
+struct TfbQueryBank {
+    device: ash::Device,
+    buffer: vk::Buffer,
+    readback: MappedBuffer,
+    slots: parking_lot::Mutex<TfbQueryBankSlots>,
+    host_access: parking_lot::Mutex<()>,
+}
+
+impl TfbQueryBank {
+    fn new(
+        device: ash::Device,
+        memory_allocator: &MemoryAllocator,
+    ) -> Result<Arc<Self>, vk::Result> {
+        let size = TFB_QUERY_SIZE * TFB_QUERY_BANK_SIZE as u64;
+        let device_info = vk::BufferCreateInfo::builder()
+            .size(size)
+            .usage(vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE)
+            .build();
+        let buffer = memory_allocator
+            .create_buffer(&device_info, MemoryUsage::DeviceLocal)
+            .map_err(|error| error.result)?;
+        let readback_info = vk::BufferCreateInfo::builder()
+            .size(size)
+            .usage(vk::BufferUsageFlags::TRANSFER_DST)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE)
+            .build();
+        let readback = memory_allocator
+            .create_mapped_buffer(&readback_info, MemoryUsage::Download)
+            .map_err(|error| error.result)?;
+        Ok(Arc::new(Self {
+            device,
+            buffer,
+            readback,
+            slots: parking_lot::Mutex::new(TfbQueryBankSlots {
+                free: (0..TFB_QUERY_BANK_SIZE as u32).rev().collect(),
+                in_use: 0,
+                last_used_tick: 0,
+            }),
+            host_access: parking_lot::Mutex::new(()),
+        }))
+    }
+
+    fn reserve(&self, scheduler: &Scheduler) -> Option<u32> {
+        let mut slots = self.slots.lock();
+        if slots.free.is_empty() && slots.in_use == 0 && scheduler.is_free(slots.last_used_tick) {
+            slots.free = (0..TFB_QUERY_BANK_SIZE as u32).rev().collect();
+        }
+        let slot = slots.free.pop()?;
+        slots.in_use += 1;
+        slots.last_used_tick = scheduler.pending_tick();
+        Some(slot)
+    }
+
+    fn release(&self) {
+        let mut slots = self.slots.lock();
+        slots.in_use = slots
+            .in_use
+            .checked_sub(1)
+            .expect("transform-feedback query bank reference count underflow");
+    }
+
+    fn resolve(&self, slot: u32) -> u32 {
+        let _host_access = self.host_access.lock();
+        self.readback.invalidate();
+        let offset = slot as usize * TFB_QUERY_SIZE as usize;
+        u32::from_le_bytes(
+            self.readback.mapped_slice()[offset..offset + TFB_QUERY_SIZE as usize]
+                .try_into()
+                .expect("transform-feedback result slot has four bytes"),
+        )
+    }
+}
+
+struct TfbQueryLease {
+    bank: Arc<TfbQueryBank>,
+    slot: u32,
+}
+
+impl Drop for TfbQueryLease {
+    fn drop(&mut self) {
+        self.bank.release();
+    }
+}
+
+struct TfbReport(Arc<TfbQueryLease>);
+
+impl TfbReport {
+    fn resolve(self) -> u64 {
+        self.0.bank.resolve(self.0.slot) as u64
+    }
+}
+
+#[derive(Clone, Copy)]
+struct TfbCounterConfig {
+    enabled: bool,
+    buffers_count: usize,
+    streams_mask: u64,
+    stream_to_slot: [usize; NUM_TFB_STREAMS],
+    strides: [usize; NUM_TFB_STREAMS],
+}
+
+impl Default for TfbCounterConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            buffers_count: 0,
+            streams_mask: 0,
+            stream_to_slot: [INVALID_TFB_SLOT; NUM_TFB_STREAMS],
+            strides: [1; NUM_TFB_STREAMS],
+        }
+    }
+}
+
+fn make_tfb_counter_config(
+    enabled: bool,
+    feedback_state: crate::transform_feedback::TransformFeedbackState,
+    buffers: [crate::engines::maxwell_3d::TransformFeedbackBufferInfo;
+        NUM_TRANSFORM_FEEDBACK_BUFFERS],
+) -> TfbCounterConfig {
+    let mut config = TfbCounterConfig {
+        enabled,
+        ..TfbCounterConfig::default()
+    };
+    for index in 0..NUM_TRANSFORM_FEEDBACK_BUFFERS {
+        if buffers[index].enable == 0 {
+            continue;
+        }
+        config.buffers_count = config.buffers_count.max(index + 1);
+        let stream = feedback_state.layouts[index].stream as usize;
+        if stream >= NUM_TFB_STREAMS {
+            log::warn!("Transform-feedback stream {stream} is out of range");
+            continue;
+        }
+        if config.streams_mask & (1 << stream) != 0 {
+            continue;
+        }
+        config.strides[stream] = feedback_state.layouts[index].stride as usize;
+        config.stream_to_slot[stream] = index;
+        config.streams_mask |= 1 << stream;
+    }
+    config
+}
+
+pub(crate) struct TfbCounterState {
+    device: ash::Device,
+    transform_feedback: Option<vk::ExtTransformFeedbackFn>,
+    counters_buffer: vk::Buffer,
+    counter_buffers: [vk::Buffer; NUM_TFB_STREAMS],
+    offsets: [vk::DeviceSize; NUM_TFB_STREAMS],
+    maxwell3d: Option<usize>,
+    config: TfbCounterConfig,
+    has_started: bool,
+    has_flushed_end_pending: bool,
+}
+
+impl TfbCounterState {
+    fn bind_3d_engine(&mut self, maxwell3d: Option<usize>) {
+        self.maxwell3d = maxwell3d.filter(|address| *address != 0);
+    }
+
+    fn update_buffers(&mut self) {
+        let Some(maxwell3d) = self.maxwell3d else {
+            self.config = TfbCounterConfig::default();
+            return;
+        };
+        // `ChannelSetupCaches` stores the address of the channel-owned boxed
+        // Maxwell3D. The box remains stable until the channel is erased, when
+        // this pointer is cleared by `bind_3d_engine(None)`.
+        let maxwell3d = unsafe { &*(maxwell3d as *const crate::engines::maxwell_3d::Maxwell3D) };
+        self.config = make_tfb_counter_config(
+            maxwell3d.transform_feedback_enabled(),
+            maxwell3d.transform_feedback_state(),
+            std::array::from_fn(|index| maxwell3d.transform_feedback_buffer_info(index as u32)),
+        );
+    }
+
+    fn transform_feedback_enabled(&self) -> bool {
+        let Some(maxwell3d) = self.maxwell3d else {
+            return false;
+        };
+        let maxwell3d = unsafe { &*(maxwell3d as *const crate::engines::maxwell_3d::Maxwell3D) };
+        maxwell3d.transform_feedback_enabled()
+    }
+
+    fn tessellation_enabled(&self) -> bool {
+        let Some(maxwell3d) = self.maxwell3d else {
+            return false;
+        };
+        let maxwell3d = unsafe { &*(maxwell3d as *const crate::engines::maxwell_3d::Maxwell3D) };
+        maxwell3d.shader_config_enabled(crate::engines::maxwell_3d::ShaderStageType::TessInit)
+            || maxwell3d
+                .shader_config_enabled(crate::engines::maxwell_3d::ShaderStageType::Tessellation)
+    }
+
+    fn start_counter(&mut self, scheduler: &mut Scheduler) {
+        if self.transform_feedback.is_none() {
+            return;
+        }
+        self.flush_begin_tfb(scheduler);
+        self.has_started = true;
+    }
+
+    fn flush_begin_tfb(&mut self, scheduler: &mut Scheduler) {
+        if self.transform_feedback.is_none() || self.has_flushed_end_pending {
+            return;
+        }
+        self.has_flushed_end_pending = true;
+        self.update_buffers();
+        let transform_feedback = self.transform_feedback.clone().unwrap();
+        let buffers_count = self.config.buffers_count as u32;
+        if !self.has_started || buffers_count == 0 {
+            scheduler.record(move |cmdbuf| unsafe {
+                (transform_feedback.cmd_begin_transform_feedback_ext)(
+                    cmdbuf,
+                    0,
+                    0,
+                    std::ptr::null(),
+                    std::ptr::null(),
+                );
+            });
+        } else {
+            let buffers = self.counter_buffers;
+            let offsets = self.offsets;
+            let device = self.device.clone();
+            scheduler.record(move |cmdbuf| unsafe {
+                let barrier = vk::MemoryBarrier::builder()
+                    .src_access_mask(vk::AccessFlags::TRANSFORM_FEEDBACK_COUNTER_WRITE_EXT)
+                    .dst_access_mask(vk::AccessFlags::TRANSFORM_FEEDBACK_COUNTER_READ_EXT)
+                    .build();
+                device.cmd_pipeline_barrier(
+                    cmdbuf,
+                    vk::PipelineStageFlags::TRANSFORM_FEEDBACK_EXT,
+                    vk::PipelineStageFlags::TRANSFORM_FEEDBACK_EXT,
+                    vk::DependencyFlags::empty(),
+                    &[barrier],
+                    &[],
+                    &[],
+                );
+                (transform_feedback.cmd_begin_transform_feedback_ext)(
+                    cmdbuf,
+                    0,
+                    buffers_count,
+                    buffers.as_ptr(),
+                    offsets.as_ptr(),
+                );
+            });
+        }
+    }
+
+    fn flush_end_tfb(&mut self, scheduler: &mut Scheduler) {
+        let Some(transform_feedback) = self.transform_feedback.clone() else {
+            return;
+        };
+        if !self.has_flushed_end_pending {
+            return;
+        }
+        self.has_flushed_end_pending = false;
+        self.update_buffers();
+        let buffers_count = self.config.buffers_count as u32;
+        let buffers = self.counter_buffers;
+        let offsets = self.offsets;
+        scheduler.record(move |cmdbuf| unsafe {
+            if buffers_count == 0 {
+                (transform_feedback.cmd_end_transform_feedback_ext)(
+                    cmdbuf,
+                    0,
+                    0,
+                    std::ptr::null(),
+                    std::ptr::null(),
+                );
+            } else {
+                (transform_feedback.cmd_end_transform_feedback_ext)(
+                    cmdbuf,
+                    0,
+                    buffers_count,
+                    buffers.as_ptr(),
+                    offsets.as_ptr(),
+                );
+            }
+        });
+    }
+
+    pub(crate) fn close_counter(&mut self, scheduler: &mut Scheduler) {
+        if self.has_flushed_end_pending && scheduler.is_inside_renderpass() {
+            self.flush_end_tfb(scheduler);
+        }
+        if !self.transform_feedback_enabled() {
+            self.config.streams_mask = 0;
+            self.has_started = false;
+        }
+    }
+}
+
+struct TfbCounterStreamer {
+    device: ash::Device,
+    // SAFETY: RendererVulkan owns the allocator longer than RasterizerVulkan,
+    // which owns this streamer. This mirrors Eden's allocator reference.
+    memory_allocator: NonNull<MemoryAllocator>,
+    state: Arc<parking_lot::Mutex<TfbCounterState>>,
+    banks: Vec<Arc<TfbQueryBank>>,
+}
+
+impl TfbCounterStreamer {
+    fn new(
+        instance: &ash::Instance,
+        device: ash::Device,
+        memory_allocator: &MemoryAllocator,
+        transform_feedback_supported: bool,
+    ) -> Result<Self, vk::Result> {
+        let transform_feedback = transform_feedback_supported.then(|| {
+            vk::ExtTransformFeedbackFn::load(|name| unsafe {
+                std::mem::transmute(instance.get_device_proc_addr(device.handle(), name.as_ptr()))
+            })
+        });
+        let usage = vk::BufferUsageFlags::TRANSFER_SRC
+            | vk::BufferUsageFlags::TRANSFER_DST
+            | if transform_feedback_supported {
+                vk::BufferUsageFlags::TRANSFORM_FEEDBACK_COUNTER_BUFFER_EXT
+            } else {
+                vk::BufferUsageFlags::empty()
+            };
+        let create_info = vk::BufferCreateInfo::builder()
+            .size(TFB_QUERY_SIZE * NUM_TFB_STREAMS as u64)
+            .usage(usage)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE)
+            .build();
+        let counters_buffer = memory_allocator
+            .create_buffer(&create_info, MemoryUsage::DeviceLocal)
+            .map_err(|error| error.result)?;
+        Ok(Self {
+            device: device.clone(),
+            memory_allocator: NonNull::from(memory_allocator),
+            state: Arc::new(parking_lot::Mutex::new(TfbCounterState {
+                device,
+                transform_feedback,
+                counters_buffer,
+                counter_buffers: [counters_buffer; NUM_TFB_STREAMS],
+                offsets: std::array::from_fn(|index| index as u64 * TFB_QUERY_SIZE),
+                maxwell3d: None,
+                config: TfbCounterConfig::default(),
+                has_started: false,
+                has_flushed_end_pending: false,
+            })),
+            banks: Vec::new(),
+        })
+    }
+
+    fn shared_state(&self) -> Arc<parking_lot::Mutex<TfbCounterState>> {
+        Arc::clone(&self.state)
+    }
+
+    fn counter_enable(&mut self, scheduler: &mut Scheduler, enable: bool) {
+        let mut state = self.state.lock();
+        if enable {
+            state.start_counter(scheduler);
+        } else {
+            state.close_counter(scheduler);
+        }
+    }
+
+    fn close_counter(&mut self, scheduler: &mut Scheduler) {
+        self.state.lock().close_counter(scheduler);
+    }
+
+    fn reserve(&mut self, scheduler: &Scheduler) -> Result<TfbReport, vk::Result> {
+        for bank in &self.banks {
+            if let Some(slot) = bank.reserve(scheduler) {
+                return Ok(TfbReport(Arc::new(TfbQueryLease {
+                    bank: Arc::clone(bank),
+                    slot,
+                })));
+            }
+        }
+        // SAFETY: documented on `memory_allocator`; the renderer destroys the
+        // rasterizer and its query cache before the allocator.
+        let memory_allocator = unsafe { self.memory_allocator.as_ref() };
+        let bank = TfbQueryBank::new(self.device.clone(), memory_allocator)?;
+        let slot = bank
+            .reserve(scheduler)
+            .expect("a new transform-feedback query bank must have a free slot");
+        self.banks.push(Arc::clone(&bank));
+        Ok(TfbReport(Arc::new(TfbQueryLease { bank, slot })))
+    }
+
+    fn take_report(&mut self, scheduler: &mut Scheduler, subreport: u32) -> Option<TfbReport> {
+        let state = self.state.lock();
+        if state.transform_feedback.is_none() {
+            return None;
+        }
+        let config = state.config;
+        drop(state);
+        let stream = subreport as usize;
+        if stream >= NUM_TFB_STREAMS
+            || config.streams_mask & (1 << stream) == 0
+            || config.stream_to_slot[stream] >= NUM_TFB_STREAMS
+        {
+            return None;
+        }
+        scheduler.request_outside_renderpass();
+        self.close_counter(scheduler);
+        let report = match self.reserve(scheduler) {
+            Ok(report) => report,
+            Err(error) => {
+                log::error!("Failed to allocate transform-feedback query bank: {error:?}");
+                return None;
+            }
+        };
+        let counter_slot = config.stream_to_slot[stream];
+        let (device, source, source_offset) = {
+            let state = self.state.lock();
+            (
+                report.0.bank.device.clone(),
+                state.counters_buffer,
+                state.offsets[counter_slot],
+            )
+        };
+        let bank = report.0.bank.buffer;
+        let readback = report.0.bank.readback.buffer();
+        let destination_offset = report.0.slot as u64 * TFB_QUERY_SIZE;
+        scheduler.record(move |cmdbuf| unsafe {
+            let counter_barrier = vk::MemoryBarrier::builder()
+                .src_access_mask(vk::AccessFlags::TRANSFORM_FEEDBACK_COUNTER_WRITE_EXT)
+                .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
+                .build();
+            device.cmd_pipeline_barrier(
+                cmdbuf,
+                vk::PipelineStageFlags::TRANSFORM_FEEDBACK_EXT,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::empty(),
+                &[counter_barrier],
+                &[],
+                &[],
+            );
+            device.cmd_copy_buffer(
+                cmdbuf,
+                source,
+                bank,
+                &[vk::BufferCopy {
+                    src_offset: source_offset,
+                    dst_offset: destination_offset,
+                    size: TFB_QUERY_SIZE,
+                }],
+            );
+            let bank_barrier = vk::BufferMemoryBarrier::builder()
+                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .buffer(bank)
+                .offset(destination_offset)
+                .size(TFB_QUERY_SIZE)
+                .build();
+            device.cmd_pipeline_barrier(
+                cmdbuf,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[bank_barrier],
+                &[],
+            );
+            device.cmd_copy_buffer(
+                cmdbuf,
+                bank,
+                readback,
+                &[vk::BufferCopy {
+                    src_offset: destination_offset,
+                    dst_offset: destination_offset,
+                    size: TFB_QUERY_SIZE,
+                }],
+            );
+            let host_barrier = vk::MemoryBarrier::builder()
+                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                .dst_access_mask(vk::AccessFlags::HOST_READ)
+                .build();
+            device.cmd_pipeline_barrier(
+                cmdbuf,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::HOST,
+                vk::DependencyFlags::empty(),
+                &[host_barrier],
+                &[],
+                &[],
+            );
+        });
+        Some(report)
+    }
+}
+
+fn write_query_result(
+    memory_manager: &parking_lot::Mutex<crate::memory_manager::MemoryManager>,
+    gpu_addr: u64,
+    has_timestamp: bool,
+    value: u64,
+    gpu_ticks: u64,
+) {
+    let mm = memory_manager.lock();
+    if has_timestamp {
+        mm.write_block_unsafe(gpu_addr + 8, &gpu_ticks.to_le_bytes());
+        mm.write_block_unsafe(gpu_addr, &value.to_le_bytes());
+    } else {
+        mm.write_block_unsafe(gpu_addr, &(value as u32).to_le_bytes());
+    }
+}
 
 // ---------------------------------------------------------------------------
 // QueryCacheRuntime
@@ -47,16 +890,38 @@ pub const SAMPLES_QUERY_SIZE: usize = 8;
 /// - Streamer objects for different query types
 /// - Host conditional rendering state and buffers
 /// - References to device, scheduler, staging pool, etc.
-pub struct QueryCacheRuntime {
-    /// Whether host conditional rendering is currently active.
+#[derive(Default)]
+pub(crate) struct QueryRuntimeState {
     host_conditional_rendering_active: bool,
-    /// Whether host conditional rendering is currently paused.
     host_conditional_rendering_paused: bool,
+}
+
+impl QueryRuntimeState {
+    fn end_host_conditional_rendering(&mut self) {
+        self.host_conditional_rendering_active = false;
+    }
+
+    pub(crate) fn pause_host_conditional_rendering(&mut self) {
+        if self.host_conditional_rendering_active {
+            self.host_conditional_rendering_paused = true;
+        }
+    }
+
+    fn resume_host_conditional_rendering(&mut self) {
+        if !self.host_conditional_rendering_active {
+            return;
+        }
+        self.host_conditional_rendering_paused = false;
+    }
+}
+
+pub struct QueryCacheRuntime {
+    state: Arc<parking_lot::Mutex<QueryRuntimeState>>,
     /// Whether a 3D engine has been bound through the query-cache owner path.
     ///
-    /// Upstream binds a live `Maxwell3D*` here. The current Rust owner graph
-    /// does not yet carry that engine reference, but the lifecycle edge still
-    /// belongs to this runtime owner.
+    /// The concrete live engine address is held by `TfbCounterState`, which is
+    /// shared with the scheduler; this flag preserves the runtime lifecycle
+    /// contract exposed through `QueryCacheRuntimeHandle`.
     bound_3d_engine: bool,
 }
 
@@ -73,10 +938,13 @@ impl QueryCacheRuntime {
     /// - QueriesPrefixScanPass
     pub fn new() -> Self {
         QueryCacheRuntime {
-            host_conditional_rendering_active: false,
-            host_conditional_rendering_paused: false,
+            state: Arc::new(parking_lot::Mutex::new(QueryRuntimeState::default())),
             bound_3d_engine: false,
         }
+    }
+
+    pub(crate) fn shared_state(&self) -> Arc<parking_lot::Mutex<QueryRuntimeState>> {
+        Arc::clone(&self.state)
     }
 
     /// Port of `QueryCacheRuntime::Barriers`.
@@ -115,9 +983,7 @@ impl QueryCacheRuntime {
     /// Ends the current host conditional rendering scope by calling
     /// `vkCmdEndConditionalRenderingEXT`.
     pub fn end_host_conditional_rendering(&mut self) {
-        if self.host_conditional_rendering_active {
-            self.host_conditional_rendering_active = false;
-        }
+        self.state.lock().end_host_conditional_rendering();
     }
 
     /// Port of `QueryCacheRuntime::PauseHostConditionalRendering`.
@@ -125,18 +991,14 @@ impl QueryCacheRuntime {
     /// Temporarily pauses conditional rendering so that unconditional
     /// operations can be recorded.
     pub fn pause_host_conditional_rendering(&mut self) {
-        if self.host_conditional_rendering_active && !self.host_conditional_rendering_paused {
-            self.host_conditional_rendering_paused = true;
-        }
+        self.state.lock().pause_host_conditional_rendering();
     }
 
     /// Port of `QueryCacheRuntime::ResumeHostConditionalRendering`.
     ///
     /// Resumes previously paused conditional rendering.
     pub fn resume_host_conditional_rendering(&mut self) {
-        if self.host_conditional_rendering_paused {
-            self.host_conditional_rendering_paused = false;
-        }
+        self.state.lock().resume_host_conditional_rendering();
     }
 
     /// Port of `QueryCacheRuntime::HostConditionalRenderingCompareValue`.
@@ -175,7 +1037,7 @@ impl QueryCacheRuntime {
 
     /// Returns whether host conditional rendering is currently active.
     pub fn is_host_conditional_rendering_active(&self) -> bool {
-        self.host_conditional_rendering_active
+        self.state.lock().host_conditional_rendering_active
     }
 
     pub fn is_3d_engine_bound(&self) -> bool {
@@ -231,6 +1093,8 @@ impl QueryCacheRuntimeHandle for QueryCacheRuntime {
 pub struct QueryCache {
     pub base: QueryCacheBase,
     pub runtime: QueryCacheRuntime,
+    samples_streamer: Option<SamplesStreamer>,
+    tfb_streamer: Option<TfbCounterStreamer>,
     /// Channel-bound GPU device memory manager. Used to translate the
     /// query's GPU virtual address to the underlying CPU/guest address
     /// when writing the query result back. Mirrors the wiring in
@@ -242,10 +1106,42 @@ pub struct QueryCache {
 }
 
 impl QueryCache {
-    pub fn new() -> Self {
-        QueryCache {
+    pub fn new(
+        instance: &ash::Instance,
+        device: ash::Device,
+        scheduler: &mut Scheduler,
+        memory_allocator: &MemoryAllocator,
+        transform_feedback_supported: bool,
+        host_query_reset_supported: bool,
+    ) -> Result<Self, vk::Result> {
+        let samples_streamer = SamplesStreamer::new(device, host_query_reset_supported);
+        let tfb_streamer = TfbCounterStreamer::new(
+            instance,
+            samples_streamer.device.clone(),
+            memory_allocator,
+            transform_feedback_supported,
+        )?;
+        let runtime = QueryCacheRuntime::new();
+        scheduler.set_samples_query_state(samples_streamer.shared_state());
+        scheduler.set_tfb_query_state(tfb_streamer.shared_state());
+        scheduler.set_query_runtime_state(runtime.shared_state());
+        Ok(QueryCache {
+            base: QueryCacheBase::new(),
+            runtime,
+            samples_streamer: Some(samples_streamer),
+            tfb_streamer: Some(tfb_streamer),
+            channel_memory_manager: None,
+            gpu_ticks_getter: None,
+        })
+    }
+
+    #[cfg(test)]
+    fn new_for_test() -> Self {
+        Self {
             base: QueryCacheBase::new(),
             runtime: QueryCacheRuntime::new(),
+            samples_streamer: None,
+            tfb_streamer: None,
             channel_memory_manager: None,
             gpu_ticks_getter: None,
         }
@@ -258,6 +1154,12 @@ impl QueryCache {
     pub fn bind_to_channel(&mut self, channel_id: i32) {
         self.base.bind_to_channel(channel_id);
         self.runtime.bind_3d_engine();
+        if let Some(tfb_streamer) = self.tfb_streamer.as_mut() {
+            tfb_streamer
+                .state
+                .lock()
+                .bind_3d_engine(self.base.channel_caches.maxwell3d);
+        }
         self.channel_memory_manager = self
             .base
             .channel_caches
@@ -267,21 +1169,79 @@ impl QueryCache {
 
     pub fn erase_channel(&mut self, channel_id: i32) {
         self.base.erase_channel(channel_id);
+        if let Some(tfb_streamer) = self.tfb_streamer.as_mut() {
+            tfb_streamer.state.lock().bind_3d_engine(None);
+        }
         self.channel_memory_manager = None;
     }
 
     /// Port of `QueryCache::NotifySegment`.
     ///
     /// Notifies the cache of a new command segment for query tracking.
-    pub fn notify_segment(&mut self, _is_draw: bool) {
-        // Base class handles segment tracking
+    pub fn notify_segment(&mut self, is_draw: bool) {
+        if is_draw {
+            self.runtime.resume_host_conditional_rendering();
+        } else {
+            self.runtime.pause_host_conditional_rendering();
+        }
     }
 
     /// Port of `QueryCache::CounterEnable`.
     ///
     /// Enables or disables a query counter type.
-    pub fn counter_enable(&mut self, _query_type: u32, _enable: bool) {
-        // Base class handles counter enable/disable
+    pub fn counter_enable(&mut self, scheduler: &mut Scheduler, query_type: u32, enable: bool) {
+        if query_type == crate::query_cache::types::QueryType::ZPassPixelCount64 as u32 {
+            if let Some(samples_streamer) = self.samples_streamer.as_mut() {
+                if enable {
+                    samples_streamer.start_counter(scheduler);
+                } else {
+                    samples_streamer.state.lock().pause_counter(scheduler);
+                }
+            }
+        } else if query_type == crate::query_cache::types::QueryType::StreamingByteCount as u32 {
+            if let Some(tfb_streamer) = self.tfb_streamer.as_mut() {
+                tfb_streamer.counter_enable(scheduler, enable);
+            }
+        }
+    }
+
+    /// Port of `RasterizerVulkan::HandleTransformFeedback` and
+    /// `TFBCounterStreamer::UpdateBuffers`.
+    pub fn handle_transform_feedback(&mut self, scheduler: &mut Scheduler) {
+        let Some(tfb_streamer) = self.tfb_streamer.as_mut() else {
+            return;
+        };
+        let (enabled, supported, tessellation_enabled) = {
+            let state = tfb_streamer.state.lock();
+            (
+                state.transform_feedback_enabled(),
+                state.transform_feedback.is_some(),
+                state.tessellation_enabled(),
+            )
+        };
+        if !supported {
+            static WARN_UNSUPPORTED: Once = Once::new();
+            WARN_UNSUPPORTED.call_once(|| {
+                if enabled {
+                    log::warn!(
+                        "Transform feedback requested by guest but VK_EXT_transform_feedback is unavailable; queries disabled"
+                    );
+                } else {
+                    log::info!("VK_EXT_transform_feedback not available on device");
+                }
+            });
+            return;
+        }
+        tfb_streamer.counter_enable(scheduler, enabled);
+        if enabled && tessellation_enabled {
+            log::warn!("Transform feedback with tessellation shaders is not implemented");
+        }
+    }
+
+    pub fn transform_feedback_dispatch(&self) -> Option<vk::ExtTransformFeedbackFn> {
+        self.tfb_streamer
+            .as_ref()
+            .and_then(|streamer| streamer.state.lock().transform_feedback.clone())
     }
 
     /// Wire the GPU tick getter used for timestamped queries.
@@ -289,7 +1249,17 @@ impl QueryCache {
         self.gpu_ticks_getter = Some(getter);
     }
 
-    pub fn reset_counter(&mut self, _query_type: u32) {}
+    pub fn reset_counter(&mut self, scheduler: &mut Scheduler, query_type: u32) {
+        if query_type == crate::query_cache::types::QueryType::ZPassPixelCount64 as u32 {
+            if let Some(samples_streamer) = self.samples_streamer.as_mut() {
+                samples_streamer.reset_counter(scheduler);
+            }
+        } else if query_type == crate::query_cache::types::QueryType::StreamingByteCount as u32 {
+            if let Some(tfb_streamer) = self.tfb_streamer.as_mut() {
+                tfb_streamer.close_counter(scheduler);
+            }
+        }
+    }
     pub fn invalidate_region(&mut self, _addr: u64, _size: usize) {}
     pub fn flush_region(&mut self, _addr: u64, _size: usize) {}
     pub fn notify_wfi(&mut self) {
@@ -315,9 +1285,93 @@ impl QueryCache {
     /// Mirrors `gl_query_cache::QueryCache::query`.
     pub fn query(
         &mut self,
+        scheduler: &mut Scheduler,
+        gpu_addr: u64,
+        query_type: u32,
+        flags: QueryPropertiesFlags,
+        payload: u32,
+        subreport: u32,
+        signal_fence: impl FnOnce(Box<dyn FnOnce() + Send>),
+        sync_operation: impl FnOnce(Box<dyn FnOnce() + Send>),
+    ) {
+        let Some(memory_manager) = self.channel_memory_manager.as_ref().cloned() else {
+            return;
+        };
+        if memory_manager.lock().gpu_to_cpu_address(gpu_addr).is_none() {
+            return;
+        }
+
+        let has_samples_streamer = query_type == QueryType::ZPassPixelCount64 as u32;
+        let has_tfb_streamer = query_type == QueryType::StreamingByteCount as u32;
+        let has_payload_streamer = query_type == QueryType::Payload as u32;
+        let (effective_query_type, effective_payload) =
+            if has_samples_streamer || has_payload_streamer || has_tfb_streamer {
+                (query_type, if has_tfb_streamer { 0 } else { payload })
+            } else {
+                (
+                    QueryType::Payload as u32,
+                    unsupported_query_payload(query_type),
+                )
+            };
+        let has_timestamp = flags.contains(QueryPropertiesFlags::HAS_TIMEOUT);
+        let is_fence = flags.contains(QueryPropertiesFlags::IS_A_FENCE);
+        let host_report_is_synchronized = is_host_query_report_synchronized(
+            is_fence,
+            common::settings::is_gpu_level_high(&common::settings::values()),
+        );
+        if !is_fence
+            && effective_query_type == QueryType::Payload as u32
+            && !common::settings::is_gpu_level_high(&common::settings::values())
+        {
+            let gpu_ticks = if has_timestamp {
+                self.gpu_ticks_getter
+                    .as_ref()
+                    .map(|getter| getter())
+                    .unwrap_or(0)
+            } else {
+                0
+            };
+            write_query_result(
+                &memory_manager,
+                gpu_addr,
+                has_timestamp,
+                effective_payload as u64,
+                gpu_ticks,
+            );
+            return;
+        }
+
+        let host_report = if has_samples_streamer {
+            self.samples_streamer
+                .as_mut()
+                .and_then(|samples_streamer| samples_streamer.take_report(scheduler))
+                .map(HostQueryReport::Samples)
+        } else if has_tfb_streamer {
+            self.tfb_streamer
+                .as_mut()
+                .and_then(|streamer| streamer.take_report(scheduler, subreport))
+                .map(HostQueryReport::TransformFeedback)
+        } else {
+            None
+        };
+        self.enqueue_query_writeback(
+            gpu_addr,
+            flags,
+            effective_payload,
+            host_report,
+            host_report_is_synchronized,
+            signal_fence,
+            sync_operation,
+        );
+    }
+
+    fn enqueue_query_writeback(
+        &self,
         gpu_addr: u64,
         flags: QueryPropertiesFlags,
         payload: u32,
+        host_report: Option<HostQueryReport>,
+        host_report_is_synchronized: bool,
         signal_fence: impl FnOnce(Box<dyn FnOnce() + Send>),
         sync_operation: impl FnOnce(Box<dyn FnOnce() + Send>),
     ) {
@@ -328,17 +1382,24 @@ impl QueryCache {
         let is_fence = flags.contains(QueryPropertiesFlags::IS_A_FENCE);
         let gpu_ticks_getter = self.gpu_ticks_getter.as_ref().cloned();
         let operation = Box::new(move || {
-            let mm = memory_manager.lock();
-            if has_timeout {
-                let gpu_ticks = gpu_ticks_getter
+            if host_report.is_some() && !host_report_is_synchronized {
+                log::error!(
+                    "Query report value not synchronized. Consider increasing GPU accuracy."
+                );
+                return;
+            }
+            let value = host_report
+                .map(HostQueryReport::resolve)
+                .unwrap_or(payload as u64);
+            let gpu_ticks = if has_timeout {
+                gpu_ticks_getter
                     .as_ref()
                     .map(|getter| getter())
-                    .unwrap_or(0);
-                mm.write_block_unsafe(gpu_addr + 8, &gpu_ticks.to_le_bytes());
-                mm.write_block_unsafe(gpu_addr, &(payload as u64).to_le_bytes());
+                    .unwrap_or(0)
             } else {
-                mm.write_block_unsafe(gpu_addr, &payload.to_le_bytes());
-            }
+                0
+            };
+            write_query_result(&memory_manager, gpu_addr, has_timeout, value, gpu_ticks);
         });
         if is_fence {
             signal_fence(operation);
@@ -408,9 +1469,61 @@ mod tests {
     }
 
     #[test]
+    fn inactive_host_conditional_rendering_is_not_resumed() {
+        let mut state = QueryRuntimeState {
+            host_conditional_rendering_active: false,
+            host_conditional_rendering_paused: true,
+        };
+
+        state.resume_host_conditional_rendering();
+
+        assert!(state.host_conditional_rendering_paused);
+    }
+
+    #[test]
+    fn fence_host_reports_require_delayed_gpu_accuracy() {
+        assert!(!is_host_query_report_synchronized(true, false));
+        assert!(is_host_query_report_synchronized(true, true));
+        assert!(is_host_query_report_synchronized(false, false));
+    }
+
+    #[test]
+    fn primitives_needed_minus_succeeded_uses_upstream_stub_value() {
+        assert_eq!(
+            unsupported_query_payload(QueryType::StreamingPrimitivesNeededMinusSucceeded as u32),
+            0
+        );
+    }
+
+    #[test]
     fn constants() {
         assert_eq!(SAMPLES_QUERY_BANK_SIZE, 256);
         assert_eq!(SAMPLES_QUERY_SIZE, 8);
+        assert_eq!(TFB_QUERY_BANK_SIZE, 1024);
+        assert_eq!(TFB_QUERY_SIZE, 4);
+    }
+
+    #[test]
+    fn tfb_counter_config_matches_enabled_buffer_stream_mapping() {
+        let mut feedback_state = crate::transform_feedback::TransformFeedbackState::default();
+        feedback_state.layouts[0].stream = 2;
+        feedback_state.layouts[0].stride = 24;
+        feedback_state.layouts[3].stream = 1;
+        feedback_state.layouts[3].stride = 40;
+        let mut buffers = [crate::engines::maxwell_3d::TransformFeedbackBufferInfo::default(); 4];
+        buffers[0].enable = 1;
+        buffers[3].enable = 1;
+
+        let config = make_tfb_counter_config(true, feedback_state, buffers);
+
+        assert!(config.enabled);
+        assert_eq!(config.buffers_count, 4);
+        assert_eq!(config.streams_mask, (1 << 1) | (1 << 2));
+        assert_eq!(
+            config.stream_to_slot,
+            [INVALID_TFB_SLOT, 3, 0, INVALID_TFB_SLOT]
+        );
+        assert_eq!(config.strides, [1, 40, 24, 1]);
     }
 
     #[test]
@@ -443,7 +1556,7 @@ mod tests {
 
     #[test]
     fn bind_to_channel_wires_memory_manager_from_channel_cache_owner() {
-        let mut cache = QueryCache::new();
+        let mut cache = QueryCache::new_for_test();
         let mm = Arc::new(ParkingMutex::new(MemoryManager::new(33)));
         let mut channel = ChannelState::new(8);
         channel.program_id = 0x3344;
@@ -465,7 +1578,7 @@ mod tests {
 
     #[test]
     fn query_sync_operation_writes_payload_and_timestamp_through_bound_memory_manager() {
-        let mut cache = QueryCache::new();
+        let mut cache = QueryCache::new_for_test();
         let (mm, backing) = make_query_memory_manager(0x5038_50000, 0x5510_6000, 0x1000);
 
         let mut channel = ChannelState::new(9);
@@ -474,10 +1587,12 @@ mod tests {
         cache.bind_to_channel(channel.bind_id);
         cache.set_gpu_ticks_getter(Arc::new(|| 0x1122_3344_5566_7788));
 
-        cache.query(
+        cache.enqueue_query_writeback(
             0x5038_50000,
             QueryPropertiesFlags::HAS_TIMEOUT,
             0xAABB_CCDD,
+            None,
+            true,
             |_func| panic!("fence path should not be used"),
             |func| func(),
         );
@@ -488,7 +1603,7 @@ mod tests {
 
     #[test]
     fn query_fence_operation_defers_writeback_to_signal_fence_callback() {
-        let mut cache = QueryCache::new();
+        let mut cache = QueryCache::new_for_test();
         let (mm, backing) = make_query_memory_manager(0x5038_50000, 0x5510_6000, 0x1000);
 
         let mut channel = ChannelState::new(10);
@@ -499,10 +1614,12 @@ mod tests {
         let deferred = Arc::new(ParkingMutex::new(None::<Box<dyn FnOnce() + Send>>));
         let deferred_clone = Arc::clone(&deferred);
 
-        cache.query(
+        cache.enqueue_query_writeback(
             0x5038_50000,
             QueryPropertiesFlags::IS_A_FENCE,
             0x1234_5678,
+            None,
+            true,
             move |func| {
                 *deferred_clone.lock() = Some(func);
             },
@@ -515,5 +1632,27 @@ mod tests {
         func();
 
         assert_eq!(&backing[0..4], &0x1234_5678u32.to_le_bytes());
+    }
+
+    #[test]
+    fn unsynchronized_fence_host_report_is_not_resolved_or_written() {
+        let mut cache = QueryCache::new_for_test();
+        let (mm, backing) = make_query_memory_manager(0x5038_50000, 0x5510_6000, 0x1000);
+        let mut channel = ChannelState::new(11);
+        channel.memory_manager = Some(mm);
+        cache.create_channel(&channel);
+        cache.bind_to_channel(channel.bind_id);
+
+        cache.enqueue_query_writeback(
+            0x5038_50000,
+            QueryPropertiesFlags::IS_A_FENCE,
+            0,
+            Some(HostQueryReport::Test(0xDEAD_BEEF)),
+            false,
+            |func| func(),
+            |_func| panic!("sync path should not be used"),
+        );
+
+        assert_eq!(&backing[0..4], &[0; 4]);
     }
 }

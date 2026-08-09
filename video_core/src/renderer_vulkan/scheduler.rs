@@ -16,6 +16,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
 use super::command_pool::CommandPool;
+use super::query_cache::{QueryRuntimeState, SamplesQueryState, TfbCounterState};
 use super::state_tracker::StateTracker;
 
 pub(crate) type SubmitCallback = Arc<dyn Fn() + Send + Sync>;
@@ -299,6 +300,13 @@ pub struct Scheduler {
     /// build a scheduler before a rasterizer state tracker exists, so this is
     /// installed by the rasterizer once both owners are allocated.
     state_tracker: Option<NonNull<StateTracker>>,
+
+    /// Upstream keeps a `QueryCache*` here and closes ZPass before ending a
+    /// render pass. Sharing only the samples streamer preserves that ordering
+    /// without making the Rust rasterizer self-referential.
+    samples_query_state: Option<Arc<parking_lot::Mutex<SamplesQueryState>>>,
+    tfb_query_state: Option<Arc<parking_lot::Mutex<TfbCounterState>>>,
+    query_runtime_state: Option<Arc<parking_lot::Mutex<QueryRuntimeState>>>,
 
     /// Port of upstream `Scheduler::WorkerThread`: owns command-buffer
     /// recording, command-pool rotation, and queue submission.
@@ -753,6 +761,9 @@ impl Scheduler {
             submit_mutex,
             on_submit,
             state_tracker: None,
+            samples_query_state: None,
+            tfb_query_state: None,
+            query_runtime_state: None,
             worker: Some(worker),
             worker_thread: Some(worker_thread),
         })
@@ -782,6 +793,24 @@ impl Scheduler {
 
     pub fn set_state_tracker(&mut self, state_tracker: NonNull<StateTracker>) {
         self.state_tracker = Some(state_tracker);
+    }
+
+    pub(crate) fn set_samples_query_state(
+        &mut self,
+        state: Arc<parking_lot::Mutex<SamplesQueryState>>,
+    ) {
+        self.samples_query_state = Some(state);
+    }
+
+    pub(crate) fn set_query_runtime_state(
+        &mut self,
+        state: Arc<parking_lot::Mutex<QueryRuntimeState>>,
+    ) {
+        self.query_runtime_state = Some(state);
+    }
+
+    pub(crate) fn set_tfb_query_state(&mut self, state: Arc<parking_lot::Mutex<TfbCounterState>>) {
+        self.tfb_query_state = Some(state);
     }
 
     /// Record a command that only needs the render command buffer.
@@ -872,6 +901,15 @@ impl Scheduler {
         }
 
         trace!("Scheduler: ending render pass");
+        if let Some(state) = self.tfb_query_state.as_ref().cloned() {
+            state.lock().close_counter(self);
+        }
+        if let Some(state) = self.samples_query_state.as_ref().cloned() {
+            state.lock().pause_counter(self);
+        }
+        if let Some(state) = self.query_runtime_state.as_ref() {
+            state.lock().pause_host_conditional_rendering();
+        }
         let images = std::mem::take(&mut self.rp_state.images);
         let image_ranges = std::mem::take(&mut self.rp_state.image_ranges);
         let device = self.device.clone();
@@ -993,7 +1031,7 @@ impl Scheduler {
     }
 
     fn flush_impl(&mut self, signal_semaphores: &[vk::Semaphore]) -> u64 {
-        self.request_outside_renderpass();
+        self.end_pending_operations();
         self.invalidate_state();
         let tick = self.current_tick.fetch_add(1, Ordering::SeqCst) + 1;
         self.current_chunk.submit = Some(SubmitRequest {
@@ -1010,6 +1048,14 @@ impl Scheduler {
         debug!("Scheduler: flushed at tick {}", tick);
         self.rp_state = RenderPassState::default();
         tick
+    }
+
+    /// Port of upstream `Scheduler::EndPendingOperations`.
+    fn end_pending_operations(&mut self) {
+        if let Some(state) = self.samples_query_state.as_ref().cloned() {
+            state.lock().reset_counter(self);
+        }
+        self.request_outside_renderpass();
     }
 
     /// Flush + wait for GPU completion.
