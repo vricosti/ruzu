@@ -6,25 +6,39 @@
 //!
 //! IBtmUser — "btm:u".
 
-use crate::hle::result::ResultCode;
+use crate::core::SystemRef;
+use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
+use crate::hle::service::ipc_helpers::ResponseBuilder;
 use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 /// IBtmUser.
 pub struct IBtmUser {
+    system: SystemRef,
     handlers: BTreeMap<u32, FunctionInfo>,
     handlers_tipc: BTreeMap<u32, FunctionInfo>,
 }
 
 impl IBtmUser {
-    pub fn new() -> Self {
-        let handlers = build_handler_map(&[(0, None, "GetCore")]);
+    pub fn new(system: SystemRef) -> Self {
+        let handlers = build_handler_map(&[(0, Some(Self::get_core_handler), "GetCore")]);
 
         Self {
+            system,
             handlers,
             handlers_tipc: BTreeMap::new(),
         }
+    }
+
+    fn get_core_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const IBtmUser) };
+        log::warn!("IBtmUser::GetCore called");
+        let core = super::btm_user_core::IBtmUserCore::new(service.system);
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 1);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_ipc_interface(Arc::new(core));
     }
 }
 
@@ -46,5 +60,16 @@ impl ServiceFramework for IBtmUser {
     }
     fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
         &self.handlers_tipc
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn get_core_is_registered() {
+        let service = IBtmUser::new(SystemRef::null());
+        assert!(service.handlers.get(&0).unwrap().handler_callback.is_some());
     }
 }

@@ -3,88 +3,104 @@
 
 //! Port of zuyu/src/core/hle/service/ssl/ssl_types.h
 
-#[repr(i32)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub enum CaCertificateId {
-    All = -1,
-    NintendoCAG3 = 1,
-    NintendoClass2CAG3 = 2,
-    NintendoRootCAG4 = 3,
-    AmazonRootCA1 = 1000,
-    StarfieldServicesRootCertificateAuthorityG2 = 1001,
-    AddTrustExternalCARoot = 1002,
-    COMODOCertificationAuthority = 1003,
-    UTNDATACorpSGC = 1004,
-    UTNUSERFirstHardware = 1005,
-    BaltimoreCyberTrustRoot = 1006,
-    CybertrustGlobalRoot = 1007,
-    VerizonGlobalRootCA = 1008,
-    DigiCertAssuredIDRootCA = 1009,
-    DigiCertAssuredIDRootG2 = 1010,
-    DigiCertGlobalRootCA = 1011,
-    DigiCertGlobalRootG2 = 1012,
-    DigiCertHighAssuranceEVRootCA = 1013,
-    EntrustnetCertificationAuthority2048 = 1014,
-    EntrustRootCertificationAuthority = 1015,
-    EntrustRootCertificationAuthorityG2 = 1016,
-    GeoTrustGlobalCA2 = 1017,
-    GeoTrustGlobalCA = 1018,
-    GeoTrustPrimaryCertificationAuthorityG3 = 1019,
-    GeoTrustPrimaryCertificationAuthority = 1020,
-    GlobalSignRootCA = 1021,
-    GlobalSignRootCAR2 = 1022,
-    GlobalSignRootCAR3 = 1023,
-    GoDaddyClass2CertificationAuthority = 1024,
-    GoDaddyRootCertificateAuthorityG2 = 1025,
-    StarfieldClass2CertificationAuthority = 1026,
-    StarfieldRootCertificateAuthorityG2 = 1027,
-    ThawtePrimaryRootCAG3 = 1028,
-    ThawtePrimaryRootCA = 1029,
-    VeriSignClass3PublicPrimaryCertificationAuthorityG3 = 1030,
-    VeriSignClass3PublicPrimaryCertificationAuthorityG5 = 1031,
-    VeriSignUniversalRootCertificationAuthority = 1032,
-    DSTRootCAX3 = 1033,
-    USERTrustRsaCertificationAuthority = 1034,
-    ISRGRootX10 = 1035,
-    USERTrustEccCertificationAuthority = 1036,
-    COMODORsaCertificationAuthority = 1037,
-    COMODOEccCertificationAuthority = 1038,
-    AmazonRootCA2 = 1039,
-    AmazonRootCA3 = 1040,
-    AmazonRootCA4 = 1041,
-    DigiCertAssuredIDRootG3 = 1042,
-    DigiCertGlobalRootG3 = 1043,
-    DigiCertTrustedRootG4 = 1044,
-    EntrustRootCertificationAuthorityEC1 = 1045,
-    EntrustRootCertificationAuthorityG4 = 1046,
-    GlobalSignECCRootCAR4 = 1047,
-    GlobalSignECCRootCAR5 = 1048,
-    GlobalSignECCRootCAR6 = 1049,
-    GTSRootR1 = 1050,
-    GTSRootR2 = 1051,
-    GTSRootR3 = 1052,
-    GTSRootR4 = 1053,
-    SecurityCommunicationRootCA = 1054,
-    GlobalSignRootE4 = 1055,
-    GlobalSignRootR4 = 1056,
-    TTeleSecGlobalRootClass2 = 1057,
-    DigiCertTLSECCP384RootG5 = 1058,
-    DigiCertTLSRSA4096RootG5 = 1059,
+#[repr(transparent)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct CaCertificateId(i32);
+
+#[allow(non_upper_case_globals)]
+impl CaCertificateId {
+    pub const All: Self = Self(-1);
+    pub const NintendoCAG3: Self = Self(1);
+    pub const NintendoClass2CAG3: Self = Self(2);
+    pub const NintendoRootCAG4: Self = Self(3);
+    pub const AmazonRootCA1: Self = Self(1000);
+    pub const StarfieldServicesRootCertificateAuthorityG2: Self = Self(1001);
+    pub const AddTrustExternalCARoot: Self = Self(1002);
+    pub const COMODOCertificationAuthority: Self = Self(1003);
+    pub const UTNDATACorpSGC: Self = Self(1004);
+    pub const UTNUSERFirstHardware: Self = Self(1005);
+    pub const BaltimoreCyberTrustRoot: Self = Self(1006);
+    pub const CybertrustGlobalRoot: Self = Self(1007);
+    pub const VerizonGlobalRootCA: Self = Self(1008);
+    pub const DigiCertAssuredIDRootCA: Self = Self(1009);
+    pub const DigiCertAssuredIDRootG2: Self = Self(1010);
+    pub const DigiCertGlobalRootCA: Self = Self(1011);
+    pub const DigiCertGlobalRootG2: Self = Self(1012);
+    pub const DigiCertHighAssuranceEVRootCA: Self = Self(1013);
+    pub const EntrustnetCertificationAuthority2048: Self = Self(1014);
+    pub const EntrustRootCertificationAuthority: Self = Self(1015);
+    pub const EntrustRootCertificationAuthorityG2: Self = Self(1016);
+    pub const GeoTrustGlobalCA2: Self = Self(1017);
+    pub const GeoTrustGlobalCA: Self = Self(1018);
+    pub const GeoTrustPrimaryCertificationAuthorityG3: Self = Self(1019);
+    pub const GeoTrustPrimaryCertificationAuthority: Self = Self(1020);
+    pub const GlobalSignRootCA: Self = Self(1021);
+    pub const GlobalSignRootCAR2: Self = Self(1022);
+    pub const GlobalSignRootCAR3: Self = Self(1023);
+    pub const GoDaddyClass2CertificationAuthority: Self = Self(1024);
+    pub const GoDaddyRootCertificateAuthorityG2: Self = Self(1025);
+    pub const StarfieldClass2CertificationAuthority: Self = Self(1026);
+    pub const StarfieldRootCertificateAuthorityG2: Self = Self(1027);
+    pub const ThawtePrimaryRootCAG3: Self = Self(1028);
+    pub const ThawtePrimaryRootCA: Self = Self(1029);
+    pub const VeriSignClass3PublicPrimaryCertificationAuthorityG3: Self = Self(1030);
+    pub const VeriSignClass3PublicPrimaryCertificationAuthorityG5: Self = Self(1031);
+    pub const VeriSignUniversalRootCertificationAuthority: Self = Self(1032);
+    pub const DSTRootCAX3: Self = Self(1033);
+    pub const USERTrustRsaCertificationAuthority: Self = Self(1034);
+    pub const ISRGRootX10: Self = Self(1035);
+    pub const USERTrustEccCertificationAuthority: Self = Self(1036);
+    pub const COMODORsaCertificationAuthority: Self = Self(1037);
+    pub const COMODOEccCertificationAuthority: Self = Self(1038);
+    pub const AmazonRootCA2: Self = Self(1039);
+    pub const AmazonRootCA3: Self = Self(1040);
+    pub const AmazonRootCA4: Self = Self(1041);
+    pub const DigiCertAssuredIDRootG3: Self = Self(1042);
+    pub const DigiCertGlobalRootG3: Self = Self(1043);
+    pub const DigiCertTrustedRootG4: Self = Self(1044);
+    pub const EntrustRootCertificationAuthorityEC1: Self = Self(1045);
+    pub const EntrustRootCertificationAuthorityG4: Self = Self(1046);
+    pub const GlobalSignECCRootCAR4: Self = Self(1047);
+    pub const GlobalSignECCRootCAR5: Self = Self(1048);
+    pub const GlobalSignECCRootCAR6: Self = Self(1049);
+    pub const GTSRootR1: Self = Self(1050);
+    pub const GTSRootR2: Self = Self(1051);
+    pub const GTSRootR3: Self = Self(1052);
+    pub const GTSRootR4: Self = Self(1053);
+    pub const SecurityCommunicationRootCA: Self = Self(1054);
+    pub const GlobalSignRootE4: Self = Self(1055);
+    pub const GlobalSignRootR4: Self = Self(1056);
+    pub const TTeleSecGlobalRootClass2: Self = Self(1057);
+    pub const DigiCertTLSECCP384RootG5: Self = Self(1058);
+    pub const DigiCertTLSRSA4096RootG5: Self = Self(1059);
+
+    pub const fn from_raw(raw: i32) -> Self {
+        Self(raw)
+    }
+
+    pub const fn raw(self) -> i32 {
+        self.0
+    }
 }
 
-#[repr(i32)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TrustedCertStatus {
-    Invalid = -1,
-    Removed = 0,
-    EnabledTrusted = 1,
-    EnabledNotTrusted = 2,
-    Revoked = 3,
-}
+#[repr(transparent)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TrustedCertStatus(i32);
 
-impl Default for TrustedCertStatus {
-    fn default() -> Self {
-        TrustedCertStatus::Invalid
+#[allow(non_upper_case_globals)]
+impl TrustedCertStatus {
+    pub const Invalid: Self = Self(-1);
+    pub const Removed: Self = Self(0);
+    pub const EnabledTrusted: Self = Self(1);
+    pub const EnabledNotTrusted: Self = Self(2);
+    pub const Revoked: Self = Self(3);
+
+    pub const fn from_raw(raw: i32) -> Self {
+        Self(raw)
+    }
+
+    pub const fn raw(self) -> i32 {
+        self.0
     }
 }
 

@@ -88,11 +88,9 @@ pub trait ProfileSelectApplet: Applet {
     fn select_profile(&self, callback: SelectProfileCallback, parameters: &ProfileSelectParameters);
 }
 
-/// Default (stub) profile selection applet implementation.
+/// Default profile selection applet implementation.
 ///
 /// Corresponds to upstream `Core::Frontend::DefaultProfileSelectApplet`.
-/// NOTE: Upstream creates a ProfileManager and queries the current user.
-/// This stub returns a default UUID.
 pub struct DefaultProfileSelectApplet;
 
 impl Applet for DefaultProfileSelectApplet {
@@ -105,16 +103,9 @@ impl ProfileSelectApplet for DefaultProfileSelectApplet {
         callback: SelectProfileCallback,
         _parameters: &ProfileSelectParameters,
     ) {
-        // Upstream: creates a Service::Account::ProfileManager and returns
-        // manager.GetUser(Settings::values.current_user.GetValue()).
-        // Settings::values.current_user is available via common::settings::values(),
-        // but ProfileManager is not yet ported. Returning a default UUID matches
-        // upstream's fallback when the user index yields no profile (value_or(Common::UUID{})).
-        let _current_user = *common::settings::values().current_user.get_value();
-        log::info!(
-            "called, selecting current user {} instead of prompting...",
-            _current_user
-        );
-        callback(Some(0u128));
+        let manager = crate::hle::service::acc::profile_manager::ProfileManager::new();
+        let current_user = *common::settings::values().current_user.get_value() as usize;
+        callback(Some(manager.get_user(current_user).unwrap_or_default()));
+        log::info!("called, selecting current user instead of prompting...");
     }
 }

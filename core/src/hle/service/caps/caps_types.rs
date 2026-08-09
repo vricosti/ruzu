@@ -4,44 +4,57 @@
 //! Port of zuyu/src/core/hle/service/caps/caps_types.h
 
 /// nn::album::ImageOrientation
-#[repr(u32)]
+#[repr(transparent)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum AlbumImageOrientation {
-    #[default]
-    None = 0,
-    Rotate90 = 1,
-    Rotate180 = 2,
-    Rotate270 = 3,
+pub struct AlbumImageOrientation(pub u32);
+
+#[allow(non_upper_case_globals)]
+impl AlbumImageOrientation {
+    pub const None: Self = Self(0);
+    pub const Rotate90: Self = Self(1);
+    pub const Rotate180: Self = Self(2);
+    pub const Rotate270: Self = Self(3);
 }
+const _: () = assert!(core::mem::size_of::<AlbumImageOrientation>() == 0x4);
 
 /// nn::album::AlbumReportOption
-#[repr(i32)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AlbumReportOption {
-    Disable = 0,
-    Enable = 1,
-    Unknown2 = 2,
-    Unknown3 = 3,
+#[repr(transparent)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct AlbumReportOption(pub i32);
+
+#[allow(non_upper_case_globals)]
+impl AlbumReportOption {
+    pub const Disable: Self = Self(0);
+    pub const Enable: Self = Self(1);
+    pub const Unknown2: Self = Self(2);
+    pub const Unknown3: Self = Self(3);
 }
+const _: () = assert!(core::mem::size_of::<AlbumReportOption>() == 0x4);
 
 /// Content type.
-#[repr(u8)]
+#[repr(transparent)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Hash)]
-pub enum ContentType {
-    #[default]
-    Screenshot = 0,
-    Movie = 1,
-    ExtraMovie = 3,
+pub struct ContentType(pub u8);
+
+#[allow(non_upper_case_globals)]
+impl ContentType {
+    pub const Screenshot: Self = Self(0);
+    pub const Movie: Self = Self(1);
+    pub const ExtraMovie: Self = Self(3);
 }
+const _: () = assert!(core::mem::size_of::<ContentType>() == 0x1);
 
 /// Album storage location.
-#[repr(u8)]
+#[repr(transparent)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Hash)]
-pub enum AlbumStorage {
-    #[default]
-    Nand = 0,
-    Sd = 1,
+pub struct AlbumStorage(pub u8);
+
+#[allow(non_upper_case_globals)]
+impl AlbumStorage {
+    pub const Nand: Self = Self(0);
+    pub const Sd: Self = Self(1);
 }
+const _: () = assert!(core::mem::size_of::<AlbumStorage>() == 0x1);
 
 /// Screenshot decoder flags.
 #[repr(transparent)]
@@ -157,12 +170,21 @@ const _: () = assert!(core::mem::size_of::<ApplicationAlbumFileEntry>() == 0x30)
 
 /// Application data buffer.
 #[repr(C)]
-#[derive(Clone)]
+#[derive(Clone, Copy)]
 pub struct ApplicationData {
     pub data: [u8; 0x400],
     pub data_size: u32,
 }
 const _: () = assert!(core::mem::size_of::<ApplicationData>() == 0x404);
+
+impl Default for ApplicationData {
+    fn default() -> Self {
+        Self {
+            data: [0; 0x400],
+            data_size: 0,
+        }
+    }
+}
 
 /// Screenshot attribute.
 #[repr(C)]
@@ -205,5 +227,18 @@ const _: () = assert!(core::mem::size_of::<LoadAlbumScreenShotImageOutput>() == 
 impl Default for LoadAlbumScreenShotImageOutput {
     fn default() -> Self {
         unsafe { core::mem::zeroed() }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn guest_enum_newtypes_preserve_unknown_bit_patterns() {
+        assert_eq!(AlbumImageOrientation(0xDEAD_BEEF).0, 0xDEAD_BEEF);
+        assert_eq!(AlbumReportOption(-7).0, -7);
+        assert_eq!(ContentType(0xFF).0, 0xFF);
+        assert_eq!(AlbumStorage(0xFE).0, 0xFE);
     }
 }

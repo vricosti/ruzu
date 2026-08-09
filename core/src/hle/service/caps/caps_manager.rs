@@ -38,7 +38,7 @@ impl AlbumManager {
     /// Upstream calls GetFile to resolve the path, then removes the file.
     pub fn delete_album_file(&mut self, file_id: &AlbumFileId) -> ResultCode {
         log::debug!("AlbumManager::delete_album_file called");
-        if (file_id.storage as u8) > (AlbumStorage::Sd as u8) {
+        if file_id.storage.0 > AlbumStorage::Sd.0 {
             return super::caps_result::RESULT_INVALID_STORAGE;
         }
         if !self.is_mounted {
@@ -58,7 +58,7 @@ impl AlbumManager {
     /// IsAlbumMounted.
     pub fn is_album_mounted(&mut self, storage: AlbumStorage) -> ResultCode {
         log::debug!("AlbumManager::is_album_mounted called");
-        if (storage as u8) > (AlbumStorage::Sd as u8) {
+        if storage.0 > AlbumStorage::Sd.0 {
             return super::caps_result::RESULT_INVALID_STORAGE;
         }
         self.is_mounted = true;
@@ -82,7 +82,7 @@ impl AlbumManager {
         _flags: u8,
     ) -> (ResultCode, u64) {
         log::debug!("AlbumManager::get_album_file_list called");
-        if (storage as u8) > (AlbumStorage::Sd as u8) {
+        if storage.0 > AlbumStorage::Sd.0 {
             return (super::caps_result::RESULT_INVALID_STORAGE, 0);
         }
         if !self.is_mounted {
@@ -211,7 +211,7 @@ impl AlbumManager {
         _decoder_options: &ScreenShotDecodeOption,
     ) -> ResultCode {
         log::debug!("AlbumManager::load_album_screen_shot_image called");
-        if (file_id.storage as u8) > (AlbumStorage::Sd as u8) {
+        if file_id.storage.0 > AlbumStorage::Sd.0 {
             return super::caps_result::RESULT_INVALID_STORAGE;
         }
         if !self.is_mounted {
@@ -258,7 +258,7 @@ impl AlbumManager {
         _decoder_options: &ScreenShotDecodeOption,
     ) -> ResultCode {
         log::debug!("AlbumManager::load_album_screen_shot_thumbnail called");
-        if (file_id.storage as u8) > (AlbumStorage::Sd as u8) {
+        if file_id.storage.0 > AlbumStorage::Sd.0 {
             return super::caps_result::RESULT_INVALID_STORAGE;
         }
         if !self.is_mounted {

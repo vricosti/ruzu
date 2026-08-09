@@ -105,7 +105,11 @@ impl AccU1 {
             (104, None, "GetProfileUpdateNotifier"),
             (105, None, "CheckNetworkServiceAvailabilityAsync"),
             (106, None, "GetProfileSyncNotifier"),
-            (110, None, "StoreSaveDataThumbnail"),
+            (
+                110,
+                Some(AccU1::store_save_data_thumbnail_handler),
+                "StoreSaveDataThumbnail",
+            ),
             (111, None, "ClearSaveDataThumbnail"),
             (112, None, "LoadSaveDataThumbnail"),
             (113, None, "GetSaveDataThumbnailExistence"),
@@ -228,6 +232,14 @@ impl AccU1 {
         rb.push_raw(&uuid);
     }
 
+    fn store_save_data_thumbnail_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let svc = unsafe { &*(this as *const dyn ServiceFramework as *const AccU1) };
+        let mut rp = RequestParser::new(ctx);
+        let uuid = rp.pop_raw::<u128>();
+        svc.interface
+            .store_save_data_thumbnail_application(ctx, uuid);
+    }
+
     fn list_open_context_stored_users_handler(
         this: &dyn ServiceFramework,
         ctx: &mut HLERequestContext,
@@ -277,5 +289,28 @@ impl ServiceFramework for AccU1 {
 
     fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
         &self.handlers_tipc
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn store_save_data_thumbnail_is_registered() {
+        let service = AccU1::new(
+            Arc::new(super::super::acc::Module),
+            Arc::new(Mutex::new(
+                super::super::profile_manager::ProfileManager::new(),
+            )),
+            crate::core::SystemRef::null(),
+        );
+        assert!(service
+            .handlers
+            .get(&110)
+            .unwrap()
+            .handler_callback
+            .is_some());
     }
 }

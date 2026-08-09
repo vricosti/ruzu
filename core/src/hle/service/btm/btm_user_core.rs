@@ -6,8 +6,10 @@
 //!
 //! IBtmUserCore — BLE user core interface.
 
-use crate::hle::result::ResultCode;
+use crate::core::SystemRef;
+use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
+use crate::hle::service::ipc_helpers::ResponseBuilder;
 use crate::hle::service::kernel_helpers::ServiceContext;
 use crate::hle::service::os::event::Event;
 use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
@@ -33,7 +35,7 @@ pub struct IBtmUserCore {
 }
 
 impl IBtmUserCore {
-    pub fn new() -> Self {
+    pub fn new(_system: SystemRef) -> Self {
         let mut service_context = ServiceContext::new("IBtmUserCore".to_string());
 
         let scan_handle = service_context.create_event("IBtmUserCore:ScanEvent".to_string());
@@ -49,7 +51,11 @@ impl IBtmUserCore {
         let config_event = service_context.get_event(cfg_handle).unwrap();
 
         let handlers = build_handler_map(&[
-            (0, None, "AcquireBleScanEvent"),
+            (
+                0,
+                Some(Self::acquire_ble_scan_event_handler),
+                "AcquireBleScanEvent",
+            ),
             (1, None, "GetBleScanFilterParameter"),
             (2, None, "GetBleScanFilterParameter2"),
             (3, None, "StartBleScanForGeneral"),
@@ -60,7 +66,11 @@ impl IBtmUserCore {
             (8, None, "StartBleScanForSmartDevice"),
             (9, None, "StopBleScanForSmartDevice"),
             (10, None, "GetBleScanResultsForSmartDevice"),
-            (17, None, "AcquireBleConnectionEvent"),
+            (
+                17,
+                Some(Self::acquire_ble_connection_event_handler),
+                "AcquireBleConnectionEvent",
+            ),
             (18, None, "BleConnect"),
             (19, None, "BleDisconnect"),
             (20, None, "BleGetConnectionState"),
@@ -69,14 +79,22 @@ impl IBtmUserCore {
             (23, None, "BleUnPairDevice"),
             (24, None, "BleUnPairDevice2"),
             (25, None, "BleGetPairedDevices"),
-            (26, None, "AcquireBleServiceDiscoveryEvent"),
+            (
+                26,
+                Some(Self::acquire_ble_service_discovery_event_handler),
+                "AcquireBleServiceDiscoveryEvent",
+            ),
             (27, None, "GetGattServices"),
             (28, None, "GetGattService"),
             (29, None, "GetGattIncludedServices"),
             (30, None, "GetBelongingGattService"),
             (31, None, "GetGattCharacteristics"),
             (32, None, "GetGattDescriptors"),
-            (33, None, "AcquireBleMtuConfigEvent"),
+            (
+                33,
+                Some(Self::acquire_ble_mtu_config_event_handler),
+                "AcquireBleMtuConfigEvent",
+            ),
             (34, None, "ConfigureBleMtu"),
             (35, None, "GetBleMtu"),
             (36, None, "RegisterBleGattDataPath"),
@@ -92,6 +110,48 @@ impl IBtmUserCore {
             service_discovery_event,
             config_event,
         }
+    }
+
+    fn acquire_event(ctx: &mut HLERequestContext, event: &Event, name: &str) {
+        log::warn!("(STUBBED) {name} called");
+        let object_id = event.copy_object_id(ctx).unwrap_or(0);
+        let mut rb = ResponseBuilder::new(ctx, 3, 1, 0);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_bool(true);
+        rb.push_copy_object_id(object_id);
+    }
+
+    fn acquire_ble_scan_event_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const IBtmUserCore) };
+        Self::acquire_event(ctx, &service.scan_event, "AcquireBleScanEvent");
+    }
+
+    fn acquire_ble_connection_event_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const IBtmUserCore) };
+        Self::acquire_event(ctx, &service.connection_event, "AcquireBleConnectionEvent");
+    }
+
+    fn acquire_ble_service_discovery_event_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const IBtmUserCore) };
+        Self::acquire_event(
+            ctx,
+            &service.service_discovery_event,
+            "AcquireBleServiceDiscoveryEvent",
+        );
+    }
+
+    fn acquire_ble_mtu_config_event_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const IBtmUserCore) };
+        Self::acquire_event(ctx, &service.config_event, "AcquireBleMtuConfigEvent");
     }
 }
 
@@ -113,5 +173,26 @@ impl ServiceFramework for IBtmUserCore {
     }
     fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
         &self.handlers_tipc
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn upstream_event_handlers_are_registered() {
+        let service = IBtmUserCore::new(SystemRef::null());
+        for command_id in [0, 17, 26, 33] {
+            assert!(
+                service
+                    .handlers
+                    .get(&command_id)
+                    .unwrap()
+                    .handler_callback
+                    .is_some(),
+                "command {command_id} must have an IPC handler"
+            );
+        }
     }
 }

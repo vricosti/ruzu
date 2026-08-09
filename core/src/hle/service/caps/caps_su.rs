@@ -12,10 +12,10 @@ use std::sync::{Arc, Mutex};
 use super::caps_manager::AlbumManager;
 use super::caps_types::{
     AlbumReportOption, ApplicationAlbumEntry, ApplicationData, ScreenShotAttribute,
-    ShimLibraryVersion,
 };
-use crate::hle::result::ResultCode;
+use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
+use crate::hle::service::ipc_helpers::{RequestParser, ResponseBuilder};
 use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
 
 /// IPC command table for IScreenShotApplicationService.
@@ -46,10 +46,22 @@ pub struct IScreenShotApplicationService {
 impl IScreenShotApplicationService {
     pub fn new(album_manager: Arc<Mutex<AlbumManager>>) -> Self {
         let handlers = build_handler_map(&[
-            (32, None, "SetShimLibraryVersion"),
+            (
+                32,
+                Some(Self::set_shim_library_version_handler),
+                "SetShimLibraryVersion",
+            ),
             (201, None, "SaveScreenShot"),
-            (203, None, "SaveScreenShotEx0"),
-            (205, None, "SaveScreenShotEx1"),
+            (
+                203,
+                Some(Self::save_screen_shot_ex0_handler),
+                "SaveScreenShotEx0",
+            ),
+            (
+                205,
+                Some(Self::save_screen_shot_ex1_handler),
+                "SaveScreenShotEx1",
+            ),
             (210, None, "SaveScreenShotEx2"),
         ]);
 
@@ -78,6 +90,19 @@ impl IScreenShotApplicationService {
             aruid,
         );
         Ok(())
+    }
+
+    fn set_shim_library_version_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const Self) };
+        let mut request = RequestParser::new(ctx);
+        let library_version = request.pop_u64();
+        let aruid = request.pop_u64();
+        let result = service
+            .set_shim_library_version(library_version, aruid)
+            .err()
+            .unwrap_or(RESULT_SUCCESS);
+        let mut response = ResponseBuilder::new(ctx, 2, 0, 0);
+        response.push_result(result);
     }
 
     /// SaveScreenShotEx0 (cmd 203).
@@ -112,6 +137,62 @@ impl IScreenShotApplicationService {
         } else {
             Err(result)
         }
+    }
+
+    fn save_screen_shot_ex0_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const Self) };
+        let mut request = RequestParser::new(ctx);
+        let attribute = request.pop_raw::<ScreenShotAttribute>();
+        let report_option = AlbumReportOption(request.pop_i32());
+        request.pop_u32();
+        let aruid = request.pop_u64();
+        let image_data = ctx.read_buffer(0);
+
+        let (result, entry) =
+            match service.save_screen_shot_ex0(&attribute, report_option, aruid, &image_data) {
+                Ok(entry) => (RESULT_SUCCESS, entry),
+                Err(result) => (result, ApplicationAlbumEntry::default()),
+            };
+        let mut response = ResponseBuilder::new(ctx, 10, 0, 0);
+        response.push_result(result);
+        response.push_raw(&entry);
+    }
+
+    fn read_large_data<T: Default>(buffer: &[u8]) -> T {
+        let mut value = T::default();
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                buffer.as_ptr(),
+                (&mut value as *mut T).cast::<u8>(),
+                buffer.len().min(core::mem::size_of::<T>()),
+            );
+        }
+        value
+    }
+
+    fn save_screen_shot_ex1_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const Self) };
+        let mut request = RequestParser::new(ctx);
+        let attribute = request.pop_raw::<ScreenShotAttribute>();
+        let report_option = AlbumReportOption(request.pop_i32());
+        request.pop_u32();
+        let aruid = request.pop_u64();
+        let app_data = Self::read_large_data::<ApplicationData>(&ctx.read_buffer(0));
+        let image_data = ctx.read_buffer(1);
+
+        let (result, entry) = match service.save_screen_shot_ex1(
+            &attribute,
+            report_option,
+            aruid,
+            &app_data,
+            &image_data,
+        ) {
+            Ok(entry) => (RESULT_SUCCESS, entry),
+            Err(result) => (result, ApplicationAlbumEntry::default()),
+        };
+        let mut response = ResponseBuilder::new(ctx, 10, 0, 0);
+        response.push_result(result);
+        response.push_raw(&entry);
     }
 
     /// SaveScreenShotEx1 (cmd 205).
@@ -213,5 +294,40 @@ impl ServiceFramework for IScreenShotApplicationService {
 
     fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
         &self.handlers_tipc
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn set_shim_library_version_is_registered() {
+        let service = IScreenShotApplicationService::new(Arc::new(Mutex::new(AlbumManager::new())));
+        assert!(service
+            .handlers
+            .get(&32)
+            .unwrap()
+            .handler_callback
+            .is_some());
+        assert!(service
+            .handlers
+            .get(&203)
+            .unwrap()
+            .handler_callback
+            .is_some());
+        assert!(service
+            .handlers
+            .get(&205)
+            .unwrap()
+            .handler_callback
+            .is_some());
+    }
+
+    #[test]
+    fn large_data_is_zero_filled_then_partially_copied() {
+        let data = IScreenShotApplicationService::read_large_data::<ApplicationData>(&[1, 2, 3]);
+        assert_eq!(&data.data[..4], &[1, 2, 3, 0]);
+        assert_eq!(data.data_size, 0);
     }
 }

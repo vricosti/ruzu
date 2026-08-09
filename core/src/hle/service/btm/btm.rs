@@ -178,16 +178,16 @@ pub fn loop_process(system: crate::core::SystemRef) {
 
         server_manager.register_named_service(
             "btm:sys",
-            Box::new(|| -> SessionRequestHandlerPtr {
-                std::sync::Arc::new(super::btm_system::IBtmSystem::new())
+            Box::new(move || -> SessionRequestHandlerPtr {
+                std::sync::Arc::new(super::btm_system::IBtmSystem::new(system))
             }),
             16,
         );
 
         server_manager.register_named_service(
             "btm:u",
-            Box::new(|| -> SessionRequestHandlerPtr {
-                std::sync::Arc::new(super::btm_user::IBtmUser::new())
+            Box::new(move || -> SessionRequestHandlerPtr {
+                std::sync::Arc::new(super::btm_user::IBtmUser::new(system))
             }),
             16,
         );

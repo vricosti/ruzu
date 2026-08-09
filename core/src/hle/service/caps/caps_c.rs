@@ -10,9 +10,9 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
 use super::caps_manager::AlbumManager;
-use super::caps_types::ShimLibraryVersion;
-use crate::hle::result::ResultCode;
+use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
+use crate::hle::service::ipc_helpers::{RequestParser, ResponseBuilder};
 use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
 
 /// IPC command table for IAlbumControlService.
@@ -54,7 +54,11 @@ impl IAlbumControlService {
         let handlers = build_handler_map(&[
             (1, None, "CaptureRawImage"),
             (2, None, "CaptureRawImageWithTimeout"),
-            (33, None, "SetShimLibraryVersion"),
+            (
+                33,
+                Some(Self::set_shim_library_version_handler),
+                "SetShimLibraryVersion",
+            ),
             (1001, None, "RequestTakingScreenShot"),
             (1002, None, "RequestTakingScreenShotWithTimeout"),
             (1011, None, "NotifyTakingScreenShotRefused"),
@@ -95,6 +99,19 @@ impl IAlbumControlService {
         );
         Ok(())
     }
+
+    fn set_shim_library_version_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const Self) };
+        let mut request = RequestParser::new(ctx);
+        let library_version = request.pop_u64();
+        let aruid = request.pop_u64();
+        let result = service
+            .set_shim_library_version(library_version, aruid)
+            .err()
+            .unwrap_or(RESULT_SUCCESS);
+        let mut response = ResponseBuilder::new(ctx, 2, 0, 0);
+        response.push_result(result);
+    }
 }
 
 impl SessionRequestHandler for IAlbumControlService {
@@ -118,5 +135,21 @@ impl ServiceFramework for IAlbumControlService {
 
     fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
         &self.handlers_tipc
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn set_shim_library_version_is_registered() {
+        let service = IAlbumControlService::new(Arc::new(Mutex::new(AlbumManager::new())));
+        assert!(service
+            .handlers
+            .get(&33)
+            .unwrap()
+            .handler_callback
+            .is_some());
     }
 }

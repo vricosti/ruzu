@@ -10,6 +10,7 @@ use bitflags::bitflags;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU16, AtomicU8, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
 
+use super::k_light_lock::{KLightLock, KScopedLightLock};
 use super::k_process::KProcess;
 use super::k_scheduler::KScheduler;
 use super::k_scheduler_lock::KScopedSchedulerLock;
@@ -454,8 +455,7 @@ impl LockWithPriorityInheritanceInfo {
             debug_assert!(
                 false,
                 "LockWithPriorityInheritanceInfo::add_waiter duplicate waiter priority={} thread_id={}",
-                priority,
-                thread_id
+                priority, thread_id
             );
         }
     }
@@ -474,8 +474,7 @@ impl LockWithPriorityInheritanceInfo {
             debug_assert!(
                 false,
                 "LockWithPriorityInheritanceInfo::remove_waiter missing waiter priority={} thread_id={}",
-                priority,
-                thread_id
+                priority, thread_id
             );
             self.waiter_count = self.tree.len() as u32;
         }
@@ -586,7 +585,9 @@ pub struct KThread {
     pub kernel_stack_top: KVirtualAddress,
     pub light_ipc_data: Option<Vec<u32>>,
     pub tls_address: KProcessAddress,
-    // m_activity_pause_lock — KLightLock; stubbed
+    /// Serializes thread activity, affinity, and context operations.
+    /// Upstream: `KLightLock m_activity_pause_lock`.
+    pub activity_pause_lock: Arc<KLightLock>,
     pub schedule_count: i64,
     pub last_scheduled_tick: i64,
     // per_core_priority_queue_entry removed: entries now stored inside KPriorityQueue.
@@ -738,6 +739,7 @@ impl KThread {
             kernel_stack_top: KVirtualAddress::default(),
             light_ipc_data: None,
             tls_address: KProcessAddress::default(),
+            activity_pause_lock: Arc::new(KLightLock::new()),
             schedule_count: 0,
             last_scheduled_tick: 0,
             // per_core_priority_queue_entry removed: entries in KPriorityQueue
@@ -1038,6 +1040,9 @@ impl KThread {
     ///
     /// Upstream: `KThread::GetThreadContext3` in `k_thread.cpp`.
     pub fn get_thread_context3(&self, out: &mut ThreadContext) -> u32 {
+        let activity_pause_lock = self.activity_pause_lock.clone();
+        let _activity_guard = KScopedLightLock::new(activity_pause_lock.as_ref());
+
         let _sl = if self.scheduler_lock_ptr != 0 {
             Some(KScopedSchedulerLock::new(unsafe {
                 &*(self.scheduler_lock_ptr
@@ -1060,10 +1065,8 @@ impl KThread {
             const EL0_AARCH32_PSR_MASK: u32 = 0xFE0F_FE20;
 
             let is_64bit = self
-                .parent
-                .as_ref()
-                .and_then(Weak::upgrade)
-                .map(|parent| parent.lock().unwrap().is_64bit())
+                .get_parent_raw_ptr()
+                .map(|parent| unsafe { (&*parent).is_64bit() })
                 .unwrap_or(true);
             if is_64bit {
                 out.pstate &= EL0_AARCH64_PSR_MASK;
@@ -1364,10 +1367,8 @@ impl KThread {
     /// calls `waiter->SetWaitingLockInfo(this)` (k_thread.h:801). Callers no
     /// longer need a separate `set_waiting_lock_owner_thread_id` step.
     ///
-    /// NOTE: Priority inheritance (RestorePriority) is simplified here —
-    /// full chain-walking requires access to other threads' mutexes.
-    /// Callers that need full priority inheritance should call
-    /// `restore_priority_simplified()` after this.
+    /// Priority inheritance follows the complete lock-owner chain, matching
+    /// upstream `RestorePriority`.
     pub fn add_waiter(
         &mut self,
         waiter: &Arc<KThreadLock>,
@@ -1410,7 +1411,7 @@ impl KThread {
 
         // If the waiter has higher priority than us, inherit it.
         if waiter_priority < self.priority {
-            self.restore_priority_simplified();
+            self.restore_priority();
         }
     }
 
@@ -1418,7 +1419,7 @@ impl KThread {
     /// Matches upstream `KThread::AddWaiter()` followed by
     /// `KThread::RestorePriority(kernel, this)`.
     pub fn add_waiter_with_process(
-        process_guard: &mut KProcess,
+        _process_guard: &mut KProcess,
         owner_thread: &Arc<KThreadLock>,
         waiter: &Arc<KThreadLock>,
     ) {
@@ -1432,7 +1433,7 @@ impl KThread {
             )
         };
 
-        let (owner_thread_id, should_restore) = {
+        let should_restore = {
             let mut owner = owner_thread.lock().unwrap();
             if should_trace_priority_inheritance() {
                 log::info!(
@@ -1462,11 +1463,11 @@ impl KThread {
                 .unwrap()
                 .set_waiting_lock_owner_thread_id(Some(owner_thread_id), owner_ptr);
 
-            (owner_thread_id, waiter_priority < owner.priority)
+            waiter_priority < owner.priority
         };
 
         if should_restore {
-            Self::restore_priority_with_process(process_guard, owner_thread_id);
+            owner_thread.lock().unwrap().restore_priority();
         }
     }
 
@@ -1489,7 +1490,7 @@ impl KThread {
         // If our priority equals the removed waiter's and we've inherited,
         // we may need to drop back.
         if self.priority == waiter_priority && self.priority < self.base_priority {
-            self.restore_priority_simplified();
+            self.restore_priority();
         }
     }
 
@@ -1578,7 +1579,7 @@ impl KThread {
             // The new owner was the only waiter — lock info is freed (dropped).
             *has_waiters = false;
             if self.priority == next_owner_priority && self.priority < self.base_priority {
-                self.restore_priority_simplified();
+                self.restore_priority();
             }
             return Some((
                 next_owner_thread_id,
@@ -1593,7 +1594,7 @@ impl KThread {
 
         // If our priority matched the next owner's and we've inherited, restore.
         if self.priority == next_owner_priority && self.priority < self.base_priority {
-            self.restore_priority_simplified();
+            self.restore_priority();
         }
 
         Some((
@@ -1604,89 +1605,36 @@ impl KThread {
         ))
     }
 
-    /// Simplified RestorePriority — computes new priority from base priority
-    /// and all held locks' highest-priority waiters.
-    /// Matches upstream `KThread::RestorePriority()` (k_thread.cpp:1011-1061)
-    /// but without the chain-walking (which requires locking other threads).
-    pub fn restore_priority_simplified(&mut self) {
-        let mut new_priority = self.base_priority;
-        for lock_info in &self.held_lock_info_list {
-            if let Some(highest) = lock_info.get_highest_priority_waiter() {
-                new_priority = new_priority.min(highest.priority);
-            }
-        }
+    /// Restore inherited priority along the complete lock-owner chain.
+    /// Matches upstream `KThread::RestorePriority()` (k_thread.cpp).
+    pub fn restore_priority(&mut self) {
+        let mut thread_ptr = self as *mut KThread;
 
-        if new_priority != self.priority {
-            let old_priority = self.priority;
-            self.priority = new_priority;
-            if should_trace_priority_inheritance() {
-                log::info!(
-                    "PI restore_priority tid={} old_prio={} new_prio={} base_prio={} held_locks={}",
-                    self.thread_id,
-                    old_priority,
-                    new_priority,
-                    self.base_priority,
-                    self.held_lock_info_list.len(),
-                );
-            }
-            self.notify_priority_change(old_priority);
-        }
-    }
-
-    /// Full upstream `KThread::RestorePriority`.
-    ///
-    /// The C++ code temporarily removes a waiting thread from its owner's PI
-    /// tree before changing priority, updates any condition-variable tree key,
-    /// reinserts the thread, notifies the scheduler, then walks to the lock
-    /// owner. This preserves red-black/BTree ordering invariants across chained
-    /// priority inheritance.
-    pub fn restore_priority_with_process(process_guard: &mut KProcess, start_thread_id: u64) {
-        let mut thread_id = Some(start_thread_id);
-
-        while let Some(current_thread_id) = thread_id {
-            let Some(current_thread) = process_guard.get_thread_by_thread_id(current_thread_id)
-            else {
-                return;
-            };
-
-            let (
-                old_priority,
-                new_priority,
-                base_priority,
-                held_locks_len,
-                lock_ref,
-                waiting_on_condition_variable,
-            ) = {
-                let thread = current_thread.lock().unwrap();
-                let mut new_priority = thread.base_priority;
-                for held_lock in &thread.held_lock_info_list {
-                    if let Some(highest) = held_lock.get_highest_priority_waiter() {
-                        new_priority = new_priority.min(highest.priority);
-                    }
+        while !thread_ptr.is_null() {
+            // SAFETY: callers hold the scheduler lock, which is the ownership
+            // contract used by upstream for this intrusive owner-chain walk.
+            let thread = unsafe { &mut *thread_ptr };
+            let mut new_priority = thread.base_priority;
+            for held_lock in &thread.held_lock_info_list {
+                if let Some(highest) = held_lock.get_highest_priority_waiter() {
+                    new_priority = new_priority.min(highest.priority);
                 }
-                (
-                    thread.priority,
-                    new_priority,
-                    thread.base_priority,
-                    thread.held_lock_info_list.len(),
-                    thread.waiting_lock_info.clone(),
-                    matches!(
-                        thread.get_condition_variable_tree(),
-                        Some(ConditionVariableTreeState::ConditionVariable)
-                    ),
-                )
-            };
+            }
 
-            if new_priority == old_priority {
+            if new_priority == thread.priority {
                 return;
             }
+
+            let old_priority = thread.priority;
+            let lock_ref = thread.waiting_lock_info.clone();
+            let lock_owner_ptr = lock_ref.as_ref().map_or(std::ptr::null_mut(), |lock_ref| {
+                lock_ref.owner_thread_ptr as *mut KThread
+            });
 
             if let Some(lock_ref) = lock_ref.as_ref() {
-                if let Some(lock_owner) =
-                    process_guard.get_thread_by_thread_id(lock_ref.owner_thread_id)
-                {
-                    lock_owner.lock().unwrap().remove_waiter_impl(
-                        current_thread_id,
+                if !lock_owner_ptr.is_null() {
+                    unsafe { &mut *lock_owner_ptr }.remove_waiter_impl(
+                        thread.thread_id,
                         old_priority,
                         lock_ref.is_kernel_address_key,
                         lock_ref.address_key,
@@ -1694,60 +1642,52 @@ impl KThread {
                 }
             }
 
+            let waiting_on_condition_variable = matches!(
+                thread.get_condition_variable_tree(),
+                Some(ConditionVariableTreeState::ConditionVariable)
+            );
+            let parent_ptr = thread.get_parent_raw_ptr();
             if waiting_on_condition_variable {
-                process_guard.before_update_condition_variable_priority(current_thread_id);
+                if let Some(parent_ptr) = parent_ptr {
+                    unsafe { &mut *parent_ptr }
+                        .before_update_condition_variable_priority(thread.thread_id);
+                }
             }
 
-            let updated_thread_key = {
-                let mut thread = current_thread.lock().unwrap();
-                thread.priority = new_priority;
-                if should_trace_priority_inheritance() {
-                    log::info!(
-                        "PI restore_priority tid={} old_prio={} new_prio={} base_prio={} held_locks={}",
-                        thread.thread_id,
-                        old_priority,
-                        new_priority,
-                        base_priority,
-                        held_locks_len,
-                    );
-                }
-                thread.condition_variable_tree_key()
-            };
+            thread.priority = new_priority;
+            if should_trace_priority_inheritance() {
+                log::info!(
+                    "PI restore_priority tid={} old_prio={} new_prio={} base_prio={} held_locks={}",
+                    thread.thread_id,
+                    old_priority,
+                    new_priority,
+                    thread.base_priority,
+                    thread.held_lock_info_list.len(),
+                );
+            }
 
             if waiting_on_condition_variable {
-                process_guard.after_update_condition_variable_priority(updated_thread_key);
+                if let Some(parent_ptr) = parent_ptr {
+                    unsafe { &mut *parent_ptr }.after_update_condition_variable_priority(
+                        thread.condition_variable_tree_key(),
+                    );
+                }
             }
 
             if let Some(lock_ref) = lock_ref.as_ref() {
-                if let Some(lock_owner) =
-                    process_guard.get_thread_by_thread_id(lock_ref.owner_thread_id)
-                {
-                    let owner_ptr = {
-                        let mut owner = lock_owner.lock().unwrap();
-                        owner.add_waiter_impl(
-                            current_thread_id,
-                            new_priority,
-                            current_thread.as_ref().as_ptr() as usize,
-                            lock_ref.address_key,
-                            lock_ref.is_kernel_address_key,
-                        );
-                        (&mut *owner as *mut KThread) as usize
-                    };
-                    current_thread
-                        .lock()
-                        .unwrap()
-                        .set_waiting_lock_owner_thread_id(
-                            Some(lock_ref.owner_thread_id),
-                            owner_ptr,
-                        );
+                if !lock_owner_ptr.is_null() {
+                    unsafe { &mut *lock_owner_ptr }.add_waiter_impl(
+                        thread.thread_id,
+                        new_priority,
+                        thread_ptr as usize,
+                        lock_ref.address_key,
+                        lock_ref.is_kernel_address_key,
+                    );
                 }
             }
 
-            current_thread
-                .lock()
-                .unwrap()
-                .notify_priority_change(old_priority);
-            thread_id = lock_ref.map(|lock_ref| lock_ref.owner_thread_id);
+            thread.notify_priority_change(old_priority);
+            thread_ptr = lock_owner_ptr;
         }
     }
 
@@ -1840,7 +1780,7 @@ impl KThread {
                 self.held_lock_info_list.remove(i);
             }
             if self.priority == key.priority && self.priority < self.base_priority {
-                self.restore_priority_simplified();
+                self.restore_priority();
             }
             return;
         }
@@ -2542,9 +2482,7 @@ impl KThread {
     /// Process-owned `KThread::SetBasePriority()` port.
     ///
     /// Upstream takes `KScopedSchedulerLock`, stores `m_base_priority`, then
-    /// calls `RestorePriority(m_kernel, this)`. The Rust process-aware helper
-    /// avoids holding the target thread mutex while `restore_priority_with_process`
-    /// re-enters the process thread table.
+    /// calls `RestorePriority(m_kernel, this)`.
     pub fn set_base_priority_with_process(
         process_guard: &mut KProcess,
         thread_id: u64,
@@ -2553,8 +2491,9 @@ impl KThread {
         let Some(thread) = process_guard.get_thread_by_thread_id(thread_id) else {
             return;
         };
-        thread.lock().unwrap().base_priority = value;
-        Self::restore_priority_with_process(process_guard, thread_id);
+        let mut thread = thread.lock().unwrap();
+        thread.base_priority = value;
+        thread.restore_priority();
     }
 
     /// Arc-backed entry used by runtime owners that must not hold the thread
@@ -2935,7 +2874,7 @@ impl KThread {
         if self.base_priority > priority {
             self.base_priority = priority;
             // Upstream: RestorePriority(kernel, this)
-            self.restore_priority_simplified();
+            self.restore_priority();
         }
     }
 
@@ -3406,9 +3345,17 @@ impl KThread {
     /// Set the thread's activity (pause/resume).
     /// Matches upstream `KThread::SetActivity()`.
     pub fn set_activity(&mut self, activity: u32) -> u32 {
+        let activity_pause_lock = self.activity_pause_lock.clone();
+        let _activity_guard = KScopedLightLock::new(activity_pause_lock.as_ref());
+
         {
             let _scheduler_lock =
                 super::kernel::scheduler_lock().map(|lock| KScopedSchedulerLock::new(lock));
+
+            let cur_state = self.get_state();
+            if cur_state != ThreadState::WAITING && cur_state != ThreadState::RUNNABLE {
+                return RESULT_INVALID_STATE.get_inner_value();
+            }
 
             match activity {
                 0 => {
@@ -3418,10 +3365,6 @@ impl KThread {
                     self.resume(SuspendType::Thread);
                 }
                 1 => {
-                    let cur_state = self.get_state();
-                    if cur_state != ThreadState::WAITING && cur_state != ThreadState::RUNNABLE {
-                        return RESULT_INVALID_STATE.get_inner_value();
-                    }
                     if self.is_suspend_requested_type(SuspendType::Thread) {
                         return RESULT_INVALID_STATE.get_inner_value();
                     }
@@ -3563,12 +3506,16 @@ impl KThread {
     /// Get core mask.
     /// Matches upstream `KThread::GetCoreMask()`.
     pub fn get_core_mask(&self) -> (i32, u64) {
+        let _scheduler_lock =
+            super::kernel::scheduler_lock().map(|lock| KScopedSchedulerLock::new(lock));
         (self.virtual_ideal_core_id, self.virtual_affinity_mask)
     }
 
     /// Get physical core mask.
     /// Matches upstream `KThread::GetPhysicalCoreMask()`.
     pub fn get_physical_core_mask(&self) -> (i32, u64) {
+        let _scheduler_lock =
+            super::kernel::scheduler_lock().map(|lock| KScopedSchedulerLock::new(lock));
         debug_assert!(self.num_core_migration_disables >= 0);
         if self.num_core_migration_disables == 0 {
             (
@@ -3587,6 +3534,8 @@ impl KThread {
     /// Matches upstream `KThread::SetCoreMask()`.
     pub fn set_core_mask(&mut self, cpu_core_id: i32, affinity_mask: u64) -> u32 {
         debug_assert!(affinity_mask != 0);
+        let activity_pause_lock = self.activity_pause_lock.clone();
+        let _activity_guard = KScopedLightLock::new(activity_pause_lock.as_ref());
 
         let physical_affinity_mask_for_waiters;
 
@@ -4457,7 +4406,9 @@ mod tests {
     fn test_on_timer_wakes_sleeping_thread() {
         let mut thread = KThread::new();
 
-        assert_eq!(thread.sleep(1), RESULT_SUCCESS.get_inner_value());
+        thread.wait_result = RESULT_SUCCESS.get_inner_value();
+        thread.begin_wait_with_queue(KThreadQueueWithoutEndWait::new().base);
+        thread.set_wait_reason_for_debugging(ThreadWaitReasonForDebugging::Sleep);
         assert_eq!(thread.get_state(), ThreadState::WAITING);
         thread.waiting_lock_info = Some(WaitingLockRef {
             owner_thread_id: 99,

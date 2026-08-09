@@ -12,10 +12,10 @@ use std::sync::{Arc, Mutex};
 use super::caps_manager::AlbumManager;
 use super::caps_types::{
     AlbumFileDateTime, AlbumStorage, ApplicationAlbumEntry, ApplicationAlbumFileEntry, ContentType,
-    ShimLibraryVersion,
 };
-use crate::hle::result::ResultCode;
+use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
+use crate::hle::service::ipc_helpers::{RequestParser, ResponseBuilder};
 use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
 
 /// IPC command table for IAlbumApplicationService.
@@ -50,8 +50,16 @@ pub struct IAlbumApplicationService {
 impl IAlbumApplicationService {
     pub fn new(album_manager: Arc<Mutex<AlbumManager>>) -> Self {
         let handlers = build_handler_map(&[
-            (32, None, "SetShimLibraryVersion"),
-            (102, None, "GetAlbumFileList0AafeAruidDeprecated"),
+            (
+                32,
+                Some(Self::set_shim_library_version_handler),
+                "SetShimLibraryVersion",
+            ),
+            (
+                102,
+                Some(Self::get_album_file_list0_aafe_aruid_deprecated_handler),
+                "GetAlbumFileList0AafeAruidDeprecated",
+            ),
             (103, None, "DeleteAlbumFileByAruid"),
             (104, None, "GetAlbumFileSizeByAruid"),
             (105, None, "DeleteAlbumFileByAruidForDebug"),
@@ -60,7 +68,11 @@ impl IAlbumApplicationService {
             (130, None, "PrecheckToCreateContentsByAruid"),
             (140, None, "GetAlbumFileList1AafeAruidDeprecated"),
             (141, None, "GetAlbumFileList2AafeUidAruidDeprecated"),
-            (142, None, "GetAlbumFileList3AaeAruid"),
+            (
+                142,
+                Some(Self::get_album_file_list3_aae_aruid_handler),
+                "GetAlbumFileList3AaeAruid",
+            ),
             (143, None, "GetAlbumFileList4AaeUidAruid"),
             (144, None, "GetAllAlbumFileList3AaeAruid"),
             (60002, None, "OpenAccessorSessionForApplication"),
@@ -87,6 +99,113 @@ impl IAlbumApplicationService {
             aruid,
         );
         Ok(())
+    }
+
+    fn set_shim_library_version_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const Self) };
+        let mut request = RequestParser::new(ctx);
+        let library_version = request.pop_u64();
+        let aruid = request.pop_u64();
+        let result = service
+            .set_shim_library_version(library_version, aruid)
+            .err()
+            .unwrap_or(RESULT_SUCCESS);
+        let mut response = ResponseBuilder::new(ctx, 2, 0, 0);
+        response.push_result(result);
+    }
+
+    fn read_raw_data_at<T: Copy + Default>(ctx: &HLERequestContext, byte_offset: usize) -> T {
+        let payload_word = if ctx.is_tipc() {
+            2
+        } else {
+            ctx.get_data_payload_offset() as usize + 2
+        };
+        let base = payload_word * core::mem::size_of::<u32>() + byte_offset;
+        let end = base + core::mem::size_of::<T>();
+        assert!(end <= core::mem::size_of_val(&ctx.cmd_buf));
+
+        let mut value = T::default();
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                ctx.cmd_buf.as_ptr().cast::<u8>().add(base),
+                (&mut value as *mut T).cast::<u8>(),
+                core::mem::size_of::<T>(),
+            );
+        }
+        value
+    }
+
+    fn values_as_bytes<T>(values: &[T]) -> &[u8] {
+        unsafe {
+            core::slice::from_raw_parts(
+                values.as_ptr().cast::<u8>(),
+                core::mem::size_of_val(values),
+            )
+        }
+    }
+
+    fn get_album_file_list0_aafe_aruid_deprecated_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const Self) };
+        let content_type = ContentType(Self::read_raw_data_at::<u8>(ctx, 0));
+        let start_posix_time = Self::read_raw_data_at::<i64>(ctx, 8);
+        let end_posix_time = Self::read_raw_data_at::<i64>(ctx, 16);
+        let aruid = Self::read_raw_data_at::<u64>(ctx, 24);
+        let mut entries = vec![
+            ApplicationAlbumFileEntry::default();
+            ctx.get_write_buffer_size(0)
+                / core::mem::size_of::<ApplicationAlbumFileEntry>()
+        ];
+        let (result, count) = match service.get_album_file_list0_aafe_aruid_deprecated(
+            content_type,
+            start_posix_time,
+            end_posix_time,
+            aruid,
+            &mut entries,
+        ) {
+            Ok(count) => (RESULT_SUCCESS, count),
+            Err(result) => (result, 0),
+        };
+        if !entries.is_empty() {
+            ctx.write_buffer(Self::values_as_bytes(&entries), 0);
+        }
+        let mut response = ResponseBuilder::new(ctx, 4, 0, 0);
+        response.push_result(result);
+        response.push_u64(count);
+    }
+
+    fn get_album_file_list3_aae_aruid_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const Self) };
+        let content_type = ContentType(Self::read_raw_data_at::<u8>(ctx, 0));
+        let start_date_time = Self::read_raw_data_at::<AlbumFileDateTime>(ctx, 2);
+        let end_date_time = Self::read_raw_data_at::<AlbumFileDateTime>(ctx, 10);
+        let aruid = Self::read_raw_data_at::<u64>(ctx, 24);
+        let mut entries = vec![
+            ApplicationAlbumEntry::default();
+            ctx.get_write_buffer_size(0)
+                / core::mem::size_of::<ApplicationAlbumEntry>()
+        ];
+        let (result, count) = match service.get_album_file_list3_aae_aruid(
+            content_type,
+            start_date_time,
+            end_date_time,
+            aruid,
+            &mut entries,
+        ) {
+            Ok(count) => (RESULT_SUCCESS, count),
+            Err(result) => (result, 0),
+        };
+        if !entries.is_empty() {
+            ctx.write_buffer(Self::values_as_bytes(&entries), 0);
+        }
+        let mut response = ResponseBuilder::new(ctx, 4, 0, 0);
+        response.push_result(result);
+        response.push_u64(count);
     }
 
     /// GetAlbumFileList0AafeAruidDeprecated (cmd 102).
@@ -197,5 +316,92 @@ impl ServiceFramework for IAlbumApplicationService {
 
     fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
         &self.handlers_tipc
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn set_shim_library_version_is_registered() {
+        let service = IAlbumApplicationService::new(Arc::new(Mutex::new(AlbumManager::new())));
+        assert!(service
+            .handlers
+            .get(&32)
+            .unwrap()
+            .handler_callback
+            .is_some());
+        for command_id in [102, 142] {
+            assert!(service
+                .handlers
+                .get(&command_id)
+                .unwrap()
+                .handler_callback
+                .is_some());
+        }
+    }
+
+    #[test]
+    fn list3_cmif_raw_offsets_match_upstream_alignment() {
+        let mut ctx = HLERequestContext::new();
+        let base = 2 * core::mem::size_of::<u32>();
+        let start = AlbumFileDateTime {
+            year: 2024,
+            month: 3,
+            day: 4,
+            hour: 5,
+            minute: 6,
+            second: 7,
+            unique_id: 8,
+        };
+        let end = AlbumFileDateTime {
+            year: 2025,
+            month: 9,
+            day: 10,
+            hour: 11,
+            minute: 12,
+            second: 13,
+            unique_id: 14,
+        };
+        let aruid = 0x1122_3344_5566_7788u64;
+        let bytes = unsafe {
+            core::slice::from_raw_parts_mut(
+                ctx.cmd_buf.as_mut_ptr().cast::<u8>(),
+                core::mem::size_of_val(&ctx.cmd_buf),
+            )
+        };
+        bytes[base] = 3;
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                (&start as *const AlbumFileDateTime).cast::<u8>(),
+                bytes.as_mut_ptr().add(base + 2),
+                core::mem::size_of::<AlbumFileDateTime>(),
+            );
+            core::ptr::copy_nonoverlapping(
+                (&end as *const AlbumFileDateTime).cast::<u8>(),
+                bytes.as_mut_ptr().add(base + 10),
+                core::mem::size_of::<AlbumFileDateTime>(),
+            );
+            core::ptr::copy_nonoverlapping(
+                (&aruid as *const u64).cast::<u8>(),
+                bytes.as_mut_ptr().add(base + 24),
+                core::mem::size_of::<u64>(),
+            );
+        }
+
+        assert_eq!(IAlbumApplicationService::read_raw_data_at::<u8>(&ctx, 0), 3);
+        assert_eq!(
+            IAlbumApplicationService::read_raw_data_at::<AlbumFileDateTime>(&ctx, 2),
+            start
+        );
+        assert_eq!(
+            IAlbumApplicationService::read_raw_data_at::<AlbumFileDateTime>(&ctx, 10),
+            end
+        );
+        assert_eq!(
+            IAlbumApplicationService::read_raw_data_at::<u64>(&ctx, 24),
+            aruid
+        );
     }
 }

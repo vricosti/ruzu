@@ -21,9 +21,20 @@ pub struct Nvmemp {
 impl Nvmemp {
     pub fn new() -> Self {
         Self {
-            handlers: build_handler_map(&[(0, None, "Open"), (1, None, "GetAruid")]),
+            handlers: build_handler_map(&[
+                (0, Some(Self::open), "Open"),
+                (1, Some(Self::get_aruid), "GetAruid"),
+            ]),
             handlers_tipc: BTreeMap::new(),
         }
+    }
+
+    fn open(_this: &dyn ServiceFramework, _ctx: &mut HLERequestContext) {
+        log::error!("NVMEMP::Open is unimplemented");
+    }
+
+    fn get_aruid(_this: &dyn ServiceFramework, _ctx: &mut HLERequestContext) {
+        log::error!("NVMEMP::GetAruid is unimplemented");
     }
 }
 
@@ -48,5 +59,17 @@ impl ServiceFramework for Nvmemp {
 
     fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
         &self.handlers_tipc
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn command_table_registers_upstream_handlers() {
+        let service = Nvmemp::new();
+        assert!(service.handlers.get(&0).unwrap().handler_callback.is_some());
+        assert!(service.handlers.get(&1).unwrap().handler_callback.is_some());
     }
 }

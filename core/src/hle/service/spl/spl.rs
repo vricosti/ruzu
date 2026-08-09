@@ -233,11 +233,14 @@ pub fn loop_process(system: crate::core::SystemRef) {
 
     let server_manager = ServerManager::new_shared(system);
 
-    let stub_names = &[
-        "csrng", "spl:", "spl:mig", "spl:fs", "spl:ssl", "spl:es", "spl:manu",
-    ];
+    let stub_names = &["spl", "spl:mig", "spl:fs", "spl:ssl", "spl:es", "spl:manu"];
     {
         let mut server_manager = server_manager.lock().unwrap();
+        server_manager.register_named_service_handler(
+            "csrng",
+            Arc::new(super::csrng::Csrng::new(None)),
+            16,
+        );
         for &name in stub_names {
             let svc_name = name.to_string();
             server_manager.register_named_service(

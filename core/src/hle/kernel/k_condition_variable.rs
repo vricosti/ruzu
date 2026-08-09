@@ -576,7 +576,9 @@ impl KConditionVariable {
             } else {
                 None
             };
-            KThread::restore_priority_with_process(&mut process_guard, current_thread_id);
+            if let Some(current_thread) = process_guard.get_thread_by_thread_id(current_thread_id) {
+                current_thread.lock().unwrap().restore_priority();
+            }
 
             // Determine the next tag.
             // Matches upstream: next_value = next_owner_thread->GetAddressKeyValue();
@@ -628,7 +630,9 @@ impl KConditionVariable {
                 "KConditionVariable::signal_to_address owner_tid={} addr=0x{:X} next_owner={:?} has_result={:#x} next_value=0x{:08X}",
                 current_thread_id,
                 addr,
-                next_owner_thread.as_ref().map(|t| t.lock().unwrap().get_thread_id()),
+                next_owner_thread
+                    .as_ref()
+                    .map(|t| t.lock().unwrap().get_thread_id()),
                 result.get_inner_value(),
                 next_value
             );
@@ -958,7 +962,11 @@ impl KConditionVariable {
                 .collect();
             log::info!(
                 "[CV_KEY_TRACE] signal_enter cv_key=0x{:X} count={} issuer_tid={:?} issuer_core={} waiters_in_tree={:?}",
-                cv_key, count, issuer_tid, issuer_core, waiters
+                cv_key,
+                count,
+                issuer_tid,
+                issuer_core,
+                waiters
             );
         }
 
@@ -1066,9 +1074,7 @@ impl KConditionVariable {
             let (issuer_tid, issuer_core) = current_trace_owner();
             trace_kcv(format_args!(
                 "KCV::signal issuer_tid={:?} issuer_core={} cv_key=0x{:X} clear_has_waiter_flag no_remaining_waiters",
-                issuer_tid,
-                issuer_core,
-                cv_key,
+                issuer_tid, issuer_core, cv_key,
             ));
         }
 
@@ -1260,7 +1266,11 @@ impl KConditionVariable {
                     .unwrap()
                     .set_waiting_lock_info(None);
 
-                KThread::restore_priority_with_process(process_guard, current_thread_id);
+                if let Some(current_thread) =
+                    process_guard.get_thread_by_thread_id(current_thread_id)
+                {
+                    current_thread.lock().unwrap().restore_priority();
+                }
 
                 next_value = next_owner_thread.lock().unwrap().get_address_key_value();
                 if has_waiters {
@@ -1402,7 +1412,11 @@ impl KConditionVariable {
         if should_trace_cv_key(key) {
             log::info!(
                 "[CV_KEY_TRACE] wait_insert cv_key=0x{:X} tid={} addr=0x{:X} tag=0x{:08X} timeout={}",
-                key, current_thread_id, addr, value, timeout
+                key,
+                current_thread_id,
+                addr,
+                value,
+                timeout
             );
         }
 

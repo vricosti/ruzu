@@ -16,10 +16,12 @@ use crate::hle::service::sockets::bsd::Bsd;
 use crate::hle::service::sockets::sockets::Errno as BsdErrno;
 use crate::internal_network::network::Errno as NetworkErrno;
 
+use super::cert_store::CertStore;
 use super::ssl_backend::{
     SslConnectionBackend, RESULT_INTERNAL_ERROR, RESULT_INVALID_SOCKET, RESULT_NO_SOCKET,
 };
 use super::ssl_backend_openssl::create_ssl_connection_backend;
+use super::ssl_types::CaCertificateId;
 
 /// nn::ssl::sf::CertificateFormat
 #[repr(u32)]
@@ -727,6 +729,7 @@ impl ServiceFramework for ISslContext {
 
 pub struct ISslService {
     system: SystemRef,
+    cert_store: CertStore,
     handlers: BTreeMap<u32, FunctionInfo>,
     handlers_tipc: BTreeMap<u32, FunctionInfo>,
 }
@@ -735,6 +738,7 @@ impl ISslService {
     pub fn new(system: SystemRef) -> Self {
         Self {
             system,
+            cert_store: CertStore::new(system),
             handlers: build_handler_map(&[
                 (
                     0,
@@ -742,8 +746,16 @@ impl ISslService {
                     "CreateContext",
                 ),
                 (1, None, "GetContextCount"),
-                (2, None, "GetCertificates"),
-                (3, None, "GetCertificateBufSize"),
+                (
+                    2,
+                    Some(ISslService::get_certificates_handler),
+                    "GetCertificates",
+                ),
+                (
+                    3,
+                    Some(ISslService::get_certificate_buf_size_handler),
+                    "GetCertificateBufSize",
+                ),
                 (4, None, "DebugIoctl"),
                 (
                     5,
@@ -791,6 +803,49 @@ impl ISslService {
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
     }
+
+    fn get_certificate_buf_size_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const ISslService) };
+        log::info!("ISslService::GetCertificateBufSize called");
+        let certificate_ids = parse_certificate_ids(&ctx.read_buffer(0));
+        let (result, size) = match service
+            .cert_store
+            .get_certificate_buf_size(&certificate_ids)
+        {
+            Ok((size, _num_entries)) => (RESULT_SUCCESS, size),
+            Err(result) => (result, 0),
+        };
+        let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
+        rb.push_result(result);
+        rb.push_u32(size);
+    }
+
+    fn get_certificates_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const ISslService) };
+        log::info!("ISslService::GetCertificates called");
+        let certificate_ids = parse_certificate_ids(&ctx.read_buffer(0));
+        let mut output = vec![0u8; ctx.get_write_buffer_size(0)];
+        let (result, num_entries) = match service
+            .cert_store
+            .get_certificates(&mut output, &certificate_ids)
+        {
+            Ok(num_entries) => {
+                ctx.write_buffer(&output, 0);
+                (RESULT_SUCCESS, num_entries)
+            }
+            Err(result) => (result, 0),
+        };
+        let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
+        rb.push_result(result);
+        rb.push_u32(num_entries);
+    }
+}
+
+fn parse_certificate_ids(bytes: &[u8]) -> Vec<CaCertificateId> {
+    bytes
+        .chunks_exact(std::mem::size_of::<i32>())
+        .map(|chunk| CaCertificateId::from_raw(i32::from_le_bytes(chunk.try_into().unwrap())))
+        .collect()
 }
 
 impl SessionRequestHandler for ISslService {

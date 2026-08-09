@@ -6,6 +6,7 @@
 //!
 //! IBtmSystemCore — Bluetooth system core interface.
 
+use crate::core::SystemRef;
 use crate::hle::result::ResultCode;
 use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
 use crate::hle::service::kernel_helpers::ServiceContext;
@@ -30,7 +31,7 @@ pub struct IBtmSystemCore {
 }
 
 impl IBtmSystemCore {
-    pub fn new() -> Self {
+    pub fn new(_system: SystemRef) -> Self {
         let mut service_context = ServiceContext::new("IBtmSystemCore".to_string());
 
         let radio_handle = service_context.create_event("IBtmSystemCore::RadioEvent".to_string());

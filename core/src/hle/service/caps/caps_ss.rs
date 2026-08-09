@@ -13,8 +13,9 @@ use super::caps_manager::AlbumManager;
 use super::caps_types::{
     AlbumFileId, AlbumReportOption, ApplicationAlbumEntry, ScreenShotAttribute,
 };
-use crate::hle::result::ResultCode;
+use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
+use crate::hle::service::ipc_helpers::{RequestParser, ResponseBuilder};
 use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
 
 /// IPC command table for IScreenShotService.
@@ -42,9 +43,17 @@ impl IScreenShotService {
         let handlers = build_handler_map(&[
             (201, None, "SaveScreenShot"),
             (202, None, "SaveEditedScreenShot"),
-            (203, None, "SaveScreenShotEx0"),
+            (
+                203,
+                Some(Self::save_screen_shot_ex0_handler),
+                "SaveScreenShotEx0",
+            ),
             (204, None, "SaveEditedScreenShotEx0"),
-            (206, None, "SaveEditedScreenShotEx1"),
+            (
+                206,
+                Some(Self::save_edited_screen_shot_ex1_handler),
+                "SaveEditedScreenShotEx1",
+            ),
             (208, None, "SaveScreenShotOfMovieEx1"),
             (1000, None, "Unknown1000"),
         ]);
@@ -88,6 +97,59 @@ impl IScreenShotService {
         } else {
             Err(result)
         }
+    }
+
+    fn save_screen_shot_ex0_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const Self) };
+        let mut request = RequestParser::new(ctx);
+        let attribute = request.pop_raw::<ScreenShotAttribute>();
+        let report_option = AlbumReportOption(request.pop_i32());
+        request.pop_u32();
+        let aruid = request.pop_u64();
+        let image_data = ctx.read_buffer(0);
+
+        let (result, entry) =
+            match service.save_screen_shot_ex0(&attribute, report_option, aruid, &image_data) {
+                Ok(entry) => (RESULT_SUCCESS, entry),
+                Err(result) => (result, ApplicationAlbumEntry::default()),
+            };
+        let mut response = ResponseBuilder::new(ctx, 10, 0, 0);
+        response.push_result(result);
+        response.push_raw(&entry);
+    }
+
+    fn save_edited_screen_shot_ex1_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const Self) };
+        let mut request = RequestParser::new(ctx);
+        let attribute = request.pop_raw::<ScreenShotAttribute>();
+        let width = request.pop_u64();
+        let height = request.pop_u64();
+        let thumbnail_width = request.pop_u64();
+        let thumbnail_height = request.pop_u64();
+        let file_id = request.pop_raw::<AlbumFileId>();
+        let image_data = ctx.read_buffer(1);
+        let thumbnail_image_data = ctx.read_buffer(2);
+
+        let (result, entry) = match service.save_edited_screen_shot_ex1(
+            &attribute,
+            width,
+            height,
+            thumbnail_width,
+            thumbnail_height,
+            &file_id,
+            &[0; 0x400],
+            &image_data,
+            &thumbnail_image_data,
+        ) {
+            Ok(entry) => (RESULT_SUCCESS, entry),
+            Err(result) => (result, ApplicationAlbumEntry::default()),
+        };
+        let mut response = ResponseBuilder::new(ctx, 10, 0, 0);
+        response.push_result(result);
+        response.push_raw(&entry);
     }
 
     /// SaveEditedScreenShotEx1 (cmd 206).
@@ -154,5 +216,23 @@ impl ServiceFramework for IScreenShotService {
 
     fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
         &self.handlers_tipc
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn save_screen_shot_ex0_is_registered() {
+        let service = IScreenShotService::new(Arc::new(Mutex::new(AlbumManager::new())));
+        for command_id in [203, 206] {
+            assert!(service
+                .handlers
+                .get(&command_id)
+                .unwrap()
+                .handler_callback
+                .is_some());
+        }
     }
 }

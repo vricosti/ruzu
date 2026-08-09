@@ -6,6 +6,7 @@
 //!
 //! Account module and Interface base class.
 
+use super::async_context::{AsyncContext, AsyncContextBase};
 use super::profile_manager::{ProfileBase, ProfileManager, UserData, UserIdArray};
 use crate::constants::ACCOUNT_BACKUP_JPEG;
 use crate::file_sys::romfs_factory::StorageId;
@@ -19,10 +20,8 @@ use crate::hle::service::hle_ipc::{
     HLERequestContext, SessionRequestHandler, SessionRequestHandlerPtr,
 };
 use crate::hle::service::ipc_helpers::{RequestParser, ResponseBuilder};
-use crate::hle::service::os::event::Event;
 use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 const MAX_JPEG_IMAGE_SIZE: usize = 0x20000;
@@ -403,6 +402,24 @@ impl Interface {
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(result);
     }
+
+    /// Port of upstream `Module::Interface::StoreSaveDataThumbnailSystem`.
+    pub fn store_save_data_thumbnail_system(
+        &self,
+        ctx: &mut HLERequestContext,
+        uuid: u128,
+        title_id: u64,
+    ) {
+        log::warn!(
+            "Account::StoreSaveDataThumbnailSystem: STUBBED called, uuid=0x{uuid:032x}, tid={title_id:016X}"
+        );
+
+        let result =
+            self.store_save_data_thumbnail_result(uuid, title_id, ctx.get_read_buffer_size(0));
+
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(result);
+    }
 }
 
 fn push_interface_response(ctx: &mut HLERequestContext, object: SessionRequestHandlerPtr) {
@@ -411,95 +428,34 @@ fn push_interface_response(ctx: &mut HLERequestContext, object: SessionRequestHa
     rb.push_ipc_interface(object);
 }
 
-struct EnsureTokenIdCacheAsyncInterface {
-    completion_event: Arc<Event>,
-    is_complete: AtomicBool,
-    handlers: BTreeMap<u32, FunctionInfo>,
-    handlers_tipc: BTreeMap<u32, FunctionInfo>,
+struct EnsureTokenIdCacheAsyncState;
+
+impl AsyncContext for EnsureTokenIdCacheAsyncState {
+    fn is_complete(&self) -> bool {
+        true
+    }
+
+    fn cancel(&self) {}
+
+    fn get_result(&self) -> ResultCode {
+        RESULT_SUCCESS
+    }
 }
 
-impl EnsureTokenIdCacheAsyncInterface {
-    fn new() -> Self {
-        let handlers = build_handler_map(&[
-            (0, Some(Self::get_system_event_handler), "GetSystemEvent"),
-            (1, Some(Self::cancel_handler), "Cancel"),
-            (2, Some(Self::has_done_handler), "HasDone"),
-            (3, Some(Self::get_result_handler), "GetResult"),
-        ]);
-        let completion_event = Arc::new(Event::new());
-        completion_event.signal();
-        Self {
-            completion_event,
-            is_complete: AtomicBool::new(true),
-            handlers,
-            handlers_tipc: BTreeMap::new(),
-        }
-    }
+type EnsureTokenIdCacheAsyncInterface = AsyncContextBase<EnsureTokenIdCacheAsyncState>;
 
-    fn get_system_event_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
-        let svc = unsafe {
-            &*(this as *const dyn ServiceFramework as *const EnsureTokenIdCacheAsyncInterface)
-        };
-        let object_id = svc.completion_event.copy_object_id(ctx).unwrap_or(0);
-        let mut rb = ResponseBuilder::new(ctx, 2, 1, 0);
-        rb.push_result(RESULT_SUCCESS);
-        rb.push_copy_object_id(object_id);
-    }
+fn new_ensure_token_id_cache_async_interface() -> EnsureTokenIdCacheAsyncInterface {
+    let context = AsyncContextBase::new(EnsureTokenIdCacheAsyncState);
+    context.mark_complete();
+    context
+}
 
-    fn cancel_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
-        let svc = unsafe {
-            &*(this as *const dyn ServiceFramework as *const EnsureTokenIdCacheAsyncInterface)
-        };
-        svc.is_complete.store(true, Ordering::Release);
-        svc.completion_event.signal();
-        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
-        rb.push_result(RESULT_SUCCESS);
-    }
-
-    fn has_done_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
-        let svc = unsafe {
-            &*(this as *const dyn ServiceFramework as *const EnsureTokenIdCacheAsyncInterface)
-        };
-        let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
-        rb.push_result(RESULT_SUCCESS);
-        rb.push_bool(svc.is_complete.load(Ordering::Acquire));
-    }
-
-    fn get_result_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
-        let svc = unsafe {
-            &*(this as *const dyn ServiceFramework as *const EnsureTokenIdCacheAsyncInterface)
-        };
-        svc.is_complete.store(true, Ordering::Release);
-        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
-        rb.push_result(RESULT_SUCCESS);
-    }
-
+impl AsyncContextBase<EnsureTokenIdCacheAsyncState> {
     fn load_id_token_cache(&self, ctx: &mut HLERequestContext) {
-        self.is_complete.store(true, Ordering::Release);
-        self.completion_event.signal();
+        log::warn!("Account::LoadIdTokenCache: STUBBED called");
         let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
         rb.push_result(RESULT_SUCCESS);
         rb.push_u32(0);
-    }
-}
-
-impl SessionRequestHandler for EnsureTokenIdCacheAsyncInterface {
-    fn handle_sync_request(&self, ctx: &mut HLERequestContext) -> ResultCode {
-        ServiceFramework::handle_sync_request_impl(self, ctx)
-    }
-}
-
-impl ServiceFramework for EnsureTokenIdCacheAsyncInterface {
-    fn get_service_name(&self) -> &str {
-        "EnsureTokenIdCacheAsyncInterface"
-    }
-
-    fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> {
-        &self.handlers
-    }
-
-    fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
-        &self.handlers_tipc
     }
 }
 
@@ -544,7 +500,7 @@ impl IManagerForApplication {
         ]);
         Self {
             profile_manager,
-            ensure_token_id: Arc::new(EnsureTokenIdCacheAsyncInterface::new()),
+            ensure_token_id: Arc::new(new_ensure_token_id_cache_async_interface()),
             handlers,
             handlers_tipc: BTreeMap::new(),
         }
@@ -1073,7 +1029,7 @@ mod tests {
     }
 
     #[test]
-    fn initialize_application_info_base_uses_arp_launch_property() {
+    fn initialize_application_info_base_uses_arp_storage_type_without_retaining_property() {
         let mut system = crate::core::System::new();
         let program_id = 0x0100_1520_0002_2000;
         system.set_runtime_program_id(program_id);
@@ -1094,10 +1050,8 @@ mod tests {
         let result = interface.initialize_application_info();
 
         assert_eq!(result, RESULT_SUCCESS);
-        assert_eq!(
-            interface.application_info.launch_property.title_id,
-            program_id
-        );
+        // Upstream currently uses the local launch property only to classify storage.
+        assert_eq!(interface.application_info.launch_property.title_id, 0);
         assert_eq!(
             interface.application_info.application_type,
             ApplicationType::Digital
@@ -1105,7 +1059,7 @@ mod tests {
     }
 
     #[test]
-    fn initialize_application_info_base_rejects_second_initialization() {
+    fn initialize_application_info_base_repeats_while_upstream_property_is_not_retained() {
         let mut system = crate::core::System::new();
         let program_id = 0x0100_1520_0002_2000;
         system.set_runtime_program_id(program_id);
@@ -1124,19 +1078,16 @@ mod tests {
 
         let mut interface = make_interface(crate::core::SystemRef::from_ref(&system));
         assert_eq!(interface.initialize_application_info(), RESULT_SUCCESS);
-        assert_eq!(
-            interface.initialize_application_info(),
-            RESULT_APPLICATION_INFO_ALREADY_INITIALIZED
-        );
+        assert_eq!(interface.initialize_application_info(), RESULT_SUCCESS);
     }
 
     #[test]
     fn ensure_token_id_load_id_token_cache_uses_upstream_response_shape() {
         let mut ctx = HLERequestContext::new();
 
-        EnsureTokenIdCacheAsyncInterface::new().load_id_token_cache(&mut ctx);
+        new_ensure_token_id_cache_async_interface().load_id_token_cache(&mut ctx);
 
-        assert_eq!(ctx.write_size, 3);
+        assert_eq!(ctx.write_size - ctx.data_payload_offset, 3);
     }
 
     #[test]
