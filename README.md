@@ -1,5 +1,17 @@
 # ruzu
 
+> ### ⚠️ This project is discontinued — its successor is [**reden**](https://github.com/vricosti/reden)
+>
+> ruzu achieved what it set out to prove: a large, deeply stateful C++ codebase
+> *can* be ported faithfully to Rust with the help of a large language model, and
+> the result boots and runs commercial titles. The experiment succeeded, and it
+> stops here.
+>
+> Active development continues in **[reden](https://github.com/vricosti/reden)**,
+> which carries the lessons of this port forward. New issues, contributions and
+> builds belong there. This repository stays online, unmaintained, as the record
+> of the experiment.
+
 **ruzu is not a new emulator. It is a port.**
 
 Every design decision, file layout, class boundary, constant and control flow in
@@ -58,8 +70,9 @@ The emulator runs on both **x86-64** and **aarch64** hosts. rdynarmic carries a
 backend for each, so guest ARM code is JIT-compiled natively on either
 architecture rather than interpreted.
 
-A **RISC-V** host is one of the next objectives — the plan is to get the
-workspace compiling on riscv64 first, then add a RISC-V backend to rdynarmic.
+A **RISC-V** host was planned — compiling the workspace on riscv64 first, then
+adding a RISC-V backend to rdynarmic. That work was never done here, and is left
+to [reden](https://github.com/vricosti/reden).
 
 ### Compilation tested on
 
