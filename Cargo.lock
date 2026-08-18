@@ -131,6 +131,7 @@ dependencies = [
  "cubeb-sys",
  "log",
  "parking_lot",
+ "pkg-config",
  "sdl3",
  "winapi",
 ]
