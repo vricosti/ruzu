@@ -64,8 +64,8 @@ adding a RISC-V backend to rdynarmic. That work is not implemented yet.
 ### Compilation tested on
 
 Results from [the compatibility
-report](https://github.com/vricosti/ruzu) of 29 July 2026. Each platform started
-from a clean image with neither build dependencies nor a Rust toolchain
+report](https://github.com/vricosti/ruzu) of 18 August 2026. Each platform
+started from a clean image with neither build dependencies nor a Rust toolchain
 installed; `setup.sh` installed them, and the validation command was
 `cargo build --locked --bin ruzu`.
 
@@ -74,14 +74,20 @@ installed; `setup.sh` installed them, and the validation command was
 | Ubuntu 22.04.5 LTS | apt | 4.6.9 | 1.97.1 (rustup) | OK |
 | Ubuntu 24.04.4 LTS | apt | 4.14.5 | 1.97.1 (rustup) | OK |
 | Ubuntu 26.04 LTS | apt | 4.22.4 | 1.97.1 (rustup) | OK |
+| Debian 13 (trixie) | apt | 4.18.6 | 1.97.1 (rustup) | OK |
 | Fedora 44 | dnf | 4.22.4 | 1.97.1 (rustup) | OK |
 | Arch Linux | pacman | 4.22.4 | 1.97.1 (rustup) | OK |
 | openSUSE Tumbleweed | zypper | 4.22.4 | 1.97.1 (rustup) | OK |
-| Alpine 3.24.1 | apk | 4.22.4 | 1.97.1 (rustup, musl) | OK |
+| Alpine 3.24 | apk | 4.22.4 | 1.97.1 (rustup, musl) | OK |
 | FreeBSD 15.1-RELEASE | pkg | 4.20.4 | 1.97.1 (rustup) | OK |
 | NetBSD 10.1 | pkgin | 4.22.4 | 1.97.1 (rustup) | OK |
 | OpenBSD 7.9 | pkg_add | 4.22.3 | 1.94.1 (native package) | OK |
 | macOS Tahoe 26 | Homebrew | — | rustup | Not yet run — Homebrew support is implemented in `setup.sh`, pending validation on real Apple hardware |
+
+NetBSD needs two steps that `setup.sh` cannot take on its own, because they
+provision the package manager and X11 themselves: install `pkgin` with
+`pkg_add`, and unpack the `xbase`, `xcomp` and `xfont` base sets. pkgsrc
+publishes no X11 packages for NetBSD.
 
 ## Building
 
