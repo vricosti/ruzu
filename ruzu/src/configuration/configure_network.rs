@@ -5,17 +5,13 @@
 // (`ConfigureNetwork`), whose widget tree lives in `configure_network.ui`.
 //
 // A single "General" group with the network-interface picker. Upstream fills
-// the combo from `Network::GetAvailableNetworkInterfaces()` with a leading
-// "None" entry, and stores the *interface name* (not the index).
+// the combo directly from `Network::GetAvailableNetworkInterfaces()` and
+// stores the *interface name* (not the index).
 
 use gtk::prelude::*;
 
 use super::configure_dialog::Page;
 use super::shared_widget as w;
-
-/// The first combo entry, meaning "no interface bound" — upstream inserts
-/// `tr("None")` before the enumerated interfaces.
-const NONE_ENTRY: &str = "None";
 
 /// Build the Network tab — upstream `ConfigureNetwork`.
 pub fn page() -> Page {
@@ -23,8 +19,7 @@ pub fn page() -> Page {
 
     let (general_group, general) = w::group("General");
 
-    let mut entries = vec![NONE_ENTRY.to_string()];
-    entries.extend(available_network_interfaces());
+    let entries = available_network_interfaces();
     let entry_refs: Vec<&str> = entries.iter().map(String::as_str).collect();
 
     let current = common::settings::values()
@@ -38,42 +33,44 @@ pub fn page() -> Page {
 
     let (interface_row, interface) = w::combo_row("Network Interface", &entry_refs, selected);
     general.append(&interface_row);
+    let airplane_mode = w::check_row(
+        "Enable Airplane Mode",
+        *common::settings::values().airplane_mode.get_value(),
+    );
+    general.append(&airplane_mode);
 
     column.append(&general_group);
 
     Page::new("Network", scroller, move || {
         let index = interface.selected() as usize;
-        // Row 0 is "None", which upstream stores as an empty interface name.
-        let name = if index == 0 {
-            String::new()
-        } else {
-            entries.get(index).cloned().unwrap_or_default()
-        };
+        let name = entries.get(index).cloned().unwrap_or_default();
         common::settings::values_mut()
             .network_interface
             .set_value(name);
+        common::settings::values_mut()
+            .airplane_mode
+            .set_value(airplane_mode.is_active());
     })
 }
 
 /// Host network interface names — upstream
 /// `Network::GetAvailableNetworkInterfaces()`.
 ///
-/// Reads them from `/sys/class/net`, which is the same set `getifaddrs` reports
-/// on Linux. Returns an empty list on other platforms or if the directory can't
-/// be read, leaving just the "None" entry — the same result upstream produces
-/// when enumeration fails.
+/// Keep enumeration in the upstream-owned core counterpart; the frontend only
+/// consumes interface names, exactly like `ConfigureNetwork` does.
 fn available_network_interfaces() -> Vec<String> {
-    let Ok(entries) = std::fs::read_dir("/sys/class/net") else {
-        return Vec::new();
-    };
-    let mut names: Vec<String> = entries
-        .filter_map(|entry| entry.ok())
-        .map(|entry| entry.file_name().to_string_lossy().into_owned())
-        // Upstream skips the loopback interface; it can't reach a LAN peer.
-        .filter(|name| name != "lo")
-        .collect();
-    names.sort_unstable();
-    names
+    interface_names_in_enumeration_order(
+        ruzu_core::internal_network::network_interface::get_available_network_interfaces(),
+    )
+}
+
+fn interface_names_in_enumeration_order(
+    interfaces: Vec<ruzu_core::internal_network::network_interface::NetworkInterface>,
+) -> Vec<String> {
+    interfaces
+        .into_iter()
+        .map(|interface| interface.name)
+        .collect()
 }
 
 #[cfg(test)]
@@ -88,10 +85,21 @@ mod tests {
     }
 
     #[test]
-    fn interfaces_are_sorted() {
-        let names = available_network_interfaces();
-        let mut sorted = names.clone();
-        sorted.sort_unstable();
-        assert_eq!(names, sorted);
+    fn interface_names_preserve_core_enumeration_order() {
+        use std::net::Ipv4Addr;
+
+        let interface =
+            |name: &str| ruzu_core::internal_network::network_interface::NetworkInterface {
+                name: name.to_string(),
+                ip_address: Ipv4Addr::UNSPECIFIED,
+                subnet_mask: Ipv4Addr::UNSPECIFIED,
+                gateway: Ipv4Addr::UNSPECIFIED,
+                kind: ruzu_core::internal_network::network_interface::HostAdapterKind::Ethernet,
+            };
+
+        assert_eq!(
+            interface_names_in_enumeration_order(vec![interface("wlan0"), interface("eth0")]),
+            ["wlan0", "eth0"]
+        );
     }
 }

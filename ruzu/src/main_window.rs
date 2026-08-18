@@ -22,7 +22,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use gtk::prelude::*;
 use gtk::{gio, glib, Application, ApplicationWindow};
 
-use common::settings_enums::ConfirmStop;
+use common::settings_enums::{ConfirmStop, FullscreenMode};
 use input_common::drivers::mouse::MouseButton;
 use ruzu_core::frontend::framebuffer_layout::{default_frame_layout, FramebufferLayout};
 
@@ -101,6 +101,21 @@ fn fullscreen_hotkey(keyval: gtk::gdk::Key) -> Option<FullscreenHotkey> {
     }
 }
 
+/// Upstream `MainWindow::UsingExclusiveFullscreen`.
+fn uses_exclusive_fullscreen(mode: FullscreenMode, is_wayland: bool) -> bool {
+    mode == FullscreenMode::Exclusive || is_wayland
+}
+
+fn display_uses_wayland() -> bool {
+    gtk::gdk::Display::default().is_some_and(|display| {
+        display
+            .type_()
+            .name()
+            .to_ascii_lowercase()
+            .contains("wayland")
+    })
+}
+
 fn should_warn_about_missing_keys(keys_present: bool) -> bool {
     !keys_present
 }
@@ -123,6 +138,10 @@ fn restart_path_after_shutdown(
 /// upstream class members do.
 pub struct GMainWindow {
     window: ApplicationWindow,
+    /// Multiplayer client. Upstream keeps it in `Core::System`'s room network;
+    /// it lives here until the room network owner is ported, because the
+    /// Multiplayer menu is currently its only user.
+    room_member: Arc<network::room_member::RoomMember>,
     /// In-window menu bar on non-macOS platforms. Upstream hides the menu bar
     /// while the single-window render surface is fullscreen.
     menu_bar: Option<gtk::PopoverMenuBar>,
@@ -342,6 +361,29 @@ mod loading_event_mailbox_tests {
     use super::*;
 
     #[test]
+    fn configuration_refresh_precedes_following_boot_progress() {
+        let mut mailbox = LoadingEventMailbox::default();
+        mailbox.push(LoadingEvent::ConfigurationApplied);
+        mailbox.push(LoadingEvent::Progress {
+            stage: LoadStage::Prepare,
+            value: 0,
+            total: 0,
+        });
+
+        assert!(matches!(
+            mailbox.pop(),
+            Some(LoadingEvent::ConfigurationApplied)
+        ));
+        assert!(matches!(
+            mailbox.pop(),
+            Some(LoadingEvent::Progress {
+                stage: LoadStage::Prepare,
+                ..
+            })
+        ));
+    }
+
+    #[test]
     fn completed_hot_cache_does_not_force_build_stage_visible() {
         let mut mailbox = LoadingEventMailbox::default();
         mailbox.push(LoadingEvent::Progress {
@@ -466,6 +508,16 @@ mod fullscreen_hotkey_tests {
         );
         assert_eq!(fullscreen_hotkey(gtk::gdk::Key::F10), None);
     }
+
+    #[test]
+    fn exclusive_fullscreen_predicate_matches_upstream() {
+        assert!(uses_exclusive_fullscreen(FullscreenMode::Exclusive, false));
+        assert!(!uses_exclusive_fullscreen(
+            FullscreenMode::Borderless,
+            false
+        ));
+        assert!(uses_exclusive_fullscreen(FullscreenMode::Borderless, true));
+    }
 }
 
 #[cfg(test)]
@@ -571,17 +623,30 @@ mod help_menu_tests {
     }
 
     #[test]
-    fn unimplemented_multiplayer_menu_is_hidden() {
-        assert!(!MENU_UI.contains("_Multiplayer"));
-        for action in [
-            "view_lobby",
-            "start_room",
-            "connect_to_room",
-            "show_room",
-            "leave_room",
-        ] {
+    fn only_multiplayer_entries_with_a_working_transport_are_shown() {
+        // RoomMember has a real ENet transport, so these are reachable.
+        assert!(MENU_UI.contains("_Multiplayer"));
+        assert!(MENU_UI.contains("app.connect_to_room"));
+        assert!(MENU_UI.contains("app.leave_room"));
+
+        // Discovery and the current-room window have working dependencies too.
+        assert!(MENU_UI.contains("app.show_room"));
+        assert!(MENU_UI.contains("app.view_lobby"));
+        // Hosting still needs the Room server, which is not ported.
+        for action in ["start_room"] {
             assert!(!MENU_UI.contains(&format!("app.{action}")));
         }
+    }
+
+    #[test]
+    fn current_room_actions_follow_edens_connected_states() {
+        use network::room_member::RoomMemberState;
+
+        assert!(!room_actions_enabled(RoomMemberState::Uninitialized));
+        assert!(!room_actions_enabled(RoomMemberState::Idle));
+        assert!(!room_actions_enabled(RoomMemberState::Joining));
+        assert!(room_actions_enabled(RoomMemberState::Joined));
+        assert!(room_actions_enabled(RoomMemberState::Moderator));
     }
 }
 
@@ -790,6 +855,7 @@ impl GMainWindow {
 
         let this = Rc::new(Self {
             window,
+            room_member: Arc::new(network::room_member::RoomMember::new()),
             menu_bar,
             stack,
             loading_screen,
@@ -815,6 +881,22 @@ impl GMainWindow {
 
         controller_applet_frontend.start();
 
+        // Eden's `OnToggleGpuAccuracy` applies the new setting to the active
+        // system. Its context-menu action and the other status actions only
+        // mutate their setting and refresh their button.
+        this.status_bar.connect_gpu_accuracy_changed(glib::clone!(
+            #[weak(rename_to = this)]
+            this,
+            move || {
+                {
+                    let session = this.session.borrow();
+                    if let Some(session) = session.as_ref() {
+                        let _ = session.apply_renderer_settings();
+                    }
+                }
+            }
+        ));
+
         // Upstream calls `input_subsystem->Initialize()` from the
         // `GRenderWindow` constructor. Do it once here, before any boot, so the
         // engines are registered when the guest starts reading its controllers.
@@ -836,17 +918,39 @@ impl GMainWindow {
                     w.boot_game_from_list(path, start_type)
                 }
             ),
+            glib::clone!(
+                #[weak(rename_to = w)]
+                this,
+                #[upgrade_or]
+                false,
+                move || {
+                    let unlocked = w.session.borrow().is_none();
+                    unlocked
+                }
+            ),
         );
         this.stack.add_named(&game_list, Some(PAGE_GAME_LIST));
         this.stack.set_visible_child_name(PAGE_GAME_LIST);
         *this.game_list.borrow_mut() = Some(game_list_handle);
 
-        // Upstream shows the window before checking decryption components.
-        // Defer the check so GTK has presented the parent window, and sequence
-        // ruzu's optional first-run import before it to avoid stacked dialogs.
+        // Upstream calls `show()` before checking decryption components. An
+        // idle callback alone can run before the compositor maps the parent,
+        // leaving the modal import/missing-keys dialog invisible while it owns
+        // the input grab. Wait for the first map to finish, then run the checks
+        // on the following main-loop iteration.
         {
-            let this = Rc::clone(&this);
-            glib::idle_add_local_once(move || this.run_startup_checks(offer_config_import));
+            let startup_checks_pending = Cell::new(true);
+            this.window.connect_map(glib::clone!(
+                #[weak(rename_to = this)]
+                this,
+                move |_| {
+                    if startup_checks_pending.replace(false) {
+                        glib::idle_add_local_once(move || {
+                            this.run_startup_checks(offer_config_import)
+                        });
+                    }
+                }
+            ));
         }
 
         // Keep the embedded render surface sized to the central stack as the
@@ -1077,6 +1181,11 @@ impl GMainWindow {
             ));
             app.add_action(&action);
         }
+        window_action!("view_lobby", on_view_lobby);
+        window_action!("connect_to_room", on_direct_connect_to_room);
+        window_action!("show_room", on_show_current_room);
+        window_action!("leave_room", on_leave_room);
+        update_room_action_state(app, self.room_member.get_state());
         window_action!("open_quickstart_guide", on_open_quickstart_guide);
         window_action!("about", on_about);
 
@@ -1196,7 +1305,12 @@ impl GMainWindow {
     }
 
     fn exit_fullscreen(&self, app: &Application) {
-        if self.session.borrow().is_some() && self.window.is_fullscreen() {
+        let fullscreen = app
+            .lookup_action("fullscreen")
+            .and_then(|action| action.state())
+            .and_then(|state| state.get::<bool>())
+            .unwrap_or(false);
+        if self.session.borrow().is_some() && fullscreen {
             self.set_fullscreen_action_state(app, false);
             crate::uisettings::with_mut(|values| values.fullscreen.set_value(false));
             persist_view_settings();
@@ -1208,7 +1322,25 @@ impl GMainWindow {
     /// `HideFullscreen`, adapted to ruzu's always-single-window GTK frontend.
     fn set_fullscreen(&self, fullscreen: bool) {
         self.update_fullscreen_chrome(fullscreen);
-        self.window.set_fullscreened(fullscreen);
+        let mode = *common::settings::values().fullscreen_mode.get_value();
+        let exclusive = uses_exclusive_fullscreen(mode, display_uses_wayland());
+        if fullscreen {
+            if exclusive {
+                self.window.set_fullscreened(true);
+            } else {
+                // GTK has no Qt-style `FramelessWindowHint` geometry path.
+                // An undecorated maximized X11 window is the corresponding
+                // borderless mode; Wayland is forced through fullscreen above,
+                // exactly like upstream.
+                self.window.set_decorated(false);
+                self.window.maximize();
+            }
+        } else if exclusive {
+            self.window.set_fullscreened(false);
+        } else {
+            self.window.unmaximize();
+            self.window.set_decorated(true);
+        }
     }
 
     fn update_fullscreen_chrome(&self, fullscreen: bool) {
@@ -1590,6 +1722,47 @@ impl GMainWindow {
     /// Upstream `GMainWindow::OnAbout`.
     fn on_about(&self) {
         crate::about_dialog::AboutDialog::new(&self.window).present();
+    }
+
+    /// Upstream `GMainWindow::OnViewLobby`.
+    fn on_view_lobby(&self) {
+        let Some(game_list) = self.game_list.borrow().clone() else {
+            return;
+        };
+        let parent = self.window.clone();
+        let room_member = Arc::clone(&self.room_member);
+        crate::multiplayer::lobby::show(
+            &self.window,
+            Arc::clone(&self.room_member),
+            game_list,
+            move || {
+                crate::multiplayer::client_room::show(&parent, Arc::clone(&room_member));
+            },
+        );
+    }
+
+    /// Upstream `GMainWindow::OnOpenDirectConnect`.
+    fn on_direct_connect_to_room(&self) {
+        let parent = self.window.clone();
+        let room_member = Arc::clone(&self.room_member);
+        crate::multiplayer::direct_connect::show(
+            &self.window,
+            Arc::clone(&self.room_member),
+            move || {
+                crate::multiplayer::client_room::show(&parent, Arc::clone(&room_member));
+            },
+        );
+    }
+
+    /// Upstream `GMainWindow::OnOpenRoomWindow`.
+    fn on_show_current_room(&self) {
+        crate::multiplayer::client_room::show(&self.window, Arc::clone(&self.room_member));
+    }
+
+    /// Upstream `GMainWindow::OnCloseRoom`, minus the confirmation prompt it
+    /// only shows when hosting — hosting is not ported.
+    fn on_leave_room(&self) {
+        self.room_member.leave();
     }
 
     /// Re-read everything that came from the freshly imported configuration.
@@ -2300,16 +2473,34 @@ impl GMainWindow {
     /// Upstream `GMainWindow::OnConfigure`: build and show the configuration
     /// dialog, parented to the main window.
     ///
-    /// Upstream keeps the dialog on the stack and inspects its exec() result to
-    /// decide whether to re-read settings. GTK dialogs are modeless objects
-    /// whose OK handler applies the settings itself, so the `Rc` is held alive
-    /// by the window until the next invocation replaces it.
+    /// Upstream keeps the dialog on the stack and inspects its `exec()` result
+    /// to decide whether to re-read settings. GTK uses a non-blocking modal
+    /// transient window; the `Rc` preserves the same single-dialog lifetime
+    /// until its OK/Cancel close edge.
     fn on_configure(self: &Rc<Self>) {
+        // `QDialog::exec()` prevents a second Configure action from creating a
+        // competing dialog. Preserve that single modal instance in GTK and
+        // raise it if the action is invoked again through a shortcut.
+        if let Some(dialog) = self.configure_dialog.borrow().as_ref() {
+            dialog.present();
+            return;
+        }
         let dialog = crate::configuration::ConfigureDialog::new(
             Some(&self.window),
             Rc::clone(&self.input_subsystem),
             Arc::clone(&self.hid_core),
+            self.session.borrow().is_none(),
         );
+        dialog.connect_applied(glib::clone!(
+            #[weak(rename_to = this)]
+            self,
+            move || {
+                if let Some(session) = this.session.borrow().as_ref() {
+                    let _ = session.apply_renderer_settings();
+                }
+                this.status_bar.refresh();
+            }
+        ));
         dialog.connect_closed(glib::clone!(
             #[weak(rename_to = this)]
             self,
@@ -2506,6 +2697,7 @@ impl GMainWindow {
                 return glib::ControlFlow::Break;
             }
             match mailbox.lock().unwrap().pop() {
+                Some(LoadingEvent::ConfigurationApplied) => this.status_bar.refresh(),
                 Some(LoadingEvent::Assets(assets)) => {
                     loading.set_assets(assets.logo.as_deref(), assets.banner.as_deref());
                 }
@@ -2569,6 +2761,7 @@ impl GMainWindow {
             loading_event,
         );
         *self.session.borrow_mut() = Some(session);
+        self.status_bar.set_emulation_running(true);
         if let Some(app) = self.window.application() {
             update_menu_state(&app, true, false);
         }
@@ -2691,6 +2884,7 @@ impl GMainWindow {
                 return glib::ControlFlow::Break;
             }
             match mailbox.lock().unwrap().pop() {
+                Some(LoadingEvent::ConfigurationApplied) => this.status_bar.refresh(),
                 Some(LoadingEvent::Assets(assets)) => {
                     loading.set_assets(assets.logo.as_deref(), assets.banner.as_deref());
                 }
@@ -2753,6 +2947,7 @@ impl GMainWindow {
             loading_event,
         );
         *self.session.borrow_mut() = Some(session);
+        self.status_bar.set_emulation_running(true);
         if let Some(app) = self.window.application() {
             update_menu_state(&app, true, false);
         }
@@ -2864,6 +3059,7 @@ impl GMainWindow {
                 return glib::ControlFlow::Break;
             }
             match mailbox.lock().unwrap().pop() {
+                Some(LoadingEvent::ConfigurationApplied) => this.status_bar.refresh(),
                 Some(LoadingEvent::Assets(assets)) => {
                     loading.set_assets(assets.logo.as_deref(), assets.banner.as_deref());
                 }
@@ -2924,6 +3120,7 @@ impl GMainWindow {
             loading_event,
         );
         *self.session.borrow_mut() = Some(session);
+        self.status_bar.set_emulation_running(true);
         if let Some(app) = self.window.application() {
             update_menu_state(&app, true, false);
         }
@@ -3279,6 +3476,7 @@ impl GMainWindow {
         if let Some(mut session) = self.session.borrow_mut().take() {
             session.stop();
         }
+        self.status_bar.set_emulation_running(false);
         if let Some(tas) = self.input_subsystem.borrow().get_tas() {
             tas.lock().stop();
         }
@@ -3390,6 +3588,9 @@ impl GMainWindow {
                     this.status_bar
                         .update_performance(results, shaders_building);
                     this.refresh_tas_ui();
+                    if let Some(app) = this.window.application() {
+                        update_room_action_state(&app, this.room_member.get_state());
+                    }
                     glib::ControlFlow::Continue
                 }
             ),
@@ -4091,6 +4292,25 @@ pub fn update_menu_state(app: &Application, emulation_running: bool, is_paused: 
     set_enabled("capture_screenshot", emulation_running && !is_paused);
 }
 
+/// Eden's `MultiplayerState::UpdateNotificationStatus` enables these actions
+/// only after the server has admitted the member, not during `Joining`.
+fn update_room_action_state(app: &Application, state: network::room_member::RoomMemberState) {
+    let connected = room_actions_enabled(state);
+    for name in ["show_room", "leave_room"] {
+        if let Some(action) = app.lookup_action(name).and_downcast::<gio::SimpleAction>() {
+            action.set_enabled(connected);
+        }
+    }
+}
+
+fn room_actions_enabled(state: network::room_member::RoomMemberState) -> bool {
+    matches!(
+        state,
+        network::room_member::RoomMemberState::Joined
+            | network::room_member::RoomMemberState::Moderator
+    )
+}
+
 /// Whether system firmware is installed — upstream
 /// `GMainWindow::CheckFirmwarePresence`, which asks the content provider for
 /// the Mii Edit applet's program NCA.
@@ -4312,8 +4532,29 @@ const MENU_UI: &str = r##"<?xml version="1.0" encoding="UTF-8"?>
       </section>
     </submenu>
 
-    <!-- Multiplayer stays hidden until the GTK actions, ENet transport, and
-         ruzu-owned public lobby service are implemented. -->
+    <!-- Only entries whose network dependency exists are listed. Room hosting
+         remains hidden until the Room server transport is complete. -->
+    <submenu>
+      <attribute name="label" translatable="yes">_Multiplayer</attribute>
+      <section>
+        <item>
+          <attribute name="label" translatable="yes">_Browse Public Game Lobby</attribute>
+          <attribute name="action">app.view_lobby</attribute>
+        </item>
+        <item>
+          <attribute name="label" translatable="yes">_Direct Connect to Room</attribute>
+          <attribute name="action">app.connect_to_room</attribute>
+        </item>
+        <item>
+          <attribute name="label" translatable="yes">_Show Current Room</attribute>
+          <attribute name="action">app.show_room</attribute>
+        </item>
+        <item>
+          <attribute name="label" translatable="yes">_Leave Room</attribute>
+          <attribute name="action">app.leave_room</attribute>
+        </item>
+      </section>
+    </submenu>
 
     <submenu>
       <attribute name="label" translatable="yes">_Help</attribute>

@@ -101,6 +101,41 @@ pub fn emit_composite_insert_f16x4(
         .unwrap()
 }
 
+// ── F64 composite operations ─────────────────────────────────────────────
+
+pub fn emit_composite_insert_f64x2(
+    ctx: &mut SpirvEmitContext,
+    composite: Word,
+    object: Word,
+    index: u32,
+) -> Word {
+    ctx.builder
+        .composite_insert(ctx.f64_vec2_type, None, object, composite, vec![index])
+        .unwrap()
+}
+
+pub fn emit_composite_insert_f64x3(
+    ctx: &mut SpirvEmitContext,
+    composite: Word,
+    object: Word,
+    index: u32,
+) -> Word {
+    ctx.builder
+        .composite_insert(ctx.f64_vec3_type, None, object, composite, vec![index])
+        .unwrap()
+}
+
+pub fn emit_composite_insert_f64x4(
+    ctx: &mut SpirvEmitContext,
+    composite: Word,
+    object: Word,
+    index: u32,
+) -> Word {
+    ctx.builder
+        .composite_insert(ctx.f64_vec4_type, None, object, composite, vec![index])
+        .unwrap()
+}
+
 // ── U32 composite operations ─────────────────────────────────────────────
 
 /// Emit `OpCompositeConstruct` for U32x2.

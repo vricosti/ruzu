@@ -112,13 +112,10 @@ impl AudioManager {
     ) {
         let callbacks = buffer_events
             .lock()
-            .expect("audio manager callbacks poisoned");
+            .expect("audio manager callbacks poisoned")
+            .clone();
         for index in 0..callbacks.len() {
-            let event_type = match index {
-                0 => Type::AudioInManager,
-                1 => Type::AudioOutManager,
-                _ => Type::FinalOutputRecorderManager,
-            };
+            let event_type = Type::ALL[index];
 
             if (events.check_audio_event_set(event_type) || timed_out) && callbacks[index].is_some()
             {
@@ -158,5 +155,25 @@ mod tests {
 
         other_owner.shutdown();
         assert!(other_owner.thread.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn callback_runs_without_holding_the_callback_registry_lock() {
+        let events = Event::new();
+        let callbacks: Arc<Mutex<[Option<BufferEventFunc>; 3]>> =
+            Arc::new(Mutex::new(array::from_fn(|_| None)));
+        let callbacks_for_handler = Arc::clone(&callbacks);
+        let registry_was_unlocked = Arc::new(AtomicBool::new(false));
+        let registry_was_unlocked_for_handler = Arc::clone(&registry_was_unlocked);
+
+        callbacks.lock().unwrap()[0] = Some(Arc::new(move || {
+            registry_was_unlocked_for_handler
+                .store(callbacks_for_handler.try_lock().is_ok(), Ordering::SeqCst);
+        }));
+        events.set_audio_event(Type::AudioInManager, true);
+
+        AudioManager::dispatch_ready_callbacks(&events, callbacks.as_ref(), false);
+
+        assert!(registry_was_unlocked.load(Ordering::SeqCst));
     }
 }

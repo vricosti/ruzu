@@ -1,6 +1,6 @@
 //! Port of upstream
 //! `dynarmic/frontend/A64/translate/impl/simd_scalar_three_same.cpp`
-//! (subset of integer/FP scalar comparisons + add/sub/shifts) and the
+//! (subset of integer/FP scalar comparisons + add/sub/shifts/reciprocal steps) and the
 //! "scalar (zero)" comparison forms which upstream lumps into the same
 //! family.
 
@@ -288,6 +288,56 @@ impl<'a> TranslatorVisitor<'a> {
         self.v_scalar_write(esize, vd, result);
         true
     }
+
+    /// FRECPS (scalar, half-precision). `01011110010mmmmm001111nnnnnddddd`.
+    pub fn frecps_1(&mut self, inst: &DecodedInst) -> bool {
+        let vm = Vec::from_u32(inst.bits(20, 16));
+        let vn = Vec::from_u32(inst.bits(9, 5));
+        let vd = Vec::from_u32(inst.rd());
+        let operand1 = self.v_scalar_read(16, vn);
+        let operand2 = self.v_scalar_read(16, vm);
+        let result = self.ir.ir().fp_recip_step_fused(16, operand1, operand2);
+        self.v_scalar_write(16, vd, result);
+        true
+    }
+
+    /// FRECPS (scalar, single/double). `010111100z1mmmmm111111nnnnnddddd`.
+    pub fn frecps_2(&mut self, inst: &DecodedInst) -> bool {
+        let esize = if inst.bit(22) { 64 } else { 32 };
+        let vm = Vec::from_u32(inst.bits(20, 16));
+        let vn = Vec::from_u32(inst.bits(9, 5));
+        let vd = Vec::from_u32(inst.rd());
+        let operand1 = self.v_scalar_read(esize, vn);
+        let operand2 = self.v_scalar_read(esize, vm);
+        let result = self.ir.ir().fp_recip_step_fused(esize, operand1, operand2);
+        self.v_scalar_write(esize, vd, result);
+        true
+    }
+
+    /// FRSQRTS (scalar, half-precision). `01011110110mmmmm001111nnnnnddddd`.
+    pub fn frsqrts_1(&mut self, inst: &DecodedInst) -> bool {
+        let vm = Vec::from_u32(inst.bits(20, 16));
+        let vn = Vec::from_u32(inst.bits(9, 5));
+        let vd = Vec::from_u32(inst.rd());
+        let operand1 = self.v_scalar_read(16, vn);
+        let operand2 = self.v_scalar_read(16, vm);
+        let result = self.ir.ir().fp_rsqrt_step_fused(16, operand1, operand2);
+        self.v_scalar_write(16, vd, result);
+        true
+    }
+
+    /// FRSQRTS (scalar, single/double). `010111101z1mmmmm111111nnnnnddddd`.
+    pub fn frsqrts_2(&mut self, inst: &DecodedInst) -> bool {
+        let esize = if inst.bit(22) { 64 } else { 32 };
+        let vm = Vec::from_u32(inst.bits(20, 16));
+        let vn = Vec::from_u32(inst.bits(9, 5));
+        let vd = Vec::from_u32(inst.rd());
+        let operand1 = self.v_scalar_read(esize, vn);
+        let operand2 = self.v_scalar_read(esize, vm);
+        let result = self.ir.ir().fp_rsqrt_step_fused(esize, operand1, operand2);
+        self.v_scalar_write(esize, vd, result);
+        true
+    }
 }
 
 #[derive(Copy, Clone)]
@@ -329,5 +379,42 @@ mod tests {
             .iter()
             .any(|inst| inst.opcode == Opcode::FPAbs32));
         assert!(!matches!(block.terminal, Terminal::Interpret { .. }));
+    }
+
+    #[test]
+    fn observed_frsqrts_scalar_encoding_translates_instead_of_interpreting() {
+        let (block, should_continue, name) = translate_one(0x5EB0_FE52);
+        assert_eq!(name, A64InstructionName::FRSQRTS_2);
+        assert!(should_continue);
+        assert!(block
+            .instructions
+            .iter()
+            .any(|inst| inst.opcode == Opcode::FPRSqrtStepFused32));
+        assert!(!matches!(block.terminal, Terminal::Interpret { .. }));
+    }
+
+    #[test]
+    fn scalar_fp_reciprocal_step_families_use_matching_ir_opcodes() {
+        let cases = [
+            (0x5E40_3C00, Opcode::FPRecipStepFused16),
+            (0x5E20_FC00, Opcode::FPRecipStepFused32),
+            (0x5E60_FC00, Opcode::FPRecipStepFused64),
+            (0x5EC0_3C00, Opcode::FPRSqrtStepFused16),
+            (0x5EA0_FC00, Opcode::FPRSqrtStepFused32),
+            (0x5EE0_FC00, Opcode::FPRSqrtStepFused64),
+        ];
+
+        for (encoding, expected_opcode) in cases {
+            let (block, should_continue, _) = translate_one(encoding);
+            assert!(should_continue, "encoding 0x{encoding:08X}");
+            assert!(
+                block
+                    .instructions
+                    .iter()
+                    .any(|inst| inst.opcode == expected_opcode),
+                "encoding 0x{encoding:08X} did not emit {expected_opcode:?}"
+            );
+            assert!(!matches!(block.terminal, Terminal::Interpret { .. }));
+        }
     }
 }

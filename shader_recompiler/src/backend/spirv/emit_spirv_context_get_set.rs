@@ -13,6 +13,80 @@ use crate::ir::{self, Opcode};
 use crate::runtime_info::AttributeType;
 use rspirv::spirv::Word;
 
+fn unreachable_instruction() -> ! {
+    std::panic::panic_any(crate::exception::LogicError::new("Unreachable instruction"));
+}
+
+fn unimplemented_flag_instruction() -> ! {
+    std::panic::panic_any(crate::exception::NotImplementedException::new(
+        "SPIR-V Instruction",
+    ));
+}
+
+pub fn emit_get_register(_ctx: &mut SpirvEmitContext) -> ! {
+    unreachable_instruction()
+}
+
+pub fn emit_set_register(_ctx: &mut SpirvEmitContext) -> ! {
+    unreachable_instruction()
+}
+
+pub fn emit_get_pred(_ctx: &mut SpirvEmitContext) -> ! {
+    unreachable_instruction()
+}
+
+pub fn emit_set_pred(_ctx: &mut SpirvEmitContext) -> ! {
+    unreachable_instruction()
+}
+
+pub fn emit_set_goto_variable(_ctx: &mut SpirvEmitContext) -> ! {
+    unreachable_instruction()
+}
+
+pub fn emit_get_goto_variable(_ctx: &mut SpirvEmitContext) -> ! {
+    unreachable_instruction()
+}
+
+pub fn emit_set_indirect_branch_variable(_ctx: &mut SpirvEmitContext) -> ! {
+    unreachable_instruction()
+}
+
+pub fn emit_get_indirect_branch_variable(_ctx: &mut SpirvEmitContext) -> ! {
+    unreachable_instruction()
+}
+
+pub fn emit_get_z_flag(_ctx: &mut SpirvEmitContext) -> ! {
+    unimplemented_flag_instruction()
+}
+
+pub fn emit_get_s_flag(_ctx: &mut SpirvEmitContext) -> ! {
+    unimplemented_flag_instruction()
+}
+
+pub fn emit_get_c_flag(_ctx: &mut SpirvEmitContext) -> ! {
+    unimplemented_flag_instruction()
+}
+
+pub fn emit_get_o_flag(_ctx: &mut SpirvEmitContext) -> ! {
+    unimplemented_flag_instruction()
+}
+
+pub fn emit_set_z_flag(_ctx: &mut SpirvEmitContext) -> ! {
+    unimplemented_flag_instruction()
+}
+
+pub fn emit_set_s_flag(_ctx: &mut SpirvEmitContext) -> ! {
+    unimplemented_flag_instruction()
+}
+
+pub fn emit_set_c_flag(_ctx: &mut SpirvEmitContext) -> ! {
+    unimplemented_flag_instruction()
+}
+
+pub fn emit_set_o_flag(_ctx: &mut SpirvEmitContext) -> ! {
+    unimplemented_flag_instruction()
+}
+
 /// Emit SetFragDepth.
 pub fn emit_set_frag_depth(ctx: &mut SpirvEmitContext, value: Word) {
     let value = if ctx.runtime_info.convert_depth_mode && !ctx.profile.support_native_ndc {
@@ -36,6 +110,18 @@ pub fn emit_set_frag_depth(ctx: &mut SpirvEmitContext, value: Word) {
     ctx.builder
         .store(ctx.frag_depth, value, None, vec![])
         .unwrap();
+}
+
+/// Port of upstream `EmitSR_WScaleFactorXY`.
+pub fn emit_sr_w_scale_factor_xy(ctx: &mut SpirvEmitContext) -> Word {
+    log::warn!("(STUBBED) SR_WScaleFactorXY called");
+    ctx.constant_u32(0x00ff_0000)
+}
+
+/// Port of upstream `EmitSR_WScaleFactorZ`.
+pub fn emit_sr_w_scale_factor_z(ctx: &mut SpirvEmitContext) -> Word {
+    log::warn!("(STUBBED) SR_WScaleFactorZ called");
+    ctx.constant_u32(0x00ff_0000)
 }
 
 // ── IR-instruction dispatching helpers (called from spirv_emit_context) ───
@@ -178,22 +264,6 @@ fn get_cbuf_u32x4(ctx: &mut SpirvEmitContext, binding: ir::Value, offset: ir::Va
     )
 }
 
-fn cbuf_bit_offset(ctx: &mut SpirvEmitContext, offset: ir::Value, mask: u32) -> Word {
-    if let ir::Value::ImmU32(offset) = offset {
-        return ctx.constant_u32((offset & mask) * 8);
-    }
-    let offset = ctx.resolve_value(&offset);
-    let mask = ctx.constant_u32(mask);
-    let byte = ctx
-        .builder
-        .bitwise_and(ctx.u32_type, None, offset, mask)
-        .unwrap();
-    let three = ctx.constant_u32(3);
-    ctx.builder
-        .shift_left_logical(ctx.u32_type, None, byte, three)
-        .unwrap()
-}
-
 /// Dispatch constant-buffer load IR instructions.
 pub fn emit_get_cbuf(ctx: &mut SpirvEmitContext, inst: &ir::Inst, block_idx: u32, inst_idx: u32) {
     let binding = *inst.arg(0);
@@ -201,7 +271,9 @@ pub fn emit_get_cbuf(ctx: &mut SpirvEmitContext, inst: &ir::Inst, block_idx: u32
 
     let id = match inst.opcode {
         Opcode::GetCbufU8
-            if ctx.profile.support_descriptor_aliasing && ctx.profile.support_int8 =>
+            if ctx.profile.support_descriptor_aliasing
+                && ctx.profile.support_int8
+                && ctx.profile.support_uniform_and_storage_buffer_8bit =>
         {
             let value = get_cbuf(
                 ctx,
@@ -215,7 +287,9 @@ pub fn emit_get_cbuf(ctx: &mut SpirvEmitContext, inst: &ir::Inst, block_idx: u32
             ctx.builder.u_convert(ctx.u32_type, None, value).unwrap()
         }
         Opcode::GetCbufS8
-            if ctx.profile.support_descriptor_aliasing && ctx.profile.support_int8 =>
+            if ctx.profile.support_descriptor_aliasing
+                && ctx.profile.support_int8
+                && ctx.profile.support_uniform_and_storage_buffer_8bit =>
         {
             let value = get_cbuf(
                 ctx,
@@ -229,7 +303,9 @@ pub fn emit_get_cbuf(ctx: &mut SpirvEmitContext, inst: &ir::Inst, block_idx: u32
             ctx.builder.s_convert(ctx.u32_type, None, value).unwrap()
         }
         Opcode::GetCbufU16
-            if ctx.profile.support_descriptor_aliasing && ctx.profile.support_int16 =>
+            if ctx.profile.support_descriptor_aliasing
+                && ctx.profile.support_int16
+                && ctx.profile.support_uniform_and_storage_buffer_16bit =>
         {
             let value = get_cbuf(
                 ctx,
@@ -243,7 +319,9 @@ pub fn emit_get_cbuf(ctx: &mut SpirvEmitContext, inst: &ir::Inst, block_idx: u32
             ctx.builder.u_convert(ctx.u32_type, None, value).unwrap()
         }
         Opcode::GetCbufS16
-            if ctx.profile.support_descriptor_aliasing && ctx.profile.support_int16 =>
+            if ctx.profile.support_descriptor_aliasing
+                && ctx.profile.support_int16
+                && ctx.profile.support_uniform_and_storage_buffer_16bit =>
         {
             let value = get_cbuf(
                 ctx,
@@ -264,14 +342,18 @@ pub fn emit_get_cbuf(ctx: &mut SpirvEmitContext, inst: &ir::Inst, block_idx: u32
                 let resolved_offset = ctx.resolve_value(&offset);
                 load_cbuf_u32x4_element(ctx, vector, offset, resolved_offset, 0)
             };
-            let (mask, width, signed) = match inst.opcode {
-                Opcode::GetCbufU8 => (3, 8, false),
-                Opcode::GetCbufS8 => (3, 8, true),
-                Opcode::GetCbufU16 => (2, 16, false),
-                Opcode::GetCbufS16 => (2, 16, true),
+            let (width, signed) = match inst.opcode {
+                Opcode::GetCbufU8 => (8, false),
+                Opcode::GetCbufS8 => (8, true),
+                Opcode::GetCbufU16 => (16, false),
+                Opcode::GetCbufS16 => (16, true),
                 _ => unreachable!(),
             };
-            let bit_offset = cbuf_bit_offset(ctx, offset, mask);
+            let bit_offset = if width == 8 {
+                ctx.bit_offset_8(offset)
+            } else {
+                ctx.bit_offset_16(offset)
+            };
             let width = ctx.constant_u32(width);
             if signed {
                 ctx.builder

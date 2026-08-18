@@ -19,8 +19,7 @@ use super::{ClassId, Engine, PendingWrite, ENGINE_REG_COUNT};
 use crate::descriptor_table::{TicTable, TscTable};
 use crate::dirty_flags;
 use crate::engines::draw_manager as dm;
-use crate::macro_engine::macro_engine::{get_macro_engine, MacroEngine};
-use crate::macro_engine::macro_interpreter::MacroInterpreterImpl;
+use crate::macro_engine::macro_engine::MacroEngine;
 use crate::memory_manager::MemoryManager;
 use crate::query_cache::query_cache::{RenderConditionState, RenderConditionStateSource};
 use crate::query_cache::types::ComparisonMode;
@@ -40,17 +39,14 @@ impl Maxwell3DPtr {
     }
 
     unsafe fn read_reg(self, method: u32) -> u32 {
-        let gpu = &*self.0;
-        let idx = method as usize;
-        if idx < ENGINE_REG_COUNT {
-            gpu.regs[idx]
-        } else {
-            0
-        }
+        (&*self.0).get_register_value(method)
     }
 }
 
 // ── Register offset constants (method addresses) ────────────────────────────
+
+/// Number of user clip distances exposed by Maxwell registers.
+pub const NUM_CLIP_DISTANCES: u32 = 8;
 
 /// Render target array base. 8 targets, 0x10 words (0x40 bytes) each.
 /// Convert upstream byte offset (from ASSERT_REG_POSITION) to word index.
@@ -156,7 +152,7 @@ const GLOBAL_BASE_INSTANCE_INDEX: u32 = reg_index!(0x1438);
 /// Base vertex value consumed by HLE indexed draw macros.
 const VERTEX_ID_BASE: u32 = reg_index!(0x1118);
 /// Conservative raster enable consumed by HLE raster bounding-box macro.
-const CONSERVATIVE_RASTER_ENABLE: u32 = reg_index!(0x1148);
+pub(crate) const CONSERVATIVE_RASTER_ENABLE: u32 = reg_index!(0x1148);
 /// Automatic draw byte count consumed by HLE byte-count draw macros.
 const DRAW_AUTO_BYTE_COUNT: u32 = reg_index!(0x123C);
 /// Automatic draw stride consumed by HLE byte-count draw macros.
@@ -233,6 +229,8 @@ pub(crate) const POINT_SPRITE_ENABLE: u32 = reg_index!(0x1520);
 pub(crate) const LINE_WIDTH_SMOOTH: u32 = reg_index!(0x13B0);
 pub(crate) const LINE_WIDTH_ALIASED: u32 = reg_index!(0x13B4);
 pub(crate) const LINE_ANTI_ALIAS_ENABLE: u32 = reg_index!(0x1570);
+pub(crate) const LINE_STIPPLE_ENABLE: u32 = reg_index!(0x166C);
+pub(crate) const LINE_STIPPLE_PARAMS: u32 = reg_index!(0x1680);
 pub(crate) const SLOPE_SCALE_DEPTH_BIAS: u32 = reg_index!(0x156C);
 pub(crate) const DEPTH_BIAS: u32 = reg_index!(0x15BC);
 pub(crate) const DEPTH_BIAS_CLAMP: u32 = reg_index!(0x187C);
@@ -375,6 +373,8 @@ const UPLOAD_REGS_BASE: usize = reg_index!(0x0180) as usize;
 const SYNC_INFO: u32 = reg_index!(0x02C8);
 /// Fragment barrier register.
 const FRAGMENT_BARRIER: u32 = reg_index!(0x0DE0);
+/// `regs.iterated_blend` (`ASSERT_REG_POSITION(iterated_blend, 0x0DD0)`).
+const ITERATED_BLEND: u32 = reg_index!(0x0DD0);
 /// Draw texture trigger (writing `regs.draw_texture.src_y0` triggers the draw).
 pub(crate) const DRAW_TEXTURE_SRC_Y0: u32 = reg_index!(0x10AC);
 /// `regs.surface_clip`.
@@ -704,28 +704,9 @@ fn stop_unimplemented_query_operation(
     gpu_va: u64,
     payload: u32,
 ) -> ! {
-    #[cfg(not(test))]
-    {
-        let path = std::path::Path::new(".agents/maxwell_3d_unimplemented_state.md");
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        let _ = std::fs::write(
-            path,
-            format!(
-                "# Maxwell3D unimplemented query operation\n\n\
-                 - operation: {operation:?}\n\
-                 - query_word: 0x{query_word:08X}\n\
-                 - gpu_va: 0x{gpu_va:X}\n\
-                 - payload: 0x{payload:08X}\n\
-                 - upstream: Maxwell3D::ProcessQueryGet reaches UNIMPLEMENTED_MSG for this query operation\n\
-                 - rust: stopped before treating the unimplemented query as a handled no-op\n"
-            ),
-        );
-    }
     panic!(
-        "Maxwell3D::ProcessQueryGet unimplemented query operation {:?}",
-        operation
+        "Maxwell3D::ProcessQueryGet unimplemented query operation {:?} query=0x{:08X} gpu_va=0x{:X} payload=0x{:08X}",
+        operation, query_word, gpu_va, payload,
     );
 }
 
@@ -1127,7 +1108,10 @@ impl VertexAttribSize {
             Self::R32G32B32 | Self::R16G16B16 | Self::R8G8B8 | Self::B10G11R11 => 3,
             Self::R32G32 | Self::R16G16 | Self::R8G8 | Self::G8R8 => 2,
             Self::R32 | Self::R16 | Self::R8 | Self::A8 => 1,
-            Self::Invalid => 0,
+            // Upstream's `ComponentCount()` asserts on an unknown size and then
+            // returns 1. Returning 0 here would hand `glVertexAttribFormat` a
+            // component count GL rejects outright.
+            Self::Invalid => 1,
         }
     }
 }
@@ -2013,6 +1997,14 @@ pub struct LineStateInfo {
     pub line_width_aliased: f32,
 }
 
+/// Upstream `Regs::LineStippleParams` plus its enable register.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct LineStippleInfo {
+    pub enabled: bool,
+    pub factor: u32,
+    pub pattern: u32,
+}
+
 /// A constant buffer binding for one slot of one shader stage.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ConstBufferBinding {
@@ -2081,6 +2073,9 @@ pub struct DrawCall {
     pub window_origin_flip_y: bool,
     pub surface_clip: SurfaceClipInfo,
     pub blend: [BlendInfo; 8],
+    pub blend_per_target_enabled: bool,
+    pub global_blend: BlendInfo,
+    pub iterated_blend_enabled: bool,
     pub blend_color: BlendColorInfo,
     pub depth_stencil: DepthStencilInfo,
     pub rasterizer: RasterizerInfo,
@@ -2092,6 +2087,7 @@ pub struct DrawCall {
     pub engine_state: EngineHint,
     pub provoking_vertex_last: bool,
     pub depth_bounds_enable: bool,
+    pub depth_bounds: [f32; 2],
     pub mandated_early_z: bool,
     pub alpha_test_enabled: bool,
     pub alpha_test_func: ComparisonOp,
@@ -2104,6 +2100,7 @@ pub struct DrawCall {
     pub anti_alias_samples_mode: u32,
     pub anti_alias_alpha_control: AntiAliasAlphaControlInfo,
     pub line_anti_alias_enable: bool,
+    pub line_stipple: LineStippleInfo,
     pub program_base_address: u64,
     pub cb_bindings: [[ConstBufferBinding; MAX_CB_SLOTS]; NUM_SHADER_STAGES],
     pub vertex_attribs: [VertexAttribInfo; NUM_VERTEX_ATTRIBS as usize],
@@ -2134,6 +2131,23 @@ pub struct DrawCall {
     /// Dirty flags captured with this draw, matching upstream state-tracker
     /// decisions for render-target refresh.
     pub dirty_flags: [bool; 256],
+}
+
+impl DrawCall {
+    /// Returns the render-target register group captured for this draw.
+    ///
+    /// Rust records Maxwell state before entering the backend. Keeping this
+    /// conversion on the snapshot owner prevents renderer backends from
+    /// independently reconstructing the upstream render-target group.
+    pub fn render_targets(&self) -> crate::engines::draw_manager::Maxwell3DRenderTargets {
+        crate::engines::draw_manager::Maxwell3DRenderTargets {
+            rt_control: self.rt_control,
+            render_targets: self.render_targets,
+            zeta: self.zeta,
+            anti_alias_samples_mode: self.anti_alias_samples_mode,
+            surface_clip: self.surface_clip,
+        }
+    }
 }
 
 /// Port of `Maxwell3D::DirtyState`.
@@ -2168,8 +2182,12 @@ pub struct Maxwell3D {
     execute_on: bool,
     /// Upstream owner `DirtyState dirty`.
     dirty: DirtyState,
-    /// Upstream owner `std::unique_ptr<DrawManager> draw_manager`.
-    draw_manager: dm::DrawManager,
+    /// Upstream owner `DrawManager draw_manager`.
+    ///
+    /// Rust keeps the object in a `Box` so `with_draw_manager` can transfer
+    /// only its pointer while splitting the mutable DrawManager/Maxwell3D
+    /// borrows. The DrawManager allocation and address remain stable.
+    draw_manager: Option<Box<dm::DrawManager>>,
     /// Draw-manager state currently borrowed out by `with_draw_manager`.
     ///
     /// Upstream keeps `draw_manager` permanently owned by `Maxwell3D`, so
@@ -2240,6 +2258,30 @@ pub enum HleReplacementAttributeType {
 }
 
 impl Maxwell3D {
+    /// Port of upstream `Maxwell3D::GetRegisterValue` used by macro engines.
+    pub(crate) fn get_register_value(&self, method: u32) -> u32 {
+        assert!(
+            (method as usize) < self.regs.len(),
+            "Invalid Maxwell3D register"
+        );
+        self.regs[method as usize]
+    }
+
+    pub(crate) fn register_array_ptr(&self) -> *const u32 {
+        self.regs.as_ptr()
+    }
+    fn draw_manager(&self) -> &dm::DrawManager {
+        self.draw_manager
+            .as_deref()
+            .expect("DrawManager is only detached inside with_draw_manager")
+    }
+
+    fn draw_manager_mut(&mut self) -> &mut dm::DrawManager {
+        self.draw_manager
+            .as_deref_mut()
+            .expect("DrawManager is only detached inside with_draw_manager")
+    }
+
     fn sync_draw_manager_from_local(&self, draw_manager: &mut dm::DrawManager) {
         let vertex_buffer = dm::VertexBuffer {
             first: self.regs[VB_FIRST as usize],
@@ -2260,11 +2302,33 @@ impl Maxwell3D {
     }
 
     fn with_draw_manager<R>(&mut self, f: impl FnOnce(&mut dm::DrawManager, &mut Self) -> R) -> R {
-        let mut draw_manager = std::mem::take(&mut self.draw_manager);
-        self.sync_draw_manager_from_local(&mut draw_manager);
-        let result = f(&mut draw_manager, self);
-        self.draw_manager = draw_manager;
-        result
+        struct RestoreDrawManager {
+            slot: *mut Option<Box<dm::DrawManager>>,
+            draw_manager: Option<Box<dm::DrawManager>>,
+        }
+
+        impl Drop for RestoreDrawManager {
+            fn drop(&mut self) {
+                // SAFETY: `slot` points to the originating Maxwell3D field.
+                // The field remains alive for this guard's scope and is empty
+                // until the retained Box is restored here.
+                unsafe {
+                    *self.slot = self.draw_manager.take();
+                }
+            }
+        }
+
+        let draw_manager = self
+            .draw_manager
+            .take()
+            .expect("nested with_draw_manager call");
+        let mut restore = RestoreDrawManager {
+            slot: std::ptr::addr_of_mut!(self.draw_manager),
+            draw_manager: Some(draw_manager),
+        };
+        let draw_manager = restore.draw_manager.as_deref_mut().unwrap();
+        self.sync_draw_manager_from_local(draw_manager);
+        f(draw_manager, self)
     }
 
     fn with_active_draw_manager_state<R>(
@@ -2311,6 +2375,11 @@ impl Maxwell3D {
         upload_state: engine_upload::State,
         memory_manager: Option<Arc<Mutex<MemoryManager>>>,
     ) -> Self {
+        #[cfg(target_arch = "x86_64")]
+        let is_macro_interpreted = *common::settings::values().disable_macro_jit.get_value();
+        #[cfg(not(target_arch = "x86_64"))]
+        let is_macro_interpreted = true;
+
         // Build execution mask: mark which methods trigger immediate execution.
         let mut execution_mask = vec![false; u16::MAX as usize];
         for i in 0..execution_mask.len() {
@@ -2328,13 +2397,13 @@ impl Maxwell3D {
             },
             execute_on: true,
             dirty: DirtyState::new(),
-            draw_manager: dm::DrawManager::new(),
+            draw_manager: Some(Box::new(dm::DrawManager::new())),
             active_draw_manager_state: None,
             cb_bindings: [[ConstBufferBinding::default(); MAX_CB_SLOTS]; NUM_SHADER_STAGES],
             pending_semaphore_writes: Vec::new(),
             rasterizer: None,
             macro_positions: [0u32; 0x80],
-            macro_engine: get_macro_engine(),
+            macro_engine: MacroEngine::new(is_macro_interpreted),
             upload_state,
             memory_manager,
             executing_macro: 0,
@@ -2500,7 +2569,7 @@ impl Maxwell3D {
     }
 
     pub fn current_topology(&self) -> PrimitiveTopology {
-        self.draw_manager.get_draw_state().topology
+        self.draw_manager_state().topology
     }
 
     /// Upstream OpenGL owners read `maxwell3d->draw_manager->GetDrawState().topology`.
@@ -2510,7 +2579,7 @@ impl Maxwell3D {
     /// `draw_manager.rs` owner logic instead of exposing another backend-local
     /// reconstruction.
     pub fn draw_manager_topology(&self) -> PrimitiveTopology {
-        self.draw_manager.get_draw_state().topology
+        self.draw_manager_state().topology
     }
 
     /// Upstream `maxwell3d->regs.zeta_enable`.
@@ -2547,7 +2616,7 @@ impl Maxwell3D {
             // immutable borrow and restores it before that borrow expires.
             return unsafe { &*(address as *const dm::DrawState) };
         }
-        self.draw_manager.get_draw_state()
+        self.draw_manager().get_draw_state()
     }
 
     /// Upstream reads `regs.mandated_early_z != 0` directly.
@@ -2718,14 +2787,9 @@ impl Maxwell3D {
     }
 
     fn refresh_parameters_impl(&mut self, parameters: &mut [u32]) {
-        if !self.current_macro_dirty {
+        if !common::settings::is_gpu_level_high(&common::settings::values()) {
             return;
         }
-        let original_first = parameters.first().copied();
-        let Some(memory_manager) = self.memory_manager.as_ref().cloned() else {
-            return;
-        };
-
         let mut current_index = 0usize;
         for &(segment_addr, word_count) in &self.macro_segments {
             let word_count = word_count as usize;
@@ -2734,25 +2798,16 @@ impl Maxwell3D {
                 continue;
             }
 
-            let byte_count = word_count * std::mem::size_of::<u32>();
-            let mut bytes = vec![0u8; byte_count];
-            let memory_manager = memory_manager.lock();
-            memory_manager.read_block(segment_addr, &mut bytes);
-            for (word_index, chunk) in bytes.chunks_exact(4).enumerate() {
-                parameters[current_index + word_index] =
-                    u32::from_le_bytes(chunk.try_into().expect("4-byte chunk"));
-            }
-            current_index += word_count;
-        }
-        if parameters.first().copied() == Some(u32::MAX) {
-            log::error!(
-                "[MACRO_REFRESH_INVALID] submit={:?} original_first={:?} params={:08X?} segments={:X?} addresses={:X?}",
-                crate::dma_pusher::current_submit_traced(),
-                original_first,
-                parameters,
-                self.macro_segments,
-                self.macro_addresses
+            let bytes = bytemuck::cast_slice_mut(
+                &mut parameters[current_index..current_index + word_count],
             );
+            let memory_manager = self
+                .memory_manager
+                .as_ref()
+                .expect("nonzero macro segment requires GPU memory");
+            let memory_manager = memory_manager.lock();
+            memory_manager.read_block(segment_addr, bytes);
+            current_index += word_count;
         }
     }
 
@@ -3037,6 +3092,11 @@ impl Maxwell3D {
         self.regs[BLEND_PER_TARGET_ENABLED as usize] != 0
     }
 
+    /// Read `regs.iterated_blend.enable`.
+    pub fn iterated_blend_enabled(&self) -> bool {
+        (self.regs[ITERATED_BLEND as usize] & 1) != 0
+    }
+
     // ── Depth/Stencil accessors ──────────────────────────────────────────
 
     /// Read combined depth and stencil state.
@@ -3151,6 +3211,15 @@ impl Maxwell3D {
         }
     }
 
+    pub fn line_stipple_info(&self) -> LineStippleInfo {
+        let raw = self.regs[LINE_STIPPLE_PARAMS as usize];
+        LineStippleInfo {
+            enabled: self.regs[LINE_STIPPLE_ENABLE as usize] != 0,
+            factor: raw & 0xff,
+            pattern: (raw >> 8) & 0xffff,
+        }
+    }
+
     /// Upstream `SyncDepthClamp` interpretation of
     /// `regs.viewport_clip_control.geometry_clip`.
     pub fn depth_clamp_enabled(&self) -> bool {
@@ -3172,6 +3241,14 @@ impl Maxwell3D {
     /// Upstream `regs.depth_bounds_enable != 0`.
     pub fn depth_bounds_enable(&self) -> bool {
         self.regs[DEPTH_BOUNDS_ENABLE as usize] != 0
+    }
+
+    /// Upstream `regs.depth_bounds`.
+    pub fn depth_bounds(&self) -> [f32; 2] {
+        [
+            f32::from_bits(self.regs[DEPTH_BOUNDS_BASE as usize]),
+            f32::from_bits(self.regs[DEPTH_BOUNDS_BASE as usize + 1]),
+        ]
     }
 
     // ── Shader program accessors ─────────────────────────────────────────
@@ -3278,9 +3355,15 @@ impl Maxwell3D {
 
     // ── Vertex attribute accessors ────────────────────────────────────────
 
+    /// Raw `regs.vertex_attrib_format[index]` word.
+    #[inline(always)]
+    pub fn vertex_attrib_raw(&self, index: u32) -> u32 {
+        self.regs[(VERTEX_ATTRIB_BASE + index) as usize]
+    }
+
     /// Read vertex attribute info for `index` (0..31).
     pub fn vertex_attrib_info(&self, index: u32) -> VertexAttribInfo {
-        let raw = self.regs[(VERTEX_ATTRIB_BASE + index) as usize];
+        let raw = self.vertex_attrib_raw(index);
         VertexAttribInfo {
             buffer_index: raw & 0x1F,
             constant: (raw & (1 << 6)) != 0,
@@ -3636,15 +3719,22 @@ impl dm::Maxwell3DAccess for Maxwell3D {
 
     fn set_dirty_flag(&mut self, index: u8) {
         self.dirty.flags[index as usize] = true;
-        self.interface_state.current_dirty = true;
     }
 
-    fn dirty_flags(&self) -> [bool; 256] {
-        self.dirty.flags
+    fn dirty_flags(&self) -> &[bool; 256] {
+        &self.dirty.flags
+    }
+
+    fn dirty_flag(&self, index: u8) -> bool {
+        self.dirty.flags[index as usize]
     }
 
     fn clear_dirty_flag(&mut self, index: u8) {
         self.dirty.flags[index as usize] = false;
+    }
+
+    fn set_logic_op_enabled(&mut self, enabled: bool) {
+        self.regs[LOGIC_OP as usize] = u32::from(enabled);
     }
 
     fn dirty_flags_ptr(&mut self) -> Option<std::ptr::NonNull<[bool; 256]>> {
@@ -3803,6 +3893,10 @@ impl dm::Maxwell3DAccess for Maxwell3D {
         ((self.regs[CLEAR_CONTROL as usize] >> 8) & 1) != 0
     }
 
+    fn clear_control_use_viewport_clip0(&self) -> bool {
+        ((self.regs[CLEAR_CONTROL as usize] >> 12) & 1) != 0
+    }
+
     fn rt_address(&self, index: usize) -> u64 {
         self.rt_address(index)
     }
@@ -3863,6 +3957,10 @@ impl dm::Maxwell3DAccess for Maxwell3D {
         self.blend_per_target_enabled()
     }
 
+    fn iterated_blend_enabled(&self) -> bool {
+        self.iterated_blend_enabled()
+    }
+
     fn global_blend_info(&self, rt: usize) -> BlendInfo {
         self.global_blend_info(rt)
     }
@@ -3907,6 +4005,10 @@ impl dm::Maxwell3DAccess for Maxwell3D {
         self.line_state_info()
     }
 
+    fn line_stipple_info(&self) -> LineStippleInfo {
+        self.line_stipple_info()
+    }
+
     fn depth_clamp_enabled(&self) -> bool {
         self.depth_clamp_enabled()
     }
@@ -3925,6 +4027,10 @@ impl dm::Maxwell3DAccess for Maxwell3D {
 
     fn depth_bounds_enable(&self) -> bool {
         self.depth_bounds_enable()
+    }
+
+    fn depth_bounds(&self) -> [f32; 2] {
+        self.depth_bounds()
     }
 
     fn mandated_early_z(&self) -> bool {
@@ -4102,11 +4208,12 @@ impl Maxwell3D {
 
     // ── Dirty register tracking (matching upstream ProcessDirtyRegisters) ─
 
-    /// Update the register value if changed. Matches upstream
-    /// `Maxwell3D::ProcessDirtyRegisters`.
+    /// Update the register value and mark every owner table dirty. Matches
+    /// upstream `Maxwell3D::ProcessDirtyRegisters`, which deliberately marks
+    /// state dirty even when the guest re-emits the same register value.
     fn process_dirty_registers(&mut self, method: u32, argument: u32) {
         let idx = method as usize;
-        if idx >= ENGINE_REG_COUNT || self.regs[idx] == argument {
+        if idx >= ENGINE_REG_COUNT {
             return;
         }
 
@@ -4215,21 +4322,11 @@ impl Maxwell3D {
         let addr_low = self.regs[cb_base + 2] as u64;
         let buffer_address = (addr_high << 32) | addr_low;
 
-        if buffer_address == 0 {
-            log::warn!("Maxwell3D: ProcessCBMultiData with null buffer address");
-            return;
-        }
+        assert_ne!(buffer_address, 0);
 
         let offset = self.regs[cb_base + 3];
         let size = self.regs[cb_base];
-        if offset > size {
-            log::warn!(
-                "Maxwell3D: ProcessCBMultiData offset 0x{:X} > size 0x{:X}",
-                offset,
-                size
-            );
-            return;
-        }
+        assert!(offset <= size);
 
         let copy_size = data.len() as u32 * 4;
         let address = buffer_address.wrapping_add(offset as u64);
@@ -4359,14 +4456,15 @@ impl Maxwell3D {
         let start_address = self.index_buffer_addr();
         let end_address = <Self as dm::Maxwell3DAccess>::index_buffer_addr_end(self);
         let byte_size = self.index_buffer_format().size_bytes() as usize;
-        let max_sizes = [u8::MAX as usize, u16::MAX as usize, u32::MAX as usize];
-        let log2_byte_size = byte_size.ilog2() as usize;
+        // Upstream: `max_size = 1ull << (byte_size * CHAR_BIT)`, i.e. the number
+        // of distinct index values, not the largest one.
+        let max_size = 1u64 << (byte_size * 8);
         let cap = self
             .max_current_vertices()
             .saturating_mul(4)
             .saturating_mul(byte_size as u32) as usize;
         let lower_cap = (end_address.saturating_sub(start_address) as usize).min(cap);
-        let max_layout_size = (byte_size as u64).saturating_mul(max_sizes[log2_byte_size] as u64);
+        let max_layout_size = (byte_size as u64).saturating_mul(max_size);
         let layout_elements = self.memory_manager.as_ref().map_or(0, |memory_manager| {
             memory_manager
                 .lock()
@@ -4416,7 +4514,12 @@ impl Maxwell3D {
         self.regs[RASTER_BOUNDING_BOX as usize] = (raster_mode & 0xFFFF_F00F) | (pad << 4);
     }
 
-    pub(crate) fn hle_clear_const_buffer(&mut self, base_size: usize, parameters: &mut [u32]) {
+    pub(crate) fn hle_clear_const_buffer(
+        &mut self,
+        base_size: usize,
+        parameters: &mut [u32],
+        zeroes: &[u32; 0x7000],
+    ) {
         self.refresh_parameters_impl(parameters);
         if parameters.len() < 3 {
             return;
@@ -4426,11 +4529,10 @@ impl Maxwell3D {
         self.regs[CB_CONFIG_BASE as usize + 2] = parameters[1];
         self.regs[CB_CONFIG_BASE as usize + 3] = 0;
         // Upstream passes `parameters[2] * 4` as the u32-count amount to
-        // ProcessCBMultiData (macro_hle.cpp:457). `parameters[2]` is a vec4
+        // HLE_ClearConstBuffer::Execute (macro.cpp). `parameters[2]` is a vec4
         // (16-byte) entry count; multiply by 4 to get u32 count.
-        let u32_count = (parameters[2] as usize).saturating_mul(4);
-        let zeroes = vec![0u32; u32_count];
-        self.process_cb_multi_data(&zeroes);
+        let u32_count = parameters[2].wrapping_mul(4) as usize;
+        self.process_cb_multi_data(&zeroes[..u32_count]);
     }
 
     pub(crate) fn hle_d7333d26e0a93ede(&mut self, parameters: &mut [u32]) {
@@ -4470,7 +4572,6 @@ impl Maxwell3D {
         let pipeline_base = (PIPELINE_BASE + ((index as u32) & 0xF) * PIPELINE_STRIDE) as usize;
         self.regs[pipeline_base + 1] = parameters[2];
         self.dirty.flags[dirty_flags::flags::SHADERS as usize] = true;
-        self.interface_state.current_dirty = true;
         self.regs[SHADOW_SCRATCH_BASE as usize + 28 + index] = parameters[1];
         self.regs[SHADOW_SCRATCH_BASE as usize + 34 + index] = parameters[2];
 
@@ -4552,7 +4653,7 @@ impl Maxwell3D {
         let topology = PrimitiveTopology::from_raw(parameters[0]);
         if self.any_parameters_dirty() && topology.is_hle_safe() {
             let indirect_start_address = self.get_macro_address(1);
-            let params = self.draw_manager.get_indirect_params_mut();
+            let params = self.draw_manager_mut().get_indirect_params_mut();
             params.is_byte_count = false;
             params.is_indexed = false;
             params.include_count = false;
@@ -4649,7 +4750,7 @@ impl Maxwell3D {
                     HleReplacementAttributeType::BaseInstance,
                 );
             }
-            let params = self.draw_manager.get_indirect_params_mut();
+            let params = self.draw_manager_mut().get_indirect_params_mut();
             params.is_byte_count = false;
             params.is_indexed = true;
             params.include_count = false;
@@ -4683,7 +4784,6 @@ impl Maxwell3D {
         self.regs[GLOBAL_BASE_VERTEX_INDEX as usize] = element_base;
         self.regs[GLOBAL_BASE_INSTANCE_INDEX as usize] = base_instance;
         self.dirty.flags[dirty_flags::flags::INDEX_BUFFER as usize] = true;
-        self.interface_state.current_dirty = true;
 
         if extended {
             self.engine_state = EngineHint::OnHleMacro;
@@ -4740,7 +4840,7 @@ impl Maxwell3D {
             let count_start_address = self.get_macro_address(4);
             let indirect_start_address = self.get_macro_address(5);
             self.dirty.flags[dirty_flags::flags::INDEX_BUFFER as usize] = true;
-            let params = self.draw_manager.get_indirect_params_mut();
+            let params = self.draw_manager_mut().get_indirect_params_mut();
             params.is_byte_count = false;
             params.is_indexed = true;
             params.include_count = true;
@@ -4801,7 +4901,6 @@ impl Maxwell3D {
 
             self.regs[VERTEX_ID_BASE as usize] = base_vertex;
             self.dirty.flags[dirty_flags::flags::INDEX_BUFFER as usize] = true;
-            self.interface_state.current_dirty = true;
             <Self as EngineInterface>::call_method(self, 0x8E3, 0x648, true);
             <Self as EngineInterface>::call_method(self, 0x8E4, index as u32, true);
 
@@ -5056,22 +5155,11 @@ impl Maxwell3D {
         let self_raw = std::ptr::from_mut(self);
         let self_ptr = Maxwell3DPtr(self_raw);
         self.macro_engine.set_maxwell_3d(self_raw);
-        let compile =
-            move |code: &[u32]| -> Box<dyn crate::macro_engine::macro_engine::CachedMacro> {
-                let mut program = MacroInterpreterImpl::new(code.to_vec());
-                let writer_ptr = self_ptr;
-                program.set_method_writer(move |address, value, _is_last_call| unsafe {
-                    writer_ptr.call_method(address, value);
-                });
-                let reader_ptr = self_ptr;
-                program.set_method_reader(move |method| unsafe { reader_ptr.read_reg(method) });
-                Box::new(program)
-            };
         self.macro_engine.execute(
+            self_raw,
             macro_method,
             &mut params,
             move |parameters| unsafe { (&mut *self_ptr.0).refresh_parameters_impl(parameters) },
-            compile,
         );
 
         // Upstream calls draw_manager->DrawDeferred() here.
@@ -5079,7 +5167,9 @@ impl Maxwell3D {
             draw_manager.draw_deferred(this);
         });
 
-        self.macro_params.clear();
+        params.clear();
+        debug_assert!(self.macro_params.is_empty());
+        self.macro_params = params;
         self.macro_addresses.clear();
         self.macro_segments.clear();
         self.current_macro_dirty = false;
@@ -5096,7 +5186,7 @@ impl Maxwell3D {
     /// Internal sink consumption matching upstream `ConsumeSinkImpl`.
     fn consume_sink_inner(&mut self) {
         let control = ShadowRamControl::from_raw(self.shadow_state[SHADOW_RAM_CONTROL as usize]);
-        let sink = std::mem::take(&mut self.interface_state.method_sink);
+        let mut sink = std::mem::take(&mut self.interface_state.method_sink);
         match control {
             ShadowRamControl::Track | ShadowRamControl::TrackWithFilter => {
                 for (method, value) in &sink {
@@ -5116,6 +5206,9 @@ impl Maxwell3D {
                 }
             }
         }
+        sink.clear();
+        debug_assert!(self.interface_state.method_sink.is_empty());
+        self.interface_state.method_sink = sink;
     }
 
     // ── Legacy process_method (used by MacroProcessor::macro_write) ─────
@@ -5193,21 +5286,15 @@ impl Maxwell3D {
         let self_ptr = Maxwell3DPtr(self_raw);
         self.macro_engine.set_maxwell_3d(self_raw);
         self.macro_engine.execute(
+            self_raw,
             macro_method,
             &mut params,
             move |parameters| unsafe { (&mut *self_ptr.0).refresh_parameters_impl(parameters) },
-            |code| {
-                let mut program = MacroInterpreterImpl::new(code.to_vec());
-                let writer_ptr = self_ptr;
-                program.set_method_writer(move |address, value, _is_last_call| unsafe {
-                    writer_ptr.call_method(address, value);
-                });
-                let reader_ptr = self_ptr;
-                program.set_method_reader(move |method| unsafe { reader_ptr.read_reg(method) });
-                Box::new(program)
-            },
         );
         self.executing_macro = 0;
+        params.clear();
+        debug_assert!(self.macro_params.is_empty());
+        self.macro_params = params;
     }
 }
 
@@ -5397,16 +5484,26 @@ mod tests {
     }
 
     struct TestRasterizer {
+        accelerate_dma: crate::rasterizer_interface::TestAccelerateDMA,
         calls: Arc<Mutex<RasterizerCalls>>,
     }
 
     impl TestRasterizer {
         fn new(calls: Arc<Mutex<RasterizerCalls>>) -> Self {
-            Self { calls }
+            Self {
+                accelerate_dma: Default::default(),
+                calls,
+            }
         }
     }
 
     impl RasterizerInterface for TestRasterizer {
+        fn access_accelerate_dma(
+            &mut self,
+        ) -> &mut dyn crate::engines::maxwell_dma::AccelerateDMAInterface {
+            &mut self.accelerate_dma
+        }
+
         fn draw(
             &mut self,
             draw_view: crate::engines::draw_manager::Maxwell3DDrawView<'_>,
@@ -5442,7 +5539,7 @@ mod tests {
         ) {
             self.calls.lock().unwrap().clear_layers.push(layer_count);
         }
-        fn dispatch_compute(&mut self) {}
+        fn dispatch_compute(&mut self, _dispatch: &crate::engines::kepler_compute::DispatchCall) {}
         fn reset_counter(&mut self, query_type: u32) {
             self.calls.lock().unwrap().reset_counter.push(query_type);
         }
@@ -5501,8 +5598,13 @@ mod tests {
         fn signal_reference(&mut self) {}
         fn release_fences(&mut self, _force: bool) {}
         fn flush_all(&mut self) {}
-        fn flush_region(&mut self, _addr: u64, _size: u64) {}
-        fn must_flush_region(&self, _addr: u64, _size: u64) -> bool {
+        fn flush_region(&mut self, _addr: u64, _size: u64, _which: crate::cache_types::CacheType) {}
+        fn must_flush_region(
+            &self,
+            _addr: u64,
+            _size: u64,
+            _which: crate::cache_types::CacheType,
+        ) -> bool {
             false
         }
         fn get_flush_area(&self, addr: u64, size: u64) -> RasterizerDownloadArea {
@@ -5512,7 +5614,13 @@ mod tests {
                 preemptive: false,
             }
         }
-        fn invalidate_region(&mut self, _addr: u64, _size: u64) {}
+        fn invalidate_region(
+            &mut self,
+            _addr: u64,
+            _size: u64,
+            _which: crate::cache_types::CacheType,
+        ) {
+        }
         fn on_cache_invalidation(&mut self, _addr: u64, _size: u64) {}
         fn on_cpu_write(&mut self, _addr: u64, _size: u64) -> bool {
             false
@@ -5520,7 +5628,13 @@ mod tests {
         fn invalidate_gpu_cache(&mut self) {}
         fn unmap_memory(&mut self, _addr: u64, _size: u64) {}
         fn modify_gpu_memory(&mut self, _as_id: usize, _addr: u64, _size: u64) {}
-        fn flush_and_invalidate_region(&mut self, _addr: u64, _size: u64) {}
+        fn flush_and_invalidate_region(
+            &mut self,
+            _addr: u64,
+            _size: u64,
+            _which: crate::cache_types::CacheType,
+        ) {
+        }
         fn wait_for_idle(&mut self) {
             self.calls.lock().unwrap().wait_for_idle += 1;
         }
@@ -5799,9 +5913,27 @@ mod tests {
         assert_eq!(d.vertex_first, 0);
         assert_eq!(d.vertex_count, 36);
         assert!(!d.indexed);
-        assert_eq!(d.vertex_streams.len(), 1);
+        assert_eq!(d.vertex_streams.len(), NUM_VERTEX_ARRAYS as usize);
         assert_eq!(d.vertex_streams[0].stride, 32);
         assert_eq!(d.viewports[0].width, 1280.0);
+    }
+
+    #[test]
+    fn draw_call_render_targets_preserve_the_complete_register_group() {
+        let mut engine = Maxwell3D::new();
+        engine.write_reg(ANTI_ALIAS_SAMPLES_MODE, 0x5a);
+        engine.write_reg(SURFACE_CLIP_BASE, 12 | (800 << 16));
+        engine.write_reg(SURFACE_CLIP_BASE + 1, 34 | (450 << 16));
+        engine.write_reg(DRAW_BEGIN, PrimitiveTopology::Triangles as u32);
+        engine.write_reg(DRAW_END, 0);
+
+        let draw = engine.take_draw_calls().remove(0);
+        let targets = draw.render_targets();
+        assert_eq!(targets.anti_alias_samples_mode, 0x5a);
+        assert_eq!(targets.surface_clip.x, 12);
+        assert_eq!(targets.surface_clip.y, 34);
+        assert_eq!(targets.surface_clip.width, 800);
+        assert_eq!(targets.surface_clip.height, 450);
     }
 
     #[test]
@@ -6032,6 +6164,18 @@ mod tests {
         assert_eq!(bi.color_dst, BlendFactor::Zero);
     }
 
+    #[test]
+    fn iterated_blend_enable_uses_upstream_register_bit() {
+        let mut engine = Maxwell3D::new();
+        assert!(!engine.iterated_blend_enabled());
+
+        engine.regs[ITERATED_BLEND as usize] = 0b10;
+        assert!(!engine.iterated_blend_enabled());
+
+        engine.regs[ITERATED_BLEND as usize] = 0b11;
+        assert!(engine.iterated_blend_enabled());
+    }
+
     // ── Depth/Stencil tests ──────────────────────────────────────────────
 
     #[test]
@@ -6172,7 +6316,11 @@ mod tests {
     fn test_cb_data_increments_offset() {
         let mut engine = Maxwell3D::new();
 
-        // Set initial offset.
+        // Upstream asserts that the configured buffer address is non-zero and
+        // that the current offset does not exceed its size.
+        engine.write_reg(CB_CONFIG_BASE, 0x200);
+        engine.write_reg(CB_CONFIG_BASE + 1, 0);
+        engine.write_reg(CB_CONFIG_BASE + 2, 0x1000);
         engine.write_reg(CB_CONFIG_BASE + 3, 0x100); // offset = 0x100
 
         // Write CB_DATA — should auto-increment offset by 4 each time.
@@ -6350,7 +6498,9 @@ mod tests {
         assert_eq!(VertexAttribSize::B10G11R11.component_count(), 3);
         assert_eq!(VertexAttribSize::G8R8.component_count(), 2);
         assert_eq!(VertexAttribSize::A8.component_count(), 1);
-        assert_eq!(VertexAttribSize::Invalid.component_count(), 0);
+        // Upstream asserts on an unknown size and returns 1; a component count
+        // of 0 is not something `glVertexAttribFormat` accepts.
+        assert_eq!(VertexAttribSize::Invalid.component_count(), 1);
     }
 
     #[test]
@@ -6389,6 +6539,7 @@ mod tests {
         let raw = 3u32 | (16 << 7) | (0x01 << 21) | (7 << 27);
         engine.regs[VERTEX_ATTRIB_BASE as usize] = raw;
 
+        assert_eq!(engine.vertex_attrib_raw(0), raw);
         let info = engine.vertex_attrib_info(0);
         assert_eq!(info.buffer_index, 3);
         assert!(!info.constant);
@@ -6411,6 +6562,7 @@ mod tests {
             | (1 << 31); // bgra
         engine.regs[(VERTEX_ATTRIB_BASE + 5) as usize] = raw;
 
+        assert_eq!(engine.vertex_attrib_raw(5), raw);
         let info = engine.vertex_attrib_info(5);
         assert_eq!(info.buffer_index, 0);
         assert!(info.constant);
@@ -6589,7 +6741,7 @@ mod tests {
         engine.write_reg(DRAW_END, 0);
 
         let draws = engine.take_draw_calls();
-        assert_eq!(draws[0].vertex_attribs.len(), 2);
+        assert_eq!(draws[0].vertex_attribs.len(), NUM_VERTEX_ATTRIBS as usize);
         assert_eq!(draws[0].vertex_attribs[0].size, VertexAttribSize::R32G32B32);
         assert_eq!(
             draws[0].vertex_attribs[0].attrib_type,
@@ -7180,6 +7332,31 @@ mod tests {
     }
 
     #[test]
+    fn test_with_draw_manager_keeps_stable_allocation_and_restores_owner() {
+        let mut engine = Maxwell3D::new();
+        let initial_address = engine.draw_manager() as *const dm::DrawManager as usize;
+
+        let active_address = engine.with_draw_manager(|draw_manager, maxwell3d| {
+            assert!(maxwell3d.draw_manager.is_none());
+            draw_manager as *mut dm::DrawManager as usize
+        });
+        assert_eq!(active_address, initial_address);
+        assert_eq!(
+            engine.draw_manager() as *const dm::DrawManager as usize,
+            initial_address
+        );
+
+        let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            engine.with_draw_manager(|_, _| panic!("test callback unwind"));
+        }));
+        assert!(unwind.is_err());
+        assert_eq!(
+            engine.draw_manager() as *const dm::DrawManager as usize,
+            initial_address
+        );
+    }
+
+    #[test]
     fn test_active_draw_manager_state_is_visible_during_rasterizer_callback() {
         let mut engine = Maxwell3D::new();
         let idle_state = engine.draw_manager_state().clone();
@@ -7666,26 +7843,8 @@ mod tests {
 
     #[test]
     fn test_refresh_parameters_updates_dirty_macro_segments() {
-        let gpu = crate::gpu::Gpu::new(false, false);
-        gpu.set_guest_memory_reader(std::sync::Arc::new(|addr, output| {
-            let backing = [0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88];
-            let start = (addr - 0x2000) as usize;
-            output.copy_from_slice(&backing[start..start + output.len()]);
-            true
-        }));
-
-        let memory_manager = std::sync::Arc::new(parking_lot::Mutex::new(
-            crate::memory_manager::MemoryManager::default(),
-        ));
-        memory_manager.lock().map(0x1000, 0x2000, 8, 0, false);
-
-        let mut engine = Maxwell3D::new();
-        engine.set_memory_manager(std::sync::Arc::clone(&memory_manager));
-        let gpu_ptr = &gpu as *const crate::gpu::Gpu as usize;
-        engine.set_guest_memory_reader(std::sync::Arc::new(move |addr, output| unsafe {
-            let gpu = &*(gpu_ptr as *const crate::gpu::Gpu);
-            let _ = gpu.read_guest_memory(addr, output);
-        }));
+        let backing = [0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88];
+        let mut engine = new_descriptor_owner_backed_engine(&backing, 0x1000);
         engine.macro_params = vec![0, 0];
         engine.macro_segments.push((0x1000, 2));
         engine.current_macro_dirty = true;
@@ -7761,12 +7920,15 @@ mod tests {
         engine.macro_engine.add_code(0x100, exit_nop);
         engine.macro_engine.add_code(0x100, nop);
         engine.macro_params = vec![0];
+        engine.macro_params.reserve(63);
+        let macro_params_capacity = engine.macro_params.capacity();
         engine.macro_segments.push((0x1000, 1));
         engine.current_macro_dirty = true;
 
         engine.call_macro_method(MACRO_REGISTERS_START);
 
         assert!(engine.macro_params.is_empty());
+        assert_eq!(engine.macro_params.capacity(), macro_params_capacity);
         assert!(engine.macro_segments.is_empty());
         assert!(!engine.any_parameters_dirty());
     }
@@ -7816,7 +7978,7 @@ mod tests {
     }
 
     #[test]
-    fn test_dirty_state_starts_dirty_and_marks_specific_flag() {
+    fn test_gpu_dirty_flags_do_not_change_dma_parameter_dirty_state() {
         let mut engine = Maxwell3D::new();
 
         assert!(engine.dirty.flags[dirty_flags::flags::INDEX_BUFFER as usize]);
@@ -7832,7 +7994,7 @@ mod tests {
 
         assert!(engine.dirty.flags[dirty_flags::flags::INDEX_BUFFER as usize]);
         assert!(!engine.dirty.flags[dirty_flags::flags::SHADERS as usize]);
-        assert!(engine.interface_state.current_dirty);
+        assert!(!engine.interface_state.current_dirty);
     }
 
     #[test]
@@ -7853,15 +8015,32 @@ mod tests {
     }
 
     #[test]
+    fn maxwell_draw_view_persists_logic_op_register_mutation() {
+        let mut engine = Maxwell3D::new();
+        engine.write_reg(LOGIC_OP, 1);
+
+        let draw_state = dm::DrawState::default();
+        let mut view = dm::Maxwell3DDrawView::live(&draw_state, false, &mut engine);
+        view.set_logic_op_enabled(false);
+        drop(view);
+
+        assert!(!engine.logic_op_info().enabled);
+        assert_eq!(engine.regs[LOGIC_OP as usize], 0);
+    }
+
+    #[test]
     fn maxwell_access_delegates_fixed_pipeline_registers_to_live_engine() {
         let mut engine = Maxwell3D::new();
         engine.write_reg(PROVOKING_VERTEX, 1);
         engine.write_reg(DEPTH_BOUNDS_ENABLE, 1);
+        engine.write_reg(DEPTH_BOUNDS_BASE, 0.25_f32.to_bits());
+        engine.write_reg(DEPTH_BOUNDS_BASE + 1, 0.75_f32.to_bits());
         engine.write_reg(MANDATED_EARLY_Z, 1);
 
         let access: &dyn dm::Maxwell3DAccess = &engine;
         assert!(access.provoking_vertex_last());
         assert!(access.depth_bounds_enable());
+        assert_eq!(access.depth_bounds(), [0.25, 0.75]);
         assert!(access.mandated_early_z());
     }
 
@@ -7874,10 +8053,13 @@ mod tests {
         engine.dirty.tables[0][method] = dirty_flags::flags::INDEX_BUFFER;
         engine.dirty.tables[1][method] = dirty_flags::flags::SHADERS;
 
+        // Upstream ProcessDirtyRegisters marks both table owners even when
+        // the value written is identical to the current register value.
         engine.write_reg(method as u32, 0);
-        assert!(!engine.dirty.flags[dirty_flags::flags::INDEX_BUFFER as usize]);
-        assert!(!engine.dirty.flags[dirty_flags::flags::SHADERS as usize]);
+        assert!(engine.dirty.flags[dirty_flags::flags::INDEX_BUFFER as usize]);
+        assert!(engine.dirty.flags[dirty_flags::flags::SHADERS as usize]);
 
+        engine.dirty.flags.fill(false);
         engine.write_reg(method as u32, 0xCAFE_BABE);
         assert!(engine.dirty.flags[dirty_flags::flags::INDEX_BUFFER as usize]);
         assert!(engine.dirty.flags[dirty_flags::flags::SHADERS as usize]);
@@ -7901,9 +8083,10 @@ mod tests {
         engine.dirty.tables[1][method] = dirty_flags::flags::SHADERS;
 
         engine.process_method(method as u32, 0);
-        assert!(!engine.dirty.flags[dirty_flags::flags::INDEX_BUFFER as usize]);
-        assert!(!engine.dirty.flags[dirty_flags::flags::SHADERS as usize]);
+        assert!(engine.dirty.flags[dirty_flags::flags::INDEX_BUFFER as usize]);
+        assert!(engine.dirty.flags[dirty_flags::flags::SHADERS as usize]);
 
+        engine.dirty.flags.fill(false);
         engine.process_method(method as u32, 0xFEED_FACE);
         assert!(engine.dirty.flags[dirty_flags::flags::INDEX_BUFFER as usize]);
         assert!(engine.dirty.flags[dirty_flags::flags::SHADERS as usize]);
@@ -7931,9 +8114,12 @@ mod tests {
 
         // Invoke macro at slot 0 (method MACRO_METHODS_START) with param 0xDEAD.
         engine.write_reg(MACRO_METHODS_START, 0xDEAD);
+        engine.macro_params.reserve(63);
+        let macro_params_capacity = engine.macro_params.capacity();
         engine.flush_macro();
 
         assert!(engine.macro_params.is_empty());
+        assert_eq!(engine.macro_params.capacity(), macro_params_capacity);
     }
 
     #[test]
@@ -8180,10 +8366,10 @@ mod tests {
     #[test]
     fn test_hle_clear_const_buffer_sets_cb_and_resets_offset() {
         let mut engine = Maxwell3D::new();
-        // parameters[2] is the vec4 count upstream (macro_hle.cpp:457 passes
+        // parameters[2] is the vec4 count upstream (macro.cpp passes
         // parameters[2] * 4 as the u32-count amount). parameters[2]=4 means
         // 4 vec4 entries = 16 u32 = 64 bytes written.
-        engine.hle_clear_const_buffer(0x5F00, &mut [0x12, 0x3456, 4]);
+        engine.hle_clear_const_buffer(0x5F00, &mut [0x12, 0x3456, 4], &[0; 0x7000]);
 
         assert_eq!(engine.regs[CB_CONFIG_BASE as usize], 0x5F00);
         assert_eq!(engine.regs[(CB_CONFIG_BASE + 1) as usize], 0x12);
@@ -8554,6 +8740,11 @@ mod tests {
     #[test]
     fn test_hle_multi_draw_indexed_indirect_count_fallback_emits_draw_sequence() {
         let mut engine = Maxwell3D::new();
+        // The upstream fallback writes DrawID through the guest's currently
+        // configured constant buffer and asserts this configuration is valid.
+        engine.regs[CB_CONFIG_BASE as usize] = 0x1000;
+        engine.regs[(CB_CONFIG_BASE + 1) as usize] = 0;
+        engine.regs[(CB_CONFIG_BASE + 2) as usize] = 0x1000;
 
         engine.hle_multi_draw_indexed_indirect_count(&mut [
             0,
@@ -8603,7 +8794,7 @@ mod tests {
             4,
         ]);
 
-        let params = engine.draw_manager.get_indirect_params();
+        let params = engine.draw_manager().get_indirect_params();
         assert!(params.is_indexed);
         assert!(params.include_count);
         assert!(!params.is_byte_count);
@@ -8658,6 +8849,22 @@ mod tests {
             .process_exec(&upload_regs, engine.launch_dma_is_linear());
 
         engine.process_inline_upload_multi(&[0x1122_3344, 0x5566_7788]);
+
+        assert_eq!(
+            calls.lock().unwrap().inline_to_memory,
+            vec![(
+                0x2000,
+                8,
+                vec![0x44, 0x33, 0x22, 0x11, 0x88, 0x77, 0x66, 0x55]
+            )]
+        );
+
+        calls.lock().unwrap().inline_to_memory.clear();
+        engine
+            .upload_state
+            .process_exec(&upload_regs, engine.launch_dma_is_linear());
+        engine.process_inline_upload_word(0x1122_3344, false);
+        engine.process_inline_upload_word(0x5566_7788, true);
 
         assert_eq!(
             calls.lock().unwrap().inline_to_memory,
@@ -8802,6 +9009,19 @@ mod tests {
         assert_eq!(engine.regs[0x200], 0x1111);
         assert_eq!(engine.regs[0x201], 0x2222);
         assert!(engine.interface_state.method_sink.is_empty());
+    }
+
+    #[test]
+    fn test_method_sink_consume_retains_capacity_like_upstream_clear() {
+        let mut engine = Maxwell3D::new();
+        engine.interface_state.method_sink.reserve(64);
+        let capacity = engine.interface_state.method_sink.capacity();
+        engine.interface_state.method_sink.push((0x200, 0x1111));
+
+        engine.consume_sink();
+
+        assert!(engine.interface_state.method_sink.is_empty());
+        assert_eq!(engine.interface_state.method_sink.capacity(), capacity);
     }
 
     #[test]
@@ -8952,7 +9172,7 @@ mod tests {
 
         engine.call_method(DRAW_TEXTURE_SRC_Y0, 1024, true);
 
-        let state = engine.draw_manager.get_draw_texture_state();
+        let state = engine.draw_manager().get_draw_texture_state();
         assert_eq!(state.dst_x0, 1.0);
         assert_eq!(state.dst_y0, 98.0);
         assert_eq!(state.dst_x1, 4.0);

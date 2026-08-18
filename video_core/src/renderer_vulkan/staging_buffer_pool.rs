@@ -12,30 +12,92 @@ use ash::vk;
 use log::trace;
 
 use super::scheduler::Scheduler;
+use crate::vulkan_common::vulkan_device::{Device, DeviceReference};
+use crate::vulkan_common::vulkan_memory_allocator::{
+    AllocatedBuffer, MemoryAllocator, MemoryUsage,
+};
+use crate::vulkan_common::vulkan_wrapper::VulkanError;
 
-/// A staging buffer allocation.
+// Port of the anonymous-namespace constants in `vk_staging_buffer_pool.cpp`.
+const MAX_ALIGNMENT: vk::DeviceSize = 256;
+#[cfg(any(target_os = "windows", target_os = "android"))]
+const MAX_STREAM_BUFFER_SIZE: vk::DeviceSize = 256 * 1024 * 1024;
+#[cfg(not(any(target_os = "windows", target_os = "android")))]
+const MAX_STREAM_BUFFER_SIZE: vk::DeviceSize = 128 * 1024 * 1024;
+
+/// Port of upstream `StagingBufferRef`.
 #[derive(Clone, Copy)]
-pub struct StagingBuffer {
+pub struct StagingBufferRef {
     pub buffer: vk::Buffer,
-    pub memory: vk::DeviceMemory,
-    pub mapped: *mut u8,
+    pub device_address: vk::DeviceAddress,
     pub offset: vk::DeviceSize,
+    pub mapped: *mut u8,
     pub size: vk::DeviceSize,
-    pub usage: StagingBufferUsage,
-    pub index: u64,
+    pub usage: MemoryUsage,
     pub log2_level: u32,
-    pub tick: u64,
-    pub deferred: bool,
+    pub index: u64,
+}
+
+impl crate::buffer_cache::buffer_cache_base::BufferCacheAsyncBuffer for StagingBufferRef {
+    fn offset(&self) -> u64 {
+        self.offset
+    }
+
+    fn mapped_span(&self) -> &[u8] {
+        if self.size == 0 {
+            return &[];
+        }
+        assert!(!self.mapped.is_null());
+        unsafe { std::slice::from_raw_parts(self.mapped, self.size as usize) }
+    }
+
+    fn mapped_span_mut(&mut self) -> &mut [u8] {
+        if self.size == 0 {
+            return &mut [];
+        }
+        assert!(!self.mapped.is_null());
+        unsafe { std::slice::from_raw_parts_mut(self.mapped, self.size as usize) }
+    }
+
+    #[cfg(test)]
+    fn empty_for_test() -> Self {
+        Self {
+            buffer: vk::Buffer::null(),
+            device_address: 0,
+            offset: 0,
+            mapped: std::ptr::null_mut(),
+            size: 0,
+            usage: MemoryUsage::Upload,
+            log2_level: 0,
+            index: 0,
+        }
+    }
 }
 
 // Raw pointer is only used for mapped memory
-unsafe impl Send for StagingBuffer {}
+unsafe impl Send for StagingBufferRef {}
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum StagingBufferUsage {
-    DeviceLocal,
-    Upload,
-    Download,
+struct OwnedStagingBuffer {
+    reference: StagingBufferRef,
+    _allocation: AllocatedBuffer,
+    tick: u64,
+    deferred: bool,
+}
+
+struct StagingBuffers {
+    entries: Vec<OwnedStagingBuffer>,
+    delete_index: usize,
+    iterate_index: usize,
+}
+
+impl StagingBuffers {
+    fn new() -> Self {
+        Self {
+            entries: Vec::new(),
+            delete_index: 0,
+            iterate_index: 0,
+        }
+    }
 }
 
 /// Pool of staging buffers for CPU↔GPU data transfer.
@@ -43,9 +105,8 @@ pub enum StagingBufferUsage {
 /// Ref: zuyu StagingBufferPool — uses a large stream buffer for small
 /// allocations and a free list for larger ones.
 pub struct StagingBufferPool {
-    device: ash::Device,
-    instance: ash::Instance,
-    physical_device: vk::PhysicalDevice,
+    device_owner: DeviceReference,
+    memory_allocator: NonNull<MemoryAllocator>,
     scheduler: NonNull<Scheduler>,
 
     /// Stream buffer for small per-draw allocations (uniforms, index data).
@@ -56,60 +117,162 @@ pub struct StagingBufferPool {
     /// reused once `Scheduler::known_gpu_tick` passes its stamp — the old
     /// per-frame `stream_offset = 0` reset recycled mappings while earlier
     /// (possibly not even submitted) work still read them.
-    stream_buffer: Option<StagingBuffer>,
+    stream_buffer: OwnedStagingBuffer,
     stream_capacity: vk::DeviceSize,
     stream_iterator: vk::DeviceSize,
     stream_used_iterator: vk::DeviceSize,
     stream_free_iterator: vk::DeviceSize,
     stream_sync_ticks: [u64; Self::NUM_SYNCS],
 
-    /// Dedicated staging buffers owned by the pool, matching upstream cached
-    /// staging entries. Returned `StagingBuffer`s are references to these
-    /// entries, not owners.
-    buffers: Vec<StagingBuffer>,
+    device_local_cache: [StagingBuffers; Self::NUM_LEVELS],
+    upload_cache: [StagingBuffers; Self::NUM_LEVELS],
+    download_cache: [StagingBuffers; Self::NUM_LEVELS],
+    current_delete_level: usize,
+    buffer_index: u64,
     unique_ids: u64,
-    current_delete_level: u32,
+}
+
+/// Port of upstream `GetStreamBufferSize`.
+fn get_stream_buffer_size(device: &Device) -> vk::DeviceSize {
+    if !device.has_debugging_tool_attached() {
+        return MAX_STREAM_BUFFER_SIZE;
+    }
+
+    let memory_properties = unsafe {
+        device
+            .get_instance()
+            .get_physical_device_memory_properties(device.get_physical())
+    };
+    let mut size = 0;
+    let mut has_device_local_host_visible_heap = false;
+    for index in 0..memory_properties.memory_type_count as usize {
+        let memory_type = memory_properties.memory_types[index];
+        if memory_type
+            .property_flags
+            .contains(vk::MemoryPropertyFlags::DEVICE_LOCAL)
+            && memory_type
+                .property_flags
+                .contains(vk::MemoryPropertyFlags::HOST_VISIBLE)
+        {
+            has_device_local_host_visible_heap = true;
+            size = size.max(memory_properties.memory_heaps[memory_type.heap_index as usize].size);
+        }
+    }
+    if has_device_local_host_visible_heap {
+        if size <= MAX_STREAM_BUFFER_SIZE {
+            size = size * 40 / 100;
+        }
+    } else {
+        size = MAX_STREAM_BUFFER_SIZE;
+    }
+    let aligned = (size + MAX_ALIGNMENT - 1) & !(MAX_ALIGNMENT - 1);
+    aligned.min(MAX_STREAM_BUFFER_SIZE)
 }
 
 impl StagingBufferPool {
-    /// Stream buffer size, port of upstream `MAX_STREAM_BUFFER_SIZE` (128MiB).
-    const STREAM_BUFFER_SIZE: vk::DeviceSize = 128 * 1024 * 1024;
     /// Port of upstream `StagingBufferPool::NUM_SYNCS`.
     const NUM_SYNCS: usize = 16;
-    /// Port of upstream `MAX_ALIGNMENT`.
-    const MAX_ALIGNMENT: vk::DeviceSize = 256;
+    const NUM_LEVELS: usize = usize::BITS as usize;
+
+    /// Port of upstream `StagingBufferPool::StreamBuf`.
+    pub fn stream_buffer_handle(&self) -> vk::Buffer {
+        self.stream_buffer.reference.buffer
+    }
 
     pub fn new(
-        device: ash::Device,
-        instance: ash::Instance,
-        physical_device: vk::PhysicalDevice,
+        vulkan_device: &Device,
+        memory_allocator: &mut MemoryAllocator,
         scheduler: &mut Scheduler,
-    ) -> Self {
-        Self {
-            device,
-            instance,
-            physical_device,
+    ) -> Result<Self, VulkanError> {
+        let stream_capacity = get_stream_buffer_size(vulkan_device);
+        let mut usage = vk::BufferUsageFlags::TRANSFER_SRC
+            | vk::BufferUsageFlags::UNIFORM_BUFFER
+            | vk::BufferUsageFlags::INDEX_BUFFER
+            | vk::BufferUsageFlags::STORAGE_BUFFER;
+        if vulkan_device.is_ext_transform_feedback_supported() {
+            usage |= vk::BufferUsageFlags::TRANSFORM_FEEDBACK_BUFFER_EXT;
+        }
+        if vulkan_device.is_buffer_device_address_supported() {
+            usage |= vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS;
+        }
+        let stream_ci = vk::BufferCreateInfo::builder()
+            .size(stream_capacity)
+            .usage(usage)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE)
+            .build();
+        let allocation = memory_allocator.create_owned_buffer(&stream_ci, MemoryUsage::Stream)?;
+        assert!(
+            !allocation.mapped_ptr().is_null(),
+            "Stream buffer must be host visible"
+        );
+        let stream_buffer_address = if vulkan_device.is_buffer_device_address_supported() {
+            unsafe {
+                vulkan_device.get_logical().get_buffer_device_address(
+                    &vk::BufferDeviceAddressInfo::builder()
+                        .buffer(allocation.handle())
+                        .build(),
+                )
+            }
+        } else {
+            0
+        };
+        if vulkan_device.has_debugging_tool_attached() {
+            vulkan_device.set_buffer_name(allocation.handle(), "Stream Buffer");
+        }
+        let stream_buffer = StagingBufferRef {
+            buffer: allocation.handle(),
+            device_address: stream_buffer_address,
+            mapped: allocation.mapped_ptr(),
+            offset: 0,
+            size: stream_capacity,
+            usage: MemoryUsage::DeviceLocal,
+            index: 0,
+            log2_level: 0,
+        };
+        Ok(Self {
+            device_owner: DeviceReference::new(vulkan_device),
+            memory_allocator: NonNull::from(memory_allocator),
             scheduler: NonNull::from(scheduler),
-            stream_buffer: None,
-            stream_capacity: Self::STREAM_BUFFER_SIZE,
+            stream_buffer: OwnedStagingBuffer {
+                reference: stream_buffer,
+                _allocation: allocation,
+                tick: 0,
+                deferred: false,
+            },
+            stream_capacity,
             stream_iterator: 0,
             stream_used_iterator: 0,
             stream_free_iterator: 0,
             stream_sync_ticks: [0; Self::NUM_SYNCS],
-            buffers: Vec::new(),
-            unique_ids: 1,
+            device_local_cache: std::array::from_fn(|_| StagingBuffers::new()),
+            upload_cache: std::array::from_fn(|_| StagingBuffers::new()),
+            download_cache: std::array::from_fn(|_| StagingBuffers::new()),
             current_delete_level: 0,
-        }
+            buffer_index: 0,
+            unique_ids: 0,
+        })
     }
 
     /// Request a staging buffer for CPU→GPU upload.
-    pub fn request_upload_buffer(&mut self, size: vk::DeviceSize) -> Option<StagingBuffer> {
-        self.request_buffer(size, StagingBufferUsage::Upload, false)
+    pub fn request_upload_buffer(&mut self, size: vk::DeviceSize) -> Option<StagingBufferRef> {
+        self.request_buffer(size, MemoryUsage::Upload, false)
+    }
+
+    /// Persistent upload allocation released explicitly by the async texture
+    /// unswizzle lifecycle.
+    pub fn request_deferred_upload_buffer(
+        &mut self,
+        size: vk::DeviceSize,
+    ) -> Option<StagingBufferRef> {
+        self.request_buffer(size, MemoryUsage::Upload, true)
     }
 
     /// Request device-local scratch storage for GPU-side conversion passes.
-    pub fn request_device_local_buffer(&mut self, size: vk::DeviceSize) -> Option<StagingBuffer> {
-        self.request_buffer(size, StagingBufferUsage::DeviceLocal, false)
+    pub fn request_device_local_buffer(
+        &mut self,
+        size: vk::DeviceSize,
+    ) -> Option<StagingBufferRef> {
+        self.request_buffer(size, MemoryUsage::DeviceLocal, false)
     }
 
     /// Request a staging buffer for GPU→CPU readback.
@@ -117,38 +280,33 @@ impl StagingBufferPool {
         &mut self,
         size: vk::DeviceSize,
         deferred: bool,
-    ) -> Option<StagingBuffer> {
-        self.request_buffer(size, StagingBufferUsage::Download, deferred)
+    ) -> Option<StagingBufferRef> {
+        self.request_buffer(size, MemoryUsage::Download, deferred)
     }
 
     /// Port of upstream `StagingBufferPool::FreeDeferred`.
-    pub fn free_deferred(&mut self, buffer: &mut StagingBuffer) {
-        let current_tick = self.scheduler().pending_tick();
-        let Some(entry) = self.buffers.iter_mut().find(|entry| {
-            entry.index == buffer.index
-                && entry.usage == buffer.usage
-                && entry.log2_level == buffer.log2_level
-        }) else {
-            debug_assert!(
-                buffer.index == 0,
-                "deferred staging buffer missing from Vulkan staging pool"
-            );
-            return;
-        };
-        debug_assert!(entry.deferred);
-        entry.tick = current_tick;
+    pub fn free_deferred(&mut self, buffer: &mut StagingBufferRef) {
+        let scheduler = self.scheduler;
+        let entry = self.get_cache_mut(buffer.usage)[buffer.log2_level as usize]
+            .entries
+            .iter_mut()
+            .find(|entry| entry.reference.index == buffer.index)
+            .expect("deferred staging buffer missing from Vulkan staging pool");
+        assert!(entry.deferred);
+        // SAFETY: the scheduler is boxed by the rasterizer and outlives the
+        // staging pool, matching upstream's `Scheduler&` member.
+        entry.tick = unsafe { scheduler.as_ref() }.current_tick();
         entry.deferred = false;
-        entry.offset = 0;
-        buffer.tick = entry.tick;
-        buffer.deferred = false;
     }
 
     /// Per-frame housekeeping (upstream `TickFrame`): rotate the deletion
     /// level. The stream buffer is NOT reset here — its regions retire
     /// individually against the GPU timeline (see `try_stream_allocate`).
     pub fn new_frame(&mut self) {
-        self.current_delete_level = (self.current_delete_level + 1) % vk::DeviceSize::BITS;
-        self.release_level(self.current_delete_level);
+        self.current_delete_level = (self.current_delete_level + 1) % Self::NUM_LEVELS;
+        self.release_cache(MemoryUsage::DeviceLocal);
+        self.release_cache(MemoryUsage::Upload);
+        self.release_cache(MemoryUsage::Download);
     }
 
     fn scheduler(&self) -> &Scheduler {
@@ -161,13 +319,13 @@ impl StagingBufferPool {
     fn request_buffer(
         &mut self,
         size: vk::DeviceSize,
-        usage: StagingBufferUsage,
+        usage: MemoryUsage,
         deferred: bool,
-    ) -> Option<StagingBuffer> {
+    ) -> Option<StagingBufferRef> {
         // Upstream only uses the stream buffer for non-deferred uploads that
         // fit in one region (Request: `size <= region_size`).
         if !deferred
-            && usage == StagingBufferUsage::Upload
+            && usage == MemoryUsage::Upload
             && size <= self.stream_capacity / Self::NUM_SYNCS as vk::DeviceSize
         {
             if let Some(buf) = self.try_stream_allocate(size) {
@@ -185,17 +343,7 @@ impl StagingBufferPool {
     /// (vk_staging_buffer_pool.cpp:105-139). Returns `None` (upstream falls
     /// back to `GetStagingBuffer`) instead of waiting when the required
     /// regions are still referenced by in-flight GPU work.
-    fn try_stream_allocate(&mut self, size: vk::DeviceSize) -> Option<StagingBuffer> {
-        // Initialize stream buffer if needed
-        if self.stream_buffer.is_none() {
-            let buf = self.allocate_buffer(self.stream_capacity, StagingBufferUsage::Upload)?;
-            self.stream_buffer = Some(buf);
-            self.stream_iterator = 0;
-            self.stream_used_iterator = 0;
-            self.stream_free_iterator = 0;
-            self.stream_sync_ticks = [0; Self::NUM_SYNCS];
-        }
-
+    fn try_stream_allocate(&mut self, size: vk::DeviceSize) -> Option<StagingBufferRef> {
         let region_size = self.stream_capacity / Self::NUM_SYNCS as vk::DeviceSize;
         let region = |offset: vk::DeviceSize| (offset / region_size) as usize;
 
@@ -207,7 +355,7 @@ impl StagingBufferPool {
             return None;
         }
 
-        let current_tick = self.scheduler().pending_tick();
+        let current_tick = self.scheduler().current_tick();
         for tick in &mut self.stream_sync_ticks
             [region(self.stream_used_iterator)..region(self.stream_iterator)]
         {
@@ -234,20 +382,18 @@ impl StagingBufferPool {
 
         let offset = self.stream_iterator;
         self.stream_iterator =
-            (self.stream_iterator + size + Self::MAX_ALIGNMENT - 1) & !(Self::MAX_ALIGNMENT - 1);
+            (self.stream_iterator + size + MAX_ALIGNMENT - 1) & !(MAX_ALIGNMENT - 1);
 
-        let stream = self.stream_buffer.as_ref()?;
-        Some(StagingBuffer {
+        let stream = &self.stream_buffer.reference;
+        Some(StagingBufferRef {
             buffer: stream.buffer,
-            memory: stream.memory,
+            device_address: stream.device_address,
             mapped: unsafe { stream.mapped.add(offset as usize) },
             offset,
             size,
-            usage: StagingBufferUsage::Upload,
+            usage: MemoryUsage::DeviceLocal,
             index: 0,
             log2_level: 0,
-            tick: current_tick,
-            deferred: false,
         })
     }
 
@@ -262,159 +408,195 @@ impl StagingBufferPool {
     fn try_get_reserved_buffer(
         &mut self,
         size: vk::DeviceSize,
-        usage: StagingBufferUsage,
+        usage: MemoryUsage,
         deferred: bool,
-    ) -> Option<StagingBuffer> {
-        let log2_level = log2_ceil(size.max(1));
-        let current_tick = self.scheduler().pending_tick();
-        let free_index = self.buffers.iter().position(|entry| {
-            entry.usage == usage
-                && entry.log2_level == log2_level
-                && !entry.deferred
-                && entry.size >= size
-                && self.scheduler().is_free(entry.tick)
-        })?;
-        let entry = &mut self.buffers[free_index];
-        entry.tick = if deferred { u64::MAX } else { current_tick };
+    ) -> Option<StagingBufferRef> {
+        let log2_level = log2_ceil(size) as usize;
+        let cache_level = &self.get_cache(usage)[log2_level];
+        let hint = cache_level.iterate_index;
+        let is_free =
+            |entry: &OwnedStagingBuffer| !entry.deferred && self.scheduler().is_free(entry.tick);
+        let free_index = cache_level.entries[hint..]
+            .iter()
+            .position(|entry| is_free(entry))
+            .map(|index| hint + index)
+            .or_else(|| {
+                cache_level.entries[..hint]
+                    .iter()
+                    .position(|entry| is_free(entry))
+            })?;
+        self.get_cache_mut(usage)[log2_level].iterate_index = free_index + 1;
+        let tick = if deferred {
+            u64::MAX
+        } else {
+            self.scheduler().current_tick()
+        };
+        let cache_level = &mut self.get_cache_mut(usage)[log2_level];
+        let entry = &mut cache_level.entries[free_index];
+        entry.tick = tick;
+        assert!(!entry.deferred);
         entry.deferred = deferred;
-        let mut handle = *entry;
-        handle.deferred = deferred;
-        Some(handle)
+        Some(entry.reference)
     }
 
     fn create_staging_buffer(
         &mut self,
         size: vk::DeviceSize,
-        usage: StagingBufferUsage,
+        usage: MemoryUsage,
         deferred: bool,
-    ) -> Option<StagingBuffer> {
-        let log2_level = log2_ceil(size.max(1));
-        let allocation_size = 1u64.checked_shl(log2_level).unwrap_or(size.max(1));
+    ) -> Option<StagingBufferRef> {
+        let log2_level = log2_ceil((size as u32) as vk::DeviceSize);
+        let allocation_size = 1u64 << log2_level;
         let mut buffer = self.allocate_buffer(allocation_size, usage)?;
-        buffer.index = self.unique_ids;
-        buffer.log2_level = log2_level;
+        buffer.reference.index = self.unique_ids;
+        buffer.reference.log2_level = log2_level;
         buffer.tick = if deferred {
             u64::MAX
         } else {
-            self.scheduler().pending_tick()
+            self.scheduler().current_tick()
         };
         buffer.deferred = deferred;
         self.unique_ids = self.unique_ids.wrapping_add(1);
-        self.buffers.push(buffer);
-        Some(buffer)
+        let reference = buffer.reference;
+        self.get_cache_mut(usage)[log2_level as usize]
+            .entries
+            .push(buffer);
+        Some(reference)
     }
 
-    fn release_level(&mut self, log2_level: u32) {
-        const DELETIONS_PER_TICK: usize = 16;
+    fn get_cache(&self, usage: MemoryUsage) -> &[StagingBuffers; Self::NUM_LEVELS] {
+        match usage {
+            MemoryUsage::DeviceLocal => &self.device_local_cache,
+            MemoryUsage::Upload => &self.upload_cache,
+            MemoryUsage::Download => &self.download_cache,
+            MemoryUsage::Stream => panic!("invalid staging-cache memory usage: Stream"),
+        }
+    }
 
-        let mut deleted = 0usize;
-        let mut index = 0usize;
-        while index < self.buffers.len() && deleted < DELETIONS_PER_TICK {
-            let entry = self.buffers[index];
-            if entry.log2_level == log2_level
-                && !entry.deferred
-                && entry.index != 0
-                && self.scheduler().is_free(entry.tick)
-            {
-                let entry = self.buffers.swap_remove(index);
-                unsafe {
-                    if !entry.mapped.is_null() {
-                        self.device.unmap_memory(entry.memory);
-                    }
-                    self.device.destroy_buffer(entry.buffer, None);
-                    self.device.free_memory(entry.memory, None);
-                }
-                deleted += 1;
-                continue;
-            }
-            index += 1;
+    fn get_cache_mut(&mut self, usage: MemoryUsage) -> &mut [StagingBuffers; Self::NUM_LEVELS] {
+        match usage {
+            MemoryUsage::DeviceLocal => &mut self.device_local_cache,
+            MemoryUsage::Upload => &mut self.upload_cache,
+            MemoryUsage::Download => &mut self.download_cache,
+            MemoryUsage::Stream => panic!("invalid staging-cache memory usage: Stream"),
+        }
+    }
+
+    fn release_cache(&mut self, usage: MemoryUsage) {
+        self.release_level(usage, self.current_delete_level);
+    }
+
+    fn release_level(&mut self, usage: MemoryUsage, log2_level: usize) {
+        const DELETIONS_PER_TICK: usize = 16;
+        let (begin, end) = {
+            let level = &self.get_cache(usage)[log2_level];
+            let begin = level.delete_index;
+            (begin, (begin + DELETIONS_PER_TICK).min(level.entries.len()))
+        };
+        let scheduler = self.scheduler;
+        let level = &mut self.get_cache_mut(usage)[log2_level];
+        erase_if_in_range(&mut level.entries, begin..end, |entry| {
+            // SAFETY: the scheduler is boxed by the rasterizer and outlives
+            // the staging pool, matching upstream's `Scheduler&` member.
+            unsafe { scheduler.as_ref() }.is_free(entry.tick)
+        });
+        level.delete_index += DELETIONS_PER_TICK;
+        if level.delete_index >= level.entries.len() {
+            level.delete_index = 0;
+        }
+        if level.iterate_index > level.entries.len() {
+            level.iterate_index = 0;
         }
     }
 
     fn allocate_buffer(
-        &self,
+        &mut self,
         size: vk::DeviceSize,
-        usage: StagingBufferUsage,
-    ) -> Option<StagingBuffer> {
+        usage: MemoryUsage,
+    ) -> Option<OwnedStagingBuffer> {
+        let supports_device_address = self.device_owner.get().is_buffer_device_address_supported();
         let buf_info = vk::BufferCreateInfo::builder()
             .size(size)
-            .usage(
-                vk::BufferUsageFlags::TRANSFER_SRC
+            .usage({
+                let mut flags = vk::BufferUsageFlags::TRANSFER_SRC
                     | vk::BufferUsageFlags::TRANSFER_DST
                     | vk::BufferUsageFlags::UNIFORM_BUFFER
                     | vk::BufferUsageFlags::STORAGE_BUFFER
                     | vk::BufferUsageFlags::INDEX_BUFFER
-                    | vk::BufferUsageFlags::VERTEX_BUFFER,
-            )
+                    | vk::BufferUsageFlags::VERTEX_BUFFER;
+                if self
+                    .device_owner
+                    .get()
+                    .is_ext_transform_feedback_supported()
+                {
+                    flags |= vk::BufferUsageFlags::TRANSFORM_FEEDBACK_BUFFER_EXT;
+                }
+                if supports_device_address {
+                    flags |= vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS;
+                }
+                flags
+            })
             .sharing_mode(vk::SharingMode::EXCLUSIVE)
             .build();
 
-        let buffer = unsafe { self.device.create_buffer(&buf_info, None).ok()? };
+        // SAFETY: the allocator is boxed by RendererVulkan and outlives the
+        // rasterizer and its staging pool, matching upstream's reference member.
+        let memory_allocator = unsafe { self.memory_allocator.as_ref() };
+        let allocation = memory_allocator
+            .create_owned_buffer(&buf_info, usage)
+            .ok()?;
+        let buffer = allocation.handle();
+        let mapped = allocation.mapped_ptr();
+        assert!(usage == MemoryUsage::DeviceLocal || !mapped.is_null());
 
-        let mem_reqs = unsafe { self.device.get_buffer_memory_requirements(buffer) };
-        let mem_type = find_memory(
-            &self.instance,
-            self.physical_device,
-            mem_reqs.memory_type_bits,
-            memory_properties_for_usage(usage),
-        )?;
-
-        let alloc_info = vk::MemoryAllocateInfo::builder()
-            .allocation_size(mem_reqs.size)
-            .memory_type_index(mem_type)
-            .build();
-        let memory = unsafe { self.device.allocate_memory(&alloc_info, None).ok()? };
-        unsafe {
-            self.device.bind_buffer_memory(buffer, memory, 0).ok()?;
+        if self.device_owner.get().has_debugging_tool_attached() {
+            self.buffer_index = self.buffer_index.wrapping_add(1);
+            self.device_owner
+                .get()
+                .set_buffer_name(buffer, &format!("Staging Buffer {}", self.buffer_index));
         }
-
-        let mapped = if usage == StagingBufferUsage::DeviceLocal {
-            std::ptr::null_mut()
-        } else {
-            unsafe {
-                self.device
-                    .map_memory(memory, 0, size, vk::MemoryMapFlags::empty())
-                    .ok()? as *mut u8
-            }
-        };
 
         trace!("StagingBufferPool: allocated {} bytes", size);
 
-        Some(StagingBuffer {
-            buffer,
-            memory,
-            mapped,
-            offset: 0,
-            size,
-            usage,
-            index: 0,
-            log2_level: log2_ceil(size.max(1)),
-            tick: self.scheduler().pending_tick(),
+        let device_address = if supports_device_address {
+            unsafe {
+                self.device_owner
+                    .get()
+                    .get_logical()
+                    .get_buffer_device_address(
+                        &vk::BufferDeviceAddressInfo::builder()
+                            .buffer(buffer)
+                            .build(),
+                    )
+            }
+        } else {
+            0
+        };
+        Some(OwnedStagingBuffer {
+            reference: StagingBufferRef {
+                buffer,
+                device_address,
+                mapped,
+                offset: 0,
+                size,
+                usage,
+                index: 0,
+                log2_level: log2_ceil(size),
+            },
+            _allocation: allocation,
+            tick: 0,
             deferred: false,
         })
     }
 }
 
-impl Drop for StagingBufferPool {
-    fn drop(&mut self) {
-        unsafe {
-            // Free stream buffer
-            if let Some(buf) = self.stream_buffer.take() {
-                if !buf.mapped.is_null() {
-                    self.device.unmap_memory(buf.memory);
-                }
-                self.device.destroy_buffer(buf.buffer, None);
-                self.device.free_memory(buf.memory, None);
-            }
-            for buf in self.buffers.drain(..) {
-                if !buf.mapped.is_null() {
-                    self.device.unmap_memory(buf.memory);
-                }
-                self.device.destroy_buffer(buf.buffer, None);
-                self.device.free_memory(buf.memory, None);
-            }
-        }
-    }
+/// Mechanical Rust equivalent of upstream's `erase(remove_if(begin, end))`.
+fn erase_if_in_range<T>(
+    entries: &mut Vec<T>,
+    range: std::ops::Range<usize>,
+    predicate: impl FnMut(&mut T) -> bool,
+) {
+    entries.extract_if(range, predicate).for_each(drop);
 }
 
 fn log2_ceil(value: vk::DeviceSize) -> u32 {
@@ -425,48 +607,15 @@ fn log2_ceil(value: vk::DeviceSize) -> u32 {
     }
 }
 
-fn memory_properties_for_usage(usage: StagingBufferUsage) -> vk::MemoryPropertyFlags {
-    match usage {
-        StagingBufferUsage::DeviceLocal => vk::MemoryPropertyFlags::DEVICE_LOCAL,
-        StagingBufferUsage::Upload => {
-            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT
-        }
-        StagingBufferUsage::Download => {
-            vk::MemoryPropertyFlags::HOST_VISIBLE
-                | vk::MemoryPropertyFlags::HOST_COHERENT
-                | vk::MemoryPropertyFlags::HOST_CACHED
-        }
-    }
-}
-
-fn find_memory(
-    instance: &ash::Instance,
-    physical_device: vk::PhysicalDevice,
-    type_filter: u32,
-    required: vk::MemoryPropertyFlags,
-) -> Option<u32> {
-    let mem_props = unsafe { instance.get_physical_device_memory_properties(physical_device) };
-    for i in 0..mem_props.memory_type_count {
-        if (type_filter & (1 << i)) != 0
-            && mem_props.memory_types[i as usize]
-                .property_flags
-                .contains(required)
-        {
-            return Some(i);
-        }
-    }
-    None
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn test_staging_buffer_send() {
-        // Verify StagingBuffer is Send
+        // Verify StagingBufferRef is Send
         fn assert_send<T: Send>() {}
-        assert_send::<StagingBuffer>();
+        assert_send::<StagingBufferRef>();
     }
 
     #[test]
@@ -481,17 +630,9 @@ mod tests {
     }
 
     #[test]
-    fn memory_usage_properties_match_upstream_allocator_contract() {
-        assert_eq!(
-            memory_properties_for_usage(StagingBufferUsage::DeviceLocal),
-            vk::MemoryPropertyFlags::DEVICE_LOCAL
-        );
-        let upload = memory_properties_for_usage(StagingBufferUsage::Upload);
-        assert!(upload.contains(vk::MemoryPropertyFlags::HOST_VISIBLE));
-        assert!(upload.contains(vk::MemoryPropertyFlags::HOST_COHERENT));
-        let download = memory_properties_for_usage(StagingBufferUsage::Download);
-        assert!(download.contains(vk::MemoryPropertyFlags::HOST_VISIBLE));
-        assert!(download.contains(vk::MemoryPropertyFlags::HOST_COHERENT));
-        assert!(download.contains(vk::MemoryPropertyFlags::HOST_CACHED));
+    fn release_level_compacts_only_the_upstream_deletion_window() {
+        let mut entries = vec![0, 1, 2, 3, 4, 5, 6];
+        erase_if_in_range(&mut entries, 1..5, |entry| *entry % 2 == 0);
+        assert_eq!(entries, [0, 1, 3, 5, 6]);
     }
 }

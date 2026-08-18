@@ -9,6 +9,7 @@ pub enum AppletType {
     #[default]
     Application,
     LibraryApplet,
+    OverlayApplet,
     SystemApplet,
 }
 

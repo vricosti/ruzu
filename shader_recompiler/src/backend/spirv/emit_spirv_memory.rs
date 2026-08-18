@@ -150,22 +150,6 @@ fn write_storage_32(
     );
 }
 
-fn bit_offset(ctx: &mut SpirvEmitContext, offset: Value, mask: u32) -> Word {
-    if offset.is_immediate() {
-        return ctx.constant_u32((offset.imm_u32() & mask) * 8);
-    }
-    let offset = ctx.resolve_value(&offset);
-    let mask = ctx.constant_u32(mask);
-    let byte = ctx
-        .builder
-        .bitwise_and(ctx.u32_type, None, offset, mask)
-        .unwrap();
-    let three = ctx.constant_u32(3);
-    ctx.builder
-        .shift_left_logical(ctx.u32_type, None, byte, three)
-        .unwrap()
-}
-
 fn write_storage_by_cas_loop(
     ctx: &mut SpirvEmitContext,
     binding: Value,
@@ -207,7 +191,9 @@ fn emit_load_storage(
 ) -> Word {
     match opcode {
         Opcode::LoadStorageU8
-            if ctx.profile.support_int8 && ctx.profile.support_descriptor_aliasing =>
+            if ctx.profile.support_int8
+                && ctx.profile.support_storage_buffer_8bit
+                && ctx.profile.support_descriptor_aliasing =>
         {
             let value = load_storage(
                 ctx,
@@ -221,7 +207,9 @@ fn emit_load_storage(
             ctx.builder.u_convert(ctx.u32_type, None, value).unwrap()
         }
         Opcode::LoadStorageS8
-            if ctx.profile.support_int8 && ctx.profile.support_descriptor_aliasing =>
+            if ctx.profile.support_int8
+                && ctx.profile.support_storage_buffer_8bit
+                && ctx.profile.support_descriptor_aliasing =>
         {
             let value = load_storage(
                 ctx,
@@ -235,7 +223,9 @@ fn emit_load_storage(
             ctx.builder.s_convert(ctx.u32_type, None, value).unwrap()
         }
         Opcode::LoadStorageU16
-            if ctx.profile.support_int16 && ctx.profile.support_descriptor_aliasing =>
+            if ctx.profile.support_int16
+                && ctx.profile.support_storage_buffer_16bit
+                && ctx.profile.support_descriptor_aliasing =>
         {
             let value = load_storage(
                 ctx,
@@ -249,7 +239,9 @@ fn emit_load_storage(
             ctx.builder.u_convert(ctx.u32_type, None, value).unwrap()
         }
         Opcode::LoadStorageS16
-            if ctx.profile.support_int16 && ctx.profile.support_descriptor_aliasing =>
+            if ctx.profile.support_int16
+                && ctx.profile.support_storage_buffer_16bit
+                && ctx.profile.support_descriptor_aliasing =>
         {
             let value = load_storage(
                 ctx,
@@ -267,14 +259,18 @@ fn emit_load_storage(
         | Opcode::LoadStorageU16
         | Opcode::LoadStorageS16 => {
             let word = load_storage_32(ctx, binding, offset, 0);
-            let (mask, width, signed) = match opcode {
-                Opcode::LoadStorageU8 => (3, 8, false),
-                Opcode::LoadStorageS8 => (3, 8, true),
-                Opcode::LoadStorageU16 => (2, 16, false),
-                Opcode::LoadStorageS16 => (2, 16, true),
+            let (width, signed) = match opcode {
+                Opcode::LoadStorageU8 => (8, false),
+                Opcode::LoadStorageS8 => (8, true),
+                Opcode::LoadStorageU16 => (16, false),
+                Opcode::LoadStorageS16 => (16, true),
                 _ => unreachable!(),
             };
-            let bit_offset = bit_offset(ctx, offset, mask);
+            let bit_offset = if width == 8 {
+                ctx.bit_offset_8(offset)
+            } else {
+                ctx.bit_offset_16(offset)
+            };
             let width = ctx.constant_u32(width);
             if signed {
                 ctx.builder
@@ -332,15 +328,27 @@ fn emit_write_storage(
     value: Word,
 ) {
     match opcode {
-        Opcode::WriteStorageU8 if ctx.profile.support_int8 => {
+        Opcode::WriteStorageU8
+            if ctx.profile.support_int8
+                && ctx.profile.support_storage_buffer_8bit
+                && ctx.profile.support_descriptor_aliasing =>
+        {
             let value = ctx.builder.s_convert(ctx.u8_type, None, value).unwrap();
             write_storage(ctx, binding, offset, value, StorageDefinitionKind::U8, 1, 0);
         }
-        Opcode::WriteStorageS8 if ctx.profile.support_int8 => {
+        Opcode::WriteStorageS8
+            if ctx.profile.support_int8
+                && ctx.profile.support_storage_buffer_8bit
+                && ctx.profile.support_descriptor_aliasing =>
+        {
             let value = ctx.builder.s_convert(ctx.i8_type, None, value).unwrap();
             write_storage(ctx, binding, offset, value, StorageDefinitionKind::I8, 1, 0);
         }
-        Opcode::WriteStorageU16 if ctx.profile.support_int16 => {
+        Opcode::WriteStorageU16
+            if ctx.profile.support_int16
+                && ctx.profile.support_storage_buffer_16bit
+                && ctx.profile.support_descriptor_aliasing =>
+        {
             let value = ctx.builder.s_convert(ctx.u16_type, None, value).unwrap();
             write_storage(
                 ctx,
@@ -352,7 +360,11 @@ fn emit_write_storage(
                 0,
             );
         }
-        Opcode::WriteStorageS16 if ctx.profile.support_int16 => {
+        Opcode::WriteStorageS16
+            if ctx.profile.support_int16
+                && ctx.profile.support_storage_buffer_16bit
+                && ctx.profile.support_descriptor_aliasing =>
+        {
             let value = ctx.builder.s_convert(ctx.i16_type, None, value).unwrap();
             write_storage(
                 ctx,
@@ -365,11 +377,11 @@ fn emit_write_storage(
             );
         }
         Opcode::WriteStorageU8 | Opcode::WriteStorageS8 => {
-            let bit_offset = bit_offset(ctx, offset, 3);
+            let bit_offset = ctx.bit_offset_8(offset);
             write_storage_by_cas_loop(ctx, binding, offset, value, bit_offset, 8);
         }
         Opcode::WriteStorageU16 | Opcode::WriteStorageS16 => {
-            let bit_offset = bit_offset(ctx, offset, 2);
+            let bit_offset = ctx.bit_offset_16(offset);
             write_storage_by_cas_loop(ctx, binding, offset, value, bit_offset, 16);
         }
         Opcode::WriteStorage32 => write_storage_32(ctx, binding, offset, value, 0),
@@ -549,6 +561,7 @@ mod tests {
         let profile = Profile {
             support_descriptor_aliasing: true,
             support_int8: true,
+            support_storage_buffer_8bit: true,
             ..Profile::default()
         };
         let mut ctx = context(profile, Type::U8 as u32, true);
@@ -565,6 +578,28 @@ mod tests {
         assert!(contains_opcode(&ctx, spirv::Op::Load));
         assert!(contains_opcode(&ctx, spirv::Op::UConvert));
         assert!(!contains_opcode(&ctx, spirv::Op::BitFieldUExtract));
+    }
+
+    #[test]
+    fn missing_storage_8bit_capability_uses_u32_fallback() {
+        let profile = Profile {
+            support_descriptor_aliasing: true,
+            support_int8: true,
+            ..Profile::default()
+        };
+        let mut ctx = context(profile, Type::U8 as u32, true);
+
+        let _ = emit_load_storage(
+            &mut ctx,
+            Opcode::LoadStorageU8,
+            Value::ImmU32(0),
+            Value::ImmU32(3),
+        );
+        ctx.builder.ret().unwrap();
+        ctx.builder.end_function().unwrap();
+
+        assert!(contains_opcode(&ctx, spirv::Op::BitFieldUExtract));
+        assert!(!contains_opcode(&ctx, spirv::Op::UConvert));
     }
 
     #[test]

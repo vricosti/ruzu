@@ -974,6 +974,7 @@ mod tests {
                 states: [0; 2],
                 needs_init: [false; 2],
                 filter_tap_count: 2,
+                ..Default::default()
             });
 
         assert_eq!(v3.estimate(&command), 0);

@@ -12,19 +12,10 @@ use crate::engines::engine_interface::EngineInterface;
 use crate::engines::engine_interface::EngineTypes;
 use crate::query_cache::types::{QueryPropertiesFlags, QueryType};
 use crate::rasterizer_interface::{RasterizerHandle, RasterizerInterface};
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
-static PULLER_ENGINE_TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
-static PULLER_SEMAPHORE_WRITEBACK_TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
-
-fn should_trace_dma_flow() -> bool {
-    std::env::var_os("RUZU_TRACE_DMA_FLOW").is_some()
-}
-
-fn should_trace_semaphore_writeback() -> bool {
-    std::env::var_os("RUZU_TRACE_SEMAPHORE_WRITEBACK").is_some()
-}
+const GF100_BIND_CLASS_MASK: u32 = 0xFFFF;
+const GF100_BIND_VALID_MASK: u32 = 0x1F0000 | GF100_BIND_CLASS_MASK;
 
 /// GPU virtual address type.
 pub type GPUVAddr = u64;
@@ -339,7 +330,6 @@ impl PullerRegs {
 
 /// Number of subchannels.
 const NUM_SUBCHANNELS: usize = 8;
-static PULLER_TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
 
 /// The GPU command puller.
 ///
@@ -391,50 +381,15 @@ impl Puller {
         amount: Option<u32>,
         methods_pending: Option<u32>,
     ) {
-        #[cfg(not(test))]
-        {
-            let path = std::path::Path::new(".agents/puller_unimplemented_state.md");
-            if let Some(parent) = path.parent() {
-                let _ = std::fs::create_dir_all(parent);
-            }
-            let entry = format!(
-                "\n## Puller unsupported engine path\n\
-                 - caller: {}\n\
-                 - upstream: video_core/engines/puller.cpp uses UNIMPLEMENTED_MSG for unsupported engine dispatch\n\
-                 - engine: 0x{:04X}\n\
-                 - subchannel: {}\n\
-                 - method: 0x{:X}\n\
-                 - argument: {}\n\
-                 - amount: {}\n\
-                 - methods_pending: {}\n",
-                caller,
-                engine.raw(),
-                subchannel,
-                method,
-                argument
-                    .map(|value| format!("0x{value:X}"))
-                    .unwrap_or_else(|| "n/a".to_string()),
-                amount
-                    .map(|value| value.to_string())
-                    .unwrap_or_else(|| "n/a".to_string()),
-                methods_pending
-                    .map(|value| value.to_string())
-                    .unwrap_or_else(|| "n/a".to_string()),
-            );
-            let _ = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(path)
-                .and_then(|mut file| {
-                    use std::io::Write;
-                    file.write_all(entry.as_bytes())
-                });
-        }
         log::error!(
-            "{} unsupported engine 0x{:04X} on subchannel {}",
+            "{} unsupported engine 0x{:04X} on subchannel {} method=0x{:X} argument={:?} amount={:?} methods_pending={:?}",
             caller,
             engine.raw(),
-            subchannel
+            subchannel,
+            method,
+            argument,
+            amount,
+            methods_pending,
         );
     }
 
@@ -533,24 +488,6 @@ impl Puller {
     ///
     /// Corresponds to `Puller::CallPullerMethod`.
     pub fn call_puller_method(&mut self, method_call: &MethodCall) {
-        let trace_idx = PULLER_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
-        if should_trace_dma_flow() && trace_idx < 96 {
-            log::info!(
-                "Puller::call_puller_method method=0x{:X} arg=0x{:X} subch={} pending={}",
-                method_call.method,
-                method_call.argument,
-                method_call.subchannel,
-                method_call.method_count
-            );
-        } else if trace_idx < 48 {
-            log::trace!(
-                "Puller::call_puller_method method=0x{:X} arg=0x{:X} subch={} pending={}",
-                method_call.method,
-                method_call.argument,
-                method_call.subchannel,
-                method_call.method_count
-            );
-        }
         let method_idx = method_call.method as usize;
         if method_idx < PULLER_NUM_REGS {
             self.regs.reg_array[method_idx] = method_call.argument;
@@ -619,24 +556,6 @@ impl Puller {
     pub fn call_engine_method(&mut self, method_call: &MethodCall) {
         let engine = self.bound_engines[method_call.subchannel as usize];
 
-        let trace_idx = PULLER_ENGINE_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
-        if should_trace_dma_flow() && trace_idx < 96 {
-            log::info!(
-                "Puller::call_engine_method engine={:?} method=0x{:X} arg=0x{:X} subch={}",
-                engine,
-                method_call.method,
-                method_call.argument,
-                method_call.subchannel
-            );
-        } else if trace_idx < 48 {
-            log::trace!(
-                "Puller::call_engine_method engine={:?} method=0x{:X} arg=0x{:X} subch={}",
-                engine,
-                method_call.method,
-                method_call.argument,
-                method_call.subchannel
-            );
-        }
         match engine {
             EngineID::MaxwellB => {
                 let channel_state = unsafe { &mut *self.channel_state };
@@ -776,20 +695,16 @@ impl Puller {
     ///
     /// Corresponds to `Puller::ProcessBindMethod`.
     fn process_bind_method(&mut self, method_call: &MethodCall) {
-        if should_trace_dma_flow() {
-            log::info!(
-                "Puller::process_bind_method subch={} raw_engine=0x{:X}",
-                method_call.subchannel,
-                method_call.argument
-            );
-        } else {
-            log::debug!(
-                "Binding subchannel {} to engine {}",
-                method_call.subchannel,
-                method_call.argument
-            );
+        log::debug!(
+            "Binding subchannel {} to engine {}",
+            method_call.subchannel,
+            method_call.argument
+        );
+        let mut engine = method_call.argument;
+        if (engine & !GF100_BIND_CLASS_MASK) != 0 && (engine & !GF100_BIND_VALID_MASK) == 0 {
+            engine &= GF100_BIND_CLASS_MASK;
         }
-        let eid = EngineID::from_raw(method_call.argument);
+        let eid = EngineID::from_raw(engine);
         self.bound_engines[method_call.subchannel as usize] = eid;
         match eid {
             EngineID::FermiTwodA
@@ -797,19 +712,6 @@ impl Puller {
             | EngineID::KeplerComputeB
             | EngineID::KeplerInlineToMemoryB
             | EngineID::MaxwellDmaCopyA => {
-                if should_trace_dma_flow() {
-                    log::info!(
-                        "Puller::process_bind_method bound subch={} engine={:?}",
-                        method_call.subchannel,
-                        eid
-                    );
-                } else {
-                    log::trace!(
-                        "Puller::process_bind_method subch={} engine={:?}",
-                        method_call.subchannel,
-                        eid
-                    );
-                }
                 let channel_state = unsafe { &mut *self.channel_state };
                 let dma_pusher = unsafe { self.dma_pusher.as_mut() };
                 if let Some(dma_pusher) = dma_pusher {
@@ -882,13 +784,6 @@ impl Puller {
     /// Corresponds to `Puller::ProcessFenceActionMethod`.
     fn process_fence_action_method(&mut self) {
         let action = self.regs.fence_action();
-        if should_trace_dma_flow() || std::env::var_os("RUZU_TRACE_GPU_SUBMIT").is_some() {
-            log::info!(
-                "Puller::process_fence_action_method op={:?} syncpoint_id={}",
-                action.op(),
-                action.syncpoint_id()
-            );
-        }
         match action.op() {
             FenceOperation::Acquire => {
                 self.with_rasterizer_mut(|rasterizer| rasterizer.release_fences(true));
@@ -906,45 +801,9 @@ impl Puller {
     fn process_semaphore_trigger_method(&mut self) {
         let semaphore_op_mask = 0xF;
         let op = self.regs.semaphore_trigger() & semaphore_op_mask;
-        if should_trace_dma_flow() {
-            log::info!(
-                "Puller::process_semaphore_trigger_method op=0x{:X} trigger=0x{:X} addr=0x{:X} payload=0x{:X}",
-                op,
-                self.regs.semaphore_trigger(),
-                self.regs.semaphore_address(),
-                self.regs.semaphore_sequence()
-            );
-        } else {
-            log::trace!(
-                "PULLER_SEMTRIG op=0x{:X} trigger=0x{:X} addr=0x{:X} payload=0x{:X}",
-                op,
-                self.regs.semaphore_trigger(),
-                self.regs.semaphore_address(),
-                self.regs.semaphore_sequence()
-            );
-        }
         if op == GpuSemaphoreOperation::WriteLong as u32 {
             let sequence_address = self.regs.semaphore_address();
             let payload = self.regs.semaphore_sequence();
-            log::trace!(
-                "Puller::SemaphoreTrigger WriteLong gpu_addr=0x{:X} payload=0x{:X} trigger=0x{:X}",
-                sequence_address,
-                payload,
-                self.regs.semaphore_trigger()
-            );
-            if std::env::var_os("RUZU_TRACE_SEM_RELEASE").is_some() {
-                let cpu = self
-                    .memory_manager
-                    .lock()
-                    .gpu_to_cpu_address(sequence_address);
-                log::info!(
-                    "[SEM_RELEASE] gpu_va=0x{:X} -> cpu={:?} payload=0x{:X} trigger=0x{:X}",
-                    sequence_address,
-                    cpu,
-                    payload,
-                    self.regs.semaphore_trigger(),
-                );
-            }
             self.with_rasterizer_mut(|rasterizer| {
                 rasterizer.query(
                     sequence_address,
@@ -1056,6 +915,7 @@ mod tests {
 
     #[derive(Default)]
     struct FakeRasterizer {
+        accelerate_dma: crate::rasterizer_interface::TestAccelerateDMA,
         syncpoints: StdArc<StdMutex<Vec<u32>>>,
         wait_for_idle_calls: StdArc<StdMutex<u32>>,
         reference_calls: StdArc<StdMutex<u32>>,
@@ -1064,6 +924,12 @@ mod tests {
     }
 
     impl RasterizerInterface for FakeRasterizer {
+        fn access_accelerate_dma(
+            &mut self,
+        ) -> &mut dyn crate::engines::maxwell_dma::AccelerateDMAInterface {
+            &mut self.accelerate_dma
+        }
+
         fn draw(
             &mut self,
             _draw_view: crate::engines::draw_manager::Maxwell3DDrawView<'_>,
@@ -1081,7 +947,7 @@ mod tests {
             _layer_count: u32,
         ) {
         }
-        fn dispatch_compute(&mut self) {}
+        fn dispatch_compute(&mut self, _dispatch: &crate::engines::kepler_compute::DispatchCall) {}
         fn reset_counter(&mut self, _query_type: u32) {}
         fn query(
             &mut self,
@@ -1117,8 +983,13 @@ mod tests {
             self.release_fence_calls.lock().unwrap().push(force);
         }
         fn flush_all(&mut self) {}
-        fn flush_region(&mut self, _addr: u64, _size: u64) {}
-        fn must_flush_region(&self, _addr: u64, _size: u64) -> bool {
+        fn flush_region(&mut self, _addr: u64, _size: u64, _which: crate::cache_types::CacheType) {}
+        fn must_flush_region(
+            &self,
+            _addr: u64,
+            _size: u64,
+            _which: crate::cache_types::CacheType,
+        ) -> bool {
             false
         }
         fn get_flush_area(&self, addr: u64, _size: u64) -> RasterizerDownloadArea {
@@ -1128,7 +999,13 @@ mod tests {
                 preemptive: true,
             }
         }
-        fn invalidate_region(&mut self, _addr: u64, _size: u64) {}
+        fn invalidate_region(
+            &mut self,
+            _addr: u64,
+            _size: u64,
+            _which: crate::cache_types::CacheType,
+        ) {
+        }
         fn on_cache_invalidation(&mut self, _addr: u64, _size: u64) {}
         fn on_cpu_write(&mut self, _addr: u64, _size: u64) -> bool {
             false
@@ -1136,7 +1013,13 @@ mod tests {
         fn invalidate_gpu_cache(&mut self) {}
         fn unmap_memory(&mut self, _addr: u64, _size: u64) {}
         fn modify_gpu_memory(&mut self, _as_id: usize, _addr: u64, _size: u64) {}
-        fn flush_and_invalidate_region(&mut self, _addr: u64, _size: u64) {}
+        fn flush_and_invalidate_region(
+            &mut self,
+            _addr: u64,
+            _size: u64,
+            _which: crate::cache_types::CacheType,
+        ) {
+        }
         fn wait_for_idle(&mut self) {
             *self.wait_for_idle_calls.lock().unwrap() += 1;
         }

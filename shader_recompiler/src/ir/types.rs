@@ -253,6 +253,8 @@ pub struct TextureInstInfo {
     pub image_format: u8,
     /// Whether TEX.NDV mode is active.
     pub ndv_is_active: bool,
+    /// Whether the sampled texture returns integer components.
+    pub is_integer: bool,
 }
 
 impl TextureInstInfo {
@@ -267,6 +269,7 @@ impl TextureInstInfo {
         v |= (self.num_derivatives as u32 & 0x3) << 25;
         v |= (self.image_format as u32 & 0x7) << 27;
         v |= (self.ndv_is_active as u32) << 30;
+        v |= (self.is_integer as u32) << 31;
         v
     }
 
@@ -282,6 +285,7 @@ impl TextureInstInfo {
             num_derivatives: ((v >> 25) & 0x3) as u8,
             image_format: ((v >> 27) & 0x7) as u8,
             ndv_is_active: (v >> 30) & 1 != 0,
+            is_integer: (v >> 31) & 1 != 0,
         }
     }
 }
@@ -311,6 +315,7 @@ mod tests {
             num_derivatives: 3,
             image_format: 6,
             ndv_is_active: true,
+            is_integer: true,
         };
 
         let raw = info.to_u32();
@@ -324,6 +329,7 @@ mod tests {
         assert_eq!((raw >> 25) & 0x3, 3);
         assert_eq!((raw >> 27) & 0x7, 6);
         assert_eq!((raw >> 30) & 1, 1);
+        assert_eq!((raw >> 31) & 1, 1);
         assert_eq!(TextureInstInfo::from_u32(raw), info);
     }
 }

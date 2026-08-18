@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2025 ruzu contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! Port of zuyu/src/video_core/renderer_opengl/present/util.h
+//! Port of Eden `video_core/renderer_opengl/present/util.h`.
 //!
 //! Utility functions for the presentation pipeline (sampler creation, shader include replacement).
 
@@ -23,15 +23,15 @@ pub fn replace_include(shader_source: &mut String, include_name: &str, include_c
 /// Create a bilinear sampler with clamp-to-edge wrapping.
 ///
 /// Corresponds to `OpenGL::CreateBilinearSampler()`.
-pub fn create_bilinear_sampler() -> u32 {
-    let mut sampler: u32 = 0;
+pub fn create_bilinear_sampler() -> OGLSampler {
+    let mut sampler = OGLSampler::new();
+    sampler.create();
     unsafe {
-        gl::GenSamplers(1, &mut sampler);
-        gl::SamplerParameteri(sampler, gl::TEXTURE_MIN_FILTER, gl::LINEAR as i32);
-        gl::SamplerParameteri(sampler, gl::TEXTURE_MAG_FILTER, gl::LINEAR as i32);
-        gl::SamplerParameteri(sampler, gl::TEXTURE_WRAP_S, gl::CLAMP_TO_EDGE as i32);
-        gl::SamplerParameteri(sampler, gl::TEXTURE_WRAP_T, gl::CLAMP_TO_EDGE as i32);
-        gl::SamplerParameteri(sampler, gl::TEXTURE_WRAP_R, gl::CLAMP_TO_EDGE as i32);
+        gl::SamplerParameteri(sampler.handle, gl::TEXTURE_MIN_FILTER, gl::LINEAR as i32);
+        gl::SamplerParameteri(sampler.handle, gl::TEXTURE_MAG_FILTER, gl::LINEAR as i32);
+        gl::SamplerParameteri(sampler.handle, gl::TEXTURE_WRAP_S, gl::CLAMP_TO_EDGE as i32);
+        gl::SamplerParameteri(sampler.handle, gl::TEXTURE_WRAP_T, gl::CLAMP_TO_EDGE as i32);
+        gl::SamplerParameteri(sampler.handle, gl::TEXTURE_WRAP_R, gl::CLAMP_TO_EDGE as i32);
     }
     sampler
 }
@@ -39,15 +39,16 @@ pub fn create_bilinear_sampler() -> u32 {
 /// Create a nearest-neighbor sampler with clamp-to-edge wrapping.
 ///
 /// Corresponds to `OpenGL::CreateNearestNeighborSampler()`.
-pub fn create_nearest_neighbor_sampler() -> u32 {
-    let mut sampler: u32 = 0;
+pub fn create_nearest_neighbor_sampler() -> OGLSampler {
+    let mut sampler = OGLSampler::new();
+    sampler.create();
     unsafe {
-        gl::GenSamplers(1, &mut sampler);
-        gl::SamplerParameteri(sampler, gl::TEXTURE_MIN_FILTER, gl::NEAREST as i32);
-        gl::SamplerParameteri(sampler, gl::TEXTURE_MAG_FILTER, gl::NEAREST as i32);
-        gl::SamplerParameteri(sampler, gl::TEXTURE_WRAP_S, gl::CLAMP_TO_EDGE as i32);
-        gl::SamplerParameteri(sampler, gl::TEXTURE_WRAP_T, gl::CLAMP_TO_EDGE as i32);
-        gl::SamplerParameteri(sampler, gl::TEXTURE_WRAP_R, gl::CLAMP_TO_EDGE as i32);
+        gl::SamplerParameteri(sampler.handle, gl::TEXTURE_MIN_FILTER, gl::NEAREST as i32);
+        gl::SamplerParameteri(sampler.handle, gl::TEXTURE_MAG_FILTER, gl::NEAREST as i32);
+        gl::SamplerParameteri(sampler.handle, gl::TEXTURE_WRAP_S, gl::CLAMP_TO_EDGE as i32);
+        gl::SamplerParameteri(sampler.handle, gl::TEXTURE_WRAP_T, gl::CLAMP_TO_EDGE as i32);
+        gl::SamplerParameteri(sampler.handle, gl::TEXTURE_WRAP_R, gl::CLAMP_TO_EDGE as i32);
     }
     sampler
 }
+use crate::renderer_opengl::gl_resource_manager::OGLSampler;

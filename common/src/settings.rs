@@ -1,4 +1,4 @@
-//! Port of zuyu/src/common/settings.h and zuyu/src/common/settings.cpp
+//! Port of eden/src/common/settings.h and eden/src/common/settings.cpp
 //! Status: COMPLET
 //! Derniere synchro: 2026-03-05
 //!
@@ -17,10 +17,11 @@ use crate::settings_setting::BasicSetting;
 // Re-export the types that consumers most commonly need.
 pub use crate::settings_enums::{
     AnisotropyMode, AntiAliasing, AppletMode, AspectRatio, AstcDecodeMode, AstcRecompression,
-    AudioEngine, AudioMode, Category, ConfirmStop, ConsoleMode, CpuAccuracy, CpuBackend,
-    FullscreenMode, GpuAccuracy, GpuFenceBehavior, Language, MemoryLayout, NvdecEmulation, Region,
-    RendererBackend, ResolutionSetup, ScalingFilter, ShaderBackend, TimeZone, VSyncMode,
-    VramUsageMode,
+    AudioEngine, AudioMode, Category, ConfirmStop, ConsoleMode, CpuAccuracy, CpuBackend, CpuClock,
+    DmaAccuracy, ExtendedDynamicState, FramePacingMode, FullscreenMode, GpuAccuracy, GpuClock,
+    GpuFenceBehavior, GpuUnswizzle, GpuUnswizzleChunk, GpuUnswizzleSize, Language, MemoryLayout,
+    NvdecEmulation, Region, RendererBackend, ResolutionSetup, ScalingFilter, SpeedMode, TimeZone,
+    VSyncMode, VramUsageMode,
 };
 pub use crate::settings_input::{
     AnalogsRaw, ButtonsRaw, PlayerInput, RingconRaw, TouchFromButtonMap, TouchscreenInput,
@@ -111,21 +112,22 @@ impl ResolutionScalingInfo {
 #[derive(Clone)]
 pub struct Values {
     // ── Applet ──────────────────────────────────────────────────────────
-    pub cabinet_applet_mode: Setting<AppletMode>,
-    pub controller_applet_mode: Setting<AppletMode>,
+    pub cabinet_applet_mode: SwitchableSetting<AppletMode>,
+    pub controller_applet_mode: SwitchableSetting<AppletMode>,
     pub data_erase_applet_mode: Setting<AppletMode>,
-    pub error_applet_mode: Setting<AppletMode>,
+    pub error_applet_mode: SwitchableSetting<AppletMode>,
     pub net_connect_applet_mode: Setting<AppletMode>,
-    pub player_select_applet_mode: Setting<AppletMode>,
-    pub swkbd_applet_mode: Setting<AppletMode>,
-    pub mii_edit_applet_mode: Setting<AppletMode>,
-    pub web_applet_mode: Setting<AppletMode>,
+    pub player_select_applet_mode: SwitchableSetting<AppletMode>,
+    pub swkbd_applet_mode: SwitchableSetting<AppletMode>,
+    pub mii_edit_applet_mode: SwitchableSetting<AppletMode>,
+    pub web_applet_mode: SwitchableSetting<AppletMode>,
     pub shop_applet_mode: Setting<AppletMode>,
-    pub photo_viewer_applet_mode: Setting<AppletMode>,
-    pub offline_web_applet_mode: Setting<AppletMode>,
+    pub photo_viewer_applet_mode: SwitchableSetting<AppletMode>,
+    pub offline_web_applet_mode: SwitchableSetting<AppletMode>,
     pub login_share_applet_mode: Setting<AppletMode>,
     pub wifi_web_auth_applet_mode: Setting<AppletMode>,
     pub my_page_applet_mode: Setting<AppletMode>,
+    pub enable_overlay: SwitchableSetting<bool>,
 
     // ── Audio ───────────────────────────────────────────────────────────
     pub sink_id: SwitchableSetting<AudioEngine>,
@@ -141,10 +143,17 @@ pub struct Values {
     pub memory_layout_mode: SwitchableSetting<MemoryLayout>,
     pub use_speed_limit: SwitchableSetting<bool>,
     pub speed_limit: SwitchableSetting<u16>,
+    pub slow_speed_limit: SwitchableSetting<u16>,
+    pub turbo_speed_limit: SwitchableSetting<u16>,
+    pub current_speed_mode: Setting<SpeedMode>,
+    pub sync_core_speed: SwitchableSetting<bool>,
 
     // ── CPU ─────────────────────────────────────────────────────────────
     pub cpu_backend: SwitchableSetting<CpuBackend>,
     pub cpu_accuracy: SwitchableSetting<CpuAccuracy>,
+    pub cpu_clock: SwitchableSetting<CpuClock>,
+    pub use_custom_cpu_ticks: SwitchableSetting<bool>,
+    pub cpu_ticks: SwitchableSetting<u32>,
     pub cpu_debug_mode: SwitchableSetting<bool>,
 
     pub cpuopt_page_tables: Setting<bool>,
@@ -160,6 +169,7 @@ pub struct Values {
     pub cpuopt_recompile_exclusives: Setting<bool>,
     pub cpuopt_ignore_memory_aborts: Setting<bool>,
 
+    pub cpuopt_unsafe_host_mmu: SwitchableSetting<bool>,
     pub cpuopt_unsafe_unfuse_fma: SwitchableSetting<bool>,
     pub cpuopt_unsafe_reduce_fp_error: SwitchableSetting<bool>,
     pub cpuopt_unsafe_ignore_standard_fpcr: SwitchableSetting<bool>,
@@ -169,8 +179,7 @@ pub struct Values {
 
     // ── Renderer ────────────────────────────────────────────────────────
     pub renderer_backend: SwitchableSetting<RendererBackend>,
-    pub shader_backend: SwitchableSetting<ShaderBackend>,
-    pub vulkan_device: SwitchableSetting<i32>,
+    pub vulkan_device: SwitchableSetting<u32>,
 
     pub use_disk_shader_cache: SwitchableSetting<bool>,
     pub use_asynchronous_gpu_emulation: SwitchableSetting<bool>,
@@ -193,19 +202,39 @@ pub struct Values {
     // ── Renderer Advanced ───────────────────────────────────────────────
     pub gpu_accuracy: SwitchableSetting<GpuAccuracy>,
     pub current_gpu_accuracy: GpuAccuracy,
+    pub dma_accuracy: SwitchableSetting<DmaAccuracy>,
     pub gpu_fence_behavior: SwitchableSetting<GpuFenceBehavior>,
+    pub frame_pacing_mode: SwitchableSetting<FramePacingMode>,
     pub max_anisotropy: SwitchableSetting<AnisotropyMode>,
     pub astc_recompression: SwitchableSetting<AstcRecompression>,
     pub vram_usage_mode: SwitchableSetting<VramUsageMode>,
-    pub async_presentation: SwitchableSetting<bool>,
+    pub sync_memory_operations: SwitchableSetting<bool>,
     pub renderer_force_max_clock: SwitchableSetting<bool>,
     pub use_reactive_flushing: SwitchableSetting<bool>,
-    pub use_asynchronous_shaders: SwitchableSetting<bool>,
-    pub use_fast_gpu_time: SwitchableSetting<bool>,
+    pub gpu_clock: SwitchableSetting<GpuClock>,
     pub use_vulkan_driver_pipeline_cache: SwitchableSetting<bool>,
     pub enable_compute_pipelines: SwitchableSetting<bool>,
     pub use_video_framerate: SwitchableSetting<bool>,
     pub barrier_feedback_loops: SwitchableSetting<bool>,
+    pub enable_buffer_history: SwitchableSetting<bool>,
+    pub enable_gpu_buffer_readback: SwitchableSetting<bool>,
+
+    // ── Renderer Hacks ──────────────────────────────────────────────────
+    pub skip_cpu_inner_invalidation: SwitchableSetting<bool>,
+    pub async_presentation: SwitchableSetting<bool>,
+    pub fix_bloom_effects: SwitchableSetting<bool>,
+    pub emulate_bgr565: SwitchableSetting<bool>,
+    pub rescale_hack: SwitchableSetting<bool>,
+    pub use_asynchronous_shaders: SwitchableSetting<bool>,
+    pub gpu_unswizzle_texture_size: SwitchableSetting<GpuUnswizzleSize>,
+    pub gpu_unswizzle_stream_size: SwitchableSetting<GpuUnswizzle>,
+    pub gpu_unswizzle_chunk_size: SwitchableSetting<GpuUnswizzleChunk>,
+    pub gpu_unswizzle_enabled: SwitchableSetting<bool>,
+
+    // ── Renderer Extensions ─────────────────────────────────────────────
+    pub dyna_state: SwitchableSetting<ExtendedDynamicState>,
+    pub sample_shading: SwitchableSetting<u32>,
+    pub vertex_input_dynamic_state: SwitchableSetting<bool>,
 
     // ── Renderer Debug ──────────────────────────────────────────────────
     pub renderer_debug: Setting<bool>,
@@ -290,10 +319,10 @@ pub struct Values {
     pub record_frame_times: bool,
     pub use_gdbstub: Setting<bool>,
     pub gdbstub_port: Setting<u16>,
-    pub program_args: Setting<String>,
+    pub program_args: SwitchableSetting<String>,
     pub dump_exefs: Setting<bool>,
     pub dump_nso: Setting<bool>,
-    pub dump_shaders: Setting<bool>,
+    pub dump_guest_shaders: Setting<bool>,
     pub dump_macros: Setting<bool>,
     pub enable_fs_access_log: Setting<bool>,
     pub reporting_services: Setting<bool>,
@@ -312,6 +341,7 @@ pub struct Values {
 
     // ── Network ─────────────────────────────────────────────────────────
     pub network_interface: Setting<String>,
+    pub airplane_mode: SwitchableSetting<bool>,
 
     // ── WebService ──────────────────────────────────────────────────────
     pub enable_telemetry: Setting<bool>,
@@ -321,6 +351,9 @@ pub struct Values {
 
     // ── Add-Ons ─────────────────────────────────────────────────────────
     pub disabled_addons: HashMap<u64, Vec<String>>,
+
+    // ── Per-game overrides ──────────────────────────────────────────────
+    pub use_squashed_iterated_blend: bool,
 
     // ── Extra fields (not in C++ Values but kept for backward compat) ──
     pub title_id: u64,
@@ -347,6 +380,24 @@ impl Values {
         }
 
         match category {
+            Category::LibraryApplet => visit!(
+                cabinet_applet_mode,
+                controller_applet_mode,
+                data_erase_applet_mode,
+                error_applet_mode,
+                net_connect_applet_mode,
+                player_select_applet_mode,
+                swkbd_applet_mode,
+                mii_edit_applet_mode,
+                web_applet_mode,
+                shop_applet_mode,
+                photo_viewer_applet_mode,
+                offline_web_applet_mode,
+                login_share_applet_mode,
+                wifi_web_auth_applet_mode,
+                my_page_applet_mode,
+                enable_overlay,
+            ),
             Category::Audio => visit!(
                 sink_id,
                 audio_output_device_id,
@@ -360,8 +411,12 @@ impl Values {
                 memory_layout_mode,
                 use_speed_limit,
                 speed_limit,
+                slow_speed_limit,
+                turbo_speed_limit,
+                current_speed_mode,
+                sync_core_speed,
             ),
-            Category::Cpu => visit!(cpu_backend, cpu_accuracy),
+            Category::Cpu => visit!(cpu_backend, cpu_accuracy, use_custom_cpu_ticks, cpu_ticks,),
             Category::CpuDebug => visit!(
                 cpu_debug_mode,
                 cpuopt_page_tables,
@@ -378,6 +433,7 @@ impl Values {
                 cpuopt_ignore_memory_aborts,
             ),
             Category::CpuUnsafe => visit!(
+                cpuopt_unsafe_host_mmu,
                 cpuopt_unsafe_unfuse_fma,
                 cpuopt_unsafe_reduce_fp_error,
                 cpuopt_unsafe_ignore_standard_fpcr,
@@ -387,13 +443,9 @@ impl Values {
             ),
             Category::Renderer => visit!(
                 renderer_backend,
-                shader_backend,
                 vulkan_device,
-                use_disk_shader_cache,
                 use_asynchronous_gpu_emulation,
-                accelerate_astc,
                 vsync_mode,
-                nvdec_emulation,
                 fullscreen_mode,
                 aspect_ratio,
                 resolution_setup,
@@ -406,20 +458,40 @@ impl Values {
             ),
             Category::RendererAdvanced => visit!(
                 gpu_accuracy,
+                dma_accuracy,
                 gpu_fence_behavior,
-                max_anisotropy,
-                astc_recompression,
                 vram_usage_mode,
-                async_presentation,
+                nvdec_emulation,
+                max_anisotropy,
+                accelerate_astc,
+                frame_pacing_mode,
+                astc_recompression,
+                sync_memory_operations,
                 renderer_force_max_clock,
-                use_reactive_flushing,
-                use_asynchronous_shaders,
-                use_fast_gpu_time,
+                use_disk_shader_cache,
                 use_vulkan_driver_pipeline_cache,
                 enable_compute_pipelines,
                 use_video_framerate,
+                use_reactive_flushing,
                 barrier_feedback_loops,
+                enable_buffer_history,
+                enable_gpu_buffer_readback,
             ),
+            Category::RendererHacks => visit!(
+                skip_cpu_inner_invalidation,
+                async_presentation,
+                fix_bloom_effects,
+                emulate_bgr565,
+                rescale_hack,
+                use_asynchronous_shaders,
+                gpu_unswizzle_texture_size,
+                gpu_unswizzle_stream_size,
+                gpu_unswizzle_chunk_size,
+                gpu_unswizzle_enabled,
+            ),
+            Category::RendererExtensions => {
+                visit!(dyna_state, sample_shading, vertex_input_dynamic_state,)
+            }
             Category::RendererDebug => visit!(
                 renderer_debug,
                 renderer_shader_feedback,
@@ -428,7 +500,34 @@ impl Values {
                 enable_renderdoc_hotkey,
                 disable_buffer_reorder,
             ),
+            Category::Debugging => visit!(
+                use_gdbstub,
+                gdbstub_port,
+                dump_exefs,
+                dump_nso,
+                enable_fs_access_log,
+                reporting_services,
+                quest_flag,
+                use_dev_keys,
+                extended_logging,
+                use_debug_asserts,
+                use_auto_stub,
+                enable_all_controllers,
+                perform_vulkan_check,
+            ),
+            Category::DebuggingGraphics => visit!(
+                dump_guest_shaders,
+                dump_macros,
+                disable_macro_jit,
+                disable_macro_hle,
+            ),
+            Category::Miscellaneous => visit!(log_filter),
+            Category::WebService => {
+                visit!(enable_telemetry, web_api_url, yuzu_username, yuzu_token,)
+            }
             Category::System => visit!(
+                cpu_clock,
+                gpu_clock,
                 language_index,
                 region_index,
                 time_zone_index,
@@ -440,6 +539,7 @@ impl Values {
                 device_name,
                 current_user,
                 use_docked_mode,
+                program_args,
             ),
             Category::SystemAudio => visit!(sound_index),
             Category::DataStorage => visit!(
@@ -455,6 +555,7 @@ impl Values {
                 enable_accurate_vibrations,
                 motion_enabled,
             ),
+            Category::Network => visit!(network_interface, airplane_mode,),
             _ => {}
         }
     }
@@ -466,12 +567,12 @@ impl Default for Values {
 
         Self {
             // Applet
-            cabinet_applet_mode: Setting::new(
+            cabinet_applet_mode: SwitchableSetting::new(
                 AppletMode::LLE,
                 "cabinet_applet_mode",
                 LibraryApplet,
             ),
-            controller_applet_mode: Setting::new(
+            controller_applet_mode: SwitchableSetting::new(
                 AppletMode::HLE,
                 "controller_applet_mode",
                 LibraryApplet,
@@ -481,31 +582,43 @@ impl Default for Values {
                 "data_erase_applet_mode",
                 LibraryApplet,
             ),
-            error_applet_mode: Setting::new(AppletMode::LLE, "error_applet_mode", LibraryApplet),
+            error_applet_mode: SwitchableSetting::new(
+                AppletMode::LLE,
+                "error_applet_mode",
+                LibraryApplet,
+            ),
             net_connect_applet_mode: Setting::new(
-                AppletMode::HLE,
+                AppletMode::LLE,
                 "net_connect_applet_mode",
                 LibraryApplet,
             ),
-            player_select_applet_mode: Setting::new(
-                AppletMode::HLE,
+            player_select_applet_mode: SwitchableSetting::new(
+                AppletMode::LLE,
                 "player_select_applet_mode",
                 LibraryApplet,
             ),
-            swkbd_applet_mode: Setting::new(AppletMode::LLE, "swkbd_applet_mode", LibraryApplet),
-            mii_edit_applet_mode: Setting::new(
+            swkbd_applet_mode: SwitchableSetting::new(
+                AppletMode::HLE,
+                "swkbd_applet_mode",
+                LibraryApplet,
+            ),
+            mii_edit_applet_mode: SwitchableSetting::new(
                 AppletMode::LLE,
                 "mii_edit_applet_mode",
                 LibraryApplet,
             ),
-            web_applet_mode: Setting::new(AppletMode::HLE, "web_applet_mode", LibraryApplet),
+            web_applet_mode: SwitchableSetting::new(
+                AppletMode::HLE,
+                "web_applet_mode",
+                LibraryApplet,
+            ),
             shop_applet_mode: Setting::new(AppletMode::HLE, "shop_applet_mode", LibraryApplet),
-            photo_viewer_applet_mode: Setting::new(
+            photo_viewer_applet_mode: SwitchableSetting::new(
                 AppletMode::LLE,
                 "photo_viewer_applet_mode",
                 LibraryApplet,
             ),
-            offline_web_applet_mode: Setting::new(
+            offline_web_applet_mode: SwitchableSetting::new(
                 AppletMode::LLE,
                 "offline_web_applet_mode",
                 LibraryApplet,
@@ -525,6 +638,7 @@ impl Default for Values {
                 "my_page_applet_mode",
                 LibraryApplet,
             ),
+            enable_overlay: SwitchableSetting::new(false, "enable_overlay", LibraryApplet),
 
             // Audio
             sink_id: SwitchableSetting::with_options(
@@ -583,7 +697,7 @@ impl Default for Values {
             memory_layout_mode: SwitchableSetting::ranged(
                 MemoryLayout::Memory4Gb,
                 MemoryLayout::Memory4Gb,
-                MemoryLayout::Memory8Gb,
+                MemoryLayout::Memory12Gb,
                 "memory_layout_mode",
                 Core,
             ),
@@ -592,7 +706,7 @@ impl Default for Values {
                 "use_speed_limit",
                 Core,
                 Specialization::PAIRED,
-                false,
+                true,
                 true,
             ),
             speed_limit: SwitchableSetting::ranged_with_options(
@@ -605,6 +719,35 @@ impl Default for Values {
                 true,
                 true,
             ),
+            slow_speed_limit: SwitchableSetting::ranged_with_options(
+                50,
+                0,
+                9999,
+                "slow_speed_limit",
+                Core,
+                Specialization::COUNTABLE | Specialization::PERCENTAGE,
+                true,
+                true,
+            ),
+            turbo_speed_limit: SwitchableSetting::ranged_with_options(
+                200,
+                0,
+                9999,
+                "turbo_speed_limit",
+                Core,
+                Specialization::COUNTABLE | Specialization::PERCENTAGE,
+                true,
+                true,
+            ),
+            current_speed_mode: Setting::with_options(
+                SpeedMode::Standard,
+                "current_speed_mode",
+                Core,
+                Specialization::DEFAULT,
+                false,
+                true,
+            ),
+            sync_core_speed: SwitchableSetting::new(false, "sync_core_speed", Core),
 
             // CPU
             cpu_backend: SwitchableSetting::ranged(
@@ -620,6 +763,32 @@ impl Default for Values {
                 CpuAccuracy::Paranoid,
                 "cpu_accuracy",
                 Cpu,
+            ),
+            cpu_clock: SwitchableSetting::with_options(
+                CpuClock::Normal,
+                "fast_cpu_time",
+                System,
+                Specialization::DEFAULT,
+                true,
+                true,
+            ),
+            use_custom_cpu_ticks: SwitchableSetting::with_options(
+                false,
+                "use_custom_cpu_ticks",
+                Cpu,
+                Specialization::PAIRED,
+                true,
+                true,
+            ),
+            cpu_ticks: SwitchableSetting::ranged_with_options(
+                16_000,
+                77,
+                65_535,
+                "cpu_ticks",
+                Cpu,
+                Specialization::COUNTABLE,
+                true,
+                true,
             ),
             cpu_debug_mode: SwitchableSetting::new(false, "cpu_debug_mode", CpuDebug),
 
@@ -652,6 +821,16 @@ impl Default for Values {
                 CpuDebug,
             ),
 
+            cpuopt_unsafe_host_mmu: SwitchableSetting::new(
+                cfg!(any(
+                    target_vendor = "apple",
+                    target_os = "linux",
+                    target_os = "android",
+                    target_os = "windows"
+                )),
+                "cpuopt_unsafe_host_mmu",
+                CpuUnsafe,
+            ),
             cpuopt_unsafe_unfuse_fma: SwitchableSetting::new(
                 true,
                 "cpuopt_unsafe_unfuse_fma",
@@ -685,21 +864,15 @@ impl Default for Values {
 
             // Renderer
             renderer_backend: SwitchableSetting::ranged(
-                RendererBackend::Vulkan,
-                RendererBackend::OpenGL,
-                RendererBackend::Null,
+                if cfg!(target_os = "solaris") {
+                    RendererBackend::OpenGlGlsl
+                } else {
+                    RendererBackend::Vulkan
+                },
+                RendererBackend::OpenGlGlsl,
+                RendererBackend::OpenGlSpirV,
                 "backend",
                 Renderer,
-            ),
-            shader_backend: SwitchableSetting::ranged_with_options(
-                ShaderBackend::Glsl,
-                ShaderBackend::Glsl,
-                ShaderBackend::SpirV,
-                "shader_backend",
-                Renderer,
-                Specialization::RUNTIME_LIST,
-                true,
-                false,
             ),
             vulkan_device: SwitchableSetting::with_options(
                 0,
@@ -710,9 +883,13 @@ impl Default for Values {
                 false,
             ),
 
-            use_disk_shader_cache: SwitchableSetting::new(true, "use_disk_shader_cache", Renderer),
-            use_asynchronous_gpu_emulation: SwitchableSetting::new(
+            use_disk_shader_cache: SwitchableSetting::new(
                 true,
+                "use_disk_shader_cache",
+                RendererAdvanced,
+            ),
+            use_asynchronous_gpu_emulation: SwitchableSetting::new(
+                !cfg!(target_os = "android"),
                 "use_asynchronous_gpu_emulation",
                 Renderer,
             ),
@@ -721,7 +898,7 @@ impl Default for Values {
                 AstcDecodeMode::Cpu,
                 AstcDecodeMode::CpuAsynchronous,
                 "accelerate_astc",
-                Renderer,
+                RendererAdvanced,
             ),
             vsync_mode: SwitchableSetting::ranged_with_options(
                 VSyncMode::Fifo,
@@ -736,10 +913,14 @@ impl Default for Values {
             nvdec_emulation: SwitchableSetting::new(
                 NvdecEmulation::Gpu,
                 "nvdec_emulation",
-                Renderer,
+                RendererAdvanced,
             ),
             fullscreen_mode: SwitchableSetting::ranged_with_options(
-                FullscreenMode::Exclusive,
+                if cfg!(target_os = "windows") {
+                    FullscreenMode::Borderless
+                } else {
+                    FullscreenMode::Exclusive
+                },
                 FullscreenMode::Borderless,
                 FullscreenMode::Exclusive,
                 "fullscreen_mode",
@@ -782,7 +963,7 @@ impl Default for Values {
                 true,
             ),
             fsr_sharpening_slider: SwitchableSetting::ranged_with_options(
-                25,
+                if cfg!(target_os = "android") { 0 } else { 25 },
                 0,
                 200,
                 "fsr_sharpening_slider",
@@ -819,9 +1000,13 @@ impl Default for Values {
 
             // Renderer Advanced
             gpu_accuracy: SwitchableSetting::ranged_with_options(
+                if cfg!(target_os = "android") {
+                    GpuAccuracy::Low
+                } else {
+                    GpuAccuracy::High
+                },
+                GpuAccuracy::Low,
                 GpuAccuracy::High,
-                GpuAccuracy::Normal,
-                GpuAccuracy::Extreme,
                 "gpu_accuracy",
                 RendererAdvanced,
                 Specialization::DEFAULT,
@@ -829,6 +1014,16 @@ impl Default for Values {
                 true,
             ),
             current_gpu_accuracy: GpuAccuracy::High,
+            dma_accuracy: SwitchableSetting::ranged_with_options(
+                DmaAccuracy::Default,
+                DmaAccuracy::Default,
+                DmaAccuracy::Safe,
+                "dma_accuracy",
+                RendererAdvanced,
+                Specialization::DEFAULT,
+                true,
+                true,
+            ),
             gpu_fence_behavior: SwitchableSetting::ranged_with_options(
                 GpuFenceBehavior::Default,
                 GpuFenceBehavior::Default,
@@ -839,10 +1034,24 @@ impl Default for Values {
                 true,
                 true,
             ),
+            frame_pacing_mode: SwitchableSetting::ranged_with_options(
+                FramePacingMode::Target_Auto,
+                FramePacingMode::Target_Auto,
+                FramePacingMode::Target_120,
+                "frame_pacing_mode",
+                RendererAdvanced,
+                Specialization::DEFAULT,
+                true,
+                true,
+            ),
             max_anisotropy: SwitchableSetting::ranged(
+                if cfg!(target_os = "android") {
+                    AnisotropyMode::Default
+                } else {
+                    AnisotropyMode::Automatic
+                },
                 AnisotropyMode::Automatic,
-                AnisotropyMode::Automatic,
-                AnisotropyMode::X16,
+                AnisotropyMode::None,
                 "max_anisotropy",
                 RendererAdvanced,
             ),
@@ -860,10 +1069,13 @@ impl Default for Values {
                 "vram_usage_mode",
                 RendererAdvanced,
             ),
-            async_presentation: SwitchableSetting::new(
-                cfg!(target_os = "android"),
-                "async_presentation",
+            sync_memory_operations: SwitchableSetting::with_options(
+                false,
+                "sync_memory_operations",
                 RendererAdvanced,
+                Specialization::DEFAULT,
+                true,
+                true,
             ),
             renderer_force_max_clock: SwitchableSetting::new(
                 false,
@@ -871,19 +1083,14 @@ impl Default for Values {
                 RendererAdvanced,
             ),
             use_reactive_flushing: SwitchableSetting::new(
-                true,
+                !cfg!(target_os = "android"),
                 "use_reactive_flushing",
                 RendererAdvanced,
             ),
-            use_asynchronous_shaders: SwitchableSetting::new(
-                false,
-                "use_asynchronous_shaders",
-                RendererAdvanced,
-            ),
-            use_fast_gpu_time: SwitchableSetting::with_options(
-                true,
-                "use_fast_gpu_time",
-                RendererAdvanced,
+            gpu_clock: SwitchableSetting::with_options(
+                GpuClock::Boost,
+                "fast_gpu_time",
+                System,
                 Specialization::DEFAULT,
                 true,
                 true,
@@ -910,6 +1117,88 @@ impl Default for Values {
                 true,
                 "barrier_feedback_loops",
                 RendererAdvanced,
+            ),
+            enable_buffer_history: SwitchableSetting::with_options(
+                false,
+                "enable_buffer_history",
+                RendererAdvanced,
+                Specialization::DEFAULT,
+                true,
+                true,
+            ),
+            enable_gpu_buffer_readback: SwitchableSetting::with_options(
+                false,
+                "enable_gpu_buffer_readback",
+                RendererAdvanced,
+                Specialization::DEFAULT,
+                true,
+                true,
+            ),
+
+            // Renderer Hacks
+            skip_cpu_inner_invalidation: SwitchableSetting::with_options(
+                false,
+                "skip_cpu_inner_invalidation",
+                RendererHacks,
+                Specialization::DEFAULT,
+                true,
+                true,
+            ),
+            async_presentation: SwitchableSetting::new(false, "async_presentation", RendererHacks),
+            fix_bloom_effects: SwitchableSetting::new(false, "fix_bloom_effects", RendererHacks),
+            emulate_bgr565: SwitchableSetting::new(false, "emulate_bgr565", RendererHacks),
+            rescale_hack: SwitchableSetting::new(
+                cfg!(target_os = "android"),
+                "rescale_hack",
+                RendererHacks,
+            ),
+            use_asynchronous_shaders: SwitchableSetting::new(
+                false,
+                "use_asynchronous_shaders",
+                RendererHacks,
+            ),
+            gpu_unswizzle_texture_size: SwitchableSetting::new(
+                GpuUnswizzleSize::Large,
+                "gpu_unswizzle_texture_size",
+                RendererHacks,
+            ),
+            gpu_unswizzle_stream_size: SwitchableSetting::new(
+                GpuUnswizzle::Medium,
+                "gpu_unswizzle_stream_size",
+                RendererHacks,
+            ),
+            gpu_unswizzle_chunk_size: SwitchableSetting::new(
+                GpuUnswizzleChunk::Medium,
+                "gpu_unswizzle_chunk_size",
+                RendererHacks,
+            ),
+            gpu_unswizzle_enabled: SwitchableSetting::new(
+                false,
+                "gpu_unswizzle_enabled",
+                RendererHacks,
+            ),
+
+            // Renderer Extensions
+            dyna_state: SwitchableSetting::new(
+                if cfg!(any(target_os = "android", target_os = "macos")) {
+                    ExtendedDynamicState::Disabled
+                } else {
+                    ExtendedDynamicState::EDS2
+                },
+                "dyna_state",
+                RendererExtensions,
+            ),
+            sample_shading: SwitchableSetting::ranged(
+                0,
+                0,
+                100,
+                "sample_shading_fraction",
+                RendererExtensions,
+            ),
+            vertex_input_dynamic_state: SwitchableSetting::new(
+                !cfg!(target_os = "android"),
+                "vertex_input_dynamic_state",
+                RendererExtensions,
             ),
 
             // Renderer Debug
@@ -1134,12 +1423,19 @@ impl Default for Values {
             record_frame_times: false,
             use_gdbstub: Setting::new(false, "use_gdbstub", Debugging),
             gdbstub_port: Setting::new(6543, "gdbstub_port", Debugging),
-            program_args: Setting::new(String::new(), "program_args", Debugging),
+            program_args: SwitchableSetting::with_options(
+                String::new(),
+                "program_args",
+                System,
+                Specialization::DEFAULT,
+                true,
+                false,
+            ),
             dump_exefs: Setting::new(false, "dump_exefs", Debugging),
             dump_nso: Setting::new(false, "dump_nso", Debugging),
-            dump_shaders: Setting::with_options(
+            dump_guest_shaders: Setting::with_options(
                 false,
-                "dump_shaders",
+                "dump_guest_shaders",
                 DebuggingGraphics,
                 Specialization::DEFAULT,
                 false,
@@ -1187,15 +1483,19 @@ impl Default for Values {
 
             // Miscellaneous
             log_filter: Setting::new("*:Info".to_string(), "log_filter", Miscellaneous),
-            use_dev_keys: Setting::new(false, "use_dev_keys", Miscellaneous),
+            use_dev_keys: Setting::new(false, "use_dev_keys", Debugging),
 
             // Network
             network_interface: Setting::new(String::new(), "network_interface", Network),
+            airplane_mode: SwitchableSetting::new(false, "airplane_mode", Network),
 
             // WebService
             enable_telemetry: Setting::new(true, "enable_telemetry", WebService),
             web_api_url: Setting::new(
-                "https://api.yuzu-emu.org".to_string(),
+                // Eden's announce host, verbatim from upstream
+                // common/settings.h: `web_api_url{linkage, "api.ynet-fun.xyz", ...}`.
+                // yuzu's api.yuzu-emu.org no longer answers.
+                "api.ynet-fun.xyz".to_string(),
                 "web_api_url",
                 WebService,
             ),
@@ -1204,6 +1504,9 @@ impl Default for Values {
 
             // Add-Ons
             disabled_addons: HashMap::new(),
+
+            // Per-game overrides
+            use_squashed_iterated_blend: false,
 
             // Extra
             title_id: 0,
@@ -1220,15 +1523,19 @@ pub fn update_gpu_accuracy(values: &mut Values) {
     values.current_gpu_accuracy = *values.gpu_accuracy.get_value();
 }
 
-/// Returns true if GPU accuracy is Extreme.
-pub fn is_gpu_level_extreme(values: &Values) -> bool {
-    values.current_gpu_accuracy == GpuAccuracy::Extreme
+/// Returns true if GPU accuracy is High.
+pub fn is_gpu_level_high(values: &Values) -> bool {
+    values.current_gpu_accuracy == GpuAccuracy::High
 }
 
-/// Returns true if GPU accuracy is High or Extreme.
-pub fn is_gpu_level_high(values: &Values) -> bool {
-    values.current_gpu_accuracy == GpuAccuracy::Extreme
-        || values.current_gpu_accuracy == GpuAccuracy::High
+/// Eden `Settings::IsDMALevelDefault`.
+pub fn is_dma_level_default(values: &Values) -> bool {
+    *values.dma_accuracy.get_value() == DmaAccuracy::Default
+}
+
+/// Eden `Settings::IsDMALevelSafe`.
+pub fn is_dma_level_safe(values: &Values) -> bool {
+    *values.dma_accuracy.get_value() == DmaAccuracy::Safe
 }
 
 pub fn is_gpu_fence_behavior_default(values: &Values) -> bool {
@@ -1247,11 +1554,47 @@ pub fn is_gpu_fence_behavior_strict(values: &Values) -> bool {
     *values.gpu_fence_behavior.get_value() == GpuFenceBehavior::Strict
 }
 
+/// Upstream `Settings::IsOpenGL()`.
+pub fn is_opengl() -> bool {
+    matches!(
+        *values().renderer_backend.get_value(),
+        RendererBackend::OpenGlGlsl | RendererBackend::OpenGlGlasm | RendererBackend::OpenGlSpirV
+    )
+}
+
 /// Returns true if fastmem is effectively enabled.
 pub fn is_fastmem_enabled(values: &Values) -> bool {
     if *values.cpu_debug_mode.get_value() {
-        *values.cpuopt_fastmem.get_value()
-    } else {
+        return *values.cpuopt_fastmem.get_value();
+    }
+    if *values.cpu_accuracy.get_value() == CpuAccuracy::Unsafe {
+        return *values.cpuopt_unsafe_host_mmu.get_value();
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+    {
+        // Eden supports host-MMU fastmem on Linux/AArch64 only with 4 KiB
+        // host pages.
+        return unsafe { libc::getpagesize() == 4096 };
+    }
+    #[cfg(not(any(
+        target_vendor = "apple",
+        target_os = "android",
+        target_os = "windows",
+        target_os = "linux",
+        target_os = "freebsd"
+    )))]
+    {
+        return false;
+    }
+    #[cfg(any(
+        target_vendor = "apple",
+        target_os = "android",
+        target_os = "windows",
+        all(target_os = "linux", not(target_arch = "aarch64")),
+        target_os = "freebsd"
+    ))]
+    {
         true
     }
 }
@@ -1298,6 +1641,11 @@ pub fn volume(values: &Values) -> f32 {
 pub fn translate_resolution_info(setup: ResolutionSetup, info: &mut ResolutionScalingInfo) {
     info.downscale = false;
     match setup {
+        ResolutionSetup::Res1_4X => {
+            info.up_scale = 1;
+            info.down_shift = 2;
+            info.downscale = true;
+        }
         ResolutionSetup::Res1_2X => {
             info.up_scale = 1;
             info.down_shift = 1;
@@ -1311,6 +1659,10 @@ pub fn translate_resolution_info(setup: ResolutionSetup, info: &mut ResolutionSc
         ResolutionSetup::Res1X => {
             info.up_scale = 1;
             info.down_shift = 0;
+        }
+        ResolutionSetup::Res5_4X => {
+            info.up_scale = 5;
+            info.down_shift = 2;
         }
         ResolutionSetup::Res3_2X => {
             info.up_scale = 3;
@@ -1356,12 +1708,66 @@ pub fn update_rescaling_info(values: &mut Values) {
     translate_resolution_info(setup, &mut values.resolution_info);
 }
 
+/// Return the active speed percentage selected by `current_speed_mode`.
+/// This is Eden `Settings::SpeedLimit`.
+pub fn speed_limit() -> u16 {
+    let values = values();
+    speed_limit_for_mode(
+        *values.current_speed_mode.get_value(),
+        *values.speed_limit.get_value(),
+        *values.turbo_speed_limit.get_value(),
+        *values.slow_speed_limit.get_value(),
+    )
+}
+
+fn speed_limit_for_mode(mode: SpeedMode, standard: u16, turbo: u16, slow: u16) -> u16 {
+    match mode {
+        SpeedMode::Standard => standard,
+        SpeedMode::Turbo => turbo,
+        SpeedMode::Slow => slow,
+    }
+}
+
+/// Select Eden's runtime speed mode. Slow and turbo always enable limiting.
+pub fn set_speed_mode(mode: SpeedMode) {
+    let mut values = values_mut();
+    values.current_speed_mode.set_value(mode);
+    if matches!(mode, SpeedMode::Turbo | SpeedMode::Slow) {
+        values.use_speed_limit.set_value(true);
+    }
+}
+
+pub fn toggle_standard_mode() {
+    let enabled = !*values().use_speed_limit.get_value();
+    values_mut().use_speed_limit.set_value(enabled);
+    set_speed_mode(SpeedMode::Standard);
+}
+
+pub fn toggle_turbo_mode() {
+    let next = if *values().current_speed_mode.get_value() == SpeedMode::Turbo {
+        SpeedMode::Standard
+    } else {
+        SpeedMode::Turbo
+    };
+    set_speed_mode(next);
+}
+
+pub fn toggle_slow_mode() {
+    let next = if *values().current_speed_mode.get_value() == SpeedMode::Slow {
+        SpeedMode::Standard
+    } else {
+        SpeedMode::Slow
+    };
+    set_speed_mode(next);
+}
+
 /// Restore all switchable settings to their global state.
 /// Should be called when a game is not running.
 pub fn restore_global_state(values: &mut Values, is_powered_on: bool) {
     if is_powered_on {
         return;
     }
+
     values.sink_id.set_global(true);
     values.audio_output_device_id.set_global(true);
     values.audio_input_device_id.set_global(true);
@@ -1371,11 +1777,18 @@ pub fn restore_global_state(values: &mut Values, is_powered_on: bool) {
     values.memory_layout_mode.set_global(true);
     values.use_speed_limit.set_global(true);
     values.speed_limit.set_global(true);
+    values.slow_speed_limit.set_global(true);
+    values.turbo_speed_limit.set_global(true);
+    values.sync_core_speed.set_global(true);
     values.cpu_backend.set_global(true);
     values.cpu_accuracy.set_global(true);
+    values.cpu_clock.set_global(true);
+    values.use_custom_cpu_ticks.set_global(true);
+    values.cpu_ticks.set_global(true);
     values.cpu_debug_mode.set_global(true);
     values.cpuopt_fastmem.set_global(true);
     values.cpuopt_fastmem_exclusives.set_global(true);
+    values.cpuopt_unsafe_host_mmu.set_global(true);
     values.cpuopt_unsafe_unfuse_fma.set_global(true);
     values.cpuopt_unsafe_reduce_fp_error.set_global(true);
     values.cpuopt_unsafe_ignore_standard_fpcr.set_global(true);
@@ -1383,7 +1796,6 @@ pub fn restore_global_state(values: &mut Values, is_powered_on: bool) {
     values.cpuopt_unsafe_fastmem_check.set_global(true);
     values.cpuopt_unsafe_ignore_global_monitor.set_global(true);
     values.renderer_backend.set_global(true);
-    values.shader_backend.set_global(true);
     values.vulkan_device.set_global(true);
     values.use_disk_shader_cache.set_global(true);
     values.use_asynchronous_gpu_emulation.set_global(true);
@@ -1400,19 +1812,35 @@ pub fn restore_global_state(values: &mut Values, is_powered_on: bool) {
     values.bg_green.set_global(true);
     values.bg_blue.set_global(true);
     values.gpu_accuracy.set_global(true);
+    values.dma_accuracy.set_global(true);
     values.gpu_fence_behavior.set_global(true);
+    values.frame_pacing_mode.set_global(true);
     values.max_anisotropy.set_global(true);
     values.astc_recompression.set_global(true);
     values.vram_usage_mode.set_global(true);
-    values.async_presentation.set_global(true);
+    values.sync_memory_operations.set_global(true);
     values.renderer_force_max_clock.set_global(true);
     values.use_reactive_flushing.set_global(true);
-    values.use_asynchronous_shaders.set_global(true);
-    values.use_fast_gpu_time.set_global(true);
+    values.gpu_clock.set_global(true);
     values.use_vulkan_driver_pipeline_cache.set_global(true);
     values.enable_compute_pipelines.set_global(true);
     values.use_video_framerate.set_global(true);
     values.barrier_feedback_loops.set_global(true);
+    values.enable_buffer_history.set_global(true);
+    values.enable_gpu_buffer_readback.set_global(true);
+    values.skip_cpu_inner_invalidation.set_global(true);
+    values.async_presentation.set_global(true);
+    values.fix_bloom_effects.set_global(true);
+    values.emulate_bgr565.set_global(true);
+    values.rescale_hack.set_global(true);
+    values.use_asynchronous_shaders.set_global(true);
+    values.gpu_unswizzle_texture_size.set_global(true);
+    values.gpu_unswizzle_stream_size.set_global(true);
+    values.gpu_unswizzle_chunk_size.set_global(true);
+    values.gpu_unswizzle_enabled.set_global(true);
+    values.dyna_state.set_global(true);
+    values.sample_shading.set_global(true);
+    values.vertex_input_dynamic_state.set_global(true);
     values.language_index.set_global(true);
     values.region_index.set_global(true);
     values.time_zone_index.set_global(true);
@@ -1422,10 +1850,25 @@ pub fn restore_global_state(values: &mut Values, is_powered_on: bool) {
     values.rng_seed_enabled.set_global(true);
     values.rng_seed.set_global(true);
     values.use_docked_mode.set_global(true);
+    values.program_args.set_global(true);
+    values.cabinet_applet_mode.set_global(true);
+    values.controller_applet_mode.set_global(true);
+    values.error_applet_mode.set_global(true);
+    values.player_select_applet_mode.set_global(true);
+    values.swkbd_applet_mode.set_global(true);
+    values.mii_edit_applet_mode.set_global(true);
+    values.web_applet_mode.set_global(true);
+    values.photo_viewer_applet_mode.set_global(true);
+    values.offline_web_applet_mode.set_global(true);
+    values.enable_overlay.set_global(true);
+    values.airplane_mode.set_global(true);
     values.enable_gamemode.set_global(true);
     values.vibration_enabled.set_global(true);
     values.enable_accurate_vibrations.set_global(true);
     values.motion_enabled.set_global(true);
+
+    // Reset per-game flags, matching `Settings::RestoreGlobalState`.
+    values.use_squashed_iterated_blend = false;
 }
 
 static CONFIGURING_GLOBAL: AtomicBool = AtomicBool::new(true);
@@ -1450,7 +1893,6 @@ pub fn log_settings(values: &Values) {
         "  renderer_backend: {:?}",
         values.renderer_backend.get_value()
     );
-    info!("  shader_backend: {:?}", values.shader_backend.get_value());
     info!("  vulkan_device: {}", values.vulkan_device.get_value());
     info!("  gpu_accuracy: {:?}", values.gpu_accuracy.get_value());
     info!(
@@ -1475,3 +1917,283 @@ pub fn log_settings(values: &Values) {
 
 /// The old `Settings` struct name -- now an alias to `Values`.
 pub type Settings = Values;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn visible_graphics_defaults_match_eden_settings_h() {
+        let values = Values::default();
+
+        assert_eq!(
+            *values.renderer_backend.get_value(),
+            if cfg!(target_os = "solaris") {
+                RendererBackend::OpenGlGlsl
+            } else {
+                RendererBackend::Vulkan
+            }
+        );
+        assert_eq!(*values.vulkan_device.get_value(), 0);
+        assert_eq!(*values.resolution_setup.get_value(), ResolutionSetup::Res1X);
+        assert_eq!(*values.vsync_mode.get_value(), VSyncMode::Fifo);
+        assert_eq!(*values.scaling_filter.get_value(), ScalingFilter::Bilinear);
+        assert_eq!(
+            *values.fsr_sharpening_slider.get_value(),
+            if cfg!(target_os = "android") { 0 } else { 25 }
+        );
+        assert_eq!(*values.aspect_ratio.get_value(), AspectRatio::R16_9);
+        assert_eq!(*values.anti_aliasing.get_value(), AntiAliasing::None);
+        assert_eq!(
+            *values.use_asynchronous_gpu_emulation.get_value(),
+            !cfg!(target_os = "android")
+        );
+        assert_eq!(
+            *values.fullscreen_mode.get_value(),
+            if cfg!(target_os = "windows") {
+                FullscreenMode::Borderless
+            } else {
+                FullscreenMode::Exclusive
+            }
+        );
+        assert_eq!(
+            (
+                *values.bg_red.get_value(),
+                *values.bg_green.get_value(),
+                *values.bg_blue.get_value(),
+            ),
+            (0, 0, 0)
+        );
+
+        assert_eq!(
+            *values.gpu_accuracy.get_value(),
+            if cfg!(target_os = "android") {
+                GpuAccuracy::Low
+            } else {
+                GpuAccuracy::High
+            }
+        );
+        assert_eq!(*values.dma_accuracy.get_value(), DmaAccuracy::Default);
+        assert_eq!(
+            *values.gpu_fence_behavior.get_value(),
+            GpuFenceBehavior::Default
+        );
+        assert_eq!(
+            *values.vram_usage_mode.get_value(),
+            VramUsageMode::Conservative
+        );
+        assert_eq!(*values.nvdec_emulation.get_value(), NvdecEmulation::Gpu);
+        assert_eq!(
+            *values.max_anisotropy.get_value(),
+            if cfg!(target_os = "android") {
+                AnisotropyMode::Default
+            } else {
+                AnisotropyMode::Automatic
+            }
+        );
+        assert_eq!(*values.accelerate_astc.get_value(), AstcDecodeMode::Gpu);
+        assert_eq!(
+            *values.frame_pacing_mode.get_value(),
+            FramePacingMode::Target_Auto
+        );
+        assert_eq!(
+            *values.astc_recompression.get_value(),
+            AstcRecompression::Uncompressed
+        );
+        assert!(!*values.sync_memory_operations.get_value());
+        assert!(!*values.renderer_force_max_clock.get_value());
+        assert!(*values.use_disk_shader_cache.get_value());
+        assert!(*values.use_vulkan_driver_pipeline_cache.get_value());
+        assert!(!*values.enable_compute_pipelines.get_value());
+        assert!(!*values.use_video_framerate.get_value());
+        assert_eq!(
+            *values.use_reactive_flushing.get_value(),
+            !cfg!(target_os = "android")
+        );
+        assert!(*values.barrier_feedback_loops.get_value());
+        assert!(!*values.enable_buffer_history.get_value());
+        assert!(!*values.enable_gpu_buffer_readback.get_value());
+
+        assert!(!*values.skip_cpu_inner_invalidation.get_value());
+        assert!(!*values.async_presentation.get_value());
+        assert!(!*values.fix_bloom_effects.get_value());
+        assert!(!*values.emulate_bgr565.get_value());
+        assert_eq!(
+            *values.rescale_hack.get_value(),
+            cfg!(target_os = "android")
+        );
+        assert!(!*values.use_asynchronous_shaders.get_value());
+        assert_eq!(
+            *values.gpu_unswizzle_texture_size.get_value(),
+            GpuUnswizzleSize::Large
+        );
+        assert_eq!(
+            *values.gpu_unswizzle_stream_size.get_value(),
+            GpuUnswizzle::Medium
+        );
+        assert_eq!(
+            *values.gpu_unswizzle_chunk_size.get_value(),
+            GpuUnswizzleChunk::Medium
+        );
+        assert!(!*values.gpu_unswizzle_enabled.get_value());
+
+        assert_eq!(
+            *values.dyna_state.get_value(),
+            if cfg!(any(target_os = "android", target_os = "macos")) {
+                ExtendedDynamicState::Disabled
+            } else {
+                ExtendedDynamicState::EDS2
+            }
+        );
+        assert_eq!(*values.sample_shading.get_value(), 0);
+        assert_eq!(
+            *values.vertex_input_dynamic_state.get_value(),
+            !cfg!(target_os = "android")
+        );
+    }
+
+    #[test]
+    fn gpu_level_high_only_matches_high() {
+        let mut values = Values::default();
+        values.current_gpu_accuracy = GpuAccuracy::High;
+        assert!(is_gpu_level_high(&values));
+
+        values.current_gpu_accuracy = GpuAccuracy::Low;
+        assert!(!is_gpu_level_high(&values));
+    }
+
+    #[test]
+    fn fastmem_enablement_matches_upstream_accuracy_switches() {
+        let mut values = Values::default();
+        values.cpu_debug_mode.set_value(false);
+        values.cpu_accuracy.set_value(CpuAccuracy::Unsafe);
+        values.cpuopt_unsafe_host_mmu.set_value(false);
+        assert!(!is_fastmem_enabled(&values));
+
+        values.cpuopt_unsafe_host_mmu.set_value(true);
+        assert!(is_fastmem_enabled(&values));
+
+        values.cpu_debug_mode.set_value(true);
+        values.cpuopt_fastmem.set_value(false);
+        assert!(!is_fastmem_enabled(&values));
+        values.cpuopt_fastmem.set_value(true);
+        assert!(is_fastmem_enabled(&values));
+    }
+
+    #[test]
+    fn update_gpu_accuracy_publishes_the_selected_level_to_the_gpu() {
+        let mut values = Values::default();
+        values.gpu_accuracy.set_value(GpuAccuracy::Low);
+        values.current_gpu_accuracy = GpuAccuracy::High;
+
+        update_gpu_accuracy(&mut values);
+
+        assert_eq!(values.current_gpu_accuracy, GpuAccuracy::Low);
+
+        values.gpu_accuracy.set_value(GpuAccuracy::High);
+        update_gpu_accuracy(&mut values);
+
+        assert_eq!(values.current_gpu_accuracy, GpuAccuracy::High);
+        assert!(is_gpu_level_high(&values));
+    }
+
+    #[test]
+    fn speed_limit_selects_the_active_eden_mode() {
+        assert_eq!(speed_limit_for_mode(SpeedMode::Standard, 100, 200, 50), 100);
+        assert_eq!(speed_limit_for_mode(SpeedMode::Turbo, 100, 200, 50), 200);
+        assert_eq!(speed_limit_for_mode(SpeedMode::Slow, 100, 200, 50), 50);
+    }
+
+    #[test]
+    fn update_rescaling_info_publishes_the_selected_resolution() {
+        let mut values = Values::default();
+        values.resolution_setup.set_value(ResolutionSetup::Res3_2X);
+
+        update_rescaling_info(&mut values);
+
+        assert_eq!(values.resolution_info.up_scale, 3);
+        assert_eq!(values.resolution_info.down_shift, 1);
+        assert_eq!(values.resolution_info.up_factor, 1.5);
+        assert!(values.resolution_info.active);
+    }
+
+    #[test]
+    fn resolution_setup_numeric_values_and_fractional_scales_match_upstream() {
+        assert_eq!(ResolutionSetup::Res1_4X as u32, 0);
+        assert_eq!(ResolutionSetup::Res1X as u32, 3);
+        assert_eq!(ResolutionSetup::Res5_4X as u32, 4);
+        assert_eq!(ResolutionSetup::Res8X as u32, 12);
+
+        let mut quarter = ResolutionScalingInfo::default();
+        translate_resolution_info(ResolutionSetup::Res1_4X, &mut quarter);
+        assert_eq!((quarter.up_scale, quarter.down_shift), (1, 2));
+        assert_eq!((quarter.up_factor, quarter.down_factor), (0.25, 4.0));
+        assert!(quarter.downscale);
+
+        let mut five_quarters = ResolutionScalingInfo::default();
+        translate_resolution_info(ResolutionSetup::Res5_4X, &mut five_quarters);
+        assert_eq!((five_quarters.up_scale, five_quarters.down_shift), (5, 2));
+        assert_eq!(
+            (five_quarters.up_factor, five_quarters.down_factor),
+            (1.25, 0.8)
+        );
+        assert!(!five_quarters.downscale);
+    }
+
+    #[test]
+    fn network_category_persists_interface_and_switchable_airplane_mode() {
+        let mut values = Values::default();
+        let mut labels = Vec::new();
+        let mut switchable = Vec::new();
+        values.for_each_setting_in_category_mut(Category::Network, |setting| {
+            labels.push(setting.label().to_string());
+            switchable.push(setting.switchable());
+        });
+        assert_eq!(labels, ["network_interface", "airplane_mode"]);
+        assert_eq!(switchable, [false, true]);
+    }
+
+    #[test]
+    fn library_applet_category_matches_upstream_switchability_and_defaults() {
+        let mut values = Values::default();
+        let mut entries = Vec::new();
+        values.for_each_setting_in_category_mut(Category::LibraryApplet, |setting| {
+            entries.push((setting.label().to_string(), setting.switchable()));
+        });
+        assert_eq!(entries.len(), 16);
+        for label in [
+            "cabinet_applet_mode",
+            "controller_applet_mode",
+            "error_applet_mode",
+            "player_select_applet_mode",
+            "swkbd_applet_mode",
+            "mii_edit_applet_mode",
+            "web_applet_mode",
+            "photo_viewer_applet_mode",
+            "offline_web_applet_mode",
+            "enable_overlay",
+        ] {
+            assert!(entries
+                .iter()
+                .any(|entry| entry == &(label.to_string(), true)));
+        }
+        for label in [
+            "data_erase_applet_mode",
+            "net_connect_applet_mode",
+            "shop_applet_mode",
+            "login_share_applet_mode",
+            "wifi_web_auth_applet_mode",
+            "my_page_applet_mode",
+        ] {
+            assert!(entries
+                .iter()
+                .any(|entry| entry == &(label.to_string(), false)));
+        }
+        assert_eq!(*values.net_connect_applet_mode.get_value(), AppletMode::LLE);
+        assert_eq!(
+            *values.player_select_applet_mode.get_value(),
+            AppletMode::LLE
+        );
+        assert_eq!(*values.swkbd_applet_mode.get_value(), AppletMode::HLE);
+    }
+}

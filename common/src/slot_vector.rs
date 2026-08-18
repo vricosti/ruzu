@@ -11,7 +11,13 @@ pub struct SlotId {
 }
 
 impl SlotId {
+    pub const TAGGED_MASK: u32 = 0x7fff_ffff;
+    pub const TAGGED_VALUE: u32 = 0x8000_0000;
     pub const INVALID_INDEX: u32 = u32::MAX;
+
+    pub const fn value(self) -> u32 {
+        self.index & !Self::TAGGED_VALUE
+    }
 
     pub const fn invalid() -> Self {
         Self {
@@ -68,7 +74,7 @@ impl<T> SlotVector<T> {
     /// Panics if the id is invalid or the slot is not occupied.
     pub fn get(&self, id: SlotId) -> &T {
         self.validate_index(id);
-        self.values[id.index as usize].as_ref().unwrap()
+        self.values[id.value() as usize].as_ref().unwrap()
     }
 
     /// Access an element mutably by its slot id.
@@ -77,7 +83,7 @@ impl<T> SlotVector<T> {
     /// Panics if the id is invalid or the slot is not occupied.
     pub fn get_mut(&mut self, id: SlotId) -> &mut T {
         self.validate_index(id);
-        self.values[id.index as usize].as_mut().unwrap()
+        self.values[id.value() as usize].as_mut().unwrap()
     }
 
     /// Insert a value and return its [`SlotId`].
@@ -90,9 +96,10 @@ impl<T> SlotVector<T> {
 
     /// Remove the value at `id`, freeing the slot for reuse.
     pub fn erase(&mut self, id: SlotId) {
-        self.values[id.index as usize] = None;
-        self.free_list.push(id.index);
-        self.reset_storage_bit(id.index);
+        let index = id.value();
+        self.values[index as usize] = None;
+        self.free_list.push(index);
+        self.reset_storage_bit(index);
     }
 
     /// Remove the value at `id` and return it, freeing the slot for reuse.
@@ -101,11 +108,12 @@ impl<T> SlotVector<T> {
     /// by `slot_buffers.erase(id)`.
     pub fn take(&mut self, id: SlotId) -> T {
         self.validate_index(id);
-        let value = self.values[id.index as usize]
+        let index = id.value();
+        let value = self.values[index as usize]
             .take()
             .expect("SlotVector::take called on empty slot");
-        self.free_list.push(id.index);
-        self.reset_storage_bit(id.index);
+        self.free_list.push(index);
+        self.reset_storage_bit(index);
         value
     }
 
@@ -120,7 +128,7 @@ impl<T> SlotVector<T> {
             return false;
         }
         self.values
-            .get(id.index as usize)
+            .get(id.value() as usize)
             .is_some_and(Option::is_some)
     }
 
@@ -162,8 +170,8 @@ impl<T> SlotVector<T> {
 
     fn validate_index(&self, id: SlotId) {
         debug_assert!(id.is_valid());
-        debug_assert!((id.index as usize / 64) < self.stored_bitset.len());
-        debug_assert!(self.read_storage_bit(id.index));
+        debug_assert!((id.value() as usize / 64) < self.stored_bitset.len());
+        debug_assert!(self.read_storage_bit(id.value()));
     }
 
     fn free_value_index(&mut self) -> u32 {
@@ -355,5 +363,20 @@ mod tests {
     fn test_slot_id_default() {
         let id = SlotId::default();
         assert!(!id.is_valid());
+    }
+
+    #[test]
+    fn tagged_slot_id_accesses_the_underlying_slot() {
+        let mut sv = SlotVector::new();
+        let id = sv.insert(10);
+        let tagged = SlotId {
+            index: id.index | SlotId::TAGGED_VALUE,
+        };
+
+        assert_eq!(tagged.value(), id.index);
+        assert!(sv.contains(tagged));
+        assert_eq!(sv[tagged], 10);
+        sv[tagged] = 20;
+        assert_eq!(sv[id], 20);
     }
 }

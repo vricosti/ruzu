@@ -11,11 +11,13 @@ use common::slot_vector::SlotId;
 use common::slot_vector::SlotVector;
 use common::types::VAddr;
 use smallvec::SmallVec;
+use std::ptr::NonNull;
 
 use super::buffer_base::BufferBase;
 use crate::control::channel_state::ChannelState;
 use crate::control::channel_state_cache::{ChannelCacheAccessor, ChannelInfo, FromChannelState};
 use crate::engines::maxwell_3d::{IndexFormat, PrimitiveTopology};
+use crate::surface::PixelFormat;
 
 // ---------------------------------------------------------------------------
 // Re-export BufferId
@@ -124,9 +126,7 @@ pub struct TextureBufferBinding {
     /// Buffer slot that backs this binding.
     pub buffer_id: BufferId,
     /// Pixel format of the texture buffer view.
-    /// Upstream: `PixelFormat format;` — stored as u32 here because callers pass
-    /// raw format IDs from the GPU engine which are u32 throughout the buffer cache.
-    pub format: u32,
+    pub format: PixelFormat,
 }
 
 impl Default for TextureBufferBinding {
@@ -135,7 +135,7 @@ impl Default for TextureBufferBinding {
             device_addr: 0,
             size: 0,
             buffer_id: NULL_BUFFER_ID,
-            format: 0,
+            format: PixelFormat::Invalid,
         }
     }
 }
@@ -213,16 +213,17 @@ pub struct BufferCacheChannelInfo {
     pub enabled_uniform_buffer_masks: [u32; NUM_STAGES as usize],
     pub enabled_compute_uniform_buffer_mask: u32,
 
-    // -- Uniform buffer sizes (pointers into engine state) --
-    // In Rust we use Option<&'static ...> or indices; for now use owned copies.
-    pub uniform_buffer_sizes: Option<Box<UniformBufferSizes>>,
-    pub compute_uniform_buffer_sizes: Option<Box<ComputeUniformBufferSizes>>,
+    // -- Uniform buffer sizes (non-owning pointers into stable pipeline state) --
+    pub uniform_buffer_sizes: Option<NonNull<UniformBufferSizes>>,
+    pub compute_uniform_buffer_sizes: Option<NonNull<ComputeUniformBufferSizes>>,
 
     // -- Storage buffer masks --
     pub enabled_storage_buffers: [u32; NUM_STAGES as usize],
     pub written_storage_buffers: [u32; NUM_STAGES as usize],
     pub enabled_compute_storage_buffers: u32,
     pub written_compute_storage_buffers: u32,
+    pub total_graphics_storage_buffers: u32,
+    pub total_compute_storage_buffers: u32,
 
     // -- Texture buffer masks --
     pub enabled_texture_buffers: [u32; NUM_STAGES as usize],
@@ -233,8 +234,8 @@ pub struct BufferCacheChannelInfo {
     pub image_compute_texture_buffers: u32,
 
     // -- Uniform cache statistics --
-    pub uniform_cache_hits: [u32; 16],
-    pub uniform_cache_shots: [u32; 16],
+    pub uniform_cache_hits: [u32; NUM_GRAPHICS_UNIFORM_BUFFERS as usize],
+    pub uniform_cache_shots: [u32; NUM_GRAPHICS_UNIFORM_BUFFERS as usize],
 
     /// Size threshold for uniform buffer skip-cache.
     pub uniform_buffer_skip_cache_size: u32,
@@ -294,6 +295,8 @@ impl BufferCacheChannelInfo {
             written_storage_buffers: [0; NUM_STAGES as usize],
             enabled_compute_storage_buffers: 0,
             written_compute_storage_buffers: 0,
+            total_graphics_storage_buffers: 0,
+            total_compute_storage_buffers: 0,
 
             enabled_texture_buffers: [0; NUM_STAGES as usize],
             written_texture_buffers: [0; NUM_STAGES as usize],
@@ -302,8 +305,8 @@ impl BufferCacheChannelInfo {
             written_compute_texture_buffers: 0,
             image_compute_texture_buffers: 0,
 
-            uniform_cache_hits: [0; 16],
-            uniform_cache_shots: [0; 16],
+            uniform_cache_hits: [0; NUM_GRAPHICS_UNIFORM_BUFFERS as usize],
+            uniform_cache_shots: [0; NUM_GRAPHICS_UNIFORM_BUFFERS as usize],
 
             uniform_buffer_skip_cache_size: DEFAULT_SKIP_CACHE_SIZE,
 
@@ -360,6 +363,13 @@ impl ChannelCacheAccessor for BufferCacheChannelInfo {
 /// implementation of this trait, supplying its buffer type, runtime,
 /// and various capability flags.
 pub trait BufferCacheParams {
+    /// Backend runtime, matching `P::Runtime` upstream.
+    type Runtime: BufferCacheRuntime<Buffer = Self::Buffer, AsyncBuffer = Self::AsyncBuffer>;
+    /// Backend buffer, matching `P::Buffer` upstream.
+    type Buffer: BufferCacheBuffer<Runtime = Self::Runtime>;
+    /// Backend staging allocation, matching `P::Async_Buffer` upstream.
+    type AsyncBuffer: BufferCacheAsyncBuffer;
+
     /// Whether this is the OpenGL backend.
     const IS_OPENGL: bool;
     /// Whether persistent uniform buffer bindings are supported.
@@ -376,6 +386,48 @@ pub trait BufferCacheParams {
     const SEPARATE_IMAGE_BUFFER_BINDINGS: bool;
     /// Whether memory maps are used for uploads.
     const USE_MEMORY_MAPS_FOR_UPLOADS: bool;
+}
+
+/// Backend buffer interface required by the common `BufferCache<P>` template.
+///
+/// The concrete OpenGL and Vulkan objects own their API handles and backend
+/// state. `Deref<Target = BufferBase>` preserves the inheritance relationship
+/// from the C++ port without moving backend state into the common base.
+pub trait BufferCacheBuffer:
+    std::ops::Deref<Target = BufferBase> + std::ops::DerefMut<Target = BufferBase> + Sized
+{
+    type Runtime: BufferCacheRuntime<Buffer = Self>;
+
+    fn null(runtime: &mut Self::Runtime, params: super::buffer_base::NullBufferParams) -> Self;
+    fn new(runtime: &mut Self::Runtime, cpu_addr: VAddr, size_bytes: u64) -> Self;
+
+    fn immediate_upload(&self, offset: u64, data: &[u8]);
+    fn immediate_download(&self, offset: u64, data: &mut [u8]);
+
+    /// Backend API handle used by same-backend rasterizer helpers.
+    fn raw_handle(&self) -> u64;
+
+    /// Backend-specific usage tracking. OpenGL intentionally implements these
+    /// as no-ops; Vulkan owns the range tracker on its concrete `Buffer`.
+    fn mark_usage(&mut self, _offset: u64, _size: u64) {}
+    fn is_region_used(&self, _offset: u64, _size: u64) -> bool {
+        false
+    }
+    fn reset_usage_tracking(&mut self) {}
+    fn last_usage_tick(&self) -> u64 {
+        0
+    }
+}
+
+/// Common accessors used by `BufferCache<P>` for the backend-specific staging
+/// type selected by `P::Async_Buffer` upstream.
+pub trait BufferCacheAsyncBuffer: Sized {
+    fn offset(&self) -> u64;
+    fn mapped_span(&self) -> &[u8];
+    fn mapped_span_mut(&mut self) -> &mut [u8];
+
+    #[cfg(test)]
+    fn empty_for_test() -> Self;
 }
 
 // ---------------------------------------------------------------------------
@@ -434,7 +486,7 @@ pub struct StagingBufferRef {
     pub buffer: BufferId,
     /// Backend-native buffer handle used by runtimes whose staging buffers do not
     /// live in the generic slot vector.
-    pub gpu_handle: u32,
+    pub gpu_handle: u64,
     /// Offset within the staging buffer.
     pub offset: u64,
     /// Index in the backend staging allocation pool.
@@ -466,7 +518,7 @@ impl StagingBufferRef {
     /// `mapped_ptr` and `sync`, matching upstream `StagingBufferMap`.
     pub unsafe fn from_mapped_backend(
         buffer: BufferId,
-        gpu_handle: u32,
+        gpu_handle: u64,
         offset: u64,
         index: usize,
         mapped_ptr: *mut u8,
@@ -530,6 +582,25 @@ impl Drop for StagingBufferRef {
     }
 }
 
+impl BufferCacheAsyncBuffer for StagingBufferRef {
+    fn offset(&self) -> u64 {
+        self.offset
+    }
+
+    fn mapped_span(&self) -> &[u8] {
+        StagingBufferRef::mapped_span(self)
+    }
+
+    fn mapped_span_mut(&mut self) -> &mut [u8] {
+        StagingBufferRef::mapped_span_mut(self)
+    }
+
+    #[cfg(test)]
+    fn empty_for_test() -> Self {
+        StagingBufferRef::host(0)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // BufferCacheRuntime trait — the Runtime template parameter interface
 // ---------------------------------------------------------------------------
@@ -543,19 +614,15 @@ impl Drop for StagingBufferRef {
 /// Method signatures are derived from the union of methods called on `runtime`
 /// in upstream `buffer_cache.h` (template method implementations).
 pub trait BufferCacheRuntime {
-    /// Initialize backend-specific buffer state after the backend handle is
-    /// created.
-    ///
-    /// Upstream OpenGL performs this in `OpenGL::Buffer::Buffer(runtime, ...)`,
-    /// including bindless GPU-address discovery.
-    fn initialize_backend_buffer(&mut self, _buffer: &mut BufferBase) {}
+    type Buffer: BufferCacheBuffer<Runtime = Self>;
+    type AsyncBuffer: BufferCacheAsyncBuffer;
 
     // -- Frame lifecycle --
 
     /// Called once per frame to allow the runtime to reclaim resources.
     ///
     /// Upstream: `Runtime::TickFrame(SlotVector<Buffer>&)`
-    fn tick_frame(&mut self);
+    fn tick_frame(&mut self, slot_buffers: &mut SlotVector<Self::Buffer>);
 
     /// Whether the runtime can report actual device memory usage.
     ///
@@ -600,22 +667,22 @@ pub trait BufferCacheRuntime {
     /// Allocate a staging buffer for CPU→GPU upload.
     ///
     /// Upstream: `Runtime::UploadStagingBuffer(size)`
-    fn upload_staging_buffer(&mut self, size: u64) -> StagingBufferRef;
+    fn upload_staging_buffer(&mut self, size: u64) -> Self::AsyncBuffer;
 
     /// Allocate a staging buffer for GPU→CPU download.
     ///
     /// Upstream: `Runtime::DownloadStagingBuffer(size, deferred)`
-    fn download_staging_buffer(&mut self, size: u64, deferred: bool) -> StagingBufferRef;
+    fn download_staging_buffer(&mut self, size: u64, deferred: bool) -> Self::AsyncBuffer;
 
     /// Free a deferred staging buffer.
     ///
     /// Upstream: `Runtime::FreeDeferredStagingBuffer(ref)`
-    fn free_deferred_staging_buffer(&mut self, buffer: &mut StagingBufferRef);
+    fn free_deferred_staging_buffer(&mut self, buffer: &mut Self::AsyncBuffer);
 
     /// Whether uploads to `buffer` with given `copies` can be reordered.
     ///
     /// Upstream: `Runtime::CanReorderUpload(buffer, copies)`
-    fn can_reorder_upload(&self, buffer_id: BufferId, copies: &[BufferCopy]) -> bool;
+    fn can_reorder_upload(&self, buffer: &Self::Buffer, copies: &[BufferCopy]) -> bool;
 
     // -- Copy / Clear --
 
@@ -634,26 +701,38 @@ pub trait BufferCacheRuntime {
     /// Upstream: `Runtime::CopyBuffer(dst, src, copies, barrier, can_reorder_upload)`
     fn copy_buffer(
         &mut self,
-        dst_buffer: BufferId,
-        dst_gpu_handle: u32,
-        src_buffer: BufferId,
-        src_gpu_handle: u32,
+        dst_buffer: &Self::Buffer,
+        src_buffer: &Self::Buffer,
         copies: &[BufferCopy],
         barrier: bool,
         can_reorder_upload: bool,
     );
 
+    /// Copy from a backend staging allocation into a cached buffer. This is a
+    /// named Rust counterpart of the C++ `CopyBuffer(Buffer&, APIHandle, ...)`
+    /// overload selected by the template.
+    fn copy_buffer_from_staging(
+        &mut self,
+        dst_buffer: &Self::Buffer,
+        src_buffer: &Self::AsyncBuffer,
+        copies: &[BufferCopy],
+        barrier: bool,
+        can_reorder_upload: bool,
+    );
+
+    /// Copy from a cached buffer into a backend staging allocation.
+    fn copy_buffer_to_staging(
+        &mut self,
+        dst_buffer: &Self::AsyncBuffer,
+        src_buffer: &Self::Buffer,
+        copies: &[BufferCopy],
+        barrier: bool,
+    );
+
     /// Clear a buffer region to a uniform value.
     ///
     /// Upstream: `Runtime::ClearBuffer(buffer, offset, size, value)`
-    fn clear_buffer(
-        &mut self,
-        buffer: BufferId,
-        gpu_handle: u32,
-        offset: u32,
-        size: u64,
-        value: u32,
-    );
+    fn clear_buffer(&mut self, buffer: &Self::Buffer, offset: u32, size: u64, value: u32);
 
     // -- Index buffer binding --
 
@@ -667,7 +746,7 @@ pub trait BufferCacheRuntime {
         index_format: IndexFormat,
         base_vertex: u32,
         num_indices: u32,
-        buffer: &mut BufferBase,
+        buffer: &mut Self::Buffer,
         offset: u32,
         size: u32,
     );
@@ -687,13 +766,6 @@ pub trait BufferCacheRuntime {
         0
     }
 
-    /// Resolve a backend buffer handle into the raw API object consumed by
-    /// same-backend subsystems. Vulkan uses this to convert the backend handle
-    /// stored in `BufferBase::gpu_handle` into the real `VkBuffer`.
-    fn resolve_backend_buffer_raw(&self, gpu_handle: u32) -> u64 {
-        gpu_handle as u64
-    }
-
     // -- Vertex buffer binding --
 
     /// Bind vertex buffers collected in `HostBindings`.
@@ -704,7 +776,7 @@ pub trait BufferCacheRuntime {
     fn bind_vertex_buffers(
         &mut self,
         bindings: &HostBindings,
-        buffers: &mut SlotVector<BufferBase>,
+        buffers: &mut SlotVector<Self::Buffer>,
     );
 
     // -- Uniform buffer binding (graphics) --
@@ -717,8 +789,7 @@ pub trait BufferCacheRuntime {
         &mut self,
         stage: usize,
         binding_index: u32,
-        buffer: BufferId,
-        gpu_handle: u32,
+        buffer: &mut Self::Buffer,
         offset: u32,
         size: u32,
     );
@@ -749,6 +820,16 @@ pub trait BufferCacheRuntime {
     /// and bindless program-local parameters for GLASM when necessary.
     fn set_enable_storage_buffers(&mut self, _enable: bool) {}
 
+    /// Vulkan driver workaround from `BufferCacheRuntime` upstream. Backends
+    /// without the named methods take the `if constexpr`-absent path.
+    fn should_limit_dynamic_storage_buffers(&self) -> bool {
+        false
+    }
+
+    fn max_dynamic_storage_buffers(&self) -> u32 {
+        u32::MAX
+    }
+
     // -- Storage buffer binding (graphics) --
 
     /// Bind a graphics-stage storage buffer.
@@ -759,7 +840,7 @@ pub trait BufferCacheRuntime {
         &mut self,
         stage: usize,
         binding_index: u32,
-        buffer: &mut BufferBase,
+        buffer: &mut Self::Buffer,
         offset: u32,
         size: u32,
         is_written: bool,
@@ -772,11 +853,10 @@ pub trait BufferCacheRuntime {
     /// Upstream: `Runtime::BindTextureBuffer(buffer, offset, size, format)`
     fn bind_texture_buffer(
         &mut self,
-        buffer: BufferId,
-        gpu_handle: u32,
+        buffer: &mut Self::Buffer,
         offset: u32,
         size: u32,
-        format: u32,
+        format: PixelFormat,
     );
 
     /// Bind an image buffer view (separate from texture on some backends).
@@ -784,11 +864,10 @@ pub trait BufferCacheRuntime {
     /// Upstream: `Runtime::BindImageBuffer(buffer, offset, size, format)`
     fn bind_image_buffer(
         &mut self,
-        buffer: BufferId,
-        gpu_handle: u32,
+        buffer: &mut Self::Buffer,
         offset: u32,
         size: u32,
-        format: u32,
+        format: PixelFormat,
     );
 
     // -- Transform feedback --
@@ -799,7 +878,7 @@ pub trait BufferCacheRuntime {
     fn bind_transform_feedback_buffers(
         &mut self,
         bindings: &HostBindings,
-        buffers: &mut SlotVector<BufferBase>,
+        buffers: &mut SlotVector<Self::Buffer>,
     );
 
     /// Create and bind the backend transform-feedback object associated with
@@ -812,7 +891,7 @@ pub trait BufferCacheRuntime {
     /// address.
     ///
     /// Upstream OpenGL: `BufferCacheRuntime::GetTransformFeedbackObject`.
-    fn get_transform_feedback_object(&self, _tfb_object_addr: u64) -> u32 {
+    fn get_transform_feedback_object(&mut self, _tfb_object_addr: u64) -> u32 {
         0
     }
 
@@ -824,8 +903,7 @@ pub trait BufferCacheRuntime {
     fn bind_compute_uniform_buffer(
         &mut self,
         binding_index: u32,
-        buffer: BufferId,
-        gpu_handle: u32,
+        buffer: &mut Self::Buffer,
         offset: u32,
         size: u32,
     );
@@ -836,7 +914,7 @@ pub trait BufferCacheRuntime {
     fn bind_compute_storage_buffer(
         &mut self,
         binding_index: u32,
-        buffer: &mut BufferBase,
+        buffer: &mut Self::Buffer,
         offset: u32,
         size: u32,
         is_written: bool,
@@ -856,6 +934,13 @@ pub trait BufferCacheRuntime {
     /// Upstream (OpenGL): `Runtime::SupportsNonZeroUniformOffset()`
     fn supports_non_zero_uniform_offset(&self) -> bool {
         true
+    }
+
+    /// Required alignment for host uniform-buffer offsets.
+    ///
+    /// Upstream (Vulkan): `Runtime::GetUniformBufferAlignment()`.
+    fn uniform_buffer_alignment(&self) -> u32 {
+        1
     }
 
     /// Bind a fast uniform buffer (OpenGL assembly shader path).
@@ -879,6 +964,320 @@ pub trait BufferCacheRuntime {
         _write: &mut dyn FnMut(&mut [u8]),
     ) -> bool {
         false
+    }
+}
+
+// Test-only concrete specialization of the upstream BufferCache template. It
+// keeps backend state on the concrete buffer, so unit tests exercise the same
+// ownership shape as the OpenGL and Vulkan specializations without requiring a
+// graphics context.
+#[cfg(test)]
+pub(crate) struct TestBuffer {
+    base: BufferBase,
+    storage: parking_lot::Mutex<Vec<u8>>,
+    tracker: super::usage_tracker::UsageTracker,
+    last_usage_tick: u64,
+}
+
+#[cfg(test)]
+impl std::ops::Deref for TestBuffer {
+    type Target = BufferBase;
+
+    fn deref(&self) -> &Self::Target {
+        &self.base
+    }
+}
+
+#[cfg(test)]
+impl std::ops::DerefMut for TestBuffer {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.base
+    }
+}
+
+#[cfg(test)]
+impl BufferCacheBuffer for TestBuffer {
+    type Runtime = TestBufferCacheRuntime;
+
+    fn null(_runtime: &mut Self::Runtime, params: super::buffer_base::NullBufferParams) -> Self {
+        Self {
+            base: BufferBase::null(params),
+            storage: parking_lot::Mutex::new(Vec::new()),
+            tracker: super::usage_tracker::UsageTracker::new(4096),
+            last_usage_tick: 0,
+        }
+    }
+
+    fn new(_runtime: &mut Self::Runtime, cpu_addr: VAddr, size_bytes: u64) -> Self {
+        Self {
+            base: BufferBase::new(cpu_addr, size_bytes),
+            storage: parking_lot::Mutex::new(vec![0; size_bytes as usize]),
+            tracker: super::usage_tracker::UsageTracker::new(size_bytes as usize),
+            last_usage_tick: 0,
+        }
+    }
+
+    fn immediate_upload(&self, offset: u64, data: &[u8]) {
+        let offset = offset as usize;
+        self.storage.lock()[offset..offset + data.len()].copy_from_slice(data);
+    }
+
+    fn immediate_download(&self, offset: u64, data: &mut [u8]) {
+        let offset = offset as usize;
+        data.copy_from_slice(&self.storage.lock()[offset..offset + data.len()]);
+    }
+
+    fn raw_handle(&self) -> u64 {
+        0
+    }
+
+    fn mark_usage(&mut self, offset: u64, size: u64) {
+        self.tracker.track(offset, size);
+        self.last_usage_tick = self.last_usage_tick.wrapping_add(1);
+    }
+
+    fn is_region_used(&self, offset: u64, size: u64) -> bool {
+        self.tracker.is_used(offset, size)
+    }
+
+    fn reset_usage_tracking(&mut self) {
+        self.tracker.reset();
+    }
+
+    fn last_usage_tick(&self) -> u64 {
+        self.last_usage_tick
+    }
+}
+
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct TestBufferCacheRuntime {
+    limit_dynamic_storage_buffers: bool,
+    max_dynamic_storage_buffers: u32,
+    can_report_memory_usage: bool,
+    device_local_memory: u64,
+}
+
+#[cfg(test)]
+impl TestBufferCacheRuntime {
+    pub(crate) fn with_dynamic_storage_limit(max: u32) -> Self {
+        Self {
+            limit_dynamic_storage_buffers: true,
+            max_dynamic_storage_buffers: max,
+            ..Self::default()
+        }
+    }
+
+    pub(crate) fn with_device_local_memory(device_local_memory: u64) -> Self {
+        Self {
+            can_report_memory_usage: true,
+            device_local_memory,
+            ..Self::default()
+        }
+    }
+}
+
+#[cfg(test)]
+impl TestBufferCacheRuntime {
+    fn copy_cached_buffers(dst: &TestBuffer, src: &TestBuffer, copies: &[BufferCopy]) {
+        let src_storage = src.storage.lock();
+        let mut dst_storage = dst.storage.lock();
+        for copy in copies {
+            let src_start = copy.src_offset as usize;
+            let dst_start = copy.dst_offset as usize;
+            let size = copy.size as usize;
+            dst_storage[dst_start..dst_start + size]
+                .copy_from_slice(&src_storage[src_start..src_start + size]);
+        }
+    }
+}
+
+#[cfg(test)]
+impl BufferCacheRuntime for TestBufferCacheRuntime {
+    type Buffer = TestBuffer;
+    type AsyncBuffer = StagingBufferRef;
+
+    fn tick_frame(&mut self, _slot_buffers: &mut SlotVector<Self::Buffer>) {}
+
+    fn can_report_memory_usage(&self) -> bool {
+        self.can_report_memory_usage
+    }
+
+    fn get_device_local_memory(&self) -> u64 {
+        self.device_local_memory
+    }
+
+    fn get_device_memory_usage(&self) -> u64 {
+        0
+    }
+
+    fn get_storage_buffer_alignment(&self) -> u32 {
+        0x100
+    }
+
+    fn should_limit_dynamic_storage_buffers(&self) -> bool {
+        self.limit_dynamic_storage_buffers
+    }
+
+    fn max_dynamic_storage_buffers(&self) -> u32 {
+        if self.limit_dynamic_storage_buffers {
+            self.max_dynamic_storage_buffers
+        } else {
+            u32::MAX
+        }
+    }
+
+    fn finish(&mut self) {}
+
+    fn upload_staging_buffer(&mut self, size: u64) -> Self::AsyncBuffer {
+        StagingBufferRef::host(size as usize)
+    }
+
+    fn download_staging_buffer(&mut self, size: u64, _deferred: bool) -> Self::AsyncBuffer {
+        StagingBufferRef::host(size as usize)
+    }
+
+    fn free_deferred_staging_buffer(&mut self, _buffer: &mut Self::AsyncBuffer) {}
+
+    fn can_reorder_upload(&self, _buffer: &Self::Buffer, _copies: &[BufferCopy]) -> bool {
+        false
+    }
+
+    fn pre_copy_barrier(&mut self) {}
+
+    fn post_copy_barrier(&mut self) {}
+
+    fn copy_buffer(
+        &mut self,
+        dst_buffer: &Self::Buffer,
+        src_buffer: &Self::Buffer,
+        copies: &[BufferCopy],
+        _barrier: bool,
+        _can_reorder_upload: bool,
+    ) {
+        Self::copy_cached_buffers(dst_buffer, src_buffer, copies);
+    }
+
+    fn copy_buffer_from_staging(
+        &mut self,
+        dst_buffer: &Self::Buffer,
+        src_buffer: &Self::AsyncBuffer,
+        copies: &[BufferCopy],
+        _barrier: bool,
+        _can_reorder_upload: bool,
+    ) {
+        let src_storage = src_buffer.mapped_span();
+        let mut dst_storage = dst_buffer.storage.lock();
+        for copy in copies {
+            let src_start = copy.src_offset as usize;
+            let dst_start = copy.dst_offset as usize;
+            let size = copy.size as usize;
+            dst_storage[dst_start..dst_start + size]
+                .copy_from_slice(&src_storage[src_start..src_start + size]);
+        }
+    }
+
+    fn copy_buffer_to_staging(
+        &mut self,
+        _dst_buffer: &Self::AsyncBuffer,
+        _src_buffer: &Self::Buffer,
+        _copies: &[BufferCopy],
+        _barrier: bool,
+    ) {
+    }
+
+    fn clear_buffer(&mut self, buffer: &Self::Buffer, offset: u32, size: u64, value: u32) {
+        let pattern = value.to_ne_bytes();
+        let mut storage = buffer.storage.lock();
+        let start = offset as usize;
+        let end = start + size as usize;
+        for (index, byte) in storage[start..end].iter_mut().enumerate() {
+            *byte = pattern[index & 3];
+        }
+    }
+
+    fn bind_index_buffer(
+        &mut self,
+        _topology: PrimitiveTopology,
+        _index_format: IndexFormat,
+        _base_vertex: u32,
+        _num_indices: u32,
+        _buffer: &mut Self::Buffer,
+        _offset: u32,
+        _size: u32,
+    ) {
+    }
+
+    fn bind_vertex_buffers(
+        &mut self,
+        _bindings: &HostBindings,
+        _buffers: &mut SlotVector<Self::Buffer>,
+    ) {
+    }
+
+    fn bind_uniform_buffer(
+        &mut self,
+        _stage: usize,
+        _binding_index: u32,
+        _buffer: &mut Self::Buffer,
+        _offset: u32,
+        _size: u32,
+    ) {
+    }
+
+    fn bind_storage_buffer(
+        &mut self,
+        _stage: usize,
+        _binding_index: u32,
+        _buffer: &mut Self::Buffer,
+        _offset: u32,
+        _size: u32,
+        _is_written: bool,
+    ) {
+    }
+
+    fn bind_texture_buffer(
+        &mut self,
+        _buffer: &mut Self::Buffer,
+        _offset: u32,
+        _size: u32,
+        _format: PixelFormat,
+    ) {
+    }
+
+    fn bind_image_buffer(
+        &mut self,
+        _buffer: &mut Self::Buffer,
+        _offset: u32,
+        _size: u32,
+        _format: PixelFormat,
+    ) {
+    }
+
+    fn bind_transform_feedback_buffers(
+        &mut self,
+        _bindings: &HostBindings,
+        _buffers: &mut SlotVector<Self::Buffer>,
+    ) {
+    }
+
+    fn bind_compute_uniform_buffer(
+        &mut self,
+        _binding_index: u32,
+        _buffer: &mut Self::Buffer,
+        _offset: u32,
+        _size: u32,
+    ) {
+    }
+
+    fn bind_compute_storage_buffer(
+        &mut self,
+        _binding_index: u32,
+        _buffer: &mut Self::Buffer,
+        _offset: u32,
+        _size: u32,
+        _is_written: bool,
+    ) {
     }
 }
 
@@ -976,28 +1375,6 @@ pub struct DrawIndirectParams {
     pub include_count: bool,
 }
 
-/// Information needed from the compute engine's launch description.
-///
-/// Upstream: `kepler_compute->launch_description`
-#[derive(Debug, Clone)]
-pub struct ComputeLaunchInfo {
-    /// Bitmask of enabled constant buffers.
-    pub const_buffer_enable_mask: u32,
-    /// Constant buffer configurations (address + size).
-    pub const_buffer_config: Vec<ComputeConstBufferConfig>,
-}
-
-/// A single compute constant buffer configuration.
-///
-/// Upstream: `Tegra::Engines::KeplerCompute::LaunchDescription::ConstBufferConfig`
-#[derive(Debug, Clone, Copy, Default)]
-pub struct ComputeConstBufferConfig {
-    /// GPU virtual address of the constant buffer.
-    pub address: u64,
-    /// Size in bytes.
-    pub size: u32,
-}
-
 /// Index buffer reference from the draw state.
 ///
 /// Upstream: `maxwell3d->draw_manager->GetDrawState().index_buffer`
@@ -1013,14 +1390,6 @@ pub struct IndexBufferRef {
     pub first: u32,
     /// Bytes per index element (1, 2, or 4).
     pub format_size_in_bytes: u32,
-}
-
-/// Temporary bridge for the KeplerCompute launch description.
-///
-/// Graphics state is read directly from the channel-bound Maxwell3D.
-pub trait ComputeEngineState {
-    /// Return compute launch info (const buffer enable mask + configs).
-    fn get_compute_launch_info(&self) -> ComputeLaunchInfo;
 }
 
 /// Dirty flags used by the buffer cache.
@@ -1055,6 +1424,14 @@ mod tests {
         assert_eq!(info.enabled_compute_uniform_buffer_mask, 0);
         assert!(!info.has_deleted_buffers);
         assert_eq!(info.uniform_buffer_skip_cache_size, DEFAULT_SKIP_CACHE_SIZE);
+        assert_eq!(
+            info.uniform_cache_hits.len(),
+            NUM_GRAPHICS_UNIFORM_BUFFERS as usize
+        );
+        assert_eq!(
+            info.uniform_cache_shots.len(),
+            NUM_GRAPHICS_UNIFORM_BUFFERS as usize
+        );
     }
 
     #[test]
@@ -1073,5 +1450,22 @@ mod tests {
         assert!(!bindings.offsets.spilled());
         assert!(!bindings.sizes.spilled());
         assert!(!bindings.strides.spilled());
+    }
+
+    #[test]
+    fn staging_buffer_ref_preserves_native_64_bit_backend_handle() {
+        let native_handle = u64::from(u32::MAX) + 0x1234;
+        let staging = unsafe {
+            StagingBufferRef::from_mapped_backend(
+                NULL_BUFFER_ID,
+                native_handle,
+                0,
+                0,
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null_mut(),
+            )
+        };
+        assert_eq!(staging.gpu_handle, native_handle);
     }
 }

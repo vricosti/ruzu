@@ -130,7 +130,7 @@ struct InputSubsystemImpl {
     camera: Option<Camera>,
     virtual_amiibo: Option<VirtualAmiibo>,
     virtual_gamepad: Option<VirtualGamepad>,
-    /// Upstream registers this under `HAVE_SDL2`; it backs every `engine:sdl`
+    /// Upstream registers this under `HAVE_SDL3`; it backs every `engine:sdl`
     /// binding, i.e. all physical gamepads.
     sdl: Option<SDLDriver>,
     // GCAdapter, Joycons and Android remain unported.
@@ -194,7 +194,7 @@ impl InputSubsystemImpl {
         register_engine(virtual_gamepad.engine(), &mapping_factory);
         self.virtual_gamepad = Some(virtual_gamepad);
 
-        // Upstream: `RegisterEngine("sdl", sdl);` under HAVE_SDL2.
+        // Upstream: `RegisterEngine("sdl", sdl);` under HAVE_SDL3.
         let sdl = SDLDriver::new("sdl".to_string());
         let sdl_engine = sdl.engine();
         register_engine(sdl_engine, &mapping_factory);
@@ -263,43 +263,34 @@ impl InputSubsystemImpl {
 
     /// Port of Impl::BeginConfiguration.
     fn begin_configuration(&mut self) {
-        for engine in self.engines() {
-            engine.lock().begin_configuration();
+        if let Some(ref keyboard) = self.keyboard {
+            keyboard.engine().lock().begin_configuration();
+        }
+        if let Some(ref mouse) = self.mouse {
+            mouse.engine().lock().begin_configuration();
+        }
+        if let Some(ref udp_client) = self.udp_client {
+            udp_client.engine().lock().begin_configuration();
+        }
+        if let Some(ref sdl) = self.sdl {
+            sdl.engine().lock().begin_configuration();
         }
     }
 
     /// Port of Impl::EndConfiguration.
     fn end_configuration(&mut self) {
-        for engine in self.engines() {
-            engine.lock().end_configuration();
-        }
-    }
-
-    /// Every engine that can produce a mapping event.
-    fn engines(&self) -> Vec<Arc<Mutex<InputEngine>>> {
-        let mut engines = Vec::new();
-        if let Some(ref update_engine) = self.update_engine {
-            engines.push(update_engine.engine());
-        }
         if let Some(ref keyboard) = self.keyboard {
-            engines.push(keyboard.engine());
+            keyboard.engine().lock().end_configuration();
         }
         if let Some(ref mouse) = self.mouse {
-            engines.push(mouse.engine());
-        }
-        if let Some(ref touch_screen) = self.touch_screen {
-            engines.push(touch_screen.engine());
+            mouse.engine().lock().end_configuration();
         }
         if let Some(ref udp_client) = self.udp_client {
-            engines.push(udp_client.engine());
-        }
-        if let Some(ref tas) = self.tas_input {
-            engines.push(tas.lock().engine());
+            udp_client.engine().lock().end_configuration();
         }
         if let Some(ref sdl) = self.sdl {
-            engines.push(sdl.engine());
+            sdl.engine().lock().end_configuration();
         }
-        engines
     }
 
     /// Port of Impl::PumpEvents
@@ -694,6 +685,47 @@ mod tests {
         assert_eq!(param.get_str("engine", ""), "keyboard");
         assert_eq!(param.get_int("code", -1), 42);
         assert_eq!(param.get_str("toggle", ""), "0");
+    }
+
+    #[test]
+    fn configuration_excludes_updater_but_includes_keyboard() {
+        let mapping_factory = Arc::new(Mutex::new(MappingFactory::new()));
+        let update_engine = UpdateEngine::new("updater".to_string());
+        update_engine
+            .engine()
+            .lock()
+            .set_mapping_callback(mapping_callback(&mapping_factory));
+        let keyboard = Keyboard::new("keyboard".to_string());
+        keyboard
+            .engine()
+            .lock()
+            .set_mapping_callback(mapping_callback(&mapping_factory));
+
+        let mut imp = InputSubsystemImpl::new();
+        imp.mapping_factory = Some(Arc::clone(&mapping_factory));
+        imp.update_engine = Some(update_engine);
+        imp.keyboard = Some(keyboard);
+        imp.begin_configuration();
+        mapping_factory
+            .lock()
+            .begin_mapping(Polling::InputType::Button);
+
+        imp.pump_events();
+        assert_eq!(
+            mapping_factory
+                .lock()
+                .get_next_input()
+                .get_str("engine", ""),
+            ""
+        );
+
+        imp.keyboard.as_mut().unwrap().press_key(42);
+        let input = mapping_factory.lock().get_next_input();
+        assert_eq!(input.get_str("engine", ""), "keyboard");
+        assert_eq!(input.get_int("code", -1), 42);
+
+        imp.end_configuration();
+        mapping_factory.lock().stop_mapping();
     }
 
     fn capture_status(

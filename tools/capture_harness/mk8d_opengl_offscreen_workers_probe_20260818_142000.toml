@@ -1,0 +1,65 @@
+[process]
+executable = "../../target/release/reden"
+rom_path = "/home/vricosti/Games/Emulators/Switch/common/roms/commercial/Mario Kart 8 Deluxe [NSP]/Mario Kart 8 Deluxe [0100152000022000][v0].nsp"
+args = []
+working_directory = "../.."
+log_file = "../../screenshots/reden/mk8d-opengl-offscreen-workers-probe-20260818-142000/process.log"
+stop_at = "00:00:40.000"
+terminate_after_timeline = true
+termination_grace_ms = 3000
+
+[process.environment]
+DISPLAY = ":0"
+RUST_LOG = "info"
+
+[input]
+default_hold_ms = 250
+restore_config = true
+
+[[input.events]]
+at = "00:00:12.000"
+buttons = ["l", "r"]
+label = "L+R"
+
+[[input.events]]
+at = "00:00:16.000"
+buttons = ["l", "r"]
+label = "L+R retry"
+
+[[input.events]]
+at = "00:00:20.000"
+buttons = ["a"]
+label = "A 1"
+
+[[input.events]]
+at = "00:00:24.000"
+buttons = ["a"]
+label = "A 2"
+
+[[input.events]]
+at = "00:00:28.000"
+buttons = ["a"]
+label = "A 3"
+
+[[input.events]]
+at = "00:00:32.000"
+buttons = ["a"]
+label = "A 4"
+
+[[input.events]]
+at = "00:00:36.000"
+buttons = ["a"]
+label = "A 5"
+
+[capture]
+output_directory = "../../screenshots/reden/mk8d-opengl-offscreen-workers-probe-20260818-142000"
+target = "window"
+match_process_pid = true
+window_wait_timeout = "00:00:10"
+screenshot_prefix = "mk8d-opengl-offscreen-workers-probe"
+times = ["00:00:11.000", "00:00:15.000", "00:00:19.000", "00:00:23.000", "00:00:27.000", "00:00:31.000", "00:00:35.000", "00:00:39.000"]
+
+[video]
+enabled = false
+end = "00:00:39"
+output = "unused.mp4"

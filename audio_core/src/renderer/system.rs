@@ -1176,7 +1176,6 @@ fn typed_slice_as_bytes<T>(slice: &[T]) -> &[u8] {
 mod tests {
     use super::*;
     use crate::adsp::apps::audio_renderer::AudioRenderer;
-    use crate::common::common::make_magic;
     use crate::common::feature_support::CURRENT_REVISION;
     use crate::renderer::behavior::behavior_info::{
         InParameter as BehaviorInParameter, OutStatus as BehaviorOutStatus,
@@ -1192,6 +1191,7 @@ mod tests {
     };
     use crate::sink::null_sink::NullSink;
     use crate::sink::sink::new_sink_handle;
+    use common::common_funcs::make_magic;
     use parking_lot::Mutex;
     use ruzu_core::hle::kernel::k_event::KEvent;
     use ruzu_core::hle::kernel::k_readable_event::KReadableEvent;
@@ -1476,7 +1476,7 @@ mod tests {
         let audio_renderer = make_renderer_handle(core.clone());
         let mut system = System::new_for_tests(core, audio_renderer);
         let mut params = make_params();
-        params.revision = make_magic('R', 'E', 'V', '1');
+        params.revision = make_magic(b'R', b'E', b'V', b'1');
         let transfer_size = System::get_work_buffer_size(&params);
 
         let (result, _transfer_memory, _process) =
@@ -1684,7 +1684,7 @@ mod tests {
             .unwrap();
         system.set_rendered_readable_event(readable_event.clone());
         let mut params = make_params();
-        params.revision = make_magic('R', 'E', 'V', '1');
+        params.revision = make_magic(b'R', b'E', b'V', b'1');
         let transfer_size = System::get_work_buffer_size(&params);
         let mut transfer_memory = Box::new(KTransferMemory::new());
 

@@ -501,6 +501,7 @@ impl SharedBufferManager {
         let Some(buffer_page_group) = inner.buffer_page_group.as_ref() else {
             return Err(vi_results::RESULT_OPERATION_FAILED);
         };
+        let mut smmu_scratch = common::scratch_buffer::ScratchBuffer::<u32>::new();
         for block in buffer_page_group.iter() {
             let start = unsafe { (*device_memory).get_pointer(block.get_address()) as *mut u8 };
             let mut current = start;
@@ -520,9 +521,13 @@ impl SharedBufferManager {
 
             let end = unsafe { start.add(size) };
             let invalidate_size = end as usize - current as usize;
-            host1x.smmu_apply_op_on_host_pointer(current as usize, &mut |addr| {
-                gpu.invalidate_region(addr, invalidate_size as u64);
-            });
+            host1x.smmu_apply_op_on_host_pointer(
+                current as usize,
+                &mut smmu_scratch,
+                &mut |addr| {
+                    gpu.invalidate_region(addr, invalidate_size as u64);
+                },
+            );
         }
 
         Ok((true, 1))

@@ -27,29 +27,6 @@ pub struct BufferQueueConsumer {
 }
 
 fn stop_unimplemented_transact(code: u32, flags: u32, name: &str) -> ! {
-    #[cfg(not(test))]
-    {
-        let path = std::path::Path::new(".agents/buffer_queue_consumer_unimplemented_state.md");
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        let entry = format!(
-            "\n## BufferQueueConsumer unsupported transaction\n\
-             - code: {}\n\
-             - name: {}\n\
-             - flags: {}\n\
-             - upstream: core/hle/service/nvnflinger/buffer_queue_consumer.cpp asserts for unsupported Transact paths; AcquireBuffer reaches UNREACHABLE because BufferItem flattening is not implemented\n",
-            code, name, flags
-        );
-        let _ = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)
-            .and_then(|mut file| {
-                use std::io::Write;
-                file.write_all(entry.as_bytes())
-            });
-    }
     panic!(
         "BufferQueueConsumer::transact unimplemented transaction {} ({}) flags={}",
         code, name, flags

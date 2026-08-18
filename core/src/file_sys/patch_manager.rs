@@ -9,7 +9,9 @@ use super::common_funcs::get_base_title_id;
 use super::content_archive::NCA;
 use super::control_metadata::{LANGUAGE_NAMES, NACP};
 use super::nca_metadata::{ContentRecordType, TitleType};
-use super::registered_cache::{get_update_title_id, ContentProvider, ContentProviderEntry};
+use super::registered_cache::{
+    get_update_title_id, ContentProvider, ContentProviderEntry, ContentProviderUnionSlot,
+};
 use super::romfs::{create_romfs, extract_romfs};
 use super::vfs::vfs::get_or_create_directory_relative;
 use super::vfs::vfs_cached::CachedVfsDirectory;
@@ -122,6 +124,18 @@ fn get_disabled_addons(title_id: u64) -> Vec<String> {
         .unwrap_or_default()
 }
 
+fn is_versioned_external_update_disabled(disabled: &[String], version: u32) -> bool {
+    disabled
+        .iter()
+        .any(|entry| entry == &format!("Update@{version}"))
+}
+
+fn is_legacy_update_disabled(disabled: &[String]) -> bool {
+    ["Update", "Update (NAND)", "Update (SDMC)"]
+        .iter()
+        .any(|name| disabled.iter().any(|entry| entry == name))
+}
+
 /// Apply LayeredFS patches to a RomFS file.
 /// Corresponds to upstream static `ApplyLayeredFS`.
 fn apply_layered_fs(
@@ -221,6 +235,15 @@ pub enum PatchType {
     Mod,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PatchSource {
+    Unknown,
+    NAND,
+    SDMC,
+    External,
+    Packed,
+}
+
 /// A single patch entry.
 /// Corresponds to upstream `Patch`.
 #[derive(Debug, Clone)]
@@ -231,6 +254,9 @@ pub struct Patch {
     pub patch_type: PatchType,
     pub program_id: u64,
     pub title_id: u64,
+    pub source: PatchSource,
+    pub location: String,
+    pub numeric_version: u32,
 }
 
 /// Build ID — 0x20 bytes.
@@ -289,28 +315,79 @@ impl<'a> PatchManager<'a> {
         log::info!("Patching ExeFS for title_id={:016X}", self.title_id);
 
         let disabled = get_disabled_addons(self.title_id);
-        let update_disabled = disabled.iter().any(|d| d == "Update");
-
-        // Game Updates
         let update_tid = get_update_title_id(self.title_id);
-        let update = self
-            .content_provider
-            .and_then(|cp| cp.get_entry(update_tid, ContentRecordType::Program));
+        let mut selected_update: Option<(VirtualFile, u32)> = None;
+        if let Some(provider) = self.content_provider {
+            let versions = provider.list_update_versions(update_tid);
+            if let Some(version) = versions
+                .iter()
+                .find(|entry| !is_versioned_external_update_disabled(&disabled, entry.version))
+                .map(|entry| entry.version)
+            {
+                selected_update = provider
+                    .get_entry_for_version(update_tid, ContentRecordType::Program, version)
+                    .map(|file| (file, version));
+            }
 
-        if !update_disabled {
-            if let Some(update_nca) = update {
-                if let Some(update_exefs) = update_nca.get_exefs() {
-                    log::info!(
-                        "    ExeFS: Update ({}) applied successfully",
-                        format_title_version(
-                            self.content_provider
-                                .and_then(|cp| cp.get_entry_version(update_tid))
+            if selected_update.is_none() {
+                for (slot, _) in provider.list_entries_filter_origin(
+                    Some(TitleType::Update),
+                    Some(ContentRecordType::Program),
+                    Some(update_tid),
+                ) {
+                    if matches!(
+                        slot,
+                        ContentProviderUnionSlot::External
+                            | ContentProviderUnionSlot::FrontendManual
+                    ) {
+                        continue;
+                    }
+                    let disabled_name = match slot {
+                        ContentProviderUnionSlot::UserNAND | ContentProviderUnionSlot::SysNAND => {
+                            "Update (NAND)"
+                        }
+                        ContentProviderUnionSlot::SDMC => "Update (SDMC)",
+                        ContentProviderUnionSlot::External => continue,
+                        ContentProviderUnionSlot::FrontendManual => continue,
+                    };
+                    if disabled.contains(&disabled_name.to_string()) {
+                        continue;
+                    }
+                    if let Some(file) = provider.get_entry_raw_from_slot(
+                        slot,
+                        update_tid,
+                        ContentRecordType::Program,
+                    ) {
+                        selected_update = Some((
+                            file,
+                            provider
+                                .get_entry_version_from_slot(slot, update_tid)
                                 .unwrap_or(0),
-                            TitleVersionFormat::ThreeElements,
-                        )
-                    );
-                    exefs = update_exefs;
+                        ));
+                        break;
+                    }
                 }
+            }
+
+            if selected_update.is_none()
+                && versions.is_empty()
+                && !provider.supports_origin_tracking()
+                && !is_legacy_update_disabled(&disabled)
+            {
+                selected_update = provider
+                    .get_entry_raw(update_tid, ContentRecordType::Program)
+                    .map(|file| (file, provider.get_entry_version(update_tid).unwrap_or(0)));
+            }
+        }
+
+        if let Some((file, version)) = selected_update {
+            let update = NCA::new(file, None);
+            if let Some(update_exefs) = update.get_exefs() {
+                log::info!(
+                    "    ExeFS: Update ({}) applied successfully",
+                    format_title_version(version, TitleVersionFormat::ThreeElements)
+                );
+                exefs = update_exefs;
             }
         }
 
@@ -429,7 +506,7 @@ impl<'a> PatchManager<'a> {
             );
         }
 
-        use super::super::loader::loader::make_magic;
+        use common::common_funcs::make_magic;
         if header.magic != make_magic(b'N', b'S', b'O', b'0') {
             return nso;
         }
@@ -582,45 +659,123 @@ impl<'a> PatchManager<'a> {
 
         // Game Updates
         let update_tid = get_update_title_id(self.title_id);
-        let update_pm = PatchManager {
-            title_id: update_tid,
-            fs_controller: self.fs_controller,
-            content_provider: self.content_provider,
-        };
-        let metadata = update_pm.get_control_metadata();
-        let nacp = metadata.0;
-
-        let update_disabled = disabled.iter().any(|d| d == "Update");
-        let mut update_patch = Patch {
-            enabled: !update_disabled,
-            name: "Update".to_string(),
-            version: String::new(),
-            patch_type: PatchType::Update,
-            program_id: self.title_id,
-            title_id: self.title_id,
-        };
-
-        if let Some(ref nacp_data) = nacp {
-            update_patch.version = nacp_data.get_version_string();
-            out.push(update_patch);
-        } else if self
+        if self
             .content_provider
-            .map(|cp| cp.has_entry(update_tid, ContentRecordType::Program))
-            .unwrap_or(false)
+            .is_some_and(ContentProvider::supports_origin_tracking)
         {
-            let meta_ver = self
-                .content_provider
-                .and_then(|cp| cp.get_entry_version(update_tid));
-            if meta_ver.unwrap_or(0) == 0 {
+            let provider = self.content_provider.unwrap();
+            let mut external_updates: Vec<Patch> = provider
+                .list_update_versions(update_tid)
+                .into_iter()
+                .map(|entry| Patch {
+                    enabled: !is_versioned_external_update_disabled(&disabled, entry.version),
+                    name: "Update".to_string(),
+                    version: if entry.version_string.is_empty() {
+                        format_title_version(entry.version, TitleVersionFormat::ThreeElements)
+                    } else {
+                        entry.version_string
+                    },
+                    patch_type: PatchType::Update,
+                    program_id: self.title_id,
+                    title_id: update_tid,
+                    source: PatchSource::External,
+                    location: String::new(),
+                    numeric_version: entry.version,
+                })
+                .collect();
+            let mut found_enabled = false;
+            for patch in &mut external_updates {
+                if patch.enabled {
+                    if found_enabled {
+                        patch.enabled = false;
+                    } else {
+                        found_enabled = true;
+                    }
+                }
+            }
+            out.extend(external_updates);
+
+            for (slot, _) in provider.list_entries_filter_origin(
+                Some(TitleType::Update),
+                Some(ContentRecordType::Program),
+                Some(update_tid),
+            ) {
+                if matches!(
+                    slot,
+                    ContentProviderUnionSlot::External | ContentProviderUnionSlot::FrontendManual
+                ) {
+                    continue;
+                }
+                let (source, suffix) = match slot {
+                    ContentProviderUnionSlot::UserNAND | ContentProviderUnionSlot::SysNAND => {
+                        (PatchSource::NAND, " (NAND)")
+                    }
+                    ContentProviderUnionSlot::SDMC => (PatchSource::SDMC, " (SDMC)"),
+                    ContentProviderUnionSlot::External => continue,
+                    ContentProviderUnionSlot::FrontendManual => continue,
+                };
+                let numeric_version = provider
+                    .get_entry_version_from_slot(slot, update_tid)
+                    .unwrap_or(0);
+                let name = format!("Update{suffix}");
+                out.push(Patch {
+                    enabled: !disabled.contains(&name),
+                    name,
+                    version: (numeric_version != 0)
+                        .then(|| {
+                            format_title_version(numeric_version, TitleVersionFormat::ThreeElements)
+                        })
+                        .unwrap_or_default(),
+                    patch_type: PatchType::Update,
+                    program_id: self.title_id,
+                    title_id: update_tid,
+                    source,
+                    location: String::new(),
+                    numeric_version,
+                });
+            }
+        } else {
+            let update_pm = PatchManager {
+                title_id: update_tid,
+                fs_controller: self.fs_controller,
+                content_provider: self.content_provider,
+            };
+            let nacp = update_pm.get_control_metadata().0;
+            let update_disabled = disabled.iter().any(|d| d == "Update");
+            let mut update_patch = Patch {
+                enabled: !update_disabled,
+                name: "Update".to_string(),
+                version: String::new(),
+                patch_type: PatchType::Update,
+                program_id: self.title_id,
+                title_id: self.title_id,
+                source: PatchSource::Unknown,
+                location: String::new(),
+                numeric_version: 0,
+            };
+
+            if let Some(ref nacp_data) = nacp {
+                update_patch.version = nacp_data.get_version_string();
                 out.push(update_patch);
-            } else {
-                update_patch.version =
-                    format_title_version(meta_ver.unwrap(), TitleVersionFormat::ThreeElements);
+            } else if self
+                .content_provider
+                .map(|cp| cp.has_entry(update_tid, ContentRecordType::Program))
+                .unwrap_or(false)
+            {
+                let meta_ver = self
+                    .content_provider
+                    .and_then(|cp| cp.get_entry_version(update_tid));
+                if let Some(version) = meta_ver.filter(|version| *version != 0) {
+                    update_patch.version =
+                        format_title_version(version, TitleVersionFormat::ThreeElements);
+                    update_patch.numeric_version = version;
+                }
+                out.push(update_patch);
+            } else if update_raw.is_some() {
+                update_patch.version = "PACKED".to_string();
+                update_patch.source = PatchSource::Packed;
                 out.push(update_patch);
             }
-        } else if update_raw.is_some() {
-            update_patch.version = "PACKED".to_string();
-            out.push(update_patch);
         }
 
         // General Mods (LayeredFS and IPS)
@@ -628,6 +783,23 @@ impl<'a> PatchManager<'a> {
             .fs_controller
             .and_then(|fc| fc.get_modification_load_root(self.title_id))
         {
+            for file in mod_dir.get_files() {
+                let name = file.get_name();
+                if name.starts_with("cheat_") {
+                    let mod_disabled = disabled.contains(&name);
+                    out.push(Patch {
+                        enabled: !mod_disabled,
+                        name,
+                        version: "Cheats".to_string(),
+                        patch_type: PatchType::Mod,
+                        program_id: self.title_id,
+                        title_id: self.title_id,
+                        source: PatchSource::Unknown,
+                        location: file.get_full_path(),
+                        numeric_version: 0,
+                    });
+                }
+            }
             for mod_subdir in mod_dir.get_subdirectories() {
                 let mut types = String::new();
 
@@ -660,8 +832,17 @@ impl<'a> PatchManager<'a> {
                     }
                 }
 
-                if is_dir_valid_and_non_empty(&find_subdirectory_caseless(&mod_subdir, "romfs")) {
+                if is_dir_valid_and_non_empty(&find_subdirectory_caseless(&mod_subdir, "romfs"))
+                    || is_dir_valid_and_non_empty(&find_subdirectory_caseless(
+                        &mod_subdir,
+                        "romfslite",
+                    ))
+                {
                     append_comma_if_not_empty(&mut types, "LayeredFS");
+                }
+                if is_dir_valid_and_non_empty(&find_subdirectory_caseless(&mod_subdir, "romfs_ext"))
+                {
+                    append_comma_if_not_empty(&mut types, "ExtLayeredFS");
                 }
                 if is_dir_valid_and_non_empty(&find_subdirectory_caseless(&mod_subdir, "cheats")) {
                     append_comma_if_not_empty(&mut types, "Cheats");
@@ -679,6 +860,9 @@ impl<'a> PatchManager<'a> {
                     patch_type: PatchType::Mod,
                     program_id: self.title_id,
                     title_id: self.title_id,
+                    source: PatchSource::Unknown,
+                    location: mod_subdir.get_full_path(),
+                    numeric_version: 0,
                 });
             }
         }
@@ -692,8 +876,16 @@ impl<'a> PatchManager<'a> {
             if is_dir_valid_and_non_empty(&find_subdirectory_caseless(&sdmc_mod_dir, "exefs")) {
                 append_comma_if_not_empty(&mut types, "LayeredExeFS");
             }
-            if is_dir_valid_and_non_empty(&find_subdirectory_caseless(&sdmc_mod_dir, "romfs")) {
+            if is_dir_valid_and_non_empty(&find_subdirectory_caseless(&sdmc_mod_dir, "romfs"))
+                || is_dir_valid_and_non_empty(&find_subdirectory_caseless(
+                    &sdmc_mod_dir,
+                    "romfslite",
+                ))
+            {
                 append_comma_if_not_empty(&mut types, "LayeredFS");
+            }
+            if is_dir_valid_and_non_empty(&find_subdirectory_caseless(&sdmc_mod_dir, "romfs_ext")) {
+                append_comma_if_not_empty(&mut types, "ExtLayeredFS");
             }
 
             if !types.is_empty() {
@@ -705,6 +897,9 @@ impl<'a> PatchManager<'a> {
                     patch_type: PatchType::Mod,
                     program_id: self.title_id,
                     title_id: self.title_id,
+                    source: PatchSource::Unknown,
+                    location: String::new(),
+                    numeric_version: 0,
                 });
             }
         }
@@ -750,6 +945,9 @@ impl<'a> PatchManager<'a> {
                 patch_type: PatchType::DLC,
                 program_id: self.title_id,
                 title_id: dlc_match.last().unwrap().title_id,
+                source: PatchSource::Unknown,
+                location: String::new(),
+                numeric_version: 0,
             });
         }
 
@@ -864,36 +1062,87 @@ impl<'a> PatchManager<'a> {
 
         // Game Updates
         let update_tid = get_update_title_id(self.title_id);
-        let update_raw = self
-            .content_provider
-            .and_then(|cp| cp.get_entry_raw(update_tid, record_type));
-
         let disabled = get_disabled_addons(self.title_id);
-        let update_disabled = disabled.iter().any(|d| d == "Update");
+        let mut selected_update: Option<(VirtualFile, u32)> = None;
+        if let Some(provider) = self.content_provider {
+            let versions = provider.list_update_versions(update_tid);
+            if let Some(version) = versions
+                .iter()
+                .find(|entry| !is_versioned_external_update_disabled(&disabled, entry.version))
+                .map(|entry| entry.version)
+            {
+                selected_update = provider
+                    .get_entry_for_version(update_tid, record_type, version)
+                    .map(|file| (file, version));
+            }
+            if selected_update.is_none() {
+                for (slot, _) in provider.list_entries_filter_origin(
+                    Some(TitleType::Update),
+                    Some(record_type),
+                    Some(update_tid),
+                ) {
+                    if matches!(
+                        slot,
+                        ContentProviderUnionSlot::External
+                            | ContentProviderUnionSlot::FrontendManual
+                    ) {
+                        continue;
+                    }
+                    let disabled_name = match slot {
+                        ContentProviderUnionSlot::UserNAND | ContentProviderUnionSlot::SysNAND => {
+                            "Update (NAND)"
+                        }
+                        ContentProviderUnionSlot::SDMC => "Update (SDMC)",
+                        ContentProviderUnionSlot::External => continue,
+                        ContentProviderUnionSlot::FrontendManual => continue,
+                    };
+                    if disabled.iter().any(|entry| entry == disabled_name) {
+                        continue;
+                    }
+                    if let Some(file) =
+                        provider.get_entry_raw_from_slot(slot, update_tid, record_type)
+                    {
+                        selected_update = Some((
+                            file,
+                            provider
+                                .get_entry_version_from_slot(slot, update_tid)
+                                .unwrap_or(0),
+                        ));
+                        break;
+                    }
+                }
+            }
+            if selected_update.is_none()
+                && versions.is_empty()
+                && !provider.supports_origin_tracking()
+                && !is_legacy_update_disabled(&disabled)
+            {
+                selected_update = provider
+                    .get_entry_raw(update_tid, record_type)
+                    .map(|file| (file, provider.get_entry_version(update_tid).unwrap_or(0)));
+            }
+        }
 
-        if !update_disabled {
-            if let (Some(raw), Some(base_nca)) = (update_raw, base_nca) {
+        if let Some(base_nca) = base_nca {
+            if let Some((raw, version)) = selected_update {
                 let new_nca = NCA::new(raw, Some(base_nca));
                 if new_nca.get_status() == super::partition_filesystem::ResultStatus::Success {
                     if let Some(new_romfs) = new_nca.get_romfs() {
                         log::info!(
                             "    RomFS: Update ({}) applied successfully",
-                            format_title_version(
-                                self.content_provider
-                                    .and_then(|cp| cp.get_entry_version(update_tid))
-                                    .unwrap_or(0),
-                                TitleVersionFormat::ThreeElements,
-                            )
+                            format_title_version(version, TitleVersionFormat::ThreeElements,)
                         );
                         romfs = new_romfs;
                     }
                 }
-            } else if let (Some(packed_raw), Some(base_nca)) = (packed_update_raw, base_nca) {
-                let new_nca = NCA::new(packed_raw, Some(base_nca));
-                if new_nca.get_status() == super::partition_filesystem::ResultStatus::Success {
-                    if let Some(new_romfs) = new_nca.get_romfs() {
-                        log::info!("    RomFS: Update (PACKED) applied successfully");
-                        romfs = new_romfs;
+            } else if !disabled.iter().any(|entry| entry == "Update") {
+                if let Some(packed_raw) = packed_update_raw {
+                    let new_nca = NCA::new(packed_raw, Some(base_nca));
+                    if new_nca.get_status() == super::partition_filesystem::ResultStatus::Success {
+                        if let Some(new_romfs) = new_nca.get_romfs() {
+                            log::info!("    RomFS: Update (PACKED) applied successfully");
+                            romfs = new_romfs;
+                        }
                     }
                 }
             }
@@ -941,6 +1190,16 @@ mod tests {
             format_title_version(0, TitleVersionFormat::ThreeElements),
             "v0.0.0"
         );
+    }
+
+    #[test]
+    fn external_update_disabled_keys_include_numeric_version() {
+        let disabled = vec!["Update@65536".to_string(), "Update".to_string()];
+        assert!(is_versioned_external_update_disabled(&disabled, 65536));
+        assert!(!is_versioned_external_update_disabled(&disabled, 65537));
+        assert!(is_legacy_update_disabled(&["Update (NAND)".to_string()]));
+        assert!(is_legacy_update_disabled(&["Update (SDMC)".to_string()]));
+        assert!(!is_legacy_update_disabled(&["Update@65536".to_string()]));
     }
 
     #[test]

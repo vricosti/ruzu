@@ -139,7 +139,6 @@ impl WindowAdaptPass {
         blend_modes: &[BlendMode],
         dst_framebuffer: vk::Framebuffer,
         render_area: vk::Extent2D,
-        bg_color: [f32; 4],
     ) {
         let layer_count = push_constants_list.len();
 
@@ -158,6 +157,12 @@ impl WindowAdaptPass {
         let descriptor_sets = descriptor_sets.to_vec();
 
         scheduler.record(move |cmdbuf| unsafe {
+            let values = common::settings::values();
+            let bg_color = normalized_background_color(
+                *values.bg_red.get_value(),
+                *values.bg_green.get_value(),
+                *values.bg_blue.get_value(),
+            );
             util::begin_render_pass(&device, cmdbuf, render_pass, dst_framebuffer, render_area);
 
             let clear_attachment = vk::ClearAttachment {
@@ -210,6 +215,28 @@ impl WindowAdaptPass {
 
             device.cmd_end_render_pass(cmdbuf);
         });
+    }
+}
+
+fn normalized_background_color(red: u8, green: u8, blue: u8) -> [f32; 4] {
+    [
+        red as f32 / 255.0,
+        green as f32 / 255.0,
+        blue as f32 / 255.0,
+        1.0,
+    ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalized_background_color;
+
+    #[test]
+    fn background_color_uses_all_three_configured_channels() {
+        assert_eq!(
+            normalized_background_color(255, 128, 0),
+            [1.0, 128.0 / 255.0, 0.0, 1.0]
+        );
     }
 }
 

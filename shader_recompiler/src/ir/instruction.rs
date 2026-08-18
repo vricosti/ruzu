@@ -101,12 +101,20 @@ impl Inst {
 
     /// Get argument at index.
     pub fn arg(&self, index: usize) -> &Value {
-        &self.args[index]
+        if self.opcode == Opcode::Phi {
+            &self.phi_args[index].1
+        } else {
+            &self.args[index]
+        }
     }
 
     /// Set argument at index.
     pub fn set_arg(&mut self, index: usize, value: Value) {
-        self.args[index] = value;
+        if self.opcode == Opcode::Phi {
+            self.phi_args[index].1 = value;
+        } else {
+            self.args[index] = value;
+        }
     }
 
     /// Whether this instruction has any uses.
@@ -128,6 +136,15 @@ impl Inst {
     pub fn add_phi_operand(&mut self, block: u32, value: Value) {
         debug_assert_eq!(self.opcode, Opcode::Phi);
         self.phi_args.push((block, value));
+    }
+
+    /// Order Phi operands from the farthest predecessor to the nearest.
+    ///
+    /// Upstream: `Inst::OrderPhiArgs()` in `frontend/ir/microinstruction.cpp`.
+    pub fn order_phi_args(&mut self, block_orders: &[u32]) {
+        assert_eq!(self.opcode, Opcode::Phi);
+        self.phi_args
+            .sort_by_key(|(block, _)| block_orders[*block as usize]);
     }
 
     /// Get or create the associated pseudo-instructions structure.
@@ -155,24 +172,102 @@ impl Inst {
     /// Set the associated pseudo-instruction for a specific pseudo-opcode.
     pub fn set_associated_pseudo(&mut self, pseudo_op: Opcode, inst_ref: InstRef) {
         let assoc = self.get_or_create_associated();
-        match pseudo_op {
+        let slot = match pseudo_op {
             Opcode::GetZeroFromOp | Opcode::GetSparseFromOp | Opcode::GetInBoundsFromOp => {
-                assoc.zero_inst = Some(inst_ref);
+                &mut assoc.zero_inst
             }
-            Opcode::GetSignFromOp => assoc.sign_inst = Some(inst_ref),
-            Opcode::GetCarryFromOp => assoc.carry_inst = Some(inst_ref),
-            Opcode::GetOverflowFromOp => assoc.overflow_inst = Some(inst_ref),
-            _ => {}
-        }
+            Opcode::GetSignFromOp => &mut assoc.sign_inst,
+            Opcode::GetCarryFromOp => &mut assoc.carry_inst,
+            Opcode::GetOverflowFromOp => &mut assoc.overflow_inst,
+            _ => return,
+        };
+        assert!(
+            slot.is_none(),
+            "only one of each associated pseudo-instruction is allowed"
+        );
+        *slot = Some(inst_ref);
     }
 
-    /// Replace all uses of this instruction's result with another value.
-    /// This decrements our use_count and cannot be done here alone —
-    /// caller must walk all users. This is a marker for the pattern.
+    /// Detach an associated pseudo-instruction when that pseudo-instruction is
+    /// invalidated. This is the indexed-reference equivalent of upstream
+    /// `Inst::UndoUse` calling `RemovePseudoInstruction`.
+    pub fn remove_associated_pseudo(&mut self, pseudo_op: Opcode, inst_ref: InstRef) {
+        let Some(assoc) = self.associated.as_mut() else {
+            panic!("removing a pseudo-instruction from a parent without associations");
+        };
+        let slot = match pseudo_op {
+            Opcode::GetZeroFromOp | Opcode::GetSparseFromOp | Opcode::GetInBoundsFromOp => {
+                &mut assoc.zero_inst
+            }
+            Opcode::GetSignFromOp => &mut assoc.sign_inst,
+            Opcode::GetCarryFromOp => &mut assoc.carry_inst,
+            Opcode::GetOverflowFromOp => &mut assoc.overflow_inst,
+            _ => return,
+        };
+        assert_eq!(
+            *slot,
+            Some(inst_ref),
+            "removing an invalid associated pseudo-instruction"
+        );
+        *slot = None;
+    }
+
+    /// Upstream `Inst::ReplaceUsesWith`.
+    ///
+    /// The name does not mean that Eden walks every user. Instruction identity
+    /// is pointer-stable there, so the definition itself becomes
+    /// `Identity(replacement)` and existing users keep referring to it. Rust's
+    /// stable `InstRef` slots preserve the same constant-time operation.
+    pub fn replace_uses_with(&mut self, replacement: Value) {
+        self.opcode = Opcode::Identity;
+        self.args.clear();
+        self.phi_args.clear();
+        self.args.push(replacement);
+    }
+
+    /// Upstream `Inst::Invalidate` without cross-instruction use bookkeeping.
+    /// The owning `Program` handles indexed pseudo links and recomputes use
+    /// counts before passes which consume them.
     pub fn invalidate(&mut self) {
         self.opcode = Opcode::Void;
         self.args.clear();
-        self.use_count = 0;
+        self.phi_args.clear();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn phi_argument_access_mutation_and_invalidation_match_upstream() {
+        let mut inst = Inst::phi();
+        inst.add_phi_operand(3, Value::ImmU32(10));
+
+        assert_eq!(inst.num_args(), 1);
+        assert_eq!(*inst.arg(0), Value::ImmU32(10));
+        inst.set_arg(0, Value::ImmU32(20));
+        assert_eq!(inst.phi_args, vec![(3, Value::ImmU32(20))]);
+
+        inst.invalidate();
+        assert!(inst.phi_args.is_empty());
+        assert_eq!(inst.opcode, Opcode::Void);
+    }
+
+    #[test]
+    fn replace_uses_with_keeps_definition_identity_and_use_count() {
+        let mut inst = Inst::phi();
+        inst.flags = 0x44;
+        inst.use_count = 7;
+        inst.add_phi_operand(3, Value::ImmU32(10));
+
+        inst.replace_uses_with(Value::ImmU32(20));
+
+        assert_eq!(inst.opcode, Opcode::Identity);
+        assert_eq!(inst.args, vec![Value::ImmU32(20)]);
+        assert!(inst.phi_args.is_empty());
+        assert_eq!(inst.use_count, 7);
+        assert_eq!(inst.flags, 0x44);
     }
 }
 

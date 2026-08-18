@@ -22,6 +22,7 @@ bitflags = "2"
 log = "0.4"
 thiserror = "2"
 libc = "0.2"
+hashbrown = "0.16"
 
 [[bin]]
 name = "a32_diff"

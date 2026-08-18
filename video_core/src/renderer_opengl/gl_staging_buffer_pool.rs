@@ -1,8 +1,7 @@
 // SPDX-FileCopyrightText: 2025 ruzu contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! Port of zuyu/src/video_core/renderer_opengl/gl_staging_buffer_pool.h and
-//! gl_staging_buffer_pool.cpp
+//! Port of Eden `video_core/renderer_opengl/gl_staging_buffer_pool.{h,cpp}`.
 //!
 //! OpenGL staging buffer pool -- manages persistent mapped buffers for CPU-GPU transfers.
 
@@ -10,23 +9,29 @@ use std::sync::Arc;
 
 use parking_lot::Mutex;
 
-pub type SharedStagingBufferPool = Arc<Mutex<StagingBufferPool>>;
+use super::gl_resource_manager::{OGLBuffer, OGLSync};
 
-pub fn make_shared_staging_buffer_pool() -> SharedStagingBufferPool {
+pub(crate) type SharedStagingBufferPool = Arc<Mutex<StagingBufferPool>>;
+
+pub(crate) fn make_shared_staging_buffer_pool() -> SharedStagingBufferPool {
     Arc::new(Mutex::new(StagingBufferPool::new()))
 }
 
 /// Stream buffer size (64 MiB).
-pub const STREAM_BUFFER_SIZE: usize = 64 * 1024 * 1024;
+const STREAM_BUFFER_SIZE: usize = 64 * 1024 * 1024;
 
 /// Number of sync regions in the stream buffer.
-pub const NUM_SYNCS: usize = 16;
+const NUM_SYNCS: usize = 16;
 
 /// Size of each sync region.
-pub const REGION_SIZE: usize = STREAM_BUFFER_SIZE / NUM_SYNCS;
+const REGION_SIZE: usize = STREAM_BUFFER_SIZE / NUM_SYNCS;
 
 /// Maximum alignment for stream buffer requests.
-pub const MAX_ALIGNMENT: usize = 256;
+const MAX_ALIGNMENT: usize = 256;
+
+const _: () = assert!(STREAM_BUFFER_SIZE % MAX_ALIGNMENT == 0);
+const _: () = assert!(STREAM_BUFFER_SIZE % NUM_SYNCS == 0);
+const _: () = assert!(REGION_SIZE % MAX_ALIGNMENT == 0);
 
 /// A mapped region from a staging buffer.
 ///
@@ -38,22 +43,11 @@ pub struct StagingBufferMap {
     pub mapped_size: usize,
     /// Offset within the staging buffer.
     pub offset: usize,
+    pub sync: *mut OGLSync,
     /// GL buffer handle.
     pub buffer: u32,
     /// Index in the alloc array (for freeing deferred buffers).
     pub index: usize,
-    /// Whether this map has an associated sync object.
-    pub has_sync: bool,
-    sync: *mut gl::types::GLsync,
-}
-
-pub struct StagingBufferRawParts {
-    pub mapped_ptr: *mut u8,
-    pub mapped_size: usize,
-    pub offset: usize,
-    pub buffer: u32,
-    pub index: usize,
-    pub sync: *mut gl::types::GLsync,
 }
 
 impl StagingBufferMap {
@@ -72,29 +66,30 @@ impl StagingBufferMap {
         assert!(!self.mapped_ptr.is_null());
         unsafe { std::slice::from_raw_parts(self.mapped_ptr, self.mapped_size) }
     }
+}
 
-    pub fn flush(&self) {
-        if self.buffer == 0 || self.mapped_size == 0 {
-            return;
-        }
-        unsafe {
-            gl::FlushMappedNamedBufferRange(
-                self.buffer,
-                self.offset as isize,
-                self.mapped_size as isize,
-            );
-        }
+impl crate::buffer_cache::buffer_cache_base::BufferCacheAsyncBuffer for StagingBufferMap {
+    fn offset(&self) -> u64 {
+        self.offset as u64
     }
 
-    pub fn into_raw_parts(self) -> StagingBufferRawParts {
-        let map = std::mem::ManuallyDrop::new(self);
-        StagingBufferRawParts {
-            mapped_ptr: map.mapped_ptr,
-            mapped_size: map.mapped_size,
-            offset: map.offset,
-            buffer: map.buffer,
-            index: map.index,
-            sync: map.sync,
+    fn mapped_span(&self) -> &[u8] {
+        StagingBufferMap::mapped_span(self)
+    }
+
+    fn mapped_span_mut(&mut self) -> &mut [u8] {
+        StagingBufferMap::mapped_span_mut(self)
+    }
+
+    #[cfg(test)]
+    fn empty_for_test() -> Self {
+        Self {
+            mapped_ptr: std::ptr::null_mut(),
+            mapped_size: 0,
+            offset: 0,
+            buffer: 0,
+            index: usize::MAX,
+            sync: std::ptr::null_mut(),
         }
     }
 }
@@ -105,48 +100,31 @@ impl Drop for StagingBufferMap {
             return;
         }
         unsafe {
-            // OGLSync::Create is idempotent upstream. A live fence must never be
-            // replaced because it still protects the allocation from reuse.
-            if (*self.sync).is_null() {
-                *self.sync = gl::FenceSync(gl::SYNC_GPU_COMMANDS_COMPLETE, 0);
-            }
+            (*self.sync).create();
         }
     }
 }
 
 /// A single staging buffer allocation.
-struct StagingBufferAlloc {
-    sync: gl::types::GLsync,
-    sync_index: usize,
-    buffer: u32,
-    map: *mut u8,
-    size: usize,
-    deferred: bool,
-}
-
-/// Round up to the next power of two.
-fn next_pow2(v: usize) -> usize {
-    if v == 0 {
-        return 1;
-    }
-    let mut n = v - 1;
-    n |= n >> 1;
-    n |= n >> 2;
-    n |= n >> 4;
-    n |= n >> 8;
-    n |= n >> 16;
-    n |= n >> 32;
-    n + 1
+pub struct StagingBufferAlloc {
+    // Rust drops fields in declaration order. Eden destroys `buffer` before
+    // `sync` because C++ members are destroyed in reverse declaration order.
+    pub buffer: OGLBuffer,
+    pub sync: OGLSync,
+    pub map: *mut u8,
+    pub size: usize,
+    pub sync_index: usize,
+    pub deferred: bool,
 }
 
 /// A collection of staging buffers for a given access pattern.
 ///
 /// Corresponds to `OpenGL::StagingBuffers`.
 pub struct StagingBuffers {
-    allocs: Vec<StagingBufferAlloc>,
-    storage_flags: u32,
-    map_flags: u32,
-    current_sync_index: usize,
+    pub allocs: Vec<StagingBufferAlloc>,
+    pub storage_flags: u32,
+    pub map_flags: u32,
+    pub current_sync_index: usize,
 }
 
 impl StagingBuffers {
@@ -173,7 +151,7 @@ impl StagingBuffers {
         let alloc = &mut self.allocs[index];
 
         if insert_fence {
-            self.current_sync_index += 1;
+            self.current_sync_index = self.current_sync_index.wrapping_add(1);
             alloc.sync_index = self.current_sync_index;
         } else {
             alloc.sync_index = 0;
@@ -184,9 +162,8 @@ impl StagingBuffers {
             mapped_ptr: alloc.map,
             mapped_size: requested_size,
             offset: 0,
-            buffer: alloc.buffer,
+            buffer: alloc.buffer.handle,
             index,
-            has_sync: insert_fence,
             sync: if insert_fence {
                 &mut alloc.sync as *mut _
             } else {
@@ -199,52 +176,61 @@ impl StagingBuffers {
     ///
     /// Port of `StagingBuffers::FreeDeferredStagingBuffer`.
     pub fn free_deferred_staging_buffer(&mut self, index: usize) {
-        assert!(self.allocs[index].deferred);
+        if !self.allocs[index].deferred {
+            log::error!(
+                "StagingBuffers::FreeDeferredStagingBuffer: allocation {index} is not deferred"
+            );
+        }
         self.allocs[index].deferred = false;
     }
 
     /// Request or allocate a buffer of the given size.
     ///
     /// Port of `StagingBuffers::RequestBuffer`.
-    fn request_buffer(&mut self, requested_size: usize) -> usize {
+    pub fn request_buffer(&mut self, requested_size: usize) -> usize {
         if let Some(index) = self.find_buffer(requested_size) {
             return index;
         }
 
-        let next_pow2_size = next_pow2(requested_size);
-        let mut buffer: u32 = 0;
-        let map: *mut u8;
+        let mut alloc = StagingBufferAlloc {
+            buffer: OGLBuffer::new(),
+            sync: OGLSync::new(),
+            map: std::ptr::null_mut(),
+            size: 0,
+            sync_index: 0,
+            deferred: false,
+        };
+        alloc.buffer.create();
+        let next_pow2_size = common::bit_util::next_pow2_u64(requested_size as u64) as usize;
         let persistent_flags = self.storage_flags | gl::MAP_PERSISTENT_BIT;
         let persistent_map_flags = self.map_flags | gl::MAP_PERSISTENT_BIT;
 
         unsafe {
-            gl::CreateBuffers(1, &mut buffer);
             gl::NamedBufferStorage(
-                buffer,
+                alloc.buffer.handle,
                 next_pow2_size as isize,
                 std::ptr::null(),
                 persistent_flags,
             );
-            map = gl::MapNamedBufferRange(buffer, 0, next_pow2_size as isize, persistent_map_flags)
-                as *mut u8;
+            alloc.map = gl::MapNamedBufferRange(
+                alloc.buffer.handle,
+                0,
+                next_pow2_size as isize,
+                persistent_map_flags,
+            ) as *mut u8;
         }
+        debug_assert!(!alloc.map.is_null());
+        alloc.size = next_pow2_size;
 
-        self.allocs.push(StagingBufferAlloc {
-            sync: std::ptr::null(),
-            sync_index: 0,
-            buffer,
-            map,
-            size: next_pow2_size,
-            deferred: false,
-        });
+        self.allocs.push(alloc);
         self.allocs.len() - 1
     }
 
     /// Find an existing free buffer that fits the requested size.
     ///
     /// Port of `StagingBuffers::FindBuffer`.
-    fn find_buffer(&mut self, requested_size: usize) -> Option<usize> {
-        let mut known_unsignaled_index = self.current_sync_index + 1;
+    pub fn find_buffer(&mut self, requested_size: usize) -> Option<usize> {
+        let mut known_unsignaled_index = self.current_sync_index.wrapping_add(1);
         let mut smallest_buffer = usize::MAX;
         let mut found: Option<usize> = None;
 
@@ -256,23 +242,16 @@ impl StagingBuffers {
             if self.allocs[index].deferred {
                 continue;
             }
-            let sync = self.allocs[index].sync;
-            if !sync.is_null() {
+            if !self.allocs[index].sync.handle.is_null() {
                 let sync_index = self.allocs[index].sync_index;
                 if sync_index >= known_unsignaled_index {
                     continue;
                 }
-                let status = unsafe { gl::ClientWaitSync(sync, 0, 0) };
-                assert_ne!(status, gl::WAIT_FAILED);
-                if status == gl::TIMEOUT_EXPIRED {
+                if !self.allocs[index].sync.is_signaled() {
                     known_unsignaled_index = known_unsignaled_index.min(sync_index);
                     continue;
                 }
-                // Signaled - release the sync
-                unsafe {
-                    gl::DeleteSync(sync);
-                }
-                self.allocs[index].sync = std::ptr::null();
+                self.allocs[index].sync.release();
             }
             smallest_buffer = buffer_size;
             found = Some(index);
@@ -281,67 +260,58 @@ impl StagingBuffers {
     }
 }
 
-impl Drop for StagingBuffers {
-    fn drop(&mut self) {
-        for alloc in &self.allocs {
-            unsafe {
-                if alloc.buffer != 0 {
-                    gl::DeleteBuffers(1, &alloc.buffer);
-                }
-                if !alloc.sync.is_null() {
-                    gl::DeleteSync(alloc.sync);
-                }
-            }
-        }
-    }
-}
-
 /// A persistent mapped stream buffer for uniform data.
 ///
 /// Corresponds to `OpenGL::StreamBuffer`.
 pub struct StreamBuffer {
+    // Rust drops owning fields in declaration order, matching Eden's reverse
+    // C++ member destruction: fences before buffer.
+    fences: [OGLSync; NUM_SYNCS],
+    buffer: OGLBuffer,
     iterator: usize,
     used_iterator: usize,
     free_iterator: usize,
     mapped_pointer: *mut u8,
-    buffer: u32,
-    fences: [gl::types::GLsync; NUM_SYNCS],
 }
 
 // SAFETY: The GL handles and mapped pointers are only accessed on the GL thread.
 unsafe impl Send for StreamBuffer {}
-unsafe impl Sync for StreamBuffer {}
 
 impl StreamBuffer {
     /// Create a new stream buffer.
     ///
     /// Port of `StreamBuffer::StreamBuffer`.
     pub fn new() -> Self {
-        let mut buffer: u32 = 0;
+        let mut buffer = OGLBuffer::new();
+        let mut fences = std::array::from_fn(|_| OGLSync::new());
+        buffer.create();
         let mapped_pointer: *mut u8;
         let flags = gl::MAP_WRITE_BIT | gl::MAP_PERSISTENT_BIT | gl::MAP_COHERENT_BIT;
 
         unsafe {
-            gl::CreateBuffers(1, &mut buffer);
-            gl::NamedBufferStorage(buffer, STREAM_BUFFER_SIZE as isize, std::ptr::null(), flags);
+            gl::ObjectLabel(gl::BUFFER, buffer.handle, -1, c"Stream Buffer".as_ptr());
+            gl::NamedBufferStorage(
+                buffer.handle,
+                STREAM_BUFFER_SIZE as isize,
+                std::ptr::null(),
+                flags,
+            );
             mapped_pointer =
-                gl::MapNamedBufferRange(buffer, 0, STREAM_BUFFER_SIZE as isize, flags) as *mut u8;
+                gl::MapNamedBufferRange(buffer.handle, 0, STREAM_BUFFER_SIZE as isize, flags)
+                    as *mut u8;
         }
 
-        let mut fences = [std::ptr::null(); NUM_SYNCS];
         for fence in &mut fences {
-            unsafe {
-                *fence = gl::FenceSync(gl::SYNC_GPU_COMMANDS_COMPLETE, 0);
-            }
+            fence.create();
         }
 
         Self {
+            fences,
+            buffer,
             iterator: 0,
             used_iterator: 0,
             free_iterator: 0,
             mapped_pointer,
-            buffer,
-            fences,
         }
     }
 
@@ -351,44 +321,38 @@ impl StreamBuffer {
     ///
     /// Port of `StreamBuffer::Request`.
     pub fn request(&mut self, size: usize) -> (*mut u8, usize) {
-        assert!(size < REGION_SIZE);
+        if size >= REGION_SIZE {
+            log::error!(
+                "StreamBuffer::Request size {size} must be smaller than region size {REGION_SIZE}"
+            );
+        }
 
         // Create fences for used regions
         let region_start = Self::region(self.used_iterator);
         let region_end = Self::region(self.iterator);
         for region in region_start..region_end {
-            unsafe {
-                if self.fences[region].is_null() {
-                    self.fences[region] = gl::FenceSync(gl::SYNC_GPU_COMMANDS_COMPLETE, 0);
-                }
-            }
+            self.fences[region].create();
         }
         self.used_iterator = self.iterator;
 
         // Wait for regions we're about to overwrite
-        let wait_start = Self::region(self.free_iterator) + 1;
-        let wait_end = (Self::region(self.iterator + size) + 1).min(NUM_SYNCS);
+        let wait_start = Self::region(self.free_iterator).wrapping_add(1);
+        let request_end = self.iterator.wrapping_add(size);
+        let wait_end = Self::region(request_end).wrapping_add(1).min(NUM_SYNCS);
         for region in wait_start..wait_end {
             unsafe {
-                if !self.fences[region].is_null() {
-                    gl::ClientWaitSync(self.fences[region], 0, u64::MAX);
-                    gl::DeleteSync(self.fences[region]);
-                    self.fences[region] = std::ptr::null();
-                }
+                gl::ClientWaitSync(self.fences[region].handle, 0, gl::TIMEOUT_IGNORED);
             }
+            self.fences[region].release();
         }
-        if self.iterator + size >= self.free_iterator {
-            self.free_iterator = self.iterator + size;
+        if request_end >= self.free_iterator {
+            self.free_iterator = request_end;
         }
 
         // Wrap around if needed
-        if self.iterator + size > STREAM_BUFFER_SIZE {
+        if request_end > STREAM_BUFFER_SIZE {
             for region in Self::region(self.used_iterator)..NUM_SYNCS {
-                unsafe {
-                    if self.fences[region].is_null() {
-                        self.fences[region] = gl::FenceSync(gl::SYNC_GPU_COMMANDS_COMPLETE, 0);
-                    }
-                }
+                self.fences[region].create();
             }
             self.used_iterator = 0;
             self.iterator = 0;
@@ -396,18 +360,19 @@ impl StreamBuffer {
 
             for region in 0..=Self::region(size) {
                 unsafe {
-                    if !self.fences[region].is_null() {
-                        gl::ClientWaitSync(self.fences[region], 0, u64::MAX);
-                        gl::DeleteSync(self.fences[region]);
-                        self.fences[region] = std::ptr::null();
-                    }
+                    gl::ClientWaitSync(self.fences[region].handle, 0, gl::TIMEOUT_IGNORED);
                 }
+                self.fences[region].release();
             }
         }
 
         let offset = self.iterator;
         // Align up to MAX_ALIGNMENT
-        self.iterator = (self.iterator + size + MAX_ALIGNMENT - 1) & !(MAX_ALIGNMENT - 1);
+        self.iterator = self
+            .iterator
+            .wrapping_add(size)
+            .wrapping_add(MAX_ALIGNMENT - 1)
+            & !(MAX_ALIGNMENT - 1);
 
         let ptr = unsafe { self.mapped_pointer.add(offset) };
         (ptr, offset)
@@ -415,7 +380,7 @@ impl StreamBuffer {
 
     /// Get the GL buffer handle.
     pub fn handle(&self) -> u32 {
-        self.buffer
+        self.buffer.handle
     }
 
     fn region(offset: usize) -> usize {
@@ -423,27 +388,13 @@ impl StreamBuffer {
     }
 }
 
-impl Drop for StreamBuffer {
-    fn drop(&mut self) {
-        unsafe {
-            for fence in &self.fences {
-                if !fence.is_null() {
-                    gl::DeleteSync(*fence);
-                }
-            }
-            if self.buffer != 0 {
-                gl::DeleteBuffers(1, &self.buffer);
-            }
-        }
-    }
-}
-
 /// Top-level staging buffer pool.
 ///
 /// Corresponds to `OpenGL::StagingBufferPool`.
 pub struct StagingBufferPool {
-    upload_buffers: StagingBuffers,
+    // Eden's C++ members are destroyed in reverse declaration order.
     download_buffers: StagingBuffers,
+    upload_buffers: StagingBuffers,
 }
 
 // The rasterizer transfers this GL-thread-owned pool with the renderer. Access
@@ -453,16 +404,7 @@ unsafe impl Send for StagingBufferPool {}
 impl StagingBufferPool {
     /// Create a new staging buffer pool.
     pub fn new() -> Self {
-        Self {
-            upload_buffers: StagingBuffers::new(
-                gl::MAP_WRITE_BIT,
-                gl::MAP_WRITE_BIT | gl::MAP_FLUSH_EXPLICIT_BIT,
-            ),
-            download_buffers: StagingBuffers::new(
-                gl::MAP_READ_BIT | gl::CLIENT_STORAGE_BIT,
-                gl::MAP_READ_BIT,
-            ),
-        }
+        Self::default()
     }
 
     /// Request an upload staging buffer.
@@ -486,9 +428,20 @@ impl StagingBufferPool {
         self.download_buffers
             .free_deferred_staging_buffer(buffer.index);
     }
+}
 
-    pub fn free_deferred_staging_buffer_by_index(&mut self, index: usize) {
-        self.download_buffers.free_deferred_staging_buffer(index);
+impl Default for StagingBufferPool {
+    fn default() -> Self {
+        Self {
+            download_buffers: StagingBuffers::new(
+                gl::MAP_READ_BIT | gl::CLIENT_STORAGE_BIT,
+                gl::MAP_READ_BIT,
+            ),
+            upload_buffers: StagingBuffers::new(
+                gl::MAP_WRITE_BIT,
+                gl::MAP_WRITE_BIT | gl::MAP_FLUSH_EXPLICIT_BIT,
+            ),
+        }
     }
 }
 
@@ -513,14 +466,19 @@ mod tests {
     }
 
     #[test]
-    fn next_pow2_works() {
-        assert_eq!(next_pow2(0), 1);
-        assert_eq!(next_pow2(1), 1);
-        assert_eq!(next_pow2(2), 2);
-        assert_eq!(next_pow2(3), 4);
-        assert_eq!(next_pow2(5), 8);
-        assert_eq!(next_pow2(256), 256);
-        assert_eq!(next_pow2(257), 512);
+    fn free_deferred_staging_buffer_preserves_edens_fail_soft_assertion() {
+        let mut buffers = StagingBuffers::new(0, 0);
+        buffers.allocs.push(StagingBufferAlloc {
+            buffer: OGLBuffer::new(),
+            sync: OGLSync::new(),
+            map: std::ptr::null_mut(),
+            size: 1,
+            sync_index: 0,
+            deferred: false,
+        });
+
+        buffers.free_deferred_staging_buffer(0);
+        assert!(!buffers.allocs[0].deferred);
     }
 
     #[test]

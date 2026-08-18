@@ -481,6 +481,11 @@ impl DecoderImpl for H264 {
             );
             context
         };
+        let params = &self.current_context.h264_parameter_set;
+        self.state.set_frame_dimensions(
+            (params.pic_width_in_mbs as i32) * 16,
+            (params.frame_height_in_mbs as i32) * 16,
+        );
 
         let frame_number = self.current_context.h264_parameter_set.frame_number() as i64;
         if !self.is_first_frame && frame_number != 0 {

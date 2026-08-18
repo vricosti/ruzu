@@ -31,6 +31,10 @@ pub fn page() -> Page {
         w::path_row("NAND", &get_ruzu_path_string(RuzuPath::NANDDir));
     storage.append(&nand_row);
 
+    let (save_row, save, save_browse) =
+        w::path_row("Save Data", &get_ruzu_path_string(RuzuPath::SaveDir));
+    storage.append(&save_row);
+
     let (sdmc_row, sdmc, sdmc_browse) =
         w::path_row("SD Card", &get_ruzu_path_string(RuzuPath::SDMCDir));
     storage.append(&sdmc_row);
@@ -127,6 +131,7 @@ pub fn page() -> Page {
 
     // Directory pickers for every path row.
     connect_folder_picker(&nand_browse, &nand, "Select NAND Directory...");
+    connect_folder_picker(&save_browse, &save, "Select Save Data Directory...");
     connect_folder_picker(&sdmc_browse, &sdmc, "Select SD Card Directory...");
     connect_gamecard_picker(&gamecard_browse, &gamecard_path);
     connect_folder_picker(&dump_browse, &dump_root, "Select Dump Directory...");
@@ -159,6 +164,7 @@ pub fn page() -> Page {
         // The storage/patch directory entries feed `Common::FS::SetYuzuPath`
         // upstream — `path_util::set_ruzu_path` here.
         set_ruzu_path(RuzuPath::NANDDir, Path::new(&nand.text()));
+        set_ruzu_path(RuzuPath::SaveDir, Path::new(&save.text()));
         set_ruzu_path(RuzuPath::SDMCDir, Path::new(&sdmc.text()));
         set_ruzu_path(RuzuPath::DumpDir, Path::new(&dump_root.text()));
         set_ruzu_path(RuzuPath::LoadDir, Path::new(&load_root.text()));

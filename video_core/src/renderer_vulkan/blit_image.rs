@@ -8,6 +8,7 @@
 //! format conversions, and color/stencil clears.
 
 use ash::vk;
+use std::collections::VecDeque;
 use std::ffi::CString;
 use std::ptr::NonNull;
 
@@ -15,6 +16,7 @@ use crate::host_shaders::spirv_shaders::{
     BLIT_COLOR_FLOAT_FRAG_SPV, CONVERT_ABGR8_TO_D24S8_FRAG_SPV, CONVERT_ABGR8_TO_D32F_FRAG_SPV,
     CONVERT_D24S8_TO_ABGR8_FRAG_SPV, CONVERT_D32F_TO_ABGR8_FRAG_SPV,
     CONVERT_DEPTH_TO_FLOAT_FRAG_SPV, CONVERT_FLOAT_TO_DEPTH_FRAG_SPV,
+    CONVERT_MSAA_TO_NON_MSAA_FRAG_SPV, CONVERT_NON_MSAA_TO_MSAA_FRAG_SPV,
     CONVERT_S8D24_TO_ABGR8_FRAG_SPV, FULL_SCREEN_TRIANGLE_VERT_SPV,
     VULKAN_BLIT_DEPTH_STENCIL_FRAG_SPV, VULKAN_COLOR_CLEAR_FRAG_SPV, VULKAN_COLOR_CLEAR_VERT_SPV,
     VULKAN_DEPTHSTENCIL_CLEAR_FRAG_SPV,
@@ -22,9 +24,13 @@ use crate::host_shaders::spirv_shaders::{
 use crate::renderer_vulkan::descriptor_pool::{
     DescriptorAllocator, DescriptorBankInfo, DescriptorPool,
 };
+use crate::renderer_vulkan::render_pass_cache::{RenderPassCache, RenderPassKey};
 use crate::renderer_vulkan::scheduler::Scheduler;
 use crate::renderer_vulkan::shader_util::build_shader;
-use crate::texture_cache::types::NUM_RT;
+use crate::surface::PixelFormat;
+use crate::texture_cache::samples_helper::samples_log2;
+use crate::texture_cache::types::{ImageCopy, NUM_RT};
+use crate::vulkan_common::vulkan_device::{Device, FormatType};
 
 // ---------------------------------------------------------------------------
 // Push constants (file-local, matching upstream anonymous namespace)
@@ -36,6 +42,15 @@ use crate::texture_cache::types::NUM_RT;
 struct PushConstants {
     tex_scale: [f32; 2],
     tex_offset: [f32; 2],
+}
+
+/// Port of anonymous `MSAACopyPushConstants`.
+#[derive(Debug, Clone, Copy, Default)]
+#[repr(C)]
+struct MsaaCopyPushConstants {
+    dst_offset: [i32; 2],
+    src_offset: [i32; 2],
+    scale: [i32; 2],
 }
 
 // ---------------------------------------------------------------------------
@@ -57,6 +72,24 @@ pub struct BlitDepthStencilPipelineKey {
     pub stencil_mask: u8,
     pub stencil_compare_mask: u32,
     pub stencil_ref: u32,
+}
+
+/// Port of `MSAACopyPipelineKey`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct MsaaCopyPipelineKey {
+    renderpass: vk::RenderPass,
+    samples: vk::SampleCountFlags,
+    msaa_to_non_msaa: bool,
+}
+
+/// Resources referenced by an asynchronously recorded MSAA copy.
+///
+/// Port of `BlitImageHelper::MSAACopyResources`.
+struct MsaaCopyResources {
+    tick: u64,
+    src_view: vk::ImageView,
+    dst_view: vk::ImageView,
+    framebuffer: vk::Framebuffer,
 }
 
 /// Minimal framebuffer view consumed by `BlitImageHelper`, matching the
@@ -325,6 +358,43 @@ fn conversion_extent(src: ConversionImageView) -> vk::Extent2D {
     }
 }
 
+fn sample_count_flag(num_samples: u32) -> vk::SampleCountFlags {
+    match num_samples {
+        2 => vk::SampleCountFlags::TYPE_2,
+        4 => vk::SampleCountFlags::TYPE_4,
+        8 => vk::SampleCountFlags::TYPE_8,
+        16 => vk::SampleCountFlags::TYPE_16,
+        _ => vk::SampleCountFlags::TYPE_1,
+    }
+}
+
+fn make_msaa_copy_view(
+    device: &ash::Device,
+    image: vk::Image,
+    format: vk::Format,
+    base_level: u32,
+) -> Result<vk::ImageView, vk::Result> {
+    let create_info = vk::ImageViewCreateInfo::builder()
+        .image(image)
+        .view_type(vk::ImageViewType::TYPE_2D)
+        .format(format)
+        .components(vk::ComponentMapping {
+            r: vk::ComponentSwizzle::IDENTITY,
+            g: vk::ComponentSwizzle::IDENTITY,
+            b: vk::ComponentSwizzle::IDENTITY,
+            a: vk::ComponentSwizzle::IDENTITY,
+        })
+        .subresource_range(vk::ImageSubresourceRange {
+            aspect_mask: vk::ImageAspectFlags::COLOR,
+            base_mip_level: base_level,
+            level_count: 1,
+            base_array_layer: 0,
+            layer_count: 1,
+        })
+        .build();
+    unsafe { device.create_image_view(&create_info, None) }
+}
+
 fn ensure_conversion_pipeline(
     device: &ash::Device,
     pipeline: &mut vk::Pipeline,
@@ -449,6 +519,7 @@ fn ensure_conversion_pipeline(
 /// fullscreen-triangle shaders and cached pipelines.
 pub struct BlitImageHelper {
     device: ash::Device,
+    device_owner: NonNull<Device>,
     scheduler: NonNull<Scheduler>,
     shader_stencil_export_supported: bool,
 
@@ -462,6 +533,7 @@ pub struct BlitImageHelper {
     one_texture_pipeline_layout: vk::PipelineLayout,
     two_textures_pipeline_layout: vk::PipelineLayout,
     clear_color_pipeline_layout: vk::PipelineLayout,
+    msaa_copy_pipeline_layout: vk::PipelineLayout,
 
     // Shader modules
     full_screen_vert: vk::ShaderModule,
@@ -477,6 +549,8 @@ pub struct BlitImageHelper {
     convert_d32f_to_abgr8_frag: vk::ShaderModule,
     convert_d24s8_to_abgr8_frag: vk::ShaderModule,
     convert_s8d24_to_abgr8_frag: vk::ShaderModule,
+    convert_msaa_to_non_msaa_frag: vk::ShaderModule,
+    convert_non_msaa_to_msaa_frag: vk::ShaderModule,
 
     // Samplers
     linear_sampler: vk::Sampler,
@@ -491,6 +565,9 @@ pub struct BlitImageHelper {
     clear_color_pipelines: Vec<vk::Pipeline>,
     clear_stencil_keys: Vec<BlitDepthStencilPipelineKey>,
     clear_stencil_pipelines: Vec<vk::Pipeline>,
+    msaa_copy_keys: Vec<MsaaCopyPipelineKey>,
+    msaa_copy_pipelines: Vec<vk::Pipeline>,
+    msaa_copy_resources: VecDeque<MsaaCopyResources>,
 
     // Conversion pipelines (lazily created)
     convert_d32_to_r32_pipeline: vk::Pipeline,
@@ -527,11 +604,12 @@ impl BlitImageHelper {
 
     /// Port of `BlitImageHelper::BlitImageHelper`.
     pub fn new(
-        device: ash::Device,
+        vulkan_device: &Device,
         scheduler: &mut Scheduler,
         descriptor_pool: &mut DescriptorPool,
         shader_stencil_export_supported: bool,
     ) -> Self {
+        let device = vulkan_device.get_logical().clone();
         // Create one-texture descriptor set layout (1 combined image sampler)
         let one_tex_binding = vk::DescriptorSetLayoutBinding {
             binding: 0,
@@ -619,6 +697,21 @@ impl BlitImageHelper {
                 .expect("Failed to create clear color pipeline layout")
         };
 
+        let msaa_copy_push_range = vk::PushConstantRange {
+            stage_flags: vk::ShaderStageFlags::FRAGMENT,
+            offset: 0,
+            size: std::mem::size_of::<MsaaCopyPushConstants>() as u32,
+        };
+        let msaa_copy_pl_ci = vk::PipelineLayoutCreateInfo::builder()
+            .set_layouts(&one_tex_layouts)
+            .push_constant_ranges(std::slice::from_ref(&msaa_copy_push_range))
+            .build();
+        let msaa_copy_pipeline_layout = unsafe {
+            device
+                .create_pipeline_layout(&msaa_copy_pl_ci, None)
+                .expect("Failed to create MSAA copy pipeline layout")
+        };
+
         // Create samplers
         let linear_sampler_ci = vk::SamplerCreateInfo::builder()
             .mag_filter(vk::Filter::LINEAR)
@@ -680,6 +773,12 @@ impl BlitImageHelper {
             .expect("Failed to build convert_d24s8_to_abgr8.frag");
         let convert_s8d24_to_abgr8_frag = build_shader(&device, CONVERT_S8D24_TO_ABGR8_FRAG_SPV)
             .expect("Failed to build convert_s8d24_to_abgr8.frag");
+        let convert_msaa_to_non_msaa_frag =
+            build_shader(&device, CONVERT_MSAA_TO_NON_MSAA_FRAG_SPV)
+                .expect("Failed to build convert_msaa_to_non_msaa.frag");
+        let convert_non_msaa_to_msaa_frag =
+            build_shader(&device, CONVERT_NON_MSAA_TO_MSAA_FRAG_SPV)
+                .expect("Failed to build convert_non_msaa_to_msaa.frag");
         let one_texture_descriptor_allocator = descriptor_pool
             .allocator(one_texture_set_layout, &Self::ONE_TEXTURE_BANK_INFO)
             .expect("Failed to create one-texture descriptor allocator");
@@ -689,6 +788,7 @@ impl BlitImageHelper {
 
         BlitImageHelper {
             device,
+            device_owner: NonNull::from(vulkan_device),
             scheduler: NonNull::from(scheduler),
             shader_stencil_export_supported,
             one_texture_set_layout,
@@ -698,6 +798,7 @@ impl BlitImageHelper {
             one_texture_pipeline_layout,
             two_textures_pipeline_layout,
             clear_color_pipeline_layout,
+            msaa_copy_pipeline_layout,
             full_screen_vert,
             blit_color_to_color_frag,
             blit_depth_stencil_frag,
@@ -711,6 +812,8 @@ impl BlitImageHelper {
             convert_d32f_to_abgr8_frag,
             convert_d24s8_to_abgr8_frag,
             convert_s8d24_to_abgr8_frag,
+            convert_msaa_to_non_msaa_frag,
+            convert_non_msaa_to_msaa_frag,
             linear_sampler,
             nearest_sampler,
             blit_color_keys: Vec::new(),
@@ -721,6 +824,9 @@ impl BlitImageHelper {
             clear_color_pipelines: Vec::new(),
             clear_stencil_keys: Vec::new(),
             clear_stencil_pipelines: Vec::new(),
+            msaa_copy_keys: Vec::new(),
+            msaa_copy_pipelines: Vec::new(),
+            msaa_copy_resources: VecDeque::new(),
             convert_d32_to_r32_pipeline: vk::Pipeline::null(),
             convert_r32_to_d32_pipeline: vk::Pipeline::null(),
             convert_d16_to_r16_pipeline: vk::Pipeline::null(),
@@ -1543,6 +1649,376 @@ impl BlitImageHelper {
         true
     }
 
+    /// Port of `BlitImageHelper::CopyMSAA`.
+    pub fn copy_msaa(
+        &mut self,
+        render_pass_cache: &RenderPassCache,
+        dst_image: vk::Image,
+        dst_format: PixelFormat,
+        src_image: vk::Image,
+        src_format: PixelFormat,
+        num_samples: u32,
+        copies: &[ImageCopy],
+        msaa_to_non_msaa: bool,
+    ) -> bool {
+        while self
+            .msaa_copy_resources
+            .front()
+            .is_some_and(|resource| unsafe { self.scheduler.as_ref() }.is_free(resource.tick))
+        {
+            let resource = self.msaa_copy_resources.pop_front().unwrap();
+            unsafe {
+                self.device.destroy_image_view(resource.src_view, None);
+                self.device.destroy_image_view(resource.dst_view, None);
+                self.device.destroy_framebuffer(resource.framebuffer, None);
+            }
+        }
+
+        let (samples_x, samples_y) = samples_log2(num_samples as i32);
+        let scale_x = 1_i32 << samples_x;
+        let scale_y = 1_i32 << samples_y;
+        let samples = if msaa_to_non_msaa {
+            vk::SampleCountFlags::TYPE_1
+        } else {
+            sample_count_flag(num_samples)
+        };
+        let mut renderpass_key = RenderPassKey::default();
+        renderpass_key.color_formats[0] = dst_format;
+        renderpass_key.samples = samples;
+        let renderpass = match render_pass_cache.get(&renderpass_key) {
+            Ok(renderpass) => renderpass,
+            Err(err) => {
+                log::warn!("BlitImageHelper::CopyMSAA render pass creation failed: {err:?}");
+                return false;
+            }
+        };
+        let key = MsaaCopyPipelineKey {
+            renderpass,
+            samples,
+            msaa_to_non_msaa,
+        };
+        let pipeline = match self.find_or_emplace_msaa_copy_pipeline(&key) {
+            Ok(pipeline) => pipeline,
+            Err(err) => {
+                log::warn!("BlitImageHelper::CopyMSAA pipeline creation failed: {err:?}");
+                return false;
+            }
+        };
+        // SAFETY: the boxed `Device` owner outlives the rasterizer and this
+        // helper, matching upstream's `const Device&` member.
+        let vulkan_device = unsafe { self.device_owner.as_ref() };
+        let src_vk_format = super::maxwell_to_vk::surface_format(
+            vulkan_device,
+            FormatType::Optimal,
+            true,
+            src_format,
+        )
+        .format;
+        let dst_vk_format = super::maxwell_to_vk::surface_format(
+            vulkan_device,
+            FormatType::Optimal,
+            true,
+            dst_format,
+        )
+        .format;
+
+        for copy in copies {
+            assert_eq!(copy.src_subresource.base_layer, 0);
+            assert_eq!(copy.src_subresource.num_layers, 1);
+            assert_eq!(copy.dst_subresource.base_layer, 0);
+            assert_eq!(copy.dst_subresource.num_layers, 1);
+
+            let src_view = match make_msaa_copy_view(
+                &self.device,
+                src_image,
+                src_vk_format,
+                copy.src_subresource.base_level as u32,
+            ) {
+                Ok(view) => view,
+                Err(err) => {
+                    log::warn!("BlitImageHelper::CopyMSAA source view failed: {err:?}");
+                    return false;
+                }
+            };
+            let dst_view = match make_msaa_copy_view(
+                &self.device,
+                dst_image,
+                dst_vk_format,
+                copy.dst_subresource.base_level as u32,
+            ) {
+                Ok(view) => view,
+                Err(err) => {
+                    unsafe { self.device.destroy_image_view(src_view, None) };
+                    log::warn!("BlitImageHelper::CopyMSAA destination view failed: {err:?}");
+                    return false;
+                }
+            };
+            let render_area = vk::Rect2D {
+                offset: vk::Offset2D {
+                    x: copy.dst_offset.x,
+                    y: copy.dst_offset.y,
+                },
+                extent: vk::Extent2D {
+                    width: copy.extent.width,
+                    height: copy.extent.height,
+                },
+            };
+            let attachments = [dst_view];
+            let framebuffer_info = vk::FramebufferCreateInfo::builder()
+                .render_pass(renderpass)
+                .attachments(&attachments)
+                .width((copy.dst_offset.x as u32) + copy.extent.width)
+                .height((copy.dst_offset.y as u32) + copy.extent.height)
+                .layers(1)
+                .build();
+            let framebuffer = match unsafe {
+                self.device.create_framebuffer(&framebuffer_info, None)
+            } {
+                Ok(framebuffer) => framebuffer,
+                Err(err) => {
+                    unsafe {
+                        self.device.destroy_image_view(src_view, None);
+                        self.device.destroy_image_view(dst_view, None);
+                    }
+                    log::warn!("BlitImageHelper::CopyMSAA framebuffer creation failed: {err:?}");
+                    return false;
+                }
+            };
+            let descriptor_set = match self
+                .commit_descriptor(&self.one_texture_descriptor_allocator)
+            {
+                Ok(descriptor_set) => descriptor_set,
+                Err(err) => {
+                    unsafe {
+                        self.device.destroy_framebuffer(framebuffer, None);
+                        self.device.destroy_image_view(src_view, None);
+                        self.device.destroy_image_view(dst_view, None);
+                    }
+                    log::warn!("BlitImageHelper::CopyMSAA descriptor allocation failed: {err:?}");
+                    return false;
+                }
+            };
+            update_one_texture_descriptor_set(
+                &self.device,
+                descriptor_set,
+                self.nearest_sampler,
+                src_view,
+            );
+            let push_constants = MsaaCopyPushConstants {
+                dst_offset: [copy.dst_offset.x, copy.dst_offset.y],
+                src_offset: [copy.src_offset.x, copy.src_offset.y],
+                scale: [scale_x, scale_y],
+            };
+            let device = self.device.clone();
+            let layout = self.msaa_copy_pipeline_layout;
+            unsafe { self.scheduler.as_mut() }.request_outside_renderpass();
+            unsafe { self.scheduler.as_mut() }.record(move |cmdbuf| unsafe {
+                let color_range = vk::ImageSubresourceRange {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    base_mip_level: 0,
+                    level_count: vk::REMAINING_MIP_LEVELS,
+                    base_array_layer: 0,
+                    layer_count: vk::REMAINING_ARRAY_LAYERS,
+                };
+                let pre_barriers = [
+                    vk::ImageMemoryBarrier::builder()
+                        .src_access_mask(
+                            vk::AccessFlags::COLOR_ATTACHMENT_WRITE
+                                | vk::AccessFlags::SHADER_WRITE
+                                | vk::AccessFlags::TRANSFER_WRITE,
+                        )
+                        .dst_access_mask(vk::AccessFlags::SHADER_READ)
+                        .old_layout(vk::ImageLayout::GENERAL)
+                        .new_layout(vk::ImageLayout::GENERAL)
+                        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                        .image(src_image)
+                        .subresource_range(color_range)
+                        .build(),
+                    vk::ImageMemoryBarrier::builder()
+                        .src_access_mask(
+                            vk::AccessFlags::COLOR_ATTACHMENT_WRITE
+                                | vk::AccessFlags::SHADER_WRITE
+                                | vk::AccessFlags::TRANSFER_WRITE,
+                        )
+                        .dst_access_mask(
+                            vk::AccessFlags::COLOR_ATTACHMENT_READ
+                                | vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
+                        )
+                        .old_layout(vk::ImageLayout::GENERAL)
+                        .new_layout(vk::ImageLayout::GENERAL)
+                        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                        .image(dst_image)
+                        .subresource_range(color_range)
+                        .build(),
+                ];
+                device.cmd_pipeline_barrier(
+                    cmdbuf,
+                    vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT
+                        | vk::PipelineStageFlags::COMPUTE_SHADER
+                        | vk::PipelineStageFlags::FRAGMENT_SHADER
+                        | vk::PipelineStageFlags::TRANSFER,
+                    vk::PipelineStageFlags::FRAGMENT_SHADER
+                        | vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &pre_barriers,
+                );
+                let begin_info = vk::RenderPassBeginInfo::builder()
+                    .render_pass(renderpass)
+                    .framebuffer(framebuffer)
+                    .render_area(render_area)
+                    .build();
+                device.cmd_begin_render_pass(cmdbuf, &begin_info, vk::SubpassContents::INLINE);
+                device.cmd_bind_pipeline(cmdbuf, vk::PipelineBindPoint::GRAPHICS, pipeline);
+                device.cmd_bind_descriptor_sets(
+                    cmdbuf,
+                    vk::PipelineBindPoint::GRAPHICS,
+                    layout,
+                    0,
+                    &[descriptor_set],
+                    &[],
+                );
+                let viewport = vk::Viewport {
+                    x: render_area.offset.x as f32,
+                    y: render_area.offset.y as f32,
+                    width: render_area.extent.width as f32,
+                    height: render_area.extent.height as f32,
+                    min_depth: 0.0,
+                    max_depth: 1.0,
+                };
+                device.cmd_set_viewport(cmdbuf, 0, &[viewport]);
+                device.cmd_set_scissor(cmdbuf, 0, &[render_area]);
+                let push_bytes = std::slice::from_raw_parts(
+                    (&push_constants as *const MsaaCopyPushConstants).cast::<u8>(),
+                    std::mem::size_of::<MsaaCopyPushConstants>(),
+                );
+                device.cmd_push_constants(
+                    cmdbuf,
+                    layout,
+                    vk::ShaderStageFlags::FRAGMENT,
+                    0,
+                    push_bytes,
+                );
+                device.cmd_draw(cmdbuf, 3, 1, 0, 0);
+                device.cmd_end_render_pass(cmdbuf);
+                let post_barrier = vk::ImageMemoryBarrier::builder()
+                    .src_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
+                    .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::TRANSFER_READ)
+                    .old_layout(vk::ImageLayout::GENERAL)
+                    .new_layout(vk::ImageLayout::GENERAL)
+                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .image(dst_image)
+                    .subresource_range(color_range)
+                    .build();
+                device.cmd_pipeline_barrier(
+                    cmdbuf,
+                    vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+                    vk::PipelineStageFlags::FRAGMENT_SHADER
+                        | vk::PipelineStageFlags::COMPUTE_SHADER
+                        | vk::PipelineStageFlags::TRANSFER,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &[post_barrier],
+                );
+            });
+            self.msaa_copy_resources.push_back(MsaaCopyResources {
+                tick: unsafe { self.scheduler.as_ref() }.pending_tick(),
+                src_view,
+                dst_view,
+                framebuffer,
+            });
+        }
+        unsafe { self.scheduler.as_mut() }.invalidate_state();
+        true
+    }
+
+    fn find_or_emplace_msaa_copy_pipeline(
+        &mut self,
+        key: &MsaaCopyPipelineKey,
+    ) -> Result<vk::Pipeline, vk::Result> {
+        if let Some(index) = self.msaa_copy_keys.iter().position(|cached| cached == key) {
+            return Ok(self.msaa_copy_pipelines[index]);
+        }
+        let main = CString::new("main").unwrap();
+        let fragment_shader = if key.msaa_to_non_msaa {
+            self.convert_msaa_to_non_msaa_frag
+        } else {
+            self.convert_non_msaa_to_msaa_frag
+        };
+        let stages = [
+            vk::PipelineShaderStageCreateInfo::builder()
+                .stage(vk::ShaderStageFlags::VERTEX)
+                .module(self.clear_color_vert)
+                .name(&main)
+                .build(),
+            vk::PipelineShaderStageCreateInfo::builder()
+                .stage(vk::ShaderStageFlags::FRAGMENT)
+                .module(fragment_shader)
+                .name(&main)
+                .build(),
+        ];
+        let vertex_input = vk::PipelineVertexInputStateCreateInfo::builder().build();
+        let input_assembly = vk::PipelineInputAssemblyStateCreateInfo::builder()
+            .topology(vk::PrimitiveTopology::TRIANGLE_LIST)
+            .build();
+        let viewport_state = vk::PipelineViewportStateCreateInfo::builder()
+            .viewport_count(1)
+            .scissor_count(1)
+            .build();
+        let rasterization = vk::PipelineRasterizationStateCreateInfo::builder()
+            .polygon_mode(vk::PolygonMode::FILL)
+            .cull_mode(vk::CullModeFlags::BACK)
+            .front_face(vk::FrontFace::CLOCKWISE)
+            .line_width(1.0)
+            .build();
+        let multisample = vk::PipelineMultisampleStateCreateInfo::builder()
+            .rasterization_samples(key.samples)
+            .sample_shading_enable(!key.msaa_to_non_msaa)
+            .min_sample_shading(if key.msaa_to_non_msaa { 0.0 } else { 1.0 })
+            .build();
+        let blend_attachment = vk::PipelineColorBlendAttachmentState::builder()
+            .color_write_mask(
+                vk::ColorComponentFlags::R
+                    | vk::ColorComponentFlags::G
+                    | vk::ColorComponentFlags::B
+                    | vk::ColorComponentFlags::A,
+            )
+            .build();
+        let color_blend = vk::PipelineColorBlendStateCreateInfo::builder()
+            .attachments(std::slice::from_ref(&blend_attachment))
+            .build();
+        let dynamic_states = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
+        let dynamic_state = vk::PipelineDynamicStateCreateInfo::builder()
+            .dynamic_states(&dynamic_states)
+            .build();
+        let create_info = vk::GraphicsPipelineCreateInfo::builder()
+            .stages(&stages)
+            .vertex_input_state(&vertex_input)
+            .input_assembly_state(&input_assembly)
+            .viewport_state(&viewport_state)
+            .rasterization_state(&rasterization)
+            .multisample_state(&multisample)
+            .color_blend_state(&color_blend)
+            .dynamic_state(&dynamic_state)
+            .layout(self.msaa_copy_pipeline_layout)
+            .render_pass(key.renderpass)
+            .subpass(0)
+            .build();
+        let pipeline = unsafe {
+            self.device
+                .create_graphics_pipelines(vk::PipelineCache::null(), &[create_info], None)
+                .map_err(|(_, err)| err)?[0]
+        };
+        self.msaa_copy_keys.push(*key);
+        self.msaa_copy_pipelines.push(pipeline);
+        Ok(pipeline)
+    }
+
     /// Port of `BlitImageHelper::FindOrEmplaceColorPipeline`.
     ///
     /// Looks up or creates a graphics pipeline for color blitting with
@@ -1961,12 +2437,18 @@ impl BlitImageHelper {
 impl Drop for BlitImageHelper {
     fn drop(&mut self) {
         unsafe {
+            for resource in self.msaa_copy_resources.drain(..) {
+                self.device.destroy_image_view(resource.src_view, None);
+                self.device.destroy_image_view(resource.dst_view, None);
+                self.device.destroy_framebuffer(resource.framebuffer, None);
+            }
             for pipeline in self
                 .blit_color_pipelines
                 .iter_mut()
                 .chain(self.blit_depth_stencil_pipelines.iter_mut())
                 .chain(self.clear_color_pipelines.iter_mut())
                 .chain(self.clear_stencil_pipelines.iter_mut())
+                .chain(self.msaa_copy_pipelines.iter_mut())
             {
                 if *pipeline != vk::Pipeline::null() {
                     self.device.destroy_pipeline(*pipeline, None);
@@ -2005,6 +2487,8 @@ impl Drop for BlitImageHelper {
                 &mut self.convert_d32f_to_abgr8_frag,
                 &mut self.convert_d24s8_to_abgr8_frag,
                 &mut self.convert_s8d24_to_abgr8_frag,
+                &mut self.convert_msaa_to_non_msaa_frag,
+                &mut self.convert_non_msaa_to_msaa_frag,
             ] {
                 if *shader != vk::ShaderModule::null() {
                     self.device.destroy_shader_module(*shader, None);
@@ -2024,6 +2508,11 @@ impl Drop for BlitImageHelper {
                 self.device
                     .destroy_pipeline_layout(self.clear_color_pipeline_layout, None);
                 self.clear_color_pipeline_layout = vk::PipelineLayout::null();
+            }
+            if self.msaa_copy_pipeline_layout != vk::PipelineLayout::null() {
+                self.device
+                    .destroy_pipeline_layout(self.msaa_copy_pipeline_layout, None);
+                self.msaa_copy_pipeline_layout = vk::PipelineLayout::null();
             }
             if self.two_textures_pipeline_layout != vk::PipelineLayout::null() {
                 self.device
@@ -2046,5 +2535,19 @@ impl Drop for BlitImageHelper {
                 self.one_texture_set_layout = vk::DescriptorSetLayout::null();
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn msaa_copy_push_constants_match_upstream_layout() {
+        assert_eq!(std::mem::size_of::<MsaaCopyPushConstants>(), 24);
+        assert_eq!(std::mem::align_of::<MsaaCopyPushConstants>(), 4);
+        assert_eq!(std::mem::offset_of!(MsaaCopyPushConstants, dst_offset), 0);
+        assert_eq!(std::mem::offset_of!(MsaaCopyPushConstants, src_offset), 8);
+        assert_eq!(std::mem::offset_of!(MsaaCopyPushConstants, scale), 16);
     }
 }

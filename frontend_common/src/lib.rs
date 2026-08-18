@@ -8,4 +8,5 @@
 
 pub mod config;
 pub mod content_manager;
+pub mod mod_manager;
 pub mod play_time_manager;

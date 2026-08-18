@@ -233,7 +233,7 @@ fn install_signal_handler() -> SigHandlerState {
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 extern "C" fn sig_action(
     sig: libc::c_int,
-    _info: *mut libc::siginfo_t,
+    info: *mut libc::siginfo_t,
     raw_context: *mut libc::c_void,
 ) {
     unsafe {
@@ -242,34 +242,13 @@ extern "C" fn sig_action(
         let rip = mctx.gregs[libc::REG_RIP as usize] as u64;
         let rsp_ref = &mut mctx.gregs[libc::REG_RSP as usize];
 
-        // Try to handle via registered code blocks
+        // Match upstream `SigHandler::SigAction`: dispatch faults in registered JIT code and
+        // otherwise chain to the handler that was installed before Dynarmic.
         let guard = SIG_HANDLER.lock().unwrap();
         if let Some(state) = guard.as_ref() {
-            let mut hit_range = false;
             for block in &state.code_blocks {
                 if rip >= block.code_begin && rip < block.code_end {
-                    hit_range = true;
                     if let Some(fake_call) = (block.callback)(rip) {
-                        // RUZU_TRACE_FASTMEM_FAULT=1 — log each SIGSEGV
-                        // fastmem fallback dispatch (async-signal-safe).
-                        if std::env::var_os("RUZU_TRACE_FASTMEM_FAULT").is_some() {
-                            let prefix: &[u8] = b"[FASTMEM_FAULT] rip=0x";
-                            let mut buf = [0u8; 96];
-                            let mut nb = prefix.len();
-                            buf[..nb].copy_from_slice(prefix);
-                            for shift in (0..64).step_by(4).rev() {
-                                let nib = ((rip >> shift) & 0xF) as u8;
-                                buf[nb] = if nib < 10 {
-                                    b'0' + nib
-                                } else {
-                                    b'a' + nib - 10
-                                };
-                                nb += 1;
-                            }
-                            buf[nb] = b'\n';
-                            nb += 1;
-                            let _ = libc::write(2, buf.as_ptr() as *const _, nb);
-                        }
                         // "Fake call": push ret_rip, set RIP to call_rip
                         *rsp_ref -= 8;
                         let stack_ptr = *rsp_ref as *mut u64;
@@ -279,286 +258,27 @@ extern "C" fn sig_action(
                     }
                 }
             }
-            // Async-signal-safe log of any SIGSEGV that reaches this
-            // point (either outside all JIT code blocks, or inside
-            // them but with no patch entry for the faulting RIP).
-            //
-            // Without this print, the default handler chain would
-            // just kill the process. Format manually into a fixed
-            // stack buffer; format!() and env::var() both allocate
-            // which is unsafe in a signal handler.
-            let prefix: &[u8] = if hit_range {
-                b"[SIGSEGV] unhandled JIT fault (in code range, no patch): rip=0x"
-            } else {
-                b"[SIGSEGV] fault outside JIT code: rip=0x"
-            };
-            let mut buf = [0u8; 96];
-            let mut n = prefix.len();
-            buf[..n].copy_from_slice(prefix);
-            // 16-digit big-endian hex of `rip`.
-            for shift in (0..64).step_by(4).rev() {
-                let nib = ((rip >> shift) & 0xF) as u8;
-                buf[n] = if nib < 10 {
-                    b'0' + nib
-                } else {
-                    b'a' + nib - 10
-                };
-                n += 1;
-            }
-            buf[n] = b'\n';
-            n += 1;
-            let _ = libc::write(2, buf.as_ptr() as *const _, n);
-
-            // Dump 16 bytes around the faulting RIP (rip-4..rip+12) so we
-            // can identify the actual faulting instruction. Useful for
-            // diagnosing ordered-fastmem patches that don't match: if
-            // the fault is at the `LOCK XADD` we expect 0xF0 at byte +0,
-            // if it's at `XCHG` we expect a REX prefix (0x4?) then 0x87.
-            if hit_range {
-                let mut bb = [0u8; 96];
-                let p3 = b"[SIGSEGV]   bytes @ rip-4..+11:";
-                let mut k = p3.len();
-                bb[..k].copy_from_slice(p3);
-                let start = rip.wrapping_sub(4) as *const u8;
-                for i in 0..16usize {
-                    let byte = *start.add(i);
-                    bb[k] = b' ';
-                    k += 1;
-                    let nib_hi = (byte >> 4) & 0xF;
-                    let nib_lo = byte & 0xF;
-                    bb[k] = if nib_hi < 10 {
-                        b'0' + nib_hi
-                    } else {
-                        b'a' + nib_hi - 10
-                    };
-                    k += 1;
-                    bb[k] = if nib_lo < 10 {
-                        b'0' + nib_lo
-                    } else {
-                        b'a' + nib_lo - 10
-                    };
-                    k += 1;
-                    if i == 3 {
-                        bb[k] = b'|';
-                        k += 1;
-                    }
-                }
-                bb[k] = b'\n';
-                k += 1;
-                let _ = libc::write(2, bb.as_ptr() as *const _, k);
-            }
-
-            // Also emit `sig_action`'s own runtime address so callers
-            // can compute `binary_base = sig_action_runtime - file_off`
-            // and feed `(rip - binary_base + file_base_of_sig_action)`
-            // to addr2line to symbolicate the fault site.
-            let sa_addr = sig_action as usize as u64;
-            let mut buf2 = [0u8; 80];
-            let p2 = b"[SIGSEGV]   reference: sig_action runtime addr=0x";
-            let mut m = p2.len();
-            buf2[..m].copy_from_slice(p2);
-            for shift in (0..64).step_by(4).rev() {
-                let nib = ((sa_addr >> shift) & 0xF) as u8;
-                buf2[m] = if nib < 10 {
-                    b'0' + nib
-                } else {
-                    b'a' + nib - 10
-                };
-                m += 1;
-            }
-            buf2[m] = b'\n';
-            m += 1;
-            let _ = libc::write(2, buf2.as_ptr() as *const _, m);
-
-            // Dump key host GPRs for the rip=0-from-NULL-call diagnosis.
-            // R15 holds JitState pointer; reading guest PC from R15+0 lets
-            // us correlate the host fault with the guest instruction that
-            // caused it.
-            let dump_reg = |label: &[u8], val: u64| {
-                let mut b = [0u8; 64];
-                let mut k = 0;
-                b[..label.len()].copy_from_slice(label);
-                k += label.len();
-                for shift in (0..64).step_by(4).rev() {
-                    let nib = ((val >> shift) & 0xF) as u8;
-                    b[k] = if nib < 10 {
-                        b'0' + nib
-                    } else {
-                        b'a' + nib - 10
-                    };
-                    k += 1;
-                }
-                b[k] = b'\n';
-                k += 1;
-                let _ = libc::write(2, b.as_ptr() as *const _, k);
-            };
-            dump_reg(
-                b"[SIGSEGV]   host RAX=0x",
-                mctx.gregs[libc::REG_RAX as usize] as u64,
-            );
-            dump_reg(
-                b"[SIGSEGV]   host RCX=0x",
-                mctx.gregs[libc::REG_RCX as usize] as u64,
-            );
-            dump_reg(
-                b"[SIGSEGV]   host RDX=0x",
-                mctx.gregs[libc::REG_RDX as usize] as u64,
-            );
-            dump_reg(
-                b"[SIGSEGV]   host RSP=0x",
-                mctx.gregs[libc::REG_RSP as usize] as u64,
-            );
-            dump_reg(
-                b"[SIGSEGV]   host RBP=0x",
-                mctx.gregs[libc::REG_RBP as usize] as u64,
-            );
-            dump_reg(
-                b"[SIGSEGV]   host R12=0x",
-                mctx.gregs[libc::REG_R12 as usize] as u64,
-            );
-            dump_reg(
-                b"[SIGSEGV]   host R13=0x",
-                mctx.gregs[libc::REG_R13 as usize] as u64,
-            );
-            dump_reg(
-                b"[SIGSEGV]   host R14=0x",
-                mctx.gregs[libc::REG_R14 as usize] as u64,
-            );
-            dump_reg(
-                b"[SIGSEGV]   host R15=0x",
-                mctx.gregs[libc::REG_R15 as usize] as u64,
-            );
-            // [RSP] = return address pushed by the bad CALL — points at
-            // the JIT-emitted host code immediately after the call.
-            let rsp = mctx.gregs[libc::REG_RSP as usize] as u64;
-            if rsp != 0 {
-                let ret_addr = unsafe { (rsp as *const u64).read_unaligned() };
-                dump_reg(b"[SIGSEGV]   [RSP] (caller's RIP)=0x", ret_addr);
-            }
-
-            // RBP-chain walk if the binary was built with frame pointers
-            // (`RUSTFLAGS="-C force-frame-pointers=yes"`). Each frame:
-            //   [rbp+8] = return address (caller's RIP after `call`)
-            //   [rbp]   = saved RBP of the caller's frame
-            // Walks up to 32 frames or until a clearly bogus pointer.
-            // Async-signal-safe.
-            let rbp = mctx.gregs[libc::REG_RBP as usize] as u64;
-            if rbp != 0 && rbp >= 0x1000 {
-                let header =
-                    b"[SIGSEGV]   frame walk (RBP chain; requires -C force-frame-pointers=yes):\n";
-                let _ = libc::write(2, header.as_ptr() as *const _, header.len());
-                let mut cur_rbp = rbp;
-                for depth in 0..32usize {
-                    // Sanity: stop if cur_rbp is clearly invalid.
-                    if cur_rbp < 0x1000 || cur_rbp & 0x7 != 0 {
-                        break;
-                    }
-                    let saved_rbp = unsafe { (cur_rbp as *const u64).read_unaligned() };
-                    let ret_addr = unsafe { ((cur_rbp + 8) as *const u64).read_unaligned() };
-                    let mut b = [0u8; 96];
-                    let mut k = 0;
-                    let prefix = b"[SIGSEGV]     frame[";
-                    b[..prefix.len()].copy_from_slice(prefix);
-                    k += prefix.len();
-                    // depth as decimal (1-2 digits).
-                    if depth >= 10 {
-                        b[k] = b'0' + (depth / 10) as u8;
-                        k += 1;
-                    }
-                    b[k] = b'0' + (depth % 10) as u8;
-                    k += 1;
-                    let mid = b"] rbp=0x";
-                    b[k..k + mid.len()].copy_from_slice(mid);
-                    k += mid.len();
-                    for shift in (0..64).step_by(4).rev() {
-                        let nib = ((cur_rbp >> shift) & 0xF) as u8;
-                        b[k] = if nib < 10 {
-                            b'0' + nib
-                        } else {
-                            b'a' + nib - 10
-                        };
-                        k += 1;
-                    }
-                    let mid2 = b" ret=0x";
-                    b[k..k + mid2.len()].copy_from_slice(mid2);
-                    k += mid2.len();
-                    for shift in (0..64).step_by(4).rev() {
-                        let nib = ((ret_addr >> shift) & 0xF) as u8;
-                        b[k] = if nib < 10 {
-                            b'0' + nib
-                        } else {
-                            b'a' + nib - 10
-                        };
-                        k += 1;
-                    }
-                    b[k] = b'\n';
-                    k += 1;
-                    let _ = libc::write(2, b.as_ptr() as *const _, k);
-                    if saved_rbp == 0 || saved_rbp <= cur_rbp {
-                        break;
-                    }
-                    cur_rbp = saved_rbp;
-                }
-            }
-
-            // Dump 64 quadwords starting at RSP. Fallback for builds
-            // without frame pointers: the user can offline-symbolicate any
-            // value that lands in the binary's text range via `addr2line`.
-            // Async-signal-safe: only reads of stack memory + libc::write.
-            if rsp != 0 {
-                let header = b"[SIGSEGV]   stack dump (RSP..+0x200 in qwords; addr2line each):\n";
-                let _ = libc::write(2, header.as_ptr() as *const _, header.len());
-                for i in 0..64usize {
-                    let addr = rsp + (i as u64) * 8;
-                    let val = unsafe { (addr as *const u64).read_unaligned() };
-                    let mut b = [0u8; 64];
-                    let mut k = 0;
-                    let prefix = b"[SIGSEGV]     [RSP+0x";
-                    b[..prefix.len()].copy_from_slice(prefix);
-                    k += prefix.len();
-                    // Offset hex (3 nibbles enough for 0x200).
-                    let off = (i as u64) * 8;
-                    for shift in (0..12).step_by(4).rev() {
-                        let nib = ((off >> shift) & 0xF) as u8;
-                        b[k] = if nib < 10 {
-                            b'0' + nib
-                        } else {
-                            b'a' + nib - 10
-                        };
-                        k += 1;
-                    }
-                    let sep = b"]=0x";
-                    b[k..k + sep.len()].copy_from_slice(sep);
-                    k += sep.len();
-                    for shift in (0..64).step_by(4).rev() {
-                        let nib = ((val >> shift) & 0xF) as u8;
-                        b[k] = if nib < 10 {
-                            b'0' + nib
-                        } else {
-                            b'a' + nib - 10
-                        };
-                        k += 1;
-                    }
-                    b[k] = b'\n';
-                    k += 1;
-                    let _ = libc::write(2, b.as_ptr() as *const _, k);
-                }
-            }
-
-            libc::abort();
-
-            // Not handled by any code block — chain to previous handler
-            if state.old_sa.sa_flags & libc::SA_SIGINFO != 0 {
-                if let Some(handler) = std::mem::transmute::<
+            let old_sa = std::ptr::read(&state.old_sa);
+            drop(guard);
+            if old_sa.sa_flags & libc::SA_SIGINFO != 0 {
+                let handler = std::mem::transmute::<
                     usize,
-                    Option<extern "C" fn(libc::c_int, *mut libc::siginfo_t, *mut libc::c_void)>,
-                >(state.old_sa.sa_sigaction)
-                {
-                    drop(guard);
-                    handler(sig, _info, raw_context);
-                    return;
-                }
+                    extern "C" fn(libc::c_int, *mut libc::siginfo_t, *mut libc::c_void),
+                >(old_sa.sa_sigaction);
+                handler(sig, info, raw_context);
+                return;
             }
+            if old_sa.sa_sigaction == libc::SIG_DFL {
+                libc::signal(sig, libc::SIG_DFL);
+                return;
+            }
+            if old_sa.sa_sigaction == libc::SIG_IGN {
+                return;
+            }
+            let handler =
+                std::mem::transmute::<usize, extern "C" fn(libc::c_int)>(old_sa.sa_sigaction);
+            handler(sig);
+            return;
         }
 
         // No handler — re-raise with default

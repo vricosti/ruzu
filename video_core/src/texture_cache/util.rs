@@ -998,24 +998,6 @@ pub fn convert_image(
 }
 
 fn stop_unimplemented_full_download_copies_tile_spacing(tile_width_spacing: u32) -> ! {
-    #[cfg(not(test))]
-    {
-        let path = std::path::Path::new(".agents/texture_util_unimplemented_state.md");
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        let _ = std::fs::write(
-            path,
-            format!(
-                "# Texture util unimplemented FullDownloadCopies path\n\n\
-                 - function: FullDownloadCopies\n\
-                 - tile_width_spacing: {tile_width_spacing}\n\
-                 - upstream: util.cpp reaches UNIMPLEMENTED_IF(info.tile_width_spacing > 0)\n\
-                 - rust: stopped before generating download copies for an unsupported spaced-tile layout\n"
-            ),
-        );
-    }
-
     panic!("FullDownloadCopies: tile_width_spacing > 0 is unimplemented");
 }
 
@@ -1112,12 +1094,13 @@ pub fn full_upload_swizzles(info: &ImageInfo) -> Vec<SwizzleParameters> {
 
 /// Port of `SwizzleImage`.
 ///
-/// Upstream writes through `Tegra::MemoryManager& gpu_memory`. Ruzu's renderer
-/// side receives a CPU/device-address writer callback instead, so callers pass
-/// the already translated image CPU base address.
+/// Upstream reads and writes through `Tegra::MemoryManager& gpu_memory`.
+/// The paired callbacks preserve the same `UnsafeReadWrite` contract when a
+/// block-linear subresource has padding that must survive the writeback.
 pub fn swizzle_image(
+    guest_memory_reader: &dyn Fn(u64, &mut [u8]),
     guest_memory_writer: &dyn Fn(u64, &[u8]),
-    cpu_addr: VAddr,
+    gpu_addr: VAddr,
     info: &ImageInfo,
     copies: &[BufferImageCopy],
     memory: &[u8],
@@ -1152,7 +1135,7 @@ pub fn swizzle_image(
                     .wrapping_add(line)
                     .wrapping_mul(pitch) as u64;
                 let guest_offset = guest_offset_x + guest_offset_y;
-                guest_memory_writer(cpu_addr + guest_offset, &memory[host_offset..host_end]);
+                guest_memory_writer(gpu_addr + guest_offset, &memory[host_offset..host_end]);
             }
             continue;
         }
@@ -1202,6 +1185,7 @@ pub fn swizzle_image(
 
             tmp_buffer.clear();
             tmp_buffer.resize(subresource_size, 0);
+            guest_memory_reader(gpu_addr + guest_offset, tmp_buffer);
             crate::textures::decoders::swizzle_texture(
                 tmp_buffer,
                 &memory[host_offset..src_end],
@@ -1214,7 +1198,7 @@ pub fn swizzle_image(
                 calculate_level_stride_alignment(info, level),
             );
 
-            guest_memory_writer(cpu_addr + guest_offset, tmp_buffer);
+            guest_memory_writer(gpu_addr + guest_offset, tmp_buffer);
             host_offset += host_bytes_per_layer as usize;
             guest_offset += layer_stride;
         }
@@ -2021,7 +2005,15 @@ mod tests {
         memory[24..32].fill(0xBB);
         let mut tmp = Vec::new();
 
-        swizzle_image(&writer, 0x1000, &info, &[copy], &memory, &mut tmp);
+        swizzle_image(
+            &|_, output| output.fill(0),
+            &writer,
+            0x1000,
+            &info,
+            &[copy],
+            &memory,
+            &mut tmp,
+        );
 
         let writes = writes.lock().unwrap();
         assert_eq!(writes.len(), 2);
@@ -2083,7 +2075,15 @@ mod tests {
         let memory: Vec<u8> = (0..16).collect();
         let mut tmp = Vec::new();
 
-        swizzle_image(&writer, 0x1000, &info, &[copy], &memory, &mut tmp);
+        swizzle_image(
+            &|_, output| output.fill(0),
+            &writer,
+            0x1000,
+            &info,
+            &[copy],
+            &memory,
+            &mut tmp,
+        );
 
         let writes = writes.lock().unwrap();
         assert_eq!(writes.len(), 1);
@@ -2132,7 +2132,15 @@ mod tests {
         let memory = vec![0x5a; calculate_unswizzled_size_bytes(&info) as usize];
         let mut tmp = Vec::new();
 
-        swizzle_image(&writer, 0x4000, &info, &copies, &memory, &mut tmp);
+        swizzle_image(
+            &|_, output| output.fill(0),
+            &writer,
+            0x4000,
+            &info,
+            &copies,
+            &memory,
+            &mut tmp,
+        );
 
         let level_info = make_level_info_from_image(&info);
         let sizes = calculate_level_sizes(&level_info, info.resources.levels as u32);
@@ -2163,6 +2171,60 @@ mod tests {
             ]
         );
         assert_ne!(copies[1].buffer_offset as u32, sizes[0]);
+    }
+
+    #[test]
+    fn swizzle_image_block_linear_preserves_guest_padding_like_unsafe_read_write() {
+        let written = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let written_for_callback = Arc::clone(&written);
+        let writer = move |_addr: u64, bytes: &[u8]| {
+            *written_for_callback.lock().unwrap() = bytes.to_vec();
+        };
+        let info = ImageInfo {
+            format: PixelFormat::R16G16B16A16Uint,
+            image_type: ImageType::E3D,
+            resources: SubresourceExtent {
+                levels: 1,
+                layers: 1,
+            },
+            size: Extent3D {
+                width: 8,
+                height: 8,
+                depth: 1,
+            },
+            tiling: TilingMode::BlockLinear(Extent3D {
+                width: 0,
+                height: 0,
+                depth: 4,
+            }),
+            layer_stride: 0x4000,
+            maybe_unaligned_layer_stride: 0x4000,
+            num_samples: 1,
+            tile_width_spacing: 0,
+            rescaleable: false,
+            downscaleable: false,
+            forced_flushed: false,
+            dma_downloaded: false,
+            is_sparse: false,
+        };
+        let copies = full_download_copies(&info);
+        let memory = vec![0; calculate_unswizzled_size_bytes(&info) as usize];
+        let mut tmp = Vec::new();
+
+        swizzle_image(
+            &|_, output| output.fill(0xa5),
+            &writer,
+            0x4000,
+            &info,
+            &copies,
+            &memory,
+            &mut tmp,
+        );
+
+        let written = written.lock().unwrap();
+        assert_eq!(written.len(), 0x2000);
+        assert_eq!(written[0], 0);
+        assert_eq!(written[0x1fc8], 0xa5);
     }
 
     #[test]
@@ -2201,7 +2263,15 @@ mod tests {
         let memory = vec![0x5a; copy.buffer_size];
         let mut tmp = Vec::new();
 
-        swizzle_image(&writer, 0x4000, &info, &[copy], &memory, &mut tmp);
+        swizzle_image(
+            &|_, output| output.fill(0),
+            &writer,
+            0x4000,
+            &info,
+            &[copy],
+            &memory,
+            &mut tmp,
+        );
     }
 
     #[test]

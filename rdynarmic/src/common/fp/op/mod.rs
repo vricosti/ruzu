@@ -1,6 +1,7 @@
 pub mod fp_convert;
 pub mod fp_mul_add;
 pub mod fp_recip_estimate;
+pub mod fp_recip_exponent;
 pub mod fp_recip_step_fused;
 pub mod fp_round_int;
 pub mod fp_rsqrt_estimate;

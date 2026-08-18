@@ -9,6 +9,23 @@
 //! TXQ, and ATOM instructions with texture/image bindings.
 
 use super::glasm_emit_context::EmitContext;
+use crate::ir::{instruction::Inst, value::Value};
+
+pub fn emit_is_texture_scaled(ctx: &mut EmitContext, inst: &Inst) {
+    let Value::ImmU32(index) = inst.args[0] else {
+        panic!("Non-constant texture rescaling");
+    };
+    ctx.add_line(&format!("AND.U RC.x,scaling[0].x,{};", 1u32 << index));
+    ctx.add_line("SNE.S RC.x,RC.x,0;");
+}
+
+pub fn emit_is_image_scaled(ctx: &mut EmitContext, inst: &Inst) {
+    let Value::ImmU32(index) = inst.args[0] else {
+        panic!("Non-constant texture rescaling");
+    };
+    ctx.add_line(&format!("AND.U RC.x,scaling[0].y,{};", 1u32 << index));
+    ctx.add_line("SNE.S RC.x,RC.x,0;");
+}
 
 pub fn emit_image_sample_implicit_lod(ctx: &mut EmitContext) {
     ctx.add_line("; ImageSampleImplicitLod (complex, texture binding required)");

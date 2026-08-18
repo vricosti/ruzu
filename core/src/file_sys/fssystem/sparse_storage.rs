@@ -106,6 +106,16 @@ impl SparseStorage {
         self.set_zero_storage();
     }
 
+    /// Inherited from upstream `IndirectStorage::QueryNodeStorageSize`.
+    pub fn query_node_storage_size(entry_count: i32) -> i64 {
+        IndirectStorage::query_node_storage_size(entry_count)
+    }
+
+    /// Inherited from upstream `IndirectStorage::QueryEntryStorageSize`.
+    pub fn query_entry_storage_size(entry_count: i32) -> i64 {
+        IndirectStorage::query_entry_storage_size(entry_count)
+    }
+
     /// Finalize the storage.
     pub fn finalize(&mut self) {
         self.inner.finalize();

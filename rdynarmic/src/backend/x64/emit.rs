@@ -1,9 +1,9 @@
 use crate::backend::x64::a32_emit_a32 as a32;
 use crate::backend::x64::a64_emit_x64_memory;
 use crate::backend::x64::emit_a64;
+use crate::backend::x64::emit_aes;
 use crate::backend::x64::emit_context::{BlockDescriptor, EmitContext};
 use crate::backend::x64::emit_crc32;
-use crate::backend::x64::emit_crypto;
 use crate::backend::x64::emit_data_processing as dp;
 use crate::backend::x64::emit_exclusive_memory as excl_mem;
 use crate::backend::x64::emit_floating_point as fp;
@@ -12,6 +12,8 @@ use crate::backend::x64::emit_fp_vector_convert as fpvc;
 use crate::backend::x64::emit_memory;
 use crate::backend::x64::emit_packed as packed;
 use crate::backend::x64::emit_saturation as sat;
+use crate::backend::x64::emit_sha;
+use crate::backend::x64::emit_sm4;
 use crate::backend::x64::emit_terminal;
 use crate::backend::x64::emit_vector_arrangement as varr;
 use crate::backend::x64::emit_vector_basic as vbasic;
@@ -745,26 +747,26 @@ pub fn emit_block(ctx: &EmitContext, ra: &mut RegAlloc, block: &Block) -> BlockD
 
             // --- Crypto: AES ---
             Opcode::AESEncryptSingleRound => {
-                emit_crypto::emit_aes_encrypt_single_round(ctx, ra, inst_ref, inst)
+                emit_aes::emit_aes_encrypt_single_round(ctx, ra, inst_ref, inst)
             }
             Opcode::AESDecryptSingleRound => {
-                emit_crypto::emit_aes_decrypt_single_round(ctx, ra, inst_ref, inst)
+                emit_aes::emit_aes_decrypt_single_round(ctx, ra, inst_ref, inst)
             }
             Opcode::AESInverseMixColumns => {
-                emit_crypto::emit_aes_inverse_mix_columns(ctx, ra, inst_ref, inst)
+                emit_aes::emit_aes_inverse_mix_columns(ctx, ra, inst_ref, inst)
             }
-            Opcode::AESMixColumns => emit_crypto::emit_aes_mix_columns(ctx, ra, inst_ref, inst),
+            Opcode::AESMixColumns => emit_aes::emit_aes_mix_columns(ctx, ra, inst_ref, inst),
 
             // --- Crypto: SHA/SM4 ---
-            Opcode::SHA256Hash => emit_crypto::emit_sha256_hash(ctx, ra, inst_ref, inst),
+            Opcode::SHA256Hash => emit_sha::emit_sha256_hash(ctx, ra, inst_ref, inst),
             Opcode::SHA256MessageSchedule0 => {
-                emit_crypto::emit_sha256_message_schedule_0(ctx, ra, inst_ref, inst)
+                emit_sha::emit_sha256_message_schedule_0(ctx, ra, inst_ref, inst)
             }
             Opcode::SHA256MessageSchedule1 => {
-                emit_crypto::emit_sha256_message_schedule_1(ctx, ra, inst_ref, inst)
+                emit_sha::emit_sha256_message_schedule_1(ctx, ra, inst_ref, inst)
             }
             Opcode::SM4AccessSubstitutionBox => {
-                emit_crypto::emit_sm4_access_substitution_box(ctx, ra, inst_ref, inst)
+                emit_sm4::emit_sm4_access_substitution_box(ctx, ra, inst_ref, inst)
             }
 
             // --- Packed operations ---
@@ -1234,6 +1236,9 @@ pub fn emit_block(ctx: &EmitContext, ra: &mut RegAlloc, block: &Block) -> BlockD
             }
             Opcode::VectorExtract => varr::emit_vector_extract(ctx, ra, inst_ref, inst),
             Opcode::VectorExtractLower => varr::emit_vector_extract_lower(ctx, ra, inst_ref, inst),
+            Opcode::VectorRotateWholeVectorRight => {
+                varr::emit_vector_rotate_whole_vector_right(ctx, ra, inst_ref, inst)
+            }
             Opcode::VectorInterleaveLower8 => {
                 varr::emit_vector_interleave_lower8(ctx, ra, inst_ref, inst)
             }

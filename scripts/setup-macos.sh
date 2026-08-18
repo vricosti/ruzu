@@ -15,7 +15,7 @@ PLATFORM_NAME="$(sw_vers -productName) $(sw_vers -productVersion)"
 PACKAGE_MANAGER=brew
 REQUIRED_PACKAGES="
     cmake ffmpeg glslang gtk4 molten-vk ninja openssl@3
-    pkgconf sdl2 vulkan-headers vulkan-loader vulkan-tools
+    pkgconf vulkan-headers vulkan-loader vulkan-tools
 "
 
 load_homebrew() {

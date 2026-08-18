@@ -6,6 +6,7 @@
 
 use crate::backend::x64::emit_context::EmitContext;
 use crate::backend::x64::emit_vector_helpers::*;
+use crate::backend::x64::host_feature::HostFeature;
 use crate::backend::x64::reg_alloc::RegAlloc;
 use crate::ir::inst::Inst;
 use crate::ir::value::InstRef;
@@ -129,27 +130,6 @@ pub fn emit_vector_logical_shift_right64(
 // 8/64-bit have no native SSE → fallback
 // ---------------------------------------------------------------------------
 
-extern "C" fn fallback_asr8(result: *mut [u8; 16], a: *const [u8; 16], b: *const [u8; 16]) {
-    unsafe {
-        let src: [i8; 16] = std::mem::transmute(*a);
-        let shift = (*b)[0].min(7);
-        let mut out = [0i8; 16];
-        for i in 0..16 {
-            out[i] = src[i] >> shift;
-        }
-        *result = std::mem::transmute(out);
-    }
-}
-
-extern "C" fn fallback_asr64(result: *mut [u8; 16], a: *const [u8; 16], b: *const [u8; 16]) {
-    unsafe {
-        let src: [i64; 2] = std::mem::transmute(*a);
-        let shift = (*b)[0].min(63);
-        let out: [i64; 2] = [src[0] >> shift, src[1] >> shift];
-        *result = std::mem::transmute(out);
-    }
-}
-
 // VectorArithmeticShiftRight8: psrlw + sign extension via pcmpgtb
 // result = (data >> shift) | (sign_mask where data < 0)
 pub fn emit_vector_arithmetic_shift_right8(
@@ -220,7 +200,28 @@ pub fn emit_vector_arithmetic_shift_right64(
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_two_arg_fallback(ra, inst_ref, inst, fallback_asr64 as usize);
+    let mut args = ra.get_argument_info(inst_ref, &inst.args, inst.num_args());
+    let result = ra.use_scratch_xmm(&mut args[0]);
+    let shift = args[1].get_immediate_u8().min(63);
+    let sign = ra.scratch_xmm();
+    let extension = ra.scratch_xmm();
+
+    let sign_bit = 0x8000_0000_0000_0000u64 >> shift;
+    ra.asm.xorps(extension, extension).unwrap();
+    ra.asm.psrlq_imm(result, shift).unwrap();
+    let sign_mask = ra
+        .constant_pool
+        .as_mut()
+        .expect("constant pool required")
+        .get_constant(sign_bit, sign_bit);
+    ra.asm.movdqa(sign, rxbyak::xmmword_ptr(sign_mask)).unwrap();
+    ra.asm.pand(sign, result).unwrap();
+    ra.asm.psubq(extension, sign).unwrap();
+    ra.asm.por(result, extension).unwrap();
+
+    ra.release(sign);
+    ra.release(extension);
+    ra.define_value(inst_ref, result);
 }
 
 // ---------------------------------------------------------------------------
@@ -257,61 +258,141 @@ define_logical_vshift!(fallback_lvshift32, u32, 4);
 define_logical_vshift!(fallback_lvshift64, u64, 2);
 
 pub fn emit_vector_logical_vshift8(
-    _ctx: &EmitContext,
+    ctx: &EmitContext,
     ra: &mut RegAlloc,
     inst_ref: InstRef,
     inst: &Inst,
 ) {
+    if ctx.has_host_feature(HostFeature::AVX512_ORTHO | HostFeature::AVX512BW | HostFeature::GFNI) {
+        let mut args = ra.get_argument_info(inst_ref, &inst.args, inst.num_args());
+        let result = ra.use_scratch_xmm(&mut args[0]);
+        let left_shift = ra.use_scratch_xmm(&mut args[1]);
+        let tmp = ra.scratch_xmm();
+
+        let matrix = ra
+            .constant_pool
+            .as_mut()
+            .expect("constant pool required")
+            .get_constant(0x8040_2010_0804_0201, 0x8040_2010_0804_0201);
+        let valid_bits = ra
+            .constant_pool
+            .as_mut()
+            .expect("constant pool required")
+            .get_constant(0xf8f8_f8f8_f8f8_f8f8, 0xf8f8_f8f8_f8f8_f8f8);
+        let overflow_masks = ra
+            .constant_pool
+            .as_mut()
+            .expect("constant pool required")
+            .get_constant(0x0103_070f_1f3f_7fff, 0);
+
+        ra.asm.pxor(tmp, tmp).unwrap();
+        ra.asm.vpcmpb(rxbyak::K1, left_shift, tmp, 1).unwrap();
+
+        ra.asm
+            .vmovaps(rxbyak::XMM0, rxbyak::xmmword_ptr(matrix))
+            .unwrap();
+        ra.asm
+            .vgf2p8affineqb(result.k(1), result, rxbyak::XMM0, 0)
+            .unwrap();
+
+        ra.asm.pabsb(left_shift, left_shift).unwrap();
+
+        ra.asm
+            .vptestnmb(rxbyak::K2, left_shift, rxbyak::xmmword_ptr(valid_bits))
+            .unwrap();
+
+        ra.asm
+            .movdqa(tmp, rxbyak::xmmword_ptr(overflow_masks))
+            .unwrap();
+        ra.asm.vpshufb(tmp.k(2).z(), tmp, left_shift).unwrap();
+        ra.asm.pand(result, tmp).unwrap();
+
+        ra.asm.pxor(tmp, tmp).unwrap();
+        ra.asm.movsd(tmp, rxbyak::XMM0).unwrap();
+        ra.asm.pshufb(tmp, left_shift).unwrap();
+        ra.asm.gf2p8mulb(result, tmp).unwrap();
+
+        ra.asm
+            .vgf2p8affineqb(result.k(1), result, rxbyak::XMM0, 0)
+            .unwrap();
+
+        ra.release(left_shift);
+        ra.release(tmp);
+        ra.define_value(inst_ref, result);
+        return;
+    }
     emit_two_arg_fallback(ra, inst_ref, inst, fallback_lvshift8 as usize);
 }
 pub fn emit_vector_logical_vshift16(
-    _ctx: &EmitContext,
+    ctx: &EmitContext,
     ra: &mut RegAlloc,
     inst_ref: InstRef,
     inst: &Inst,
 ) {
+    if ctx.has_host_feature(HostFeature::AVX512_ORTHO | HostFeature::AVX512BW) {
+        let mut args = ra.get_argument_info(inst_ref, &inst.args, inst.num_args());
+        let result = ra.use_scratch_xmm(&mut args[0]);
+        let left_shift = ra.use_scratch_xmm(&mut args[1]);
+        let right_shift = ra.scratch_xmm();
+        let tmp = ra.scratch_xmm();
+        let mask = ra
+            .constant_pool
+            .as_mut()
+            .expect("constant pool required")
+            .get_constant(0x00ff_00ff_00ff_00ff, 0x00ff_00ff_00ff_00ff);
+
+        ra.asm.pxor(right_shift, right_shift).unwrap();
+        ra.asm.psubw(right_shift, left_shift).unwrap();
+        ra.asm.pand(left_shift, rxbyak::xmmword_ptr(mask)).unwrap();
+        ra.asm.pand(right_shift, rxbyak::xmmword_ptr(mask)).unwrap();
+        ra.asm.vpsllvw(tmp, result, left_shift).unwrap();
+        ra.asm.vpsrlvw(result, result, right_shift).unwrap();
+        ra.asm.por(result, tmp).unwrap();
+
+        ra.release(left_shift);
+        ra.release(right_shift);
+        ra.release(tmp);
+        ra.define_value(inst_ref, result);
+        return;
+    }
     emit_two_arg_fallback(ra, inst_ref, inst, fallback_lvshift16 as usize);
 }
 // LogicalVShift32: AVX2 vpsllvd/vpsrlvd with sign-based split, fallback without AVX2
 pub fn emit_vector_logical_vshift32(
-    _ctx: &EmitContext,
+    ctx: &EmitContext,
     ra: &mut RegAlloc,
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    #[cfg(target_arch = "x86_64")]
-    if std::is_x86_feature_detected!("avx2") {
+    if ctx.has_host_feature(HostFeature::AVX2) {
         let mut args = ra.get_argument_info(inst_ref, &inst.args, inst.num_args());
-        let a = ra.use_xmm(&mut args[0]);
-        let shift = ra.use_xmm(&mut args[1]);
+        let a = ra.use_scratch_xmm(&mut args[0]);
+        let shift = ra.use_scratch_xmm(&mut args[1]);
         let result = ra.scratch_xmm();
-        let neg_shift = ra.scratch_xmm();
-        let left = ra.scratch_xmm();
-        let right = ra.scratch_xmm();
-        let zero = ra.scratch_xmm();
-        ra.asm.xorps(zero, zero).unwrap();
-        // neg_shift = -shift (negate each dword: 0 - shift)
-        ra.asm.movaps(neg_shift, zero).unwrap();
-        ra.asm.psubd(neg_shift, shift).unwrap();
-        // left = vpsllvd(a, shift) — left shift by positive amounts
-        ra.asm.vpsllvd(left, a, shift).unwrap();
-        // right = vpsrlvd(a, neg_shift) — right shift by negated amounts
-        ra.asm.vpsrlvd(right, a, neg_shift).unwrap();
-        // Select: where shift >= 0, use left; else use right
-        // mask = pcmpgtd(shift, -1) → all 1s where shift >= 0
-        // Actually: pcmpgtd(zero, shift) → 1s where shift < 0
-        let mask = ra.scratch_xmm();
-        ra.asm.movaps(mask, zero).unwrap();
-        ra.asm.pcmpgtd(mask, shift).unwrap(); // mask = 0xFFFFFFFF where shift < 0
-                                              // result = (left & ~mask) | (right & mask) = blendvps
-        ra.asm.movaps(result, left).unwrap();
-        ra.asm.movaps(rxbyak::XMM0, mask).unwrap();
-        ra.asm.blendvps(result, right).unwrap();
-        ra.release(neg_shift);
-        ra.release(left);
-        ra.release(right);
-        ra.release(zero);
-        ra.release(mask);
+
+        // Preserve the sign bit of the lowest byte of each 32-bit element.
+        // XMM0 is reserved by the allocator and is the implicit blend mask.
+        ra.asm.movaps(rxbyak::XMM0, shift).unwrap();
+        ra.asm.pslld_imm(rxbyak::XMM0, 24).unwrap();
+
+        // x86 variable shifts accept positive counts only. ARM uses the
+        // signed lowest byte, so take the byte-wise absolute value and mask
+        // away all other bytes before shifting.
+        ra.asm.vpabsb(shift, shift).unwrap();
+        let shift_mask = ra
+            .constant_pool
+            .as_mut()
+            .expect("constant pool required")
+            .get_constant(0x0000_00FF_0000_00FF, 0x0000_00FF_0000_00FF);
+        ra.asm
+            .vpand(shift, shift, rxbyak::xmmword_ptr(shift_mask))
+            .unwrap();
+        ra.asm.vpsllvd(result, a, shift).unwrap();
+        ra.asm.vpsrlvd(a, a, shift).unwrap();
+        ra.asm.blendvps(result, a).unwrap();
+
+        ra.release(a);
+        ra.release(shift);
         ra.define_value(inst_ref, result);
         return;
     }
@@ -319,38 +400,34 @@ pub fn emit_vector_logical_vshift32(
 }
 // LogicalVShift64: AVX2 vpsllvq/vpsrlvq
 pub fn emit_vector_logical_vshift64(
-    _ctx: &EmitContext,
+    ctx: &EmitContext,
     ra: &mut RegAlloc,
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    #[cfg(target_arch = "x86_64")]
-    if std::is_x86_feature_detected!("avx2") {
+    if ctx.has_host_feature(HostFeature::AVX2) {
         let mut args = ra.get_argument_info(inst_ref, &inst.args, inst.num_args());
-        let a = ra.use_xmm(&mut args[0]);
-        let shift = ra.use_xmm(&mut args[1]);
+        let a = ra.use_scratch_xmm(&mut args[0]);
+        let shift = ra.use_scratch_xmm(&mut args[1]);
         let result = ra.scratch_xmm();
-        let neg_shift = ra.scratch_xmm();
-        let left = ra.scratch_xmm();
-        let right = ra.scratch_xmm();
-        let zero = ra.scratch_xmm();
-        ra.asm.xorps(zero, zero).unwrap();
-        ra.asm.movaps(neg_shift, zero).unwrap();
-        ra.asm.psubq(neg_shift, shift).unwrap();
-        ra.asm.vpsllvq(left, a, shift).unwrap();
-        ra.asm.vpsrlvq(right, a, neg_shift).unwrap();
-        // mask where shift < 0: use pcmpgtq(zero, shift)
-        let mask = ra.scratch_xmm();
-        ra.asm.movaps(mask, zero).unwrap();
-        ra.asm.pcmpgtq(mask, shift).unwrap();
-        ra.asm.movaps(result, left).unwrap();
-        ra.asm.movaps(rxbyak::XMM0, mask).unwrap();
-        ra.asm.blendvpd(result, right).unwrap();
-        ra.release(neg_shift);
-        ra.release(left);
-        ra.release(right);
-        ra.release(zero);
-        ra.release(mask);
+
+        ra.asm.movaps(rxbyak::XMM0, shift).unwrap();
+        ra.asm.psllq_imm(rxbyak::XMM0, 56).unwrap();
+        ra.asm.vpabsb(shift, shift).unwrap();
+        let shift_mask = ra
+            .constant_pool
+            .as_mut()
+            .expect("constant pool required")
+            .get_constant(0xFF, 0xFF);
+        ra.asm
+            .vpand(shift, shift, rxbyak::xmmword_ptr(shift_mask))
+            .unwrap();
+        ra.asm.vpsllvq(result, a, shift).unwrap();
+        ra.asm.vpsrlvq(a, a, shift).unwrap();
+        ra.asm.blendvpd(result, a).unwrap();
+
+        ra.release(a);
+        ra.release(shift);
         ra.define_value(inst_ref, result);
         return;
     }
@@ -401,47 +478,82 @@ pub fn emit_vector_arithmetic_vshift8(
     emit_two_arg_fallback(ra, inst_ref, inst, fallback_avshift8 as usize);
 }
 pub fn emit_vector_arithmetic_vshift16(
-    _ctx: &EmitContext,
+    ctx: &EmitContext,
     ra: &mut RegAlloc,
     inst_ref: InstRef,
     inst: &Inst,
 ) {
+    if ctx.has_host_feature(HostFeature::AVX512_ORTHO | HostFeature::AVX512BW) {
+        let mut args = ra.get_argument_info(inst_ref, &inst.args, inst.num_args());
+        let result = ra.use_scratch_xmm(&mut args[0]);
+        let left_shift = ra.use_scratch_xmm(&mut args[1]);
+        let right_shift = ra.scratch_xmm();
+        let tmp = ra.scratch_xmm();
+        let mask = ra
+            .constant_pool
+            .as_mut()
+            .expect("constant pool required")
+            .get_constant(0x00ff_00ff_00ff_00ff, 0x00ff_00ff_00ff_00ff);
+
+        ra.asm.vmovdqa32(tmp, rxbyak::xmmword_ptr(mask)).unwrap();
+        ra.asm
+            .vpxord(right_shift, right_shift, right_shift)
+            .unwrap();
+        ra.asm.vpsubw(right_shift, right_shift, left_shift).unwrap();
+        ra.asm.movaps(rxbyak::XMM0, left_shift).unwrap();
+        ra.asm.psllw_imm(rxbyak::XMM0, 8).unwrap();
+        ra.asm.psraw_imm(rxbyak::XMM0, 15).unwrap();
+        ra.asm.vpmovb2m(rxbyak::K1, rxbyak::XMM0).unwrap();
+        ra.asm.vpandd(right_shift, right_shift, tmp).unwrap();
+        ra.asm.vpandd(left_shift, left_shift, tmp).unwrap();
+        ra.asm.vpsravw(tmp, result, right_shift).unwrap();
+        ra.asm.vpsllvw(result, result, left_shift).unwrap();
+        ra.asm.vpblendmb(result.k(1), result, tmp).unwrap();
+
+        ra.release(left_shift);
+        ra.release(right_shift);
+        ra.release(tmp);
+        ra.define_value(inst_ref, result);
+        return;
+    }
     emit_two_arg_fallback(ra, inst_ref, inst, fallback_avshift16 as usize);
 }
 // ArithmeticVShift32: AVX2 vpsllvd/vpsravd with sign split
 // Positive shift = left (logical), negative = right (arithmetic)
 pub fn emit_vector_arithmetic_vshift32(
-    _ctx: &EmitContext,
+    ctx: &EmitContext,
     ra: &mut RegAlloc,
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    #[cfg(target_arch = "x86_64")]
-    if std::is_x86_feature_detected!("avx2") {
+    if ctx.has_host_feature(HostFeature::AVX2) {
         let mut args = ra.get_argument_info(inst_ref, &inst.args, inst.num_args());
-        let a = ra.use_xmm(&mut args[0]);
+        let result = ra.use_scratch_xmm(&mut args[0]);
         let shift = ra.use_xmm(&mut args[1]);
-        let result = ra.scratch_xmm();
-        let neg_shift = ra.scratch_xmm();
-        let left = ra.scratch_xmm();
+        let absolute_shift = ra.scratch_xmm();
         let right = ra.scratch_xmm();
-        let zero = ra.scratch_xmm();
-        ra.asm.xorps(zero, zero).unwrap();
-        ra.asm.movaps(neg_shift, zero).unwrap();
-        ra.asm.psubd(neg_shift, shift).unwrap();
-        ra.asm.vpsllvd(left, a, shift).unwrap();
-        ra.asm.vpsravd(right, a, neg_shift).unwrap(); // arithmetic right shift
-        let mask = ra.scratch_xmm();
-        ra.asm.movaps(mask, zero).unwrap();
-        ra.asm.pcmpgtd(mask, shift).unwrap();
-        ra.asm.movaps(result, left).unwrap();
-        ra.asm.movaps(rxbyak::XMM0, mask).unwrap();
+
+        ra.asm.vpabsb(absolute_shift, shift).unwrap();
+        ra.asm.movaps(rxbyak::XMM0, shift).unwrap();
+        ra.asm.pslld_imm(rxbyak::XMM0, 24).unwrap();
+        let shift_mask = ra
+            .constant_pool
+            .as_mut()
+            .expect("constant pool required")
+            .get_constant(0x0000_00FF_0000_00FF, 0x0000_00FF_0000_00FF);
+        ra.asm
+            .vpand(
+                absolute_shift,
+                absolute_shift,
+                rxbyak::xmmword_ptr(shift_mask),
+            )
+            .unwrap();
+        ra.asm.vpsravd(right, result, absolute_shift).unwrap();
+        ra.asm.vpsllvd(result, result, absolute_shift).unwrap();
         ra.asm.blendvps(result, right).unwrap();
-        ra.release(neg_shift);
-        ra.release(left);
+
+        ra.release(absolute_shift);
         ra.release(right);
-        ra.release(zero);
-        ra.release(mask);
         ra.define_value(inst_ref, result);
         return;
     }
@@ -449,12 +561,43 @@ pub fn emit_vector_arithmetic_vshift32(
 }
 // ArithmeticVShift64: AVX512 vpsravq or fallback
 pub fn emit_vector_arithmetic_vshift64(
-    _ctx: &EmitContext,
+    ctx: &EmitContext,
     ra: &mut RegAlloc,
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    // vpsravq requires AVX512VL — fall back for now
+    if ctx.has_host_feature(HostFeature::AVX512_ORTHO) {
+        let mut args = ra.get_argument_info(inst_ref, &inst.args, inst.num_args());
+        let result = ra.use_scratch_xmm(&mut args[0]);
+        let left_shift = ra.use_scratch_xmm(&mut args[1]);
+        let right_shift = ra.scratch_xmm();
+        let tmp = ra.scratch_xmm();
+        let mask = ra
+            .constant_pool
+            .as_mut()
+            .expect("constant pool required")
+            .get_constant(0xff, 0xff);
+
+        ra.asm.vmovdqa32(tmp, rxbyak::xmmword_ptr(mask)).unwrap();
+        ra.asm
+            .vpxorq(right_shift, right_shift, right_shift)
+            .unwrap();
+        ra.asm.vpsubq(right_shift, right_shift, left_shift).unwrap();
+        ra.asm.movaps(rxbyak::XMM0, left_shift).unwrap();
+        ra.asm.psllq_imm(rxbyak::XMM0, 56).unwrap();
+        ra.asm.vpmovq2m(rxbyak::K1, rxbyak::XMM0).unwrap();
+        ra.asm.vpandq(right_shift, right_shift, tmp).unwrap();
+        ra.asm.vpandq(left_shift, left_shift, tmp).unwrap();
+        ra.asm.vpsravq(tmp, result, right_shift).unwrap();
+        ra.asm.vpsllvq(result, result, left_shift).unwrap();
+        ra.asm.vpblendmq(result.k(1), result, tmp).unwrap();
+
+        ra.release(left_shift);
+        ra.release(right_shift);
+        ra.release(tmp);
+        ra.define_value(inst_ref, result);
+        return;
+    }
     emit_two_arg_fallback(ra, inst_ref, inst, fallback_avshift64 as usize);
 }
 
@@ -594,6 +737,22 @@ pub fn emit_vector_rounding_shift_left_unsigned64(
 mod tests {
     use super::*;
 
+    fn run_lvshift32(a: [u32; 4], b: [u32; 4]) -> [u32; 4] {
+        let mut result = [0u8; 16];
+        let a_bytes: [u8; 16] = unsafe { std::mem::transmute(a) };
+        let b_bytes: [u8; 16] = unsafe { std::mem::transmute(b) };
+        fallback_lvshift32(&mut result, &a_bytes, &b_bytes);
+        unsafe { std::mem::transmute(result) }
+    }
+
+    fn run_avshift32(a: [i32; 4], b: [u32; 4]) -> [i32; 4] {
+        let mut result = [0u8; 16];
+        let a_bytes: [u8; 16] = unsafe { std::mem::transmute(a) };
+        let b_bytes: [u8; 16] = unsafe { std::mem::transmute(b) };
+        fallback_avshift32(&mut result, &a_bytes, &b_bytes);
+        unsafe { std::mem::transmute(result) }
+    }
+
     #[test]
     fn test_fn_signatures() {
         let _: fn(&EmitContext, &mut RegAlloc, InstRef, &Inst) = emit_vector_logical_shift_left8;
@@ -607,5 +766,24 @@ mod tests {
             emit_vector_rounding_shift_left_signed8;
         let _: fn(&EmitContext, &mut RegAlloc, InstRef, &Inst) =
             emit_vector_rounding_shift_left_unsigned64;
+    }
+
+    #[test]
+    fn logical_vshift32_uses_only_each_elements_low_signed_byte() {
+        let input = [0x8000_0001, 0x8000_0001, 0x8000_0001, 0x8000_0001];
+        let shifts = [0x7F00_0001, 0x0000_00FF, 0x1234_5600, 0xFFFF_FF20];
+
+        assert_eq!(
+            run_lvshift32(input, shifts),
+            [0x0000_0002, 0x4000_0000, 0x8000_0001, 0]
+        );
+    }
+
+    #[test]
+    fn arithmetic_vshift32_uses_only_each_elements_low_signed_byte() {
+        let input = [i32::MIN, i32::MIN, -3, i32::MIN];
+        let shifts = [0x7F00_0001, 0x0000_00FF, 0x1234_56FF, 0xFFFF_FF20];
+
+        assert_eq!(run_avshift32(input, shifts), [0, -1_073_741_824, -2, 0]);
     }
 }

@@ -14,14 +14,14 @@ pub const BLOCK_DEPTH: u32 = 0;
 /// Log2 of bytes per pixel.
 pub const BPP_LOG2: u32 = 2;
 
-// PixelFormat: B8G8R8A8_UNORM (referenced from surface module)
-// pub const PIXEL_FORMAT: PixelFormat = PixelFormat::B8G8R8A8Unorm;
+/// Applet-capture pixel format.
+pub const PIXEL_FORMAT: crate::surface::PixelFormat = crate::surface::PixelFormat::B8G8R8A8Unorm;
 
-/// Linear width (undocked screen width = 1280).
-pub const LINEAR_WIDTH: u32 = 1280;
+/// Linear width derived from the undocked screen layout.
+pub const LINEAR_WIDTH: u32 = ruzu_core::frontend::framebuffer_layout::ScreenUndocked::WIDTH;
 
-/// Linear height (undocked screen height = 720).
-pub const LINEAR_HEIGHT: u32 = 720;
+/// Linear height derived from the undocked screen layout.
+pub const LINEAR_HEIGHT: u32 = ruzu_core::frontend::framebuffer_layout::ScreenUndocked::HEIGHT;
 
 /// Linear depth.
 pub const LINEAR_DEPTH: u32 = 1;
@@ -48,24 +48,38 @@ fn align_up_log2(value: u32, align_log2: u32) -> u32 {
     (value + mask) & !mask
 }
 
-/// Capture framebuffer layout.
-pub struct CaptureLayout {
-    pub width: u32,
-    pub height: u32,
-    pub screen_left: u32,
-    pub screen_top: u32,
-    pub screen_right: u32,
-    pub screen_bottom: u32,
-    pub is_srgb: bool,
-}
+/// Upstream `VideoCore::Capture::Layout`.
+pub const LAYOUT: ruzu_core::frontend::framebuffer_layout::FramebufferLayout =
+    ruzu_core::frontend::framebuffer_layout::FramebufferLayout {
+        width: LINEAR_WIDTH,
+        height: LINEAR_HEIGHT,
+        screen: ruzu_core::frontend::framebuffer_layout::Rectangle {
+            left: 0,
+            top: 0,
+            right: LINEAR_WIDTH,
+            bottom: LINEAR_HEIGHT,
+        },
+        is_srgb: false,
+    };
 
-/// Default capture layout matching upstream.
-pub const CAPTURE_LAYOUT: CaptureLayout = CaptureLayout {
-    width: LINEAR_WIDTH,
-    height: LINEAR_HEIGHT,
-    screen_left: 0,
-    screen_top: 0,
-    screen_right: LINEAR_WIDTH,
-    screen_bottom: LINEAR_HEIGHT,
-    is_srgb: false,
-};
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn capture_constants_match_upstream_layout_and_tiling() {
+        assert_eq!(PIXEL_FORMAT, crate::surface::PixelFormat::B8G8R8A8Unorm);
+        assert_eq!((LAYOUT.width, LAYOUT.height), (LINEAR_WIDTH, LINEAR_HEIGHT));
+        assert_eq!(
+            (
+                LAYOUT.screen.left,
+                LAYOUT.screen.top,
+                LAYOUT.screen.right,
+                LAYOUT.screen.bottom
+            ),
+            (0, 0, LINEAR_WIDTH, LINEAR_HEIGHT)
+        );
+        assert!(!LAYOUT.is_srgb);
+        assert_eq!(tiled_size(), TILED_WIDTH * tiled_height() * (1 << BPP_LOG2));
+    }
+}

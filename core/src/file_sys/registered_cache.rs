@@ -214,6 +214,49 @@ pub trait ContentProvider: Send + Sync {
         title_id: Option<u64>,
     ) -> Vec<ContentProviderEntry>;
 
+    fn supports_origin_tracking(&self) -> bool {
+        false
+    }
+
+    fn list_update_versions(&self, _title_id: u64) -> Vec<ExternalUpdateEntry> {
+        Vec::new()
+    }
+
+    fn get_entry_for_version(
+        &self,
+        _title_id: u64,
+        _content_type: ContentRecordType,
+        _version: u32,
+    ) -> Option<VirtualFile> {
+        None
+    }
+
+    fn list_entries_filter_origin(
+        &self,
+        _title_type: Option<TitleType>,
+        _record_type: Option<ContentRecordType>,
+        _title_id: Option<u64>,
+    ) -> Vec<(ContentProviderUnionSlot, ContentProviderEntry)> {
+        Vec::new()
+    }
+
+    fn get_entry_version_from_slot(
+        &self,
+        _slot: ContentProviderUnionSlot,
+        _title_id: u64,
+    ) -> Option<u32> {
+        None
+    }
+
+    fn get_entry_raw_from_slot(
+        &self,
+        _slot: ContentProviderUnionSlot,
+        _title_id: u64,
+        _record_type: ContentRecordType,
+    ) -> Option<VirtualFile> {
+        None
+    }
+
     /// Construct an NCA from the raw entry file.
     /// Corresponds to upstream `ContentProvider::GetEntry`.
     fn get_entry(
@@ -831,6 +874,7 @@ pub enum ContentProviderUnionSlot {
     SysNAND,
     UserNAND,
     SDMC,
+    External,
     FrontendManual,
 }
 
@@ -867,6 +911,14 @@ impl ContentProviderUnion {
 
     pub fn clear_slot(&mut self, slot: ContentProviderUnionSlot) {
         self.providers.remove(&slot);
+    }
+
+    /// Upstream `ContentProviderUnion::SetExternalProvider`.
+    ///
+    /// # Safety
+    /// The provider must outlive this union.
+    pub unsafe fn set_external_provider(&mut self, provider: *mut dyn ContentProvider) {
+        self.set_slot(ContentProviderUnionSlot::External, provider);
     }
 
     #[cfg(test)]
@@ -932,6 +984,72 @@ impl ContentProvider for ContentProviderUnion {
         result.sort();
         result.dedup();
         result
+    }
+
+    fn supports_origin_tracking(&self) -> bool {
+        true
+    }
+
+    fn list_update_versions(&self, title_id: u64) -> Vec<ExternalUpdateEntry> {
+        let mut result = Vec::new();
+        for &provider in self.providers.values() {
+            result.extend(unsafe { (*provider).list_update_versions(title_id) });
+        }
+        result.sort_by(|left, right| right.version.cmp(&left.version));
+        result.dedup_by_key(|entry| entry.version);
+        result
+    }
+
+    fn get_entry_for_version(
+        &self,
+        title_id: u64,
+        content_type: ContentRecordType,
+        version: u32,
+    ) -> Option<VirtualFile> {
+        for &provider in self.providers.values() {
+            if let Some(file) =
+                unsafe { (*provider).get_entry_for_version(title_id, content_type, version) }
+            {
+                return Some(file);
+            }
+        }
+        None
+    }
+
+    fn list_entries_filter_origin(
+        &self,
+        title_type: Option<TitleType>,
+        record_type: Option<ContentRecordType>,
+        title_id: Option<u64>,
+    ) -> Vec<(ContentProviderUnionSlot, ContentProviderEntry)> {
+        ContentProviderUnion::list_entries_filter_origin(
+            self,
+            None,
+            title_type,
+            record_type,
+            title_id,
+        )
+    }
+
+    fn get_entry_version_from_slot(
+        &self,
+        slot: ContentProviderUnionSlot,
+        title_id: u64,
+    ) -> Option<u32> {
+        self.providers
+            .get(&slot)
+            .and_then(|provider| unsafe { (**provider).get_entry_version(title_id) })
+    }
+
+    fn get_entry_raw_from_slot(
+        &self,
+        slot: ContentProviderUnionSlot,
+        title_id: u64,
+        record_type: ContentRecordType,
+    ) -> Option<VirtualFile> {
+        self.providers
+            .get(&slot)
+            .and_then(|provider| unsafe { (**provider).get_entry_raw(title_id, record_type) })
     }
 }
 
@@ -1258,6 +1376,19 @@ impl ContentProvider for ManualContentProvider {
         None
     }
 
+    fn list_update_versions(&self, title_id: u64) -> Vec<ExternalUpdateEntry> {
+        ManualContentProvider::list_update_versions(self, title_id)
+    }
+
+    fn get_entry_for_version(
+        &self,
+        title_id: u64,
+        content_type: ContentRecordType,
+        version: u32,
+    ) -> Option<VirtualFile> {
+        ManualContentProvider::get_entry_for_version(self, title_id, content_type, version)
+    }
+
     fn get_entry_unparsed(
         &self,
         title_id: u64,
@@ -1297,6 +1428,163 @@ impl ContentProvider for ManualContentProvider {
 impl Default for ManualContentProvider {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+// ============================================================================
+// ExternalContentProvider
+// ============================================================================
+
+/// Eden `ExternalContentProvider`: recursively scans configured game
+/// directories and exposes update/DLC content, including multiple update
+/// versions.
+pub struct ExternalContentProvider {
+    load_dirs: Vec<VirtualDir>,
+    entries: ManualContentProvider,
+    versions: BTreeMap<u64, u32>,
+}
+
+impl ExternalContentProvider {
+    pub fn new(load_dirs: Vec<VirtualDir>) -> Self {
+        let mut provider = Self {
+            load_dirs,
+            entries: ManualContentProvider::new(),
+            versions: BTreeMap::new(),
+        };
+        provider.refresh();
+        provider
+    }
+
+    pub fn add_directory(&mut self, directory: VirtualDir) {
+        self.scan_directory(&directory);
+        self.load_dirs.push(directory);
+    }
+
+    pub fn clear_directories(&mut self) {
+        self.load_dirs.clear();
+        self.entries.clear_all_entries();
+        self.versions.clear();
+    }
+
+    fn scan_directory(&mut self, directory: &VirtualDir) {
+        for file in directory.get_files() {
+            match file.get_extension().to_ascii_lowercase().as_str() {
+                "nsp" | "xci" => self.process_container(file),
+                _ => {}
+            }
+        }
+        for subdirectory in directory.get_subdirectories() {
+            self.scan_directory(&subdirectory);
+        }
+    }
+
+    fn process_container(&mut self, file: VirtualFile) {
+        let Some(nsp) = open_container_as_nsp(file.clone()) else {
+            return;
+        };
+        let (versions, _) = container_versions(&nsp);
+        self.versions.extend(versions);
+        self.entries.add_entries_from_container(file, true, None);
+    }
+
+    pub fn list_update_versions(&self, title_id: u64) -> Vec<ExternalUpdateEntry> {
+        self.entries.list_update_versions(title_id)
+    }
+
+    pub fn get_entry_for_version(
+        &self,
+        title_id: u64,
+        content_type: ContentRecordType,
+        version: u32,
+    ) -> Option<VirtualFile> {
+        self.entries
+            .get_entry_for_version(title_id, content_type, version)
+    }
+}
+
+impl ContentProvider for ExternalContentProvider {
+    fn refresh(&mut self) {
+        self.entries.clear_all_entries();
+        self.versions.clear();
+        for directory in self.load_dirs.clone() {
+            self.scan_directory(&directory);
+        }
+    }
+
+    fn has_entry(&self, title_id: u64, record_type: ContentRecordType) -> bool {
+        self.entries.has_entry(title_id, record_type)
+    }
+
+    fn get_entry_version(&self, title_id: u64) -> Option<u32> {
+        self.versions.get(&title_id).copied()
+    }
+
+    fn get_entry_unparsed(
+        &self,
+        title_id: u64,
+        record_type: ContentRecordType,
+    ) -> Option<VirtualFile> {
+        self.entries.get_entry_unparsed(title_id, record_type)
+    }
+
+    fn get_entry_raw(&self, title_id: u64, record_type: ContentRecordType) -> Option<VirtualFile> {
+        self.entries.get_entry_raw(title_id, record_type)
+    }
+
+    fn list_entries_filter(
+        &self,
+        title_type: Option<TitleType>,
+        record_type: Option<ContentRecordType>,
+        title_id: Option<u64>,
+    ) -> Vec<ContentProviderEntry> {
+        self.entries
+            .list_entries_filter(title_type, record_type, title_id)
+    }
+
+    fn list_update_versions(&self, title_id: u64) -> Vec<ExternalUpdateEntry> {
+        ExternalContentProvider::list_update_versions(self, title_id)
+    }
+
+    fn get_entry_for_version(
+        &self,
+        title_id: u64,
+        content_type: ContentRecordType,
+        version: u32,
+    ) -> Option<VirtualFile> {
+        ExternalContentProvider::get_entry_for_version(self, title_id, content_type, version)
+    }
+}
+
+impl Default for ExternalContentProvider {
+    fn default() -> Self {
+        Self::new(Vec::new())
+    }
+}
+
+#[cfg(test)]
+mod external_content_provider_tests {
+    use std::sync::Arc;
+
+    use super::*;
+    use crate::file_sys::vfs::vfs_vector::VectorVfsDirectory;
+
+    #[test]
+    fn add_refresh_and_clear_preserve_upstream_directory_ownership() {
+        let directory: VirtualDir = Arc::new(VectorVfsDirectory::new(
+            Vec::new(),
+            Vec::new(),
+            "games".to_string(),
+            None,
+        ));
+        let mut provider = ExternalContentProvider::default();
+        provider.add_directory(directory);
+        assert_eq!(provider.load_dirs.len(), 1);
+        provider.refresh();
+        assert_eq!(provider.load_dirs.len(), 1);
+        provider.clear_directories();
+        assert!(provider.load_dirs.is_empty());
+        assert!(provider.versions.is_empty());
+        assert!(provider.entries.multi_version_entries.is_empty());
     }
 }
 
@@ -1370,5 +1658,38 @@ mod manual_content_provider_tests {
 
         assert!(!provider.has_entry(0x800, ContentRecordType::Program));
         assert!(provider.list_update_versions(0x800).is_empty());
+    }
+
+    #[test]
+    fn frontend_manual_slot_exposes_versioned_updates_through_the_union() {
+        let mut manual = ManualContentProvider::new();
+        let title_id = 0x0100_0000_0000_0800;
+        manual.add_entry_with_version(
+            TitleType::Update,
+            ContentRecordType::Program,
+            title_id,
+            0xB_0000,
+            "1.4.3",
+            file("update.nca"),
+        );
+
+        let mut union = ContentProviderUnion::new();
+        unsafe {
+            union.set_slot(
+                ContentProviderUnionSlot::FrontendManual,
+                (&mut manual as *mut ManualContentProvider) as *mut dyn ContentProvider,
+            );
+        }
+
+        let versions = union.list_update_versions(title_id);
+        assert_eq!(versions.len(), 1);
+        assert_eq!(versions[0].version, 0xB_0000);
+        assert!(union
+            .get_entry_for_version(title_id, ContentRecordType::Program, 0xB_0000)
+            .is_some());
+        assert_eq!(
+            union.get_slot_for_entry(title_id, ContentRecordType::Program),
+            Some(ContentProviderUnionSlot::FrontendManual)
+        );
     }
 }

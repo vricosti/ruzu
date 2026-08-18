@@ -55,6 +55,8 @@ fn emit_inst(ctx: &mut EmitContext, inst: &ir::instruction::Inst) {
         Opcode::IAdd32 => ctx.add_line("ADD.S RC.x,RC.x,RC.y;"),
         Opcode::ISub32 => ctx.add_line("SUB.S RC.x,RC.x,RC.y;"),
         Opcode::IMul32 => ctx.add_line("MUL.S RC.x,RC.x,RC.y;"),
+        Opcode::SDiv32 => ctx.add_line("DIV.S RC.x,RC.x,RC.y;"),
+        Opcode::UDiv32 => ctx.add_line("DIV.U RC.x,RC.x,RC.y;"),
         Opcode::INeg32 => ctx.add_line("MOV.S RC.x,-RC.x;"),
         Opcode::IAbs32 => ctx.add_line("ABS.S RC.x,RC.x;"),
         Opcode::ShiftLeftLogical32 => ctx.add_line("SHL.U RC.x,RC.x,RC.y;"),
@@ -162,6 +164,12 @@ fn emit_inst(ctx: &mut EmitContext, inst: &ir::instruction::Inst) {
             let stage_name = ctx.stage_name;
             ctx.add_fmt(format!("MOV.S RC.x,{}.threadid;", stage_name));
         }
+        Opcode::SRWScaleFactorXY => {
+            super::emit_glasm_context_get_set::emit_sr_w_scale_factor_xy(ctx);
+        }
+        Opcode::SRWScaleFactorZ => {
+            super::emit_glasm_context_get_set::emit_sr_w_scale_factor_z(ctx);
+        }
         Opcode::VoteAll => ctx.add_line("TGALL.S RC.x,RC.x;"),
         Opcode::VoteAny => ctx.add_line("TGANY.S RC.x,RC.x;"),
         Opcode::VoteEqual => ctx.add_line("TGEQ.S RC.x,RC.x;"),
@@ -225,6 +233,12 @@ fn emit_inst(ctx: &mut EmitContext, inst: &ir::instruction::Inst) {
         | Opcode::ImageGatherDref => {
             ctx.add_line(&format!("; {} (image op, complex)", inst.opcode.name()));
         }
+        Opcode::IsTextureScaled => {
+            super::emit_glasm_image::emit_is_texture_scaled(ctx, inst);
+        }
+        Opcode::IsImageScaled => {
+            super::emit_glasm_image::emit_is_image_scaled(ctx, inst);
+        }
 
         // Memory operations
         Opcode::LoadGlobalU8
@@ -275,6 +289,15 @@ fn emit_inst(ctx: &mut EmitContext, inst: &ir::instruction::Inst) {
         | Opcode::CompositeInsertF32x3
         | Opcode::CompositeInsertF32x4 => {
             ctx.add_line(&format!("; {} (composite, complex)", inst.opcode.name()));
+        }
+
+        Opcode::CompositeInsertF64x2
+        | Opcode::CompositeInsertF64x3
+        | Opcode::CompositeInsertF64x4 => {
+            panic!(
+                "{:?} not implemented in GLASM backend (upstream NotImplemented)",
+                inst.opcode
+            )
         }
 
         // Not-implemented / fallback

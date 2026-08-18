@@ -19,6 +19,11 @@ pub fn show_warning<P: IsA<gtk::Window>>(parent: Option<&P>, message: &str, deta
     show_message_with_type(parent, message, detail, MessageType::Warning, false);
 }
 
+/// Show a modal error using the GTK 4.0 MessageDialog API.
+pub fn show_error<P: IsA<gtk::Window>>(parent: Option<&P>, message: &str, detail: &str) {
+    show_message_with_type(parent, message, detail, MessageType::Error, false);
+}
+
 /// Show a warning whose translated detail contains trusted Pango markup.
 pub fn show_warning_markup<P: IsA<gtk::Window>>(parent: Option<&P>, message: &str, detail: &str) {
     show_message_with_type(parent, message, detail, MessageType::Warning, true);

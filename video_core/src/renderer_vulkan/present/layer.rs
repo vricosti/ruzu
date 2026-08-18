@@ -22,6 +22,7 @@ use super::fxaa::Fxaa;
 use super::present_push_constants::{
     make_orthographic_matrix, PresentPushConstants, ScreenRectVertex,
 };
+use super::sgsr::Sgsr;
 use super::smaa::Smaa;
 use super::util;
 use ruzu_core::frontend::framebuffer_layout::FramebufferLayout;
@@ -69,6 +70,13 @@ pub enum AntiAliasingSetting {
     Smaa = 2,
 }
 
+/// Rust counterpart of upstream's `std::variant<std::monostate, FSR, SGSR>`.
+enum SuperResolutionFilter {
+    None,
+    Fsr(Fsr),
+    Sgsr(Sgsr),
+}
+
 /// Port of `Layer` class.
 ///
 /// Owns raw images for framebuffer upload, anti-aliasing state, FSR state,
@@ -92,7 +100,7 @@ pub struct Layer {
     anti_alias_setting: AntiAliasingSetting,
     anti_alias: Box<dyn AntiAliasPass>,
 
-    fsr: Option<Fsr>,
+    sr_filter: SuperResolutionFilter,
     resource_ticks: Vec<u64>,
     filters: &'static PresentFilters,
 }
@@ -121,16 +129,29 @@ impl Layer {
         let descriptor_sets =
             util::create_wrapped_descriptor_sets(&device, descriptor_pool, &layouts);
 
-        let fsr = if (filters.get_scaling_filter)() == ScalingFilter::Fsr {
-            Some(Fsr::new(
+        let sr_filter = match (filters.get_scaling_filter)() {
+            ScalingFilter::Fsr => SuperResolutionFilter::Fsr(Fsr::new(
                 device.clone(),
                 allocator,
                 image_count,
                 output_size,
                 supports_float16,
-            ))
-        } else {
-            None
+            )),
+            ScalingFilter::Sgsr => SuperResolutionFilter::Sgsr(Sgsr::new(
+                device.clone(),
+                allocator,
+                image_count,
+                output_size,
+                false,
+            )),
+            ScalingFilter::SgsrEdge => SuperResolutionFilter::Sgsr(Sgsr::new(
+                device.clone(),
+                allocator,
+                image_count,
+                output_size,
+                true,
+            )),
+            _ => SuperResolutionFilter::None,
         };
 
         Layer {
@@ -147,7 +168,7 @@ impl Layer {
             pixel_format: None,
             anti_alias_setting: AntiAliasingSetting::None,
             anti_alias: Box::new(NoAa),
-            fsr,
+            sr_filter,
             resource_ticks: Vec::new(),
             filters,
         }
@@ -184,26 +205,41 @@ impl Layer {
             &mut current_view,
         );
 
-        // Apply FSR if active
+        // Apply the selected super-resolution pass, matching upstream's FSR /
+        // SGSR variant. Both passes consume the guest crop and publish a full
+        // normalized output image to the window-adapt pass.
         let mut effective_crop = crop_rect;
-        if let Some(ref mut fsr) = self.fsr {
-            let render_extent = vk::Extent2D {
-                width: scaled_width,
-                height: scaled_height,
-            };
-            current_view = fsr.draw(
+        let render_extent = vk::Extent2D {
+            width: scaled_width,
+            height: scaled_height,
+        };
+        let crop = [
+            crop_rect.left,
+            crop_rect.top,
+            crop_rect.right,
+            crop_rect.bottom,
+        ];
+        let filtered_view = match &mut self.sr_filter {
+            SuperResolutionFilter::None => None,
+            SuperResolutionFilter::Fsr(fsr) => Some(fsr.draw(
                 scheduler,
                 image_index,
                 current_image,
                 current_view,
                 render_extent,
-                [
-                    crop_rect.left,
-                    crop_rect.top,
-                    crop_rect.right,
-                    crop_rect.bottom,
-                ],
-            );
+                crop,
+            )),
+            SuperResolutionFilter::Sgsr(sgsr) => Some(sgsr.draw(
+                scheduler,
+                image_index,
+                current_image,
+                current_view,
+                render_extent,
+                crop,
+            )),
+        };
+        if let Some(filtered_view) = filtered_view {
+            current_view = filtered_view;
             effective_crop = RectF {
                 left: 0.0,
                 top: 0.0,

@@ -74,6 +74,12 @@ enum EmulationCommand {
     ForceStop,
     Pause(SyncSender<()>),
     Resume(SyncSender<()>),
+    /// Graphics-relevant half of upstream `Core::System::ApplySettings()`.
+    ///
+    /// `System` is owned by the boot thread in Reden, so the GTK thread must
+    /// marshal `Renderer().RefreshBaseSettings()` to that owner instead of
+    /// touching the renderer directly.
+    ApplyRendererSettings(SyncSender<()>),
     CaptureScreenshot {
         path: std::path::PathBuf,
         layout: FramebufferLayout,
@@ -90,6 +96,9 @@ pub struct LoadingScreenAssets {
 /// Cross-thread events consumed by the GTK loading screen.
 #[derive(Debug)]
 pub enum LoadingEvent {
+    /// Per-title/global settings have been selected and are ready for the GUI
+    /// to display, matching Eden's pre-launch `UpdateStatusButtons()` point.
+    ConfigurationApplied,
     Assets(LoadingScreenAssets),
     Progress {
         stage: LoadStage,
@@ -239,6 +248,23 @@ impl EmulationSession {
         completed
     }
 
+    /// Apply live graphics settings to the active renderer.
+    ///
+    /// Upstream `ConfigureDialog::ApplyConfiguration()` calls
+    /// `Core::System::ApplySettings()`, whose renderer-side operation is
+    /// `Renderer().RefreshBaseSettings()`. The renderer lives on Reden's boot
+    /// thread, so this synchronous command preserves the same ordering before
+    /// the configuration dialog reports that applying has completed.
+    pub fn apply_renderer_settings(&self) -> bool {
+        let Some(tx) = self.command_tx.as_ref() else {
+            return false;
+        };
+        let (completed_tx, completed_rx) = std::sync::mpsc::sync_channel(0);
+        tx.send(EmulationCommand::ApplyRendererSettings(completed_tx))
+            .is_ok()
+            && completed_rx.recv().is_ok()
+    }
+
     /// Signal the boot thread to shut the system down and join it.
     pub fn stop(&mut self) {
         let _ = self.request_stop();
@@ -369,6 +395,7 @@ fn run_boot(
     if apply_boot_configuration(&filepath, parameters.use_global_configuration) {
         hid_core.lock().reload_input_devices();
     }
+    loading_event(LoadingEvent::ConfigurationApplied);
 
     // Log configuration (upstream logs settings during EmuWindow construction).
     common::settings::log_settings(&common::settings::values());
@@ -396,10 +423,12 @@ fn run_boot(
 
     // Content provider / filesystem / factories (upstream core.cpp:367-370).
     {
-        use ruzu_core::file_sys::registered_cache::ContentProviderUnion;
-        system.set_content_provider(Arc::new(std::sync::Mutex::new(ContentProviderUnion::new())));
+        // The game-list worker owns and refreshes the process-wide manual
+        // provider. Boot reuses the same union, matching QtCommon::provider.
+        let content_provider = crate::game_list::frontend_content_provider_union();
+        system.set_content_provider(content_provider);
         if system.get_filesystem().is_none() {
-            system.set_filesystem(ruzu_core::file_sys::vfs::vfs_real::RealVfsFilesystem::new());
+            system.set_filesystem(crate::game_list::frontend_vfs());
         }
         system
             .get_filesystem_controller()
@@ -424,7 +453,14 @@ fn run_boot(
         let device_memory = host1x.memory_manager().clone();
         system.set_host1x_core(Box::new(host1x));
 
-        // GPU (upstream core.cpp:278).
+        // GPU (upstream core.cpp:278). The frontend-owned subsystem factory
+        // replaces `VideoCore::CreateGPU` in this Rust dependency graph, so it
+        // must retain that function's leading `Settings::UpdateRescalingInfo`
+        // call before any renderer observes `resolution_info`.
+        {
+            let mut values = common::settings::values_mut();
+            common::settings::update_rescaling_info(&mut values);
+        }
         let system_ref = SystemRef::from_ref(&system);
         let use_async_gpu = *common::settings::values()
             .use_asynchronous_gpu_emulation
@@ -494,26 +530,25 @@ fn run_boot(
             gpu_ref.renderer_frame_end_notify();
         });
         let renderer: Box<dyn video_core::renderer_base::RendererBase> = match renderer_backend {
-            common::settings_enums::RendererBackend::OpenGL => {
+            common::settings_enums::RendererBackend::OpenGlGlsl
+            | common::settings_enums::RendererBackend::OpenGlGlasm
+            | common::settings_enums::RendererBackend::OpenGlSpirV => {
                 #[cfg(target_os = "linux")]
                 {
-                    let source = opengl_context_source.as_ref().unwrap_or_else(|| {
-                        log::error!("OpenGL renderer selected without a GLX context source");
-                        std::process::exit(1);
-                    });
-                    let context = Box::new(source.glx.create_context().unwrap_or_else(|error| {
-                        log::error!("Failed to create OpenGL renderer context: {error}");
-                        std::process::exit(1);
-                    }));
+                    let source = opengl_context_source.as_ref().ok_or_else(|| {
+                        "OpenGL renderer selected without a GLX context source".to_owned()
+                    })?;
+                    let context = Box::new(source.glx.create_context().map_err(|error| {
+                        format!("Failed to create OpenGL renderer context: {error}")
+                    })?);
                     let worker_source = source.glx.clone();
                     let shared_context_factory: video_core::renderer_opengl::gl_shader_context::SharedContextFactory =
                         Arc::new(move || {
-                            Box::new(worker_source.create_context().unwrap_or_else(|error| {
+                            Box::new(worker_source.create_offscreen_context().unwrap_or_else(|error| {
                                 panic!("failed to create shared OpenGL shader context: {error}")
                             }))
                         });
                     let mut renderer = video_core::renderer_opengl::RendererOpenGL::new(
-                        system.telemetry_session_mut(),
                         crate::render_window_x11::GlxContextSource::get_proc_address,
                         syncpoints.clone(),
                         Arc::clone(&device_memory),
@@ -523,13 +558,11 @@ fn run_boot(
                         false,
                         context,
                         Some(shared_context_factory),
+                        Arc::clone(&framebuffer_layout),
                         Arc::clone(&frame_end_notify),
                         Arc::clone(&frame_displayed_notify),
                     )
-                    .unwrap_or_else(|error| {
-                        log::error!("Failed to create OpenGL renderer: {error}");
-                        std::process::exit(1);
-                    });
+                    .map_err(|error| format!("Failed to create OpenGL renderer: {error}"))?;
                     renderer.rasterizer_mut().set_invalidate_gpu_cache_callback(
                         Arc::new(move || unsafe {
                             (&*(gpu_ptr as *const video_core::gpu::Gpu)).invalidate_gpu_cache();
@@ -580,13 +613,14 @@ fn run_boot(
                 }
                 #[cfg(not(target_os = "linux"))]
                 {
-                    log::error!("The GTK OpenGL context bridge is not available on this platform");
-                    std::process::exit(1);
+                    return Err(
+                        "The GTK OpenGL context bridge is not available on this platform"
+                            .to_owned(),
+                    );
                 }
             }
             common::settings_enums::RendererBackend::Vulkan => Box::new(
                 video_core::renderer_vulkan::renderer_vulkan::RendererVulkan::new(
-                    system.telemetry_session_mut(),
                     // SAFETY: this renderer is immediately bound to `gpu` below;
                     // `Gpu` drops the renderer before its shader notifier.
                     unsafe { gpu.shader_notify_handle() },
@@ -599,10 +633,7 @@ fn run_boot(
                     syncpoints.clone(),
                     Arc::clone(&device_memory),
                 )
-                .unwrap_or_else(|error| {
-                    log::error!("Failed to create Vulkan renderer: {error}");
-                    std::process::exit(1);
-                }),
+                .map_err(|error| format!("Failed to create Vulkan renderer: {error}"))?,
             ),
             common::settings_enums::RendererBackend::Null => Box::new(
                 video_core::renderer_null::renderer_null::RendererNull::new(syncpoints.clone()),
@@ -699,6 +730,7 @@ fn run_boot(
         // AudioCore (upstream core.cpp:283).
         let ac = audio_core::AudioCore::new(SystemRef::from_ref(system));
         system.set_audio_core(Box::new(ac));
+        Ok(())
     }));
 
     // Load the ROM (upstream `system.Load(...)`). Triggers the factory above.
@@ -819,6 +851,15 @@ fn run_boot(
                 system.run();
                 let _ = completed.send(());
             }
+            Ok(EmulationCommand::ApplyRendererSettings(completed)) => {
+                if let Some(gpu) = system
+                    .gpu_core()
+                    .and_then(|gpu| gpu.as_any().downcast_ref::<video_core::gpu::Gpu>())
+                {
+                    gpu.refresh_renderer_settings();
+                }
+                let _ = completed.send(());
+            }
             Err(RecvTimeoutError::Timeout) => {
                 let sample = system.get_and_reset_perf_stats();
                 *perf_results
@@ -892,7 +933,6 @@ fn apply_boot_configuration(filepath: &str, use_global_configuration: bool) -> b
         frontend_common::config::ConfigType::PerGameConfig,
     );
     config.initialize(&config_path);
-    config.read_values();
     crate::configuration::qt_config::load_per_game_control_values(&config_path);
     common::settings::set_configuring_global(true);
     true

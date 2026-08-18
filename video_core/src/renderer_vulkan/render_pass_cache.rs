@@ -7,25 +7,76 @@
 //! redundant creation for identical render target configurations.
 
 use std::collections::HashMap;
+use std::ptr::NonNull;
+use std::sync::Mutex;
 
 use ash::vk;
 use log::debug;
 
-use super::fixed_pipeline_state::FixedPipelineState;
 use super::maxwell_to_vk;
-use crate::surface::{
-    get_format_type, pixel_format_from_depth_format, pixel_format_from_render_target_format,
-    PixelFormat, SurfaceType,
-};
-use crate::textures::texture::MsaaMode;
-use crate::vulkan_common::vulkan_device::format_alternatives;
+use crate::surface::{PixelFormat, SurfaceType};
+use crate::vulkan_common::vulkan_device::{Device, FormatType};
 
-/// Key for render pass lookup — color formats + depth format + samples.
+/// Port of the anonymous-namespace `GetSurfaceType` in
+/// `vk_render_pass_cache.cpp`.
+const fn get_surface_type(format: PixelFormat) -> SurfaceType {
+    match format {
+        PixelFormat::D16Unorm | PixelFormat::D32Float | PixelFormat::X8D24Unorm => {
+            SurfaceType::Depth
+        }
+        PixelFormat::S8Uint => SurfaceType::Stencil,
+        PixelFormat::D24UnormS8Uint | PixelFormat::S8UintD24Unorm | PixelFormat::D32FloatS8Uint => {
+            SurfaceType::DepthStencil
+        }
+        _ => SurfaceType::ColorTexture,
+    }
+}
+
+fn attachment_stencil_ops(
+    pixel_format: PixelFormat,
+    load_op: vk::AttachmentLoadOp,
+    store_op: vk::AttachmentStoreOp,
+) -> (vk::AttachmentLoadOp, vk::AttachmentStoreOp) {
+    if matches!(
+        get_surface_type(pixel_format),
+        SurfaceType::Stencil | SurfaceType::DepthStencil
+    ) {
+        (load_op, store_op)
+    } else {
+        (
+            vk::AttachmentLoadOp::DONT_CARE,
+            vk::AttachmentStoreOp::DONT_CARE,
+        )
+    }
+}
+
+fn color_attachment_ops(
+    key: &RenderPassKey,
+    index: usize,
+) -> (vk::AttachmentLoadOp, vk::AttachmentStoreOp) {
+    let load_op = if key.color_clear_mask & (1 << index) != 0 {
+        vk::AttachmentLoadOp::CLEAR
+    } else {
+        vk::AttachmentLoadOp::LOAD
+    };
+    let store_op = if key.color_discard_mask & (1 << index) != 0 {
+        vk::AttachmentStoreOp::DONT_CARE
+    } else {
+        vk::AttachmentStoreOp::STORE
+    };
+    (load_op, store_op)
+}
+
+/// Port of upstream `RenderPassKey`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct RenderPassKey {
     pub color_formats: [PixelFormat; 8],
     pub depth_format: PixelFormat,
     pub samples: vk::SampleCountFlags,
+    pub resolve_color: bool,
+    pub color_clear_mask: u32,
+    pub depth_stencil_clear: bool,
+    pub color_discard_mask: u32,
 }
 
 impl Default for RenderPassKey {
@@ -34,29 +85,11 @@ impl Default for RenderPassKey {
             color_formats: [PixelFormat::Invalid; 8],
             depth_format: PixelFormat::Invalid,
             samples: vk::SampleCountFlags::TYPE_1,
+            resolve_color: false,
+            color_clear_mask: 0,
+            depth_stencil_clear: false,
+            color_discard_mask: 0,
         }
-    }
-}
-
-impl RenderPassKey {
-    /// Port of upstream `MakeRenderPassKey(const FixedPipelineState&)` from
-    /// `vk_graphics_pipeline.cpp`.
-    pub fn from_fixed_pipeline_state(state: &FixedPipelineState) -> Self {
-        let mut key = RenderPassKey::default();
-        for (index, &encoded_format) in state.color_formats.iter().enumerate() {
-            if encoded_format == 0 {
-                key.color_formats[index] = PixelFormat::Invalid;
-                continue;
-            }
-            key.color_formats[index] =
-                pixel_format_from_render_target_format(encoded_format as u32);
-        }
-        if state.depth_enabled() {
-            key.depth_format = pixel_format_from_depth_format(state.depth_format());
-        }
-        let msaa_mode = MsaaMode::from_raw(state.msaa_mode_raw()).unwrap_or(MsaaMode::Msaa1x1);
-        key.samples = maxwell_to_vk::msaa_mode(msaa_mode);
-        key
     }
 }
 
@@ -65,34 +98,39 @@ impl RenderPassKey {
 /// Ref: zuyu RenderPassCache — avoids re-creating VkRenderPass objects when
 /// the render target format configuration hasn't changed.
 pub struct RenderPassCache {
-    device: ash::Device,
-    instance: ash::Instance,
-    physical_device: vk::PhysicalDevice,
-    cache: HashMap<RenderPassKey, vk::RenderPass>,
+    device: NonNull<Device>,
+    cache: Mutex<HashMap<RenderPassKey, vk::RenderPass>>,
 }
 
+// SAFETY: the pointed-to `Device` is boxed by `RendererVulkan` and outlives
+// the rasterizer and this cache. Vulkan device operations are externally
+// synchronized where required; the render-pass map itself is mutex-protected.
+unsafe impl Send for RenderPassCache {}
+unsafe impl Sync for RenderPassCache {}
+
 impl RenderPassCache {
-    pub fn new(
-        device: ash::Device,
-        instance: ash::Instance,
-        physical_device: vk::PhysicalDevice,
-    ) -> Self {
+    pub fn new(device: &Device) -> Self {
         Self {
-            device,
-            instance,
-            physical_device,
-            cache: HashMap::new(),
+            device: NonNull::from(device),
+            cache: Mutex::new(HashMap::new()),
         }
     }
 
+    fn device(&self) -> &Device {
+        // SAFETY: `RendererVulkan` owns stable boxed storage for `Device` and
+        // drops the rasterizer (and this cache) before that owner.
+        unsafe { self.device.as_ref() }
+    }
+
     /// Get or create a VkRenderPass for the given key.
-    pub fn get(&mut self, key: &RenderPassKey) -> Result<vk::RenderPass, vk::Result> {
-        if let Some(&rp) = self.cache.get(key) {
+    pub fn get(&self, key: &RenderPassKey) -> Result<vk::RenderPass, vk::Result> {
+        let mut cache = self.cache.lock().expect("render-pass cache mutex poisoned");
+        if let Some(&rp) = cache.get(key) {
             return Ok(rp);
         }
 
         let rp = self.create_render_pass(key)?;
-        self.cache.insert(key.clone(), rp);
+        cache.insert(key.clone(), rp);
         debug!(
             "RenderPassCache: created new render pass (depth={:?})",
             key.depth_format,
@@ -100,41 +138,35 @@ impl RenderPassCache {
         Ok(rp)
     }
 
-    /// Port of `MaxwellToVK::SurfaceFormat(device, FormatType::Optimal, true, format)`.
-    fn surface_format(&self, pixel_format: PixelFormat) -> vk::Format {
-        let format_info = maxwell_to_vk::surface_format(pixel_format);
-        let mut usage = vk::FormatFeatureFlags::SAMPLED_IMAGE
-            | vk::FormatFeatureFlags::TRANSFER_DST
-            | vk::FormatFeatureFlags::TRANSFER_SRC;
-        if format_info.attachable {
-            usage |= match get_format_type(pixel_format) {
-                SurfaceType::ColorTexture => vk::FormatFeatureFlags::COLOR_ATTACHMENT,
-                SurfaceType::Depth | SurfaceType::Stencil | SurfaceType::DepthStencil => {
-                    vk::FormatFeatureFlags::DEPTH_STENCIL_ATTACHMENT
-                }
-                SurfaceType::Invalid => vk::FormatFeatureFlags::empty(),
-            };
-        }
-        if format_info.storage {
-            usage |= vk::FormatFeatureFlags::STORAGE_IMAGE;
-        }
-        if self.is_format_supported(format_info.format, usage) {
-            return format_info.format;
-        }
-        format_alternatives(format_info.format)
-            .into_iter()
-            .flatten()
-            .copied()
-            .find(|&format| self.is_format_supported(format, usage))
-            .unwrap_or(format_info.format)
-    }
-
-    fn is_format_supported(&self, format: vk::Format, usage: vk::FormatFeatureFlags) -> bool {
-        let properties = unsafe {
-            self.instance
-                .get_physical_device_format_properties(self.physical_device, format)
-        };
-        properties.optimal_tiling_features.contains(usage)
+    /// Port of the anonymous-namespace `AttachmentDescription` helper in
+    /// `vk_render_pass_cache.cpp`.
+    fn attachment_description(
+        &self,
+        pixel_format: PixelFormat,
+        samples: vk::SampleCountFlags,
+        load_op: vk::AttachmentLoadOp,
+        store_op: vk::AttachmentStoreOp,
+    ) -> vk::AttachmentDescription {
+        let (stencil_load_op, stencil_store_op) =
+            attachment_stencil_ops(pixel_format, load_op, store_op);
+        vk::AttachmentDescription::builder()
+            .format(
+                maxwell_to_vk::surface_format(
+                    self.device(),
+                    FormatType::Optimal,
+                    true,
+                    pixel_format,
+                )
+                .format,
+            )
+            .samples(samples)
+            .load_op(load_op)
+            .store_op(store_op)
+            .stencil_load_op(stencil_load_op)
+            .stencil_store_op(stencil_store_op)
+            .initial_layout(vk::ImageLayout::GENERAL)
+            .final_layout(vk::ImageLayout::GENERAL)
+            .build()
     }
 
     fn create_render_pass(&self, key: &RenderPassKey) -> Result<vk::RenderPass, vk::Result> {
@@ -157,29 +189,19 @@ impl RenderPassCache {
                 });
                 continue;
             }
-            // Upstream `vk_render_pass_cache.cpp` uses one AttachmentDescription
-            // for every render-target attachment: LOAD/STORE (contents persist;
-            // clears are explicit vkCmdClearAttachments), and GENERAL layout
-            // throughout so attachments can be used, sampled and presented
-            // without per-use layout transitions.
             color_refs.push(vk::AttachmentReference {
                 attachment: num_colors,
                 layout: vk::ImageLayout::GENERAL,
             });
             num_attachments = i + 1;
             num_colors += 1;
-            attachments.push(
-                vk::AttachmentDescription::builder()
-                    .format(self.surface_format(pixel_format))
-                    .samples(key.samples)
-                    .load_op(vk::AttachmentLoadOp::LOAD)
-                    .store_op(vk::AttachmentStoreOp::STORE)
-                    .stencil_load_op(vk::AttachmentLoadOp::LOAD)
-                    .stencil_store_op(vk::AttachmentStoreOp::STORE)
-                    .initial_layout(vk::ImageLayout::GENERAL)
-                    .final_layout(vk::ImageLayout::GENERAL)
-                    .build(),
-            );
+            let (load_op, store_op) = color_attachment_ops(key, i);
+            attachments.push(self.attachment_description(
+                pixel_format,
+                key.samples,
+                load_op,
+                store_op,
+            ));
         }
 
         // Depth attachment
@@ -190,48 +212,104 @@ impl RenderPassCache {
                 attachment: num_colors,
                 layout: vk::ImageLayout::GENERAL,
             });
-            // Same as the colour attachments (upstream vk_render_pass_cache.cpp):
-            // LOAD/STORE with GENERAL layout, so the depth/stencil buffer
-            // persists across passes and can be sampled. Guest depth clears are
-            // honoured via explicit vkCmdClearAttachments in RasterizerVulkan.
-            attachments.push(
-                vk::AttachmentDescription::builder()
-                    .format(self.surface_format(key.depth_format))
-                    .samples(key.samples)
-                    .load_op(vk::AttachmentLoadOp::LOAD)
-                    .store_op(vk::AttachmentStoreOp::STORE)
-                    .stencil_load_op(vk::AttachmentLoadOp::LOAD)
-                    .stencil_store_op(vk::AttachmentStoreOp::STORE)
-                    .initial_layout(vk::ImageLayout::GENERAL)
-                    .final_layout(vk::ImageLayout::GENERAL)
-                    .build(),
-            );
+            let load_op = if key.depth_stencil_clear {
+                vk::AttachmentLoadOp::CLEAR
+            } else {
+                vk::AttachmentLoadOp::LOAD
+            };
+            attachments.push(self.attachment_description(
+                key.depth_format,
+                key.samples,
+                load_op,
+                vk::AttachmentStoreOp::STORE,
+            ));
         } else {
             depth_ref = None;
+        }
+
+        let do_resolve_color =
+            key.resolve_color && key.samples != vk::SampleCountFlags::TYPE_1 && num_colors > 0;
+        let mut resolve_refs = Vec::new();
+        if do_resolve_color {
+            for &pixel_format in &key.color_formats {
+                if pixel_format == PixelFormat::Invalid {
+                    resolve_refs.push(vk::AttachmentReference {
+                        attachment: vk::ATTACHMENT_UNUSED,
+                        layout: vk::ImageLayout::GENERAL,
+                    });
+                    continue;
+                }
+                resolve_refs.push(vk::AttachmentReference {
+                    attachment: attachments.len() as u32,
+                    layout: vk::ImageLayout::GENERAL,
+                });
+                let mut description = self.attachment_description(
+                    pixel_format,
+                    vk::SampleCountFlags::TYPE_1,
+                    vk::AttachmentLoadOp::DONT_CARE,
+                    vk::AttachmentStoreOp::STORE,
+                );
+                description.initial_layout = vk::ImageLayout::UNDEFINED;
+                attachments.push(description);
+            }
         }
 
         let mut subpass = vk::SubpassDescription::builder()
             .pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS)
             .color_attachments(&color_refs[..num_attachments]);
+        if do_resolve_color {
+            subpass = subpass.resolve_attachments(&resolve_refs[..num_attachments]);
+        }
         if let Some(ref dr) = depth_ref {
             subpass = subpass.depth_stencil_attachment(dr);
         }
         let subpass = subpass.build();
 
+        // Upstream permits attachment writes to become fragment-shader reads
+        // within the same render pass (feedback-loop handling). Keep the
+        // dependency by-region so synchronization is limited to overlapping
+        // framebuffer regions.
+        let dependency = vk::SubpassDependency::builder()
+            .src_subpass(0)
+            .dst_subpass(0)
+            .src_stage_mask(
+                vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT
+                    | vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS
+                    | vk::PipelineStageFlags::LATE_FRAGMENT_TESTS,
+            )
+            .dst_stage_mask(vk::PipelineStageFlags::FRAGMENT_SHADER)
+            .src_access_mask(
+                vk::AccessFlags::COLOR_ATTACHMENT_WRITE
+                    | vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE,
+            )
+            .dst_access_mask(vk::AccessFlags::SHADER_READ)
+            .dependency_flags(vk::DependencyFlags::BY_REGION)
+            .build();
+
         let render_pass_info = vk::RenderPassCreateInfo::builder()
             .attachments(&attachments)
             .subpasses(std::slice::from_ref(&subpass))
+            .dependencies(std::slice::from_ref(&dependency))
             .build();
 
-        unsafe { self.device.create_render_pass(&render_pass_info, None) }
+        unsafe {
+            self.device()
+                .get_logical()
+                .create_render_pass(&render_pass_info, None)
+        }
     }
 }
 
 impl Drop for RenderPassCache {
     fn drop(&mut self) {
-        for (_, rp) in self.cache.drain() {
+        let device = self.device().get_logical().clone();
+        let cache = self
+            .cache
+            .get_mut()
+            .expect("render-pass cache mutex poisoned");
+        for (_, rp) in cache.drain() {
             unsafe {
-                self.device.destroy_render_pass(rp, None);
+                device.destroy_render_pass(rp, None);
             }
         }
     }
@@ -250,6 +328,33 @@ mod tests {
             .all(|&format| format == PixelFormat::Invalid));
         assert_eq!(key.depth_format, PixelFormat::Invalid);
         assert_eq!(key.samples, vk::SampleCountFlags::TYPE_1);
+        assert!(!key.resolve_color);
+        assert_eq!(key.color_clear_mask, 0);
+        assert!(!key.depth_stencil_clear);
+        assert_eq!(key.color_discard_mask, 0);
+    }
+
+    #[test]
+    fn attachment_stencil_ops_match_surface_type() {
+        assert_eq!(
+            attachment_stencil_ops(
+                PixelFormat::A8B8G8R8Unorm,
+                vk::AttachmentLoadOp::LOAD,
+                vk::AttachmentStoreOp::STORE,
+            ),
+            (
+                vk::AttachmentLoadOp::DONT_CARE,
+                vk::AttachmentStoreOp::DONT_CARE,
+            )
+        );
+        assert_eq!(
+            attachment_stencil_ops(
+                PixelFormat::D24UnormS8Uint,
+                vk::AttachmentLoadOp::CLEAR,
+                vk::AttachmentStoreOp::STORE,
+            ),
+            (vk::AttachmentLoadOp::CLEAR, vk::AttachmentStoreOp::STORE,)
+        );
     }
 
     #[test]
@@ -271,12 +376,30 @@ mod tests {
     }
 
     #[test]
-    fn render_pass_key_preserves_guest_pixel_format() {
-        let mut state = FixedPipelineState::default();
-        state.color_formats[0] = 0xD1; // A2B10G10R10_UNORM
+    fn invalid_surface_type_follows_render_pass_local_color_fallback() {
+        assert_eq!(
+            get_surface_type(PixelFormat::Invalid),
+            SurfaceType::ColorTexture
+        );
+    }
 
-        let key = RenderPassKey::from_fixed_pipeline_state(&state);
+    #[test]
+    fn render_pass_variants_select_clear_and_discard_ops_per_rt_slot() {
+        let mut key = RenderPassKey::default();
+        key.color_clear_mask = 1 << 3;
+        key.color_discard_mask = 1 << 5;
 
-        assert_eq!(key.color_formats[0], PixelFormat::A2B10G10R10Unorm);
+        assert_eq!(
+            color_attachment_ops(&key, 3),
+            (vk::AttachmentLoadOp::CLEAR, vk::AttachmentStoreOp::STORE)
+        );
+        assert_eq!(
+            color_attachment_ops(&key, 5),
+            (vk::AttachmentLoadOp::LOAD, vk::AttachmentStoreOp::DONT_CARE)
+        );
+        assert_eq!(
+            color_attachment_ops(&key, 0),
+            (vk::AttachmentLoadOp::LOAD, vk::AttachmentStoreOp::STORE)
+        );
     }
 }

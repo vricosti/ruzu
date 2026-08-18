@@ -1086,7 +1086,7 @@ mod tests {
         assert!(before_ssa.contains(&Opcode::SetPred));
 
         crate::ir_opt::ssa_rewrite_pass::ssa_rewrite_pass(&mut program);
-        crate::ir_opt::dead_code_elimination::dead_code_elimination_pass(&mut program);
+        crate::ir_opt::dead_code_elimination_pass::dead_code_elimination_pass(&mut program);
         let after_ssa: Vec<_> = program.blocks[0].iter().map(|inst| inst.opcode).collect();
         for flag_op in [
             Opcode::SetZFlag,

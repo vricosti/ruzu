@@ -90,7 +90,7 @@ fn composite3(v: &mut TranslatorVisitor, reg_a: u32, reg_b: u32, reg_c: u32) -> 
 fn read_array(v: &mut TranslatorVisitor, value: Value) -> Value {
     let extracted =
         v.ir.bit_field_u_extract(value, Value::ImmU32(0), Value::ImmU32(16));
-    v.ir.convert_f32_from_u32(extracted)
+    v.ir.convert_u_to_f(32, 16, extracted, crate::ir::types::FpControl::default())
 }
 
 struct Sample {
@@ -380,6 +380,21 @@ mod tests {
         let mut program = Program::new(ShaderStage::Fragment);
         program.blocks.push(Block::new());
         program
+    }
+
+    #[test]
+    fn array_layer_preserves_upstream_u16_conversion() {
+        let mut program = fresh_program();
+        let mut visitor = TranslatorVisitor::new(&mut program, 0);
+
+        let _ = read_array(&mut visitor, Value::ImmU32(0x1234_5678));
+
+        assert!(visitor
+            .ir
+            .program
+            .block(0)
+            .iter()
+            .any(|inst| { inst.opcode == Opcode::ConvertF32U16 }));
     }
 
     #[test]

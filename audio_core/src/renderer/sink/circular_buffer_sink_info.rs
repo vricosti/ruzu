@@ -9,6 +9,9 @@ pub struct CircularBufferSinkInfo {
     pub base: SinkInfoBase,
 }
 
+const _: () =
+    assert!(std::mem::size_of::<CircularBufferSinkInfo>() <= std::mem::size_of::<SinkInfoBase>());
+
 impl CircularBufferSinkInfo {
     pub fn new() -> Self {
         let mut info = Self::default();

@@ -157,6 +157,21 @@ pub enum TexturePixelFormat {
     Astc2d6x5Unorm,
     Astc2d6x5Srgb,
     E5B9G9R9Float,
+    // ETC2 / EAC. These carry no meaning for the shader recompiler, but the
+    // discriminants of this enum must stay identical to
+    // `VideoCore::Surface::PixelFormat`: `convert_texture_pixel_format`
+    // transmutes one into the other, so a variant missing here shifts every
+    // depth format and yields an invalid discriminant.
+    Etc2RgbUnorm,
+    Etc2RgbaUnorm,
+    Etc2RgbPtaUnorm,
+    Etc2RgbSrgb,
+    Etc2RgbaSrgb,
+    Etc2RgbPtaSrgb,
+    EacR11Unorm,
+    EacR11Snorm,
+    EacR11G11Unorm,
+    EacR11G11Snorm,
     D32Float,
     D16Unorm,
     X8D24Unorm,
@@ -266,6 +281,7 @@ pub struct TextureDescriptor {
     pub texture_type: TextureType,
     pub is_depth: bool,
     pub is_multisample: bool,
+    pub is_integer: bool,
     pub has_secondary: bool,
     pub cbuf_index: u32,
     pub cbuf_offset: u32,

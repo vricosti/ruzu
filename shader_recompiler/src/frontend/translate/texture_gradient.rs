@@ -68,7 +68,7 @@ fn read_array(v: &mut TranslatorVisitor, reg: u32, has_lod_clamp: bool) -> Value
     let count = if has_lod_clamp { 12 } else { 16 };
     let array_index =
         v.ir.bit_field_u_extract(value, Value::ImmU32(0), Value::ImmU32(count));
-    v.ir.convert_f32_from_u32(array_index)
+    v.ir.convert_u_to_f(32, 16, array_index, crate::ir::types::FpControl::default())
 }
 
 fn impl_txd(v: &mut TranslatorVisitor, insn: u64, is_bindless: bool) {
@@ -206,6 +206,21 @@ mod tests {
         let mut program = Program::new(ShaderStage::Fragment);
         program.blocks.push(Block::new());
         program
+    }
+
+    #[test]
+    fn array_layer_preserves_upstream_u16_conversion() {
+        let mut program = fresh_program();
+        let mut visitor = TranslatorVisitor::new(&mut program, 0);
+
+        let _ = read_array(&mut visitor, 0, false);
+
+        assert!(visitor
+            .ir
+            .program
+            .block(0)
+            .iter()
+            .any(|inst| { inst.opcode == Opcode::ConvertF32U16 }));
     }
 
     #[test]

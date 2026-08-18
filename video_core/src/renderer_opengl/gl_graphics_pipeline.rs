@@ -1,54 +1,55 @@
 // SPDX-FileCopyrightText: 2025 ruzu contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! Port of zuyu/src/video_core/renderer_opengl/gl_graphics_pipeline.h and gl_graphics_pipeline.cpp
+//! Port of Eden's video_core/renderer_opengl/gl_graphics_pipeline.h and gl_graphics_pipeline.cpp
 //!
 //! OpenGL graphics pipeline management -- compiles and configures vertex/fragment/etc shaders.
 
 use std::ffi::c_void;
 use std::hash::{Hash, Hasher};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::ptr::NonNull;
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
-use crate::buffer_cache::buffer_cache::BufferCache;
-use crate::buffer_cache::buffer_cache_base::{BufferCacheParams, UniformBufferSizes};
-use crate::buffer_cache::word_manager::DeviceTracker;
-use crate::engines::draw_manager::Maxwell3DRenderTargets;
+use crate::buffer_cache::buffer_cache_base::UniformBufferSizes;
+use crate::engines::draw_manager::Maxwell3DDrawView;
 use crate::engines::maxwell_3d::SurfaceClipInfo;
-use crate::engines::maxwell_3d::{ConstBufferBinding, MAX_CB_SLOTS};
+use crate::engines::maxwell_3d::{ConstBufferBinding, Maxwell3D, MAX_CB_SLOTS};
+use crate::memory_manager::MemoryManager;
 use crate::renderer_opengl::gl_shader_context::Context as ShaderContext;
-use crate::renderer_opengl::gl_shader_manager::ProgramManager;
+use crate::renderer_opengl::gl_shader_manager::ProgramManagerHandle;
 use crate::renderer_opengl::gl_shader_util::{
-    compile_assembly_program, create_program_from_spirv, delete_assembly_program,
+    compile_assembly_program, create_program_from_source, create_program_from_spirv,
     program_local_parameter_4f_arb,
 };
 use crate::renderer_opengl::gl_state_tracker::StateTracker;
-use crate::renderer_opengl::gl_texture_cache::{
-    RenderTargetDirtyFlagAccess, TextureCache as OpenGLTextureCache,
-};
+use crate::renderer_opengl::gl_texture_cache::TextureCache as OpenGLTextureCache;
 use crate::shader_notify::ShaderNotifyHandle;
 use crate::texture_cache::texture_cache_base::{DescriptorSyncRegs, ImageViewInOut};
-use crate::texture_cache::types::{Extent2D, ImageViewId, SamplerId};
+use crate::texture_cache::types::SamplerId;
 use crate::textures::texture::texture_pair;
 use crate::transform_feedback::TransformFeedbackState;
 use common::thread_worker::StatefulThreadWorker;
-use common::{cityhash::city_hash64, settings, trace};
+use common::{cityhash::city_hash64, settings};
 use shader_recompiler::shader_info::{num_descriptors, Info as ShaderInfo};
 
+use super::gl_buffer_cache::BufferCache as OpenGLBufferCache;
+use super::gl_resource_manager::{OGLAssemblyProgram, OGLProgram, OGLSync};
+
 /// Maximum number of textures bound to a graphics pipeline.
-pub const MAX_TEXTURES: u32 = 64;
+const MAX_TEXTURES: u32 = 64;
 
 /// Maximum number of images bound to a graphics pipeline.
-pub const MAX_IMAGES: u32 = 8;
+const MAX_IMAGES: u32 = 8;
 
 /// Number of shader stages (vertex, tess control, tess eval, geometry, fragment).
 pub const NUM_STAGES: usize = 5;
 
 /// Number of transform feedback buffers.
-pub const NUM_TRANSFORM_FEEDBACK_BUFFERS: usize = 4;
+const NUM_TRANSFORM_FEEDBACK_BUFFERS: usize = 4;
 
 /// Stride of each XFB attribute entry (token, count, attrib).
-pub const XFB_ENTRY_STRIDE: usize = 3;
+const XFB_ENTRY_STRIDE: usize = 3;
+const XFB_ATTRIB_COUNT: usize = 128 * XFB_ENTRY_STRIDE * NUM_TRANSFORM_FEEDBACK_BUFFERS;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum GraphicsProgramBackend {
@@ -58,8 +59,76 @@ pub(crate) enum GraphicsProgramBackend {
     SpirV,
 }
 
-static GLSL_ERROR_DUMP_COUNTER: AtomicU64 = AtomicU64::new(0);
-static GL_PIPELINE_BUILD_TRACE_SEQ: AtomicU64 = AtomicU64::new(0);
+/// Runtime representation of Eden's three `ConfigureImpl<Spec>`
+/// specializations. Rust does not monomorphize a function pointer selected at
+/// pipeline construction, but it preserves the same selection order and the
+/// same enabled-stage/descriptor gates.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum ConfigureSpec {
+    SimpleVertex,
+    SimpleVertexFragment,
+    #[default]
+    Default,
+}
+
+impl ConfigureSpec {
+    fn enabled_stage(self, stage: usize) -> bool {
+        match self {
+            Self::SimpleVertex => stage == 0,
+            Self::SimpleVertexFragment => stage == 0 || stage == 4,
+            Self::Default => true,
+        }
+    }
+
+    fn has_storage_buffers(self) -> bool {
+        self == Self::Default
+    }
+
+    fn has_texture_buffers(self) -> bool {
+        self == Self::Default
+    }
+
+    fn has_image_buffers(self) -> bool {
+        self == Self::Default
+    }
+
+    fn has_images(self) -> bool {
+        self == Self::Default
+    }
+
+    fn passes(self, infos: &[Option<ShaderInfo>; NUM_STAGES], enabled_stages_mask: u32) -> bool {
+        for (stage, info) in infos.iter().enumerate() {
+            if !self.enabled_stage(stage) && ((enabled_stages_mask >> stage) & 1) != 0 {
+                return false;
+            }
+            let Some(info) = info.as_ref() else {
+                continue;
+            };
+            if !self.has_storage_buffers() && !info.storage_buffers_descriptors.is_empty() {
+                return false;
+            }
+            if !self.has_texture_buffers() && !info.texture_buffer_descriptors.is_empty() {
+                return false;
+            }
+            if !self.has_image_buffers() && !info.image_buffer_descriptors.is_empty() {
+                return false;
+            }
+            if !self.has_images() && !info.image_descriptors.is_empty() {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn select(infos: &[Option<ShaderInfo>; NUM_STAGES], enabled_stages_mask: u32) -> Self {
+        for spec in [Self::SimpleVertex, Self::SimpleVertexFragment] {
+            if spec.passes(infos, enabled_stages_mask) {
+                return spec;
+            }
+        }
+        Self::Default
+    }
+}
 
 type GlTransformFeedbackAttribsNv = unsafe extern "system" fn(
     count: gl::types::GLsizei,
@@ -82,93 +151,10 @@ where
     let _ = GL_TRANSFORM_FEEDBACK_ATTRIBS_NV.set(function);
 }
 
-macro_rules! trace_gl_pipeline_stall {
-    ($($arg:tt)*) => {
-        if std::env::var_os("RUZU_TRACE_GL_PIPELINE_STALL").is_some() {
-            eprintln!($($arg)*);
-        }
-    };
-}
-
-/// Diagnostic snapshot for one sampled-texture descriptor resolved by
-/// `GraphicsPipeline::bind_stage_sampled_textures`.
-pub struct SampledTextureBinding {
-    pub stage: usize,
-    pub texture_binding: usize,
-    pub stage_texture_binding: u32,
-    pub view_id: ImageViewId,
-    pub handle: u32,
-    pub texture_type: u32,
-    pub is_depth: bool,
-    pub is_multisample: bool,
-}
-
-/// Transient texture/sampler/image binding arrays used while configuring one graphics draw.
-///
-/// Owns the Rust counterpart of upstream `GraphicsPipeline::ConfigureImpl` locals:
-/// `texture_binding`, `image_binding`, `sampler_binding`,
-/// `std::array<GLuint, MAX_TEXTURES> textures`,
-/// `std::array<GLuint, MAX_IMAGES> images`, and
-/// `std::array<GLuint, MAX_TEXTURES> gl_samplers`.
-pub struct GraphicsTextureImageBindingState {
-    pub textures: [u32; MAX_TEXTURES as usize],
-    pub samplers: [u32; MAX_TEXTURES as usize],
-    pub bound_texture_view_ids: [ImageViewId; MAX_TEXTURES as usize],
-    pub images: [u32; MAX_IMAGES as usize],
-    pub texture_binding: usize,
-    pub sampler_binding: usize,
-    pub image_binding: usize,
-    pub sampler_it: usize,
-    pub views_it: usize,
-}
-
-impl GraphicsTextureImageBindingState {
-    pub fn new() -> Self {
-        Self {
-            textures: [0; MAX_TEXTURES as usize],
-            samplers: [0; MAX_TEXTURES as usize],
-            bound_texture_view_ids: [crate::texture_cache::types::NULL_IMAGE_VIEW_ID;
-                MAX_TEXTURES as usize],
-            images: [0; MAX_IMAGES as usize],
-            texture_binding: 0,
-            sampler_binding: 0,
-            image_binding: 0,
-            sampler_it: 0,
-            views_it: 0,
-        }
-    }
-}
-
-fn trace_pipeline_build(stage: u64, key: &GraphicsPipelineKey, aux0: u64, aux1: u64, aux2: u64) {
-    if !trace::is_enabled(trace::cat::GL_PIPELINE) {
-        return;
-    }
-    let seq = GL_PIPELINE_BUILD_TRACE_SEQ.fetch_add(1, Ordering::Relaxed);
-    let _ = trace::emit_raw(
-        trace::cat::GL_PIPELINE,
-        &[
-            stage,
-            seq,
-            0,
-            key.raw as u64,
-            key.hash_key(),
-            key.unique_hashes[0],
-            key.unique_hashes[1],
-            key.unique_hashes[2],
-            key.unique_hashes[3],
-            key.unique_hashes[4],
-            key.unique_hashes[5],
-            aux0,
-            aux1,
-            aux2,
-        ],
-    );
-}
-
 /// Key used to identify a unique graphics pipeline configuration.
 ///
 /// Corresponds to `OpenGL::GraphicsPipelineKey`.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default)]
 #[repr(C)]
 pub struct GraphicsPipelineKey {
     pub unique_hashes: [u64; 6],
@@ -179,6 +165,21 @@ pub struct GraphicsPipelineKey {
     pub padding: [u32; 3],
     pub xfb_state: TransformFeedbackState,
 }
+
+impl PartialEq for GraphicsPipelineKey {
+    fn eq(&self, rhs: &Self) -> bool {
+        let size = self.size();
+        // SAFETY: both values are live `repr(C)` keys and Eden compares this
+        // exact prefix with `std::memcmp(this, &rhs, Size())`.
+        let lhs_bytes =
+            unsafe { std::slice::from_raw_parts(self as *const Self as *const u8, size) };
+        let rhs_bytes =
+            unsafe { std::slice::from_raw_parts(rhs as *const Self as *const u8, size) };
+        lhs_bytes == rhs_bytes
+    }
+}
+
+impl Eq for GraphicsPipelineKey {}
 
 impl GraphicsPipelineKey {
     const XFB_ENABLED_SHIFT: u32 = 0;
@@ -203,31 +204,6 @@ impl GraphicsPipelineKey {
         let bytes: &[u8] =
             unsafe { std::slice::from_raw_parts(self as *const Self as *const u8, size) };
         city_hash64(bytes)
-    }
-
-    pub fn to_cache_bytes(&self) -> &[u8] {
-        unsafe {
-            std::slice::from_raw_parts(
-                (self as *const Self).cast::<u8>(),
-                std::mem::size_of::<Self>(),
-            )
-        }
-    }
-
-    pub fn read_from_file(file: &mut std::fs::File) -> std::io::Result<Self> {
-        use std::io::Read;
-
-        let mut key = Self::default();
-        let bytes = unsafe {
-            std::slice::from_raw_parts_mut(
-                (&mut key as *mut Self).cast::<u8>(),
-                std::mem::size_of::<Self>(),
-            )
-        };
-        file.read_exact(bytes)?;
-        key.raw &= (1 << 14) - 1;
-        key.padding = [0; 3];
-        Ok(key)
     }
 
     /// Returns the xfb_enabled bit.
@@ -311,95 +287,83 @@ impl Hash for GraphicsPipelineKey {
 }
 
 struct ProgramBuild {
-    source_programs: [u32; NUM_STAGES],
-    assembly_programs: [u32; NUM_STAGES],
-    program_pipeline: u32,
-    fence: gl::types::GLsync,
+    assembly_programs: [OGLAssemblyProgram; NUM_STAGES],
+    source_programs: [OGLProgram; NUM_STAGES],
+    fence: OGLSync,
 }
 
 unsafe impl Send for ProgramBuild {}
 
 impl Drop for ProgramBuild {
     fn drop(&mut self) {
-        if !self.fence.is_null() {
-            unsafe { gl::DeleteSync(self.fence) };
-        }
-        if self.program_pipeline != 0 {
-            unsafe { gl::DeleteProgramPipelines(1, &self.program_pipeline) };
-        }
-        for program in self.source_programs {
-            if program != 0 {
-                unsafe { gl::DeleteProgram(program) };
-            }
-        }
-        for program in self.assembly_programs {
-            if program != 0 {
-                delete_assembly_program(program);
-            }
-        }
+        self.fence.release();
     }
 }
 
-type AsyncBuildResult = Result<ProgramBuild, (usize, String)>;
-type AsyncBuildSlot = Arc<(Mutex<Option<AsyncBuildResult>>, Condvar)>;
+type AsyncBuildSlot = Arc<(Mutex<Option<ProgramBuild>>, Condvar)>;
 
 /// OpenGL graphics pipeline.
 ///
 /// Corresponds to `OpenGL::GraphicsPipeline`.
 pub struct GraphicsPipeline {
-    pub key: GraphicsPipelineKey,
+    /// Non-owning references retained by Eden's `GraphicsPipeline`.
+    /// Production pipelines always have all four; the optional representation
+    /// exists only so GL-free unit tests can exercise key/metadata behavior.
+    texture_cache: Option<NonNull<OpenGLTextureCache>>,
+    buffer_cache: Option<NonNull<crate::renderer_opengl::gl_buffer_cache::BufferCache>>,
+    program_manager: Option<ProgramManagerHandle>,
+    state_tracker: Option<NonNull<StateTracker>>,
+    maxwell3d: Option<NonNull<Maxwell3D>>,
+    gpu_memory: Option<Arc<parking_lot::Mutex<MemoryManager>>>,
+
+    key: GraphicsPipelineKey,
 
     /// Per-stage GLSL source produced by the recompiler. Stages with no shader
     /// leave the corresponding entry as `None`.
-    pub glsl_sources: [Option<String>; NUM_STAGES],
+    glsl_sources: [Option<String>; NUM_STAGES],
 
     /// Per-stage SPIR-V binaries produced by the recompiler.
-    pub spirv_sources: [Option<Vec<u32>>; NUM_STAGES],
+    spirv_sources: [Option<Vec<u32>>; NUM_STAGES],
 
     program_backend: GraphicsProgramBackend,
     max_glasm_storage_buffer_blocks: u32,
 
-    /// Source program handles per stage (GLSL or SPIR-V).
-    pub source_programs: [u32; NUM_STAGES],
-    /// Assembly program handles per stage (GLASM).
-    pub assembly_programs: [u32; NUM_STAGES],
+    /// Assembly programs per stage (GLASM).
+    assembly_programs: [OGLAssemblyProgram; NUM_STAGES],
+    /// Source programs per stage (GLSL or SPIR-V).
+    source_programs: [OGLProgram; NUM_STAGES],
     /// Bitmask of enabled stages.
-    pub enabled_stages_mask: u32,
+    enabled_stages_mask: u32,
+    /// Eden's constructor-selected `ConfigureImpl<Spec>` specialization.
+    configure_spec: ConfigureSpec,
 
     /// Per-stage enabled uniform buffer masks.
-    pub enabled_uniform_buffer_masks: [u32; NUM_STAGES],
+    enabled_uniform_buffer_masks: [u32; NUM_STAGES],
     /// Per-stage uniform buffer used sizes.
-    pub uniform_buffer_sizes: UniformBufferSizes,
+    uniform_buffer_sizes: UniformBufferSizes,
     /// Per-stage base uniform bindings.
-    pub base_uniform_bindings: [u32; NUM_STAGES],
+    base_uniform_bindings: [u32; NUM_STAGES],
     /// Per-stage base storage bindings.
-    pub base_storage_bindings: [u32; NUM_STAGES],
+    base_storage_bindings: [u32; NUM_STAGES],
     /// Per-stage texture buffer counts.
-    pub num_texture_buffers: [u32; NUM_STAGES],
+    num_texture_buffers: [u32; NUM_STAGES],
     /// Per-stage image buffer counts.
-    pub num_image_buffers: [u32; NUM_STAGES],
+    num_image_buffers: [u32; NUM_STAGES],
 
-    pub use_storage_buffers: bool,
-    pub writes_global_memory: bool,
-    pub uses_local_memory: bool,
+    use_storage_buffers: bool,
+    writes_global_memory: bool,
+    uses_local_memory: bool,
 
     /// Transform feedback attributes array.
-    pub num_xfb_attribs: i32,
-    pub num_xfb_buffers_active: u32,
-    pub xfb_attribs: Vec<i32>,
+    num_xfb_attribs: i32,
+    num_xfb_buffers_active: u32,
+    xfb_attribs: [i32; XFB_ATTRIB_COUNT],
 
     // Build synchronization
     shader_notify: Option<ShaderNotifyHandle>,
     pending_build: Option<AsyncBuildSlot>,
-    built_fence: gl::types::GLsync,
+    built_fence: OGLSync,
     is_built: bool,
-
-    /// GL program pipeline object that aggregates the per-stage separable
-    /// programs in `source_programs`. `0` means uninitialised.
-    ///
-    /// Created lazily in `build_from_sources` and bound by `configure()`,
-    /// matching upstream's per-pipeline `OGLPipeline` object.
-    program_pipeline: u32,
 
     /// Per-stage shader translation result. Mirrors upstream
     /// `std::array<Shader::Info, NUM_STAGES> stage_infos`. Populated by
@@ -407,7 +371,7 @@ pub struct GraphicsPipeline {
     /// equivalent can iterate `texture_descriptors` /
     /// `texture_buffer_descriptors` / `image_descriptors` per stage to
     /// build `ImageViewInOut[]` for `fill_graphics_image_views`.
-    pub stage_infos: [Option<ShaderInfo>; NUM_STAGES],
+    stage_infos: [Option<ShaderInfo>; NUM_STAGES],
 }
 
 // SAFETY: pipeline fields stay on the render thread. Worker threads publish a
@@ -417,12 +381,9 @@ unsafe impl Sync for GraphicsPipeline {}
 
 impl Drop for GraphicsPipeline {
     fn drop(&mut self) {
-        // Release any per-stage program handles created via
-        // `build_from_sources`. Safe to call without a current GL context
-        // because all entries are zero in that case.
-        if self.has_gl_programs() {
-            self.delete_gl_programs();
-        }
+        // `built_fence` is declared after the program arrays upstream, so its
+        // RAII wrapper is destroyed first during reverse member destruction.
+        self.built_fence.release();
     }
 }
 
@@ -431,7 +392,7 @@ impl GraphicsPipeline {
     ///
     /// Corresponds to the first side effect in upstream
     /// `GraphicsPipeline::ConfigureImpl`: `texture_cache.SynchronizeGraphicsDescriptors()`.
-    pub fn synchronize_graphics_descriptors(
+    fn synchronize_graphics_descriptors(
         &self,
         texture_cache: &mut OpenGLTextureCache,
         regs: DescriptorSyncRegs,
@@ -439,19 +400,86 @@ impl GraphicsPipeline {
         texture_cache.base.synchronize_graphics_descriptors(regs);
     }
 
+    fn configure_buffer_cache_state(&self, buffer_cache: &mut OpenGLBufferCache) {
+        // SAFETY: the pipeline is heap-stable in ShaderCache, matching the
+        // non-owning `uniform_buffer_sizes` pointer retained by Eden's cache.
+        unsafe {
+            buffer_cache.set_uniform_buffers_state(
+                &self.enabled_uniform_buffer_masks,
+                &self.uniform_buffer_sizes,
+            );
+        }
+        buffer_cache.set_graphics_base_uniform_bindings(&self.base_uniform_bindings);
+        buffer_cache.set_graphics_base_storage_bindings(&self.base_storage_bindings);
+        buffer_cache.set_enable_storage_buffers(self.use_storage_buffers);
+    }
+
     /// Create a new graphics pipeline.
     ///
     /// Corresponds to `GraphicsPipeline::GraphicsPipeline()`.
-    pub fn new(key: GraphicsPipelineKey, shader_notify: Option<ShaderNotifyHandle>) -> Self {
+    pub(crate) fn new(
+        texture_cache: NonNull<OpenGLTextureCache>,
+        buffer_cache: NonNull<crate::renderer_opengl::gl_buffer_cache::BufferCache>,
+        program_manager: ProgramManagerHandle,
+        state_tracker: NonNull<StateTracker>,
+        thread_worker: Option<&StatefulThreadWorker<ShaderContext>>,
+        shader_notify: Option<ShaderNotifyHandle>,
+        glsl_sources: [Option<String>; NUM_STAGES],
+        spirv_sources: [Option<Vec<u32>>; NUM_STAGES],
+        infos: &[Option<ShaderInfo>; NUM_STAGES],
+        key: GraphicsPipelineKey,
+        program_backend: GraphicsProgramBackend,
+        max_glasm_storage_buffer_blocks: u32,
+        use_assembly_shaders: bool,
+        force_context_flush: bool,
+    ) -> Self {
+        if let Some(shader_notify) = shader_notify {
+            shader_notify.mark_shader_building();
+        }
+        let mut pipeline = Self::new_impl(
+            key,
+            shader_notify,
+            Some(texture_cache),
+            Some(buffer_cache),
+            Some(program_manager),
+            Some(state_tracker),
+        );
+        pipeline.glsl_sources = glsl_sources;
+        pipeline.spirv_sources = spirv_sources;
+        pipeline.program_backend = program_backend;
+        pipeline.max_glasm_storage_buffer_blocks = max_glasm_storage_buffer_blocks;
+        pipeline.apply_shader_infos(infos);
+        if key.xfb_enabled() && use_assembly_shaders {
+            pipeline.generate_transform_feedback_state();
+        }
+        pipeline.start_program_build(thread_worker, force_context_flush);
+        pipeline
+    }
+
+    fn new_impl(
+        key: GraphicsPipelineKey,
+        shader_notify: Option<ShaderNotifyHandle>,
+        texture_cache: Option<NonNull<OpenGLTextureCache>>,
+        buffer_cache: Option<NonNull<crate::renderer_opengl::gl_buffer_cache::BufferCache>>,
+        program_manager: Option<ProgramManagerHandle>,
+        state_tracker: Option<NonNull<StateTracker>>,
+    ) -> Self {
         Self {
+            texture_cache,
+            buffer_cache,
+            program_manager,
+            state_tracker,
+            maxwell3d: None,
+            gpu_memory: None,
             key,
             glsl_sources: Default::default(),
             spirv_sources: Default::default(),
             program_backend: GraphicsProgramBackend::Glsl,
             max_glasm_storage_buffer_blocks: 0,
-            source_programs: [0; NUM_STAGES],
-            assembly_programs: [0; NUM_STAGES],
+            assembly_programs: std::array::from_fn(|_| OGLAssemblyProgram::new()),
+            source_programs: std::array::from_fn(|_| OGLProgram::new()),
             enabled_stages_mask: 0,
+            configure_spec: ConfigureSpec::Default,
             enabled_uniform_buffer_masks: [0; NUM_STAGES],
             uniform_buffer_sizes: [[0;
                 crate::buffer_cache::buffer_cache_base::NUM_GRAPHICS_UNIFORM_BUFFERS as usize];
@@ -465,23 +493,227 @@ impl GraphicsPipeline {
             uses_local_memory: false,
             num_xfb_attribs: 0,
             num_xfb_buffers_active: 0,
-            xfb_attribs: vec![0i32; 128 * XFB_ENTRY_STRIDE * NUM_TRANSFORM_FEEDBACK_BUFFERS],
+            xfb_attribs: [0; XFB_ATTRIB_COUNT],
             shader_notify,
             pending_build: None,
-            built_fence: std::ptr::null(),
+            built_fence: OGLSync::new(),
             is_built: true,
-            program_pipeline: 0,
             stage_infos: Default::default(),
         }
     }
 
-    pub(crate) fn set_program_backend(
-        &mut self,
-        backend: GraphicsProgramBackend,
+    #[cfg(test)]
+    pub(crate) fn new_for_test(
+        key: GraphicsPipelineKey,
+        shader_notify: Option<ShaderNotifyHandle>,
+    ) -> Self {
+        Self::new_impl(key, shader_notify, None, None, None, None)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_for_test_with_sources(
+        key: GraphicsPipelineKey,
+        shader_notify: Option<ShaderNotifyHandle>,
+        glsl_sources: [Option<String>; NUM_STAGES],
+        spirv_sources: [Option<Vec<u32>>; NUM_STAGES],
+        infos: &[Option<ShaderInfo>; NUM_STAGES],
+        program_backend: GraphicsProgramBackend,
         max_glasm_storage_buffer_blocks: u32,
+        use_assembly_shaders: bool,
+    ) -> Self {
+        let mut pipeline = Self::new_for_test(key, shader_notify);
+        pipeline.glsl_sources = glsl_sources;
+        pipeline.spirv_sources = spirv_sources;
+        pipeline.program_backend = program_backend;
+        pipeline.max_glasm_storage_buffer_blocks = max_glasm_storage_buffer_blocks;
+        pipeline.apply_shader_infos(infos);
+        if key.xfb_enabled() && use_assembly_shaders {
+            pipeline.generate_transform_feedback_state();
+        }
+        pipeline
+    }
+
+    #[cfg(test)]
+    pub(crate) fn glsl_source_for_test(&self, stage: usize) -> Option<&str> {
+        self.glsl_sources[stage].as_deref()
+    }
+
+    /// Port of `GraphicsPipeline::SetEngine`.
+    pub fn set_engine(
+        &mut self,
+        maxwell3d: NonNull<Maxwell3D>,
+        gpu_memory: Arc<parking_lot::Mutex<MemoryManager>>,
     ) {
-        self.program_backend = backend;
-        self.max_glasm_storage_buffer_blocks = max_glasm_storage_buffer_blocks;
+        self.maxwell3d = Some(maxwell3d);
+        self.gpu_memory = Some(gpu_memory);
+    }
+
+    /// Port of `GraphicsPipeline::Configure(bool is_indexed)` and its
+    /// `ConfigureImpl` body. The pipeline obtains the cache/manager owners from
+    /// its constructor and the live engine/memory owners from `set_engine`, as
+    /// Eden does; the rasterizer no longer reconstructs this state per draw.
+    pub fn configure(&mut self, is_indexed: bool) -> bool {
+        let (
+            Some(mut texture_cache_ptr),
+            Some(mut buffer_cache_ptr),
+            Some(program_manager),
+            Some(mut state_tracker_ptr),
+            Some(mut maxwell3d_ptr),
+            Some(gpu_memory),
+        ) = (
+            self.texture_cache,
+            self.buffer_cache,
+            self.program_manager.clone(),
+            self.state_tracker,
+            self.maxwell3d,
+            self.gpu_memory.clone(),
+        )
+        else {
+            return false;
+        };
+
+        // SAFETY: all pointers refer to heap-stable renderer/rasterizer owners
+        // that outlive the shader cache and its pipelines. Configure runs on
+        // the serialized renderer thread while PrepareDraw holds both cache
+        // mutexes, matching Eden's non-owning references and raw engine
+        // pointers.
+        let texture_cache = unsafe { texture_cache_ptr.as_mut() };
+        let buffer_cache = unsafe { buffer_cache_ptr.as_mut() };
+        let state_tracker = unsafe { state_tracker_ptr.as_mut() };
+        let draw_state = unsafe { maxwell3d_ptr.as_ref().draw_manager_state() as *const _ };
+        let mut draw_view =
+            unsafe { Maxwell3DDrawView::live(&*draw_state, is_indexed, maxwell3d_ptr.as_mut()) };
+
+        let descriptor_sync_regs = draw_view.descriptor_sync_regs();
+        self.synchronize_graphics_descriptors(texture_cache, descriptor_sync_regs);
+        self.configure_buffer_cache_state(buffer_cache);
+
+        let cb_bindings = draw_view.cb_bindings();
+        let via_header_index = descriptor_sync_regs.sampler_binding_via_header;
+        let mut views = [ImageViewInOut::default(); (MAX_TEXTURES + MAX_IMAGES) as usize];
+        let mut samplers = [SamplerId::default(); MAX_TEXTURES as usize];
+        let mut views_index = 0usize;
+        let mut samplers_index = 0usize;
+        // Eden owns a raw `MemoryManager*` and uses it for both descriptor
+        // handles and GetSamplerId. Keep the equivalent Rust guard for the
+        // complete descriptor pass and pass that same borrow into the cache,
+        // avoiding a recursive lock without changing Eden's call order.
+        let gpu_memory_guard = gpu_memory.lock();
+        for stage in 0..NUM_STAGES {
+            if !self.configure_spec.enabled_stage(stage) {
+                continue;
+            }
+            self.configure_stage(
+                stage,
+                buffer_cache,
+                texture_cache,
+                &cb_bindings[stage],
+                &gpu_memory_guard,
+                via_header_index,
+                &mut views,
+                &mut views_index,
+                &mut samplers,
+                &mut samplers_index,
+            );
+        }
+        drop(gpu_memory_guard);
+        texture_cache.fill_image_views(
+            &mut views[..views_index],
+            false,
+            self.configure_spec.has_images(),
+        );
+
+        let render_targets = draw_view.render_targets();
+        let surface_clip = draw_view.surface_clip();
+        let (framebuffer, _, _) = texture_cache
+            .update_render_targets_and_get_framebuffer_from_snapshot(
+                &render_targets,
+                &mut draw_view,
+                false,
+                None,
+            );
+        state_tracker.bind_framebuffer(framebuffer);
+
+        let mut texture_buffer_it = 0usize;
+        for stage in 0..NUM_STAGES {
+            if self.configure_spec.enabled_stage(stage) {
+                self.bind_stage_info(
+                    stage,
+                    buffer_cache,
+                    texture_cache,
+                    &views,
+                    &mut texture_buffer_it,
+                );
+            }
+        }
+        buffer_cache.update_graphics_buffers(is_indexed);
+        buffer_cache.bind_host_geometry_buffers(is_indexed);
+
+        if !self.is_built() {
+            self.wait_for_build();
+        }
+        {
+            let mut program_manager = program_manager.lock();
+            if self.assembly_programs[0].handle != 0 {
+                program_manager
+                    .bind_assembly_programs(&self.assembly_programs, self.enabled_stages_mask);
+            } else {
+                program_manager.bind_source_programs(&self.source_programs);
+            }
+        }
+
+        let mut textures = [0u32; MAX_TEXTURES as usize];
+        let mut images = [0u32; MAX_IMAGES as usize];
+        let mut gl_samplers = [0u32; MAX_TEXTURES as usize];
+        let mut views_it = 0usize;
+        let mut samplers_it = 0usize;
+        let mut texture_binding = 0usize;
+        let mut image_binding = 0usize;
+        let mut sampler_binding = 0usize;
+        for stage in 0..NUM_STAGES {
+            if self.configure_spec.enabled_stage(stage) {
+                self.prepare_stage(
+                    stage,
+                    buffer_cache,
+                    texture_cache,
+                    &views,
+                    &samplers,
+                    surface_clip,
+                    &mut views_it,
+                    &mut samplers_it,
+                    &mut textures,
+                    &mut images,
+                    &mut gl_samplers,
+                    &mut texture_binding,
+                    &mut image_binding,
+                    &mut sampler_binding,
+                );
+            }
+        }
+        if texture_binding != 0 {
+            if texture_binding != sampler_binding {
+                // Eden's ASSERT is fail-soft and still issues both bindings.
+                log::error!(
+                    "GraphicsPipeline::Configure texture binding count {} differs from sampler binding count {}",
+                    texture_binding,
+                    sampler_binding
+                );
+            }
+            unsafe {
+                gl::BindTextures(0, texture_binding as i32, textures.as_ptr());
+                gl::BindSamplers(0, sampler_binding as i32, gl_samplers.as_ptr());
+            }
+        }
+        if image_binding != 0 {
+            unsafe {
+                gl::BindImageTextures(0, image_binding as i32, images.as_ptr());
+            }
+        }
+        if buffer_cache.any_buffer_uploaded {
+            buffer_cache.runtime.post_copy_barrier();
+            buffer_cache.any_buffer_uploaded = false;
+        }
+        true
     }
 
     /// Populate per-stage descriptor metadata from translated shader infos.
@@ -490,7 +722,7 @@ impl GraphicsPipeline {
     /// `GraphicsPipeline::GraphicsPipeline(...)` (`gl_graphics_pipeline.cpp`):
     /// enabled stage mask, per-stage UBO mask/sizes, and cumulative base
     /// bindings are derived from `Shader::Info`.
-    pub fn apply_shader_infos(&mut self, infos: &[Option<ShaderInfo>; NUM_STAGES]) {
+    fn apply_shader_infos(&mut self, infos: &[Option<ShaderInfo>; NUM_STAGES]) {
         self.enabled_stages_mask = 0;
         self.enabled_uniform_buffer_masks = [0; NUM_STAGES];
         self.uniform_buffer_sizes = [[0;
@@ -543,1732 +775,308 @@ impl GraphicsPipeline {
             }
         }
 
-        assert!(num_textures <= MAX_TEXTURES);
-        assert!(num_images <= MAX_IMAGES);
+        if num_textures > MAX_TEXTURES {
+            log::error!(
+                "GraphicsPipeline texture descriptor count {num_textures} exceeds {MAX_TEXTURES}"
+            );
+        }
+        if num_images > MAX_IMAGES {
+            log::error!(
+                "GraphicsPipeline image descriptor count {num_images} exceeds {MAX_IMAGES}"
+            );
+        }
 
         self.use_storage_buffers = self.program_backend != GraphicsProgramBackend::Glasm
             || num_storage_buffers <= self.max_glasm_storage_buffer_blocks;
         if self.use_storage_buffers {
             self.writes_global_memory = false;
         }
+        self.configure_spec = ConfigureSpec::select(infos, self.enabled_stages_mask);
     }
 
-    /// Bind graphics programs during the upstream `ConfigureImpl` sequence.
-    ///
-    /// Corresponds to upstream:
-    /// `WaitForBuild();`
-    /// then `program_manager.BindAssemblyPrograms(...)` or
-    /// `program_manager.BindSourcePrograms(...)`.
-    pub fn bind_graphics_programs_for_configure(&mut self) {
-        self.wait_for_build();
-
-        // Bind the per-pipeline object so the next draw uses the separable
-        // programs that `build_from_sources` compiled and aggregated. Mirrors
-        // upstream `OpenGL::ProgramManager::BindGraphicsPipeline`.
-        if self.program_pipeline != 0 {
-            unsafe {
-                // Detach any monolithic program first — separable programs
-                // and a bound monolithic program are mutually exclusive.
-                gl::UseProgram(0);
-                gl::BindProgramPipeline(self.program_pipeline);
-            }
-        }
-    }
-
-    /// Bind graphics programs through the upstream `ProgramManager` owner.
-    ///
-    /// Corresponds to upstream:
-    /// `program_manager.BindAssemblyPrograms(assembly_programs, enabled_stages_mask)`
-    /// or `program_manager.BindSourcePrograms(source_programs)`.
-    pub fn bind_graphics_programs_for_configure_with_program_manager(
-        &mut self,
-        program_manager: &mut ProgramManager,
-    ) {
-        self.wait_for_build();
-        if self.assembly_programs[0] != 0 {
-            program_manager
-                .bind_assembly_programs(&self.assembly_programs, self.enabled_stages_mask);
-        } else {
-            program_manager.bind_source_programs(&self.source_programs);
-        }
-    }
-
-    /// Configure the buffer-cache base state owned by upstream
-    /// `GraphicsPipeline::ConfigureImpl`.
-    pub fn configure_buffer_cache_state<P, DT>(&self, buffer_cache: &mut BufferCache<P, DT>)
-    where
-        P: BufferCacheParams,
-        DT: DeviceTracker,
-    {
-        buffer_cache.set_uniform_buffers_state(
-            &self.enabled_uniform_buffer_masks,
-            &self.uniform_buffer_sizes,
-        );
-        buffer_cache.set_graphics_base_uniform_bindings(&self.base_uniform_bindings);
-        buffer_cache.set_graphics_base_storage_bindings(&self.base_storage_bindings);
-        buffer_cache.set_enable_storage_buffers(self.use_storage_buffers);
-    }
-
-    /// Synchronize graphics descriptors, then configure the buffer-cache base state.
-    ///
-    /// This owns the first adjacent upstream `GraphicsPipeline::ConfigureImpl`
-    /// side effects:
-    /// `texture_cache.SynchronizeGraphicsDescriptors()`, then
-    /// `SetUniformBuffersState`, `SetBaseUniformBindings`,
-    /// `SetBaseStorageBindings`, and `SetEnableStorageBuffers`.
-    pub fn synchronize_graphics_descriptors_then_configure_buffer_cache_state<P, DT>(
+    /// Mechanical Rust form of upstream `ConfigureImpl`'s `config_stage`
+    /// lambda. Keeping this helper private preserves the upstream owner while
+    /// avoiding the former public combinatorial configure API.
+    #[allow(clippy::too_many_arguments)]
+    fn configure_stage(
         &self,
+        stage: usize,
+        buffer_cache: &mut OpenGLBufferCache,
         texture_cache: &mut OpenGLTextureCache,
-        regs: DescriptorSyncRegs,
-        buffer_cache: &mut BufferCache<P, DT>,
-    ) where
-        P: BufferCacheParams,
-        DT: DeviceTracker,
-    {
-        self.synchronize_graphics_descriptors(texture_cache, regs);
-        self.configure_buffer_cache_state(buffer_cache);
-    }
-
-    /// Bind enabled graphics uniform buffers from the draw-time cbuf snapshot.
-    ///
-    /// Corresponds to the uniform-buffer binding state consumed by upstream
-    /// `GraphicsPipeline::ConfigureImpl` before `UpdateGraphicsBuffers`.
-    pub fn bind_graphics_uniform_buffers<P, DT, A>(
-        &self,
-        buffer_cache: &mut BufferCache<P, DT>,
-        cb_bindings: &[[ConstBufferBinding; MAX_CB_SLOTS]],
-        mut gpu_to_cpu_address: A,
-    ) where
-        P: BufferCacheParams,
-        DT: DeviceTracker,
-        A: FnMut(u64) -> Option<u64>,
-    {
-        for stage in 0..self
-            .enabled_uniform_buffer_masks
-            .len()
-            .min(cb_bindings.len())
-        {
-            let mut bits = self.enabled_uniform_buffer_masks[stage];
-            let mut slot = 0u32;
-            while bits != 0 {
-                let skip = bits.trailing_zeros();
-                slot += skip;
-                bits >>= skip;
-
-                let binding = cb_bindings[stage][slot as usize];
-                if binding.enabled && binding.address != 0 && binding.size != 0 {
-                    let device_addr =
-                        gpu_to_cpu_address(binding.address).unwrap_or(binding.address);
-                    buffer_cache.bind_graphics_uniform_buffer_with_device_addr(
-                        stage,
-                        slot,
-                        device_addr,
-                        binding.size,
+        cbufs: &[ConstBufferBinding; MAX_CB_SLOTS],
+        gpu_memory: &MemoryManager,
+        via_header_index: bool,
+        views: &mut [ImageViewInOut; (MAX_TEXTURES + MAX_IMAGES) as usize],
+        views_index: &mut usize,
+        samplers: &mut [SamplerId; MAX_TEXTURES as usize],
+        samplers_index: &mut usize,
+    ) {
+        buffer_cache.unbind_graphics_storage_buffers(stage);
+        let Some(info) = self.stage_infos[stage].as_ref() else {
+            return;
+        };
+        if self.configure_spec.has_storage_buffers() {
+            for (ssbo_index, desc) in info.storage_buffers_descriptors.iter().enumerate() {
+                if desc.count != 1 {
+                    // Eden's ASSERT is fail-soft and still binds the descriptor.
+                    log::error!(
+                        "GraphicsPipeline::Configure storage-buffer descriptor count is {}, expected 1",
+                        desc.count
                     );
-                } else {
-                    buffer_cache.disable_graphics_uniform_buffer(stage, slot);
                 }
-
-                slot += 1;
-                bits >>= 1;
+                buffer_cache.bind_graphics_storage_buffer_with_gpu_reader(
+                    stage,
+                    ssbo_index,
+                    desc.cbuf_index,
+                    desc.cbuf_offset,
+                    desc.is_written,
+                    |gpu_addr| gpu_memory.gpu_to_cpu_address(gpu_addr),
+                    |gpu_addr| gpu_memory.get_memory_layout_size(gpu_addr),
+                    |gpu_addr, output| gpu_memory.read_block(gpu_addr, output),
+                );
             }
         }
-    }
 
-    /// Bind storage-buffer descriptors for one graphics stage.
-    ///
-    /// Corresponds to upstream `GraphicsPipeline::ConfigureImpl`'s
-    /// `config_stage` lambda before texture/image descriptor collection:
-    /// `UnbindGraphicsStorageBuffers(stage)`, then
-    /// `BindGraphicsStorageBuffer(stage, ssbo_index, ...)` for each storage
-    /// descriptor when storage buffers are enabled.
-    pub fn bind_stage_storage_buffers<P, DT>(
-        &self,
-        buffer_cache: &mut BufferCache<P, DT>,
-        stage: usize,
-    ) where
-        P: BufferCacheParams,
-        DT: DeviceTracker,
-    {
-        let Some(info) = self.stage_infos.get(stage).and_then(Option::as_ref) else {
-            return;
+        let read_word = |cbuf_index: u32, offset: u32| {
+            let cbuf = cbufs[cbuf_index as usize];
+            if !cbuf.enabled {
+                // Eden's ASSERT is fail-soft and proceeds with the address.
+                log::error!(
+                    "GraphicsPipeline::Configure reads disabled cbuf {cbuf_index} at offset {offset:#x}"
+                );
+            }
+            let address = cbuf.address.wrapping_add(u64::from(offset));
+            gpu_memory.read::<u32>(address)
         };
-
-        buffer_cache.unbind_graphics_storage_buffers(stage);
-        if !self.use_storage_buffers {
-            return;
+        macro_rules! read_handle {
+            ($desc:expr, $index:expr) => {{
+                let index_offset = ($index as u32) << $desc.size_shift;
+                let offset = $desc.cbuf_offset.wrapping_add(index_offset);
+                if $desc.has_secondary {
+                    let second_offset = $desc.secondary_cbuf_offset.wrapping_add(index_offset);
+                    let lhs = read_word($desc.cbuf_index, offset) << $desc.shift_left;
+                    let rhs = read_word($desc.secondary_cbuf_index, second_offset)
+                        << $desc.secondary_shift_left;
+                    texture_pair(lhs | rhs, via_header_index)
+                } else {
+                    texture_pair(read_word($desc.cbuf_index, offset), via_header_index)
+                }
+            }};
         }
-
-        for (ssbo_index, desc) in info.storage_buffers_descriptors.iter().enumerate() {
-            assert_eq!(
-                desc.count, 1,
-                "GraphicsPipeline storage buffer descriptor count must match upstream ASSERT"
-            );
-            buffer_cache.bind_graphics_storage_buffer(
-                stage,
-                ssbo_index,
-                desc.cbuf_index,
-                desc.cbuf_offset,
-                desc.is_written,
-            );
-        }
-    }
-
-    /// Bind storage-buffer descriptors using caller-provided GPU-memory
-    /// helpers, preserving the Rust no-relock bridge while keeping upstream
-    /// `ConfigureImpl` ownership on the graphics pipeline.
-    pub fn bind_stage_storage_buffers_with_gpu_reader<P, DT, A, L, R>(
-        &self,
-        buffer_cache: &mut BufferCache<P, DT>,
-        stage: usize,
-        mut gpu_to_cpu_address: A,
-        mut get_memory_layout_size: L,
-        mut read_block: R,
-    ) where
-        P: BufferCacheParams,
-        DT: DeviceTracker,
-        A: FnMut(u64) -> Option<u64>,
-        L: FnMut(u64) -> u64,
-        R: FnMut(u64, &mut [u8]) -> bool,
-    {
-        let Some(info) = self.stage_infos.get(stage).and_then(Option::as_ref) else {
-            return;
-        };
-
-        buffer_cache.unbind_graphics_storage_buffers(stage);
-        if !self.use_storage_buffers {
-            return;
-        }
-
-        for (ssbo_index, desc) in info.storage_buffers_descriptors.iter().enumerate() {
-            assert_eq!(
-                desc.count, 1,
-                "GraphicsPipeline storage buffer descriptor count must match upstream ASSERT"
-            );
-            buffer_cache.bind_graphics_storage_buffer_with_gpu_reader(
-                stage,
-                ssbo_index,
-                desc.cbuf_index,
-                desc.cbuf_offset,
-                desc.is_written,
-                &mut gpu_to_cpu_address,
-                &mut get_memory_layout_size,
-                &mut read_block,
-            );
-        }
-    }
-
-    /// Collect texture/image descriptors for one graphics stage.
-    ///
-    /// Corresponds to upstream `GraphicsPipeline::ConfigureImpl`'s
-    /// `config_stage` descriptor loops after storage-buffer binding:
-    /// texture-buffer descriptors, image-buffer descriptors, sampled texture
-    /// descriptors plus sampler ids, then storage-image descriptors.
-    pub fn collect_stage_texture_image_descriptors<R, S, D>(
-        &self,
-        stage: usize,
-        max_desc_count: u32,
-        via_header_index: bool,
-        views: &mut Vec<ImageViewInOut>,
-        sampler_ids: &mut Vec<SamplerId>,
-        mut read_handle: R,
-        mut get_graphics_sampler_id: S,
-        mut record_detail: D,
-        trace_texture_descriptors: bool,
-    ) -> bool
-    where
-        R: FnMut(usize, u32, u32) -> Option<u32>,
-        S: FnMut(u32) -> SamplerId,
-        D: FnMut(usize, u64, u64),
-    {
-        let Some(info) = self.stage_infos.get(stage).and_then(Option::as_ref) else {
-            return false;
-        };
-
-        if trace_texture_descriptors {
-            log::warn!(
-                "[TEX_DESC] stage={} texture_buffers={} image_buffers={} textures={} images={}",
-                stage,
-                info.texture_buffer_descriptors.len(),
-                info.image_buffer_descriptors.len(),
-                info.texture_descriptors.len(),
-                info.image_descriptors.len(),
-            );
-        }
-
-        let mut has_images = false;
-        macro_rules! descriptor_offset {
-            ($desc:expr, $idx:expr) => {{
-                let shift = $desc.size_shift.min(31);
-                $idx.checked_shl(shift)
-                    .and_then(|index_offset| $desc.cbuf_offset.checked_add(index_offset))
+        macro_rules! add_image {
+            ($desc:expr, $blacklist:expr) => {{
+                for index in 0..$desc.count {
+                    let index_offset = index << $desc.size_shift;
+                    let offset = $desc.cbuf_offset.wrapping_add(index_offset);
+                    let (image_index, _) =
+                        texture_pair(read_word($desc.cbuf_index, offset), via_header_index);
+                    views[*views_index] = ImageViewInOut {
+                        index: image_index,
+                        blacklist: $blacklist,
+                        id: Default::default(),
+                    };
+                    *views_index += 1;
+                }
             }};
         }
 
-        macro_rules! resolve_texture_handle {
-            ($desc:expr, $idx:expr) => {
-                (|| -> Option<u32> {
-                    let shift = $desc.size_shift.min(31);
-                    let index_offset = $idx.checked_shl(shift)?;
-                    let offset = $desc.cbuf_offset.checked_add(index_offset)?;
-                    if !$desc.has_secondary {
-                        read_handle(stage, $desc.cbuf_index, offset)
-                    } else {
-                        let second_offset =
-                            $desc.secondary_cbuf_offset.checked_add(index_offset)?;
-                        debug_assert!($desc.shift_left < 32);
-                        debug_assert!($desc.secondary_shift_left < 32);
-                        let lhs = read_handle(stage, $desc.cbuf_index, offset)
-                            .map(|raw| raw << $desc.shift_left);
-                        let rhs = read_handle(stage, $desc.secondary_cbuf_index, second_offset)
-                            .map(|raw| raw << $desc.secondary_shift_left);
-                        lhs.zip(rhs).map(|(lhs, rhs)| lhs | rhs)
-                    }
-                })()
-            };
-        }
-
-        record_detail(
-            36,
-            stage as u64,
-            info.texture_buffer_descriptors.len() as u64,
-        );
-        for desc in &info.texture_buffer_descriptors {
-            let count = desc.count.min(max_desc_count);
-            for idx in 0..count {
-                if let Some(raw) = resolve_texture_handle!(desc, idx) {
-                    let (tic_id, _) = texture_pair(raw, via_header_index);
-                    views.push(ImageViewInOut {
-                        index: tic_id,
+        if self.configure_spec.has_texture_buffers() {
+            for desc in &info.texture_buffer_descriptors {
+                for index in 0..desc.count {
+                    let (image_index, _) = read_handle!(desc, index);
+                    views[*views_index] = ImageViewInOut {
+                        index: image_index,
                         blacklist: false,
                         id: Default::default(),
-                    });
-                }
-            }
-        }
-        record_detail(37, stage as u64, 0);
-
-        record_detail(38, stage as u64, info.image_buffer_descriptors.len() as u64);
-        for desc in &info.image_buffer_descriptors {
-            let count = desc.count.min(max_desc_count);
-            for idx in 0..count {
-                if let Some(offset) = descriptor_offset!(desc, idx) {
-                    let Some(raw) = read_handle(stage, desc.cbuf_index, offset) else {
-                        continue;
                     };
-                    let (tic_id, _) = texture_pair(raw, via_header_index);
-                    views.push(ImageViewInOut {
-                        index: tic_id,
-                        blacklist: false,
-                        id: Default::default(),
-                    });
+                    *views_index += 1;
                 }
             }
         }
-        record_detail(39, stage as u64, 0);
-
-        record_detail(40, stage as u64, info.texture_descriptors.len() as u64);
-        for (desc_index, desc) in info.texture_descriptors.iter().enumerate() {
-            let count = desc.count.min(max_desc_count);
-            for idx in 0..count {
-                let packed_desc = ((desc_index as u64) << 32) | idx as u64;
-                record_detail(45, stage as u64, packed_desc);
-                let raw = resolve_texture_handle!(desc, idx);
-                record_detail(46, stage as u64, packed_desc);
-                if trace_texture_descriptors {
-                    log::warn!(
-                        "[TEX_DESC] sampled stage={} idx={} cbuf={} offset=0x{:X} shift={} count={} raw={:?}",
-                        stage,
-                        idx,
-                        desc.cbuf_index,
-                        desc.cbuf_offset,
-                        desc.size_shift,
-                        desc.count,
-                        raw,
-                    );
-                }
-                if let Some(raw) = raw {
-                    let (tic_id, tsc_id) = texture_pair(raw, via_header_index);
-                    record_detail(47, stage as u64, packed_desc);
-                    views.push(ImageViewInOut {
-                        index: tic_id,
-                        blacklist: false,
-                        id: Default::default(),
-                    });
-                    record_detail(48, stage as u64, packed_desc);
-                    sampler_ids.push(get_graphics_sampler_id(tsc_id));
-                    record_detail(49, stage as u64, packed_desc);
-                    record_detail(50, stage as u64, packed_desc);
-                }
+        if self.configure_spec.has_image_buffers() {
+            for desc in &info.image_buffer_descriptors {
+                add_image!(desc, false);
             }
         }
-        record_detail(41, stage as u64, 0);
-
-        record_detail(42, stage as u64, info.image_descriptors.len() as u64);
-        for desc in &info.image_descriptors {
-            has_images = true;
-            let count = desc.count.min(max_desc_count);
-            for idx in 0..count {
-                if let Some(offset) = descriptor_offset!(desc, idx) {
-                    let Some(raw) = read_handle(stage, desc.cbuf_index, offset) else {
-                        continue;
-                    };
-                    let (tic_id, _) = texture_pair(raw, via_header_index);
-                    views.push(ImageViewInOut {
-                        index: tic_id,
-                        blacklist: desc.is_written,
-                        id: Default::default(),
-                    });
-                }
+        for desc in &info.texture_descriptors {
+            for index in 0..desc.count {
+                let (image_index, sampler_index) = read_handle!(desc, index);
+                views[*views_index] = ImageViewInOut {
+                    index: image_index,
+                    blacklist: false,
+                    id: Default::default(),
+                };
+                *views_index += 1;
+                samplers[*samplers_index] =
+                    texture_cache
+                        .base
+                        .get_sampler_id_with_memory(sampler_index, false, gpu_memory);
+                *samplers_index += 1;
             }
         }
-        record_detail(43, stage as u64, 0);
-        record_detail(44, stage as u64, 0);
-
-        has_images
-    }
-
-    /// Configure storage-buffer and texture/image descriptor state for all enabled graphics stages.
-    ///
-    /// Corresponds to upstream `GraphicsPipeline::ConfigureImpl`'s
-    /// `if constexpr (Spec::enabled_stages[N]) { config_stage(N); }` sequence.
-    /// Rust still receives GPU-memory and diagnostic bridges as closures until
-    /// the pipeline owns upstream-equivalent `gpu_memory` and live engine state.
-    #[allow(clippy::too_many_arguments)]
-    pub fn configure_enabled_stage_texture_image_descriptors<P, DT, A, L, B, R, S, D>(
-        &self,
-        buffer_cache: &mut BufferCache<P, DT>,
-        num_shader_stages: usize,
-        max_desc_count: u32,
-        via_header_index: bool,
-        views: &mut Vec<ImageViewInOut>,
-        sampler_ids: &mut Vec<SamplerId>,
-        use_gpu_reader: bool,
-        mut gpu_to_cpu_address: A,
-        mut get_memory_layout_size: L,
-        mut read_block: B,
-        mut read_handle: R,
-        mut get_graphics_sampler_id: S,
-        mut record_detail: D,
-        trace_texture_descriptors: bool,
-    ) -> bool
-    where
-        P: BufferCacheParams,
-        DT: DeviceTracker,
-        A: FnMut(u64) -> Option<u64>,
-        L: FnMut(u64) -> u64,
-        B: FnMut(u64, &mut [u8]) -> bool,
-        R: FnMut(usize, u32, u32) -> Option<u32>,
-        S: FnMut(u32) -> SamplerId,
-        D: FnMut(usize, u64, u64),
-    {
-        let mut has_images = false;
-        for stage in 0..NUM_STAGES.min(num_shader_stages) {
-            record_detail(32, stage as u64, 0);
-            let Some(info) = self.stage_infos[stage].as_ref() else {
-                continue;
-            };
-            let storage_descriptor_count = info.storage_buffers_descriptors.len() as u64;
-            if use_gpu_reader {
-                self.bind_stage_storage_buffers_with_gpu_reader(
-                    buffer_cache,
-                    stage,
-                    &mut gpu_to_cpu_address,
-                    &mut get_memory_layout_size,
-                    &mut read_block,
-                );
-            } else {
-                self.bind_stage_storage_buffers(buffer_cache, stage);
+        if self.configure_spec.has_images() {
+            for desc in &info.image_descriptors {
+                add_image!(desc, desc.is_written);
             }
-            record_detail(33, stage as u64, 0);
-            record_detail(34, stage as u64, storage_descriptor_count);
-            record_detail(35, stage as u64, 0);
-            has_images |= self.collect_stage_texture_image_descriptors(
-                stage,
-                max_desc_count,
-                via_header_index,
-                views,
-                sampler_ids,
-                &mut read_handle,
-                &mut get_graphics_sampler_id,
-                &mut record_detail,
-                trace_texture_descriptors,
-            );
         }
-        has_images
     }
 
-    /// Fill graphics image views and materialize their OpenGL backing objects.
-    ///
-    /// Corresponds to upstream `GraphicsPipeline::ConfigureImpl`:
-    /// `texture_cache.FillGraphicsImageViews<Spec::has_images>(...)`.
-    /// The extra materialization calls are the Rust OpenGL bridge for the
-    /// backend-independent slot pools populated by `FillGraphicsImageViews`.
-    pub fn fill_and_materialize_graphics_image_views(
+    /// Mechanical Rust form of upstream `ConfigureImpl`'s `bind_stage_info`
+    /// lambda.
+    fn bind_stage_info(
         &self,
-        texture_cache: &mut OpenGLTextureCache,
-        views: &mut [ImageViewInOut],
-        sampler_ids: &[SamplerId],
-        has_images: bool,
-    ) {
-        trace_gl_pipeline_stall!(
-            "[GL_PIPELINE_STALL] fill_and_materialize_graphics_image_views enter len={} samplers={} has_images={}",
-            views.len(),
-            sampler_ids.len(),
-            has_images
-        );
-        if std::env::var_os("RUZU_TRACE_VIEW_FILL").is_some() {
-            log::warn!(
-                "[VIEW_FILL] before len={} samplers={} has_images={} first={:?}",
-                views.len(),
-                sampler_ids.len(),
-                has_images,
-                views.first(),
-            );
-        }
-        texture_cache.fill_graphics_image_views(views, has_images);
-        trace_gl_pipeline_stall!("[GL_PIPELINE_STALL] after_fill_graphics_image_views");
-        if std::env::var_os("RUZU_TRACE_VIEW_FILL").is_some() {
-            log::warn!(
-                "[VIEW_FILL] after_fill len={} first={:?}",
-                views.len(),
-                views.first(),
-            );
-        }
-        texture_cache.materialize_views(views);
-        trace_gl_pipeline_stall!("[GL_PIPELINE_STALL] after_materialize_views");
-        if std::env::var_os("RUZU_TRACE_VIEW_FILL").is_some() {
-            log::warn!(
-                "[VIEW_FILL] after_materialize len={} first={:?}",
-                views.len(),
-                views.first(),
-            );
-        }
-        texture_cache.materialize_samplers(sampler_ids);
-        trace_gl_pipeline_stall!("[GL_PIPELINE_STALL] after_materialize_samplers");
-    }
-
-    /// Fill graphics image views, then update render targets and bind the draw framebuffer.
-    ///
-    /// This owns the adjacent upstream `GraphicsPipeline::ConfigureImpl` slice:
-    /// `texture_cache.FillGraphicsImageViews<Spec::has_images>(...)`,
-    /// `texture_cache.UpdateRenderTargets(false)`, then
-    /// `state_tracker.BindFramebuffer(texture_cache.GetFramebuffer()->Handle())`.
-    pub fn fill_graphics_image_views_then_update_render_targets_and_bind_framebuffer<D>(
-        &self,
-        texture_cache: &mut OpenGLTextureCache,
-        state_tracker: &mut StateTracker,
-        views: &mut [ImageViewInOut],
-        sampler_ids: &[SamplerId],
-        has_images: bool,
-        render_targets: &Maxwell3DRenderTargets,
-        dirty_flags: &[bool; 256],
-        dirty_access: &mut D,
-        fallback_size: Extent2D,
-    ) -> Option<(u32, u32, u32)>
-    where
-        D: RenderTargetDirtyFlagAccess,
-    {
-        trace_gl_pipeline_stall!("[GL_PIPELINE_STALL] fill_then_update enter");
-        self.fill_and_materialize_graphics_image_views(
-            texture_cache,
-            views,
-            sampler_ids,
-            has_images,
-        );
-        trace_gl_pipeline_stall!("[GL_PIPELINE_STALL] before_update_render_targets_and_bind");
-        self.update_render_targets_and_bind_framebuffer(
-            texture_cache,
-            state_tracker,
-            render_targets,
-            dirty_flags,
-            dirty_access,
-            fallback_size,
-        )
-    }
-
-    /// Collect graphics texture/image descriptors, fill image views, update render targets,
-    /// then bind the draw framebuffer in upstream `ConfigureImpl` order.
-    ///
-    /// This owns the adjacent upstream slice from the enabled-stage
-    /// `config_stage(...)` calls through:
-    /// `texture_cache.FillGraphicsImageViews<Spec::has_images>(...)`,
-    /// `texture_cache.UpdateRenderTargets(false)`, and
-    /// `state_tracker.BindFramebuffer(texture_cache.GetFramebuffer()->Handle())`.
-    #[allow(clippy::too_many_arguments)]
-    pub fn configure_graphics_descriptors_then_fill_and_bind_framebuffer<
-        P,
-        DT,
-        A,
-        L,
-        B,
-        R,
-        RD,
-        DA,
-    >(
-        &self,
-        buffer_cache: &mut BufferCache<P, DT>,
-        texture_cache: &mut OpenGLTextureCache,
-        state_tracker: &mut StateTracker,
-        num_shader_stages: usize,
-        max_desc_count: u32,
-        via_header_index: bool,
-        views: &mut Vec<ImageViewInOut>,
-        sampler_ids: &mut Vec<SamplerId>,
-        use_gpu_reader: bool,
-        gpu_to_cpu_address: A,
-        get_memory_layout_size: L,
-        read_block: B,
-        read_handle: R,
-        record_detail: RD,
-        trace_texture_descriptors: bool,
-        render_targets: &Maxwell3DRenderTargets,
-        dirty_flags: &[bool; 256],
-        dirty_access: &mut DA,
-        fallback_size: Extent2D,
-    ) -> Option<(u32, u32, u32)>
-    where
-        P: BufferCacheParams,
-        DT: DeviceTracker,
-        A: FnMut(u64) -> Option<u64>,
-        L: FnMut(u64) -> u64,
-        B: FnMut(u64, &mut [u8]) -> bool,
-        R: FnMut(usize, u32, u32) -> Option<u32>,
-        RD: FnMut(usize, u64, u64),
-        DA: RenderTargetDirtyFlagAccess,
-    {
-        trace_gl_pipeline_stall!("[GL_PIPELINE_STALL] configure_descriptors_then_fill enter");
-        let has_images = self.configure_enabled_stage_texture_image_descriptors(
-            buffer_cache,
-            num_shader_stages,
-            max_desc_count,
-            via_header_index,
-            views,
-            sampler_ids,
-            use_gpu_reader,
-            gpu_to_cpu_address,
-            get_memory_layout_size,
-            read_block,
-            read_handle,
-            |tsc_id| texture_cache.base.get_graphics_sampler_id(tsc_id),
-            record_detail,
-            trace_texture_descriptors,
-        );
-        trace_gl_pipeline_stall!(
-            "[GL_PIPELINE_STALL] after_configure_enabled_stage_texture_image_descriptors has_images={} views={} samplers={}",
-            has_images,
-            views.len(),
-            sampler_ids.len()
-        );
-        self.fill_graphics_image_views_then_update_render_targets_and_bind_framebuffer(
-            texture_cache,
-            state_tracker,
-            views,
-            sampler_ids,
-            has_images,
-            render_targets,
-            dirty_flags,
-            dirty_access,
-            fallback_size,
-        )
-    }
-
-    /// Collect descriptors, fill image views, and update render targets.
-    ///
-    /// This is the Rust bridge for the upstream `ConfigureImpl` sequence after
-    /// the base buffer-cache state is configured and before `config_stage(...)`
-    /// walks descriptors using `maxwell3d->state.shader_stages[...]`.
-    #[allow(clippy::too_many_arguments)]
-    pub fn configure_graphics_descriptors_and_framebuffer<P, DT, A, L, B, R, RD, DA, E>(
-        &self,
-        buffer_cache: &mut BufferCache<P, DT>,
-        mut after_live_engine_bound: E,
-        texture_cache: &mut OpenGLTextureCache,
-        state_tracker: &mut StateTracker,
-        num_shader_stages: usize,
-        max_desc_count: u32,
-        via_header_index: bool,
-        views: &mut Vec<ImageViewInOut>,
-        sampler_ids: &mut Vec<SamplerId>,
-        use_gpu_reader: bool,
-        gpu_to_cpu_address: A,
-        get_memory_layout_size: L,
-        read_block: B,
-        read_handle: R,
-        record_detail: RD,
-        trace_texture_descriptors: bool,
-        render_targets: &Maxwell3DRenderTargets,
-        dirty_flags: &[bool; 256],
-        dirty_access: &mut DA,
-        fallback_size: Extent2D,
-    ) -> Option<(u32, u32, u32)>
-    where
-        P: BufferCacheParams,
-        DT: DeviceTracker,
-        A: FnMut(u64) -> Option<u64>,
-        L: FnMut(u64) -> u64,
-        B: FnMut(u64, &mut [u8]) -> bool,
-        R: FnMut(usize, u32, u32) -> Option<u32>,
-        RD: FnMut(usize, u64, u64),
-        DA: RenderTargetDirtyFlagAccess,
-        E: FnMut(),
-    {
-        trace_gl_pipeline_stall!("[GL_PIPELINE_STALL] set_engine_then_configure enter");
-        after_live_engine_bound();
-        trace_gl_pipeline_stall!("[GL_PIPELINE_STALL] after_bind_live_graphics_engine");
-        self.configure_graphics_descriptors_then_fill_and_bind_framebuffer(
-            buffer_cache,
-            texture_cache,
-            state_tracker,
-            num_shader_stages,
-            max_desc_count,
-            via_header_index,
-            views,
-            sampler_ids,
-            use_gpu_reader,
-            gpu_to_cpu_address,
-            get_memory_layout_size,
-            read_block,
-            read_handle,
-            record_detail,
-            trace_texture_descriptors,
-            render_targets,
-            dirty_flags,
-            dirty_access,
-            fallback_size,
-        )
-    }
-
-    /// Synchronize descriptors/base buffer state, then collect descriptors,
-    /// fill image views, and update targets in upstream order.
-    ///
-    /// This extends the Rust bridge for upstream `ConfigureImpl` from:
-    /// `texture_cache.SynchronizeGraphicsDescriptors()` through
-    /// `SetUniformBuffersState`, `SetBase*Bindings`, `SetEnableStorageBuffers`,
-    /// `SetEngine`, `config_stage(...)`, `FillGraphicsImageViews`,
-    /// `UpdateRenderTargets(false)`, and framebuffer bind.
-    #[allow(clippy::too_many_arguments)]
-    pub fn synchronize_then_configure_graphics_framebuffer<P, DT, A, L, B, R, RD, DA, S, E>(
-        &self,
-        texture_cache: &mut OpenGLTextureCache,
-        descriptor_sync_regs: DescriptorSyncRegs,
-        buffer_cache: &mut BufferCache<P, DT>,
-        mut after_descriptor_base_state: S,
-        after_live_engine_bound: E,
-        state_tracker: &mut StateTracker,
-        num_shader_stages: usize,
-        max_desc_count: u32,
-        via_header_index: bool,
-        views: &mut Vec<ImageViewInOut>,
-        sampler_ids: &mut Vec<SamplerId>,
-        use_gpu_reader: bool,
-        gpu_to_cpu_address: A,
-        get_memory_layout_size: L,
-        read_block: B,
-        read_handle: R,
-        record_detail: RD,
-        trace_texture_descriptors: bool,
-        render_targets: &Maxwell3DRenderTargets,
-        dirty_flags: &[bool; 256],
-        dirty_access: &mut DA,
-        fallback_size: Extent2D,
-    ) -> Option<(u32, u32, u32)>
-    where
-        P: BufferCacheParams,
-        DT: DeviceTracker,
-        A: FnMut(u64) -> Option<u64>,
-        L: FnMut(u64) -> u64,
-        B: FnMut(u64, &mut [u8]) -> bool,
-        R: FnMut(usize, u32, u32) -> Option<u32>,
-        RD: FnMut(usize, u64, u64),
-        DA: RenderTargetDirtyFlagAccess,
-        S: FnMut(),
-        E: FnMut(),
-    {
-        trace_gl_pipeline_stall!("[GL_PIPELINE_STALL] synchronize_then_configure enter");
-        self.synchronize_graphics_descriptors_then_configure_buffer_cache_state(
-            texture_cache,
-            descriptor_sync_regs,
-            buffer_cache,
-        );
-        after_descriptor_base_state();
-        trace_gl_pipeline_stall!("[GL_PIPELINE_STALL] after_synchronize_descriptor_base_state");
-        self.configure_graphics_descriptors_and_framebuffer(
-            buffer_cache,
-            after_live_engine_bound,
-            texture_cache,
-            state_tracker,
-            num_shader_stages,
-            max_desc_count,
-            via_header_index,
-            views,
-            sampler_ids,
-            use_gpu_reader,
-            gpu_to_cpu_address,
-            get_memory_layout_size,
-            read_block,
-            read_handle,
-            record_detail,
-            trace_texture_descriptors,
-            render_targets,
-            dirty_flags,
-            dirty_access,
-            fallback_size,
-        )
-    }
-
-    /// Bind host buffer resources at the start of one prepare-stage pass.
-    ///
-    /// This is the owner-local slice of upstream
-    /// `GraphicsPipeline::ConfigureImpl`'s `prepare_stage` lambda:
-    /// `SetImagePointers(&textures[texture_binding], &images[image_binding])`
-    /// followed by `BindHostStageBuffers(stage)`, then the texture/image-buffer
-    /// binding and view iterator skips before sampled textures are prepared.
-    pub fn prepare_stage_host_buffer_bindings<P, DT>(
-        &self,
-        buffer_cache: &mut BufferCache<P, DT>,
         stage: usize,
-        textures: &mut [u32],
-        samplers: &mut [u32],
-        images: &mut [u32],
-        bound_texture_view_ids: &mut [ImageViewId],
-        texture_binding: &mut usize,
-        sampler_binding: &mut usize,
-        image_binding: &mut usize,
+        buffer_cache: &mut OpenGLBufferCache,
+        texture_cache: &OpenGLTextureCache,
         views: &[ImageViewInOut],
         views_it: &mut usize,
-    ) where
-        P: BufferCacheParams,
-        DT: DeviceTracker,
-    {
-        if self
-            .stage_infos
-            .get(stage)
-            .and_then(Option::as_ref)
-            .is_none()
-        {
+    ) {
+        buffer_cache.unbind_graphics_texture_buffers(stage);
+        let Some(info) = self.stage_infos[stage].as_ref() else {
             return;
-        }
+        };
+        let mut index = 0usize;
 
-        let texture_ptr = if *texture_binding <= textures.len() {
-            unsafe { textures.as_mut_ptr().add(*texture_binding) }
-        } else {
-            std::ptr::null_mut()
-        };
-        let image_ptr = if *image_binding <= images.len() {
-            unsafe { images.as_mut_ptr().add(*image_binding) }
-        } else {
-            std::ptr::null_mut()
-        };
-        buffer_cache.set_image_pointers(texture_ptr, image_ptr);
+        macro_rules! add_buffer {
+            ($desc:expr, $is_image:expr, $is_written:expr) => {{
+                for _ in 0..$desc.count {
+                    let view_id = views[*views_it].id;
+                    *views_it += 1;
+                    let image_view = texture_cache
+                        .get_image_view(view_id)
+                        .expect("filled texture-buffer view must exist");
+                    let gpu_addr = texture_cache.image_view_gpu_addr(view_id);
+                    buffer_cache.bind_graphics_texture_buffer(
+                        stage,
+                        index,
+                        gpu_addr,
+                        image_view.buffer_size(),
+                        image_view.pixel_format(),
+                        $is_written,
+                        $is_image,
+                    );
+                    index += 1;
+                }
+            }};
+        }
+        if self.configure_spec.has_texture_buffers() {
+            for desc in &info.texture_buffer_descriptors {
+                add_buffer!(desc, false, false);
+            }
+        }
+        if self.configure_spec.has_image_buffers() {
+            for desc in &info.image_buffer_descriptors {
+                add_buffer!(desc, true, desc.is_written);
+            }
+        }
+        for desc in &info.texture_descriptors {
+            *views_it += desc.count as usize;
+        }
+        if self.configure_spec.has_images() {
+            for desc in &info.image_descriptors {
+                *views_it += desc.count as usize;
+            }
+        }
+    }
+
+    /// Mechanical Rust form of upstream `ConfigureImpl`'s `prepare_stage`
+    /// lambda.
+    #[allow(clippy::too_many_arguments)]
+    fn prepare_stage(
+        &self,
+        stage: usize,
+        buffer_cache: &mut OpenGLBufferCache,
+        texture_cache: &mut OpenGLTextureCache,
+        views: &[ImageViewInOut],
+        samplers: &[SamplerId],
+        surface_clip: SurfaceClipInfo,
+        views_it: &mut usize,
+        samplers_it: &mut usize,
+        textures: &mut [u32; MAX_TEXTURES as usize],
+        images: &mut [u32; MAX_IMAGES as usize],
+        gl_samplers: &mut [u32; MAX_TEXTURES as usize],
+        texture_binding: &mut usize,
+        image_binding: &mut usize,
+        sampler_binding: &mut usize,
+    ) {
+        buffer_cache.set_image_pointers(
+            textures[*texture_binding..].as_mut_ptr(),
+            images[*image_binding..].as_mut_ptr(),
+        );
         buffer_cache.bind_host_stage_buffers(stage);
 
-        let texture_buffer_count = self.num_texture_buffers[stage] as usize;
-        let image_buffer_count = self.num_image_buffers[stage] as usize;
-        for _ in 0..texture_buffer_count {
-            if *sampler_binding < samplers.len() {
-                samplers[*sampler_binding] = 0;
-            }
-            if *texture_binding < bound_texture_view_ids.len() && *views_it < views.len() {
-                bound_texture_view_ids[*texture_binding] = views[*views_it].id;
-            }
-            *texture_binding += 1;
-            *sampler_binding += 1;
-            *views_it = views_it.saturating_add(1).min(views.len());
-        }
+        *texture_binding += self.num_texture_buffers[stage] as usize;
+        *image_binding += self.num_image_buffers[stage] as usize;
+        *views_it += self.num_texture_buffers[stage] as usize;
+        *views_it += self.num_image_buffers[stage] as usize;
 
-        for _ in 0..image_buffer_count {
-            *image_binding += 1;
-            *views_it = views_it.saturating_add(1).min(views.len());
-        }
-    }
-
-    /// Clear the transient host texture/image pointer bridge after prepare-stage binding.
-    pub fn clear_host_stage_buffer_pointers<P, DT>(&self, buffer_cache: &mut BufferCache<P, DT>)
-    where
-        P: BufferCacheParams,
-        DT: DeviceTracker,
-    {
-        buffer_cache.set_image_pointers(std::ptr::null_mut(), std::ptr::null_mut());
-    }
-
-    /// Prepare one graphics stage's host buffer, sampled-texture, storage-image, and uniform state.
-    ///
-    /// Corresponds to the full upstream `GraphicsPipeline::ConfigureImpl`
-    /// `prepare_stage` lambda. The observer callback carries Rust-only draw
-    /// diagnostics that upstream does not have.
-    pub fn prepare_stage_texture_image_bindings<P, DT, F>(
-        &self,
-        buffer_cache: &mut BufferCache<P, DT>,
-        texture_cache: &mut OpenGLTextureCache,
-        stage: usize,
-        textures: &mut [u32],
-        samplers: &mut [u32],
-        images: &mut [u32],
-        bound_texture_view_ids: &mut [ImageViewId],
-        texture_binding: &mut usize,
-        sampler_binding: &mut usize,
-        image_binding: &mut usize,
-        views: &[ImageViewInOut],
-        views_it: &mut usize,
-        sampler_ids: &[SamplerId],
-        sampler_it: &mut usize,
-        max_desc_count: u32,
-        surface_clip: SurfaceClipInfo,
-        mut observe: F,
-    ) where
-        P: BufferCacheParams,
-        DT: DeviceTracker,
-        F: FnMut(&SampledTextureBinding, &OpenGLTextureCache),
-    {
-        if self
-            .stage_infos
-            .get(stage)
-            .and_then(Option::as_ref)
-            .is_none()
-        {
+        let Some(info) = self.stage_infos[stage].as_ref() else {
             return;
-        }
-
-        self.prepare_stage_host_buffer_bindings(
-            buffer_cache,
-            stage,
-            textures,
-            samplers,
-            images,
-            bound_texture_view_ids,
-            texture_binding,
-            sampler_binding,
-            image_binding,
-            views,
-            views_it,
-        );
-
-        let mut stage_texture_binding = 0u32;
-        let mut stage_image_binding = 0u32;
-        let texture_cache_ref: &OpenGLTextureCache = &*texture_cache;
-        let texture_scaling_mask = self.bind_stage_sampled_textures(
-            texture_cache_ref,
-            stage,
-            views,
-            views_it,
-            sampler_ids,
-            sampler_it,
-            textures,
-            samplers,
-            bound_texture_view_ids,
-            texture_binding,
-            sampler_binding,
-            &mut stage_texture_binding,
-            max_desc_count,
-            |binding| observe(binding, texture_cache_ref),
-        );
-        let image_scaling_mask = self.bind_stage_storage_images(
-            texture_cache,
-            stage,
-            views,
-            views_it,
-            images,
-            image_binding,
-            &mut stage_image_binding,
-            max_desc_count,
-        );
-        self.upload_stage_uniforms(
-            texture_cache,
-            stage,
-            texture_scaling_mask,
-            image_scaling_mask,
-            surface_clip,
-        );
-    }
-
-    /// Prepare all enabled graphics stages in upstream stage order.
-    ///
-    /// Corresponds to the `if constexpr (Spec::enabled_stages[N]) { prepare_stage(N); }`
-    /// sequence at the end of upstream `GraphicsPipeline::ConfigureImpl`'s
-    /// `prepare_stage` lambda block. Rust still receives `num_shader_stages`
-    /// from the rasterizer because the generated specialization shape is not
-    /// represented as a Rust const generic yet.
-    pub fn prepare_enabled_graphics_texture_image_bindings<P, DT, F>(
-        &self,
-        buffer_cache: &mut BufferCache<P, DT>,
-        texture_cache: &mut OpenGLTextureCache,
-        num_shader_stages: usize,
-        textures: &mut [u32],
-        samplers: &mut [u32],
-        images: &mut [u32],
-        bound_texture_view_ids: &mut [ImageViewId],
-        texture_binding: &mut usize,
-        sampler_binding: &mut usize,
-        image_binding: &mut usize,
-        views: &[ImageViewInOut],
-        views_it: &mut usize,
-        sampler_ids: &[SamplerId],
-        sampler_it: &mut usize,
-        max_desc_count: u32,
-        surface_clip: SurfaceClipInfo,
-        mut observe: F,
-    ) where
-        P: BufferCacheParams,
-        DT: DeviceTracker,
-        F: FnMut(&SampledTextureBinding, &OpenGLTextureCache),
-    {
-        for stage in 0..NUM_STAGES.min(num_shader_stages) {
-            self.prepare_stage_texture_image_bindings(
-                buffer_cache,
-                texture_cache,
-                stage,
-                textures,
-                samplers,
-                images,
-                bound_texture_view_ids,
-                texture_binding,
-                sampler_binding,
-                image_binding,
-                views,
-                views_it,
-                sampler_ids,
-                sampler_it,
-                max_desc_count,
-                surface_clip,
-                |binding, texture_cache| observe(binding, texture_cache),
-            );
-        }
-    }
-
-    /// Prepare enabled stages, run local diagnostics, then perform the final
-    /// texture/sampler/image bulk binds in upstream `ConfigureImpl` order.
-    pub fn prepare_and_bind_graphics_texture_image_arrays<P, DT, F, B>(
-        &self,
-        buffer_cache: &mut BufferCache<P, DT>,
-        texture_cache: &mut OpenGLTextureCache,
-        num_shader_stages: usize,
-        bindings: &mut GraphicsTextureImageBindingState,
-        views: &[ImageViewInOut],
-        sampler_ids: &[SamplerId],
-        max_desc_count: u32,
-        surface_clip: SurfaceClipInfo,
-        disable_sampler_bind: bool,
-        observe: F,
-        before_bind: B,
-    ) where
-        P: BufferCacheParams,
-        DT: DeviceTracker,
-        F: FnMut(&SampledTextureBinding, &OpenGLTextureCache),
-        B: FnOnce(&GraphicsTextureImageBindingState, &OpenGLTextureCache),
-    {
-        self.prepare_enabled_graphics_texture_image_bindings(
-            buffer_cache,
-            texture_cache,
-            num_shader_stages,
-            &mut bindings.textures,
-            &mut bindings.samplers,
-            &mut bindings.images,
-            &mut bindings.bound_texture_view_ids,
-            &mut bindings.texture_binding,
-            &mut bindings.sampler_binding,
-            &mut bindings.image_binding,
-            views,
-            &mut bindings.views_it,
-            sampler_ids,
-            &mut bindings.sampler_it,
-            max_desc_count,
-            surface_clip,
-            observe,
-        );
-        self.clear_host_stage_buffer_pointers(buffer_cache);
-        before_bind(bindings, texture_cache);
-        self.bind_graphics_texture_image_arrays(
-            &bindings.textures,
-            &bindings.samplers,
-            bindings.texture_binding,
-            bindings.sampler_binding,
-            &bindings.images,
-            bindings.image_binding,
-            disable_sampler_bind,
-        );
-    }
-
-    /// Update graphics buffers and bind host geometry buffers in upstream order.
-    ///
-    /// Corresponds to `GraphicsPipeline::ConfigureImpl`:
-    /// `buffer_cache.UpdateGraphicsBuffers(is_indexed);`
-    /// `buffer_cache.BindHostGeometryBuffers(is_indexed);`
-    pub fn configure_graphics_buffers<P, DT>(
-        &self,
-        buffer_cache: &mut BufferCache<P, DT>,
-        is_indexed: bool,
-    ) where
-        P: BufferCacheParams,
-        DT: DeviceTracker,
-    {
-        buffer_cache.update_graphics_buffers(is_indexed);
-        buffer_cache.bind_host_geometry_buffers(is_indexed);
-    }
-
-    /// Update graphics buffers, bind host geometry buffers, then bind the
-    /// current graphics programs in upstream `ConfigureImpl` order.
-    pub fn configure_graphics_buffers_and_bind_programs<P, DT>(
-        &mut self,
-        buffer_cache: &mut BufferCache<P, DT>,
-        program_manager: &mut ProgramManager,
-        is_indexed: bool,
-    ) where
-        P: BufferCacheParams,
-        DT: DeviceTracker,
-    {
-        self.configure_graphics_buffers(buffer_cache, is_indexed);
-        self.bind_graphics_programs_for_configure_with_program_manager(program_manager);
-    }
-
-    /// Update graphics buffers through caller-provided GPU address helpers and
-    /// bind host geometry buffers in upstream order.
-    pub fn configure_graphics_buffers_with_gpu_resolver<P, DT, A, R, C>(
-        &self,
-        buffer_cache: &mut BufferCache<P, DT>,
-        is_indexed: bool,
-        gpu_to_cpu_address: A,
-        is_within_gpu_address_range: R,
-        max_continuous_range: C,
-    ) where
-        P: BufferCacheParams,
-        DT: DeviceTracker,
-        A: FnMut(u64) -> Option<u64>,
-        R: FnMut(u64) -> bool,
-        C: FnMut(u64, u64) -> u64,
-    {
-        buffer_cache.update_graphics_buffers_with_gpu_resolver(
-            is_indexed,
-            gpu_to_cpu_address,
-            is_within_gpu_address_range,
-            max_continuous_range,
-        );
-        buffer_cache.bind_host_geometry_buffers(is_indexed);
-    }
-
-    /// Update graphics buffers through caller-provided GPU address helpers,
-    /// bind host geometry buffers, then bind the current graphics programs in
-    /// upstream `ConfigureImpl` order.
-    pub fn configure_graphics_buffers_and_bind_programs_with_gpu_resolver<P, DT, A, R, C>(
-        &mut self,
-        buffer_cache: &mut BufferCache<P, DT>,
-        program_manager: &mut ProgramManager,
-        is_indexed: bool,
-        gpu_to_cpu_address: A,
-        is_within_gpu_address_range: R,
-        max_continuous_range: C,
-    ) where
-        P: BufferCacheParams,
-        DT: DeviceTracker,
-        A: FnMut(u64) -> Option<u64>,
-        R: FnMut(u64) -> bool,
-        C: FnMut(u64, u64) -> u64,
-    {
-        self.configure_graphics_buffers_with_gpu_resolver(
-            buffer_cache,
-            is_indexed,
-            gpu_to_cpu_address,
-            is_within_gpu_address_range,
-            max_continuous_range,
-        );
-        self.bind_graphics_programs_for_configure_with_program_manager(program_manager);
-    }
-
-    /// Bind texture-buffer views, uniform buffers, graphics buffers, and programs in order.
-    ///
-    /// This owns the upstream-adjacent `ConfigureImpl` slice after framebuffer
-    /// binding and before `prepare_stage`: enabled-stage `bind_stage_info`,
-    /// Rust's UBO binding bridge, `UpdateGraphicsBuffers(is_indexed)`,
-    /// `BindHostGeometryBuffers(is_indexed)`, then program binding.
-    #[allow(clippy::too_many_arguments)]
-    pub fn bind_texture_buffers_uniforms_then_configure_graphics_buffers_and_programs<P, DT, A>(
-        &mut self,
-        buffer_cache: &mut BufferCache<P, DT>,
-        texture_cache: &OpenGLTextureCache,
-        program_manager: &mut ProgramManager,
-        num_shader_stages: usize,
-        views: &[ImageViewInOut],
-        texture_buffer_views_it: &mut usize,
-        max_desc_count: u32,
-        cb_bindings: &[[ConstBufferBinding; MAX_CB_SLOTS]],
-        gpu_to_cpu_address: A,
-        is_indexed: bool,
-    ) where
-        P: BufferCacheParams,
-        DT: DeviceTracker,
-        A: FnMut(u64) -> Option<u64>,
-    {
-        self.bind_enabled_stage_texture_buffer_views(
-            buffer_cache,
-            texture_cache,
-            num_shader_stages,
-            views,
-            texture_buffer_views_it,
-            max_desc_count,
-        );
-        self.bind_graphics_uniform_buffers(buffer_cache, cb_bindings, gpu_to_cpu_address);
-        self.configure_graphics_buffers_and_bind_programs(
-            buffer_cache,
-            program_manager,
-            is_indexed,
-        );
-    }
-
-    /// GPU-resolver variant of the post-framebuffer graphics buffer/program configure slice.
-    #[allow(clippy::too_many_arguments)]
-    pub fn bind_texture_buffers_uniforms_then_configure_graphics_buffers_and_programs_with_gpu_resolver<
-        P,
-        DT,
-        A,
-        G,
-        R,
-        C,
-    >(
-        &mut self,
-        buffer_cache: &mut BufferCache<P, DT>,
-        texture_cache: &OpenGLTextureCache,
-        program_manager: &mut ProgramManager,
-        num_shader_stages: usize,
-        views: &[ImageViewInOut],
-        texture_buffer_views_it: &mut usize,
-        max_desc_count: u32,
-        cb_bindings: &[[ConstBufferBinding; MAX_CB_SLOTS]],
-        uniform_gpu_to_cpu_address: A,
-        is_indexed: bool,
-        graphics_gpu_to_cpu_address: G,
-        is_within_gpu_address_range: R,
-        max_continuous_range: C,
-    ) where
-        P: BufferCacheParams,
-        DT: DeviceTracker,
-        A: FnMut(u64) -> Option<u64>,
-        G: FnMut(u64) -> Option<u64>,
-        R: FnMut(u64) -> bool,
-        C: FnMut(u64, u64) -> u64,
-    {
-        self.bind_enabled_stage_texture_buffer_views(
-            buffer_cache,
-            texture_cache,
-            num_shader_stages,
-            views,
-            texture_buffer_views_it,
-            max_desc_count,
-        );
-        self.bind_graphics_uniform_buffers(buffer_cache, cb_bindings, uniform_gpu_to_cpu_address);
-        self.configure_graphics_buffers_and_bind_programs_with_gpu_resolver(
-            buffer_cache,
-            program_manager,
-            is_indexed,
-            graphics_gpu_to_cpu_address,
-            is_within_gpu_address_range,
-            max_continuous_range,
-        );
-    }
-
-    /// Configure post-framebuffer buffers/programs, then prepare and bind texture/image arrays.
-    ///
-    /// This extends the pipeline-owned post-framebuffer `ConfigureImpl` slice
-    /// through `prepare_stage(...)` and the final `glBind*` calls.
-    #[allow(clippy::too_many_arguments)]
-    pub fn configure_buffers_programs_then_prepare_and_bind_graphics_resources<P, DT, A, O, M, B>(
-        &mut self,
-        buffer_cache: &mut BufferCache<P, DT>,
-        texture_cache: &mut OpenGLTextureCache,
-        program_manager: &mut ProgramManager,
-        num_shader_stages: usize,
-        views: &[ImageViewInOut],
-        texture_buffer_views_it: &mut usize,
-        max_desc_count: u32,
-        cb_bindings: &[[ConstBufferBinding; MAX_CB_SLOTS]],
-        gpu_to_cpu_address: A,
-        is_indexed: bool,
-        bindings: &mut GraphicsTextureImageBindingState,
-        sampler_ids: &[SamplerId],
-        surface_clip: SurfaceClipInfo,
-        disable_sampler_bind: bool,
-        mut after_buffer_programs: M,
-        observe: O,
-        before_bind: B,
-    ) where
-        P: BufferCacheParams,
-        DT: DeviceTracker,
-        A: FnMut(u64) -> Option<u64>,
-        O: FnMut(&SampledTextureBinding, &OpenGLTextureCache),
-        M: FnMut(),
-        B: FnOnce(&GraphicsTextureImageBindingState, &OpenGLTextureCache),
-    {
-        self.bind_texture_buffers_uniforms_then_configure_graphics_buffers_and_programs(
-            buffer_cache,
-            texture_cache,
-            program_manager,
-            num_shader_stages,
-            views,
-            texture_buffer_views_it,
-            max_desc_count,
-            cb_bindings,
-            gpu_to_cpu_address,
-            is_indexed,
-        );
-        after_buffer_programs();
-        self.prepare_and_bind_graphics_texture_image_arrays(
-            buffer_cache,
-            texture_cache,
-            num_shader_stages,
-            bindings,
-            views,
-            sampler_ids,
-            max_desc_count,
-            surface_clip,
-            disable_sampler_bind,
-            observe,
-            before_bind,
-        );
-    }
-
-    /// Configure post-framebuffer buffers/programs with GPU-memory helpers, then prepare/bind.
-    #[allow(clippy::too_many_arguments)]
-    pub fn configure_buffers_programs_then_prepare_and_bind_graphics_resources_with_gpu_resolver<
-        P,
-        DT,
-        A,
-        R,
-        C,
-        U,
-        O,
-        M,
-        B,
-    >(
-        &mut self,
-        buffer_cache: &mut BufferCache<P, DT>,
-        texture_cache: &mut OpenGLTextureCache,
-        program_manager: &mut ProgramManager,
-        num_shader_stages: usize,
-        views: &[ImageViewInOut],
-        texture_buffer_views_it: &mut usize,
-        max_desc_count: u32,
-        cb_bindings: &[[ConstBufferBinding; MAX_CB_SLOTS]],
-        uniform_gpu_to_cpu_address: U,
-        is_indexed: bool,
-        gpu_to_cpu_address: A,
-        is_within_gpu_address_range: R,
-        max_continuous_range: C,
-        bindings: &mut GraphicsTextureImageBindingState,
-        sampler_ids: &[SamplerId],
-        surface_clip: SurfaceClipInfo,
-        disable_sampler_bind: bool,
-        mut after_buffer_programs: M,
-        observe: O,
-        before_bind: B,
-    ) where
-        P: BufferCacheParams,
-        DT: DeviceTracker,
-        A: FnMut(u64) -> Option<u64>,
-        R: FnMut(u64) -> bool,
-        C: FnMut(u64, u64) -> u64,
-        U: FnMut(u64) -> Option<u64>,
-        O: FnMut(&SampledTextureBinding, &OpenGLTextureCache),
-        M: FnMut(),
-        B: FnOnce(&GraphicsTextureImageBindingState, &OpenGLTextureCache),
-    {
-        self.bind_texture_buffers_uniforms_then_configure_graphics_buffers_and_programs_with_gpu_resolver(
-            buffer_cache,
-            texture_cache,
-            program_manager,
-            num_shader_stages,
-            views,
-            texture_buffer_views_it,
-            max_desc_count,
-            cb_bindings,
-            uniform_gpu_to_cpu_address,
-            is_indexed,
-            gpu_to_cpu_address,
-            is_within_gpu_address_range,
-            max_continuous_range,
-        );
-        after_buffer_programs();
-        self.prepare_and_bind_graphics_texture_image_arrays(
-            buffer_cache,
-            texture_cache,
-            num_shader_stages,
-            bindings,
-            views,
-            sampler_ids,
-            max_desc_count,
-            surface_clip,
-            disable_sampler_bind,
-            observe,
-            before_bind,
-        );
-    }
-
-    /// Bind the current draw framebuffer through the OpenGL state tracker.
-    ///
-    /// Corresponds to `GraphicsPipeline::ConfigureImpl`:
-    /// `state_tracker.BindFramebuffer(texture_cache.GetFramebuffer()->Handle());`
-    pub fn bind_draw_framebuffer(&self, state_tracker: &mut StateTracker, framebuffer: u32) {
-        state_tracker.bind_framebuffer(framebuffer);
-    }
-
-    /// Update render targets and bind the resulting framebuffer in upstream order.
-    ///
-    /// Corresponds to `GraphicsPipeline::ConfigureImpl`:
-    /// `texture_cache.UpdateRenderTargets(false);`
-    /// `state_tracker.BindFramebuffer(texture_cache.GetFramebuffer()->Handle());`
-    pub fn update_render_targets_and_bind_framebuffer<D>(
-        &self,
-        texture_cache: &mut OpenGLTextureCache,
-        state_tracker: &mut StateTracker,
-        render_targets: &Maxwell3DRenderTargets,
-        dirty_flags: &[bool; 256],
-        dirty_access: &mut D,
-        fallback_size: Extent2D,
-    ) -> Option<(u32, u32, u32)>
-    where
-        D: RenderTargetDirtyFlagAccess,
-    {
-        trace_gl_pipeline_stall!("[GL_PIPELINE_STALL] update_render_targets_and_bind enter");
-        let framebuffer = texture_cache.update_render_targets_and_get_framebuffer_from_snapshot(
-            render_targets,
-            dirty_flags,
-            dirty_access,
-            false,
-            None,
-            fallback_size,
-        );
-        trace_gl_pipeline_stall!(
-            "[GL_PIPELINE_STALL] after_update_render_targets framebuffer={:?}",
-            framebuffer
-        );
-        if let Some((framebuffer, _, _)) = framebuffer {
-            self.bind_draw_framebuffer(state_tracker, framebuffer);
-            trace_gl_pipeline_stall!("[GL_PIPELINE_STALL] after_bind_draw_framebuffer");
-        }
-        framebuffer
-    }
-
-    /// Bind collected texture, sampler, and image handles in upstream order.
-    ///
-    /// Corresponds to the final `GraphicsPipeline::ConfigureImpl` bindings:
-    /// `glBindTextures(0, texture_binding, textures.data());`
-    /// `glBindSamplers(0, sampler_binding, gl_samplers.data());`
-    /// `glBindImageTextures(0, image_binding, images.data());`
-    pub fn bind_graphics_texture_image_arrays(
-        &self,
-        textures: &[u32],
-        samplers: &[u32],
-        texture_binding: usize,
-        sampler_binding: usize,
-        images: &[u32],
-        image_binding: usize,
-        disable_sampler_bind: bool,
-    ) {
-        if texture_binding != 0 {
-            debug_assert_eq!(texture_binding, sampler_binding);
-            debug_assert!(texture_binding <= textures.len());
-            debug_assert!(sampler_binding <= samplers.len());
-            unsafe {
-                gl::BindTextures(0, texture_binding as i32, textures.as_ptr());
-                if disable_sampler_bind {
-                    let null_samplers = [0u32; MAX_TEXTURES as usize];
-                    gl::BindSamplers(0, sampler_binding as i32, null_samplers.as_ptr());
-                } else {
-                    gl::BindSamplers(0, sampler_binding as i32, samplers.as_ptr());
-                }
-            }
-        }
-
-        if image_binding != 0 {
-            debug_assert!(image_binding <= images.len());
-            unsafe {
-                gl::BindImageTextures(0, image_binding as i32, images.as_ptr());
-            }
-        }
-    }
-
-    /// Bind texture-buffer and image-buffer descriptors for one graphics stage.
-    ///
-    /// Corresponds to upstream `GraphicsPipeline::ConfigureImpl`'s
-    /// `bind_stage_info` lambda: unbind stale stage texture buffers, iterate
-    /// `texture_buffer_descriptors`, then iterate `image_buffer_descriptors`,
-    /// and feed `ImageView::{GpuAddr, BufferSize, format}` into
-    /// `BufferCache::BindGraphicsTextureBuffer`.
-    pub fn bind_stage_texture_buffer_views<P, DT>(
-        &self,
-        buffer_cache: &mut BufferCache<P, DT>,
-        texture_cache: &OpenGLTextureCache,
-        stage: usize,
-        views: &[ImageViewInOut],
-        views_it: &mut usize,
-        max_desc_count: u32,
-    ) where
-        P: BufferCacheParams,
-        DT: DeviceTracker,
-    {
-        let Some(info) = self.stage_infos.get(stage).and_then(Option::as_ref) else {
-            return;
-        };
-
-        buffer_cache.unbind_graphics_texture_buffers(stage);
-        let mut tbo_index = 0usize;
-
-        for desc in &info.texture_buffer_descriptors {
-            let count = desc.count.min(max_desc_count);
-            for _ in 0..count {
-                if *views_it >= views.len() {
-                    break;
-                }
-                let view_id = views[*views_it].id;
-                *views_it += 1;
-
-                if view_id.is_valid() {
-                    let image_view = texture_cache
-                        .get_image_view(view_id)
-                        .expect("valid graphics texture-buffer view must be materialized");
-                    let gpu_addr = texture_cache.image_view_gpu_addr(view_id).unwrap_or(0);
-                    buffer_cache.bind_graphics_texture_buffer(
-                        stage,
-                        tbo_index,
-                        gpu_addr,
-                        image_view.buffer_size(),
-                        image_view.pixel_format() as u32,
-                        false,
-                        false,
-                    );
-                }
-                tbo_index += 1;
-            }
-        }
-
-        for desc in &info.image_buffer_descriptors {
-            let count = desc.count.min(max_desc_count);
-            for _ in 0..count {
-                if *views_it >= views.len() {
-                    break;
-                }
-                let view_id = views[*views_it].id;
-                *views_it += 1;
-
-                if view_id.is_valid() {
-                    let image_view = texture_cache
-                        .get_image_view(view_id)
-                        .expect("valid graphics image-buffer view must be materialized");
-                    let gpu_addr = texture_cache.image_view_gpu_addr(view_id).unwrap_or(0);
-                    buffer_cache.bind_graphics_texture_buffer(
-                        stage,
-                        tbo_index,
-                        gpu_addr,
-                        image_view.buffer_size(),
-                        image_view.pixel_format() as u32,
-                        desc.is_written,
-                        true,
-                    );
-                }
-                tbo_index += 1;
-            }
-        }
-
-        for desc in &info.texture_descriptors {
-            let count = desc.count.min(max_desc_count) as usize;
-            *views_it = (*views_it).saturating_add(count).min(views.len());
-        }
-        for desc in &info.image_descriptors {
-            let count = desc.count.min(max_desc_count) as usize;
-            *views_it = (*views_it).saturating_add(count).min(views.len());
-        }
-    }
-
-    /// Bind texture-buffer and image-buffer descriptors for all enabled graphics stages.
-    ///
-    /// Corresponds to the `if constexpr (Spec::enabled_stages[N]) { bind_stage_info(N); }`
-    /// sequence in upstream `GraphicsPipeline::ConfigureImpl`, immediately
-    /// before `UpdateGraphicsBuffers(is_indexed)`.
-    pub fn bind_enabled_stage_texture_buffer_views<P, DT>(
-        &self,
-        buffer_cache: &mut BufferCache<P, DT>,
-        texture_cache: &OpenGLTextureCache,
-        num_shader_stages: usize,
-        views: &[ImageViewInOut],
-        views_it: &mut usize,
-        max_desc_count: u32,
-    ) where
-        P: BufferCacheParams,
-        DT: DeviceTracker,
-    {
-        for stage in 0..NUM_STAGES.min(num_shader_stages) {
-            self.bind_stage_texture_buffer_views(
-                buffer_cache,
-                texture_cache,
-                stage,
-                views,
-                views_it,
-                max_desc_count,
-            );
-        }
-    }
-
-    /// Fill sampled-texture and sampler handles for one graphics stage.
-    ///
-    /// Corresponds to the `info.texture_descriptors` loop in upstream
-    /// `GraphicsPipeline::ConfigureImpl::prepare_stage`.
-    pub fn bind_stage_sampled_textures<F>(
-        &self,
-        texture_cache: &OpenGLTextureCache,
-        stage: usize,
-        views: &[ImageViewInOut],
-        views_it: &mut usize,
-        sampler_ids: &[SamplerId],
-        sampler_it: &mut usize,
-        textures: &mut [u32],
-        samplers: &mut [u32],
-        bound_texture_view_ids: &mut [ImageViewId],
-        texture_binding: &mut usize,
-        sampler_binding: &mut usize,
-        stage_texture_binding: &mut u32,
-        max_desc_count: u32,
-        mut observe: F,
-    ) -> u32
-    where
-        F: FnMut(&SampledTextureBinding),
-    {
-        let Some(info) = self.stage_infos.get(stage).and_then(Option::as_ref) else {
-            return 0;
         };
 
         let mut texture_scaling_mask = 0u32;
-        for desc in &info.texture_descriptors {
-            let count = desc.count.min(max_desc_count);
-            for _ in 0..count {
-                if *views_it >= views.len() || *texture_binding >= textures.len() {
-                    break;
-                }
-                let view_id = views[*views_it].id;
-                *views_it += 1;
-
-                let (handle, view_supports_aniso) = texture_cache
-                    .get_image_view(view_id)
-                    .map(|iv| {
-                        (
-                            iv.handle_for_texture_type(desc.texture_type),
-                            iv.supports_anisotropy(),
-                        )
-                    })
-                    .unwrap_or((0, false));
-                if texture_cache.image_view_is_rescaling(view_id) && *stage_texture_binding < 32 {
-                    texture_scaling_mask |= 1u32 << *stage_texture_binding;
-                }
-
-                observe(&SampledTextureBinding {
-                    stage,
-                    texture_binding: *texture_binding,
-                    stage_texture_binding: *stage_texture_binding,
-                    view_id,
-                    handle,
-                    texture_type: desc.texture_type as u32,
-                    is_depth: desc.is_depth,
-                    is_multisample: desc.is_multisample,
-                });
-
-                textures[*texture_binding] = handle;
-                if *texture_binding < bound_texture_view_ids.len() {
-                    bound_texture_view_ids[*texture_binding] = view_id;
-                }
-
-                let sampler_handle = if *sampler_it < sampler_ids.len() {
-                    let sampler_id = sampler_ids[*sampler_it];
-                    *sampler_it += 1;
-                    texture_cache
-                        .get_sampler(sampler_id)
-                        .map(|sampler| {
-                            if sampler.has_added_anisotropy() && !view_supports_aniso {
-                                sampler.handle_with_default_anisotropy()
-                            } else {
-                                sampler.handle()
-                            }
-                        })
-                        .unwrap_or(0)
-                } else {
-                    0
-                };
-                if *sampler_binding < samplers.len() {
-                    samplers[*sampler_binding] = sampler_handle;
-                }
-
-                *texture_binding += 1;
-                *sampler_binding += 1;
-                *stage_texture_binding += 1;
-            }
-        }
-        texture_scaling_mask
-    }
-
-    /// Fill storage-image handles for one graphics stage in upstream order.
-    ///
-    /// Corresponds to the `info.image_descriptors` loop in
-    /// `GraphicsPipeline::ConfigureImpl::prepare_stage`.
-    pub fn bind_stage_storage_images(
-        &self,
-        texture_cache: &mut OpenGLTextureCache,
-        stage: usize,
-        views: &[ImageViewInOut],
-        views_it: &mut usize,
-        images: &mut [u32],
-        image_binding: &mut usize,
-        stage_image_binding: &mut u32,
-        max_desc_count: u32,
-    ) -> u32 {
-        let Some(info) = self.stage_infos.get(stage).and_then(Option::as_ref) else {
-            return 0;
-        };
-
         let mut image_scaling_mask = 0u32;
-        for desc in &info.image_descriptors {
-            let count = desc.count.min(max_desc_count);
-            for _ in 0..count {
-                if *views_it >= views.len() || *image_binding >= images.len() {
-                    break;
-                }
-                let view_id = views[*views_it].id;
-                *views_it += 1;
+        let mut stage_texture_binding = 0u32;
+        let mut stage_image_binding = 0u32;
 
-                if desc.is_written && view_id.is_valid() {
-                    let parent_id = texture_cache.base.slot_image_views.get(view_id).image_id;
-                    if parent_id.is_valid() {
-                        texture_cache.base.mark_modification_by_id(parent_id);
-                    }
+        if self.configure_spec.has_texture_buffers() {
+            for desc in &info.texture_buffer_descriptors {
+                for _ in 0..desc.count {
+                    gl_samplers[*sampler_binding] = 0;
+                    *sampler_binding += 1;
                 }
-
-                let handle = texture_cache
-                    .get_image_view_mut(view_id)
-                    .map(|iv| iv.storage_view(desc.texture_type, desc.format))
-                    .unwrap_or(0);
-                if texture_cache.image_view_is_rescaling(view_id) && *stage_image_binding < 32 {
-                    image_scaling_mask |= 1u32 << *stage_image_binding;
-                }
-                images[*image_binding] = handle;
-                *image_binding += 1;
-                *stage_image_binding += 1;
             }
         }
-        image_scaling_mask
-    }
+        for desc in &info.texture_descriptors {
+            for _ in 0..desc.count {
+                let view_id = views[*views_it].id;
+                *views_it += 1;
+                let image_view = texture_cache
+                    .get_image_view(view_id)
+                    .expect("filled sampled-image view must exist");
+                textures[*texture_binding] = image_view.handle_for_texture_type(desc.texture_type);
+                if texture_cache.image_view_is_rescaling(view_id) {
+                    texture_scaling_mask |= 1u32 << stage_texture_binding;
+                }
+                *texture_binding += 1;
+                stage_texture_binding += 1;
 
-    /// Upload per-stage rescaling and render-area uniforms in upstream order.
-    ///
-    /// Corresponds to the `uses_rescaling_uniform` and `uses_render_area`
-    /// blocks at the end of `GraphicsPipeline::ConfigureImpl::prepare_stage`.
-    pub fn upload_stage_uniforms(
-        &self,
-        texture_cache: &OpenGLTextureCache,
-        stage: usize,
-        texture_scaling_mask: u32,
-        image_scaling_mask: u32,
-        surface_clip: SurfaceClipInfo,
-    ) {
-        let Some(info) = self.stage_infos.get(stage).and_then(Option::as_ref) else {
-            return;
-        };
-        let use_assembly = self.assembly_programs[0] != 0;
+                let sampler = texture_cache
+                    .get_sampler(samplers[*samplers_it])
+                    .expect("filled sampled-image sampler must exist");
+                *samplers_it += 1;
+                gl_samplers[*sampler_binding] =
+                    if sampler.has_added_anisotropy() && !image_view.supports_anisotropy() {
+                        sampler.handle_with_default_anisotropy()
+                    } else {
+                        sampler.handle()
+                    };
+                *sampler_binding += 1;
+            }
+        }
+        if self.configure_spec.has_images() {
+            for desc in &info.image_descriptors {
+                for _ in 0..desc.count {
+                    let view_id = views[*views_it].id;
+                    *views_it += 1;
+                    if desc.is_written {
+                        let image_id = texture_cache.base.slot_image_views[view_id].image_id;
+                        texture_cache.base.mark_modification_by_id(image_id);
+                    }
+                    images[*image_binding] = texture_cache
+                        .get_image_view_mut(view_id)
+                        .expect("filled storage-image view must exist")
+                        .storage_view(desc.texture_type, desc.format);
+                    if texture_cache.image_view_is_rescaling(view_id) {
+                        image_scaling_mask |= 1u32 << stage_image_binding;
+                    }
+                    *image_binding += 1;
+                    stage_image_binding += 1;
+                }
+            }
+        }
 
+        let use_assembly = self.assembly_programs[0].handle != 0;
         if info.uses_rescaling_uniform {
             let texture_mask = f32::from_bits(texture_scaling_mask);
             let image_mask = f32::from_bits(image_scaling_mask);
@@ -2287,47 +1095,40 @@ impl GraphicsPipeline {
                     0.0,
                 );
             } else {
-                let program = self.source_programs[stage];
-                if program != 0 {
-                    unsafe {
-                        gl::ProgramUniform4f(
-                            program,
-                            0,
-                            texture_mask,
-                            image_mask,
-                            down_factor,
-                            0.0,
-                        );
-                    }
+                unsafe {
+                    gl::ProgramUniform4f(
+                        self.source_programs[stage].handle,
+                        0,
+                        texture_mask,
+                        image_mask,
+                        down_factor,
+                        0.0,
+                    );
                 }
             }
         }
-
         if info.uses_render_area {
-            let render_area_width = surface_clip.width as f32;
-            let render_area_height = surface_clip.height as f32;
+            let width = surface_clip.width as f32;
+            let height = surface_clip.height as f32;
             if use_assembly {
                 program_local_parameter_4f_arb(
                     gl_assembly_stage(stage),
                     1,
-                    render_area_width,
-                    render_area_height,
+                    width,
+                    height,
                     0.0,
                     0.0,
                 );
             } else {
-                let program = self.source_programs[stage];
-                if program != 0 {
-                    unsafe {
-                        gl::ProgramUniform4f(
-                            program,
-                            1,
-                            render_area_width,
-                            render_area_height,
-                            0.0,
-                            0.0,
-                        );
-                    }
+                unsafe {
+                    gl::ProgramUniform4f(
+                        self.source_programs[stage].handle,
+                        1,
+                        width,
+                        height,
+                        0.0,
+                        0.0,
+                    );
                 }
             }
         }
@@ -2342,6 +1143,13 @@ impl GraphicsPipeline {
         }
     }
 
+    /// Return the immutable pipeline cache key.
+    ///
+    /// Port of `GraphicsPipeline::Key()`.
+    pub fn key(&self) -> &GraphicsPipelineKey {
+        &self.key
+    }
+
     /// Returns whether any storage buffer is written.
     pub fn writes_global_memory(&self) -> bool {
         self.writes_global_memory
@@ -2352,112 +1160,30 @@ impl GraphicsPipeline {
         self.uses_local_memory
     }
 
-    /// Whether any compiled GL program has been attached to this pipeline.
-    pub fn has_gl_programs(&self) -> bool {
-        self.source_programs.iter().any(|h| *h != 0)
-            || self.assembly_programs.iter().any(|h| *h != 0)
-    }
-
-    pub fn program_pipeline_handle(&self) -> u32 {
-        self.program_pipeline
-    }
-
-    /// Compile and link the staged GLSL sources into per-stage separable
-    /// GL program objects.
-    ///
-    /// Mirrors what upstream `GraphicsPipeline`'s constructor does once
-    /// `EmitGLSL` has produced source strings: a `glCreateShader` /
-    /// `glShaderSource` / `glCompileShader` for each enabled stage,
-    /// followed by `glLinkProgram` (with `GL_PROGRAM_SEPARABLE`) to
-    /// produce a separable single-stage program. The resulting GL
-    /// handles land in `source_programs[stage_index]`, ready for
-    /// `configure()` to bind via `glUseProgramStages`.
-    ///
-    /// Returns `Ok(())` on full success, or `Err(stage_index, message)`
-    /// for the first stage that failed to compile or link. On error the
-    /// already-allocated handles are deleted so the pipeline ends up in
-    /// the same "no GL programs attached" state as a placeholder.
-    ///
-    /// Safety: must be called with a current OpenGL context. The cache
-    /// never invokes this directly — `RasterizerOpenGL::draw` calls it
-    /// lazily on first use, where a GL context is guaranteed.
-    pub fn build_from_sources(&mut self) -> Result<(), (usize, String)> {
-        self.build_from_sources_impl(false)
-    }
-
-    /// Build in a worker-owned shared context and publish a fence for the
-    /// render context, matching upstream's `force_context_flush` path used by
-    /// `ShaderCache::LoadDiskResources`.
-    pub(crate) fn build_from_sources_for_shared_context(&mut self) -> Result<(), (usize, String)> {
-        self.build_from_sources_impl(true)
-    }
-
-    fn build_from_sources_impl(&mut self, create_fence: bool) -> Result<(), (usize, String)> {
-        // Already built — nothing to do.
-        if self.has_gl_programs() {
-            return Ok(());
-        }
-
-        if let Some(shader_notify) = self.shader_notify {
-            shader_notify.mark_shader_building();
-        }
-        let build = build_programs(
-            &self.glsl_sources,
-            &self.spirv_sources,
-            self.program_backend,
-            create_fence,
-        );
-        if let Some(shader_notify) = self.shader_notify {
-            shader_notify.mark_shader_complete();
-        }
-        let build = build?;
-        self.accept_program_build(build);
-        self.is_built = !create_fence;
-
-        for (stage_index, source) in self.glsl_sources.iter().enumerate() {
-            let Some(source) = source else { continue };
-            let program = self.source_programs[stage_index];
-            if program == 0 {
-                continue;
+    /// Execute the host-program creation closure owned by Eden's constructor.
+    /// Rust publishes a completed build through a slot because moving a
+    /// partially-constructed `self` into the worker would not be memory safe.
+    fn start_program_build(
+        &mut self,
+        worker: Option<&StatefulThreadWorker<ShaderContext>>,
+        force_context_flush: bool,
+    ) {
+        self.is_built = false;
+        let Some(worker) = worker else {
+            let build = build_programs(
+                &self.glsl_sources,
+                &self.spirv_sources,
+                self.program_backend,
+                force_context_flush,
+            );
+            self.accept_program_build(build);
+            self.is_built = !force_context_flush;
+            if let Some(shader_notify) = self.shader_notify {
+                shader_notify.mark_shader_complete();
             }
-            trace_pipeline_build(
-                12,
-                &self.key,
-                stage_index as u64,
-                program as u64,
-                source.len() as u64,
-            );
-        }
-        if std::env::var_os("RUZU_TRACE_PIPELINE_BUILD").is_some() {
-            log::info!(
-                "[PIPELINE_BUILD] pipeline_key=0x{:016X} program_pipeline={} programs={:?}",
-                self.key.hash_key(),
-                self.program_pipeline,
-                self.source_programs,
-            );
-        }
-        trace_pipeline_build(
-            14,
-            &self.key,
-            self.program_pipeline as u64,
-            self.enabled_stages_mask as u64,
-            0,
-        );
-        dump_glsl_for_pipeline_handle(
-            self.program_pipeline,
-            self.key.hash_key(),
-            &self.glsl_sources,
-        );
-        dump_pipeline_metadata_for_handle(self);
-
-        Ok(())
-    }
-
-    /// Queue host program creation on an upstream-shaped shader worker.
-    pub fn build_async(&mut self, worker: &StatefulThreadWorker<ShaderContext>) {
-        if self.has_gl_programs() || self.pending_build.is_some() {
             return;
-        }
+        };
+
         let sources = self.glsl_sources.clone();
         let spirv_sources = self.spirv_sources.clone();
         let backend = self.program_backend;
@@ -2465,38 +1191,21 @@ impl GraphicsPipeline {
         let slot: AsyncBuildSlot = Arc::new((Mutex::new(None), Condvar::new()));
         let worker_slot = Arc::clone(&slot);
         self.pending_build = Some(slot);
-        self.is_built = false;
-        if let Some(shader_notify) = shader_notify {
-            shader_notify.mark_shader_building();
-        }
         worker.queue_work(move |_context| {
-            let result = build_programs(&sources, &spirv_sources, backend, true);
+            let build = build_programs(&sources, &spirv_sources, backend, true);
+            let (lock, condvar) = &*worker_slot;
+            *lock.lock().unwrap() = Some(build);
+            condvar.notify_one();
             if let Some(shader_notify) = shader_notify {
                 shader_notify.mark_shader_complete();
             }
-            let (lock, condvar) = &*worker_slot;
-            *lock.lock().unwrap() = Some(result);
-            condvar.notify_one();
         });
-    }
-
-    pub fn has_pending_build(&self) -> bool {
-        self.pending_build.is_some()
     }
 
     fn accept_program_build(&mut self, mut build: ProgramBuild) {
         self.source_programs = std::mem::take(&mut build.source_programs);
         self.assembly_programs = std::mem::take(&mut build.assembly_programs);
-        self.program_pipeline = std::mem::take(&mut build.program_pipeline);
-        self.built_fence = std::mem::replace(&mut build.fence, std::ptr::null());
-        self.enabled_stages_mask =
-            self.source_programs
-                .iter()
-                .enumerate()
-                .fold(0u32, |mask, (stage, &program)| {
-                    let enabled = program != 0 || self.assembly_programs[stage] != 0;
-                    mask | if enabled { 1 << stage } else { 0 }
-                });
+        self.built_fence = std::mem::take(&mut build.fence);
     }
 
     fn receive_pending_build(&mut self, wait: bool) -> bool {
@@ -2515,41 +1224,8 @@ impl GraphicsPipeline {
         let completed = result.take().expect("pending shader build completed");
         drop(result);
         self.pending_build = None;
-        match completed {
-            Ok(build) => self.accept_program_build(build),
-            Err((stage, message)) => {
-                log::error!(
-                    "OpenGL asynchronous shader build failed at stage {}: {}",
-                    stage_name(stage),
-                    message
-                );
-                self.is_built = true;
-            }
-        }
+        self.accept_program_build(completed);
         true
-    }
-
-    /// Delete every per-stage program handle this pipeline owns and the
-    /// program-pipeline object aggregating them.
-    /// Called both on `build_from_sources` rollback and on drop.
-    fn delete_gl_programs(&mut self) {
-        if self.program_pipeline != 0 {
-            unsafe { gl::DeleteProgramPipelines(1, &self.program_pipeline) };
-            self.program_pipeline = 0;
-        }
-        for handle in self.source_programs.iter_mut() {
-            if *handle != 0 {
-                unsafe { gl::DeleteProgram(*handle) };
-                *handle = 0;
-            }
-        }
-        for handle in self.assembly_programs.iter_mut() {
-            if *handle != 0 {
-                delete_assembly_program(*handle);
-                *handle = 0;
-            }
-        }
-        self.enabled_stages_mask = 0;
     }
 
     /// Returns whether the pipeline has finished building.
@@ -2563,20 +1239,11 @@ impl GraphicsPipeline {
         if self.is_built {
             return true;
         }
-        if self.built_fence.is_null() {
+        if self.built_fence.handle.is_null() {
             return false;
         }
-        // Check if the GL fence has been signaled
-        let status = unsafe { gl::ClientWaitSync(self.built_fence, 0, 0) };
-        if status == gl::ALREADY_SIGNALED || status == gl::CONDITION_SATISFIED {
-            unsafe {
-                gl::DeleteSync(self.built_fence);
-            }
-            self.built_fence = std::ptr::null();
-            self.is_built = true;
-            return true;
-        }
-        false
+        self.is_built = self.built_fence.is_signaled();
+        self.is_built
     }
 
     #[cfg(test)]
@@ -2609,19 +1276,13 @@ impl GraphicsPipeline {
     /// Generate transform feedback state from the pipeline key.
     ///
     /// Port of `GraphicsPipeline::GenerateTransformFeedbackState()`.
-    pub(crate) fn generate_transform_feedback_state(&mut self) {
-        if !self.key.xfb_enabled() {
-            self.num_xfb_attribs = 0;
-            self.num_xfb_buffers_active = 0;
-            return;
-        }
-
+    fn generate_transform_feedback_state(&mut self) {
         let mut cursor = 0usize;
         self.num_xfb_buffers_active = 0;
         for feedback in 0..NUM_TRANSFORM_FEEDBACK_BUFFERS {
             let layout = self.key.xfb_state.layouts[feedback];
             if layout.stride != layout.varying_count * 4 {
-                log::warn!(
+                log::error!(
                     "OpenGL transform feedback stride padding is not implemented: stride={} varying_count={}",
                     layout.stride,
                     layout.varying_count
@@ -2663,21 +1324,12 @@ impl GraphicsPipeline {
     ///
     /// Port of `GraphicsPipeline::WaitForBuild()`.
     fn wait_for_build(&mut self) {
-        if self.is_built {
-            return;
+        if self.built_fence.handle.is_null() {
+            self.receive_pending_build(true);
         }
-        self.receive_pending_build(true);
-        if self.is_built {
-            return;
-        }
-        if !self.built_fence.is_null() {
-            unsafe {
-                gl::ClientWaitSync(self.built_fence, gl::SYNC_FLUSH_COMMANDS_BIT, u64::MAX);
-                gl::DeleteSync(self.built_fence);
-            }
-            self.built_fence = std::ptr::null();
-            self.is_built = true;
-            return;
+        let status = unsafe { gl::ClientWaitSync(self.built_fence.handle, 0, gl::TIMEOUT_IGNORED) };
+        if status == gl::WAIT_FAILED {
+            log::error!("GraphicsPipeline::WaitForBuild: glClientWaitSync returned GL_WAIT_FAILED");
         }
         self.is_built = true;
     }
@@ -2688,12 +1340,11 @@ fn build_programs(
     spirv_sources: &[Option<Vec<u32>>; NUM_STAGES],
     backend: GraphicsProgramBackend,
     create_fence: bool,
-) -> Result<ProgramBuild, (usize, String)> {
+) -> ProgramBuild {
     let mut build = ProgramBuild {
-        source_programs: [0; NUM_STAGES],
-        assembly_programs: [0; NUM_STAGES],
-        program_pipeline: 0,
-        fence: std::ptr::null(),
+        source_programs: std::array::from_fn(|_| OGLProgram::new()),
+        assembly_programs: std::array::from_fn(|_| OGLAssemblyProgram::new()),
+        fence: OGLSync::new(),
     };
     for stage_index in 0..NUM_STAGES {
         match backend {
@@ -2704,10 +1355,8 @@ fn build_programs(
                 if source.is_empty() {
                     continue;
                 }
-                match unsafe { compile_link_separable(stage_index, source) } {
-                    Ok(program) => build.source_programs[stage_index] = program,
-                    Err(message) => return Err((stage_index, message)),
-                }
+                build.source_programs[stage_index] =
+                    create_program_from_source(source, gl_stage(stage_index));
             }
             GraphicsProgramBackend::Glasm => {
                 let Some(source) = sources[stage_index].as_ref() else {
@@ -2729,349 +1378,35 @@ fn build_programs(
             }
         }
     }
-    if backend != GraphicsProgramBackend::Glasm {
-        unsafe {
-            gl::GenProgramPipelines(1, &mut build.program_pipeline);
-            for (stage_index, &program) in build.source_programs.iter().enumerate() {
-                if program != 0 {
-                    gl::UseProgramStages(build.program_pipeline, stage_bit(stage_index), program);
-                }
-            }
-        }
-    }
     if create_fence {
-        unsafe {
-            build.fence = gl::FenceSync(gl::SYNC_GPU_COMMANDS_COMPLETE, 0);
-            gl::Flush();
-        }
+        build.fence.create();
+        unsafe { gl::Flush() };
     }
-    Ok(build)
-}
-
-/// Map a `glsl_sources` slot index to the corresponding
-/// `glUseProgramStages` stage bit. Mirrors upstream's per-stage bit
-/// constants used to assemble program pipelines.
-fn stage_bit(stage_index: usize) -> u32 {
-    match stage_index {
-        0 => gl::VERTEX_SHADER_BIT,
-        1 => gl::TESS_CONTROL_SHADER_BIT,
-        2 => gl::TESS_EVALUATION_SHADER_BIT,
-        3 => gl::GEOMETRY_SHADER_BIT,
-        4 => gl::FRAGMENT_SHADER_BIT,
-        _ => 0,
-    }
-}
-
-fn stage_name(stage_index: usize) -> &'static str {
-    match stage_index {
-        0 => "Vertex",
-        1 => "TessControl",
-        2 => "TessEval",
-        3 => "Geometry",
-        4 => "Fragment",
-        _ => "Unknown",
-    }
-}
-
-fn dump_glsl_on_error(pipeline_hash: u64, stage_index: usize, source: &str, error: &str) {
-    let Some(dir) = std::env::var_os("RUZU_DUMP_GLSL_ON_ERROR") else {
-        return;
-    };
-    let dir = std::path::PathBuf::from(dir);
-    if let Err(err) = std::fs::create_dir_all(&dir) {
-        log::warn!(
-            "Failed to create RUZU_DUMP_GLSL_ON_ERROR dir {}: {}",
-            dir.display(),
-            err
-        );
-        return;
-    }
-
-    let counter = GLSL_ERROR_DUMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let stage = stage_name(stage_index);
-    let stem = format!(
-        "{:04}_pipeline_{:016X}_stage_{}",
-        counter, pipeline_hash, stage
-    );
-    let source_path = dir.join(format!("{}.glsl", stem));
-    let log_path = dir.join(format!("{}.log", stem));
-
-    if let Err(err) = std::fs::write(&source_path, source) {
-        log::warn!(
-            "Failed to dump GLSL source {}: {}",
-            source_path.display(),
-            err
-        );
-    }
-    let log = format!(
-        "pipeline_hash=0x{:016X}\nstage_index={}\nstage={}\nsource_bytes={}\n\n{}",
-        pipeline_hash,
-        stage_index,
-        stage,
-        source.len(),
-        error
-    );
-    if let Err(err) = std::fs::write(&log_path, log) {
-        log::warn!(
-            "Failed to dump GLSL error log {}: {}",
-            log_path.display(),
-            err
-        );
-    }
-}
-
-fn should_dump_pipeline_handle(handle: u32) -> bool {
-    let Some(spec) = std::env::var_os("RUZU_DUMP_GLSL_PIPELINE_HANDLES") else {
-        return false;
-    };
-    let spec = spec.to_string_lossy();
-    spec.split(',').any(|raw| {
-        let value = raw.trim();
-        if value == "*" {
-            return true;
-        }
-        if let Some(hex) = value
-            .strip_prefix("0x")
-            .or_else(|| value.strip_prefix("0X"))
-        {
-            return u32::from_str_radix(hex, 16).is_ok_and(|target| target == handle);
-        }
-        value.parse::<u32>().is_ok_and(|target| target == handle)
-    })
-}
-
-fn dump_glsl_for_pipeline_handle(
-    handle: u32,
-    pipeline_hash: u64,
-    sources: &[Option<String>; NUM_STAGES],
-) {
-    if handle == 0 || !should_dump_pipeline_handle(handle) {
-        return;
-    }
-    let dir = std::env::var_os("RUZU_DUMP_GLSL_PIPELINE_DIR")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| std::path::PathBuf::from("/tmp/ruzu_pipeline_glsl"));
-    if let Err(err) = std::fs::create_dir_all(&dir) {
-        log::warn!(
-            "Failed to create RUZU_DUMP_GLSL_PIPELINE_DIR {}: {}",
-            dir.display(),
-            err
-        );
-        return;
-    }
-    for (stage_index, source) in sources.iter().enumerate() {
-        let Some(source) = source else { continue };
-        if source.is_empty() {
-            continue;
-        }
-        let path = dir.join(format!(
-            "pipeline_{handle}_key_{pipeline_hash:016X}_stage_{}.glsl",
-            stage_name(stage_index)
-        ));
-        if let Err(err) = std::fs::write(&path, source) {
-            log::warn!("Failed to dump GLSL source {}: {}", path.display(), err);
-        } else {
-            log::info!(
-                "[GLSL_PIPELINE_DUMP] pipeline={} stage={} bytes={} path={}",
-                handle,
-                stage_name(stage_index),
-                source.len(),
-                path.display()
-            );
-        }
-    }
-}
-
-fn dump_pipeline_metadata_for_handle(pipeline: &GraphicsPipeline) {
-    let handle = pipeline.program_pipeline;
-    if handle == 0 || !should_dump_pipeline_handle(handle) {
-        return;
-    }
-    let dir = std::env::var_os("RUZU_DUMP_GLSL_PIPELINE_DIR")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| std::path::PathBuf::from("/tmp/ruzu_pipeline_glsl"));
-    if let Err(err) = std::fs::create_dir_all(&dir) {
-        log::warn!(
-            "Failed to create RUZU_DUMP_GLSL_PIPELINE_DIR {}: {}",
-            dir.display(),
-            err
-        );
-        return;
-    }
-
-    let mut text = String::new();
-    use std::fmt::Write as _;
-    let _ = writeln!(text, "pipeline={}", handle);
-    let _ = writeln!(text, "pipeline_hash=0x{:016X}", pipeline.key.hash_key());
-    let _ = writeln!(
-        text,
-        "enabled_uniform_buffer_masks={:X?}",
-        pipeline.enabled_uniform_buffer_masks
-    );
-    let _ = writeln!(
-        text,
-        "base_uniform_bindings={:?}",
-        pipeline.base_uniform_bindings
-    );
-    let _ = writeln!(
-        text,
-        "base_storage_bindings={:?}",
-        pipeline.base_storage_bindings
-    );
-    let _ = writeln!(
-        text,
-        "enabled_stages_mask=0x{:X}",
-        pipeline.enabled_stages_mask
-    );
-    for stage in 0..NUM_STAGES {
-        let _ = writeln!(
-            text,
-            "stage{} uniform_sizes={:?}",
-            stage, pipeline.uniform_buffer_sizes[stage]
-        );
-        if let Some(info) = &pipeline.stage_infos[stage] {
-            let _ = writeln!(
-                text,
-                "stage{} info_cbuf_mask=0x{:X} descriptors={:?}",
-                stage, info.constant_buffer_mask, info.constant_buffer_descriptors
-            );
-        } else {
-            let _ = writeln!(text, "stage{} info=None", stage);
-        }
-    }
-
-    let path = dir.join(format!(
-        "pipeline_{}_key_{:016X}_metadata.txt",
-        handle,
-        pipeline.key.hash_key()
-    ));
-    if let Err(err) = std::fs::write(&path, text) {
-        log::warn!(
-            "Failed to dump pipeline metadata {}: {}",
-            path.display(),
-            err
-        );
-    }
-}
-
-/// Compile a GLSL source for `stage_index` and link it into a separable
-/// single-stage GL program.
-///
-/// Returns the linked program handle on success, or a descriptive error
-/// string. Mirrors the upstream pattern of producing one separable
-/// program per shader stage and binding them via a program-pipeline
-/// object at draw time (`glUseProgramStages`).
-///
-/// Safety: caller must hold a current OpenGL context.
-unsafe fn compile_link_separable(stage_index: usize, source: &str) -> Result<u32, String> {
-    let stage_enum = gl_stage(stage_index);
-
-    // Compile the shader.
-    let shader = gl::CreateShader(stage_enum);
-    if shader == 0 {
-        return Err(format!(
-            "glCreateShader returned 0 for stage {}",
-            stage_index
-        ));
-    }
-    let c_src = match std::ffi::CString::new(source) {
-        Ok(s) => s,
-        Err(_) => {
-            gl::DeleteShader(shader);
-            return Err("GLSL source contained interior NUL".into());
-        }
-    };
-    let src_ptr = c_src.as_ptr();
-    gl::ShaderSource(shader, 1, &src_ptr, std::ptr::null());
-    gl::CompileShader(shader);
-    let mut status: gl::types::GLint = 0;
-    gl::GetShaderiv(shader, gl::COMPILE_STATUS, &mut status);
-    if status == 0 {
-        let msg = gl_info_log_shader(shader);
-        gl::DeleteShader(shader);
-        return Err(format!("compile failed: {}", msg));
-    }
-
-    // Link as a separable program (single shader attached, then linked).
-    let program = gl::CreateProgram();
-    if program == 0 {
-        gl::DeleteShader(shader);
-        return Err(format!(
-            "glCreateProgram returned 0 for stage {}",
-            stage_index
-        ));
-    }
-    gl::ProgramParameteri(program, gl::PROGRAM_SEPARABLE, gl::TRUE as gl::types::GLint);
-    gl::AttachShader(program, shader);
-    gl::LinkProgram(program);
-    gl::DetachShader(program, shader);
-    gl::DeleteShader(shader);
-
-    let mut link_status: gl::types::GLint = 0;
-    gl::GetProgramiv(program, gl::LINK_STATUS, &mut link_status);
-    if link_status == 0 {
-        let msg = gl_info_log_program(program);
-        gl::DeleteProgram(program);
-        return Err(format!("link failed: {}", msg));
-    }
-
-    Ok(program)
-}
-
-/// Read the shader info log into a Rust `String`. Used by error paths in
-/// `compile_link_separable`.
-unsafe fn gl_info_log_shader(shader: u32) -> String {
-    let mut len: gl::types::GLint = 0;
-    gl::GetShaderiv(shader, gl::INFO_LOG_LENGTH, &mut len);
-    if len <= 0 {
-        return String::new();
-    }
-    let mut buf = vec![0u8; len as usize];
-    gl::GetShaderInfoLog(
-        shader,
-        len,
-        std::ptr::null_mut(),
-        buf.as_mut_ptr() as *mut _,
-    );
-    String::from_utf8_lossy(&buf).into_owned()
-}
-
-/// Read the program info log into a Rust `String`. Used by error paths in
-/// `compile_link_separable`.
-unsafe fn gl_info_log_program(program: u32) -> String {
-    let mut len: gl::types::GLint = 0;
-    gl::GetProgramiv(program, gl::INFO_LOG_LENGTH, &mut len);
-    if len <= 0 {
-        return String::new();
-    }
-    let mut buf = vec![0u8; len as usize];
-    gl::GetProgramInfoLog(
-        program,
-        len,
-        std::ptr::null_mut(),
-        buf.as_mut_ptr() as *mut _,
-    );
-    String::from_utf8_lossy(&buf).into_owned()
+    build
 }
 
 /// Helper: map a stage index to the corresponding GL shader stage enum.
 ///
 /// Corresponds to the anonymous `Stage()` function in gl_graphics_pipeline.cpp.
-pub fn gl_stage(stage_index: usize) -> u32 {
+fn gl_stage(stage_index: usize) -> u32 {
     match stage_index {
         0 => gl::VERTEX_SHADER,
         1 => gl::TESS_CONTROL_SHADER,
         2 => gl::TESS_EVALUATION_SHADER,
         3 => gl::GEOMETRY_SHADER,
         4 => gl::FRAGMENT_SHADER,
-        _ => panic!("Invalid stage index: {}", stage_index),
+        _ => {
+            // Eden's ASSERT_MSG is fail-soft and returns GL_NONE.
+            log::error!("Invalid OpenGL shader stage index: {stage_index}");
+            gl::NONE
+        }
     }
 }
 
 /// Helper: map a stage index to the corresponding NV assembly program enum.
 ///
 /// Corresponds to the anonymous `AssemblyStage()` function in gl_graphics_pipeline.cpp.
-pub fn gl_assembly_stage(stage_index: usize) -> u32 {
+fn gl_assembly_stage(stage_index: usize) -> u32 {
     const GL_VERTEX_PROGRAM_NV: u32 = 0x8620;
     const GL_TESS_CONTROL_PROGRAM_NV: u32 = 0x891E;
     const GL_TESS_EVALUATION_PROGRAM_NV: u32 = 0x891F;
@@ -3084,14 +1419,18 @@ pub fn gl_assembly_stage(stage_index: usize) -> u32 {
         2 => GL_TESS_EVALUATION_PROGRAM_NV,
         3 => GL_GEOMETRY_PROGRAM_NV,
         4 => GL_FRAGMENT_PROGRAM_NV,
-        _ => panic!("Invalid stage index: {}", stage_index),
+        _ => {
+            // Eden's ASSERT_MSG is fail-soft and returns GL_NONE.
+            log::error!("Invalid OpenGL assembly stage index: {stage_index}");
+            gl::NONE
+        }
     }
 }
 
 /// Translate hardware transform feedback index to ARB_transform_feedback3 tokens.
 ///
 /// Corresponds to `TransformFeedbackEnum()` in gl_graphics_pipeline.cpp.
-pub fn transform_feedback_enum(location: u32) -> (i32, i32) {
+fn transform_feedback_enum(location: u32) -> (i32, i32) {
     let index = location / 4;
     if (8..=39).contains(&index) {
         return (0x8C7D_i32, (index - 8) as i32); // GL_GENERIC_ATTRIB_NV
@@ -3107,7 +1446,7 @@ pub fn transform_feedback_enum(location: u32) -> (i32, i32) {
         42 => (0x8C77_i32, 0), // GL_BACK_PRIMARY_COLOR_NV
         43 => (0x8C78_i32, 0), // GL_BACK_SECONDARY_COLOR_NV
         _ => {
-            log::warn!("Unimplemented transform feedback index={}", index);
+            log::error!("Unimplemented transform feedback index={}", index);
             (GL_POSITION, 0)
         }
     }
@@ -3121,6 +1460,29 @@ mod tests {
     use std::io::Write;
 
     #[test]
+    fn pipeline_program_arrays_and_fence_use_upstream_raii_owners() {
+        let pipeline = GraphicsPipeline::new_for_test(GraphicsPipelineKey::default(), None);
+        assert!(pipeline
+            .source_programs
+            .iter()
+            .all(|program| program.handle == 0));
+        assert!(pipeline
+            .assembly_programs
+            .iter()
+            .all(|program| program.handle == 0));
+        assert!(pipeline.built_fence.handle.is_null());
+        let _: &[i32; XFB_ATTRIB_COUNT] = &pipeline.xfb_attribs;
+    }
+
+    #[test]
+    fn descriptor_staging_uses_upstream_fixed_arrays() {
+        let views = [ImageViewInOut::default(); (MAX_TEXTURES + MAX_IMAGES) as usize];
+        let samplers = [SamplerId::default(); MAX_TEXTURES as usize];
+        assert_eq!(views.len(), 72);
+        assert_eq!(samplers.len(), 64);
+    }
+
+    #[test]
     fn pipeline_key_xfb_bits() {
         let mut key = GraphicsPipelineKey::default();
         assert!(!key.xfb_enabled());
@@ -3129,6 +1491,26 @@ mod tests {
         key.raw = 0b11; // xfb_enabled=1, early_z=1
         assert!(key.xfb_enabled());
         assert!(key.early_z());
+    }
+
+    #[test]
+    fn pipeline_key_equality_uses_upstream_effective_size() {
+        let lhs = GraphicsPipelineKey::default();
+        let mut rhs = lhs;
+        rhs.padding = [0x1111_1111, 0x2222_2222, 0x3333_3333];
+        rhs.xfb_state.layouts[0].stride = 64;
+
+        assert_eq!(lhs, rhs);
+        assert_eq!(lhs.hash_key(), rhs.hash_key());
+
+        rhs.set_xfb_enabled(true);
+        assert_ne!(lhs, rhs);
+
+        let mut enabled_lhs = lhs;
+        enabled_lhs.set_xfb_enabled(true);
+        let mut enabled_rhs = enabled_lhs;
+        enabled_rhs.xfb_state.layouts[0].stride = 64;
+        assert_ne!(enabled_lhs, enabled_rhs);
     }
 
     #[test]
@@ -3165,11 +1547,16 @@ mod tests {
             std::process::id(),
             key.hash_key()
         ));
+        let key_bytes = unsafe {
+            std::slice::from_raw_parts(
+                (&key as *const GraphicsPipelineKey).cast::<u8>(),
+                std::mem::size_of::<GraphicsPipelineKey>(),
+            )
+        };
         let mut file = std::fs::File::create(&path).unwrap();
-        file.write_all(key.to_cache_bytes()).unwrap();
+        file.write_all(key_bytes).unwrap();
         drop(file);
-        let mut file = std::fs::File::open(&path).unwrap();
-        assert_eq!(GraphicsPipelineKey::read_from_file(&mut file).unwrap(), key);
+        assert_eq!(std::fs::read(&path).unwrap(), key_bytes);
         std::fs::remove_file(path).unwrap();
     }
 
@@ -3186,23 +1573,69 @@ mod tests {
             .collect();
         let infos = [Some(info), None, None, None, None];
 
-        let mut glsl = GraphicsPipeline::new(GraphicsPipelineKey::default(), None);
-        glsl.set_program_backend(GraphicsProgramBackend::Glsl, 0);
+        let mut glsl = GraphicsPipeline::new_for_test(GraphicsPipelineKey::default(), None);
+        glsl.program_backend = GraphicsProgramBackend::Glsl;
+        glsl.max_glasm_storage_buffer_blocks = 0;
         glsl.apply_shader_infos(&infos);
         assert!(glsl.use_storage_buffers);
         assert!(!glsl.writes_global_memory);
 
-        let mut glasm_bindless = GraphicsPipeline::new(GraphicsPipelineKey::default(), None);
-        glasm_bindless.set_program_backend(GraphicsProgramBackend::Glasm, 2);
+        let mut glasm_bindless =
+            GraphicsPipeline::new_for_test(GraphicsPipelineKey::default(), None);
+        glasm_bindless.program_backend = GraphicsProgramBackend::Glasm;
+        glasm_bindless.max_glasm_storage_buffer_blocks = 2;
         glasm_bindless.apply_shader_infos(&infos);
         assert!(!glasm_bindless.use_storage_buffers);
         assert!(glasm_bindless.writes_global_memory);
 
-        let mut glasm_storage = GraphicsPipeline::new(GraphicsPipelineKey::default(), None);
-        glasm_storage.set_program_backend(GraphicsProgramBackend::Glasm, 3);
+        let mut glasm_storage =
+            GraphicsPipeline::new_for_test(GraphicsPipelineKey::default(), None);
+        glasm_storage.program_backend = GraphicsProgramBackend::Glasm;
+        glasm_storage.max_glasm_storage_buffer_blocks = 3;
         glasm_storage.apply_shader_infos(&infos);
         assert!(glasm_storage.use_storage_buffers);
         assert!(!glasm_storage.writes_global_memory);
+    }
+
+    #[test]
+    fn configure_spec_selection_matches_upstream_find_spec_order() {
+        let vertex_only: [Option<ShaderInfo>; NUM_STAGES] =
+            [Some(ShaderInfo::default()), None, None, None, None];
+        assert_eq!(
+            ConfigureSpec::select(&vertex_only, 1 << 0),
+            ConfigureSpec::SimpleVertex
+        );
+
+        let vertex_fragment: [Option<ShaderInfo>; NUM_STAGES] = [
+            Some(ShaderInfo::default()),
+            None,
+            None,
+            None,
+            Some(ShaderInfo::default()),
+        ];
+        assert_eq!(
+            ConfigureSpec::select(&vertex_fragment, (1 << 0) | (1 << 4)),
+            ConfigureSpec::SimpleVertexFragment
+        );
+
+        let mut vertex_with_storage = ShaderInfo::default();
+        vertex_with_storage
+            .storage_buffers_descriptors
+            .push(StorageBufferDescriptor {
+                cbuf_index: 0,
+                cbuf_offset: 0,
+                count: 1,
+                is_written: false,
+            });
+        let complex: [Option<ShaderInfo>; NUM_STAGES] =
+            [Some(vertex_with_storage), None, None, None, None];
+        let spec = ConfigureSpec::select(&complex, 1 << 0);
+        assert_eq!(spec, ConfigureSpec::Default);
+        assert!((0..NUM_STAGES).all(|stage| spec.enabled_stage(stage)));
+        assert!(spec.has_storage_buffers());
+        assert!(spec.has_texture_buffers());
+        assert!(spec.has_image_buffers());
+        assert!(spec.has_images());
     }
 
     #[test]
@@ -3240,6 +1673,8 @@ mod tests {
     fn gl_stage_mapping() {
         assert_eq!(gl_stage(0), gl::VERTEX_SHADER);
         assert_eq!(gl_stage(4), gl::FRAGMENT_SHADER);
+        assert_eq!(gl_stage(NUM_STAGES), gl::NONE);
+        assert_eq!(gl_assembly_stage(NUM_STAGES), gl::NONE);
     }
 
     #[test]
@@ -3262,7 +1697,7 @@ mod tests {
         key.xfb_state.varyings[0][0] =
             crate::transform_feedback::StreamOutLayout::from_raw(0x2422_2120);
 
-        let mut pipeline = GraphicsPipeline::new(key, None);
+        let mut pipeline = GraphicsPipeline::new_for_test(key, None);
         pipeline.generate_transform_feedback_state();
 
         assert_eq!(pipeline.num_xfb_buffers_active, 1);
@@ -3271,1292 +1706,42 @@ mod tests {
     }
 
     #[test]
+    fn constructor_generates_xfb_state_only_when_device_uses_assembly_shaders() {
+        let mut key = GraphicsPipelineKey::default();
+        key.set_xfb_enabled(true);
+        key.xfb_state.layouts[0].varying_count = 1;
+        key.xfb_state.layouts[0].stride = 4;
+        key.xfb_state.varyings[0][0] = crate::transform_feedback::StreamOutLayout::from_raw(0);
+        let infos: [Option<ShaderInfo>; NUM_STAGES] = Default::default();
+
+        let disabled = GraphicsPipeline::new_for_test_with_sources(
+            key,
+            None,
+            Default::default(),
+            Default::default(),
+            &infos,
+            GraphicsProgramBackend::Glasm,
+            0,
+            false,
+        );
+        assert_eq!(disabled.num_xfb_attribs, 0);
+
+        let enabled = GraphicsPipeline::new_for_test_with_sources(
+            key,
+            None,
+            Default::default(),
+            Default::default(),
+            &infos,
+            GraphicsProgramBackend::Glasm,
+            0,
+            true,
+        );
+        assert_eq!(enabled.num_xfb_attribs, 1);
+    }
+
+    #[test]
     fn transform_feedback_position() {
         let (token, _) = transform_feedback_enum(7 * 4);
         assert_eq!(token, 0x1203); // GL_POSITION
-    }
-
-    #[test]
-    fn graphics_program_binding_does_not_configure_transform_feedback() {
-        let source = include_str!("gl_graphics_pipeline.rs");
-        let bind_programs = source
-            .find("pub fn bind_graphics_programs_for_configure")
-            .expect("GraphicsPipeline::bind_graphics_programs_for_configure");
-        let bind_programs_with_manager = source
-            .find("pub fn bind_graphics_programs_for_configure_with_program_manager")
-            .expect("GraphicsPipeline::bind_graphics_programs_for_configure_with_program_manager");
-        let transform_feedback = source[bind_programs_with_manager..]
-            .find("/// Configure transform feedback")
-            .expect("ConfigureTransformFeedback boundary")
-            + bind_programs_with_manager;
-        let bind_programs_body = &source[bind_programs..bind_programs_with_manager];
-        let bind_programs_with_manager_body =
-            &source[bind_programs_with_manager..transform_feedback];
-
-        assert!(bind_programs_body.contains("wait_for_build()"));
-        assert!(bind_programs_body.contains("gl::BindProgramPipeline(self.program_pipeline)"));
-        assert!(bind_programs_with_manager_body.contains("program_manager"));
-        assert!(bind_programs_with_manager_body.contains("bind_assembly_programs"));
-        assert!(bind_programs_with_manager_body.contains("program_manager.bind_source_programs"));
-        assert!(!bind_programs_body.contains("configure_transform_feedback"));
-        assert!(!bind_programs_with_manager_body.contains("configure_transform_feedback"));
-
-        let rasterizer = include_str!("gl_rasterizer.rs");
-        let rasterizer_runtime = rasterizer
-            .split(
-                "
-#[cfg(test)]
-mod tests",
-            )
-            .next()
-            .unwrap_or(rasterizer);
-        assert!(rasterizer_runtime.contains(
-            "pipeline.configure_buffers_programs_then_prepare_and_bind_graphics_resources"
-        ));
-    }
-
-    #[test]
-    fn synchronize_graphics_descriptors_owns_upstream_first_configure_side_effect() {
-        let source = include_str!("gl_graphics_pipeline.rs");
-        let method = source
-            .find("pub fn synchronize_graphics_descriptors")
-            .expect("synchronize_graphics_descriptors");
-        let next = source[method..]
-            .find("/// Create a new graphics pipeline")
-            .expect("next method boundary")
-            + method;
-        let body = &source[method..next];
-
-        assert!(body.contains("texture_cache.base.synchronize_graphics_descriptors(regs)"));
-
-        let rasterizer = include_str!("gl_rasterizer.rs");
-        let rasterizer_runtime = rasterizer
-            .split(
-                "
-#[cfg(test)]
-mod tests",
-            )
-            .next()
-            .unwrap_or(rasterizer);
-        assert!(rasterizer_runtime.contains(
-            "pipeline.synchronize_graphics_descriptors_then_configure_buffer_cache_state("
-        ));
-        assert!(!rasterizer_runtime.contains("pipeline.synchronize_graphics_descriptors("));
-        assert!(
-            !rasterizer_runtime.contains(".base\n            .synchronize_graphics_descriptors")
-        );
-    }
-
-    #[test]
-    fn configure_buffer_cache_state_owns_upstream_base_buffer_state_slice() {
-        let source = include_str!("gl_graphics_pipeline.rs");
-        let method = source
-            .find("pub fn configure_buffer_cache_state")
-            .expect("configure_buffer_cache_state");
-        let next = source[method..]
-            .find("/// Configure transform feedback")
-            .expect("next method boundary")
-            + method;
-        let body = &source[method..next];
-
-        assert!(body.contains("set_uniform_buffers_state"));
-        assert!(body.contains("set_graphics_base_uniform_bindings"));
-        assert!(body.contains("set_graphics_base_storage_bindings"));
-        assert!(body.contains("set_enable_storage_buffers"));
-
-        let rasterizer = include_str!("gl_rasterizer.rs");
-        assert!(rasterizer.contains(
-            "pipeline.synchronize_graphics_descriptors_then_configure_buffer_cache_state("
-        ));
-        assert!(
-            !rasterizer.contains("pipeline.configure_buffer_cache_state(&mut self.buffer_cache)")
-        );
-    }
-
-    #[test]
-    fn descriptor_sync_then_buffer_base_state_owns_upstream_initial_configure_sequence() {
-        let source = include_str!("gl_graphics_pipeline.rs");
-        let method = source
-            .find("pub fn synchronize_graphics_descriptors_then_configure_buffer_cache_state")
-            .expect("synchronize_graphics_descriptors_then_configure_buffer_cache_state");
-        let next = source[method..]
-            .find("/// Bind enabled graphics uniform buffers")
-            .expect("next method boundary")
-            + method;
-        let body = &source[method..next];
-
-        let sync = body
-            .find("self.synchronize_graphics_descriptors(texture_cache, regs)")
-            .expect("descriptor sync call");
-        let base_state = body
-            .find("self.configure_buffer_cache_state(buffer_cache)")
-            .expect("buffer-cache base state call");
-        assert!(sync < base_state);
-
-        let rasterizer = include_str!("gl_rasterizer.rs");
-        let rasterizer_runtime = rasterizer
-            .split(
-                "
-#[cfg(test)]
-mod tests",
-            )
-            .next()
-            .unwrap_or(rasterizer);
-        assert!(rasterizer_runtime.contains(
-            "pipeline.synchronize_graphics_descriptors_then_configure_buffer_cache_state("
-        ));
-        assert!(!rasterizer_runtime.contains("pipeline.synchronize_graphics_descriptors("));
-        assert!(!rasterizer_runtime.contains("pipeline.configure_buffer_cache_state("));
-    }
-
-    #[test]
-    fn graphics_pipeline_uses_channel_bound_live_maxwell_state() {
-        let rasterizer = include_str!("gl_rasterizer.rs");
-        let rasterizer_runtime = rasterizer
-            .split(
-                "
-#[cfg(test)]
-mod tests",
-            )
-            .next()
-            .unwrap_or(rasterizer);
-        assert!(rasterizer_runtime.contains(".synchronize_then_configure_graphics_framebuffer("));
-        assert!(!rasterizer_runtime.contains("DrawStateEngineAdapter"));
-        assert!(!rasterizer_runtime.contains("set_engine_state(Box::new"));
-    }
-
-    #[test]
-    fn graphics_pipeline_owns_descriptor_framebuffer_sequence() {
-        let source = include_str!("gl_graphics_pipeline.rs");
-        let method = source
-            .find("pub fn configure_graphics_descriptors_and_framebuffer")
-            .expect("configure_graphics_descriptors_and_framebuffer");
-        let next = source[method..]
-            .find("/// Bind host buffer resources")
-            .expect("next method boundary")
-            + method;
-        let body = &source[method..next];
-
-        let after_engine = body
-            .find("after_live_engine_bound();")
-            .expect("live engine-bound callback");
-        let configure = body[after_engine..]
-            .find("self.configure_graphics_descriptors_then_fill_and_bind_framebuffer(")
-            .expect("descriptor/fill/framebuffer helper")
-            + after_engine;
-        assert!(after_engine < configure);
-
-        let rasterizer = include_str!("gl_rasterizer.rs");
-        let rasterizer_runtime = rasterizer
-            .split(
-                "
-#[cfg(test)]
-mod tests",
-            )
-            .next()
-            .unwrap_or(rasterizer);
-        assert!(rasterizer_runtime.contains(".synchronize_then_configure_graphics_framebuffer("));
-        assert!(!rasterizer_runtime
-            .contains(".configure_graphics_descriptors_then_fill_and_bind_framebuffer("));
-    }
-
-    #[test]
-    fn graphics_pipeline_owns_sync_engine_descriptor_framebuffer_sequence() {
-        let source = include_str!("gl_graphics_pipeline.rs");
-        let method = source
-            .find("pub fn synchronize_then_configure_graphics_framebuffer")
-            .expect("synchronize/set-engine/configure helper");
-        let next = source[method..]
-            .find("/// Bind host buffer resources")
-            .expect("next method boundary")
-            + method;
-        let body = &source[method..next];
-
-        let sync = body
-            .find("self.synchronize_graphics_descriptors_then_configure_buffer_cache_state(")
-            .expect("descriptor sync + base buffer state");
-        let after_sync = body[sync..]
-            .find("after_descriptor_base_state();")
-            .expect("after descriptor/base-state callback")
-            + sync;
-        let set_engine = body[after_sync..]
-            .find("self.configure_graphics_descriptors_and_framebuffer(")
-            .expect("set engine then descriptor/framebuffer helper")
-            + after_sync;
-        assert!(sync < after_sync);
-        assert!(after_sync < set_engine);
-
-        let rasterizer = include_str!("gl_rasterizer.rs");
-        let rasterizer_runtime = rasterizer
-            .split(
-                "
-#[cfg(test)]
-mod tests",
-            )
-            .next()
-            .unwrap_or(rasterizer);
-        assert!(rasterizer_runtime.contains(".synchronize_then_configure_graphics_framebuffer("));
-        assert!(!rasterizer_runtime.contains(".configure_graphics_descriptors_and_framebuffer("));
-    }
-
-    #[test]
-    fn bind_graphics_uniform_buffers_owns_upstream_ubo_binding_loop() {
-        let source = include_str!("gl_graphics_pipeline.rs");
-        let method = source
-            .find("pub fn bind_graphics_uniform_buffers")
-            .expect("bind_graphics_uniform_buffers");
-        let next = source[method..]
-            .find("/// Bind storage-buffer descriptors")
-            .expect("next method boundary")
-            + method;
-        let body = &source[method..next];
-
-        assert!(body.contains("enabled_uniform_buffer_masks"));
-        assert!(body.contains("cb_bindings[stage][slot as usize]"));
-        assert!(body.contains("gpu_to_cpu_address(binding.address).unwrap_or(binding.address)"));
-        assert!(body.contains("bind_graphics_uniform_buffer_with_device_addr"));
-        assert!(body.contains("disable_graphics_uniform_buffer(stage, slot)"));
-
-        let rasterizer = include_str!("gl_rasterizer.rs");
-        assert!(rasterizer.contains(
-            "pipeline.configure_buffers_programs_then_prepare_and_bind_graphics_resources"
-        ));
-        assert!(!rasterizer.contains("pipeline.bind_graphics_uniform_buffers("));
-        assert!(!rasterizer.contains("let mut bits = pipeline.enabled_uniform_buffer_masks"));
-        assert!(!rasterizer.contains(".bind_graphics_uniform_buffer_with_device_addr(\n                                stage"));
-    }
-
-    #[test]
-    fn bind_stage_storage_buffers_owns_upstream_storage_buffer_loop() {
-        let source = include_str!("gl_graphics_pipeline.rs");
-        let method = source
-            .find("pub fn bind_stage_storage_buffers<P")
-            .expect("bind_stage_storage_buffers");
-        let next = source[method..]
-            .find("/// Bind host buffer resources")
-            .expect("next method boundary")
-            + method;
-        let body = &source[method..next];
-
-        let unbind = body
-            .find("unbind_graphics_storage_buffers(stage)")
-            .expect("UnbindGraphicsStorageBuffers");
-        let enabled = body[unbind..]
-            .find("if !self.use_storage_buffers")
-            .expect("storage buffer enable gate")
-            + unbind;
-        let descriptors = body[enabled..]
-            .find("for (ssbo_index, desc) in info.storage_buffers_descriptors")
-            .expect("storage descriptor loop")
-            + enabled;
-        let count_assert = body[descriptors..]
-            .find("assert_eq!(\n                desc.count, 1")
-            .expect("descriptor count assertion")
-            + descriptors;
-        let bind = body[count_assert..]
-            .find("bind_graphics_storage_buffer(")
-            .expect("BindGraphicsStorageBuffer")
-            + count_assert;
-        assert!(unbind < enabled);
-        assert!(enabled < descriptors);
-        assert!(descriptors < count_assert);
-        assert!(count_assert < bind);
-        assert!(body.contains("bind_graphics_storage_buffer_with_gpu_reader"));
-
-        let rasterizer = include_str!("gl_rasterizer.rs");
-        let rasterizer_runtime = rasterizer
-            .split(
-                "
-#[cfg(test)]
-mod tests",
-            )
-            .next()
-            .unwrap_or(rasterizer);
-        assert!(rasterizer_runtime.contains(".synchronize_then_configure_graphics_framebuffer("));
-        assert!(!rasterizer_runtime
-            .contains("pipeline.configure_enabled_stage_texture_image_descriptors("));
-        assert!(!rasterizer_runtime.contains("pipeline.bind_stage_storage_buffers("));
-        assert!(
-            !rasterizer_runtime.contains("pipeline.bind_stage_storage_buffers_with_gpu_reader(")
-        );
-        assert!(!rasterizer_runtime
-            .contains("self.buffer_cache.unbind_graphics_storage_buffers(stage)"));
-        assert!(!rasterizer_runtime.contains("self.buffer_cache.bind_graphics_storage_buffer("));
-        assert!(!rasterizer_runtime.contains("self.buffer_cache\n                                .bind_graphics_storage_buffer_with_gpu_reader"));
-    }
-
-    #[test]
-    fn collect_stage_texture_image_descriptors_owns_upstream_descriptor_walk() {
-        let source = include_str!("gl_graphics_pipeline.rs");
-        let method = source
-            .find("pub fn collect_stage_texture_image_descriptors")
-            .expect("collect_stage_texture_image_descriptors");
-        let next = source[method..]
-            .find("/// Bind host buffer resources")
-            .expect("next method boundary")
-            + method;
-        let body = &source[method..next];
-
-        let texture_buffers = body
-            .find("for desc in &info.texture_buffer_descriptors")
-            .expect("texture-buffer descriptor loop");
-        let image_buffers = body[texture_buffers..]
-            .find("for desc in &info.image_buffer_descriptors")
-            .expect("image-buffer descriptor loop")
-            + texture_buffers;
-        let textures = body[image_buffers..]
-            .find("for (desc_index, desc) in info.texture_descriptors")
-            .expect("sampled texture descriptor loop")
-            + image_buffers;
-        let sampler = body[textures..]
-            .find("sampler_ids.push(get_graphics_sampler_id(tsc_id))")
-            .expect("graphics sampler id collection")
-            + textures;
-        let images = body[sampler..]
-            .find("for desc in &info.image_descriptors")
-            .expect("storage-image descriptor loop")
-            + sampler;
-        assert!(texture_buffers < image_buffers);
-        assert!(image_buffers < textures);
-        assert!(textures < sampler);
-        assert!(sampler < images);
-        assert!(body.contains("texture_pair(raw, via_header_index)"));
-        assert!(body.contains("blacklist: desc.is_written"));
-
-        let rasterizer = include_str!("gl_rasterizer.rs");
-        let rasterizer_runtime = rasterizer
-            .split(
-                "
-#[cfg(test)]
-mod tests",
-            )
-            .next()
-            .unwrap_or(rasterizer);
-        assert!(rasterizer_runtime.contains(".synchronize_then_configure_graphics_framebuffer("));
-        assert!(!rasterizer_runtime
-            .contains("pipeline.configure_enabled_stage_texture_image_descriptors("));
-        assert!(!rasterizer_runtime.contains("pipeline.collect_stage_texture_image_descriptors("));
-        assert!(!rasterizer_runtime.contains("for desc in &info.texture_buffer_descriptors"));
-        assert!(!rasterizer_runtime.contains("for desc in &info.image_buffer_descriptors"));
-        assert!(!rasterizer_runtime.contains("for (desc_index, desc) in info.texture_descriptors"));
-        assert!(!rasterizer_runtime.contains("for desc in &info.image_descriptors"));
-        assert!(!rasterizer_runtime.contains("texture_pair(raw, via_header_index)"));
-    }
-
-    #[test]
-    fn configure_enabled_stage_texture_image_descriptors_owns_upstream_config_stage_sequence() {
-        let source = include_str!("gl_graphics_pipeline.rs");
-        let method = source
-            .find("pub fn configure_enabled_stage_texture_image_descriptors")
-            .expect("configure_enabled_stage_texture_image_descriptors");
-        let next = source[method..]
-            .find("/// Fill graphics image views")
-            .expect("next method boundary")
-            + method;
-        let body = &source[method..next];
-
-        let loop_pos = body
-            .find("for stage in 0..NUM_STAGES.min(num_shader_stages)")
-            .expect("enabled stage loop");
-        let storage = body[loop_pos..]
-            .find("bind_stage_storage_buffers")
-            .expect("storage-buffer binding")
-            + loop_pos;
-        let collect = body[storage..]
-            .find("collect_stage_texture_image_descriptors(")
-            .expect("descriptor collection")
-            + storage;
-        assert!(loop_pos < storage);
-        assert!(storage < collect);
-        assert!(body.contains("record_detail(32, stage as u64, 0)"));
-        assert!(body.contains("record_detail(35, stage as u64, 0)"));
-
-        let rasterizer = include_str!("gl_rasterizer.rs");
-        let rasterizer_runtime = rasterizer
-            .split(
-                "
-#[cfg(test)]
-mod tests",
-            )
-            .next()
-            .unwrap_or(rasterizer);
-        assert!(rasterizer_runtime.contains(".synchronize_then_configure_graphics_framebuffer("));
-        assert!(!rasterizer_runtime
-            .contains("pipeline.configure_enabled_stage_texture_image_descriptors("));
-        assert!(!rasterizer_runtime.contains("for stage in 0..NUM_STAGES.min(num_shader_stages)"));
-    }
-
-    #[test]
-    fn fill_and_materialize_graphics_image_views_owns_upstream_fill_slice() {
-        let source = include_str!("gl_graphics_pipeline.rs");
-        let method = source
-            .find("pub fn fill_and_materialize_graphics_image_views")
-            .expect("fill_and_materialize_graphics_image_views");
-        let next = source[method..]
-            .find("/// Fill graphics image views, then update render targets")
-            .expect("next method boundary")
-            + method;
-        let body = &source[method..next];
-
-        let fill = body
-            .find("fill_graphics_image_views(views, has_images)")
-            .expect("FillGraphicsImageViews");
-        let materialize_views = body[fill..]
-            .find("materialize_views(views)")
-            .expect("materialize views path")
-            + fill;
-        let materialize_samplers = body[materialize_views..]
-            .find("materialize_samplers(sampler_ids)")
-            .expect("materialize samplers")
-            + materialize_views;
-        assert!(fill < materialize_views);
-        assert!(materialize_views < materialize_samplers);
-        assert!(!body.contains("fill_graphics_image_views_with_gpu_reader"));
-        assert!(!body.contains("materialize_views_with_gpu_reader"));
-        assert!(!body.contains("read_gpu"));
-
-        let rasterizer = include_str!("gl_rasterizer.rs");
-        assert!(rasterizer.contains("synchronize_then_configure_graphics_framebuffer("));
-        assert!(!rasterizer.contains("pipeline.fill_and_materialize_graphics_image_views("));
-        assert!(!rasterizer.contains("let mut read_gpu = |gpu_addr, out: &mut [u8]|"));
-        assert!(!rasterizer.contains("fill_and_materialize_graphics_image_views::<"));
-        assert!(!rasterizer.contains(".fill_graphics_image_views("));
-        assert!(!rasterizer.contains(".fill_graphics_image_views_with_gpu_reader("));
-        assert!(!rasterizer.contains(".materialize_views("));
-        assert!(!rasterizer.contains(".materialize_views_with_gpu_reader("));
-        assert!(!rasterizer.contains(".materialize_samplers("));
-
-        let texture_cache = include_str!("gl_texture_cache.rs");
-        assert!(!texture_cache.contains("pub fn fill_graphics_image_views_with_gpu_reader"));
-        assert!(!texture_cache.contains("pub fn materialize_views_with_gpu_reader"));
-    }
-
-    #[test]
-    fn fill_then_update_render_targets_and_bind_framebuffer_owns_upstream_sequence() {
-        let source = include_str!("gl_graphics_pipeline.rs");
-        let method = source
-            .find(
-                "pub fn fill_graphics_image_views_then_update_render_targets_and_bind_framebuffer",
-            )
-            .expect("fill/update/bind helper");
-        let next = source[method..]
-            .find("/// Bind host buffer resources")
-            .expect("next method boundary")
-            + method;
-        let body = &source[method..next];
-
-        let fill = body
-            .find("self.fill_and_materialize_graphics_image_views(")
-            .expect("FillGraphicsImageViews bridge");
-        let update = body[fill..]
-            .find("self.update_render_targets_and_bind_framebuffer(")
-            .expect("UpdateRenderTargets + BindFramebuffer bridge")
-            + fill;
-        assert!(fill < update);
-
-        let rasterizer = include_str!("gl_rasterizer.rs");
-        let rasterizer_runtime = rasterizer
-            .split(
-                "
-#[cfg(test)]
-mod tests",
-            )
-            .next()
-            .unwrap_or(rasterizer);
-        assert!(rasterizer_runtime.contains(".synchronize_then_configure_graphics_framebuffer("));
-        assert!(!rasterizer_runtime.contains(
-            "pipeline.fill_graphics_image_views_then_update_render_targets_and_bind_framebuffer("
-        ));
-        assert!(!rasterizer_runtime.contains("pipeline.fill_and_materialize_graphics_image_views("));
-        assert!(
-            !rasterizer_runtime.contains("pipeline.update_render_targets_and_bind_framebuffer(")
-        );
-    }
-
-    #[test]
-    fn configure_graphics_descriptors_then_fill_and_bind_framebuffer_owns_upstream_sequence() {
-        let source = include_str!("gl_graphics_pipeline.rs");
-        let method = source
-            .find("pub fn configure_graphics_descriptors_then_fill_and_bind_framebuffer")
-            .expect("configure_graphics_descriptors_then_fill_and_bind_framebuffer");
-        let next = source[method..]
-            .find("/// Bind host buffer resources")
-            .expect("next method boundary")
-            + method;
-        let body = &source[method..next];
-
-        let collect = body
-            .find("self.configure_enabled_stage_texture_image_descriptors(")
-            .expect("config_stage descriptor collection");
-        let sampler = body[collect..]
-            .find("texture_cache.base.get_graphics_sampler_id(tsc_id)")
-            .expect("TextureCache-owned sampler id lookup")
-            + collect;
-        let fill_update_bind = body[sampler..]
-            .find("self.fill_graphics_image_views_then_update_render_targets_and_bind_framebuffer(")
-            .expect("FillGraphicsImageViews -> UpdateRenderTargets -> BindFramebuffer")
-            + sampler;
-        assert!(collect < sampler);
-        assert!(sampler < fill_update_bind);
-
-        let rasterizer = include_str!("gl_rasterizer.rs");
-        let rasterizer_runtime = rasterizer
-            .split(
-                "
-#[cfg(test)]
-mod tests",
-            )
-            .next()
-            .unwrap_or(rasterizer);
-        assert!(rasterizer_runtime.contains(".synchronize_then_configure_graphics_framebuffer("));
-        assert!(!rasterizer_runtime
-            .contains("pipeline.configure_enabled_stage_texture_image_descriptors("));
-        assert!(!rasterizer_runtime.contains(
-            "pipeline.fill_graphics_image_views_then_update_render_targets_and_bind_framebuffer("
-        ));
-    }
-
-    #[test]
-    fn bind_host_stage_buffers_owns_upstream_prepare_stage_buffer_slice() {
-        let source = include_str!("gl_graphics_pipeline.rs");
-        let method = source
-            .find("pub fn prepare_stage_host_buffer_bindings")
-            .expect("prepare_stage_host_buffer_bindings");
-        let next = source[method..]
-            .find("/// Clear the transient host texture/image pointer bridge")
-            .expect("next method boundary")
-            + method;
-        let body = &source[method..next];
-
-        let set_image_pointers = body.find("set_image_pointers").expect("SetImagePointers");
-        let bind_host_stage_buffers = body
-            .find("bind_host_stage_buffers(stage)")
-            .expect("BindHostStageBuffers");
-        let texture_buffer_count = body
-            .find("num_texture_buffers[stage]")
-            .expect("texture-buffer slot skip");
-        let image_buffer_count = body
-            .find("num_image_buffers[stage]")
-            .expect("image-buffer slot skip");
-        assert!(set_image_pointers < bind_host_stage_buffers);
-        assert!(bind_host_stage_buffers < texture_buffer_count);
-        assert!(texture_buffer_count < image_buffer_count);
-        assert!(body.contains(".get(stage)"));
-
-        let rasterizer = include_str!("gl_rasterizer.rs");
-        let rasterizer_runtime = rasterizer
-            .split(
-                "
-#[cfg(test)]
-mod tests",
-            )
-            .next()
-            .unwrap_or(rasterizer);
-        assert!(rasterizer_runtime.contains(
-            "pipeline.configure_buffers_programs_then_prepare_and_bind_graphics_resources"
-        ));
-        assert!(!rasterizer_runtime.contains("pipeline.prepare_stage_host_buffer_bindings("));
-    }
-
-    #[test]
-    fn prepare_stage_texture_image_bindings_owns_upstream_prepare_stage_body() {
-        let source = include_str!("gl_graphics_pipeline.rs");
-        let method = source
-            .find("pub fn prepare_stage_texture_image_bindings")
-            .expect("prepare_stage_texture_image_bindings");
-        let next = source[method..]
-            .find("/// Prepare all enabled graphics stages")
-            .expect("next method boundary")
-            + method;
-        let body = &source[method..next];
-
-        let host = body
-            .find("prepare_stage_host_buffer_bindings(")
-            .expect("host stage buffer binding");
-        let sampled = body[host..]
-            .find("bind_stage_sampled_textures(")
-            .expect("sampled texture binding")
-            + host;
-        let storage = body[sampled..]
-            .find("bind_stage_storage_images(")
-            .expect("storage image binding")
-            + sampled;
-        let uniforms = body[storage..]
-            .find("upload_stage_uniforms(")
-            .expect("uniform upload")
-            + storage;
-        assert!(host < sampled);
-        assert!(sampled < storage);
-        assert!(storage < uniforms);
-        assert!(body.contains("observe(binding, texture_cache_ref)"));
-
-        let rasterizer = include_str!("gl_rasterizer.rs");
-        let rasterizer_runtime = rasterizer
-            .split(
-                "
-#[cfg(test)]
-mod tests",
-            )
-            .next()
-            .unwrap_or(rasterizer);
-        assert!(rasterizer_runtime.contains(
-            "pipeline.configure_buffers_programs_then_prepare_and_bind_graphics_resources"
-        ));
-        assert!(!rasterizer_runtime.contains("pipeline.upload_stage_uniforms("));
-    }
-
-    #[test]
-    fn prepare_enabled_graphics_texture_image_bindings_owns_upstream_stage_sequence() {
-        let source = include_str!("gl_graphics_pipeline.rs");
-        let method = source
-            .find("pub fn prepare_enabled_graphics_texture_image_bindings")
-            .expect("prepare_enabled_graphics_texture_image_bindings");
-        let next = source[method..]
-            .find("/// Update graphics buffers")
-            .expect("next method boundary")
-            + method;
-        let body = &source[method..next];
-
-        let loop_pos = body
-            .find("for stage in 0..NUM_STAGES.min(num_shader_stages)")
-            .expect("enabled stage loop");
-        let prepare = body[loop_pos..]
-            .find("prepare_stage_texture_image_bindings(")
-            .expect("prepare_stage call")
-            + loop_pos;
-        assert!(loop_pos < prepare);
-        assert!(body.contains("|binding, texture_cache| observe(binding, texture_cache)"));
-
-        let rasterizer = include_str!("gl_rasterizer.rs");
-        let rasterizer_runtime = rasterizer
-            .split(
-                "
-#[cfg(test)]
-mod tests",
-            )
-            .next()
-            .unwrap_or(rasterizer);
-        assert!(rasterizer_runtime.contains(
-            "pipeline.configure_buffers_programs_then_prepare_and_bind_graphics_resources"
-        ));
-        assert!(!rasterizer_runtime.contains("prepare_graphics_stage!"));
-    }
-
-    #[test]
-    fn prepare_and_bind_graphics_texture_image_arrays_owns_upstream_prepare_then_bulk_bind() {
-        let source = include_str!("gl_graphics_pipeline.rs");
-        let method = source
-            .find("pub fn prepare_and_bind_graphics_texture_image_arrays")
-            .expect("prepare_and_bind_graphics_texture_image_arrays");
-        let next = source[method..]
-            .find("/// Update graphics buffers")
-            .expect("next method boundary")
-            + method;
-        let body = &source[method..next];
-
-        let prepare = body
-            .find("self.prepare_enabled_graphics_texture_image_bindings(")
-            .expect("prepare-stage sequence");
-        let clear = body[prepare..]
-            .find("self.clear_host_stage_buffer_pointers(buffer_cache)")
-            .expect("host pointer cleanup")
-            + prepare;
-        let callback = body[clear..]
-            .find("before_bind(bindings, texture_cache)")
-            .expect("local diagnostic callback")
-            + clear;
-        let bind = body[callback..]
-            .find("self.bind_graphics_texture_image_arrays(")
-            .expect("final bulk bind")
-            + callback;
-        assert!(prepare < clear);
-        assert!(clear < callback);
-        assert!(callback < bind);
-
-        let rasterizer = include_str!("gl_rasterizer.rs");
-        let rasterizer_runtime = rasterizer
-            .split(
-                "
-#[cfg(test)]
-mod tests",
-            )
-            .next()
-            .unwrap_or(rasterizer);
-        assert!(rasterizer_runtime.contains(
-            "pipeline.configure_buffers_programs_then_prepare_and_bind_graphics_resources"
-        ));
-        assert!(!rasterizer_runtime
-            .contains("pipeline.prepare_enabled_graphics_texture_image_bindings("));
-        assert!(!rasterizer_runtime.contains("pipeline.bind_graphics_texture_image_arrays("));
-    }
-
-    #[test]
-    fn texture_buffer_binding_is_separated_from_prepare_stage_slots() {
-        let source = include_str!("gl_graphics_pipeline.rs");
-        let method = source
-            .find("pub fn bind_stage_texture_buffer_views")
-            .expect("bind_stage_texture_buffer_views");
-        let next = source[method..]
-            .find("/// Bind texture-buffer and image-buffer descriptors for all enabled graphics stages")
-            .expect("next method boundary")
-            + method;
-        let body = &source[method..next];
-
-        let unbind = body
-            .find("unbind_graphics_texture_buffers(stage)")
-            .expect("UnbindGraphicsTextureBuffers");
-        let texture_buffers = body[unbind..]
-            .find("for desc in &info.texture_buffer_descriptors")
-            .expect("texture-buffer loop")
-            + unbind;
-        let image_buffers = body[texture_buffers..]
-            .find("for desc in &info.image_buffer_descriptors")
-            .expect("image-buffer loop")
-            + texture_buffers;
-        let skip_textures = body[image_buffers..]
-            .find("for desc in &info.texture_descriptors")
-            .expect("sampled descriptor skip")
-            + image_buffers;
-        assert!(unbind < texture_buffers);
-        assert!(texture_buffers < image_buffers);
-        assert!(image_buffers < skip_textures);
-        assert!(!body.contains("texture_binding"));
-        assert!(!body.contains("image_binding"));
-        assert!(!body.contains("textures["));
-        assert!(!body.contains("images["));
-
-        let rasterizer = include_str!("gl_rasterizer.rs");
-        let rasterizer_runtime = rasterizer
-            .split(
-                "
-#[cfg(test)]
-mod tests",
-            )
-            .next()
-            .unwrap_or(rasterizer);
-        let first = rasterizer_runtime
-            .find("let mut texture_buffer_views_it")
-            .expect("bind_stage_info iterator");
-        let combined = rasterizer_runtime[first..]
-            .find("pipeline.configure_buffers_programs_then_prepare_and_bind_graphics_resources")
-            .expect("combined configure/prepare/bind helper")
-            + first;
-        assert!(first < combined);
-        assert!(!rasterizer_runtime.contains("stage_texture_pointer_offsets[stage]"));
-        assert!(!rasterizer_runtime.contains("pipeline.bind_stage_sampled_textures("));
-    }
-
-    #[test]
-    fn bind_enabled_stage_texture_buffer_views_owns_upstream_stage_sequence() {
-        let source = include_str!("gl_graphics_pipeline.rs");
-        let method = source
-            .find("pub fn bind_enabled_stage_texture_buffer_views")
-            .expect("bind_enabled_stage_texture_buffer_views");
-        let next = source[method..]
-            .find("/// Fill sampled-texture")
-            .expect("next method boundary")
-            + method;
-        let body = &source[method..next];
-
-        let loop_pos = body
-            .find("for stage in 0..NUM_STAGES.min(num_shader_stages)")
-            .expect("enabled stage loop");
-        let bind = body[loop_pos..]
-            .find("bind_stage_texture_buffer_views(")
-            .expect("bind_stage_info call")
-            + loop_pos;
-        assert!(loop_pos < bind);
-
-        let rasterizer = include_str!("gl_rasterizer.rs");
-        let rasterizer_runtime = rasterizer
-            .split(
-                "
-#[cfg(test)]
-mod tests",
-            )
-            .next()
-            .unwrap_or(rasterizer);
-        assert!(rasterizer_runtime.contains(
-            "pipeline.configure_buffers_programs_then_prepare_and_bind_graphics_resources"
-        ));
-        assert!(!rasterizer_runtime.contains("pipeline.bind_enabled_stage_texture_buffer_views("));
-        assert!(!rasterizer_runtime.contains("pipeline.bind_stage_texture_buffer_views("));
-    }
-
-    #[test]
-    fn configure_graphics_buffers_owns_upstream_update_then_geometry_bind_slice() {
-        let source = include_str!("gl_graphics_pipeline.rs");
-        let method = source
-            .find("pub fn configure_graphics_buffers<P")
-            .expect("configure_graphics_buffers");
-        let next = source[method..]
-            .find("/// Update graphics buffers through caller-provided")
-            .expect("next method boundary")
-            + method;
-        let body = &source[method..next];
-
-        let update = body
-            .find("update_graphics_buffers(is_indexed)")
-            .expect("UpdateGraphicsBuffers");
-        let bind = body
-            .find("bind_host_geometry_buffers(is_indexed)")
-            .expect("BindHostGeometryBuffers");
-        assert!(update < bind);
-
-        let method = source
-            .find("pub fn configure_graphics_buffers_and_bind_programs<P")
-            .expect("configure_graphics_buffers_and_bind_programs");
-        let next = source[method..]
-            .find("/// Update graphics buffers through caller-provided")
-            .expect("next method boundary")
-            + method;
-        let body = &source[method..next];
-        let configure_buffers = body
-            .find("self.configure_graphics_buffers(buffer_cache, is_indexed)")
-            .expect("graphics buffer helper");
-        let bind_programs = body[configure_buffers..]
-            .find("self.bind_graphics_programs_for_configure_with_program_manager(program_manager)")
-            .expect("program bind after graphics buffers")
-            + configure_buffers;
-        assert!(configure_buffers < bind_programs);
-
-        let source = include_str!("gl_graphics_pipeline.rs");
-        let method = source
-            .find("pub fn configure_graphics_buffers_with_gpu_resolver")
-            .expect("configure_graphics_buffers_with_gpu_resolver");
-        let next = source[method..]
-            .find("/// Update graphics buffers through caller-provided GPU address helpers,")
-            .expect("next method boundary")
-            + method;
-        let body = &source[method..next];
-        let update = body
-            .find("update_graphics_buffers_with_gpu_resolver")
-            .expect("UpdateGraphicsBuffers with resolver");
-        let bind = body
-            .find("bind_host_geometry_buffers(is_indexed)")
-            .expect("BindHostGeometryBuffers");
-        assert!(update < bind);
-
-        let method = source
-            .find("pub fn configure_graphics_buffers_and_bind_programs_with_gpu_resolver")
-            .expect("configure_graphics_buffers_and_bind_programs_with_gpu_resolver");
-        let next = source[method..]
-            .find("/// Bind texture-buffer views")
-            .expect("next method boundary")
-            + method;
-        let body = &source[method..next];
-        let configure_buffers = body
-            .find("self.configure_graphics_buffers_with_gpu_resolver(")
-            .expect("graphics buffer helper with resolver");
-        let bind_programs = body[configure_buffers..]
-            .find("self.bind_graphics_programs_for_configure_with_program_manager(program_manager)")
-            .expect("program bind after graphics buffers with resolver")
-            + configure_buffers;
-        assert!(configure_buffers < bind_programs);
-
-        let rasterizer = include_str!("gl_rasterizer.rs");
-        let rasterizer_runtime = rasterizer
-            .split(
-                "
-#[cfg(test)]
-mod tests",
-            )
-            .next()
-            .unwrap_or(rasterizer);
-        assert!(rasterizer_runtime.contains(
-            "pipeline.configure_buffers_programs_then_prepare_and_bind_graphics_resources"
-        ));
-        assert!(
-            rasterizer_runtime.contains("let mut program_manager = self.program_manager.lock()")
-        );
-        assert!(!rasterizer_runtime.contains("pipeline.bind_graphics_programs_for_configure()"));
-    }
-
-    #[test]
-    fn post_framebuffer_buffer_program_configure_slice_is_pipeline_owned() {
-        let source = include_str!("gl_graphics_pipeline.rs");
-        let method = source
-            .find(
-                "pub fn bind_texture_buffers_uniforms_then_configure_graphics_buffers_and_programs<",
-            )
-            .expect("combined post-framebuffer configure helper");
-        let next = source[method..]
-            .find("/// GPU-resolver variant")
-            .expect("next method boundary")
-            + method;
-        let body = &source[method..next];
-
-        let texture_buffers = body
-            .find("self.bind_enabled_stage_texture_buffer_views(")
-            .expect("bind_stage_info bridge");
-        let uniforms = body[texture_buffers..]
-            .find("self.bind_graphics_uniform_buffers(")
-            .expect("uniform buffer bridge")
-            + texture_buffers;
-        let buffers_programs = body[uniforms..]
-            .find("self.configure_graphics_buffers_and_bind_programs(")
-            .expect("graphics buffer/program configure")
-            + uniforms;
-        assert!(texture_buffers < uniforms);
-        assert!(uniforms < buffers_programs);
-
-        let method = source
-            .find("pub fn bind_texture_buffers_uniforms_then_configure_graphics_buffers_and_programs_with_gpu_resolver")
-            .expect("combined post-framebuffer configure helper with resolver");
-        let next = source[method..]
-            .find("/// Configure post-framebuffer buffers/programs, then prepare")
-            .expect("next method boundary")
-            + method;
-        let body = &source[method..next];
-        let texture_buffers = body
-            .find("self.bind_enabled_stage_texture_buffer_views(")
-            .expect("bind_stage_info bridge with resolver");
-        let uniforms = body[texture_buffers..]
-            .find("self.bind_graphics_uniform_buffers(")
-            .expect("uniform buffer bridge with resolver")
-            + texture_buffers;
-        let buffers_programs = body[uniforms..]
-            .find("self.configure_graphics_buffers_and_bind_programs_with_gpu_resolver(")
-            .expect("graphics buffer/program configure with resolver")
-            + uniforms;
-        assert!(texture_buffers < uniforms);
-        assert!(uniforms < buffers_programs);
-
-        let rasterizer = include_str!("gl_rasterizer.rs");
-        let rasterizer_runtime = rasterizer
-            .split(
-                "
-#[cfg(test)]
-mod tests",
-            )
-            .next()
-            .unwrap_or(rasterizer);
-        assert!(rasterizer_runtime.contains(
-            "pipeline.configure_buffers_programs_then_prepare_and_bind_graphics_resources"
-        ));
-        assert!(!rasterizer_runtime.contains(
-            "pipeline.bind_texture_buffers_uniforms_then_configure_graphics_buffers_and_programs"
-        ));
-        assert!(!rasterizer_runtime
-            .contains("pipeline.prepare_and_bind_graphics_texture_image_arrays("));
-        assert!(!rasterizer_runtime.contains("pipeline.bind_graphics_uniform_buffers("));
-        assert!(!rasterizer_runtime.contains("pipeline.bind_enabled_stage_texture_buffer_views("));
-        assert!(
-            !rasterizer_runtime.contains("pipeline.configure_graphics_buffers_and_bind_programs(")
-        );
-        assert!(!rasterizer_runtime
-            .contains("pipeline.configure_graphics_buffers_and_bind_programs_with_gpu_resolver("));
-    }
-
-    #[test]
-    fn post_framebuffer_configure_then_prepare_bind_slice_is_pipeline_owned() {
-        let source = include_str!("gl_graphics_pipeline.rs");
-        let method = source
-            .find("pub fn configure_buffers_programs_then_prepare_and_bind_graphics_resources<")
-            .expect("post-framebuffer configure/prepare/bind helper");
-        let next = source[method..]
-            .find("/// Configure post-framebuffer buffers/programs with GPU-memory helpers")
-            .expect("next method boundary")
-            + method;
-        let body = &source[method..next];
-
-        let configure = body
-            .find(
-                "self.bind_texture_buffers_uniforms_then_configure_graphics_buffers_and_programs(",
-            )
-            .expect("buffer/program configure helper");
-        let after_configure = body[configure..]
-            .find("after_buffer_programs();")
-            .expect("after buffer/program callback")
-            + configure;
-        let prepare = body[after_configure..]
-            .find("self.prepare_and_bind_graphics_texture_image_arrays(")
-            .expect("prepare/bulk-bind helper")
-            + after_configure;
-        assert!(configure < after_configure);
-        assert!(after_configure < prepare);
-
-        let method = source
-            .find("pub fn configure_buffers_programs_then_prepare_and_bind_graphics_resources_with_gpu_resolver")
-            .expect("post-framebuffer configure/prepare/bind helper with resolver");
-        let next = source[method..]
-            .find("/// Bind the current draw framebuffer")
-            .expect("next method boundary")
-            + method;
-        let body = &source[method..next];
-        let configure = body
-            .find("self.bind_texture_buffers_uniforms_then_configure_graphics_buffers_and_programs_with_gpu_resolver(")
-            .expect("buffer/program configure helper with resolver");
-        let after_configure = body[configure..]
-            .find("after_buffer_programs();")
-            .expect("after buffer/program callback with resolver")
-            + configure;
-        let prepare = body[after_configure..]
-            .find("self.prepare_and_bind_graphics_texture_image_arrays(")
-            .expect("prepare/bulk-bind helper with resolver")
-            + after_configure;
-        assert!(configure < after_configure);
-        assert!(after_configure < prepare);
-
-        let rasterizer = include_str!("gl_rasterizer.rs");
-        let rasterizer_runtime = rasterizer
-            .split(
-                "
-#[cfg(test)]
-mod tests",
-            )
-            .next()
-            .unwrap_or(rasterizer);
-        assert!(rasterizer_runtime.contains(
-            "pipeline.configure_buffers_programs_then_prepare_and_bind_graphics_resources"
-        ));
-        assert!(!rasterizer_runtime.contains(
-            "pipeline.bind_texture_buffers_uniforms_then_configure_graphics_buffers_and_programs"
-        ));
-        assert!(!rasterizer_runtime
-            .contains("pipeline.prepare_and_bind_graphics_texture_image_arrays("));
-    }
-
-    #[test]
-    fn bind_draw_framebuffer_owns_upstream_state_tracker_bind_slice() {
-        let source = include_str!("gl_graphics_pipeline.rs");
-        let method = source
-            .find("pub fn bind_draw_framebuffer")
-            .expect("bind_draw_framebuffer");
-        let next = source[method..]
-            .find("/// Configure transform feedback")
-            .expect("next method boundary")
-            + method;
-        let body = &source[method..next];
-
-        assert!(body.contains("state_tracker.bind_framebuffer(framebuffer)"));
-        assert!(!body.contains("gl::BindFramebuffer"));
-
-        let rasterizer = include_str!("gl_rasterizer.rs");
-        assert!(rasterizer.contains(".synchronize_then_configure_graphics_framebuffer("));
-        assert!(!rasterizer.contains(
-            "pipeline.fill_graphics_image_views_then_update_render_targets_and_bind_framebuffer("
-        ));
-        assert!(!rasterizer.contains("gl::BindFramebuffer(gl::DRAW_FRAMEBUFFER, framebuffer)"));
-    }
-
-    #[test]
-    fn update_render_targets_and_bind_framebuffer_owns_upstream_pair() {
-        let source = include_str!("gl_graphics_pipeline.rs");
-        let method = source
-            .find("pub fn update_render_targets_and_bind_framebuffer")
-            .expect("update_render_targets_and_bind_framebuffer");
-        let next = source[method..]
-            .find("/// Configure transform feedback")
-            .expect("next method boundary")
-            + method;
-        let body = &source[method..next];
-
-        let update = body
-            .find("update_render_targets_and_get_framebuffer_from_snapshot")
-            .expect("UpdateRenderTargets bridge");
-        let is_clear_false = body[update..]
-            .find("false")
-            .expect("UpdateRenderTargets(false)")
-            + update;
-        let bind = body[is_clear_false..]
-            .find("self.bind_draw_framebuffer(state_tracker, framebuffer)")
-            .expect("StateTracker framebuffer bind after update")
-            + is_clear_false;
-        assert!(update < is_clear_false);
-        assert!(is_clear_false < bind);
-
-        let rasterizer = include_str!("gl_rasterizer.rs");
-        assert!(rasterizer.contains(".synchronize_then_configure_graphics_framebuffer("));
-        assert!(!rasterizer.contains(
-            "pipeline.fill_graphics_image_views_then_update_render_targets_and_bind_framebuffer("
-        ));
-    }
-
-    #[test]
-    fn bind_graphics_texture_image_arrays_owns_upstream_bulk_binds() {
-        let source = include_str!("gl_graphics_pipeline.rs");
-        let method = source
-            .find("pub fn bind_graphics_texture_image_arrays")
-            .expect("bind_graphics_texture_image_arrays");
-        let next = source[method..]
-            .find("/// Configure transform feedback")
-            .expect("next method boundary")
-            + method;
-        let body = &source[method..next];
-
-        let assert_counts = body
-            .find("debug_assert_eq!(texture_binding, sampler_binding)")
-            .expect("upstream texture/sampler binding count assertion");
-        let bind_textures = body.find("gl::BindTextures").expect("glBindTextures");
-        let bind_samplers = body[bind_textures..]
-            .find("gl::BindSamplers")
-            .expect("glBindSamplers")
-            + bind_textures;
-        let bind_images = body[bind_samplers..]
-            .find("gl::BindImageTextures")
-            .expect("glBindImageTextures")
-            + bind_samplers;
-        assert!(assert_counts < bind_textures);
-        assert!(bind_textures < bind_samplers);
-        assert!(bind_samplers < bind_images);
-
-        let rasterizer = include_str!("gl_rasterizer.rs");
-        assert!(source.contains("self.bind_graphics_texture_image_arrays("));
-        assert!(rasterizer.contains(
-            "pipeline.configure_buffers_programs_then_prepare_and_bind_graphics_resources"
-        ));
-        assert!(rasterizer.contains("sampler_binding"));
-        assert!(!rasterizer.contains("gl::BindTextures(0, texture_binding as i32"));
-        assert!(!rasterizer.contains("gl::BindImageTextures(0, image_binding as i32"));
-    }
-
-    #[test]
-    fn graphics_texture_image_binding_state_owns_upstream_configure_arrays() {
-        let source = include_str!("gl_graphics_pipeline.rs");
-        let state = source
-            .find("pub struct GraphicsTextureImageBindingState")
-            .expect("GraphicsTextureImageBindingState");
-        let next = source[state..]
-            .find("fn trace_pipeline_build")
-            .expect("next item boundary")
-            + state;
-        let body = &source[state..next];
-
-        assert!(body.contains("pub textures: [u32; MAX_TEXTURES as usize]"));
-        assert!(body.contains("pub samplers: [u32; MAX_TEXTURES as usize]"));
-        assert!(body.contains("pub images: [u32; MAX_IMAGES as usize]"));
-        assert!(body.contains("pub texture_binding: usize"));
-        assert!(body.contains("pub sampler_binding: usize"));
-        assert!(body.contains("pub image_binding: usize"));
-        assert!(body.contains("pub sampler_it: usize"));
-        assert!(body.contains("pub views_it: usize"));
-
-        let rasterizer = include_str!("gl_rasterizer.rs");
-        let runtime = rasterizer
-            .split(
-                "
-#[cfg(test)]
-mod tests",
-            )
-            .next()
-            .unwrap_or(rasterizer);
-        assert!(runtime.contains("GraphicsTextureImageBindingState::new()"));
-        assert!(!runtime.contains("let mut textures: [u32;"));
-        assert!(!runtime.contains("let mut gl_samplers: [u32;"));
-        assert!(!runtime.contains("let mut images: [u32;"));
-        assert!(!runtime.contains("let mut texture_binding: usize"));
-        assert!(source.contains("&mut bindings.textures"));
-        assert!(runtime.contains("graphics_bindings.texture_binding"));
-        assert!(runtime.contains(
-            "pipeline.configure_buffers_programs_then_prepare_and_bind_graphics_resources"
-        ));
-    }
-
-    #[test]
-    fn bind_stage_sampled_textures_owns_upstream_sampled_texture_loop() {
-        let source = include_str!("gl_graphics_pipeline.rs");
-        let method = source
-            .find("pub fn bind_stage_sampled_textures")
-            .expect("bind_stage_sampled_textures");
-        let next = source[method..]
-            .find("/// Fill storage-image handles")
-            .expect("next method boundary")
-            + method;
-        let body = &source[method..next];
-
-        let descriptors = body
-            .find("for desc in &info.texture_descriptors")
-            .expect("texture descriptor loop");
-        let image_view = body[descriptors..]
-            .find("get_image_view(view_id)")
-            .expect("GetImageView")
-            + descriptors;
-        let handle = body[image_view..]
-            .find("handle_for_texture_type(desc.texture_type)")
-            .expect("ImageView::Handle")
-            + image_view;
-        let rescaling = body[handle..]
-            .find("image_view_is_rescaling")
-            .expect("IsRescaling")
-            + handle;
-        let sampler = body[rescaling..]
-            .find("get_sampler(sampler_id)")
-            .expect("GetSampler")
-            + rescaling;
-        let fallback = body[sampler..]
-            .find("handle_with_default_anisotropy")
-            .expect("anisotropy fallback")
-            + sampler;
-        let increment = body[fallback..]
-            .find("*texture_binding += 1")
-            .expect("texture binding increment")
-            + fallback;
-
-        assert!(descriptors < image_view);
-        assert!(image_view < handle);
-        assert!(handle < rescaling);
-        assert!(rescaling < sampler);
-        assert!(sampler < fallback);
-        assert!(fallback < increment);
-
-        let rasterizer = include_str!("gl_rasterizer.rs");
-        let rasterizer_runtime = rasterizer
-            .split(
-                "
-#[cfg(test)]
-mod tests",
-            )
-            .next()
-            .unwrap_or(rasterizer);
-        assert!(rasterizer_runtime.contains(
-            "pipeline.configure_buffers_programs_then_prepare_and_bind_graphics_resources"
-        ));
-        assert!(!rasterizer_runtime.contains("pipeline.bind_stage_sampled_textures("));
-        assert!(!rasterizer_runtime.contains("handle_for_texture_type(desc.texture_type)"));
-        assert!(!rasterizer_runtime.contains("handle_with_default_anisotropy()"));
-    }
-
-    #[test]
-    fn bind_stage_storage_images_owns_upstream_storage_image_loop() {
-        let source = include_str!("gl_graphics_pipeline.rs");
-        let method = source
-            .find("pub fn bind_stage_storage_images")
-            .expect("bind_stage_storage_images");
-        let next = source[method..]
-            .find("/// Configure transform feedback")
-            .expect("next method boundary")
-            + method;
-        let body = &source[method..next];
-
-        let descriptors = body
-            .find("for desc in &info.image_descriptors")
-            .expect("image descriptor loop");
-        let mark = body[descriptors..]
-            .find("mark_modification_by_id")
-            .expect("MarkModification")
-            + descriptors;
-        let storage = body[mark..].find(".storage_view(").expect("StorageView") + mark;
-        let rescaling = body[storage..]
-            .find("image_view_is_rescaling")
-            .expect("IsRescaling")
-            + storage;
-        assert!(descriptors < mark);
-        assert!(mark < storage);
-        assert!(storage < rescaling);
-
-        let rasterizer = include_str!("gl_rasterizer.rs");
-        let rasterizer_runtime = rasterizer
-            .split(
-                "
-#[cfg(test)]
-mod tests",
-            )
-            .next()
-            .unwrap_or(rasterizer);
-        assert!(rasterizer_runtime.contains(
-            "pipeline.configure_buffers_programs_then_prepare_and_bind_graphics_resources"
-        ));
-        assert!(!rasterizer_runtime.contains("pipeline.bind_stage_storage_images("));
     }
 }

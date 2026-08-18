@@ -16,7 +16,7 @@ pub const NODE_SIZE_MIN: usize = 1024;
 pub const NODE_SIZE_MAX: usize = 512 * 1024;
 
 /// Bucket tree header.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[repr(C)]
 pub struct BucketTreeHeader {
     pub magic: u32,
@@ -38,8 +38,8 @@ impl BucketTreeHeader {
         if self.magic != BUCKET_TREE_MAGIC {
             return Err(RESULT_INVALID_BUCKET_TREE_SIGNATURE);
         }
-        if self.version != BUCKET_TREE_VERSION {
-            return Err(RESULT_INVALID_BUCKET_TREE_SIGNATURE);
+        if self.version > BUCKET_TREE_VERSION {
+            return Err(RESULT_UNSUPPORTED_VERSION);
         }
         if self.entry_count < 0 {
             return Err(RESULT_INVALID_BUCKET_TREE_ENTRY_COUNT);
@@ -68,16 +68,22 @@ impl NodeHeader {
         if self.index != node_index {
             return Err(RESULT_INVALID_BUCKET_TREE_NODE_INDEX);
         }
+        if entry_size == 0 || node_size < entry_size + std::mem::size_of::<NodeHeader>() {
+            return Err(RESULT_INVALID_SIZE);
+        }
         let entry_count = get_entry_count(node_size, entry_size);
         if self.count <= 0 || self.count > entry_count {
             return Err(RESULT_INVALID_BUCKET_TREE_NODE_ENTRY_COUNT);
+        }
+        if self.offset < 0 {
+            return Err(RESULT_INVALID_BUCKET_TREE_NODE_OFFSET);
         }
         Ok(())
     }
 }
 
 /// Offsets.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[repr(C)]
 pub struct Offsets {
     pub start_offset: i64,
@@ -175,7 +181,7 @@ struct OffsetCache {
 pub struct BucketTree {
     node_storage: Option<VirtualFile>,
     entry_storage: Option<VirtualFile>,
-    node_l1: Vec<u8>,
+    node_l1: Mutex<Vec<u8>>,
     node_size: usize,
     entry_size: usize,
     entry_count: i32,
@@ -189,7 +195,7 @@ impl BucketTree {
         Self {
             node_storage: None,
             entry_storage: None,
-            node_l1: Vec::new(),
+            node_l1: Mutex::new(Vec::new()),
             node_size: 0,
             entry_size: 0,
             entry_count: 0,
@@ -217,27 +223,55 @@ impl BucketTree {
         assert!(node_size >= entry_size + std::mem::size_of::<NodeHeader>());
         assert!(NODE_SIZE_MIN <= node_size && node_size <= NODE_SIZE_MAX);
         assert!(node_size.is_power_of_two());
+        assert!(!self.is_initialized());
 
         if entry_count <= 0 {
-            self.node_size = node_size;
-            return Ok(());
+            return Err(RESULT_INVALID_ARGUMENT);
         }
 
-        self.node_l1 = vec![0u8; node_size];
-        node_storage.read(&mut self.node_l1, node_size, 0);
+        let mut node_l1 = vec![0u8; node_size];
+        node_storage.read(&mut node_l1, node_size, 0);
+
+        let header = unsafe { std::ptr::read_unaligned(node_l1.as_ptr().cast::<NodeHeader>()) };
+        header.verify(0, node_size, std::mem::size_of::<i64>())?;
+
+        let offset_count = get_offset_count(node_size);
+        let entry_set_count = get_entry_set_count(node_size, entry_size, entry_count);
+        let begin = std::mem::size_of::<NodeHeader>();
+        let first_offset = i64::from_le_bytes(node_l1[begin..begin + 8].try_into().unwrap());
+        let start_offset = if offset_count < entry_set_count && header.count < offset_count {
+            let end = begin + header.count as usize * std::mem::size_of::<i64>();
+            i64::from_le_bytes(node_l1[end..end + 8].try_into().unwrap())
+        } else {
+            first_offset
+        };
+        let end_offset = header.offset;
+        if start_offset < 0 || start_offset > first_offset || start_offset >= end_offset {
+            return Err(RESULT_INVALID_BUCKET_TREE_ENTRY_OFFSET);
+        }
 
         self.node_storage = Some(node_storage);
         self.entry_storage = Some(entry_storage);
+        *self.node_l1.get_mut().unwrap() = node_l1;
         self.node_size = node_size;
         self.entry_size = entry_size;
         self.entry_count = entry_count;
-        self.offset_count = get_offset_count(node_size);
-        self.entry_set_count = get_entry_set_count(node_size, entry_size, entry_count);
+        self.offset_count = offset_count;
+        self.entry_set_count = entry_set_count;
+
+        let mut cache = self.offset_cache.lock().unwrap();
+        cache.offsets.start_offset = start_offset;
+        cache.offsets.end_offset = end_offset;
+        cache.is_initialized = true;
 
         Ok(())
     }
 
     pub fn initialize_empty(&mut self, node_size: usize, end_offset: i64) {
+        assert!(NODE_SIZE_MIN <= node_size && node_size <= NODE_SIZE_MAX);
+        assert!(node_size.is_power_of_two());
+        assert!(end_offset > 0);
+        assert!(!self.is_initialized());
         self.node_size = node_size;
         let mut cache = self.offset_cache.lock().unwrap();
         cache.offsets = Offsets {
@@ -250,12 +284,16 @@ impl BucketTree {
     pub fn finalize(&mut self) {
         self.node_storage = None;
         self.entry_storage = None;
-        self.node_l1.clear();
+        self.node_l1.get_mut().unwrap().clear();
         self.node_size = 0;
         self.entry_size = 0;
         self.entry_count = 0;
         self.offset_count = 0;
         self.entry_set_count = 0;
+        let mut cache = self.offset_cache.lock().unwrap();
+        cache.offsets.start_offset = 0;
+        cache.offsets.end_offset = 0;
+        cache.is_initialized = false;
     }
 
     pub fn is_initialized(&self) -> bool {
@@ -274,33 +312,55 @@ impl BucketTree {
         Ok(cache.offsets)
     }
 
+    pub fn invalidate_cache(&self) -> Result<(), ResultCode> {
+        self.offset_cache.lock().unwrap().is_initialized = false;
+        Ok(())
+    }
+
     fn ensure_offset_cache(&self) -> Result<(), ResultCode> {
         let mut cache = self.offset_cache.lock().unwrap();
         if cache.is_initialized {
             return Ok(());
         }
 
-        if self.node_l1.len() >= std::mem::size_of::<NodeHeader>() {
-            let header: &NodeHeader = unsafe { &*(self.node_l1.as_ptr() as *const NodeHeader) };
-            cache.offsets.start_offset = header.offset;
+        let mut node_l1 = self.node_l1.lock().unwrap();
+        let node_storage = self.node_storage.as_ref().ok_or(RESULT_OUT_OF_RANGE)?;
+        node_storage.read(&mut node_l1, self.node_size, 0);
 
-            if let Some(ref es) = self.entry_storage {
-                let last_set_index = self.entry_set_count - 1;
-                let offset_in_storage = last_set_index as usize * self.node_size;
-                let mut buf = vec![0u8; self.node_size];
-                es.read(&mut buf, self.node_size, offset_in_storage);
-
-                let entry_set_header: &NodeHeader =
-                    unsafe { &*(buf.as_ptr() as *const NodeHeader) };
-                let last_entry_offset = std::mem::size_of::<NodeHeader>()
-                    + (entry_set_header.count as usize - 1) * self.entry_size;
-                if last_entry_offset + 8 <= buf.len() {
-                    let end_offset_bytes = &buf[last_entry_offset..last_entry_offset + 8];
-                    cache.offsets.end_offset =
-                        i64::from_le_bytes(end_offset_bytes.try_into().unwrap());
-                }
-            }
+        if node_l1.len() < std::mem::size_of::<NodeHeader>() {
+            return Err(RESULT_INVALID_BUCKET_TREE_NODE_ENTRY_COUNT);
         }
+
+        let header = unsafe { std::ptr::read_unaligned(node_l1.as_ptr().cast::<NodeHeader>()) };
+        header.verify(0, self.node_size, std::mem::size_of::<i64>())?;
+        let begin = std::mem::size_of::<NodeHeader>();
+        let offsets_len = header.count as usize * std::mem::size_of::<i64>();
+        if begin + offsets_len > node_l1.len() {
+            return Err(RESULT_INVALID_BUCKET_TREE_NODE_ENTRY_COUNT);
+        }
+        let offsets = &node_l1[begin..begin + offsets_len];
+        let first_offset = i64::from_le_bytes(offsets[..8].try_into().unwrap());
+        let start_offset =
+            if self.offset_count < self.entry_set_count && header.count < self.offset_count {
+                let end_index = header.count as usize * std::mem::size_of::<i64>();
+                if begin + end_index + 8 > node_l1.len() {
+                    return Err(RESULT_INVALID_BUCKET_TREE_NODE_ENTRY_COUNT);
+                }
+                i64::from_le_bytes(
+                    node_l1[begin + end_index..begin + end_index + 8]
+                        .try_into()
+                        .unwrap(),
+                )
+            } else {
+                first_offset
+            };
+        let end_offset = header.offset;
+        if start_offset < 0 || start_offset > first_offset || start_offset >= end_offset {
+            return Err(RESULT_INVALID_BUCKET_TREE_ENTRY_OFFSET);
+        }
+
+        cache.offsets.start_offset = start_offset;
+        cache.offsets.end_offset = end_offset;
 
         cache.is_initialized = true;
         Ok(())
@@ -334,15 +394,17 @@ impl BucketTree {
         if !self.is_exist_l2() {
             return false;
         }
-        if self.node_l1.len() < std::mem::size_of::<NodeHeader>() {
+        let node_l1 = self.node_l1.lock().unwrap();
+        if node_l1.len() < std::mem::size_of::<NodeHeader>() {
             return false;
         }
-        let header: &NodeHeader = unsafe { &*(self.node_l1.as_ptr() as *const NodeHeader) };
+        let header = unsafe { std::ptr::read_unaligned(node_l1.as_ptr().cast::<NodeHeader>()) };
         header.count < self.offset_count
     }
 
     fn get_entry_set_index(&self, node_index: i32, offset_index: i32) -> i64 {
-        let header: &NodeHeader = unsafe { &*(self.node_l1.as_ptr() as *const NodeHeader) };
+        let node_l1 = self.node_l1.lock().unwrap();
+        let header = unsafe { std::ptr::read_unaligned(node_l1.as_ptr().cast::<NodeHeader>()) };
         (self.offset_count - header.count) as i64
             + (self.offset_count as i64 * node_index as i64)
             + offset_index as i64
@@ -350,40 +412,33 @@ impl BucketTree {
 
     /// Get the begin offset from the L1 node (offset of the first entry in node body).
     fn get_l1_begin_offset(&self) -> i64 {
-        if self.node_l1.len() < std::mem::size_of::<NodeHeader>() {
+        let begin = std::mem::size_of::<NodeHeader>();
+        let node_l1 = self.node_l1.lock().unwrap();
+        if node_l1.len() < begin + std::mem::size_of::<i64>() {
             return 0;
         }
-        let header: &NodeHeader = unsafe { &*(self.node_l1.as_ptr() as *const NodeHeader) };
-        header.offset
+        i64::from_le_bytes(node_l1[begin..begin + 8].try_into().unwrap())
     }
 
-    /// Get the end offset from the L1 node (last i64 in the node body).
+    /// Get the end offset from the L1 node header.
     fn get_l1_end_offset(&self) -> i64 {
-        if self.node_l1.len() < std::mem::size_of::<NodeHeader>() {
+        let node_l1 = self.node_l1.lock().unwrap();
+        if node_l1.len() < std::mem::size_of::<NodeHeader>() {
             return 0;
         }
-        let header: &NodeHeader = unsafe { &*(self.node_l1.as_ptr() as *const NodeHeader) };
-        // The end offset is stored at the position after all count entries.
-        // In the node, after NodeHeader, there are `count` i64 offsets, followed by more.
-        // The end offset is the i64 at NodeHeader + count * sizeof(i64).
-        let end_pos =
-            std::mem::size_of::<NodeHeader>() + header.count as usize * std::mem::size_of::<i64>();
-        if end_pos + 8 <= self.node_l1.len() {
-            i64::from_le_bytes(self.node_l1[end_pos..end_pos + 8].try_into().unwrap())
-        } else {
-            0
-        }
+        unsafe { std::ptr::read_unaligned(node_l1.as_ptr().cast::<NodeHeader>()) }.offset
     }
 
     /// Read i64 offsets from the L1 node body (after NodeHeader).
     fn read_l1_offsets(&self, start_idx: usize, count: usize) -> Vec<i64> {
+        let node_l1 = self.node_l1.lock().unwrap();
         let header_size = std::mem::size_of::<NodeHeader>();
         let mut result = Vec::with_capacity(count);
         for i in start_idx..start_idx + count {
             let pos = header_size + i * std::mem::size_of::<i64>();
-            if pos + 8 <= self.node_l1.len() {
+            if pos + 8 <= node_l1.len() {
                 result.push(i64::from_le_bytes(
-                    self.node_l1[pos..pos + 8].try_into().unwrap(),
+                    node_l1[pos..pos + 8].try_into().unwrap(),
                 ));
             }
         }
@@ -575,7 +630,9 @@ impl<'a> Visitor<'a> {
 
         if tree.is_exist_offset_l2_on_l1() && virtual_address < tree.get_l1_begin_offset() {
             // Search in the L2 offset area on L1.
-            let header: &NodeHeader = unsafe { &*(tree.node_l1.as_ptr() as *const NodeHeader) };
+            let node_l1 = tree.node_l1.lock().unwrap();
+            let header = unsafe { std::ptr::read_unaligned(node_l1.as_ptr().cast::<NodeHeader>()) };
+            drop(node_l1);
             let l2_start = header.count as usize;
             let l2_count = tree.offset_count as usize - l2_start;
             let offsets = tree.read_l1_offsets(l2_start, l2_count);
@@ -588,7 +645,9 @@ impl<'a> Visitor<'a> {
             entry_set_index = (pos - 1) as i32;
         } else {
             // Search in the main offset area on L1.
-            let header: &NodeHeader = unsafe { &*(tree.node_l1.as_ptr() as *const NodeHeader) };
+            let node_l1 = tree.node_l1.lock().unwrap();
+            let header = unsafe { std::ptr::read_unaligned(node_l1.as_ptr().cast::<NodeHeader>()) };
+            drop(node_l1);
             let count = header.count as usize;
             let offsets = tree.read_l1_offsets(0, count);
 
@@ -884,7 +943,18 @@ mod tests {
             entry_count: 0,
             reserved: 0,
         };
-        assert!(header.verify().is_err());
+        assert_eq!(header.verify(), Err(RESULT_UNSUPPORTED_VERSION));
+    }
+
+    #[test]
+    fn test_bucket_tree_header_accepts_older_version() {
+        let header = BucketTreeHeader {
+            magic: BUCKET_TREE_MAGIC,
+            version: 0,
+            entry_count: 0,
+            reserved: 0,
+        };
+        assert_eq!(header.verify(), Ok(()));
     }
 
     #[test]
@@ -901,6 +971,26 @@ mod tests {
     #[test]
     fn test_node_header_size() {
         assert_eq!(std::mem::size_of::<NodeHeader>(), 0x10);
+    }
+
+    #[test]
+    fn node_header_verify_matches_upstream_validation_order() {
+        let valid = NodeHeader {
+            index: 0,
+            count: 1,
+            offset: 1,
+        };
+        assert_eq!(valid.verify(0, 1024, 0), Err(RESULT_INVALID_SIZE));
+        assert_eq!(valid.verify(0, 16, 8), Err(RESULT_INVALID_SIZE));
+
+        let negative_offset = NodeHeader {
+            offset: -1,
+            ..valid
+        };
+        assert_eq!(
+            negative_offset.verify(0, 1024, 8),
+            Err(RESULT_INVALID_BUCKET_TREE_NODE_OFFSET)
+        );
     }
 
     #[test]
@@ -1008,6 +1098,90 @@ mod tests {
     }
 
     #[test]
+    fn offset_cache_uses_node_begin_and_header_end() {
+        use crate::file_sys::vfs::vfs_vector::VectorVfsFile;
+        use std::sync::Arc;
+
+        let node_size = 1024;
+        let mut node = vec![0u8; node_size];
+        node[0..4].copy_from_slice(&0i32.to_le_bytes());
+        node[4..8].copy_from_slice(&1i32.to_le_bytes());
+        node[8..16].copy_from_slice(&0x4000i64.to_le_bytes());
+        node[16..24].copy_from_slice(&0x200i64.to_le_bytes());
+
+        let node_storage: VirtualFile = Arc::new(VectorVfsFile::new(node, String::new(), None));
+        let entry_storage: VirtualFile = Arc::new(VectorVfsFile::new(
+            vec![0u8; node_size],
+            String::new(),
+            None,
+        ));
+        let mut tree = BucketTree::new();
+        tree.initialize(node_storage, entry_storage, node_size, 0x10, 1)
+            .unwrap();
+
+        assert_eq!(
+            tree.get_offsets().unwrap(),
+            Offsets {
+                start_offset: 0x200,
+                end_offset: 0x4000,
+            }
+        );
+    }
+
+    #[test]
+    fn initialize_rejects_non_positive_entry_count() {
+        use crate::file_sys::vfs::vfs_vector::VectorVfsFile;
+        use std::sync::Arc;
+
+        let storage = || -> VirtualFile {
+            Arc::new(VectorVfsFile::new(vec![0u8; 1024], String::new(), None))
+        };
+        let mut tree = BucketTree::new();
+        assert_eq!(
+            tree.initialize(storage(), storage(), 1024, 0x10, 0),
+            Err(RESULT_INVALID_ARGUMENT)
+        );
+        assert!(!tree.is_initialized());
+    }
+
+    #[test]
+    fn invalidate_cache_rereads_l1_storage() {
+        use crate::file_sys::vfs::vfs::VfsFile;
+        use crate::file_sys::vfs::vfs_vector::VectorVfsFile;
+        use std::sync::Arc;
+
+        let node_size = 1024;
+        let mut node = vec![0u8; node_size];
+        node[0..4].copy_from_slice(&0i32.to_le_bytes());
+        node[4..8].copy_from_slice(&1i32.to_le_bytes());
+        node[8..16].copy_from_slice(&0x4000i64.to_le_bytes());
+        node[16..24].copy_from_slice(&0x200i64.to_le_bytes());
+
+        let node_file = Arc::new(VectorVfsFile::new(node, String::new(), None));
+        let node_storage: VirtualFile = node_file.clone();
+        let entry_storage: VirtualFile = Arc::new(VectorVfsFile::new(
+            vec![0u8; node_size],
+            String::new(),
+            None,
+        ));
+        let mut tree = BucketTree::new();
+        tree.initialize(node_storage, entry_storage, node_size, 0x10, 1)
+            .unwrap();
+
+        node_file.write(&0x6000i64.to_le_bytes(), 8, 8);
+        node_file.write(&0x300i64.to_le_bytes(), 8, 16);
+        tree.invalidate_cache().unwrap();
+
+        assert_eq!(
+            tree.get_offsets().unwrap(),
+            Offsets {
+                start_offset: 0x300,
+                end_offset: 0x6000,
+            }
+        );
+    }
+
+    #[test]
     fn test_query_header_storage_size() {
         assert_eq!(BucketTree::query_header_storage_size(), 0x10);
     }
@@ -1051,5 +1225,9 @@ mod tests {
         tree.finalize();
         assert!(!tree.is_initialized());
         assert_eq!(tree.get_entry_count(), 0);
+        let cache = tree.offset_cache.lock().unwrap();
+        assert_eq!(cache.offsets.start_offset, 0);
+        assert_eq!(cache.offsets.end_offset, 0);
+        assert!(!cache.is_initialized);
     }
 }

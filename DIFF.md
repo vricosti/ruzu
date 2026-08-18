@@ -493,3 +493,31 @@ and persisted under upstream's `UIGameList\\favorites_expanded` key.
 ### Binary layout verification
 
 - PASS: no structure layout changed.
+
+## 2026-08-18 — workspace SDL manifests vs Eden `src/audio_core/CMakeLists.txt`, `src/input_common/CMakeLists.txt`, and `src/yuzu_cmd/CMakeLists.txt`
+
+### Intentional differences
+
+- Eden links `SDL3::SDL3` supplied by CMake. Ruzu pins `sdl3` 0.18.4 and
+  `sdl3-sys` 0.6.8 (SDL 3.4.14) in the workspace and builds the static SDL3
+  library from source. This keeps the same SDL generation and one resolved
+  runtime across Linux, macOS, Windows, and BSD hosts without requiring a
+  platform package, pkg-config, or vcpkg SDL installation.
+- `input_common` uses the raw `sdl3-sys` API because its port mirrors the C API;
+  `audio_core` and `ruzu_cmd` use the higher-level `sdl3` crate while still
+  resolving the same `sdl3-sys` package and native SDL library.
+
+### Unintentional differences (to fix)
+
+- None found in the desktop SDL3 dependency ownership or generation.
+
+### Missing items
+
+- Cross-target dependency resolution was verified for Windows MSVC, macOS
+  aarch64, and FreeBSD. Native linking and runtime execution still require CI
+  or hardware for each target.
+
+### Binary layout verification
+
+- N/A: this change affects native dependency selection only. `audio_core` and
+  `input_common` unit tests pass with the resolved SDL 3.4.14 build.

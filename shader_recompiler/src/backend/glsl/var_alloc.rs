@@ -300,17 +300,6 @@ impl VarAlloc {
                 return imm.to_string();
             }
         }
-        if !id.is_valid() && std::env::var_os("RUZU_TRACE_GLSL_UNDEFINED_CONSUME").is_some() {
-            eprintln!(
-                "[GLSL_UNDEFINED_CONSUME] ref={}:{} opcode={} return_type={:?} use_count={} args={:?}",
-                inst_ref.block,
-                inst_ref.inst,
-                inst.opcode.name(),
-                inst.return_type(),
-                inst.use_count,
-                inst.args,
-            );
-        }
         if inst.use_count > 0 {
             inst.use_count -= 1;
         }

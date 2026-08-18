@@ -1418,6 +1418,7 @@ impl A64Jit {
         } else {
             DEFAULT_CODE_SIZE
         };
+        let effective_optimizations = config.effective_optimizations();
 
         // Phase 1: Create boxed JitInner with stable heap address
         let mut inner = Box::new(JitInner {
@@ -1625,7 +1626,7 @@ impl A64Jit {
             emit_config,
             run_callbacks,
             translation_options,
-            config.optimizations,
+            effective_optimizations,
             cache_size,
         )?;
         // Forward the per-emulator-core index so JIT-emit-time diagnostics
@@ -2881,6 +2882,7 @@ impl A32Jit {
         } else {
             DEFAULT_CODE_SIZE
         };
+        let effective_optimizations = config.effective_optimizations();
 
         let mut inner = Box::new(A32JitInner {
             jit_state: A32JitState::new(),
@@ -3080,8 +3082,12 @@ impl A32Jit {
             cntfrq_el0: config.cntfrq_el0,
         };
 
-        let mut emitter =
-            A32EmitX64::new(emit_config, run_callbacks, config.optimizations, cache_size)?;
+        let mut emitter = A32EmitX64::new(
+            emit_config,
+            run_callbacks,
+            effective_optimizations,
+            cache_size,
+        )?;
 
         let run_code_fn = unsafe { emitter.get_run_code_fn()? };
 
@@ -4476,6 +4482,124 @@ mod tests {
 
     #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
     #[test]
+    fn a32_fastmem_takes_precedence_over_page_table() {
+        let code: [u32; 2] = [
+            0xE590_1000, // ldr r1, [r0]
+            0xEF00_0000, // svc #0
+        ];
+        let mut callback_memory = vec![0u8; 0x10_000];
+        for (index, instruction) in code.iter().enumerate() {
+            callback_memory[index * 4..index * 4 + 4].copy_from_slice(&instruction.to_le_bytes());
+        }
+        callback_memory[0x2000..0x2004].copy_from_slice(&0xDEAD_BEEFu32.to_le_bytes());
+
+        let mapping = TestFastmemMapping::new(0x10_000);
+        mapping.map_u32(0x2000, 0xCAFE_BABE);
+        let page_table = vec![0usize; 1 << (16 - 12)];
+
+        let config = JitConfig {
+            callbacks: Box::new(MockCallbacks::from_memory(0, callback_memory)),
+            enable_cycle_counting: false,
+            code_cache_size: 4 * 1024 * 1024,
+            optimizations: OptimizationFlag::NO_OPTIMIZATIONS,
+            unsafe_optimizations: false,
+            global_monitor: None,
+            fastmem_pointer: Some(mapping.ptr.cast()),
+            page_table_pointer: Some(page_table.as_ptr().cast()),
+            define_unpredictable_behaviour: false,
+            processor_id: 0,
+            wall_clock_cntpct: false,
+            cntfrq_el0: 600_000_000,
+            tpidrro_el0: None,
+            tpidr_el0: None,
+            memory: crate::backend::x64::emit_context::MemoryEmitConfig {
+                fastmem_address_space_bits: 16,
+                silently_mirror_fastmem: true,
+                page_table_present: true,
+                page_table_address_space_bits: 16,
+                silently_mirror_page_table: true,
+                absolute_offset_page_table: true,
+                ..Default::default()
+            },
+        };
+        let mut jit = A32Jit::new(config).expect("A32 JIT");
+        jit.set_register(0, 0x2000);
+        jit.set_register(15, 0);
+
+        let halt = jit.run();
+
+        assert!(halt.contains(HaltReason::SVC));
+        assert_eq!(jit.get_register(1), 0xCAFE_BABE);
+
+        drop(jit);
+        drop(page_table);
+        drop(mapping);
+    }
+
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    #[test]
+    fn a32_fastmem_fault_recompiles_to_page_table() {
+        let code: [u32; 2] = [
+            0xE590_1000, // ldr r1, [r0]
+            0xEF00_0000, // svc #0
+        ];
+        let mut callback_memory = vec![0u8; 0x10_000];
+        for (index, instruction) in code.iter().enumerate() {
+            callback_memory[index * 4..index * 4 + 4].copy_from_slice(&instruction.to_le_bytes());
+        }
+        callback_memory[0x3000..0x3004].copy_from_slice(&0xDEAD_BEEFu32.to_le_bytes());
+
+        let mapping = TestFastmemMapping::new(0x10_000);
+        let mut page_memory = vec![0u8; 0x1000];
+        page_memory[0..4].copy_from_slice(&0xCAFE_BABEu32.to_le_bytes());
+        let mut page_table = vec![0usize; 1 << (16 - 12)];
+        page_table[3] = (page_memory.as_ptr() as usize).wrapping_sub(0x3000);
+
+        let config = JitConfig {
+            callbacks: Box::new(MockCallbacks::from_memory(0, callback_memory)),
+            enable_cycle_counting: false,
+            code_cache_size: 4 * 1024 * 1024,
+            optimizations: OptimizationFlag::NO_OPTIMIZATIONS,
+            unsafe_optimizations: false,
+            global_monitor: None,
+            fastmem_pointer: Some(mapping.ptr.cast()),
+            page_table_pointer: Some(page_table.as_ptr().cast()),
+            define_unpredictable_behaviour: false,
+            processor_id: 0,
+            wall_clock_cntpct: false,
+            cntfrq_el0: 600_000_000,
+            tpidrro_el0: None,
+            tpidr_el0: None,
+            memory: crate::backend::x64::emit_context::MemoryEmitConfig {
+                fastmem_address_space_bits: 16,
+                silently_mirror_fastmem: true,
+                page_table_present: true,
+                page_table_address_space_bits: 16,
+                silently_mirror_page_table: true,
+                absolute_offset_page_table: true,
+                ..Default::default()
+            },
+        };
+        let mut jit = A32Jit::new(config).expect("A32 JIT");
+        jit.set_register(0, 0x3000);
+        jit.set_register(15, 0);
+
+        assert!(jit.run().contains(HaltReason::SVC));
+        assert_eq!(jit.get_register(1), 0xDEAD_BEEF);
+
+        jit.clear_halt(HaltReason::SVC);
+        jit.set_register(15, 0);
+        assert!(jit.run().contains(HaltReason::SVC));
+        assert_eq!(jit.get_register(1), 0xCAFE_BABE);
+
+        drop(jit);
+        drop(page_table);
+        drop(page_memory);
+        drop(mapping);
+    }
+
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    #[test]
     fn a64_fastmem_fault_recompiles_only_faulting_access() {
         let code: [u32; 3] = [
             0xB940_0001, // ldr w1, [x0]
@@ -5406,6 +5530,171 @@ mod tests {
 
         assert_eq!(jit.get_register(8), u32::MAX as u64);
         assert_eq!(jit.get_fpsr(), initial_fpsr);
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn test_a64_scalar_frecpx_uses_fpcr_and_updates_fpsr() {
+        let code = [
+            0x5EA1_F820, // FRECPX S0, S1
+            0xD400_0001, // SVC #0
+        ];
+        let jit = run_a64_alu(&code, |jit| {
+            jit.set_vector(1, 0x7f80_0001, u64::MAX);
+            jit.set_fpcr(1 << 25);
+            jit.set_fpsr(1 << 1);
+        });
+
+        assert_eq!(jit.get_vector(0), (0x7fc0_0000, 0));
+        assert_eq!(jit.get_fpsr(), (1 << 1) | 1);
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn test_a64_scalar_frecps_uses_upstream_native_result() {
+        let code = [
+            0x5E22_FC20, // FRECPS S0, S1, S2
+            0xD400_0001, // SVC #0
+        ];
+        let jit = run_a64_alu(&code, |jit| {
+            jit.set_vector(1, 4.0f32.to_bits() as u64, u64::MAX);
+            jit.set_vector(2, 0.25f32.to_bits() as u64, u64::MAX);
+            jit.set_fpsr(0);
+        });
+
+        assert_eq!(jit.get_vector(0), (1.0f32.to_bits() as u64, 0));
+        assert_eq!(jit.get_fpsr(), 0);
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn test_a64_scalar_frecps_exception_uses_reference_fallback() {
+        let code = [
+            0x5E22_FC20, // FRECPS S0, S1, S2
+            0xD400_0001, // SVC #0
+        ];
+        let jit = run_a64_alu(&code, |jit| {
+            jit.set_vector(1, 0.0f32.to_bits() as u64, u64::MAX);
+            jit.set_vector(2, f32::INFINITY.to_bits() as u64, u64::MAX);
+            jit.set_fpsr(0);
+        });
+
+        assert_eq!(jit.get_vector(0), (2.0f32.to_bits() as u64, 0));
+        // The native FMA is attempted before its NaN redirects execution to
+        // the architectural helper, so Eden retains IOC in MXCSR.
+        assert_eq!(jit.get_fpsr(), 1);
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn test_a64_scalar_frsqrts_uses_fused_common_fp_path() {
+        let code = [
+            0x5EA2_FC20, // FRSQRTS S0, S1, S2
+            0xD400_0001, // SVC #0
+        ];
+        let jit = run_a64_alu(&code, |jit| {
+            jit.set_vector(1, 4.0f32.to_bits() as u64, u64::MAX);
+            jit.set_vector(2, 0.5f32.to_bits() as u64, u64::MAX);
+            jit.set_fpsr(0);
+        });
+
+        assert_eq!(jit.get_vector(0), (0.5f32.to_bits() as u64, 0));
+        assert_eq!(jit.get_fpsr(), 0);
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn test_a64_scalar_frsqrts_near_infinity_matches_upstream_fallback() {
+        let code = [
+            0x5EB8_FCAD, // FRSQRTS S13, S5, S24
+            0xD400_0001, // SVC #0
+        ];
+        let jit = run_a64_alu(&code, |jit| {
+            jit.set_vector(5, 0xFC6A_0206, 0);
+            jit.set_vector(24, 0xFC6A_0206, 0);
+            jit.set_fpcr(0x0040_0000);
+            jit.set_fpsr(0);
+        });
+
+        assert_eq!(jit.get_vector(13), (0xFF7F_FFFF, 0));
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn test_a64_vector_frecps_auto_uses_upstream_native_result() {
+        let code = [
+            0x4E22_FC20, // FRECPS V0.4S, V1.4S, V2.4S
+            0xD400_0001, // SVC #0
+        ];
+        let auto = OptimizationFlag::ALL_SAFE_OPTIMIZATIONS
+            | OptimizationFlag::UNSAFE_UNFUSE_FMA
+            | OptimizationFlag::UNSAFE_IGNORE_STANDARD_FPCR_VALUE
+            | OptimizationFlag::UNSAFE_INACCURATE_NAN;
+        let jit = run_a64_alu_with_optimizations(&code, auto, |jit| {
+            let v1_low = (4.0f32.to_bits() as u64) | ((8.0f32.to_bits() as u64) << 32);
+            let v1_high = (16.0f32.to_bits() as u64) | ((32.0f32.to_bits() as u64) << 32);
+            let v2_low = (0.25f32.to_bits() as u64) | ((0.125f32.to_bits() as u64) << 32);
+            let v2_high = (0.0625f32.to_bits() as u64) | ((0.03125f32.to_bits() as u64) << 32);
+            jit.set_vector(1, v1_low, v1_high);
+            jit.set_vector(2, v2_low, v2_high);
+            jit.set_fpsr(0);
+        });
+
+        let one_pair = (1.0f32.to_bits() as u64) | ((1.0f32.to_bits() as u64) << 32);
+        assert_eq!(jit.get_vector(0), (one_pair, one_pair));
+        assert_eq!(jit.get_fpsr(), 0);
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn test_a64_vector_frsqrts_auto_uses_upstream_native_result() {
+        let code = [
+            0x4EA2_FC20, // FRSQRTS V0.4S, V1.4S, V2.4S
+            0xD400_0001, // SVC #0
+        ];
+        let auto = OptimizationFlag::ALL_SAFE_OPTIMIZATIONS
+            | OptimizationFlag::UNSAFE_UNFUSE_FMA
+            | OptimizationFlag::UNSAFE_IGNORE_STANDARD_FPCR_VALUE
+            | OptimizationFlag::UNSAFE_INACCURATE_NAN;
+        let jit = run_a64_alu_with_optimizations(&code, auto, |jit| {
+            let v1_low = (4.0f32.to_bits() as u64) | ((8.0f32.to_bits() as u64) << 32);
+            let v1_high = (16.0f32.to_bits() as u64) | ((32.0f32.to_bits() as u64) << 32);
+            let v2_low = (0.5f32.to_bits() as u64) | ((0.25f32.to_bits() as u64) << 32);
+            let v2_high = (0.125f32.to_bits() as u64) | ((0.0625f32.to_bits() as u64) << 32);
+            jit.set_vector(1, v1_low, v1_high);
+            jit.set_vector(2, v2_low, v2_high);
+            jit.set_fpsr(0);
+        });
+
+        let half_pair = (0.5f32.to_bits() as u64) | ((0.5f32.to_bits() as u64) << 32);
+        assert_eq!(jit.get_vector(0), (half_pair, half_pair));
+        assert_eq!(jit.get_fpsr(), 0);
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn test_a64_vector_frsqrts_exception_uses_reference_fallback() {
+        let code = [
+            0x4EA2_FC20, // FRSQRTS V0.4S, V1.4S, V2.4S
+            0xD400_0001, // SVC #0
+        ];
+        let jit = run_a64_alu(&code, |jit| {
+            let v1_low = (0.0f32.to_bits() as u64) | ((4.0f32.to_bits() as u64) << 32);
+            let v1_high = (8.0f32.to_bits() as u64) | ((16.0f32.to_bits() as u64) << 32);
+            let v2_low = (f32::INFINITY.to_bits() as u64) | ((0.5f32.to_bits() as u64) << 32);
+            let v2_high = (0.25f32.to_bits() as u64) | ((0.125f32.to_bits() as u64) << 32);
+            jit.set_vector(1, v1_low, v1_high);
+            jit.set_vector(2, v2_low, v2_high);
+            jit.set_fpsr(0);
+        });
+
+        let low = (1.5f32.to_bits() as u64) | ((0.5f32.to_bits() as u64) << 32);
+        let high = (0.5f32.to_bits() as u64) | ((0.5f32.to_bits() as u64) << 32);
+        assert_eq!(jit.get_vector(0), (low, high));
+        // The speculative native FMA raises IOC for 0 * infinity before the
+        // vector is redirected to the reference fallback. Upstream retains
+        // that sticky host exception in FPSR.
+        assert_eq!(jit.get_fpsr(), 1);
     }
 
     #[cfg(target_arch = "x86_64")]

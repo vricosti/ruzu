@@ -49,11 +49,47 @@ impl RenderTargets {
 impl Hash for RenderTargets {
     /// Port of the `std::hash<RenderTargets>` specialisation.
     fn hash<H: Hasher>(&self, state: &mut H) {
-        self.depth_buffer_id.hash(state);
+        let mut value = self.depth_buffer_id.index as u64;
         for id in &self.color_buffer_ids {
-            id.hash(state);
+            value ^= id.index as u64;
         }
-        self.draw_buffers.hash(state);
-        self.size.hash(state);
+        value ^= u64::from_ne_bytes(self.draw_buffers);
+        // SAFETY: upstream bit-casts the same two-u32 `Extent2D` to `u64`.
+        // This transmute is also a compile-time assertion that both are 8 bytes.
+        value ^= u64::from_ne_bytes(unsafe { std::mem::transmute::<Extent2D, [u8; 8]>(self.size) });
+        state.write_u64(value);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use common::hash::BuildIdentityHasher;
+    use std::hash::BuildHasher;
+
+    fn hash_value(render_targets: &RenderTargets) -> u64 {
+        let mut hasher = BuildIdentityHasher.build_hasher();
+        render_targets.hash(&mut hasher);
+        hasher.finish()
+    }
+
+    #[test]
+    fn hash_matches_upstream_xor_and_ignores_rescale_flag() {
+        let mut render_targets = RenderTargets {
+            color_buffer_ids: std::array::from_fn(|index| ImageViewId {
+                index: (index as u32 + 1) * 0x11,
+            }),
+            depth_buffer_id: ImageViewId { index: 0x1234_5678 },
+            draw_buffers: [0, 1, 2, 3, 4, 5, 6, 7],
+            size: Extent2D {
+                width: 1280,
+                height: 720,
+            },
+            is_rescaled: false,
+        };
+
+        assert_eq!(hash_value(&render_targets), 0x0706_07d4_1136_52f0);
+        render_targets.is_rescaled = true;
+        assert_eq!(hash_value(&render_targets), 0x0706_07d4_1136_52f0);
     }
 }

@@ -259,6 +259,22 @@ fn emit_inst(ctx: &mut EmitContext, program: &mut ir::Program, inst_ref: InstRef
             GlslVarType::U32,
             "*",
         ),
+        Opcode::SDiv32 => emit_binary_expr(
+            ctx,
+            program,
+            inst_ref,
+            &inst_snapshot,
+            GlslVarType::U32,
+            |a, b| format!("uint(int({})/int({}))", a, b),
+        ),
+        Opcode::UDiv32 => emit_binary(
+            ctx,
+            program,
+            inst_ref,
+            &inst_snapshot,
+            GlslVarType::U32,
+            "/",
+        ),
         Opcode::INeg32 => emit_unary_expr(
             ctx,
             program,
@@ -511,7 +527,10 @@ fn emit_inst(ctx: &mut EmitContext, program: &mut ir::Program, inst_ref: InstRef
         | Opcode::CompositeConstructF64x4
         | Opcode::CompositeExtractF64x2
         | Opcode::CompositeExtractF64x3
-        | Opcode::CompositeExtractF64x4 => {
+        | Opcode::CompositeExtractF64x4
+        | Opcode::CompositeInsertF64x2
+        | Opcode::CompositeInsertF64x3
+        | Opcode::CompositeInsertF64x4 => {
             panic!(
                 "{:?} not implemented in GLSL backend (upstream NotImplemented)",
                 inst_snapshot.opcode
@@ -1333,6 +1352,12 @@ fn emit_inst(ctx: &mut EmitContext, program: &mut ir::Program, inst_ref: InstRef
         Opcode::ImageWrite => {
             emit_glsl_image::emit_image_write_inst(ctx, program, inst_ref, &inst_snapshot);
         }
+        Opcode::IsTextureScaled => {
+            emit_glsl_image::emit_is_texture_scaled_inst(ctx, program, inst_ref, &inst_snapshot);
+        }
+        Opcode::IsImageScaled => {
+            emit_glsl_image::emit_is_image_scaled_inst(ctx, program, inst_ref, &inst_snapshot);
+        }
         Opcode::ImageAtomicIAdd32 => {
             emit_glsl_image::emit_image_atomic_iadd32_inst(ctx, program, inst_ref, &inst_snapshot);
         }
@@ -2125,6 +2150,12 @@ fn emit_inst(ctx: &mut EmitContext, program: &mut ir::Program, inst_ref: InstRef
                 "gl_HelperInvocation".to_string(),
             );
         }
+        Opcode::SRWScaleFactorXY => {
+            emit_glsl_context_get_set::emit_sr_w_scale_factor_xy(ctx);
+        }
+        Opcode::SRWScaleFactorZ => {
+            emit_glsl_context_get_set::emit_sr_w_scale_factor_z(ctx);
+        }
         Opcode::LocalInvocationId => {
             add_assign(
                 ctx,
@@ -2623,6 +2654,7 @@ mod tests {
 
         assert!(source.contains("gl_FrontMaterial.ambient.a"));
         assert!(!source.contains("y_direction"));
+        assert!(source.starts_with("#version 460 compatibility\n"));
     }
 
     #[test]

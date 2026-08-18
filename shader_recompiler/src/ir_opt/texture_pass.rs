@@ -8,7 +8,7 @@
 //! descriptors and rewrites texture instructions with concrete descriptor
 //! indices.
 
-use crate::environment::Environment;
+use crate::environment::{CbufWordKey, ConstBufferAddr, Environment, HandleKey};
 use crate::host_translate_info::HostTranslateInfo;
 use crate::ir::basic_block::Block;
 use crate::ir::instruction::Inst;
@@ -17,41 +17,13 @@ use crate::ir::program::{Program, ShaderInfo, SyntaxNode};
 use crate::ir::types::TextureInstInfo;
 use crate::ir::value::{InstRef, Value};
 use crate::shader_info::{
-    ImageBufferDescriptor, ImageDescriptor, ImageFormat, TextureBufferDescriptor,
-    TextureDescriptor, TexturePixelFormat, TextureType,
+    num_descriptors, HasCount, ImageBufferDescriptor, ImageDescriptor, ImageFormat,
+    TextureBufferDescriptor, TextureDescriptor, TexturePixelFormat, TextureType,
 };
 
 const DESCRIPTOR_SIZE_SHIFT: u32 = 3;
 const DESCRIPTOR_SIZE: u32 = 8;
-
-#[derive(Debug, Clone, Copy)]
-struct ConstBufferAddr {
-    index: u32,
-    offset: u32,
-    shift_left: u32,
-    secondary_index: u32,
-    secondary_offset: u32,
-    secondary_shift_left: u32,
-    dynamic_offset: Value,
-    count: u32,
-    has_secondary: bool,
-}
-
-impl ConstBufferAddr {
-    fn bound(index: u32, offset: u32) -> Self {
-        Self {
-            index,
-            offset,
-            shift_left: 0,
-            secondary_index: 0,
-            secondary_offset: 0,
-            secondary_shift_left: 0,
-            dynamic_offset: Value::Void,
-            count: 1,
-            has_secondary: false,
-        }
-    }
-}
+const DESCRIPTOR_MAX_COUNT: u32 = 1024;
 
 #[derive(Debug, Clone, Copy)]
 struct TextureInst {
@@ -74,8 +46,7 @@ pub fn texture_pass(
 /// Upstream bound texture instructions enter `TexturePass` with Arg(0) as a
 /// byte offset into `env.TextureBoundBuffer()`. The pass creates/deduplicates
 /// a `TextureDescriptor`, then rewrites Arg(0) to the compact descriptor index
-/// used by backends. Bindless tracking, texture buffers, images, multisample,
-/// dynamic arrays and TIC-driven type refinement are still missing.
+/// used by backends.
 pub fn texture_pass_bound_textures(program: &mut Program, texture_bound_buffer: u32) {
     texture_pass_impl(
         program,
@@ -91,10 +62,17 @@ fn texture_pass_impl(
     env: Option<&mut dyn Environment>,
     texture_bound_buffer_override: Option<u32>,
 ) {
+    let mut host_info = host_info.clone();
+    host_info.apply_descriptor_limit_policy();
     let mut to_replace = Vec::new();
     let mut env = env;
+    if let Some(env) = env.as_deref_mut() {
+        env.texture_pass_caches().clear();
+    }
 
-    for (block_index, block) in program.blocks.iter().enumerate() {
+    let post_order_blocks = program.post_order_blocks.clone();
+    for block_index in post_order_blocks {
+        let block = &program.blocks[block_index as usize];
         for (inst_index, inst) in block.instructions.iter().enumerate() {
             let Some(inst) = inst.as_ref() else {
                 continue;
@@ -112,28 +90,22 @@ fn texture_pass_impl(
                         .unwrap_or(0);
                     ConstBufferAddr::bound(texture_bound_buffer, cbuf_offset)
                 }
-                value => match track(value, program, &mut env) {
-                    Some(cbuf) => cbuf,
-                    None => {
-                        log::warn!(
-                            "TexturePass: failed to track texture handle for {:?} at {}:{}",
-                            inst.opcode,
-                            block_index,
-                            inst_index
-                        );
-                        continue;
-                    }
-                },
+                value => track_cached(value, program, &mut env, &host_info).unwrap_or_else(|| {
+                    std::panic::panic_any(crate::exception::NotImplementedException::new(
+                        "Failed to track bindless texture constant buffer",
+                    ))
+                }),
             };
             to_replace.push(TextureInst {
-                block: block_index as u32,
+                block: block_index,
                 inst: inst_index as u32,
                 cbuf,
             });
         }
     }
 
-    to_replace.sort_by_key(|texture_inst| (texture_inst.cbuf.index, texture_inst.cbuf.offset));
+    to_replace
+        .sort_unstable_by_key(|texture_inst| (texture_inst.cbuf.index, texture_inst.cbuf.offset));
     if !to_replace.is_empty() {
         // Upstream `TexturePass` owns the texture/image descriptor vectors.
         // The Rust translators still opportunistically call `register_texture`
@@ -144,6 +116,26 @@ fn texture_pass_impl(
         program.info.texture_descriptors.clear();
         program.info.image_descriptors.clear();
     }
+    let sampled_dynamic_cap = dynamic_sampled_texture_cap(
+        &program.info,
+        &host_info,
+        dynamic_sampled_texture_array_count(&to_replace, program),
+    );
+    let mut last_integer_format: Option<(u32, u32, bool)> = None;
+    let mut is_texture_pixel_format_integer =
+        |env: &mut Option<&mut dyn Environment>, cbuf: &ConstBufferAddr| {
+            if let Some((index, offset, is_integer)) = last_integer_format {
+                if index == cbuf.index && offset == cbuf.offset {
+                    return is_integer;
+                }
+            }
+            let is_integer = env
+                .as_deref_mut()
+                .map(|env| is_texture_pixel_format_integer_cached(env, cbuf))
+                .unwrap_or(false);
+            last_integer_format = Some((cbuf.index, cbuf.offset, is_integer));
+            is_integer
+        };
 
     for texture_inst in to_replace {
         let inst_snapshot = program.blocks[texture_inst.block as usize].instructions
@@ -155,47 +147,64 @@ fn texture_pass_impl(
         let cbuf = texture_inst.cbuf;
         let indexed_opcode =
             indexed_instruction(inst_snapshot.opcode).unwrap_or(inst_snapshot.opcode);
-        let texture_type = env
-            .as_deref_mut()
-            .map(|env| read_texture_type(env, &cbuf))
-            .unwrap_or_else(|| texture_type_from_flags(flags));
-        if indexed_opcode == Opcode::ImageQueryDimensions {
-            flags.texture_type = texture_type as u8;
-        } else if indexed_opcode == Opcode::ImageFetch
-            && texture_type_from_flags(flags) == TextureType::Color1D
-            && texture_type == TextureType::Buffer
-        {
-            flags.texture_type = TextureType::Buffer as u8;
+        let mut image_fetch_can_be_multisample = false;
+        let mut is_multisample = false;
+        match indexed_opcode {
+            Opcode::ImageQueryDimensions => {
+                if let Some(env) = env.as_deref_mut() {
+                    flags.texture_type = read_texture_type_cached(env, &cbuf) as u8;
+                }
+            }
+            Opcode::ImageSampleImplicitLod => {
+                if texture_type_from_flags(flags) == TextureType::Color2D {
+                    let is_rect = env
+                        .as_deref_mut()
+                        .map(|env| read_texture_type_cached(env, &cbuf) == TextureType::Color2DRect)
+                        .unwrap_or(false);
+                    if is_rect {
+                        patch_image_sample_implicit_lod(
+                            &mut program.blocks[texture_inst.block as usize],
+                            texture_inst.block,
+                            texture_inst.inst,
+                            flags,
+                        );
+                    }
+                }
+            }
+            Opcode::ImageFetch => {
+                image_fetch_can_be_multisample = matches!(
+                    texture_type_from_flags(flags),
+                    TextureType::Color2D | TextureType::Color2DRect | TextureType::ColorArray2D
+                );
+                is_multisample = image_fetch_can_be_multisample
+                    && !matches!(inst_snapshot.args.get(4), None | Some(Value::Void));
+                if texture_type_from_flags(flags) == TextureType::Color1D {
+                    let is_buffer = env
+                        .as_deref_mut()
+                        .map(|env| read_texture_type_cached(env, &cbuf) == TextureType::Buffer)
+                        .unwrap_or(false);
+                    if is_buffer {
+                        flags.texture_type = TextureType::Buffer as u8;
+                    }
+                }
+            }
+            _ => {}
         }
-        let image_fetch_can_be_multisample = indexed_opcode == Opcode::ImageFetch
-            && matches!(
-                texture_type_from_flags(flags),
-                TextureType::Color2D | TextureType::Color2DRect | TextureType::ColorArray2D
-            );
-        let is_multisample = image_fetch_can_be_multisample
-            && !matches!(inst_snapshot.args.get(4), None | Some(Value::Void));
 
-        if indexed_opcode == Opcode::ImageSampleImplicitLod
-            && texture_type_from_flags(flags) == TextureType::Color2D
-            && texture_type == TextureType::Color2DRect
-        {
-            patch_image_sample_implicit_lod(
-                &mut program.blocks[texture_inst.block as usize],
-                texture_inst.block,
-                texture_inst.inst,
-                flags,
-            );
-        }
+        let size_shift = if cbuf.count > 1 {
+            dynamic_descriptor_size_shift(cbuf.dynamic_offset, program)
+        } else {
+            DESCRIPTOR_SIZE_SHIFT
+        };
+        let mut count = cbuf.count;
 
         let descriptor_index = if is_storage_image_instruction(indexed_opcode) {
             if cbuf.has_secondary {
-                log::warn!("TexturePass: unexpected separate sampler for image op");
-                continue;
+                std::panic::panic_any(crate::exception::NotImplementedException::new(
+                    "Unexpected separate sampler",
+                ));
             }
-            let is_integer = env
-                .as_deref_mut()
-                .map(|env| is_texture_pixel_format_integer(env, &cbuf))
-                .unwrap_or(false);
+            let is_integer = is_texture_pixel_format_integer(&mut env, &cbuf);
             if texture_type_from_flags(flags) == TextureType::Buffer {
                 add_image_buffer_descriptor(
                     &mut program.info.image_buffer_descriptors,
@@ -206,8 +215,8 @@ fn texture_pass_impl(
                         is_integer,
                         cbuf_index: cbuf.index,
                         cbuf_offset: cbuf.offset,
-                        count: cbuf.count,
-                        size_shift: DESCRIPTOR_SIZE_SHIFT,
+                        count,
+                        size_shift,
                     },
                 )
             } else {
@@ -221,8 +230,8 @@ fn texture_pass_impl(
                         is_integer,
                         cbuf_index: cbuf.index,
                         cbuf_offset: cbuf.offset,
-                        count: cbuf.count,
-                        size_shift: DESCRIPTOR_SIZE_SHIFT,
+                        count,
+                        size_shift,
                     },
                 )
             }
@@ -237,15 +246,18 @@ fn texture_pass_impl(
                     secondary_cbuf_index: cbuf.secondary_index,
                     secondary_cbuf_offset: cbuf.secondary_offset,
                     secondary_shift_left: cbuf.secondary_shift_left,
-                    count: cbuf.count,
-                    size_shift: DESCRIPTOR_SIZE_SHIFT,
+                    count,
+                    size_shift,
                 },
             )
         } else {
+            count = count.min(sampled_dynamic_cap);
+            let is_integer = is_texture_pixel_format_integer(&mut env, &cbuf);
             let descriptor = TextureDescriptor {
                 texture_type: texture_type_from_flags(flags),
                 is_depth: flags.is_depth,
                 is_multisample,
+                is_integer,
                 has_secondary: cbuf.has_secondary,
                 cbuf_index: cbuf.index,
                 cbuf_offset: cbuf.offset,
@@ -253,9 +265,10 @@ fn texture_pass_impl(
                 secondary_cbuf_index: cbuf.secondary_index,
                 secondary_cbuf_offset: cbuf.secondary_offset,
                 secondary_shift_left: cbuf.secondary_shift_left,
-                count: cbuf.count,
-                size_shift: DESCRIPTOR_SIZE_SHIFT,
+                count,
+                size_shift,
             };
+            flags.is_integer = is_integer;
             add_texture_descriptor(&mut program.info.texture_descriptors, descriptor)
         };
 
@@ -271,21 +284,21 @@ fn texture_pass_impl(
                 inst.args[4] = Value::Void;
             }
         }
-        let dynamic_index = if cbuf.count > 1 {
+        let dynamic_index = if count > 1 {
             let block = &mut program.blocks[texture_inst.block as usize];
             let shifted = insert_before(
                 block,
                 texture_inst.block,
                 texture_inst.inst,
-                Opcode::ShiftRightArithmetic32,
-                vec![cbuf.dynamic_offset, Value::ImmU32(DESCRIPTOR_SIZE_SHIFT)],
+                Opcode::ShiftRightLogical32,
+                vec![cbuf.dynamic_offset, Value::ImmU32(size_shift)],
             );
             insert_before(
                 block,
                 texture_inst.block,
                 texture_inst.inst,
                 Opcode::UMin32,
-                vec![shifted, Value::ImmU32(DESCRIPTOR_SIZE - 1)],
+                vec![shifted, Value::ImmU32(count - 1)],
             )
         } else {
             Value::Void
@@ -301,13 +314,99 @@ fn texture_pass_impl(
             && texture_type_from_flags(flags) == TextureType::Buffer
         {
             if let Some(env) = env.as_deref_mut() {
-                let pixel_format = read_texture_pixel_format(env, &cbuf);
+                let pixel_format = read_texture_pixel_format_cached(env, &cbuf);
                 if is_pixel_format_snorm(pixel_format) {
                     patch_texel_fetch(program, texture_inst.block, texture_inst.inst, pixel_format);
                 }
             }
         }
     }
+}
+
+fn dynamic_descriptor_size_shift(dynamic_offset: Value, program: &Program) -> u32 {
+    let Some(inst) = get_inst_recursive(program, dynamic_offset) else {
+        return DESCRIPTOR_SIZE_SHIFT;
+    };
+    if inst.opcode != Opcode::ShiftLeftLogical32 {
+        return DESCRIPTOR_SIZE_SHIFT;
+    }
+    let Some(shift) = inst.args.get(1).filter(|shift| shift.is_immediate()) else {
+        return DESCRIPTOR_SIZE_SHIFT;
+    };
+    let size_shift = shift.imm_u32();
+    if (DESCRIPTOR_SIZE_SHIFT..31).contains(&size_shift) {
+        size_shift
+    } else {
+        DESCRIPTOR_SIZE_SHIFT
+    }
+}
+
+fn dynamic_descriptor_count(base_offset: u32, size_shift: u32, max_descriptors: u32) -> u32 {
+    let descriptor_limit = max_descriptors.max(1);
+    let max_cbuf_bytes = 16 * descriptor_limit;
+    if size_shift >= 31 || base_offset >= max_cbuf_bytes {
+        return 1;
+    }
+    let stride = 1 << size_shift;
+    let available = max_cbuf_bytes - base_offset;
+    if available < DESCRIPTOR_SIZE {
+        return 1;
+    }
+    let available_count = 1 + (available - DESCRIPTOR_SIZE) / stride;
+    descriptor_limit.min(available_count)
+}
+
+fn static_descriptor_count<T: HasCount>(descriptors: &[T]) -> u32 {
+    descriptors
+        .iter()
+        .map(HasCount::descriptor_count)
+        .filter(|&count| count <= 1)
+        .sum()
+}
+
+fn dynamic_sampled_texture_cap(
+    info: &ShaderInfo,
+    host_info: &HostTranslateInfo,
+    dynamic_arrays: u32,
+) -> u32 {
+    let sampled_limit = host_info
+        .max_per_stage_descriptor_sampled_images
+        .min(host_info.max_descriptor_set_sampled_images)
+        .max(1);
+    let resource_limit = host_info.max_per_stage_resources.max(1);
+    if dynamic_arrays > 0 {
+        let sampled_static_count = static_descriptor_count(&info.texture_buffer_descriptors)
+            + static_descriptor_count(&info.texture_descriptors);
+        let resource_static_count = num_descriptors(&info.constant_buffer_descriptors)
+            + num_descriptors(&info.storage_buffers_descriptors)
+            + sampled_static_count
+            + num_descriptors(&info.image_buffer_descriptors)
+            + num_descriptors(&info.image_descriptors);
+        let sampled_cap = sampled_limit.saturating_sub(sampled_static_count) / dynamic_arrays;
+        let resource_cap = resource_limit.saturating_sub(resource_static_count) / dynamic_arrays;
+        return sampled_cap.min(resource_cap).max(1);
+    }
+    DESCRIPTOR_MAX_COUNT.min(sampled_limit).min(resource_limit)
+}
+
+fn dynamic_sampled_texture_array_count(to_replace: &[TextureInst], program: &Program) -> u32 {
+    to_replace
+        .iter()
+        .filter(|texture_inst| {
+            let Some(inst) = program.blocks[texture_inst.block as usize].instructions
+                [texture_inst.inst as usize]
+                .as_ref()
+            else {
+                return false;
+            };
+            let flags = TextureInstInfo::from_u32(inst.flags);
+            texture_inst.cbuf.count > 1
+                && !is_storage_image_instruction(
+                    indexed_instruction(inst.opcode).unwrap_or(inst.opcode),
+                )
+                && texture_type_from_flags(flags) != TextureType::Buffer
+        })
+        .count() as u32
 }
 
 fn get_inst<'a>(program: &'a Program, inst_ref: InstRef) -> Option<&'a Inst> {
@@ -319,40 +418,67 @@ fn get_inst<'a>(program: &'a Program, inst_ref: InstRef) -> Option<&'a Inst> {
         .as_ref()
 }
 
+fn get_inst_recursive(program: &Program, value: Value) -> Option<&Inst> {
+    let inst_ref = get_inst_ref_recursive(program, value)?;
+    get_inst(program, inst_ref)
+}
+
+fn get_inst_ref_recursive(program: &Program, mut value: Value) -> Option<InstRef> {
+    loop {
+        let Value::Inst(inst_ref) = value else {
+            return None;
+        };
+        let inst = get_inst(program, inst_ref)?;
+        if inst.opcode != Opcode::Identity {
+            return Some(inst_ref);
+        }
+        value = *inst.args.first()?;
+    }
+}
+
+fn track_cached(
+    value: Value,
+    program: &Program,
+    env: &mut Option<&mut dyn Environment>,
+    host_info: &HostTranslateInfo,
+) -> Option<ConstBufferAddr> {
+    let Some(key) = get_inst_ref_recursive(program, value) else {
+        return track(value, program, env, host_info);
+    };
+    if let Some(found) = env
+        .as_deref_mut()
+        .and_then(|env| env.texture_pass_caches().track_cache.get(&key).copied())
+    {
+        return Some(found);
+    }
+    let found = track(value, program, env, host_info);
+    if let (Some(env), Some(found)) = (env.as_deref_mut(), found) {
+        env.texture_pass_caches().track_cache.insert(key, found);
+    }
+    found
+}
+
 fn track(
     value: Value,
     program: &Program,
     env: &mut Option<&mut dyn Environment>,
+    host_info: &HostTranslateInfo,
 ) -> Option<ConstBufferAddr> {
-    track_inner(value, program, env, 0)
-}
-
-fn track_inner(
-    value: Value,
-    program: &Program,
-    env: &mut Option<&mut dyn Environment>,
-    depth: u32,
-) -> Option<ConstBufferAddr> {
-    if depth > 16 {
-        return None;
-    }
-    let Value::Inst(inst_ref) = value else {
-        return None;
-    };
-    let inst = get_inst(program, inst_ref)?;
-    try_get_const_buffer(inst, program, env, depth + 1)
+    crate::ir::breadth_first_search::breadth_first_search(value, program, |inst| {
+        try_get_const_buffer(inst, program, env, host_info)
+    })
 }
 
 fn try_get_const_buffer(
     inst: &Inst,
     program: &Program,
     env: &mut Option<&mut dyn Environment>,
-    depth: u32,
+    host_info: &HostTranslateInfo,
 ) -> Option<ConstBufferAddr> {
     match inst.opcode {
         Opcode::BitwiseOr32 => {
-            let mut lhs = track_inner(*inst.args.first()?, program, env, depth)?;
-            let mut rhs = track_inner(*inst.args.get(1)?, program, env, depth)?;
+            let mut lhs = track_cached(*inst.args.first()?, program, env, host_info)?;
+            let mut rhs = track_cached(*inst.args.get(1)?, program, env, host_info)?;
             if lhs.has_secondary || rhs.has_secondary || lhs.count > 1 || rhs.count > 1 {
                 return None;
             }
@@ -376,7 +502,7 @@ fn try_get_const_buffer(
             if !shift.is_immediate() {
                 return None;
             }
-            let mut lhs = track_inner(*inst.args.first()?, program, env, depth)?;
+            let mut lhs = track_cached(*inst.args.first()?, program, env, host_info)?;
             lhs.shift_left = shift.imm_u32();
             Some(lhs)
         }
@@ -399,10 +525,7 @@ fn try_get_const_buffer(
                 return None;
             }
             let mask = op2.imm_u32();
-            if mask == 0 {
-                return None;
-            }
-            let mut lhs = track_inner(op1, program, env, depth)?;
+            let mut lhs = track_cached(op1, program, env, host_info)?;
             lhs.shift_left = mask.trailing_zeros();
             Some(lhs)
         }
@@ -415,30 +538,34 @@ fn try_get_const_buffer(
             if offset.is_immediate() {
                 return Some(ConstBufferAddr::bound(index.imm_u32(), offset.imm_u32()));
             }
-            let Value::Inst(offset_ref) = offset else {
-                return None;
-            };
-            let offset_inst = get_inst(program, offset_ref)?;
+            let offset_inst = get_inst_recursive(program, offset)?;
             if offset_inst.opcode != Opcode::IAdd32 {
                 return None;
             }
             let lhs = *offset_inst.args.first()?;
             let rhs = *offset_inst.args.get(1)?;
-            if lhs.is_immediate() {
-                Some(ConstBufferAddr {
-                    count: DESCRIPTOR_SIZE,
-                    dynamic_offset: rhs,
-                    ..ConstBufferAddr::bound(index.imm_u32(), lhs.imm_u32())
-                })
+            let (base_offset, dynamic_offset) = if lhs.is_immediate() {
+                (lhs.imm_u32(), rhs)
             } else if rhs.is_immediate() {
-                Some(ConstBufferAddr {
-                    count: DESCRIPTOR_SIZE,
-                    dynamic_offset: lhs,
-                    ..ConstBufferAddr::bound(index.imm_u32(), rhs.imm_u32())
-                })
+                (rhs.imm_u32(), lhs)
             } else {
-                None
-            }
+                return None;
+            };
+            let size_shift = dynamic_descriptor_size_shift(dynamic_offset, program);
+            let sampled_limit = host_info
+                .max_per_stage_descriptor_sampled_images
+                .min(host_info.max_descriptor_set_sampled_images)
+                .max(1);
+            let resource_limit = host_info.max_per_stage_resources.max(1);
+            Some(ConstBufferAddr {
+                count: dynamic_descriptor_count(
+                    base_offset,
+                    size_shift,
+                    DESCRIPTOR_MAX_COUNT.min(sampled_limit).min(resource_limit),
+                ),
+                dynamic_offset,
+                ..ConstBufferAddr::bound(index.imm_u32(), base_offset)
+            })
         }
         _ => None,
     }
@@ -449,10 +576,7 @@ fn try_get_constant(
     program: &Program,
     env: &mut Option<&mut dyn Environment>,
 ) -> Option<u32> {
-    let Value::Inst(inst_ref) = value else {
-        return None;
-    };
-    let inst = get_inst(program, inst_ref)?;
+    let inst = get_inst_recursive(program, value)?;
     if inst.opcode != Opcode::GetCbufU32 {
         return None;
     }
@@ -462,7 +586,7 @@ fn try_get_constant(
         return None;
     }
     let env = env.as_deref_mut()?;
-    Some(env.read_cbuf_value(index.imm_u32(), offset.imm_u32()))
+    Some(read_cbuf_cached(env, index.imm_u32(), offset.imm_u32()))
 }
 
 fn is_texture_instruction(opcode: Opcode) -> bool {
@@ -607,7 +731,30 @@ fn image_format_from_flags(flags: TextureInstInfo) -> ImageFormat {
     ImageFormat::from_u8(flags.image_format)
 }
 
-fn get_texture_handle(env: &mut dyn Environment, cbuf: &ConstBufferAddr) -> u32 {
+fn read_cbuf_cached(env: &mut dyn Environment, index: u32, offset: u32) -> u32 {
+    let key = CbufWordKey { index, offset };
+    if let Some(value) = env.texture_pass_caches().cbuf_word_cache.get(&key).copied() {
+        return value;
+    }
+    let value = env.read_cbuf_value(index, offset);
+    env.texture_pass_caches().cbuf_word_cache.insert(key, value);
+    value
+}
+
+fn get_texture_handle_cached(env: &mut dyn Environment, cbuf: &ConstBufferAddr) -> u32 {
+    let key = HandleKey {
+        index: cbuf.index,
+        offset: cbuf.offset,
+        shift_left: cbuf.shift_left,
+        secondary_index: cbuf.secondary_index,
+        secondary_offset: cbuf.secondary_offset,
+        secondary_shift_left: cbuf.secondary_shift_left,
+        count: cbuf.count,
+        has_secondary: cbuf.has_secondary,
+    };
+    if let Some(handle) = env.texture_pass_caches().handle_cache.get(&key).copied() {
+        return handle;
+    }
     let secondary_index = if cbuf.has_secondary {
         cbuf.secondary_index
     } else {
@@ -618,27 +765,32 @@ fn get_texture_handle(env: &mut dyn Environment, cbuf: &ConstBufferAddr) -> u32 
     } else {
         cbuf.offset
     };
-    let lhs_raw = env.read_cbuf_value(cbuf.index, cbuf.offset) << cbuf.shift_left;
+    let lhs_raw = read_cbuf_cached(env, cbuf.index, cbuf.offset) << cbuf.shift_left;
     let rhs_raw =
-        env.read_cbuf_value(secondary_index, secondary_offset) << cbuf.secondary_shift_left;
-    lhs_raw | rhs_raw
+        read_cbuf_cached(env, secondary_index, secondary_offset) << cbuf.secondary_shift_left;
+    let handle = lhs_raw | rhs_raw;
+    env.texture_pass_caches().handle_cache.insert(key, handle);
+    handle
 }
 
-fn read_texture_type(env: &mut dyn Environment, cbuf: &ConstBufferAddr) -> TextureType {
-    let handle = get_texture_handle(env, cbuf);
+fn read_texture_type_cached(env: &mut dyn Environment, cbuf: &ConstBufferAddr) -> TextureType {
+    let handle = get_texture_handle_cached(env, cbuf);
     env.read_texture_type(handle)
 }
 
-fn read_texture_pixel_format(
+fn read_texture_pixel_format_cached(
     env: &mut dyn Environment,
     cbuf: &ConstBufferAddr,
 ) -> TexturePixelFormat {
-    let handle = get_texture_handle(env, cbuf);
+    let handle = get_texture_handle_cached(env, cbuf);
     env.read_texture_pixel_format(handle)
 }
 
-fn is_texture_pixel_format_integer(env: &mut dyn Environment, cbuf: &ConstBufferAddr) -> bool {
-    let handle = get_texture_handle(env, cbuf);
+fn is_texture_pixel_format_integer_cached(
+    env: &mut dyn Environment,
+    cbuf: &ConstBufferAddr,
+) -> bool {
+    let handle = get_texture_handle_cached(env, cbuf);
     env.is_texture_pixel_format_integer(handle)
 }
 
@@ -928,6 +1080,7 @@ fn add_texture_descriptor(
             && existing.size_shift == descriptor.size_shift
     }) {
         descriptors[index].is_multisample |= descriptor.is_multisample;
+        descriptors[index].is_integer |= descriptor.is_integer;
         return index as u32;
     }
     descriptors.push(descriptor);
@@ -1012,7 +1165,7 @@ pub fn join_texture_info(_base: &mut ShaderInfo, _source: &mut ShaderInfo) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::environment::Environment;
+    use crate::environment::{Environment, TexturePassCaches};
     use crate::ir::basic_block::Block;
     use crate::ir::instruction::Inst;
     use crate::ir::types::ShaderStage;
@@ -1021,27 +1174,42 @@ mod tests {
     use crate::stage::Stage;
 
     struct MockEnvironment {
+        texture_pass_caches: TexturePassCaches,
         sph: ProgramHeader,
         texture_type: TextureType,
         texture_pixel_format: TexturePixelFormat,
+        texture_type_reads: usize,
+        cbuf_reads: usize,
+        texture_handles: Vec<u32>,
+        integer_handles: Vec<u32>,
     }
 
     impl Default for MockEnvironment {
         fn default() -> Self {
             Self {
+                texture_pass_caches: TexturePassCaches::default(),
                 sph: ProgramHeader::default(),
                 texture_type: TextureType::Color2D,
                 texture_pixel_format: TexturePixelFormat::A8B8G8R8Unorm,
+                texture_type_reads: 0,
+                cbuf_reads: 0,
+                texture_handles: Vec::new(),
+                integer_handles: Vec::new(),
             }
         }
     }
 
     impl Environment for MockEnvironment {
+        fn texture_pass_caches(&mut self) -> &mut TexturePassCaches {
+            &mut self.texture_pass_caches
+        }
+
         fn read_instruction(&mut self, _address: u32) -> u64 {
             0
         }
 
         fn read_cbuf_value(&mut self, cbuf_index: u32, cbuf_offset: u32) -> u32 {
+            self.cbuf_reads += 1;
             match (cbuf_index, cbuf_offset) {
                 // Upstream TryGetConstant resolves only bank 1 constants.
                 (1, 0x10) => 0x38,
@@ -1051,7 +1219,9 @@ mod tests {
             }
         }
 
-        fn read_texture_type(&mut self, _raw_handle: u32) -> TextureType {
+        fn read_texture_type(&mut self, raw_handle: u32) -> TextureType {
+            self.texture_type_reads += 1;
+            self.texture_handles.push(raw_handle);
             self.texture_type
         }
 
@@ -1059,7 +1229,8 @@ mod tests {
             self.texture_pixel_format
         }
 
-        fn is_texture_pixel_format_integer(&mut self, _raw_handle: u32) -> bool {
+        fn is_texture_pixel_format_integer(&mut self, raw_handle: u32) -> bool {
+            self.integer_handles.push(raw_handle);
             false
         }
 
@@ -1119,10 +1290,16 @@ mod tests {
         }
     }
 
-    #[test]
-    fn bound_texture_pass_rewrites_handle_to_descriptor_index() {
+    fn fragment_program() -> Program {
         let mut program = Program::new(ShaderStage::Fragment);
         program.blocks.push(Block::new());
+        program.post_order_blocks.push(0);
+        program
+    }
+
+    #[test]
+    fn bound_texture_pass_rewrites_handle_to_descriptor_index() {
+        let mut program = fragment_program();
         let flags = TextureInstInfo {
             texture_type: 2,
             ..Default::default()
@@ -1148,9 +1325,179 @@ mod tests {
     }
 
     #[test]
-    fn texture_pass_tracks_separate_texture_sampler_or_handle() {
-        let mut program = Program::new(ShaderStage::Fragment);
+    fn explicit_lod_does_not_read_texture_type() {
+        let mut program = fragment_program();
+        let flags = TextureInstInfo {
+            texture_type: TextureType::Buffer as u8,
+            ..Default::default()
+        }
+        .to_u32();
+        program.blocks[0].instructions.push(Some(Inst::with_flags(
+            Opcode::BoundImageSampleExplicitLod,
+            vec![Value::ImmU32(0x28), Value::Void],
+            flags,
+        )));
+        let mut env = MockEnvironment::default();
+
+        texture_pass(&mut env, &mut program, &HostTranslateInfo::default());
+
+        assert_eq!(env.texture_type_reads, 0);
+        assert_eq!(
+            program.blocks[0].instructions[0]
+                .as_ref()
+                .expect("texture instruction")
+                .opcode,
+            Opcode::ImageSampleExplicitLod
+        );
+    }
+
+    #[test]
+    fn texture_handle_reads_are_cached_for_each_texture_pass() {
+        fn make_program() -> Program {
+            let mut program = fragment_program();
+            let flags = TextureInstInfo {
+                texture_type: TextureType::Color2D as u8,
+                ..Default::default()
+            }
+            .to_u32();
+            for _ in 0..2 {
+                program.blocks[0].instructions.push(Some(Inst::with_flags(
+                    Opcode::BoundImageSampleImplicitLod,
+                    vec![Value::ImmU32(0x28), Value::Void],
+                    flags,
+                )));
+            }
+            program
+        }
+
+        let mut env = MockEnvironment::default();
+        let mut first = make_program();
+        texture_pass(&mut env, &mut first, &HostTranslateInfo::default());
+
+        // ReadTextureType and IsTexturePixelFormatInteger consume the same
+        // handle. Eden resolves its cbuf word only once during the pass.
+        assert_eq!(env.cbuf_reads, 1);
+        assert_eq!(env.texture_handles, vec![0, 0]);
+        assert_eq!(env.integer_handles, vec![0]);
+
+        let mut second = make_program();
+        texture_pass(&mut env, &mut second, &HostTranslateInfo::default());
+
+        // TexturePass clears all three Environment caches at entry.
+        assert_eq!(env.cbuf_reads, 2);
+        assert_eq!(env.texture_handles, vec![0, 0, 0, 0]);
+        assert_eq!(env.integer_handles, vec![0, 0]);
+    }
+
+    #[test]
+    fn texture_pass_only_visits_upstream_post_order_blocks() {
+        let mut program = fragment_program();
         program.blocks.push(Block::new());
+        let flags = TextureInstInfo {
+            texture_type: TextureType::Color2D as u8,
+            ..Default::default()
+        }
+        .to_u32();
+        program.blocks[0].append_inst(Inst::with_flags(
+            Opcode::BoundImageSampleExplicitLod,
+            vec![Value::ImmU32(0x28), Value::Void],
+            flags,
+        ));
+        program.blocks[1].append_inst(Inst::with_flags(
+            Opcode::BoundImageSampleExplicitLod,
+            vec![Value::ImmU32(0x70), Value::Void],
+            flags,
+        ));
+
+        texture_pass_bound_textures(&mut program, 3);
+
+        assert_eq!(program.info.texture_descriptors.len(), 1);
+        assert_eq!(program.info.texture_descriptors[0].cbuf_offset, 0x28);
+        assert_eq!(
+            program.blocks[1].inst(0).opcode,
+            Opcode::BoundImageSampleExplicitLod
+        );
+    }
+
+    #[test]
+    fn texture_pass_preserves_upstream_untracked_bindless_exception() {
+        let mut program = fragment_program();
+        let unknown_handle = program.blocks[0].append_inst(Inst::new(
+            Opcode::IAdd32,
+            vec![Value::ImmU32(1), Value::ImmU32(2)],
+        ));
+        program.blocks[0].append_inst(Inst::with_flags(
+            Opcode::BindlessImageSampleExplicitLod,
+            vec![
+                Value::Inst(InstRef {
+                    block: 0,
+                    inst: unknown_handle,
+                }),
+                Value::Void,
+            ],
+            TextureInstInfo {
+                texture_type: TextureType::Color2D as u8,
+                ..Default::default()
+            }
+            .to_u32(),
+        ));
+        let mut env = MockEnvironment::default();
+
+        let payload = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            texture_pass(&mut env, &mut program, &HostTranslateInfo::default());
+        }))
+        .expect_err("upstream rejects an untracked bindless texture handle");
+
+        let exception = payload
+            .downcast_ref::<crate::exception::NotImplementedException>()
+            .expect("failure must remain a shader NotImplementedException");
+        assert_eq!(
+            exception.to_string(),
+            "Failed to track bindless texture constant buffer is not implemented"
+        );
+    }
+
+    #[test]
+    fn zero_texture_handle_mask_preserves_upstream_countr_zero() {
+        let mut program = fragment_program();
+        let cbuf = program.blocks[0].append_inst(Inst::new(
+            Opcode::GetCbufU32,
+            vec![Value::ImmU32(4), Value::ImmU32(0x40)],
+        ));
+        let masked = program.blocks[0].append_inst(Inst::new(
+            Opcode::BitwiseAnd32,
+            vec![
+                Value::Inst(InstRef {
+                    block: 0,
+                    inst: cbuf,
+                }),
+                Value::ImmU32(0),
+            ],
+        ));
+        program.blocks[0].append_inst(Inst::with_flags(
+            Opcode::BindlessImageSampleExplicitLod,
+            vec![
+                Value::Inst(InstRef {
+                    block: 0,
+                    inst: masked,
+                }),
+                Value::Void,
+            ],
+            TextureInstInfo {
+                texture_type: TextureType::Color2D as u8,
+                ..Default::default()
+            }
+            .to_u32(),
+        ));
+
+        texture_pass_bound_textures(&mut program, 0);
+
+        assert_eq!(program.info.texture_descriptors[0].shift_left, 32);
+    }
+
+    #[test]
+    fn texture_pass_tracks_separate_texture_sampler_or_handle() {
+        let mut program = fragment_program();
         let block = &mut program.blocks[0];
         block.instructions.push(Some(Inst::new(
             Opcode::GetCbufU32,
@@ -1205,9 +1552,91 @@ mod tests {
     }
 
     #[test]
+    fn texture_pass_tracks_cbuf_through_upstream_breadth_first_search() {
+        let mut program = fragment_program();
+        let block = &mut program.blocks[0];
+        block.append_inst(Inst::new(
+            Opcode::GetCbufU32,
+            vec![Value::ImmU32(6), Value::ImmU32(0x70)],
+        ));
+        // IAdd32 is not a texture-handle transform recognized by
+        // TryGetConstBuffer. Eden's Track still searches its arguments.
+        block.append_inst(Inst::new(
+            Opcode::IAdd32,
+            vec![Value::Inst(InstRef { block: 0, inst: 0 }), Value::ImmU32(0)],
+        ));
+        let flags = TextureInstInfo {
+            texture_type: TextureType::Color2D as u8,
+            ..Default::default()
+        }
+        .to_u32();
+        block.append_inst(Inst::with_flags(
+            Opcode::ImageSampleImplicitLod,
+            vec![Value::Inst(InstRef { block: 0, inst: 1 }), Value::Void],
+            flags,
+        ));
+
+        texture_pass_bound_textures(&mut program, 0);
+
+        let descriptor = &program.info.texture_descriptors[0];
+        assert_eq!(descriptor.cbuf_index, 6);
+        assert_eq!(descriptor.cbuf_offset, 0x70);
+    }
+
+    #[test]
+    fn texture_pass_tracks_bindless_handle_through_phi_operands() {
+        let mut program = fragment_program();
+        let block = &mut program.blocks[0];
+        let left = block.append_inst(Inst::new(
+            Opcode::GetCbufU32,
+            vec![Value::ImmU32(4), Value::ImmU32(0x20)],
+        ));
+        let right = block.append_inst(Inst::new(
+            Opcode::GetCbufU32,
+            vec![Value::ImmU32(5), Value::ImmU32(0x40)],
+        ));
+        let mut phi = Inst::phi();
+        phi.add_phi_operand(
+            0,
+            Value::Inst(InstRef {
+                block: 0,
+                inst: left,
+            }),
+        );
+        phi.add_phi_operand(
+            0,
+            Value::Inst(InstRef {
+                block: 0,
+                inst: right,
+            }),
+        );
+        let phi = block.append_inst(phi);
+        block.append_inst(Inst::with_flags(
+            Opcode::BindlessImageSampleExplicitLod,
+            vec![
+                Value::Inst(InstRef {
+                    block: 0,
+                    inst: phi,
+                }),
+                Value::Void,
+            ],
+            TextureInstInfo {
+                texture_type: TextureType::Color2D as u8,
+                ..Default::default()
+            }
+            .to_u32(),
+        ));
+
+        texture_pass_bound_textures(&mut program, 0);
+
+        let descriptor = &program.info.texture_descriptors[0];
+        assert_eq!(descriptor.cbuf_index, 5);
+        assert_eq!(descriptor.cbuf_offset, 0x40);
+    }
+
+    #[test]
     fn texture_pass_tracks_dynamic_cbuf_offset_as_descriptor_array() {
-        let mut program = Program::new(ShaderStage::Fragment);
-        program.blocks.push(Block::new());
+        let mut program = fragment_program();
         let block = &mut program.blocks[0];
         block.append_inst(Inst::new(
             Opcode::IAdd32,
@@ -1240,7 +1669,7 @@ mod tests {
         let desc = &program.info.texture_descriptors[0];
         assert_eq!(desc.cbuf_index, 5);
         assert_eq!(desc.cbuf_offset, 0x80);
-        assert_eq!(desc.count, DESCRIPTOR_SIZE);
+        assert_eq!(desc.count, DESCRIPTOR_MAX_COUNT);
         assert_eq!(desc.size_shift, DESCRIPTOR_SIZE_SHIFT);
         let inst = program.blocks[0].instructions[2].as_ref().unwrap();
         let Value::Inst(dynamic_index) = inst.args[0] else {
@@ -1254,9 +1683,9 @@ mod tests {
             .indexed_iter()
             .map(|(_, inst)| inst.opcode)
             .collect();
-        let asr_pos = ordered_opcodes
+        let shift_pos = ordered_opcodes
             .iter()
-            .position(|&opcode| opcode == Opcode::ShiftRightArithmetic32)
+            .position(|&opcode| opcode == Opcode::ShiftRightLogical32)
             .unwrap();
         let umin_pos = ordered_opcodes
             .iter()
@@ -1266,14 +1695,50 @@ mod tests {
             .iter()
             .position(|&opcode| opcode == Opcode::ImageSampleImplicitLod)
             .unwrap();
-        assert!(asr_pos < umin_pos);
+        assert!(shift_pos < umin_pos);
         assert!(umin_pos < sample_pos);
     }
 
     #[test]
+    fn dynamic_descriptor_count_matches_upstream_cbuf_budget() {
+        assert_eq!(dynamic_descriptor_count(0, 3, 1024), 1024);
+        assert_eq!(dynamic_descriptor_count(0x80, 3, 1024), 1024);
+        assert_eq!(dynamic_descriptor_count(0x80, 5, 16), 4);
+        assert_eq!(dynamic_descriptor_count(0x100, 3, 16), 1);
+        assert_eq!(dynamic_descriptor_count(0, 31, 1024), 1);
+    }
+
+    #[test]
+    fn dynamic_sampled_texture_cap_reserves_static_resources() {
+        let mut info = ShaderInfo::default();
+        info.texture_descriptors.push(TextureDescriptor {
+            texture_type: TextureType::Color2D,
+            is_depth: false,
+            is_multisample: false,
+            is_integer: false,
+            has_secondary: false,
+            cbuf_index: 0,
+            cbuf_offset: 0,
+            shift_left: 0,
+            secondary_cbuf_index: 0,
+            secondary_cbuf_offset: 0,
+            secondary_shift_left: 0,
+            count: 1,
+            size_shift: DESCRIPTOR_SIZE_SHIFT,
+        });
+        let host_info = HostTranslateInfo {
+            max_per_stage_descriptor_sampled_images: 9,
+            max_descriptor_set_sampled_images: 7,
+            max_per_stage_resources: 5,
+            ..HostTranslateInfo::default()
+        };
+
+        assert_eq!(dynamic_sampled_texture_cap(&info, &host_info, 2), 2);
+    }
+
+    #[test]
     fn texture_pass_tracks_mask_constant_loaded_from_cbuf_bank_one() {
-        let mut program = Program::new(ShaderStage::Fragment);
-        program.blocks.push(Block::new());
+        let mut program = fragment_program();
         let block = &mut program.blocks[0];
         block.instructions.push(Some(Inst::new(
             Opcode::GetCbufU32,
@@ -1319,8 +1784,7 @@ mod tests {
 
     #[test]
     fn texture_pass_normalizes_bound_opcode_to_indexed_opcode() {
-        let mut program = Program::new(ShaderStage::Fragment);
-        program.blocks.push(Block::new());
+        let mut program = fragment_program();
         let flags = TextureInstInfo {
             texture_type: 2,
             ..Default::default()
@@ -1343,8 +1807,7 @@ mod tests {
 
     #[test]
     fn texture_pass_registers_image_atomic_as_image_descriptor() {
-        let mut program = Program::new(ShaderStage::Fragment);
-        program.blocks.push(Block::new());
+        let mut program = fragment_program();
         let flags = TextureInstInfo {
             texture_type: 2,
             ..Default::default()
@@ -1370,8 +1833,7 @@ mod tests {
 
     #[test]
     fn texture_pass_reads_storage_image_format_from_flags() {
-        let mut program = Program::new(ShaderStage::Fragment);
-        program.blocks.push(Block::new());
+        let mut program = fragment_program();
         let flags = TextureInstInfo {
             texture_type: TextureType::Color2D as u8,
             image_format: ImageFormat::R32G32Uint as u8,
@@ -1395,8 +1857,7 @@ mod tests {
 
     #[test]
     fn texture_pass_preserves_upstream_texture_type_enum_values() {
-        let mut program = Program::new(ShaderStage::Fragment);
-        program.blocks.push(Block::new());
+        let mut program = fragment_program();
         let flags = TextureInstInfo {
             texture_type: TextureType::ColorArray2D as u8,
             ..Default::default()
@@ -1419,8 +1880,7 @@ mod tests {
 
     #[test]
     fn texture_pass_patches_rect_implicit_lod_coords_before_sample() {
-        let mut program = Program::new(ShaderStage::Fragment);
-        program.blocks.push(Block::new());
+        let mut program = fragment_program();
         let coord = program.blocks[0].append_inst(Inst::new(
             Opcode::CompositeConstructF32x2,
             vec![Value::ImmF32(64.0), Value::ImmF32(32.0)],
@@ -1471,8 +1931,7 @@ mod tests {
 
     #[test]
     fn texture_pass_patches_snorm_texel_fetch_uses() {
-        let mut program = Program::new(ShaderStage::Fragment);
-        program.blocks.push(Block::new());
+        let mut program = fragment_program();
         let flags = TextureInstInfo {
             texture_type: TextureType::Color1D as u8,
             ..Default::default()
@@ -1528,8 +1987,7 @@ mod tests {
 
     #[test]
     fn replace_uses_with_rewrites_syntax_conditions() {
-        let mut program = Program::new(ShaderStage::Fragment);
-        program.blocks.push(Block::new());
+        let mut program = fragment_program();
         let old = program.blocks[0].append_inst(Inst::new(
             Opcode::ImageFetch,
             vec![Value::ImmU32(0), Value::Void, Value::ImmU32(0)],
@@ -1592,8 +2050,7 @@ mod tests {
 
     #[test]
     fn image_fetch_clears_ms_arg_for_non_2d_fetches() {
-        let mut program = Program::new(ShaderStage::Fragment);
-        program.blocks.push(Block::new());
+        let mut program = fragment_program();
         let flags = TextureInstInfo {
             texture_type: TextureType::Color1D as u8,
             ..Default::default()
@@ -1626,6 +2083,7 @@ mod tests {
             texture_type: TextureType::Color2D,
             is_depth: false,
             is_multisample: false,
+            is_integer: false,
             has_secondary: false,
             cbuf_index: 1,
             cbuf_offset: 0x20,
@@ -1640,6 +2098,7 @@ mod tests {
             texture_type: TextureType::Color2D,
             is_depth: false,
             is_multisample: true,
+            is_integer: true,
             has_secondary: false,
             cbuf_index: 1,
             cbuf_offset: 0x20,
@@ -1656,5 +2115,6 @@ mod tests {
         assert!(source.texture_descriptors.is_empty());
         assert_eq!(base.texture_descriptors.len(), 1);
         assert!(base.texture_descriptors[0].is_multisample);
+        assert!(base.texture_descriptors[0].is_integer);
     }
 }

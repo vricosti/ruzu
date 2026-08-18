@@ -29,6 +29,7 @@ pub mod configure_filesystem;
 pub mod configure_general;
 pub mod configure_graphics;
 pub mod configure_graphics_advanced;
+pub mod configure_graphics_extensions;
 pub mod configure_hotkeys;
 pub mod configure_input;
 pub mod configure_input_advanced;

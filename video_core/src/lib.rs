@@ -58,3 +58,38 @@ pub mod textures;
 pub mod transform_feedback;
 pub mod video_core;
 pub mod vulkan_common;
+
+#[cfg(test)]
+pub(crate) mod test_support {
+    use common::settings;
+    use common::settings_enums::GpuAccuracy;
+    use std::sync::{Mutex, MutexGuard};
+
+    static GPU_ACCURACY_MUTEX: Mutex<()> = Mutex::new(());
+
+    pub(crate) struct GpuAccuracyGuard {
+        previous: GpuAccuracy,
+        _lock: MutexGuard<'static, ()>,
+    }
+
+    impl GpuAccuracyGuard {
+        pub(crate) fn set(value: GpuAccuracy) -> Self {
+            let lock = GPU_ACCURACY_MUTEX
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut values = settings::values_mut();
+            let previous = values.current_gpu_accuracy;
+            values.current_gpu_accuracy = value;
+            Self {
+                previous,
+                _lock: lock,
+            }
+        }
+    }
+
+    impl Drop for GpuAccuracyGuard {
+        fn drop(&mut self) {
+            settings::values_mut().current_gpu_accuracy = self.previous;
+        }
+    }
+}

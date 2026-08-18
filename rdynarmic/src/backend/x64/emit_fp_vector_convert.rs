@@ -4,14 +4,19 @@
     unnecessary_transmutes
 )]
 
-use rxbyak::{dword_ptr, xmmword_ptr, RegExp, R15, XMM0};
+use rxbyak::{dword_ptr, qword_ptr, xmmword_ptr, JmpType, Reg, RegExp, R15, RSP, XMM0};
 
-use crate::backend::x64::emit_context::EmitContext;
+use crate::backend::x64::abi;
+use crate::backend::x64::emit_context::{DeferredEmitCtx, EmitContext};
+use crate::backend::x64::emit_fp_vector::force_to_default_nan_vector;
 use crate::backend::x64::emit_vector_helpers::*;
 use crate::backend::x64::fp_helpers;
+use crate::backend::x64::host_feature::HostFeature;
+use crate::backend::x64::hostloc::HostLoc;
 use crate::backend::x64::reg_alloc::RegAlloc;
 use crate::common::fp::fpcr::Fpcr;
 use crate::common::fp::fpsr::Fpsr;
+use crate::common::fp::op::fp_convert::fp_convert;
 use crate::common::fp::op::fp_mul_add::fp_mul_add;
 use crate::common::fp::op::fp_recip_step_fused::fp_recip_step_fused;
 use crate::common::fp::op::fp_round_int::fp_round_int;
@@ -20,11 +25,7 @@ use crate::common::fp::op::fp_to_fixed::fp_to_fixed;
 use crate::common::fp::rounding_mode::RoundingMode;
 use crate::ir::inst::Inst;
 use crate::ir::value::InstRef;
-
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-fn host_supports_sse41() -> bool {
-    std::is_x86_feature_detected!("sse4.1")
-}
+use crate::jit_config::OptimizationFlag;
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 fn host_supports_fma_avx() -> bool {
@@ -46,103 +47,41 @@ fn host_supports_avx() -> bool {
     false
 }
 
-fn step_uses_native_result(esize: usize, result: u64, rsqrt: bool) -> bool {
-    if esize == 16 || !host_supports_fma_avx() {
-        return false;
-    }
-    let (exponent, mantissa, max_exponent) = match esize {
-        32 => ((result >> 23) & 0xff, result & 0x7f_ffff, 0xff),
-        64 => ((result >> 52) & 0x7ff, result & 0xf_ffff_ffff_ffff, 0x7ff),
-        _ => unreachable!("invalid FP element size {esize}"),
-    };
-    if rsqrt {
-        // Upstream tests the fused intermediate before the exact division by
-        // two, so an output exponent one below the dangerous range also used
-        // the reference fallback.
-        exponent < max_exponent - 2
+/// Port of upstream `MaybeStandardFPSCRValue` from
+/// `emit_x64_vector_floating_point.cpp`.
+fn maybe_standard_fpscr_value(
+    ctx: &EmitContext,
+    ra: &mut RegAlloc,
+    fpcr_controlled: bool,
+    emit: impl FnOnce(&mut RegAlloc),
+) {
+    let switch_mxcsr = ctx.fpcr(fpcr_controlled) != ctx.fpcr(true);
+
+    if switch_mxcsr && !ctx.has_optimization(OptimizationFlag::UNSAFE_IGNORE_STANDARD_FPCR_VALUE) {
+        ra.asm
+            .stmxcsr(dword_ptr(
+                RegExp::from(R15) + ctx.arch.guest_mxcsr_offset() as i32,
+            ))
+            .unwrap();
+        ra.asm
+            .ldmxcsr(dword_ptr(
+                RegExp::from(R15) + ctx.arch.asimd_mxcsr_offset() as i32,
+            ))
+            .unwrap();
+        emit(ra);
+        ra.asm
+            .stmxcsr(dword_ptr(
+                RegExp::from(R15) + ctx.arch.asimd_mxcsr_offset() as i32,
+            ))
+            .unwrap();
+        ra.asm
+            .ldmxcsr(dword_ptr(
+                RegExp::from(R15) + ctx.arch.guest_mxcsr_offset() as i32,
+            ))
+            .unwrap();
     } else {
-        !(exponent == max_exponent && mantissa != 0)
+        emit(ra);
     }
-}
-
-fn rsqrt_native_attempt_overflowed(esize: usize, result: u64) -> bool {
-    match esize {
-        32 => (result >> 23) & 0xff == 0xfe,
-        64 => (result >> 52) & 0x7ff == 0x7fe,
-        16 => false,
-        _ => unreachable!("invalid FP element size {esize}"),
-    }
-}
-
-#[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
-fn host_supports_sse41() -> bool {
-    false
-}
-
-// ---------------------------------------------------------------------------
-// fp16 helpers (avoid external dependency)
-// ---------------------------------------------------------------------------
-
-fn f16_to_f32(bits: u16) -> f32 {
-    let sign = ((bits >> 15) & 1) as u32;
-    let exp = ((bits >> 10) & 0x1F) as u32;
-    let frac = (bits & 0x3FF) as u32;
-
-    if exp == 0x1F {
-        // Inf or NaN
-        let f_bits = (sign << 31) | (0xFF << 23) | (frac << 13);
-        f32::from_bits(f_bits)
-    } else if exp == 0 {
-        if frac == 0 {
-            // Zero
-            f32::from_bits(sign << 31)
-        } else {
-            // Subnormal: convert to normalized f32
-            let mut f = frac as f32 / 1024.0;
-            f *= 1.0 / 16384.0; // 2^-14
-            if sign != 0 {
-                -f
-            } else {
-                f
-            }
-        }
-    } else {
-        let f_bits = (sign << 31) | ((exp + 112) << 23) | (frac << 13);
-        f32::from_bits(f_bits)
-    }
-}
-
-fn f32_to_f16(f: f32) -> u16 {
-    let bits = f.to_bits();
-    let sign = (bits >> 31) & 1;
-    let exp = ((bits >> 23) & 0xFF) as i32;
-    let frac = bits & 0x7FFFFF;
-
-    if exp == 0xFF {
-        // Inf or NaN
-        let h_frac = if frac != 0 { (frac >> 13) | 1 } else { 0 };
-        return ((sign << 15) | (0x1F << 10) | h_frac) as u16;
-    }
-
-    let unbiased = exp - 127;
-    if unbiased > 15 {
-        // Overflow -> Inf
-        return ((sign << 15) | (0x1F << 10)) as u16;
-    }
-    if unbiased < -24 {
-        // Underflow -> zero
-        return (sign << 15) as u16;
-    }
-    if unbiased < -14 {
-        // Subnormal
-        let shift = -14 - unbiased;
-        let mantissa = (frac | 0x800000) >> (13 + shift);
-        return ((sign << 15) | mantissa) as u16;
-    }
-
-    let h_exp = (unbiased + 15) as u32;
-    let h_frac = frac >> 13;
-    ((sign << 15) | (h_exp << 10) | h_frac) as u16
 }
 
 // ---------------------------------------------------------------------------
@@ -219,6 +158,78 @@ define_fp_muladd_fallback!(
     0x0010_0000_0000_0000
 );
 
+macro_rules! define_fp_muladd_correction_fallback {
+    ($name:ident, $type:ty, $count:expr, $exponent_mask:expr, $mantissa_mask:expr, $smallest_normal:expr, $correct_nan:expr) => {
+        extern "C" fn $name(
+            result: *mut [u8; 16],
+            addend: *const [u8; 16],
+            op1: *const [u8; 16],
+            op2: *const [u8; 16],
+            fpcr: u32,
+            fpsr_exc: *mut u32,
+        ) {
+            unsafe {
+                let mut output: [$type; $count] = std::mem::transmute(*result);
+                let addend: [$type; $count] = std::mem::transmute(*addend);
+                let op1: [$type; $count] = std::mem::transmute(*op1);
+                let op2: [$type; $count] = std::mem::transmute(*op2);
+                let fpcr = Fpcr::new(fpcr);
+                let mut fpsr = Fpsr::new(fpsr_exc.read());
+                for index in 0..$count {
+                    let bits = output[index] as u64;
+                    let is_smallest_normal =
+                        bits & ($exponent_mask | $mantissa_mask) == $smallest_normal;
+                    let is_nan =
+                        bits & $exponent_mask == $exponent_mask && bits & $mantissa_mask != 0;
+                    if (fpcr.fz() && is_smallest_normal) || ($correct_nan && is_nan) {
+                        output[index] =
+                            fp_mul_add(addend[index], op1[index], op2[index], fpcr, &mut fpsr);
+                    }
+                }
+                fpsr_exc.write(fpsr.value());
+                *result = std::mem::transmute(output);
+            }
+        }
+    };
+}
+
+define_fp_muladd_correction_fallback!(
+    fallback_fp_muladd_correction32,
+    u32,
+    4,
+    0x7f80_0000,
+    0x007f_ffff,
+    0x0080_0000,
+    true
+);
+define_fp_muladd_correction_fallback!(
+    fallback_fp_muladd_correction32_inaccurate_nan,
+    u32,
+    4,
+    0x7f80_0000,
+    0x007f_ffff,
+    0x0080_0000,
+    false
+);
+define_fp_muladd_correction_fallback!(
+    fallback_fp_muladd_correction64,
+    u64,
+    2,
+    0x7ff0_0000_0000_0000,
+    0x000f_ffff_ffff_ffff,
+    0x0010_0000_0000_0000,
+    true
+);
+define_fp_muladd_correction_fallback!(
+    fallback_fp_muladd_correction64_inaccurate_nan,
+    u64,
+    2,
+    0x7ff0_0000_0000_0000,
+    0x000f_ffff_ffff_ffff,
+    0x0010_0000_0000_0000,
+    false
+);
+
 pub fn emit_fp_vector_muladd16(
     ctx: &EmitContext,
     ra: &mut RegAlloc,
@@ -233,7 +244,7 @@ pub fn emit_fp_vector_muladd32(
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_four_op_fallback(ctx, ra, inst_ref, inst, fallback_fp_muladd32 as usize);
+    emit_fp_vector_muladd(ctx, ra, inst_ref, inst, 32, fallback_fp_muladd32 as usize);
 }
 pub fn emit_fp_vector_muladd64(
     ctx: &EmitContext,
@@ -241,7 +252,246 @@ pub fn emit_fp_vector_muladd64(
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_four_op_fallback(ctx, ra, inst_ref, inst, fallback_fp_muladd64 as usize);
+    emit_fp_vector_muladd(ctx, ra, inst_ref, inst, 64, fallback_fp_muladd64 as usize);
+}
+
+fn emit_fp_vector_muladd(
+    ctx: &EmitContext,
+    ra: &mut RegAlloc,
+    inst_ref: InstRef,
+    inst: &Inst,
+    fsize: usize,
+    fallback_function: usize,
+) {
+    let fpcr_controlled = inst.args[3].get_u1();
+    let fpcr = ctx.fpcr(fpcr_controlled);
+    let inaccurate_nan = ctx.has_optimization(OptimizationFlag::UNSAFE_INACCURATE_NAN);
+
+    if ctx.has_host_feature(HostFeature::FMA) && !fpcr.fz() && (fpcr.dn() || inaccurate_nan) {
+        let mut args = ra.get_argument_info(inst_ref, &inst.args, inst.num_args());
+        let result = ra.use_scratch_xmm(&mut args[0]);
+        let operand2 = ra.use_xmm(&mut args[1]);
+        let operand3 = ra.use_xmm(&mut args[2]);
+        if fsize == 32 {
+            ra.asm.vfmadd231ps(result, operand2, operand3).unwrap();
+        } else {
+            ra.asm.vfmadd231pd(result, operand2, operand3).unwrap();
+        }
+        if fpcr.dn() {
+            force_to_default_nan_vector(ra, result, fsize);
+        }
+        ra.define_value(inst_ref, result);
+        return;
+    }
+
+    if ctx.has_host_feature(HostFeature::FMA | HostFeature::AVX) {
+        let mut args = ra.get_argument_info(inst_ref, &inst.args, inst.num_args());
+        let operand1 = ra.use_xmm(&mut args[0]);
+        let operand2 = ra.use_xmm(&mut args[1]);
+        let operand3 = ra.use_xmm(&mut args[2]);
+        let result = ra.scratch_xmm();
+        let nan_mask = ra.scratch_xmm();
+        let fallback = ra.asm.create_label();
+        let end = ra.asm.create_label();
+
+        ra.asm.movaps(result, operand1).unwrap();
+        if fsize == 32 {
+            ra.asm.vfmadd231ps(result, operand2, operand3).unwrap();
+        } else {
+            ra.asm.vfmadd231pd(result, operand2, operand3).unwrap();
+        }
+
+        let needs_nan_correction = !fpcr.dn() && !inaccurate_nan;
+        if fpcr.fz() {
+            ra.asm.movaps(nan_mask, result).unwrap();
+            let (non_sign_lo, non_sign_hi, smallest_lo, smallest_hi) = if fsize == 32 {
+                (
+                    0x7fff_ffff_7fff_ffff,
+                    0x7fff_ffff_7fff_ffff,
+                    0x0080_0000_0080_0000,
+                    0x0080_0000_0080_0000,
+                )
+            } else {
+                (
+                    0x7fff_ffff_ffff_ffff,
+                    0x7fff_ffff_ffff_ffff,
+                    0x0010_0000_0000_0000,
+                    0x0010_0000_0000_0000,
+                )
+            };
+            let non_sign = ra
+                .constant_pool
+                .as_mut()
+                .expect("constant pool required")
+                .get_constant(non_sign_lo, non_sign_hi);
+            let smallest = ra
+                .constant_pool
+                .as_mut()
+                .expect("constant pool required")
+                .get_constant(smallest_lo, smallest_hi);
+            ra.asm.andps(nan_mask, xmmword_ptr(non_sign)).unwrap();
+            if fsize == 32 {
+                ra.asm.cmpps(nan_mask, xmmword_ptr(smallest), 0).unwrap();
+            } else {
+                ra.asm.cmppd(nan_mask, xmmword_ptr(smallest), 0).unwrap();
+            }
+            if needs_nan_correction {
+                let unordered = ra.scratch_xmm();
+                ra.asm.movaps(unordered, result).unwrap();
+                if fsize == 32 {
+                    ra.asm.cmpps(unordered, result, 3).unwrap();
+                } else {
+                    ra.asm.cmppd(unordered, result, 3).unwrap();
+                }
+                ra.asm.orps(nan_mask, unordered).unwrap();
+                ra.release(unordered);
+            }
+        } else {
+            debug_assert!(needs_nan_correction);
+            ra.asm.movaps(nan_mask, result).unwrap();
+            if fsize == 32 {
+                ra.asm.cmpps(nan_mask, result, 3).unwrap();
+            } else {
+                ra.asm.cmppd(nan_mask, result, 3).unwrap();
+            }
+        }
+        ra.asm.vptest(nan_mask, nan_mask).unwrap();
+        ra.asm.jnz(&fallback, JmpType::Near).unwrap();
+        ra.asm.bind(&end).unwrap();
+        if fpcr.dn() {
+            force_to_default_nan_vector(ra, result, fsize);
+        }
+
+        let fpcr_value = fpcr.value();
+        let fpsr_offset = ctx.arch.fpsr_exc_offset() as i32;
+        let correction_function = match (fsize, inaccurate_nan) {
+            (32, false) => fallback_fp_muladd_correction32 as usize,
+            (32, true) => fallback_fp_muladd_correction32_inaccurate_nan as usize,
+            (64, false) => fallback_fp_muladd_correction64 as usize,
+            (64, true) => fallback_fp_muladd_correction64_inaccurate_nan as usize,
+            _ => unreachable!(),
+        };
+        ctx.deferred_emits
+            .borrow_mut()
+            .push(Box::new(move |dctx: &mut DeferredEmitCtx<'_>| {
+                dctx.asm.bind(&fallback).unwrap();
+                dctx.asm.sub(RSP, 8).unwrap();
+
+                #[cfg(target_os = "windows")]
+                const STACK_ARGS_SIZE: usize = 16;
+                #[cfg(not(target_os = "windows"))]
+                const STACK_ARGS_SIZE: usize = 0;
+                let (frame, local_base) =
+                    abi::push_caller_save_registers_and_adjust_stack_except_with_local(
+                        dctx.asm,
+                        Some(HostLoc::Xmm(result.get_idx())),
+                        STACK_ARGS_SIZE + 64,
+                    )
+                    .unwrap();
+                let result_offset = local_base + STACK_ARGS_SIZE;
+                let operand1_offset = result_offset + 16;
+                let operand2_offset = result_offset + 32;
+                let operand3_offset = result_offset + 48;
+
+                for (offset, operand) in [
+                    (result_offset, result),
+                    (operand1_offset, operand1),
+                    (operand2_offset, operand2),
+                    (operand3_offset, operand3),
+                ] {
+                    dctx.asm
+                        .movaps(xmmword_ptr(RegExp::from(RSP) + offset as i32), operand)
+                        .unwrap();
+                }
+                for (index, offset) in [
+                    result_offset,
+                    operand1_offset,
+                    operand2_offset,
+                    operand3_offset,
+                ]
+                .into_iter()
+                .enumerate()
+                {
+                    dctx.asm
+                        .lea(
+                            abi::ABI_PARAMS[index].to_reg64(),
+                            xmmword_ptr(RegExp::from(RSP) + offset as i32),
+                        )
+                        .unwrap();
+                }
+
+                #[cfg(target_os = "windows")]
+                {
+                    dctx.asm
+                        .mov(
+                            rxbyak::qword_ptr(RegExp::from(RSP) + abi::ABI_SHADOW_SPACE as i32),
+                            fpcr_value as i32,
+                        )
+                        .unwrap();
+                    dctx.asm
+                        .lea(rxbyak::RAX, dword_ptr(RegExp::from(R15) + fpsr_offset))
+                        .unwrap();
+                    dctx.asm
+                        .mov(
+                            rxbyak::qword_ptr(RegExp::from(RSP) + abi::ABI_SHADOW_SPACE as i32 + 8),
+                            rxbyak::RAX,
+                        )
+                        .unwrap();
+                }
+                #[cfg(not(target_os = "windows"))]
+                {
+                    dctx.asm
+                        .mov(
+                            Reg::gpr32(abi::ABI_PARAMS[4].to_reg64().get_idx()),
+                            fpcr_value as i32,
+                        )
+                        .unwrap();
+                    dctx.asm
+                        .lea(
+                            abi::ABI_PARAMS[5].to_reg64(),
+                            dword_ptr(RegExp::from(R15) + fpsr_offset),
+                        )
+                        .unwrap();
+                }
+
+                dctx.asm
+                    .mov(rxbyak::RAX, correction_function as i64)
+                    .unwrap();
+                dctx.asm.call_reg(rxbyak::RAX).unwrap();
+                dctx.asm
+                    .movaps(
+                        result,
+                        xmmword_ptr(RegExp::from(RSP) + result_offset as i32),
+                    )
+                    .unwrap();
+                abi::pop_caller_save_registers_and_adjust_stack(dctx.asm, &frame).unwrap();
+                dctx.asm.add(RSP, 8).unwrap();
+                dctx.asm.jmp(&end, JmpType::Near).unwrap();
+            }));
+
+        ra.release(nan_mask);
+        ra.define_value(inst_ref, result);
+        return;
+    }
+
+    if ctx.has_optimization(OptimizationFlag::UNSAFE_UNFUSE_FMA) {
+        let mut args = ra.get_argument_info(inst_ref, &inst.args, inst.num_args());
+        let result = ra.use_scratch_xmm(&mut args[0]);
+        let product = ra.use_scratch_xmm(&mut args[1]);
+        let operand3 = ra.use_xmm(&mut args[2]);
+        if fsize == 32 {
+            ra.asm.mulps(product, operand3).unwrap();
+            ra.asm.addps(result, product).unwrap();
+        } else {
+            ra.asm.mulpd(product, operand3).unwrap();
+            ra.asm.addpd(result, product).unwrap();
+        }
+        ra.release(product);
+        ra.define_value(inst_ref, result);
+        return;
+    }
+
+    emit_four_op_fallback(ctx, ra, inst_ref, inst, fallback_function);
 }
 
 // ---------------------------------------------------------------------------
@@ -359,7 +609,7 @@ pub fn emit_fp_vector_recip_estimate64(
 // ---------------------------------------------------------------------------
 
 macro_rules! define_fp_step_fallback {
-    ($name:ident, $type:ty, $count:expr, $bits:expr, $rsqrt:expr, $operation:ident) => {
+    ($name:ident, $type:ty, $count:expr, $operation:ident) => {
         extern "C" fn $name(
             result: *mut [u8; 16],
             a: *const [u8; 16],
@@ -371,33 +621,10 @@ macro_rules! define_fp_step_fallback {
                 let va: [$type; $count] = std::mem::transmute(*a);
                 let vb: [$type; $count] = std::mem::transmute(*b);
                 let mut out = [0 as $type; $count];
-                let mut lane_fpsr = [0u32; $count];
                 let fpcr = Fpcr::new(fpcr);
-                for index in 0..$count {
-                    let mut exceptions = Fpsr::default();
-                    out[index] = $operation(va[index], vb[index], fpcr, &mut exceptions);
-                    lane_fpsr[index] = exceptions.value();
-                }
-                let native_vector = out
-                    .iter()
-                    .all(|value| step_uses_native_result($bits, *value as u64, $rsqrt));
                 let mut fpsr = Fpsr::new(fpsr_exc.read());
-                for exceptions in lane_fpsr {
-                    let exceptions = if native_vector {
-                        exceptions & !(1 << 7)
-                    } else {
-                        exceptions
-                    };
-                    fpsr = Fpsr::new(fpsr.value() | exceptions);
-                }
-                if !native_vector
-                    && $rsqrt
-                    && out
-                        .iter()
-                        .any(|value| rsqrt_native_attempt_overflowed($bits, *value as u64))
-                {
-                    fpsr.set_ofc(true);
-                    fpsr.set_ixc(true);
+                for index in 0..$count {
+                    out[index] = $operation(va[index], vb[index], fpcr, &mut fpsr);
                 }
                 fpsr_exc.write(fpsr.value());
                 *result = std::mem::transmute(out);
@@ -406,30 +633,142 @@ macro_rules! define_fp_step_fallback {
     };
 }
 
-define_fp_step_fallback!(
-    fallback_fp_recip_step16,
-    u16,
-    8,
-    16,
-    false,
-    fp_recip_step_fused
-);
-define_fp_step_fallback!(
-    fallback_fp_recip_step32,
-    u32,
-    4,
-    32,
-    false,
-    fp_recip_step_fused
-);
-define_fp_step_fallback!(
-    fallback_fp_recip_step64,
-    u64,
-    2,
-    64,
-    false,
-    fp_recip_step_fused
-);
+define_fp_step_fallback!(fallback_fp_recip_step16, u16, 8, fp_recip_step_fused);
+define_fp_step_fallback!(fallback_fp_recip_step32, u32, 4, fp_recip_step_fused);
+define_fp_step_fallback!(fallback_fp_recip_step64, u64, 2, fp_recip_step_fused);
+
+fn emit_fp_vector_recip_step_fused(
+    ctx: &EmitContext,
+    ra: &mut RegAlloc,
+    inst_ref: InstRef,
+    inst: &Inst,
+    esize: usize,
+    fallback_function: usize,
+) {
+    if esize != 16
+        && ctx.has_host_feature(HostFeature::FMA | HostFeature::AVX)
+        && ctx.has_optimization(OptimizationFlag::UNSAFE_INACCURATE_NAN)
+    {
+        let mut args = ra.get_argument_info(inst_ref, &inst.args, inst.num_args());
+        let fpcr_controlled = args[2].get_immediate_u1();
+        let result = ra.scratch_xmm();
+        let operand1 = ra.use_xmm(&mut args[0]);
+        let operand2 = ra.use_xmm(&mut args[1]);
+
+        maybe_standard_fpscr_value(ctx, ra, fpcr_controlled, |ra| {
+            let two = vector_constant(
+                ra,
+                esize,
+                if esize == 32 {
+                    2.0f32.to_bits() as u64
+                } else {
+                    2.0f64.to_bits()
+                },
+            );
+            ra.asm.movaps(result, xmmword_ptr(two)).unwrap();
+            if esize == 32 {
+                ra.asm.vfnmadd231ps(result, operand1, operand2).unwrap();
+            } else {
+                ra.asm.vfnmadd231pd(result, operand1, operand2).unwrap();
+            }
+        });
+
+        ra.define_value(inst_ref, result);
+        return;
+    }
+
+    if esize != 16 && ctx.has_host_feature(HostFeature::FMA | HostFeature::AVX) {
+        let mut args = ra.get_argument_info(inst_ref, &inst.args, inst.num_args());
+        let fpcr_controlled = args[2].get_immediate_u1();
+        let result = ra.scratch_xmm();
+        let operand1 = ra.use_xmm(&mut args[0]);
+        let operand2 = ra.use_xmm(&mut args[1]);
+        let tmp = ra.scratch_xmm();
+        let fallback = ra.asm.create_label();
+        let end = ra.asm.create_label();
+
+        maybe_standard_fpscr_value(ctx, ra, fpcr_controlled, |ra| {
+            let two = vector_constant(
+                ra,
+                esize,
+                if esize == 32 {
+                    2.0f32.to_bits() as u64
+                } else {
+                    2.0f64.to_bits()
+                },
+            );
+            ra.asm.movaps(result, xmmword_ptr(two)).unwrap();
+            if esize == 32 {
+                ra.asm.vfnmadd231ps(result, operand1, operand2).unwrap();
+                ra.asm.vcmpps(tmp, result, result, 3).unwrap();
+            } else {
+                ra.asm.vfnmadd231pd(result, operand1, operand2).unwrap();
+                ra.asm.vcmppd(tmp, result, result, 3).unwrap();
+            }
+            ra.asm.vptest(tmp, tmp).unwrap();
+            ra.asm.jnz(&fallback, JmpType::Near).unwrap();
+            ra.asm.bind(&end).unwrap();
+        });
+
+        let fpcr_value = ctx.fpcr(fpcr_controlled).value();
+        let fpsr_exc_offset = ctx.arch.fpsr_exc_offset() as i32;
+        ctx.deferred_emits
+            .borrow_mut()
+            .push(Box::new(move |dctx: &mut DeferredEmitCtx<'_>| {
+                dctx.asm.bind(&fallback).unwrap();
+                dctx.asm.lea(RSP, qword_ptr(RegExp::from(RSP) - 8)).unwrap();
+                let frame = abi::push_caller_save_registers_and_adjust_stack_except(
+                    dctx.asm,
+                    Some(HostLoc::Xmm(result.get_idx())),
+                )
+                .unwrap();
+                emit_three_op_fallback_without_reg_alloc(
+                    dctx.asm,
+                    result,
+                    operand1,
+                    operand2,
+                    fallback_function,
+                    fpcr_value,
+                    fpsr_exc_offset,
+                );
+                abi::pop_caller_save_registers_and_adjust_stack(dctx.asm, &frame).unwrap();
+                dctx.asm.add(RSP, 8).unwrap();
+                dctx.asm.jmp(&end, JmpType::Near).unwrap();
+            }));
+
+        ra.release(tmp);
+        ra.define_value(inst_ref, result);
+        return;
+    }
+
+    if esize != 16 && ctx.has_optimization(OptimizationFlag::UNSAFE_UNFUSE_FMA) {
+        let mut args = ra.get_argument_info(inst_ref, &inst.args, inst.num_args());
+        let operand1 = ra.use_scratch_xmm(&mut args[0]);
+        let operand2 = ra.use_xmm(&mut args[1]);
+        let result = ra.scratch_xmm();
+        let two = vector_constant(
+            ra,
+            esize,
+            if esize == 32 {
+                2.0f32.to_bits() as u64
+            } else {
+                2.0f64.to_bits()
+            },
+        );
+        ra.asm.movaps(result, xmmword_ptr(two)).unwrap();
+        if esize == 32 {
+            ra.asm.mulps(operand1, operand2).unwrap();
+            ra.asm.subps(result, operand1).unwrap();
+        } else {
+            ra.asm.mulpd(operand1, operand2).unwrap();
+            ra.asm.subpd(result, operand1).unwrap();
+        }
+        ra.define_value(inst_ref, result);
+        return;
+    }
+
+    emit_three_op_fallback(ctx, ra, inst_ref, inst, fallback_function);
+}
 
 pub fn emit_fp_vector_recip_step_fused16(
     ctx: &EmitContext,
@@ -437,7 +776,14 @@ pub fn emit_fp_vector_recip_step_fused16(
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_three_op_fallback(ctx, ra, inst_ref, inst, fallback_fp_recip_step16 as usize);
+    emit_fp_vector_recip_step_fused(
+        ctx,
+        ra,
+        inst_ref,
+        inst,
+        16,
+        fallback_fp_recip_step16 as usize,
+    );
 }
 pub fn emit_fp_vector_recip_step_fused32(
     ctx: &EmitContext,
@@ -445,7 +791,14 @@ pub fn emit_fp_vector_recip_step_fused32(
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_three_op_fallback(ctx, ra, inst_ref, inst, fallback_fp_recip_step32 as usize);
+    emit_fp_vector_recip_step_fused(
+        ctx,
+        ra,
+        inst_ref,
+        inst,
+        32,
+        fallback_fp_recip_step32 as usize,
+    );
 }
 pub fn emit_fp_vector_recip_step_fused64(
     ctx: &EmitContext,
@@ -453,7 +806,14 @@ pub fn emit_fp_vector_recip_step_fused64(
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_three_op_fallback(ctx, ra, inst_ref, inst, fallback_fp_recip_step64 as usize);
+    emit_fp_vector_recip_step_fused(
+        ctx,
+        ra,
+        inst_ref,
+        inst,
+        64,
+        fallback_fp_recip_step64 as usize,
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -578,33 +938,205 @@ pub fn emit_fp_vector_rsqrt_estimate64(
 }
 
 // ---------------------------------------------------------------------------
-// FPVectorRSqrtStepFused — fallback: (3.0 - a*b) / 2.0
+// FPVectorRSqrtStepFused — native FMA with reference fallback
 // ---------------------------------------------------------------------------
 
-define_fp_step_fallback!(
-    fallback_fp_rsqrt_step16,
-    u16,
-    8,
-    16,
-    true,
-    fp_rsqrt_step_fused
-);
-define_fp_step_fallback!(
-    fallback_fp_rsqrt_step32,
-    u32,
-    4,
-    32,
-    true,
-    fp_rsqrt_step_fused
-);
-define_fp_step_fallback!(
-    fallback_fp_rsqrt_step64,
-    u64,
-    2,
-    64,
-    true,
-    fp_rsqrt_step_fused
-);
+define_fp_step_fallback!(fallback_fp_rsqrt_step16, u16, 8, fp_rsqrt_step_fused);
+define_fp_step_fallback!(fallback_fp_rsqrt_step32, u32, 4, fp_rsqrt_step_fused);
+define_fp_step_fallback!(fallback_fp_rsqrt_step64, u64, 2, fp_rsqrt_step_fused);
+
+fn emit_fp_vector_rsqrt_step_fused(
+    ctx: &EmitContext,
+    ra: &mut RegAlloc,
+    inst_ref: InstRef,
+    inst: &Inst,
+    esize: usize,
+    fallback_function: usize,
+) {
+    if esize != 16
+        && ctx.has_host_feature(HostFeature::FMA | HostFeature::AVX)
+        && ctx.has_optimization(OptimizationFlag::UNSAFE_INACCURATE_NAN)
+    {
+        let mut args = ra.get_argument_info(inst_ref, &inst.args, inst.num_args());
+        let fpcr_controlled = args[2].get_immediate_u1();
+        let result = ra.scratch_xmm();
+        let operand1 = ra.use_xmm(&mut args[0]);
+        let operand2 = ra.use_xmm(&mut args[1]);
+
+        maybe_standard_fpscr_value(ctx, ra, fpcr_controlled, |ra| {
+            let three = vector_constant(
+                ra,
+                esize,
+                if esize == 32 {
+                    3.0f32.to_bits() as u64
+                } else {
+                    3.0f64.to_bits()
+                },
+            );
+            let half = vector_constant(
+                ra,
+                esize,
+                if esize == 32 {
+                    0.5f32.to_bits() as u64
+                } else {
+                    0.5f64.to_bits()
+                },
+            );
+            ra.asm.vmovaps(result, xmmword_ptr(three)).unwrap();
+            if esize == 32 {
+                ra.asm.vfnmadd231ps(result, operand1, operand2).unwrap();
+                ra.asm.vmulps(result, result, xmmword_ptr(half)).unwrap();
+            } else {
+                ra.asm.vfnmadd231pd(result, operand1, operand2).unwrap();
+                ra.asm.vmulpd(result, result, xmmword_ptr(half)).unwrap();
+            }
+        });
+
+        ra.define_value(inst_ref, result);
+        return;
+    }
+
+    if esize != 16 && ctx.has_host_feature(HostFeature::FMA | HostFeature::AVX) {
+        let mut args = ra.get_argument_info(inst_ref, &inst.args, inst.num_args());
+        let fpcr_controlled = args[2].get_immediate_u1();
+        let result = ra.scratch_xmm();
+        let operand1 = ra.use_xmm(&mut args[0]);
+        let operand2 = ra.use_xmm(&mut args[1]);
+        let tmp = ra.scratch_xmm();
+        let mask = ra.scratch_xmm();
+        let fallback = ra.asm.create_label();
+        let end = ra.asm.create_label();
+
+        maybe_standard_fpscr_value(ctx, ra, fpcr_controlled, |ra| {
+            let three = vector_constant(
+                ra,
+                esize,
+                if esize == 32 {
+                    3.0f32.to_bits() as u64
+                } else {
+                    3.0f64.to_bits()
+                },
+            );
+            let dangerous_exponent = vector_constant(
+                ra,
+                esize,
+                if esize == 32 {
+                    0x7f00_0000
+                } else {
+                    0x7fe0_0000_0000_0000
+                },
+            );
+            ra.asm.vmovaps(result, xmmword_ptr(three)).unwrap();
+            if esize == 32 {
+                ra.asm.vfnmadd231ps(result, operand1, operand2).unwrap();
+            } else {
+                ra.asm.vfnmadd231pd(result, operand1, operand2).unwrap();
+            }
+
+            // Upstream tests the fused intermediate before the exact
+            // division by two. Infinity, NaN and the adjacent exponent range
+            // all use the reference fallback.
+            ra.asm
+                .vmovaps(mask, xmmword_ptr(dangerous_exponent))
+                .unwrap();
+            if esize == 32 {
+                ra.asm.vandps(tmp, result, mask).unwrap();
+                ra.asm.vpcmpeqd(tmp, tmp, mask).unwrap();
+            } else {
+                ra.asm.vandpd(tmp, result, mask).unwrap();
+                ra.asm.vpcmpeqq(tmp, tmp, mask).unwrap();
+            }
+            ra.asm.ptest(tmp, tmp).unwrap();
+            ra.asm.jnz(&fallback, JmpType::Near).unwrap();
+
+            let half = vector_constant(
+                ra,
+                esize,
+                if esize == 32 {
+                    0.5f32.to_bits() as u64
+                } else {
+                    0.5f64.to_bits()
+                },
+            );
+            if esize == 32 {
+                ra.asm.vmulps(result, result, xmmword_ptr(half)).unwrap();
+            } else {
+                ra.asm.vmulpd(result, result, xmmword_ptr(half)).unwrap();
+            }
+            ra.asm.bind(&end).unwrap();
+        });
+
+        let fpcr_value = ctx.fpcr(fpcr_controlled).value();
+        let fpsr_exc_offset = ctx.arch.fpsr_exc_offset() as i32;
+        ctx.deferred_emits
+            .borrow_mut()
+            .push(Box::new(move |dctx: &mut DeferredEmitCtx<'_>| {
+                dctx.asm.bind(&fallback).unwrap();
+                dctx.asm.lea(RSP, qword_ptr(RegExp::from(RSP) - 8)).unwrap();
+                let frame = abi::push_caller_save_registers_and_adjust_stack_except(
+                    dctx.asm,
+                    Some(HostLoc::Xmm(result.get_idx())),
+                )
+                .unwrap();
+                emit_three_op_fallback_without_reg_alloc(
+                    dctx.asm,
+                    result,
+                    operand1,
+                    operand2,
+                    fallback_function,
+                    fpcr_value,
+                    fpsr_exc_offset,
+                );
+                abi::pop_caller_save_registers_and_adjust_stack(dctx.asm, &frame).unwrap();
+                dctx.asm.add(RSP, 8).unwrap();
+                dctx.asm.jmp(&end, JmpType::Near).unwrap();
+            }));
+
+        ra.release(mask);
+        ra.release(tmp);
+        ra.define_value(inst_ref, result);
+        return;
+    }
+
+    if esize != 16 && ctx.has_optimization(OptimizationFlag::UNSAFE_UNFUSE_FMA) {
+        let mut args = ra.get_argument_info(inst_ref, &inst.args, inst.num_args());
+        let operand1 = ra.use_scratch_xmm(&mut args[0]);
+        let operand2 = ra.use_xmm(&mut args[1]);
+        let result = ra.scratch_xmm();
+        let three = vector_constant(
+            ra,
+            esize,
+            if esize == 32 {
+                3.0f32.to_bits() as u64
+            } else {
+                3.0f64.to_bits()
+            },
+        );
+        let half = vector_constant(
+            ra,
+            esize,
+            if esize == 32 {
+                0.5f32.to_bits() as u64
+            } else {
+                0.5f64.to_bits()
+            },
+        );
+        ra.asm.movaps(result, xmmword_ptr(three)).unwrap();
+        if esize == 32 {
+            ra.asm.mulps(operand1, operand2).unwrap();
+            ra.asm.subps(result, operand1).unwrap();
+            ra.asm.mulps(result, xmmword_ptr(half)).unwrap();
+        } else {
+            ra.asm.mulpd(operand1, operand2).unwrap();
+            ra.asm.subpd(result, operand1).unwrap();
+            ra.asm.mulpd(result, xmmword_ptr(half)).unwrap();
+        }
+        ra.define_value(inst_ref, result);
+        return;
+    }
+
+    emit_three_op_fallback(ctx, ra, inst_ref, inst, fallback_function);
+}
 
 pub fn emit_fp_vector_rsqrt_step_fused16(
     ctx: &EmitContext,
@@ -612,7 +1144,14 @@ pub fn emit_fp_vector_rsqrt_step_fused16(
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_three_op_fallback(ctx, ra, inst_ref, inst, fallback_fp_rsqrt_step16 as usize);
+    emit_fp_vector_rsqrt_step_fused(
+        ctx,
+        ra,
+        inst_ref,
+        inst,
+        16,
+        fallback_fp_rsqrt_step16 as usize,
+    );
 }
 pub fn emit_fp_vector_rsqrt_step_fused32(
     ctx: &EmitContext,
@@ -620,7 +1159,14 @@ pub fn emit_fp_vector_rsqrt_step_fused32(
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_three_op_fallback(ctx, ra, inst_ref, inst, fallback_fp_rsqrt_step32 as usize);
+    emit_fp_vector_rsqrt_step_fused(
+        ctx,
+        ra,
+        inst_ref,
+        inst,
+        32,
+        fallback_fp_rsqrt_step32 as usize,
+    );
 }
 pub fn emit_fp_vector_rsqrt_step_fused64(
     ctx: &EmitContext,
@@ -628,7 +1174,14 @@ pub fn emit_fp_vector_rsqrt_step_fused64(
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_three_op_fallback(ctx, ra, inst_ref, inst, fallback_fp_rsqrt_step64 as usize);
+    emit_fp_vector_rsqrt_step_fused(
+        ctx,
+        ra,
+        inst_ref,
+        inst,
+        64,
+        fallback_fp_rsqrt_step64 as usize,
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -749,7 +1302,7 @@ fn emit_fp_vector_round_int(
     let rounding = inst.args[1].get_u8();
     let exact = inst.args[2].get_u1();
 
-    if esize != 16 && rounding != 4 && !exact {
+    if esize != 16 && ctx.has_host_feature(HostFeature::SSE41) && rounding != 4 && !exact {
         let mut args = ra.get_argument_info(inst_ref, &inst.args, inst.num_args());
         let result = ra.use_scratch_xmm(&mut args[0]);
         let round_imm = match rounding {
@@ -987,7 +1540,7 @@ fn emit_fp_vector_to_fixed_native(
 ) -> bool {
     let fbits = inst.args[1].get_u8();
     let rounding = inst.args[2].get_u8();
-    if esize == 16 || !host_supports_sse41() || rounding == 4 {
+    if esize == 16 || !ctx.has_host_feature(HostFeature::SSE41) || rounding == 4 {
         return false;
     }
 
@@ -1240,56 +1793,166 @@ pub fn emit_fp_vector_to_unsigned_fixed64(
 }
 
 // ---------------------------------------------------------------------------
-// FPVectorFromHalf32 / FPVectorToHalf32 — fallback (half <-> single conversion)
+// FPVectorFromHalf32 / FPVectorToHalf32
 // ---------------------------------------------------------------------------
 
-extern "C" fn fallback_fp_from_half32(result: *mut [u8; 16], a: *const [u8; 16]) {
-    unsafe {
-        let va: [u16; 8] = std::mem::transmute(*a);
-        // Convert lower 4 half-floats to 4 singles
-        let out: [f32; 4] = [
-            f16_to_f32(va[0]),
-            f16_to_f32(va[1]),
-            f16_to_f32(va[2]),
-            f16_to_f32(va[3]),
-        ];
-        *result = std::mem::transmute(out);
-    }
+macro_rules! define_fp_vector_half_convert_fallback {
+    ($from_name:ident, $to_name:ident, $rounding:expr) => {
+        extern "C" fn $from_name(
+            result: *mut [u8; 16],
+            a: *const [u8; 16],
+            fpcr: u32,
+            fpsr_exc: *mut u32,
+        ) {
+            unsafe {
+                let input: [u16; 8] = std::mem::transmute(*a);
+                let fpcr = Fpcr::new(fpcr);
+                let mut fpsr = Fpsr::new(fpsr_exc.read());
+                let output = [
+                    fp_convert::<u32, u16>(input[0], fpcr, $rounding, &mut fpsr),
+                    fp_convert::<u32, u16>(input[1], fpcr, $rounding, &mut fpsr),
+                    fp_convert::<u32, u16>(input[2], fpcr, $rounding, &mut fpsr),
+                    fp_convert::<u32, u16>(input[3], fpcr, $rounding, &mut fpsr),
+                ];
+                fpsr_exc.write(fpsr.value());
+                *result = std::mem::transmute(output);
+            }
+        }
+
+        extern "C" fn $to_name(
+            result: *mut [u8; 16],
+            a: *const [u8; 16],
+            fpcr: u32,
+            fpsr_exc: *mut u32,
+        ) {
+            unsafe {
+                let input: [u32; 4] = std::mem::transmute(*a);
+                let fpcr = Fpcr::new(fpcr);
+                let mut fpsr = Fpsr::new(fpsr_exc.read());
+                let output: [u16; 8] = [
+                    fp_convert::<u16, u32>(input[0], fpcr, $rounding, &mut fpsr),
+                    fp_convert::<u16, u32>(input[1], fpcr, $rounding, &mut fpsr),
+                    fp_convert::<u16, u32>(input[2], fpcr, $rounding, &mut fpsr),
+                    fp_convert::<u16, u32>(input[3], fpcr, $rounding, &mut fpsr),
+                    0,
+                    0,
+                    0,
+                    0,
+                ];
+                fpsr_exc.write(fpsr.value());
+                *result = std::mem::transmute(output);
+            }
+        }
+    };
 }
 
-extern "C" fn fallback_fp_to_half32(result: *mut [u8; 16], a: *const [u8; 16]) {
-    unsafe {
-        let va: [f32; 4] = std::mem::transmute(*a);
-        // Convert 4 singles to 4 half-floats in lower 64 bits, upper zeroed
-        let out: [u16; 8] = [
-            f32_to_f16(va[0]),
-            f32_to_f16(va[1]),
-            f32_to_f16(va[2]),
-            f32_to_f16(va[3]),
-            0,
-            0,
-            0,
-            0,
-        ];
-        *result = std::mem::transmute(out);
+define_fp_vector_half_convert_fallback!(
+    fallback_fp_from_half32_nearest,
+    fallback_fp_to_half32_nearest,
+    RoundingMode::ToNearestTieEven
+);
+define_fp_vector_half_convert_fallback!(
+    fallback_fp_from_half32_plus,
+    fallback_fp_to_half32_plus,
+    RoundingMode::TowardsPlusInfinity
+);
+define_fp_vector_half_convert_fallback!(
+    fallback_fp_from_half32_minus,
+    fallback_fp_to_half32_minus,
+    RoundingMode::TowardsMinusInfinity
+);
+define_fp_vector_half_convert_fallback!(
+    fallback_fp_from_half32_zero,
+    fallback_fp_to_half32_zero,
+    RoundingMode::TowardsZero
+);
+define_fp_vector_half_convert_fallback!(
+    fallback_fp_from_half32_away,
+    fallback_fp_to_half32_away,
+    RoundingMode::ToNearestTieAwayFromZero
+);
+
+fn half_conversion_fallback(rounding: u8, to_half: bool) -> usize {
+    match (rounding, to_half) {
+        (0, false) => fallback_fp_from_half32_nearest as usize,
+        (1, false) => fallback_fp_from_half32_plus as usize,
+        (2, false) => fallback_fp_from_half32_minus as usize,
+        (3, false) => fallback_fp_from_half32_zero as usize,
+        (4, false) => fallback_fp_from_half32_away as usize,
+        (0, true) => fallback_fp_to_half32_nearest as usize,
+        (1, true) => fallback_fp_to_half32_plus as usize,
+        (2, true) => fallback_fp_to_half32_minus as usize,
+        (3, true) => fallback_fp_to_half32_zero as usize,
+        (4, true) => fallback_fp_to_half32_away as usize,
+        _ => unreachable!("invalid FP half conversion rounding mode {rounding}"),
     }
 }
 
 pub fn emit_fp_vector_from_half32(
-    _ctx: &EmitContext,
+    ctx: &EmitContext,
     ra: &mut RegAlloc,
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_one_arg_fallback(ra, inst_ref, inst, fallback_fp_from_half32 as usize);
+    let rounding = inst.args[1].get_u8();
+    let fpcr_controlled = inst.args[2].get_u1();
+    if ctx.has_host_feature(HostFeature::F16C) && !ctx.fpcr(true).ahp() && !ctx.fpcr(true).fz16() {
+        let mut args = ra.get_argument_info(inst_ref, &inst.args, inst.num_args());
+        let result = ra.scratch_xmm();
+        let value = ra.use_xmm(&mut args[0]);
+        ra.asm.vcvtph2ps(result, value).unwrap();
+        if ctx.fpcr(fpcr_controlled).dn() {
+            force_to_default_nan_vector(ra, result, 32);
+        }
+        ra.define_value(inst_ref, result);
+        return;
+    }
+    emit_two_op_fallback_with_fpcr_arg(
+        ctx,
+        ra,
+        inst_ref,
+        inst,
+        2,
+        half_conversion_fallback(rounding, false),
+    );
 }
 pub fn emit_fp_vector_to_half32(
-    _ctx: &EmitContext,
+    ctx: &EmitContext,
     ra: &mut RegAlloc,
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_one_arg_fallback(ra, inst_ref, inst, fallback_fp_to_half32 as usize);
+    let rounding = inst.args[1].get_u8();
+    let fpcr_controlled = inst.args[2].get_u1();
+    if ctx.has_host_feature(HostFeature::F16C)
+        && rounding <= 3
+        && !ctx.fpcr(true).ahp()
+        && !ctx.fpcr(true).fz16()
+    {
+        let mut args = ra.get_argument_info(inst_ref, &inst.args, inst.num_args());
+        let result = ra.use_scratch_xmm(&mut args[0]);
+        if ctx.fpcr(fpcr_controlled).dn() {
+            force_to_default_nan_vector(ra, result, 32);
+        }
+        let round_imm = match rounding {
+            0 => 0b00,
+            1 => 0b10,
+            2 => 0b01,
+            3 => 0b11,
+            _ => unreachable!(),
+        };
+        ra.asm.vcvtps2ph(result, result, round_imm).unwrap();
+        ra.define_value(inst_ref, result);
+        return;
+    }
+    emit_two_op_fallback_with_fpcr_arg(
+        ctx,
+        ra,
+        inst_ref,
+        inst,
+        2,
+        half_conversion_fallback(rounding, true),
+    );
 }
 
 #[cfg(test)]
@@ -1336,6 +1999,47 @@ mod tests {
         assert_eq!(out[2], 23.0); // 3 + 4*5
         assert_eq!(out[3], 34.0); // 4 + 5*6
         assert_eq!(fpsr, 0);
+    }
+
+    #[test]
+    fn muladd_correction_only_recomputes_selected_lanes() {
+        let original = [
+            42.0f32.to_bits(),
+            0x0080_0000,
+            0x7fc1_2345,
+            (-7.0f32).to_bits(),
+        ];
+        let mut result: [u8; 16] = unsafe { std::mem::transmute(original) };
+        let addend: [u8; 16] = unsafe {
+            std::mem::transmute([
+                100.0f32.to_bits(),
+                0x0080_0000,
+                0x7fc5_4321,
+                100.0f32.to_bits(),
+            ])
+        };
+        let op1: [u8; 16] = unsafe { std::mem::transmute([2.0f32.to_bits(); 4]) };
+        let op2: [u8; 16] = unsafe { std::mem::transmute([3.0f32.to_bits(); 4]) };
+        let mut fpsr = 0;
+
+        fallback_fp_muladd_correction32(&mut result, &addend, &op1, &op2, 1 << 24, &mut fpsr);
+
+        let corrected: [u32; 4] = unsafe { std::mem::transmute(result) };
+        assert_eq!(corrected[0], original[0]);
+        assert_eq!(corrected[3], original[3]);
+        assert_eq!(corrected[2], 0x7fc5_4321);
+
+        let mut inaccurate_result: [u8; 16] = unsafe { std::mem::transmute(original) };
+        fallback_fp_muladd_correction32_inaccurate_nan(
+            &mut inaccurate_result,
+            &addend,
+            &op1,
+            &op2,
+            1 << 24,
+            &mut fpsr,
+        );
+        let inaccurate: [u32; 4] = unsafe { std::mem::transmute(inaccurate_result) };
+        assert_eq!(inaccurate[2], original[2]);
     }
 
     #[test]

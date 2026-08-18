@@ -96,8 +96,12 @@ pub enum Opcode {
     InvocationInfo,
     SampleId,
     IsHelperInvocation,
+    SRWScaleFactorXY,
+    SRWScaleFactorZ,
     YDirection,
     ResolutionDownFactor,
+    IsTextureScaled,
+    IsImageScaled,
     RenderArea,
 
     // ── Undefined values ──────────────────────────────────────────────
@@ -191,6 +195,9 @@ pub enum Opcode {
     CompositeExtractF64x2,
     CompositeExtractF64x3,
     CompositeExtractF64x4,
+    CompositeInsertF64x2,
+    CompositeInsertF64x3,
+    CompositeInsertF64x4,
 
     // ── Select ────────────────────────────────────────────────────────
     SelectU1,
@@ -336,6 +343,8 @@ pub enum Opcode {
     ISub32,
     ISub64,
     IMul32,
+    SDiv32,
+    UDiv32,
     INeg32,
     INeg64,
     IAbs32,
@@ -1195,6 +1204,16 @@ impl Opcode {
                 return_type: U1,
                 arg_types: &[],
             },
+            Opcode::SRWScaleFactorXY => OpcodeMeta {
+                name: "SR_WScaleFactorXY",
+                return_type: U32,
+                arg_types: &[],
+            },
+            Opcode::SRWScaleFactorZ => OpcodeMeta {
+                name: "SR_WScaleFactorZ",
+                return_type: U32,
+                arg_types: &[],
+            },
             Opcode::YDirection => OpcodeMeta {
                 name: "YDirection",
                 return_type: F32,
@@ -1204,6 +1223,16 @@ impl Opcode {
                 name: "ResolutionDownFactor",
                 return_type: F32,
                 arg_types: &[],
+            },
+            Opcode::IsTextureScaled => OpcodeMeta {
+                name: "IsTextureScaled",
+                return_type: U1,
+                arg_types: &[U32],
+            },
+            Opcode::IsImageScaled => OpcodeMeta {
+                name: "IsImageScaled",
+                return_type: U1,
+                arg_types: &[U32],
             },
             Opcode::RenderArea => OpcodeMeta {
                 name: "RenderArea",
@@ -1621,6 +1650,21 @@ impl Opcode {
                 name: "CompositeExtractF64x4",
                 return_type: F64,
                 arg_types: &[F64x4, U32],
+            },
+            Opcode::CompositeInsertF64x2 => OpcodeMeta {
+                name: "CompositeInsertF64x2",
+                return_type: F64x2,
+                arg_types: &[F64x2, F64, U32],
+            },
+            Opcode::CompositeInsertF64x3 => OpcodeMeta {
+                name: "CompositeInsertF64x3",
+                return_type: F64x3,
+                arg_types: &[F64x3, F64, U32],
+            },
+            Opcode::CompositeInsertF64x4 => OpcodeMeta {
+                name: "CompositeInsertF64x4",
+                return_type: F64x4,
+                arg_types: &[F64x4, F64, U32],
             },
 
             // Select
@@ -2264,6 +2308,16 @@ impl Opcode {
             },
             Opcode::IMul32 => OpcodeMeta {
                 name: "IMul32",
+                return_type: U32,
+                arg_types: &[U32, U32],
+            },
+            Opcode::SDiv32 => OpcodeMeta {
+                name: "SDiv32",
+                return_type: U32,
+                arg_types: &[U32, U32],
+            },
+            Opcode::UDiv32 => OpcodeMeta {
+                name: "UDiv32",
                 return_type: U32,
                 arg_types: &[U32, U32],
             },

@@ -87,6 +87,82 @@ pub fn identify_file(file: &VirtualFile) -> FileType {
     FileType::Unknown
 }
 
+/// Return whether `file_type` is a multi-title container format.
+///
+/// Maps to upstream `Loader::IsContainerType`.
+pub fn is_container_type(file_type: FileType) -> bool {
+    matches!(file_type, FileType::NSP | FileType::XCI)
+}
+
+/// Open an NSP directly, or the secure-partition NSP carried by an XCI.
+///
+/// Maps to upstream anonymous `OpenContainerAsNsp` in `loader.cpp`.
+fn open_container_as_nsp(
+    file: VirtualFile,
+    file_type: FileType,
+    program_id: u64,
+    program_index: usize,
+) -> Option<Arc<crate::file_sys::submission_package::NSP>> {
+    use crate::file_sys::card_image::XCI;
+    use crate::file_sys::partition_filesystem::ResultStatus as FsResultStatus;
+    use crate::file_sys::submission_package::NSP;
+
+    match file_type {
+        FileType::NSP => {
+            let nsp = Arc::new(NSP::new(file, program_id, program_index));
+            (nsp.get_status() == FsResultStatus::Success).then_some(nsp)
+        }
+        FileType::XCI => {
+            let xci = XCI::new(file, program_id, program_index);
+            if xci.get_status() != FsResultStatus::Success {
+                return None;
+            }
+            let secure_nsp = xci.get_secure_partition_nsp()?;
+            (secure_nsp.get_status() == FsResultStatus::Success).then_some(secure_nsp)
+        }
+        _ => None,
+    }
+}
+
+/// Return whether an NSP contains an application program.
+///
+/// Maps to upstream anonymous `HasApplicationProgramContent` in `loader.cpp`.
+fn has_application_program_content(nsp: Option<&crate::file_sys::submission_package::NSP>) -> bool {
+    use crate::file_sys::nca_metadata::{ContentRecordType, TitleType};
+
+    let Some(nsp) = nsp else {
+        return false;
+    };
+    nsp.get_ncas().values().any(|nca_map| {
+        nca_map.contains_key(&(
+            TitleType::Application as u8,
+            ContentRecordType::Program as u8,
+        ))
+    })
+}
+
+/// Return whether a container carries Application/Program content and can be
+/// shown as a bootable game.
+///
+/// Maps to upstream `Loader::IsBootableGameContainer`.
+pub fn is_bootable_game_container(
+    file: VirtualFile,
+    mut file_type: FileType,
+    program_id: u64,
+    program_index: usize,
+) -> bool {
+    // `VirtualFile` is an `Arc<dyn VfsFile>` and therefore cannot represent
+    // upstream's nullable file handle; no separate null check is possible.
+    if file_type == FileType::Unknown {
+        file_type = identify_file(&file);
+    }
+    if !is_container_type(file_type) {
+        return false;
+    }
+    let nsp = open_container_as_nsp(file, file_type, program_id, program_index);
+    has_application_program_content(nsp.as_deref())
+}
+
 /// Helper: calls T::identify_type and returns Some(file_type) if not Error.
 ///
 /// Maps to upstream anonymous `IdentifyFileLoader<T>` template.
@@ -117,7 +193,7 @@ pub fn guess_from_filename(name: &str) -> FileType {
         return FileType::NCA;
     }
 
-    let extension = name.rsplit('.').next().unwrap_or("").to_lowercase();
+    let extension = common::fs::path_util::get_extension_from_filename(name).to_lowercase();
 
     match extension.as_str() {
         "nro" => FileType::NRO,
@@ -302,6 +378,9 @@ const RESULT_MESSAGES: &[&str] = &[
 /// Maps to upstream `Loader::GetResultStatusString`.
 pub fn get_result_status_string(status: ResultStatus) -> &'static str {
     let index = status as usize;
+    // Rust's enum value is always one of the declared variants, so the
+    // upstream `std::array::at` failure is unreachable here. Keep a defensive
+    // fallback rather than manufacturing an out-of-range indexing panic.
     if index < RESULT_MESSAGES.len() {
         RESULT_MESSAGES[index]
     } else {
@@ -422,33 +501,57 @@ pub trait AppLoader: Send + Sync {
 ///
 /// Maps to upstream static `GetFileLoader`.
 fn get_file_loader(
-    _system: &mut System,
+    system: &mut System,
     file: VirtualFile,
     file_type: FileType,
-    _program_id: u64,
-    _program_index: usize,
+    program_id: u64,
+    program_index: usize,
 ) -> Option<Box<dyn AppLoader>> {
     match file_type {
         FileType::NSO => Some(Box::new(super::nso::AppLoaderNso::new(file))),
         FileType::NRO => Some(Box::new(super::nro::AppLoaderNro::new(file))),
         FileType::NCA => Some(Box::new(super::nca::AppLoaderNca::new(file))),
         FileType::XCI => {
-            // XCI loader requires FileSystemController and ContentProvider
-            // for full NCA extraction. Created with stub until those are ported.
+            let Some(filesystem_controller) = system.filesystem_controller.as_ref() else {
+                log::error!("Cannot construct XCI loader without a filesystem controller");
+                return None;
+            };
+            let Some(content_provider) = system.content_provider.as_ref() else {
+                log::error!("Cannot construct XCI loader without a content provider");
+                return None;
+            };
+            let filesystem_controller = Arc::clone(filesystem_controller);
+            let content_provider = Arc::clone(content_provider);
+            let filesystem_controller = filesystem_controller.lock().unwrap();
+            let content_provider = content_provider.lock().unwrap();
             Some(Box::new(super::xci::AppLoaderXci::new(
                 file,
-                _program_id,
-                _program_index,
+                &filesystem_controller,
+                &*content_provider,
+                program_id,
+                program_index,
             )))
         }
         FileType::NAX => Some(Box::new(super::nax::AppLoaderNax::new(file))),
         FileType::NSP => {
-            // NSP loader requires FileSystemController and ContentProvider
-            // for control NCA parsing. Created with stub until those are ported.
+            let Some(filesystem_controller) = system.filesystem_controller.as_ref() else {
+                log::error!("Cannot construct NSP loader without a filesystem controller");
+                return None;
+            };
+            let Some(content_provider) = system.content_provider.as_ref() else {
+                log::error!("Cannot construct NSP loader without a content provider");
+                return None;
+            };
+            let filesystem_controller = Arc::clone(filesystem_controller);
+            let content_provider = Arc::clone(content_provider);
+            let filesystem_controller = filesystem_controller.lock().unwrap();
+            let content_provider = content_provider.lock().unwrap();
             Some(Box::new(super::nsp::AppLoaderNsp::new(
                 file,
-                _program_id,
-                _program_index,
+                &filesystem_controller,
+                &*content_provider,
+                program_id,
+                program_index,
             )))
         }
         FileType::KIP => Some(Box::new(super::kip::AppLoaderKip::new(file))),
@@ -470,6 +573,8 @@ pub fn get_loader(
     program_id: u64,
     program_index: usize,
 ) -> Option<Box<dyn AppLoader>> {
+    // `VirtualFile` is non-nullable in Rust, so upstream's `if (!file)` guard
+    // is represented by the type rather than a runtime branch.
     let mut file_type = identify_file(&file);
     let filename_type = guess_from_filename(&file.get_name());
 
@@ -494,9 +599,55 @@ pub fn get_loader(
     get_file_loader(system, file, file_type, program_id, program_index)
 }
 
-/// Helper to create a 4-byte magic number from individual bytes.
-///
-/// Maps to upstream `Common::MakeMagic`.
-pub const fn make_magic(a: u8, b: u8, c: u8, d: u8) -> u32 {
-    (a as u32) | ((b as u32) << 8) | ((c as u32) << 16) | ((d as u32) << 24)
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn container_types_are_limited_to_nsp_and_xci() {
+        for file_type in [FileType::NSP, FileType::XCI] {
+            assert!(is_container_type(file_type));
+        }
+        for file_type in [
+            FileType::Error,
+            FileType::Unknown,
+            FileType::NSO,
+            FileType::NRO,
+            FileType::NCA,
+            FileType::NAX,
+            FileType::KIP,
+            FileType::DeconstructedRomDirectory,
+        ] {
+            assert!(!is_container_type(file_type));
+        }
+    }
+
+    #[test]
+    fn result_messages_stay_aligned_with_result_status() {
+        assert_eq!(
+            RESULT_MESSAGES.len(),
+            ResultStatus::ErrorIntegrityVerificationFailed as usize + 1
+        );
+        assert_eq!(
+            get_result_status_string(ResultStatus::ErrorIntegrityVerificationFailed),
+            "Integrity verification failed."
+        );
+        assert_eq!(
+            get_result_status_string(ResultStatus::ErrorIntegrityVerificationNotImplemented),
+            "Integrity verification could not be performed for this file."
+        );
+    }
+
+    #[test]
+    fn filename_guess_requires_a_real_extension() {
+        assert_eq!(guess_from_filename("nsp"), FileType::Unknown);
+        assert_eq!(guess_from_filename("game.nsp"), FileType::NSP);
+        assert_eq!(guess_from_filename("archive.part.XCI"), FileType::XCI);
+        assert_eq!(guess_from_filename("game."), FileType::Unknown);
+        assert_eq!(
+            guess_from_filename("main"),
+            FileType::DeconstructedRomDirectory
+        );
+        assert_eq!(guess_from_filename("00"), FileType::NCA);
+    }
 }

@@ -6,6 +6,7 @@
 
 use crate::backend::x64::emit_context::EmitContext;
 use crate::backend::x64::emit_vector_helpers::*;
+use crate::backend::x64::host_feature::HostFeature;
 use crate::backend::x64::reg_alloc::RegAlloc;
 use crate::ir::inst::Inst;
 use crate::ir::value::InstRef;
@@ -23,13 +24,33 @@ use crate::ir::value::InstRef;
 //   pand(a, mask_00FF)   — keep low byte of each word (even results)
 //   psllw(tmp_a, 8)      — shift odd results to high byte
 //   por(a, tmp_a)        — merge even and odd results
-pub fn emit_vector_multiply8(
-    _ctx: &EmitContext,
-    ra: &mut RegAlloc,
-    inst_ref: InstRef,
-    inst: &Inst,
-) {
+pub fn emit_vector_multiply8(ctx: &EmitContext, ra: &mut RegAlloc, inst_ref: InstRef, inst: &Inst) {
     let mut args = ra.get_argument_info(inst_ref, &inst.args, inst.num_args());
+    if ctx.has_host_feature(HostFeature::AVX) {
+        let a = ra.use_scratch_xmm(&mut args[0]);
+        let b = ra.use_scratch_xmm(&mut args[1]);
+        let product = ra.scratch_xmm();
+        let mask = ra.scratch_xmm();
+        let mask_addr = ra
+            .constant_pool
+            .as_mut()
+            .expect("constant pool required")
+            .get_constant(0x00ff_00ff, 0);
+        ra.asm
+            .vbroadcastss(mask, rxbyak::dword_ptr(mask_addr))
+            .unwrap();
+        ra.asm.vpmullw(product, b, a).unwrap();
+        ra.asm.vpandn(a, mask, a).unwrap();
+        ra.asm.vpand(product, product, mask).unwrap();
+        ra.asm.vpmaddubsw(a, b, a).unwrap();
+        ra.asm.psllw_imm(a, 8).unwrap();
+        ra.asm.vpor(a, product, a).unwrap();
+        ra.release(b);
+        ra.release(product);
+        ra.release(mask);
+        ra.define_value(inst_ref, a);
+        return;
+    }
     let result = ra.use_scratch_xmm(&mut args[0]); // a
     let b = ra.use_xmm(&mut args[1]);
     let tmp_a = ra.scratch_xmm();
@@ -65,32 +86,82 @@ pub fn emit_vector_multiply16(
     emit_vector_op(ra, inst_ref, inst, rxbyak::CodeAssembler::pmullw);
 }
 pub fn emit_vector_multiply32(
-    _ctx: &EmitContext,
+    ctx: &EmitContext,
     ra: &mut RegAlloc,
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_vector_op(ra, inst_ref, inst, rxbyak::CodeAssembler::pmulld);
-}
-
-// VectorMultiply64: use pmuludq chain for lower 64 bits of product
-// Upstream SSE4.1: pextract/pinsert with imul. Keep fallback for now.
-extern "C" fn fallback_multiply64(result: *mut [u8; 16], a: *const [u8; 16], b: *const [u8; 16]) {
-    unsafe {
-        let va: [u64; 2] = std::mem::transmute(*a);
-        let vb: [u64; 2] = std::mem::transmute(*b);
-        let out: [u64; 2] = [va[0].wrapping_mul(vb[0]), va[1].wrapping_mul(vb[1])];
-        *result = std::mem::transmute(out);
+    if ctx.has_host_feature(HostFeature::SSE41) {
+        emit_vector_op(ra, inst_ref, inst, rxbyak::CodeAssembler::pmulld);
+        return;
     }
+    let mut args = ra.get_argument_info(inst_ref, &inst.args, inst.num_args());
+    let a = ra.use_scratch_xmm(&mut args[0]);
+    let b = ra.use_scratch_xmm(&mut args[1]);
+    let tmp = ra.scratch_xmm();
+    ra.asm.movdqa(tmp, a).unwrap();
+    ra.asm.psrlq_imm(a, 32).unwrap();
+    ra.asm.pmuludq(tmp, b).unwrap();
+    ra.asm.psrlq_imm(b, 32).unwrap();
+    ra.asm.pmuludq(a, b).unwrap();
+    ra.asm.pshufd(tmp, tmp, 0x08).unwrap();
+    ra.asm.pshufd(b, a, 0x08).unwrap();
+    ra.asm.punpckldq(tmp, b).unwrap();
+    ra.release(a);
+    ra.release(b);
+    ra.define_value(inst_ref, tmp);
 }
 
 pub fn emit_vector_multiply64(
-    _ctx: &EmitContext,
+    ctx: &EmitContext,
     ra: &mut RegAlloc,
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_two_arg_fallback(ra, inst_ref, inst, fallback_multiply64 as usize);
+    let mut args = ra.get_argument_info(inst_ref, &inst.args, inst.num_args());
+    if ctx.has_host_feature(HostFeature::AVX512_ORTHO | HostFeature::AVX512DQ) {
+        let a = ra.use_scratch_xmm(&mut args[0]);
+        let b = ra.use_xmm(&mut args[1]);
+        ra.asm.vpmullq(a, a, b).unwrap();
+        ra.define_value(inst_ref, a);
+    } else if ctx.has_host_feature(HostFeature::SSE41) {
+        let a = ra.use_scratch_xmm(&mut args[0]);
+        let b = ra.use_xmm(&mut args[1]);
+        let tmp1 = ra.scratch_gpr();
+        let tmp2 = ra.scratch_gpr();
+        ra.asm.movq(tmp1, a).unwrap();
+        ra.asm.movq(tmp2, b).unwrap();
+        ra.asm.imul(tmp2, tmp1).unwrap();
+        ra.asm.pextrq(tmp1, a, 1).unwrap();
+        ra.asm.movq(a, tmp2).unwrap();
+        ra.asm.pextrq(tmp2, b, 1).unwrap();
+        ra.asm.imul(tmp1, tmp2).unwrap();
+        ra.asm.pinsrq(a, tmp1, 1).unwrap();
+        ra.release(tmp1);
+        ra.release(tmp2);
+        ra.define_value(inst_ref, a);
+    } else {
+        let a = ra.use_xmm(&mut args[0]);
+        let b = ra.use_scratch_xmm(&mut args[1]);
+        let tmp1 = ra.scratch_xmm();
+        let tmp2 = ra.scratch_xmm();
+        let tmp3 = ra.scratch_xmm();
+        ra.asm.movdqa(tmp1, a).unwrap();
+        ra.asm.movdqa(tmp2, a).unwrap();
+        ra.asm.movdqa(tmp3, b).unwrap();
+        ra.asm.psrlq_imm(tmp1, 32).unwrap();
+        ra.asm.psrlq_imm(tmp3, 32).unwrap();
+        ra.asm.pmuludq(tmp2, b).unwrap();
+        ra.asm.pmuludq(tmp3, a).unwrap();
+        ra.asm.pmuludq(b, tmp1).unwrap();
+        ra.asm.paddq(b, tmp3).unwrap();
+        ra.asm.psllq_imm(b, 32).unwrap();
+        ra.asm.paddq(tmp2, b).unwrap();
+        ra.release(b);
+        ra.release(tmp1);
+        ra.release(tmp3);
+        ra.define_value(inst_ref, tmp2);
+    }
 }
 
 // ---------------------------------------------------------------------------

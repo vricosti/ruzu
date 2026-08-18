@@ -15,13 +15,14 @@ members = [
     "dedicated_room",
     "ruzu_cmd",
     "ruzu",
+    "tools/capture_harness",
 ]
 resolver = "2"
 
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.75"
+rust-version = "1.85"
 license = "GPL-3.0-or-later"
 
 [workspace.dependencies]
@@ -34,17 +35,24 @@ network = { path = "network" }
 web_service = { path = "web_service" }
 frontend_common = { path = "frontend_common" }
 
-# JIT recompiler integrated directly into this workspace.
+# JIT recompiler maintained directly in this repository. Its x64 backend
+# references the rxbyak submodule under `externals/`.
 rdynarmic = { path = "rdynarmic" }
 
 # CLI / Config
 clap = { version = "4", features = ["derive"] }
 
 # Window / Graphics
-sdl2 = { version = "0.37", features = ["raw-window-handle"] }
+# Eden uses SDL3 for input, audio, and its SDL frontend. Build the same SDL
+# generation from source so all three Rust crates share one SDL runtime even on
+# hosts without a system SDL3 development package.
+sdl3 = { version = "=0.18.4", default-features = false, features = ["build-from-source-static", "raw-window-handle"] }
+sdl3-sys = { version = "=0.6.8", default-features = false, features = ["build-from-source-static"] }
 ash = "0.37"
+vk-mem = "0.3"
 vulkano = "0.34"
 raw-window-handle = "0.6"
+libc = "0.2"
 
 # Crypto
 aes = "0.8"
@@ -86,19 +94,23 @@ image = { version = "0.25", default-features = false, features = ["jpeg"] }
 
 [profile.release]
 debug = 1
+codegen-units = 1
 
-# Opt-in profile for shipped / benchmarked binaries. Two knobs that match
-# the corresponding rdynarmic release profile (commit f2a4cb8) MINUS the
-# `lto` setting — see note below.
+# Opt-in abort-on-panic profile for benchmarking. The ordinary release profile
+# already uses one code-generation unit; this profile adds only `panic =
+# "abort"`. LTO remains disabled — see note below.
 #
 # Build with:
-#   cargo build --profile release-lto --bin ruzu-cmd
+#   cargo build --profile release-lto --bin ruzu
 #
 # Caveats:
 # - `panic = "abort"` skips unwinding. Any `catch_unwind` / `thread::join`
 #   paths that today recover from a worker panic will instead see the whole
-#   process abort. Re-check audio_core / GPU workers before shipping
-#   binaries built with this profile.
+#   process abort. In particular, the OpenGL and Vulkan shader-cache
+#   `catch_shader_exception` boundaries cannot reject a bad cached pipeline
+#   under this profile; a typed shader panic aborts the process instead.
+#   Re-check audio_core / GPU workers and shader-cache environment readers
+#   before shipping binaries built with this profile.
 # - LTO disabled: both `lto = "fat"` and `lto = "thin"` fail at the final
 #   ruzu-cmd link with `failed to get bitcode from object file for LTO
 #   (Can't find section .llvmbc)`. One of ruzu's C-linked transitive deps

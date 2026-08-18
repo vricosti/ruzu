@@ -63,6 +63,13 @@ pub enum SystemResultStatus {
 /// the application using a specified program index.
 pub type ExecuteProgramCallback = Box<dyn Fn(usize) + Send>;
 
+/// Frontend-owned construction bridge for subsystems whose crates depend on
+/// `core` and therefore cannot be instantiated directly by [`System`].
+///
+/// Renderer construction errors follow upstream `VideoCore::CreateGPU` back
+/// into `System::load` instead of terminating the frontend process.
+pub type SubsystemFactory = Box<dyn FnOnce(&mut System) -> Result<(), String> + Send>;
+
 type StopCallbackFn = Arc<dyn Fn() + Send + Sync>;
 
 #[derive(Default)]
@@ -201,12 +208,18 @@ impl SystemRef {
     pub fn do_speed_limiting_now(&self) {
         assert!(!self.0.is_null(), "SystemRef is null");
         let system = unsafe { &mut *(self.0 as *mut System) };
-        let settings = common::settings::values();
+        let (use_multi_core, use_speed_limit) = {
+            let settings = common::settings::values();
+            (
+                *settings.use_multi_core.get_value(),
+                *settings.use_speed_limit.get_value(),
+            )
+        };
         system.speed_limiter.do_speed_limiting(
             system.core_timing.get_global_time_us(),
-            *settings.use_multi_core.get_value(),
-            *settings.use_speed_limit.get_value(),
-            *settings.speed_limit.get_value(),
+            use_multi_core,
+            use_speed_limit,
+            common::settings::speed_limit(),
         );
     }
 
@@ -927,7 +940,7 @@ pub trait AudioCoreInterface: Send {
         sample_rate: u32,
         channel_count: u32,
         use_large_frame_size: bool,
-    ) -> u32;
+    ) -> std::result::Result<u32, crate::hle::result::ResultCode>;
 
     /// Mirror `IHardwareOpusDecoderManager::GetWorkBufferSizeForMultiStream*`.
     fn get_opus_work_buffer_size_for_multi_stream(
@@ -937,7 +950,7 @@ pub trait AudioCoreInterface: Send {
         total_stream_count: u32,
         stereo_stream_count: u32,
         use_large_frame_size: bool,
-    ) -> u32;
+    ) -> std::result::Result<u32, crate::hle::result::ResultCode>;
 }
 
 /// Per-session Opus decoder owned by `IHardwareOpusDecoder`.
@@ -1113,7 +1126,7 @@ pub struct System {
     /// Upstream creates these directly in SetupForApplicationProcess (core.cpp:277-283)
     /// but Rust can't due to circular crate dependencies (video_core/audio_core depend on core).
     /// The frontend registers this callback before calling load().
-    subsystem_factory: Option<Box<dyn FnOnce(&mut System) + Send>>,
+    subsystem_factory: Option<SubsystemFactory>,
 
     // ── Loader / VFS ──
     /// The application loader used to load the game.
@@ -1491,7 +1504,7 @@ impl System {
     /// Corresponds to C++ SetupForApplicationProcess(system, emu_window)
     /// (core.cpp:274-305). Called from load() after ROM loading and process
     /// creation, but before applet manager registration.
-    fn setup_for_application_process(&mut self) {
+    fn setup_for_application_process(&mut self) -> Result<(), String> {
         // Upstream order (core.cpp:274-305):
 
         // 1. TelemetrySession
@@ -1506,7 +1519,7 @@ impl System {
         // In Rust, video_core/audio_core crates depend on core (circular dep),
         // so the frontend provides a factory callback that creates them.
         if let Some(factory) = self.subsystem_factory.take() {
-            factory(self);
+            factory(self)?;
         }
 
         // 5. Create the ServiceManager.
@@ -1537,6 +1550,7 @@ impl System {
         self.exit_requested.store(false, Ordering::Release);
 
         log::info!("System: application process setup complete (services created)");
+        Ok(())
     }
 
     /// Load the game at the given filepath.
@@ -1677,7 +1691,11 @@ impl System {
         }
 
         // Phase 3: Set up GPU, audio, services (upstream: SetupForApplicationProcess)
-        self.setup_for_application_process();
+        if let Err(error) = self.setup_for_application_process() {
+            log::error!("Failed to initialize video core: {error}");
+            self.set_status(SystemResultStatus::ErrorVideoCore, Some(&error));
+            return SystemResultStatus::ErrorVideoCore;
+        }
 
         // Register the process with the filesystem controller.
         // Upstream: this happens inside each loader's Load() (e.g. nca.cpp:77-80),
@@ -1851,6 +1869,13 @@ impl System {
         // valid only after the title and its main process have been loaded.
         self.init_perf_stats(self.runtime_program_id);
 
+        if let Some(gpu_core) = self.gpu_core.as_ref() {
+            crate::game_settings::load_overrides(
+                self.runtime_program_id,
+                gpu_core.get_device_vendor(),
+            );
+        }
+
         self.status = SystemResultStatus::Success;
 
         log::info!("Successfully loaded ROM: {}", filepath);
@@ -1905,6 +1930,10 @@ impl System {
                 perf_results.frametime * 1000.0
             );
         }
+
+        // Reset per-game flags before tearing down the renderer, matching
+        // `System::Impl::ShutdownMainProcess`.
+        common::settings::values_mut().use_squashed_iterated_blend = false;
 
         self.is_powered_on.store(false, Ordering::Relaxed);
         self.exit_locked.store(false, Ordering::Release);
@@ -2080,7 +2109,7 @@ impl System {
     /// Register the subsystem factory callback.
     /// The frontend calls this before load() to provide Host1x/GPU/AudioCore creation.
     /// setup_for_application_process() will call this during loading.
-    pub fn set_subsystem_factory(&mut self, factory: Box<dyn FnOnce(&mut System) + Send>) {
+    pub fn set_subsystem_factory(&mut self, factory: SubsystemFactory) {
         self.subsystem_factory = Some(factory);
     }
 
@@ -2880,5 +2909,18 @@ mod exit_state_tests {
         stop_event.request_stop();
 
         assert_eq!(calls.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn subsystem_factory_error_stops_application_setup() {
+        let mut system = System::new();
+        system.set_subsystem_factory(Box::new(|_| Err("renderer creation failed".to_owned())));
+
+        assert_eq!(
+            system.setup_for_application_process(),
+            Err("renderer creation failed".to_owned())
+        );
+        assert!(!system.is_powered_on());
+        assert!(system.service_manager().is_none());
     }
 }

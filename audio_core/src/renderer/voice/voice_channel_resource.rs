@@ -9,6 +9,8 @@ pub struct InParameter {
     pub _unk65: [u8; 0xB],
 }
 
+const _: () = assert!(std::mem::size_of::<InParameter>() == 0x70);
+
 #[derive(Debug, Clone)]
 pub struct VoiceChannelResource {
     pub mix_volumes: [f32; MAX_MIX_BUFFERS as usize],

@@ -11,7 +11,7 @@
 //! rendering state.
 
 use std::ptr::NonNull;
-use std::sync::{Arc, Once};
+use std::sync::Arc;
 
 use ash::vk;
 use ash::vk::Handle;
@@ -20,8 +20,12 @@ use crate::buffer_cache::buffer_cache_base::{ObtainBufferOperation, ObtainBuffer
 use crate::control::channel_state::ChannelState;
 use crate::control::channel_state_cache::ChannelCacheAccessor;
 use crate::engines::maxwell_3d::PrimitiveTopology;
-use crate::query_cache::query_cache::{GpuAddressTranslator, QueryCacheRuntimeHandle};
-use crate::query_cache::query_cache_base::{LookupData, QueryCacheBase};
+use crate::query_cache::query_cache::{
+    DeviceMemoryWriter, GpuAddressTranslator, GuestStreamer, QueryCacheRuntimeHandle, StubStreamer,
+    SyncValuesRuntime, SyncValuesStruct,
+};
+use crate::query_cache::query_cache_base::{LookupData, QueryCacheBase, QueryLocation};
+use crate::query_cache::query_stream::StreamerInterface;
 use crate::query_cache::types::{QueryPropertiesFlags, QueryType};
 use crate::vulkan_common::vulkan_memory_allocator::{MappedBuffer, MemoryAllocator, MemoryUsage};
 
@@ -29,6 +33,7 @@ use super::buffer_cache::VulkanCommonBufferCache;
 use super::compute_pass::{ConditionalRenderingResolvePass, QueriesPrefixScanPass};
 use super::descriptor_pool::DescriptorPool;
 use super::scheduler::Scheduler;
+use super::staging_buffer_pool::StagingBufferPool;
 use super::update_descriptor::ComputePassDescriptorQueue;
 
 // ---------------------------------------------------------------------------
@@ -644,11 +649,21 @@ fn effective_query_type_and_payload(query_type: u32, payload: u32) -> (u32, u32)
     let has_primitives_streamer = query_type == QueryType::StreamingPrimitivesNeeded as u32
         || query_type == QueryType::VtgPrimitivesOut as u32
         || query_type == QueryType::StreamingPrimitivesSucceeded as u32;
+    let has_stub_streamer = query_type == QueryType::StreamingPrimitivesNeededMinusSucceeded as u32;
     let has_payload_streamer = query_type == QueryType::Payload as u32;
-    if has_samples_streamer || has_payload_streamer || has_tfb_streamer || has_primitives_streamer {
+    if has_samples_streamer
+        || has_payload_streamer
+        || has_tfb_streamer
+        || has_primitives_streamer
+        || has_stub_streamer
+    {
         (
             query_type,
-            if has_samples_streamer || has_tfb_streamer || has_primitives_streamer {
+            if has_samples_streamer
+                || has_tfb_streamer
+                || has_primitives_streamer
+                || has_stub_streamer
+            {
                 0
             } else {
                 payload
@@ -1345,6 +1360,7 @@ impl QueryRuntimeState {
 struct QueryRuntimeBackend {
     device: ash::Device,
     scheduler: NonNull<Scheduler>,
+    staging_pool: NonNull<StagingBufferPool>,
     buffer_cache: NonNull<VulkanCommonBufferCache>,
     device_memory: Arc<crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager>,
     conditional_resolve_pass: Option<ConditionalRenderingResolvePass>,
@@ -1352,9 +1368,139 @@ struct QueryRuntimeBackend {
     driver_id: vk::DriverId,
 }
 
+/// Stable non-owning link used by the runtime-owned guest streamers.
+///
+/// C++ stores a `QueryCacheRuntime&` in `GuestStreamer`. A Rust struct cannot
+/// safely contain a reference to itself, so the backend is boxed and this
+/// mechanical adapter points at that stable allocation. Ownership remains in
+/// `QueryCacheRuntimeImpl`, matching upstream.
+#[derive(Clone, Copy)]
+struct QueryRuntimeSyncHandle(NonNull<QueryRuntimeBackend>);
+
+impl SyncValuesRuntime for QueryRuntimeSyncHandle {
+    fn sync_values(&mut self, values: Vec<SyncValuesStruct>) {
+        // SAFETY: QueryCacheRuntime owns the boxed backend longer than its
+        // streamers, and the box keeps the pointee stable when the runtime moves.
+        unsafe { sync_guest_values(self.0.as_mut(), &values) };
+    }
+}
+
+fn build_sync_value_regions(values: &[SyncValuesStruct]) -> (Vec<usize>, Vec<(u64, u64)>, usize) {
+    const DEVICE_PAGE_SIZE: u64 = 0x1000;
+
+    let mut redirect_cache = Vec::with_capacity(values.len());
+    let mut little_cache: Vec<(u64, u64)> = Vec::new();
+    let mut total_size = 0usize;
+    for value in values {
+        total_size += value.size as usize;
+        let base = value.address & !(DEVICE_PAGE_SIZE - 1);
+        let base_end = base + DEVICE_PAGE_SIZE;
+        let mut found = false;
+        for (index, location) in little_cache.iter_mut().enumerate() {
+            let mut set_found = || {
+                redirect_cache.push(index);
+                found = true;
+            };
+            if base < location.1 && location.0 < base_end {
+                set_found();
+                break;
+            }
+            if location.0 == base_end {
+                location.0 = base;
+                set_found();
+                break;
+            }
+            if location.1 == base {
+                location.1 = base_end;
+                set_found();
+                break;
+            }
+        }
+        if !found {
+            redirect_cache.push(little_cache.len());
+            little_cache.push((base, base_end));
+        }
+    }
+    (redirect_cache, little_cache, total_size)
+}
+
+/// Port of `QueryCacheRuntime::SyncValues<SyncValuesStruct>`.
+fn sync_guest_values(backend: &mut QueryRuntimeBackend, values: &[SyncValuesStruct]) {
+    if values.is_empty() {
+        return;
+    }
+    let (redirect_cache, little_cache, total_size) = build_sync_value_regions(values);
+
+    let buffer_cache = unsafe { backend.buffer_cache.as_mut() };
+    let mutex = Arc::clone(&buffer_cache.mutex);
+    let _lock = mutex.lock();
+    let mut destination_buffers = Vec::with_capacity(little_cache.len());
+    for &(begin, end) in &little_cache {
+        let Ok(size) = u32::try_from(end - begin) else {
+            return;
+        };
+        let (buffer_id, offset) = buffer_cache.obtain_cpu_buffer(
+            begin,
+            size,
+            ObtainBufferSynchronize::FullSynchronize,
+            ObtainBufferOperation::DoNothing,
+        );
+        let raw_buffer = buffer_cache.resolve_backend_buffer_raw(buffer_id);
+        if raw_buffer == 0 {
+            return;
+        }
+        destination_buffers.push((vk::Buffer::from_raw(raw_buffer), u64::from(offset)));
+    }
+    drop(_lock);
+
+    let Some(staging) =
+        (unsafe { backend.staging_pool.as_mut() }).request_upload_buffer(total_size as u64)
+    else {
+        log::error!("QueryCacheRuntime::SyncValues failed to allocate an upload buffer");
+        return;
+    };
+    let mut copies = vec![Vec::<vk::BufferCopy>::new(); little_cache.len()];
+    let mut accumulated_size = 0usize;
+    for (index, value) in values.iter().enumerate() {
+        let size = value.size as usize;
+        debug_assert!(size <= std::mem::size_of::<u64>());
+        if size > std::mem::size_of::<u64>() {
+            return;
+        }
+        let bytes = value.value.to_le_bytes();
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                bytes.as_ptr(),
+                staging.mapped.add(accumulated_size),
+                size,
+            );
+        }
+        let destination = redirect_cache[index];
+        copies[destination].push(vk::BufferCopy {
+            src_offset: staging.offset + accumulated_size as u64,
+            dst_offset: destination_buffers[destination].1 + value.address
+                - little_cache[destination].0,
+            size: value.size,
+        });
+        accumulated_size += size;
+    }
+
+    let src_buffer = staging.buffer;
+    let device = backend.device.clone();
+    let scheduler = unsafe { backend.scheduler.as_mut() };
+    scheduler.request_outside_renderpass();
+    scheduler.record(move |cmdbuf| unsafe {
+        for (index, &(dst_buffer, _)) in destination_buffers.iter().enumerate() {
+            device.cmd_copy_buffer(cmdbuf, src_buffer, dst_buffer, &copies[index]);
+        }
+    });
+}
+
 pub struct QueryCacheRuntime {
+    guest_streamer: Option<Box<GuestStreamer<QueryRuntimeSyncHandle>>>,
+    primitives_needed_minus_succeeded_streamer: Option<Box<StubStreamer<QueryRuntimeSyncHandle>>>,
     state: Arc<parking_lot::Mutex<QueryRuntimeState>>,
-    backend: Option<QueryRuntimeBackend>,
+    backend: Option<Box<QueryRuntimeBackend>>,
     /// Whether a 3D engine has been bound through the query-cache owner path.
     ///
     /// The concrete live engine address is held by `TfbCounterState`, which is
@@ -1376,6 +1522,8 @@ impl QueryCacheRuntime {
     /// - QueriesPrefixScanPass
     pub fn new() -> Self {
         QueryCacheRuntime {
+            guest_streamer: None,
+            primitives_needed_minus_succeeded_streamer: None,
             state: Arc::new(parking_lot::Mutex::new(QueryRuntimeState::default())),
             backend: None,
             bound_3d_engine: false,
@@ -1387,6 +1535,7 @@ impl QueryCacheRuntime {
         instance: &ash::Instance,
         device: ash::Device,
         scheduler: &mut Scheduler,
+        staging_pool: &mut StagingBufferPool,
         memory_allocator: &MemoryAllocator,
         buffer_cache: &mut VulkanCommonBufferCache,
         descriptor_pool: &DescriptorPool,
@@ -1428,20 +1577,32 @@ impl QueryCacheRuntime {
         } else {
             vk::Buffer::null()
         };
+        let mut backend = Box::new(QueryRuntimeBackend {
+            device,
+            scheduler: NonNull::from(scheduler),
+            staging_pool: NonNull::from(staging_pool),
+            buffer_cache: NonNull::from(buffer_cache),
+            device_memory,
+            conditional_resolve_pass,
+            hcr_resolve_buffer,
+            driver_id,
+        });
+        let sync_handle = QueryRuntimeSyncHandle(NonNull::from(backend.as_mut()));
         Ok(Self {
+            guest_streamer: Some(Box::new(GuestStreamer::new(
+                QueryType::Payload as usize,
+                sync_handle,
+            ))),
+            primitives_needed_minus_succeeded_streamer: Some(Box::new(StubStreamer::new(
+                QueryType::StreamingPrimitivesNeededMinusSucceeded as usize,
+                sync_handle,
+                0,
+            ))),
             state: Arc::new(parking_lot::Mutex::new(QueryRuntimeState {
                 conditional_rendering,
                 ..QueryRuntimeState::default()
             })),
-            backend: Some(QueryRuntimeBackend {
-                device,
-                scheduler: NonNull::from(scheduler),
-                buffer_cache: NonNull::from(buffer_cache),
-                device_memory,
-                conditional_resolve_pass,
-                hcr_resolve_buffer,
-                driver_id,
-            }),
+            backend: Some(backend),
             bound_3d_engine: false,
         })
     }
@@ -1839,6 +2000,7 @@ pub struct QueryCache {
     /// `gl_query_cache::QueryCache`.
     channel_memory_manager: Option<Arc<parking_lot::Mutex<crate::memory_manager::MemoryManager>>>,
     gpu_memory_adapter: Option<Box<QueryGpuMemoryAdapter>>,
+    device_memory_adapter: Option<Box<QueryDeviceMemoryAdapter>>,
     /// Source of the GPU tick counter for queries with timestamps.
     /// Mirrors `gl_query_cache::QueryCache::gpu_ticks_getter`.
     gpu_ticks_getter: Option<Arc<dyn Fn() -> u64 + Send + Sync>>,
@@ -1852,11 +2014,26 @@ impl GpuAddressTranslator for QueryGpuMemoryAdapter {
     }
 }
 
+struct QueryDeviceMemoryAdapter(
+    Arc<crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager>,
+);
+
+impl DeviceMemoryWriter for QueryDeviceMemoryAdapter {
+    fn write_u32(&mut self, addr: u64, value: u32) {
+        self.0.write_u32(addr, value);
+    }
+
+    fn write_u64(&mut self, addr: u64, value: u64) {
+        self.0.write_u64(addr, value);
+    }
+}
+
 impl QueryCache {
     pub fn new(
         instance: &ash::Instance,
         device: ash::Device,
         scheduler: &mut Scheduler,
+        staging_pool: &mut StagingBufferPool,
         memory_allocator: &MemoryAllocator,
         common_buffer_cache: &mut VulkanCommonBufferCache,
         descriptor_pool: &DescriptorPool,
@@ -1868,6 +2045,7 @@ impl QueryCache {
         transform_feedback_supported: bool,
         host_query_reset_supported: bool,
     ) -> Result<Self, vk::Result> {
+        let device_memory_adapter = Box::new(QueryDeviceMemoryAdapter(Arc::clone(&device_memory)));
         let samples_streamer = SamplesStreamer::new(
             device,
             scheduler,
@@ -1888,6 +2066,7 @@ impl QueryCache {
             instance,
             samples_streamer.device.clone(),
             scheduler,
+            staging_pool,
             memory_allocator,
             common_buffer_cache,
             descriptor_pool,
@@ -1908,9 +2087,32 @@ impl QueryCache {
             common_buffer_cache: Some(NonNull::from(common_buffer_cache)),
             channel_memory_manager: None,
             gpu_memory_adapter: None,
+            device_memory_adapter: Some(device_memory_adapter),
             gpu_ticks_getter: None,
         };
         cache.base.bind_runtime(cache.runtime.as_mut());
+        cache.base.bind_device_memory(
+            cache
+                .device_memory_adapter
+                .as_deref_mut()
+                .expect("live Vulkan query cache always owns device memory"),
+        );
+        if let Some(streamer) = cache.runtime.guest_streamer.as_deref_mut() {
+            cache
+                .base
+                .impl_
+                .register_streamer(QueryType::Payload as usize, streamer);
+        }
+        if let Some(streamer) = cache
+            .runtime
+            .primitives_needed_minus_succeeded_streamer
+            .as_deref_mut()
+        {
+            cache.base.impl_.register_streamer(
+                QueryType::StreamingPrimitivesNeededMinusSucceeded as usize,
+                streamer,
+            );
+        }
         Ok(cache)
     }
 
@@ -1925,6 +2127,7 @@ impl QueryCache {
             common_buffer_cache: None,
             channel_memory_manager: None,
             gpu_memory_adapter: None,
+            device_memory_adapter: None,
             gpu_ticks_getter: None,
         }
     }
@@ -2013,37 +2216,15 @@ impl QueryCache {
         }
     }
 
-    /// Port of `RasterizerVulkan::HandleTransformFeedback` and
-    /// `TFBCounterStreamer::UpdateBuffers`.
-    pub fn handle_transform_feedback(&mut self, scheduler: &mut Scheduler) {
-        let Some(tfb_streamer) = self.tfb_streamer.as_mut() else {
-            return;
-        };
-        let (enabled, supported, tessellation_enabled) = {
+    pub fn transform_feedback_status(&self) -> Option<(bool, bool, bool)> {
+        self.tfb_streamer.as_ref().map(|tfb_streamer| {
             let state = tfb_streamer.state.lock();
             (
                 state.transform_feedback_enabled(),
                 state.transform_feedback.is_some(),
                 state.tessellation_enabled(),
             )
-        };
-        if !supported {
-            static WARN_UNSUPPORTED: Once = Once::new();
-            WARN_UNSUPPORTED.call_once(|| {
-                if enabled {
-                    log::warn!(
-                        "Transform feedback requested by guest but VK_EXT_transform_feedback is unavailable; queries disabled"
-                    );
-                } else {
-                    log::info!("VK_EXT_transform_feedback not available on device");
-                }
-            });
-            return;
-        }
-        tfb_streamer.counter_enable(scheduler, enabled);
-        if enabled && tessellation_enabled {
-            log::warn!("Transform feedback with tessellation shaders is not implemented");
-        }
+        })
     }
 
     pub fn transform_feedback_dispatch(&self) -> Option<vk::ExtTransformFeedbackFn> {
@@ -2073,19 +2254,27 @@ impl QueryCache {
             }
         }
     }
-    pub fn invalidate_region(&mut self, _addr: u64, _size: usize) {}
-    pub fn flush_region(&mut self, _addr: u64, _size: usize) {}
+    pub fn invalidate_region(&mut self, addr: u64, size: usize) {
+        self.base.invalidate_region(addr, size);
+    }
+    pub fn flush_region(&mut self, addr: u64, size: usize) {
+        self.base.flush_region(addr, size);
+    }
     pub fn notify_wfi(&mut self) {
         self.base.notify_wfi();
     }
-    pub fn commit_async_flushes(&mut self) {}
+    pub fn commit_async_flushes(&mut self) {
+        self.base.commit_async_flushes();
+    }
     pub fn has_uncommitted_flushes(&self) -> bool {
-        false
+        self.base.has_uncommitted_flushes()
     }
     pub fn should_wait_async_flushes(&self) -> bool {
-        false
+        self.base.should_wait_async_flushes()
     }
-    pub fn pop_async_flushes(&mut self) {}
+    pub fn pop_async_flushes(&mut self) {
+        self.base.pop_async_flushes();
+    }
 
     /// Port of upstream `RasterizerVulkan::Query` →
     /// `QueryCacheBase<Vulkan>::CounterReport`. Captures a write-back
@@ -2132,6 +2321,50 @@ impl QueryCache {
         };
         let host_report_is_synchronized =
             is_host_query_report_synchronized(is_fence, gpu_level_high, fence_behavior);
+        let payload_query_id = if effective_query_type == QueryType::Payload as u32 {
+            self.runtime.guest_streamer.as_deref_mut().map(|streamer| {
+                let query_id = streamer.write_counter(
+                    device_addr,
+                    has_timestamp,
+                    effective_payload,
+                    Some(subreport),
+                );
+                if is_fence {
+                    if let Some(query) = streamer.get_query_mut(query_id) {
+                        query
+                            .flags
+                            .insert(crate::query_cache::query_base::QueryFlagBits::IS_FENCE);
+                    }
+                }
+                query_id
+            })
+        } else {
+            None
+        };
+        let stub_query_id =
+            if effective_query_type == QueryType::StreamingPrimitivesNeededMinusSucceeded as u32 {
+                self.runtime
+                    .primitives_needed_minus_succeeded_streamer
+                    .as_deref_mut()
+                    .map(|streamer| {
+                        let query_id = streamer.write_counter(
+                            device_addr,
+                            has_timestamp,
+                            effective_payload,
+                            Some(subreport),
+                        );
+                        if is_fence {
+                            if let Some(query) = streamer.get_query_mut(query_id) {
+                                query.flags.insert(
+                                    crate::query_cache::query_base::QueryFlagBits::IS_FENCE,
+                                );
+                            }
+                        }
+                        query_id
+                    })
+            } else {
+                None
+            };
         if !is_fence && effective_query_type == QueryType::Payload as u32 && !gpu_level_high {
             let gpu_ticks = if has_timestamp {
                 self.gpu_ticks_getter
@@ -2148,7 +2381,27 @@ impl QueryCache {
                 effective_payload as u64,
                 gpu_ticks,
             );
+            if let (Some(streamer), Some(query_id)) =
+                (self.runtime.guest_streamer.as_deref_mut(), payload_query_id)
+            {
+                streamer.free(query_id);
+            }
             return;
+        }
+        if let Some(query_id) = payload_query_id {
+            self.base.cache_query_location(
+                device_addr,
+                QueryLocation::new(QueryType::Payload as u32, query_id as u32),
+            );
+        }
+        if let Some(query_id) = stub_query_id {
+            self.base.cache_query_location(
+                device_addr,
+                QueryLocation::new(
+                    QueryType::StreamingPrimitivesNeededMinusSucceeded as u32,
+                    query_id as u32,
+                ),
+            );
         }
 
         let host_report = if has_samples_streamer {
@@ -2309,6 +2562,33 @@ mod tests {
     }
 
     #[test]
+    fn sync_values_group_same_and_adjacent_pages_like_upstream() {
+        let values = [
+            SyncValuesStruct {
+                address: 0x2ff8,
+                value: 1,
+                size: 8,
+            },
+            SyncValuesStruct {
+                address: 0x3000,
+                value: 2,
+                size: 4,
+            },
+            SyncValuesStruct {
+                address: 0x9004,
+                value: 3,
+                size: 4,
+            },
+        ];
+
+        let (redirects, regions, total_size) = build_sync_value_regions(&values);
+
+        assert_eq!(redirects, vec![0, 0, 1]);
+        assert_eq!(regions, vec![(0x2000, 0x4000), (0x9000, 0xa000)]);
+        assert_eq!(total_size, 16);
+    }
+
+    #[test]
     fn query_cache_runtime_state() {
         let mut rt = QueryCacheRuntime::new();
         assert!(!rt.is_host_conditional_rendering_active());
@@ -2395,6 +2675,13 @@ mod tests {
         assert_eq!(
             unsupported_query_payload(QueryType::StreamingPrimitivesNeededMinusSucceeded as u32),
             0
+        );
+        assert_eq!(
+            effective_query_type_and_payload(
+                QueryType::StreamingPrimitivesNeededMinusSucceeded as u32,
+                0xDEAD_BEEF,
+            ),
+            (QueryType::StreamingPrimitivesNeededMinusSucceeded as u32, 0,)
         );
     }
 

@@ -1,8 +1,9 @@
-use crate::common::common::{make_magic, CpuAddr};
+use crate::common::common::CpuAddr;
 use crate::common::feature_support::{
     check_feature_supported, get_revision_num, SupportTags, CURRENT_REVISION,
 };
 use crate::Result;
+use common::common_funcs::make_magic;
 use log::error;
 
 pub const MAX_ERRORS: usize = 10;
@@ -48,6 +49,10 @@ pub struct OutStatus {
     pub unk_a4: [u8; 0xC],
 }
 
+const _: () = assert!(std::mem::size_of::<ErrorInfo>() == 0x10);
+const _: () = assert!(std::mem::size_of::<InParameter>() == 0x10);
+const _: () = assert!(std::mem::size_of::<OutStatus>() == 0xB0);
+
 impl Default for OutStatus {
     fn default() -> Self {
         Self {
@@ -83,10 +88,10 @@ impl BehaviorInfo {
 
     pub fn get_process_revision(&self) -> u32 {
         make_magic(
-            'R',
-            'E',
-            'V',
-            char::from_u32('0' as u32 + self.process_revision).unwrap_or(';'),
+            b'R',
+            b'E',
+            b'V',
+            b'0'.wrapping_add(self.process_revision as u8),
         )
     }
 
@@ -96,10 +101,10 @@ impl BehaviorInfo {
 
     pub fn get_user_revision(&self) -> u32 {
         make_magic(
-            'R',
-            'E',
-            'V',
-            char::from_u32('0' as u32 + self.user_revision).unwrap_or(';'),
+            b'R',
+            b'E',
+            b'V',
+            b'0'.wrapping_add(self.user_revision as u8),
         )
     }
 
@@ -261,6 +266,22 @@ impl BehaviorInfo {
 
     pub fn is_i3dl2_reverb_channel_mapping_changed(&self) -> bool {
         self.supported(SupportTags::I3dl2ReverbChannelMappingChange)
+    }
+
+    pub fn is_splitter_prev_volume_reset_supported(&self) -> bool {
+        self.supported(SupportTags::SplitterPrevVolumeReset)
+    }
+
+    pub fn is_splitter_destination_v2b_supported(&self) -> bool {
+        self.supported(SupportTags::SplitterDestinationV2b)
+    }
+
+    pub fn is_voice_in_parameter_v2_supported(&self) -> bool {
+        self.supported(SupportTags::VoiceInParameterV2)
+    }
+
+    pub fn is_biquad_filter_parameter_for_splitter_enabled(&self) -> bool {
+        self.supported(SupportTags::SplitterBiquadFilterParameter)
     }
 
     fn supported(&self, tag: SupportTags) -> bool {

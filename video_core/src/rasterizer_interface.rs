@@ -10,11 +10,12 @@
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
+use crate::cache_types::CacheType;
 use crate::control::channel_state::ChannelState;
 use crate::engines::draw_manager::{Maxwell3DClearView, Maxwell3DDrawView, Maxwell3DIndirectView};
 use crate::engines::fermi_2d::{Config as Fermi2DConfig, Surface as Fermi2DSurface};
 use crate::engines::kepler_compute::DispatchCall;
-use crate::engines::maxwell_dma::dma;
+use crate::engines::maxwell_dma::AccelerateDMAInterface;
 use crate::query_cache::types::QueryPropertiesFlags;
 
 /// Shader loading callback stages.
@@ -33,6 +34,40 @@ pub type DiskResourceLoadCallback =
 ///
 /// This is the Rust owner-equivalent of upstream's copied `std::stop_token`.
 pub type DiskResourceLoadStop = Arc<AtomicBool>;
+
+/// Inert DMA owner used only by unit-test rasterizers that never exercise DMA.
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct TestAccelerateDMA;
+
+#[cfg(test)]
+impl AccelerateDMAInterface for TestAccelerateDMA {
+    fn buffer_copy(&mut self, _src_address: u64, _dest_address: u64, _amount: u64) -> bool {
+        false
+    }
+
+    fn buffer_clear(&mut self, _dst_address: u64, _amount: u64, _value: u32) -> bool {
+        false
+    }
+
+    fn image_to_buffer(
+        &mut self,
+        _copy_info: &crate::engines::maxwell_dma::dma::ImageCopy,
+        _src: &crate::engines::maxwell_dma::dma::ImageOperand,
+        _dst: &crate::engines::maxwell_dma::dma::BufferOperand,
+    ) -> bool {
+        false
+    }
+
+    fn buffer_to_image(
+        &mut self,
+        _copy_info: &crate::engines::maxwell_dma::dma::ImageCopy,
+        _src: &crate::engines::maxwell_dma::dma::BufferOperand,
+        _dst: &crate::engines::maxwell_dma::dma::ImageOperand,
+    ) -> bool {
+        false
+    }
+}
 
 /// Non-owning rasterizer pointer matching upstream `VideoCore::RasterizerInterface*`.
 ///
@@ -126,18 +161,12 @@ pub trait RasterizerInterface {
     fn clear(&mut self, clear_view: Maxwell3DClearView<'_>, layer_count: u32);
 
     /// Dispatch a compute shader invocation.
-    fn dispatch_compute(&mut self);
-
-    /// Dispatch a compute shader invocation with the KeplerCompute state captured
-    /// at the launch boundary.
     ///
     /// Upstream `RasterizerOpenGL::DispatchCompute` reads the currently bound
     /// `KeplerCompute` owner directly. Rust passes the already-recorded dispatch
     /// snapshot to avoid re-entering `KeplerCompute` mutably while it is calling
     /// into the rasterizer.
-    fn dispatch_compute_with_call(&mut self, _dispatch: &DispatchCall) {
-        self.dispatch_compute();
-    }
+    fn dispatch_compute(&mut self, dispatch: &DispatchCall);
 
     // ── Queries ──────────────────────────────────────────────────────────
 
@@ -187,21 +216,27 @@ pub trait RasterizerInterface {
     fn flush_all(&mut self);
 
     /// Flush caches of the specified region to Switch memory.
-    fn flush_region(&mut self, addr: u64, size: u64);
+    fn flush_region(&mut self, addr: u64, size: u64, which: CacheType);
 
     /// Check if the specified memory area requires flushing to CPU memory.
-    fn must_flush_region(&self, addr: u64, size: u64) -> bool;
+    fn must_flush_region(&self, addr: u64, size: u64, which: CacheType) -> bool;
 
     /// Get the download area for flushing a region.
     fn get_flush_area(&self, addr: u64, size: u64) -> RasterizerDownloadArea;
 
     /// Invalidate caches of the specified region.
-    fn invalidate_region(&mut self, addr: u64, size: u64);
+    fn invalidate_region(&mut self, addr: u64, size: u64, which: CacheType);
 
     /// Invalidate multiple regions at once.
     fn inner_invalidation(&mut self, sequences: &[(u64, usize)]) {
+        if *common::settings::values()
+            .skip_cpu_inner_invalidation
+            .get_value()
+        {
+            return;
+        }
         for &(addr, size) in sequences {
-            self.invalidate_region(addr, size as u64);
+            self.invalidate_region(addr, size as u64, CacheType::ALL);
         }
     }
 
@@ -221,7 +256,7 @@ pub trait RasterizerInterface {
     fn modify_gpu_memory(&mut self, as_id: usize, addr: u64, size: u64);
 
     /// Flush and invalidate caches of the specified region.
-    fn flush_and_invalidate_region(&mut self, addr: u64, size: u64);
+    fn flush_and_invalidate_region(&mut self, addr: u64, size: u64, which: CacheType);
 
     // ── Barriers / sync ─────────────────────────────────────────────────
 
@@ -267,45 +302,8 @@ pub trait RasterizerInterface {
         false
     }
 
-    /// Access upstream `AccelerateDMAInterface::BufferCopy`.
-    fn accelerate_dma_buffer_copy(
-        &mut self,
-        _src_address: u64,
-        _dest_address: u64,
-        _amount: u64,
-    ) -> bool {
-        false
-    }
-
-    /// Access upstream `AccelerateDMAInterface::BufferClear`.
-    fn accelerate_dma_buffer_clear(
-        &mut self,
-        _dst_address: u64,
-        _amount: u64,
-        _value: u32,
-    ) -> bool {
-        false
-    }
-
-    /// Access upstream `AccelerateDMAInterface::ImageToBuffer`.
-    fn accelerate_dma_image_to_buffer(
-        &mut self,
-        _copy_info: &dma::ImageCopy,
-        _src: &dma::ImageOperand,
-        _dst: &dma::BufferOperand,
-    ) -> bool {
-        false
-    }
-
-    /// Access upstream `AccelerateDMAInterface::BufferToImage`.
-    fn accelerate_dma_buffer_to_image(
-        &mut self,
-        _copy_info: &dma::ImageCopy,
-        _src: &dma::BufferOperand,
-        _dst: &dma::ImageOperand,
-    ) -> bool {
-        false
-    }
+    /// Return the backend-owned DMA accelerator.
+    fn access_accelerate_dma(&mut self) -> &mut dyn AccelerateDMAInterface;
 
     /// Accelerate inline memory write.
     fn accelerate_inline_to_memory(&mut self, address: u64, copy_size: usize, memory: &[u8]);

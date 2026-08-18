@@ -453,19 +453,20 @@ impl QueryCacheBaseImpl {
     }
 
     pub fn obtain_query(&self, location: QueryLocation) -> Option<&QueryBase> {
-        let (streamer_id, query_id) = location.unpack();
-        self.streamer_for_id(streamer_id)?.get_query(query_id)
+        let (streamer_slot, query_id) = location.unpack();
+        self.get_streamer_for_query_type(streamer_slot)?
+            .get_query(query_id)
     }
 
     pub fn obtain_query_mut(&mut self, location: QueryLocation) -> Option<&mut QueryBase> {
-        let (streamer_id, query_id) = location.unpack();
-        self.streamer_for_id_mut(streamer_id)?
+        let (streamer_slot, query_id) = location.unpack();
+        self.get_streamer_for_query_type_mut(streamer_slot)?
             .get_query_mut(query_id)
     }
 
     pub fn free_query_location(&mut self, location: QueryLocation) {
-        let (streamer_id, query_id) = location.unpack();
-        if let Some(streamer) = self.streamer_for_id_mut(streamer_id) {
+        let (streamer_slot, query_id) = location.unpack();
+        if let Some(streamer) = self.get_streamer_for_query_type_mut(streamer_slot) {
             streamer.free(query_id);
         }
     }

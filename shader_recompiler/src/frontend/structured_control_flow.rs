@@ -1067,10 +1067,7 @@ mod tests {
     fn conditional_exit_does_not_emit_flat_return() {
         let mut cfg_block = block(
             EndClass::Exit,
-            Condition {
-                pred: 0,
-                negated: false,
-            },
+            Condition::from_pred(crate::ir::condition::IrPred::P0, false),
         );
         cfg_block.branch_false = Some(1);
         let syntax = structure_cfg(&[cfg_block, block(EndClass::Return, Condition::always())]);
@@ -1115,10 +1112,7 @@ mod tests {
     fn conditional_forward_branch_bodies_use_inverted_condition() {
         let mut branch = block(
             EndClass::Branch,
-            Condition {
-                pred: 0,
-                negated: false,
-            },
+            Condition::from_pred(crate::ir::condition::IrPred::P0, false),
         );
         branch.branch_true = Some(2);
         branch.branch_false = Some(1);

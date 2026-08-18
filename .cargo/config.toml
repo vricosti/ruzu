@@ -1,6 +1,7 @@
 [target.'cfg(target_env = "musl")']
-# musl targets default to a static C runtime, but Alpine's GTK, Vulkan, SDL2,
-# FFmpeg, and audio development packages provide shared libraries.
+# musl targets default to a static C runtime, but Alpine's GTK, Vulkan,
+# FFmpeg, and audio development packages provide shared libraries. SDL3 is
+# built statically from source by Cargo.
 rustflags = ["-C", "target-feature=-crt-static"]
 
 [target.'cfg(target_os = "openbsd")']

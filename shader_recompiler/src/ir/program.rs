@@ -107,6 +107,7 @@ impl ShaderInfoExt for ShaderInfo {
                     texture_type,
                     is_depth,
                     is_multisample: false,
+                    is_integer: false,
                     has_secondary: false,
                     cbuf_index: index,
                     cbuf_offset: 0,
@@ -188,8 +189,132 @@ impl Program {
         &mut self.blocks[idx as usize]
     }
 
+    /// Invalidate and erase an instruction while preserving stable slot IDs.
+    ///
+    /// Upstream instruction pointers unlink pseudo-operations from their
+    /// parent in `Inst::Invalidate` -> `ClearArgs` -> `UndoUse`. Rust stores
+    /// indexed references instead, so the owning `Program` performs that
+    /// cross-block unlink before leaving a tombstone in the block.
+    pub fn erase_inst(&mut self, inst_ref: super::value::InstRef) {
+        let (opcode, referenced_insts) = {
+            let inst = self.block(inst_ref.block).inst(inst_ref.inst);
+            let mut referenced_insts = Vec::new();
+            referenced_insts.extend(inst.args.iter().filter_map(|arg| match arg {
+                super::value::Value::Inst(parent) => Some(*parent),
+                _ => None,
+            }));
+            referenced_insts.extend(inst.phi_args.iter().filter_map(|(_, arg)| match arg {
+                super::value::Value::Inst(parent) => Some(*parent),
+                _ => None,
+            }));
+            (inst.opcode, referenced_insts)
+        };
+
+        if opcode.is_pseudo_instruction() {
+            for &parent in &referenced_insts {
+                self.block_mut(parent.block)
+                    .inst_mut(parent.inst)
+                    .remove_associated_pseudo(opcode, inst_ref);
+            }
+        }
+        for parent in referenced_insts {
+            let use_count = &mut self.block_mut(parent.block).inst_mut(parent.inst).use_count;
+            assert!(*use_count > 0, "instruction use count underflow");
+            *use_count -= 1;
+        }
+        self.block_mut(inst_ref.block).erase_inst(inst_ref.inst);
+    }
+
+    /// Rebuild instruction use counts from the indexed IR graph.
+    ///
+    /// Upstream updates its intrusive use-def chain in every `Inst::Use`,
+    /// `Inst::UndoUse`, and `Inst::SetArg` call. The Rust IR still constructs
+    /// and rewrites indexed `InstRef` values directly, so passes which perform
+    /// upstream-equivalent invalidation must first materialize that same
+    /// invariant from the current graph.
+    pub(crate) fn recompute_use_counts(&mut self) {
+        for block in &mut self.blocks {
+            for inst in block.iter_mut() {
+                inst.use_count = 0;
+            }
+        }
+
+        let mut use_counts = self
+            .blocks
+            .iter()
+            .map(|block| vec![0u32; block.instructions.len()])
+            .collect::<Vec<_>>();
+
+        let count_value = |counts: &mut [Vec<u32>], value: &super::value::Value| {
+            if let super::value::Value::Inst(inst_ref) = value {
+                if let Some(count) = counts
+                    .get_mut(inst_ref.block as usize)
+                    .and_then(|block| block.get_mut(inst_ref.inst as usize))
+                {
+                    *count += 1;
+                }
+            }
+        };
+        for block in &self.blocks {
+            for inst in block.iter() {
+                for arg in &inst.args {
+                    count_value(&mut use_counts, arg);
+                }
+                for (_, arg) in &inst.phi_args {
+                    count_value(&mut use_counts, arg);
+                }
+            }
+        }
+        for node in &self.syntax_list {
+            match node {
+                SyntaxNode::If { cond, .. }
+                | SyntaxNode::Repeat { cond, .. }
+                | SyntaxNode::Break { cond, .. } => count_value(&mut use_counts, cond),
+                _ => {}
+            }
+        }
+
+        for (block_idx, block) in self.blocks.iter_mut().enumerate() {
+            for (inst_idx, inst) in block.indexed_iter_mut() {
+                inst.use_count = use_counts[block_idx][inst_idx as usize];
+            }
+        }
+    }
+
     /// Number of blocks.
     pub fn num_blocks(&self) -> usize {
         self.blocks.len()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Program;
+    use crate::ir::{Inst, InstRef, Opcode, ShaderStage, Value};
+
+    #[test]
+    fn erase_inst_undoes_each_argument_use() {
+        let mut program = Program::new(ShaderStage::Fragment);
+        let block = program.add_block();
+        let producer = program
+            .block_mut(block)
+            .append_inst(Inst::new(Opcode::IAdd32, vec![]));
+        let producer_ref = InstRef {
+            block,
+            inst: producer,
+        };
+        program.block_mut(block).inst_mut(producer).use_count = 2;
+        let consumer = program.block_mut(block).append_inst(Inst::new(
+            Opcode::IAdd32,
+            vec![Value::Inst(producer_ref), Value::Inst(producer_ref)],
+        ));
+
+        program.erase_inst(InstRef {
+            block,
+            inst: consumer,
+        });
+
+        assert_eq!(program.block(block).inst(producer).use_count, 0);
+        assert!(program.block(block).instructions[consumer as usize].is_none());
     }
 }

@@ -1,3 +1,13 @@
+// SPDX-FileCopyrightText: 2026 reden contributors
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+//! Audio subsystem root and service-facing adapters.
+//!
+//! The manager/session adapters live here because the `core` and `audio_core`
+//! crates cannot depend on one another. Upstream owns those adapters in its HLE
+//! audio services; this dependency inversion preserves that behavior without a
+//! crate cycle.
+
 use crate::adsp::ADSP;
 use crate::audio_in_manager::Manager as AudioInManager;
 use crate::audio_manager::AudioManager;
@@ -27,6 +37,7 @@ pub struct AudioCore {
     audio_render_manager: Arc<Mutex<AudioRenderManager>>,
     output_sink: SinkHandle,
     input_sink: SinkHandle,
+    opus_decoder_manager: Mutex<Option<crate::opus::OpusDecoderManager>>,
     adsp: ADSP,
 }
 
@@ -55,6 +66,7 @@ impl AudioCore {
             audio_render_manager,
             output_sink,
             input_sink,
+            opus_decoder_manager: Mutex::new(None),
             adsp,
         }
     }
@@ -735,7 +747,16 @@ impl ruzu_core::core::AudioCoreInterface for AudioCore {
         Box<dyn ruzu_core::core::OpusDecoderInterface>,
         ruzu_core::hle::result::ResultCode,
     > {
-        let mut decoder = crate::opus::OpusDecoder::new(crate::opus::HardwareOpus::new());
+        let hardware_opus = {
+            let mut manager = self.opus_decoder_manager.lock();
+            manager
+                .get_or_insert_with(|| {
+                    crate::opus::OpusDecoderManager::new_from_adsp(self.adsp.opus_decoder())
+                })
+                .get_hardware_opus()
+                .clone()
+        };
+        let mut decoder = crate::opus::OpusDecoder::new(hardware_opus);
         let params = crate::opus::OpusParametersEx {
             sample_rate,
             channel_count,
@@ -764,7 +785,16 @@ impl ruzu_core::core::AudioCoreInterface for AudioCore {
         Box<dyn ruzu_core::core::OpusDecoderInterface>,
         ruzu_core::hle::result::ResultCode,
     > {
-        let mut decoder = crate::opus::OpusDecoder::new(crate::opus::HardwareOpus::new());
+        let hardware_opus = {
+            let mut manager = self.opus_decoder_manager.lock();
+            manager
+                .get_or_insert_with(|| {
+                    crate::opus::OpusDecoderManager::new_from_adsp(self.adsp.opus_decoder())
+                })
+                .get_hardware_opus()
+                .clone()
+        };
+        let mut decoder = crate::opus::OpusDecoder::new(hardware_opus);
         let mut params = crate::opus::OpusMultiStreamParametersEx::default();
         params.sample_rate = sample_rate;
         params.channel_count = channel_count;
@@ -786,8 +816,11 @@ impl ruzu_core::core::AudioCoreInterface for AudioCore {
         sample_rate: u32,
         channel_count: u32,
         use_large_frame_size: bool,
-    ) -> u32 {
-        let manager = crate::opus::OpusDecoderManager::new();
+    ) -> std::result::Result<u32, ruzu_core::hle::result::ResultCode> {
+        let mut manager = self.opus_decoder_manager.lock();
+        let manager = manager.get_or_insert_with(|| {
+            crate::opus::OpusDecoderManager::new_from_adsp(self.adsp.opus_decoder())
+        });
         let params = crate::opus::OpusParametersEx {
             sample_rate,
             channel_count,
@@ -795,8 +828,12 @@ impl ruzu_core::core::AudioCoreInterface for AudioCore {
             padding: [0; 7],
         };
         let mut size: u32 = 0;
-        let _ = manager.get_work_buffer_size_ex(&params, &mut size);
-        size
+        let result = manager.get_work_buffer_size_ex(&params, &mut size);
+        if result.is_error() {
+            Err(ruzu_core::hle::result::ResultCode::new(result.raw()))
+        } else {
+            Ok(size)
+        }
     }
 
     fn get_opus_work_buffer_size_for_multi_stream(
@@ -806,8 +843,11 @@ impl ruzu_core::core::AudioCoreInterface for AudioCore {
         total_stream_count: u32,
         stereo_stream_count: u32,
         use_large_frame_size: bool,
-    ) -> u32 {
-        let manager = crate::opus::OpusDecoderManager::new();
+    ) -> std::result::Result<u32, ruzu_core::hle::result::ResultCode> {
+        let mut manager = self.opus_decoder_manager.lock();
+        let manager = manager.get_or_insert_with(|| {
+            crate::opus::OpusDecoderManager::new_from_adsp(self.adsp.opus_decoder())
+        });
         let mut params = crate::opus::OpusMultiStreamParametersEx::default();
         params.sample_rate = sample_rate;
         params.channel_count = channel_count;
@@ -815,8 +855,12 @@ impl ruzu_core::core::AudioCoreInterface for AudioCore {
         params.stereo_stream_count = stereo_stream_count;
         params.use_large_frame_size = use_large_frame_size;
         let mut size: u32 = 0;
-        let _ = manager.get_work_buffer_size_for_multi_stream_ex(&params, &mut size);
-        size
+        let result = manager.get_work_buffer_size_for_multi_stream_ex(&params, &mut size);
+        if result.is_error() {
+            Err(ruzu_core::hle::result::ResultCode::new(result.raw()))
+        } else {
+            Ok(size)
+        }
     }
 }
 
@@ -977,5 +1021,41 @@ mod tests {
             drop(Box::from_raw(process));
             drop(Box::from_raw(transfer_memory));
         }
+    }
+
+    #[test]
+    fn audio_core_bridge_decodes_non_silent_opus_in_independent_sessions() {
+        let audio_core = make_audio_core();
+        let work_buffer_size = audio_core
+            .get_opus_work_buffer_size(48_000, 2, false)
+            .expect("valid stereo Opus workbuffer size");
+        let mut first = audio_core
+            .open_opus_decoder(48_000, 2, false, work_buffer_size as u64)
+            .expect("first Opus session");
+        let mut second = audio_core
+            .open_opus_decoder(48_000, 2, false, work_buffer_size as u64)
+            .expect("second Opus session");
+
+        let payload = crate::adsp::apps::opus::opus_decode_object::tests::encoded_stereo_packet();
+        let mut packet = Vec::with_capacity(8 + payload.len());
+        packet.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+        packet.extend_from_slice(&0u32.to_be_bytes());
+        packet.extend_from_slice(&payload);
+
+        for decoder in [&mut first, &mut second] {
+            let mut output = vec![0; 960 * 2 * core::mem::size_of::<i16>()];
+            let (_, sample_count, _) = decoder
+                .decode_interleaved(&packet, &mut output, false)
+                .expect("Opus packet should decode through the service bridge");
+            assert_eq!(sample_count, 960);
+            assert!(output.chunks_exact(2).any(|sample| sample != [0, 0]));
+        }
+
+        let mut output = vec![0; 960 * 2 * core::mem::size_of::<i16>()];
+        let (_, sample_count, _) = first
+            .decode_interleaved(&packet, &mut output, false)
+            .expect("first Opus session should remain independent");
+        assert_eq!(sample_count, 960);
+        assert!(output.chunks_exact(2).any(|sample| sample != [0, 0]));
     }
 }

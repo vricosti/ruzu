@@ -1092,6 +1092,10 @@ impl DecoderImpl for Vp9 {
         self.state.vp9_hidden_frame = false;
         let current_frame = self.get_current_frame(regs);
         self.current_frame_info = current_frame.info;
+        self.state.set_frame_dimensions(
+            self.current_frame_info.frame_size.width as i32,
+            self.current_frame_info.frame_size.height as i32,
+        );
 
         let mut uncompressed = self.compose_uncompressed_header(regs);
         let compressed = self.compose_compressed_header();

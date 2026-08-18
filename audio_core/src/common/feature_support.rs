@@ -1,6 +1,6 @@
-use crate::common::common::make_magic;
+use common::common_funcs::make_magic;
 
-pub const CURRENT_REVISION: u32 = 11;
+pub const CURRENT_REVISION: u32 = 15;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SupportTags {
@@ -32,6 +32,10 @@ pub enum SupportTags {
     DelayChannelMappingChange,
     ReverbChannelMappingChange,
     I3dl2ReverbChannelMappingChange,
+    SplitterPrevVolumeReset,
+    SplitterBiquadFilterParameter,
+    SplitterDestinationV2b,
+    VoiceInParameterV2,
 }
 
 const FEATURES: &[(SupportTags, u32)] = &[
@@ -62,11 +66,15 @@ const FEATURES: &[(SupportTags, u32)] = &[
     (SupportTags::DelayChannelMappingChange, 11),
     (SupportTags::ReverbChannelMappingChange, 11),
     (SupportTags::I3dl2ReverbChannelMappingChange, 11),
+    (SupportTags::SplitterBiquadFilterParameter, 12),
+    (SupportTags::SplitterPrevVolumeReset, 13),
+    (SupportTags::SplitterDestinationV2b, 15),
+    (SupportTags::VoiceInParameterV2, 15),
 ];
 
 pub const fn get_revision_num(mut user_revision: u32) -> u32 {
     if user_revision >= 0x100 {
-        user_revision -= make_magic('R', 'E', 'V', '0');
+        user_revision -= make_magic(b'R', b'E', b'V', b'0');
         user_revision >>= 24;
     }
     user_revision
@@ -82,4 +90,40 @@ pub fn check_feature_supported(tag: SupportTags, user_revision: u32) -> bool {
 
 pub const fn check_valid_revision(user_revision: u32) -> bool {
     get_revision_num(user_revision) <= CURRENT_REVISION
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn revision_12_through_15_features_match_upstream_boundaries() {
+        assert!(!check_feature_supported(
+            SupportTags::SplitterBiquadFilterParameter,
+            11
+        ));
+        assert!(check_feature_supported(
+            SupportTags::SplitterBiquadFilterParameter,
+            12
+        ));
+        assert!(!check_feature_supported(
+            SupportTags::SplitterPrevVolumeReset,
+            12
+        ));
+        assert!(check_feature_supported(
+            SupportTags::SplitterPrevVolumeReset,
+            13
+        ));
+        assert!(!check_feature_supported(
+            SupportTags::VoiceInParameterV2,
+            14
+        ));
+        assert!(check_feature_supported(SupportTags::VoiceInParameterV2, 15));
+        assert!(check_feature_supported(
+            SupportTags::SplitterDestinationV2b,
+            15
+        ));
+        assert!(check_valid_revision(15));
+        assert!(!check_valid_revision(16));
+    }
 }

@@ -11,21 +11,29 @@ use parking_lot::Mutex;
 
 use super::gl_resource_manager::OGLQuery;
 use crate::control::channel_state::ChannelState;
-use crate::control::channel_state_cache::ChannelCacheAccessor;
 use crate::query_cache_top::{
-    AsyncJob, AsyncJobId, CachedQueryBase, CounterHandle, HostCounterBase, QueryCacheLegacy,
-    QueryType, NUM_QUERY_TYPES,
+    AsyncJobId, CachedQueryBase, CounterHandle, HostCounterBase, LegacyCachedQuery,
+    QueryCacheLegacy, QueryType, NUM_QUERY_TYPES,
 };
+
+#[cfg(test)]
+use crate::query_cache_top::{AsyncJob, NULL_ASYNC_JOB_ID};
 
 /// Map a query type to the corresponding GL target.
 ///
 /// Corresponds to the anonymous `GetTarget()` in gl_query_cache.cpp.
-pub fn get_target(query_type: QueryType) -> u32 {
+fn get_target(query_type: QueryType) -> u32 {
     match query_type {
         QueryType::SamplesPassed => gl::SAMPLES_PASSED,
         QueryType::PrimitivesGenerated => gl::PRIMITIVES_GENERATED,
         QueryType::TfbPrimitivesWritten => gl::TRANSFORM_FEEDBACK_PRIMITIVES_WRITTEN,
-        QueryType::Count => unreachable!("QueryType::Count is not a concrete GL query target"),
+        QueryType::Count => {
+            log::error!(
+                "Query type {:?} is not a concrete GL query target",
+                query_type
+            );
+            0
+        }
     }
 }
 
@@ -35,9 +43,7 @@ pub fn get_target(query_type: QueryType) -> u32 {
 pub struct QueryCache {
     /// Per-type pool of reusable query objects.
     query_pools: Arc<Mutex<[Vec<OGLQuery>; NUM_QUERY_TYPES]>>,
-    channel_memory_manager: Option<Arc<parking_lot::Mutex<crate::memory_manager::MemoryManager>>>,
     legacy: QueryCacheLegacy<CachedQuery, HostCounterHandle>,
-    commands_queued: bool,
 }
 
 impl QueryCache {
@@ -47,13 +53,9 @@ impl QueryCache {
     pub fn new() -> Self {
         let mut cache = Self {
             query_pools: Arc::new(Mutex::new(std::array::from_fn(|_| Vec::new()))),
-            channel_memory_manager: None,
             legacy: QueryCacheLegacy::new(),
-            commands_queued: false,
         };
-        cache.enable_stream(QueryType::SamplesPassed);
-        cache.enable_stream(QueryType::PrimitivesGenerated);
-        cache.enable_stream(QueryType::TfbPrimitivesWritten);
+        cache.enable_counters();
         cache
     }
 
@@ -61,7 +63,14 @@ impl QueryCache {
     ///
     /// Corresponds to `QueryCache::AllocateQuery()`.
     pub fn allocate_query(&mut self, query_type: QueryType) -> OGLQuery {
-        if let Some(query) = self.query_pools.lock()[query_type as usize].pop() {
+        Self::allocate_query_from_pool(&self.query_pools, query_type)
+    }
+
+    fn allocate_query_from_pool(
+        query_pools: &Arc<Mutex<[Vec<OGLQuery>; NUM_QUERY_TYPES]>>,
+        query_type: QueryType,
+    ) -> OGLQuery {
+        if let Some(query) = query_pools.lock()[query_type as usize].pop() {
             return query;
         }
         let mut query = OGLQuery::new();
@@ -84,43 +93,69 @@ impl QueryCache {
     /// Port of `QueryCacheLegacy::BindToChannel`.
     pub fn bind_to_channel(&mut self, channel_id: i32) {
         self.legacy.bind_to_channel(channel_id);
-        self.channel_memory_manager = self
-            .legacy
-            .channel_caches
-            .current_channel_state()
-            .and_then(ChannelCacheAccessor::gpu_memory_arc);
     }
 
     /// Port of `QueryCacheLegacy::EraseChannel`.
     pub fn erase_channel(&mut self, channel_id: i32) {
         self.legacy.erase_channel(channel_id);
-        self.channel_memory_manager = self
-            .legacy
-            .channel_caches
-            .current_channel_state()
-            .and_then(ChannelCacheAccessor::gpu_memory_arc);
     }
 
-    pub fn reset_counter(&mut self, query_type: u32) {
-        let query_type = match query_type {
-            0 => QueryType::SamplesPassed,
-            1 => QueryType::PrimitivesGenerated,
-            2 => QueryType::TfbPrimitivesWritten,
-            _ => return,
+    /// Port of `QueryCacheLegacy::EnableCounters`.
+    pub fn enable_counters(&mut self) {
+        let query_pools = Arc::clone(&self.query_pools);
+        let mut make_counter = move |dependency, query_type| {
+            Arc::new(Mutex::new(HostCounter::new(
+                &query_pools,
+                dependency,
+                query_type,
+            )))
         };
-        self.reset_stream(query_type);
+        self.legacy.enable_counters(&mut make_counter);
     }
 
-    pub fn set_commands_queued(&mut self, commands_queued: bool) {
-        self.commands_queued = commands_queued;
+    /// Port of `QueryCacheLegacy::ResetCounter`.
+    pub fn reset_counter(&mut self, query_type: QueryType, any_command_queued: bool) {
+        let query_pools = Arc::clone(&self.query_pools);
+        let mut make_counter = move |dependency, query_type| {
+            Arc::new(Mutex::new(HostCounter::new(
+                &query_pools,
+                dependency,
+                query_type,
+            )))
+        };
+        self.legacy
+            .reset_counter(query_type, any_command_queued, &mut make_counter);
     }
 
-    pub fn invalidate_region(&mut self, addr: u64, size: usize) {
-        self.flush_and_remove_region(addr, size, false);
+    /// Port of `QueryCacheLegacy::DisableStreams`.
+    pub fn disable_streams(&mut self, any_command_queued: bool) {
+        self.legacy.disable_streams(any_command_queued);
     }
 
-    pub fn flush_region(&mut self, addr: u64, size: usize) {
-        self.flush_and_remove_region(addr, size, false);
+    pub fn invalidate_region(&mut self, addr: u64, size: usize, any_command_queued: bool) {
+        let query_pools = Arc::clone(&self.query_pools);
+        let mut make_counter = move |dependency, query_type| {
+            Arc::new(Mutex::new(HostCounter::new(
+                &query_pools,
+                dependency,
+                query_type,
+            )))
+        };
+        self.legacy
+            .invalidate_region(addr, size, any_command_queued, &mut make_counter);
+    }
+
+    pub fn flush_region(&mut self, addr: u64, size: usize, any_command_queued: bool) {
+        let query_pools = Arc::clone(&self.query_pools);
+        let mut make_counter = move |dependency, query_type| {
+            Arc::new(Mutex::new(HostCounter::new(
+                &query_pools,
+                dependency,
+                query_type,
+            )))
+        };
+        self.legacy
+            .flush_region(addr, size, any_command_queued, &mut make_counter);
     }
 
     pub fn commit_async_flushes(&mut self) {
@@ -135,32 +170,17 @@ impl QueryCache {
         self.legacy.should_wait_async_flushes()
     }
 
-    pub fn pop_async_flushes(&mut self) {
-        let Some(flush_list) = self.legacy.committed_flushes.pop_front() else {
-            return;
+    pub fn pop_async_flushes(&mut self, any_command_queued: bool) {
+        let query_pools = Arc::clone(&self.query_pools);
+        let mut make_counter = move |dependency, query_type| {
+            Arc::new(Mutex::new(HostCounter::new(
+                &query_pools,
+                dependency,
+                query_type,
+            )))
         };
-        let Some(flush_list) = flush_list else {
-            return;
-        };
-        for async_job_id in flush_list {
-            let should_collect = {
-                let async_jobs = self.legacy.slot_async_jobs.lock();
-                async_jobs
-                    .get(&async_job_id)
-                    .map(|async_job| !async_job.collected)
-                    .unwrap_or(false)
-            };
-            if should_collect {
-                let query_location = self
-                    .legacy
-                    .slot_async_jobs
-                    .lock()
-                    .get(&async_job_id)
-                    .map(|async_job| async_job.query_location)
-                    .unwrap_or(0);
-                self.flush_and_remove_region(query_location, 2, true);
-            }
-        }
+        self.legacy
+            .pop_async_flushes(any_command_queued, &mut make_counter);
     }
 
     pub fn query(
@@ -168,180 +188,27 @@ impl QueryCache {
         gpu_addr: u64,
         query_type: QueryType,
         timestamp: Option<u64>,
+        any_command_queued: bool,
         sync_operation: impl FnOnce(Box<dyn FnOnce() + Send>),
         invalidate_query_cache_writeback: impl FnOnce(u64, u64) + Send + 'static,
     ) {
-        let Some(memory_manager) = self.channel_memory_manager.as_ref().cloned() else {
-            return;
+        let query_pools = Arc::clone(&self.query_pools);
+        let mut make_counter = move |dependency, query_type| {
+            Arc::new(Mutex::new(HostCounter::new(
+                &query_pools,
+                dependency,
+                query_type,
+            )))
         };
-        let cpu_addr = {
-            let mm = memory_manager.lock();
-            mm.gpu_to_cpu_address(gpu_addr)
-        };
-        let Some(cpu_addr) = cpu_addr else {
-            return;
-        };
-
-        let page = cpu_addr >> 12;
-        let idx = if let Some(pos) = self.legacy.cached_queries.get(&page).and_then(|queries| {
-            queries
-                .iter()
-                .position(|query| query.cpu_addr() == cpu_addr)
-        }) {
-            pos
-        } else {
-            self.legacy
-                .cached_queries
-                .entry(page)
-                .or_default()
-                .push(CachedQuery::new(query_type, cpu_addr, gpu_addr));
-            self.legacy.cached_queries[&page].len() - 1
-        };
-
-        let previous = self.slice_current_stream(query_type);
-        let mut query = self
-            .legacy
-            .cached_queries
-            .get_mut(&page)
-            .expect("cached query page must exist")
-            .remove(idx);
-
-        if let Some((async_job_id, value)) = query.bind_counter(previous, timestamp, self) {
-            if let Some(async_job) = self.legacy.slot_async_jobs.lock().get_mut(&async_job_id) {
-                async_job.collected = true;
-                async_job.value = value;
-            }
-        }
-
-        let new_async_job_id = self.legacy.alloc_async_job_id();
-        self.legacy.slot_async_jobs.lock().insert(
-            new_async_job_id,
-            AsyncJob {
-                collected: false,
-                value: 0,
-                query_location: cpu_addr,
-                timestamp,
-            },
+        self.legacy.query(
+            gpu_addr,
+            query_type,
+            timestamp,
+            any_command_queued,
+            &mut make_counter,
+            sync_operation,
+            invalidate_query_cache_writeback,
         );
-        query.base.assigned_async_job = new_async_job_id;
-        self.legacy
-            .cached_queries
-            .get_mut(&page)
-            .expect("cached query page must exist")
-            .insert(idx, query);
-        self.legacy
-            .uncommitted_flushes
-            .get_or_insert_with(Vec::new)
-            .push(new_async_job_id);
-
-        let async_jobs = Arc::clone(&self.legacy.slot_async_jobs);
-        let operation = Box::new(move || {
-            let value = async_jobs
-                .lock()
-                .get(&new_async_job_id)
-                .map(|job| job.value)
-                .unwrap_or(0);
-            let mm = memory_manager.lock();
-            if let Some(timestamp) = timestamp {
-                mm.write_block_unsafe(gpu_addr + 8, &timestamp.to_le_bytes());
-                mm.write_block_unsafe(gpu_addr, &value.to_le_bytes());
-                invalidate_query_cache_writeback(gpu_addr, 16);
-            } else {
-                mm.write_block_unsafe(gpu_addr, &(value as u32).to_le_bytes());
-                invalidate_query_cache_writeback(gpu_addr, 4);
-            }
-            async_jobs.lock().remove(&new_async_job_id);
-        });
-        sync_operation(operation);
-    }
-
-    fn counter(
-        &mut self,
-        dependency: Option<HostCounterHandle>,
-        query_type: QueryType,
-    ) -> HostCounterHandle {
-        Arc::new(Mutex::new(HostCounter::new(self, dependency, query_type)))
-    }
-
-    fn enable_stream(&mut self, query_type: QueryType) {
-        let dependency = self.legacy.stream(query_type).last.clone();
-        if self.legacy.stream(query_type).current.is_none() {
-            let new_counter = self.counter(dependency, query_type);
-            self.legacy.stream_mut(query_type).enable_with(new_counter);
-        }
-    }
-
-    fn reset_stream(&mut self, query_type: QueryType) {
-        let had_current = {
-            let stream = self.legacy.stream_mut(query_type);
-            if let Some(current) = stream.current.take() {
-                current.end_query(self.commands_queued);
-                true
-            } else {
-                false
-            }
-        };
-        let new_current = had_current.then(|| self.counter(None, query_type));
-        let stream = self.legacy.stream_mut(query_type);
-        stream.current = new_current;
-        stream.last = None;
-    }
-
-    fn disable_stream(&mut self, query_type: QueryType) {
-        self.legacy
-            .stream_mut(query_type)
-            .disable(self.commands_queued);
-    }
-
-    fn slice_current_stream(&mut self, query_type: QueryType) -> Option<HostCounterHandle> {
-        let previous = {
-            let stream = self.legacy.stream_mut(query_type);
-            let current = stream.current.take()?;
-            current.end_query(self.commands_queued);
-            stream.last = Some(current);
-            stream.last.clone()
-        };
-        let new_counter = self.counter(previous.clone(), query_type);
-        self.legacy.stream_mut(query_type).current = Some(new_counter);
-        previous
-    }
-
-    fn flush_and_remove_region(&mut self, addr: u64, size: usize, r#async: bool) {
-        let addr_begin = addr;
-        let addr_end = addr_begin + size as u64;
-        let page_begin = addr_begin >> 12;
-        let page_end = addr_end >> 12;
-        for page in page_begin..=page_end {
-            let Some(mut page_vec) = self.legacy.cached_queries.remove(&page) else {
-                continue;
-            };
-            let mut kept = Vec::with_capacity(page_vec.len());
-            for mut query in page_vec.drain(..) {
-                let cache_begin = query.cpu_addr();
-                let cache_end = cache_begin + query.size_in_bytes();
-                if cache_begin < addr_end && addr_begin < cache_end {
-                    let async_job_id = query.base.assigned_async_job;
-                    let value = query.flush(self, r#async);
-                    assert_ne!(
-                        async_job_id,
-                        AsyncJobId(0),
-                        "flushed cached queries must own an async job"
-                    );
-                    if let Some(async_job) =
-                        self.legacy.slot_async_jobs.lock().get_mut(&async_job_id)
-                    {
-                        async_job.collected = true;
-                        async_job.value = value;
-                    }
-                    query.base.assigned_async_job = AsyncJobId(0);
-                } else {
-                    kept.push(query);
-                }
-            }
-            if !kept.is_empty() {
-                self.legacy.cached_queries.insert(page, kept);
-            }
-        }
     }
 }
 
@@ -350,9 +217,7 @@ impl QueryCache {
     pub(crate) fn new_for_test() -> Self {
         Self {
             query_pools: Arc::new(Mutex::new(std::array::from_fn(|_| Vec::new()))),
-            channel_memory_manager: None,
             legacy: QueryCacheLegacy::new(),
-            commands_queued: false,
         }
     }
 }
@@ -381,7 +246,7 @@ impl CounterHandle for HostCounterHandle {
 ///
 /// Corresponds to `OpenGL::HostCounter`.
 pub struct HostCounter {
-    pub query_type: QueryType,
+    query_type: QueryType,
     query: Option<OGLQuery>,
     query_pools: Arc<Mutex<[Vec<OGLQuery>; NUM_QUERY_TYPES]>>,
     base: HostCounterBase<HostCounterHandle>,
@@ -390,18 +255,18 @@ pub struct HostCounter {
 impl HostCounter {
     /// Create and begin a new host counter.
     pub fn new(
-        cache: &mut QueryCache,
+        query_pools: &Arc<Mutex<[Vec<OGLQuery>; NUM_QUERY_TYPES]>>,
         dependency: Option<HostCounterHandle>,
         query_type: QueryType,
     ) -> Self {
-        let query = cache.allocate_query(query_type);
+        let query = QueryCache::allocate_query_from_pool(query_pools, query_type);
         unsafe {
             gl::BeginQuery(get_target(query_type), query.handle);
         }
         Self {
             query_type,
             query: Some(query),
-            query_pools: Arc::clone(&cache.query_pools),
+            query_pools: Arc::clone(query_pools),
             base: HostCounterBase::new(dependency),
         }
     }
@@ -419,26 +284,18 @@ impl HostCounter {
     }
 
     /// Block and read the query result.
-    pub fn blocking_query(&self, _async: bool) -> u64 {
+    fn blocking_query(query: &OGLQuery, _async: bool) -> u64 {
         let mut value: i64 = 0;
         unsafe {
-            gl::GetQueryObjecti64v(
-                self.query.as_ref().expect("query must be allocated").handle,
-                gl::QUERY_RESULT,
-                &mut value,
-            );
+            gl::GetQueryObjecti64v(query.handle, gl::QUERY_RESULT, &mut value);
         }
         value as u64
     }
 
     pub fn query(&mut self, r#async: bool) -> u64 {
-        let query = self.query.as_ref().expect("query must be allocated").handle;
-        self.base.query(r#async, move |_async_query| {
-            let mut value: i64 = 0;
-            unsafe {
-                gl::GetQueryObjecti64v(query, gl::QUERY_RESULT, &mut value);
-            }
-            value as u64
+        let query = self.query.as_ref().expect("query must be allocated");
+        self.base.query(r#async, |async_query| {
+            Self::blocking_query(query, async_query)
         })
     }
 
@@ -463,16 +320,16 @@ impl Drop for HostCounter {
 ///
 /// Corresponds to `OpenGL::CachedQuery`.
 pub struct CachedQuery {
-    pub query_type: QueryType,
-    pub base: CachedQueryBase<HostCounterHandle>,
+    query_type: QueryType,
+    base: CachedQueryBase<HostCounterHandle>,
 }
 
 impl CachedQuery {
     /// Create a new cached query.
-    pub fn new(query_type: QueryType, cpu_addr: u64, gpu_addr: u64) -> Self {
+    pub fn new(query_type: QueryType, cpu_addr: u64, host_ptr: *mut u8) -> Self {
         Self {
             query_type,
-            base: CachedQueryBase::new(cpu_addr, gpu_addr),
+            base: CachedQueryBase::new(cpu_addr, host_ptr),
         }
     }
 
@@ -480,58 +337,89 @@ impl CachedQuery {
         self.base.cpu_addr
     }
 
-    pub fn bind_counter(
-        &mut self,
-        counter: Option<HostCounterHandle>,
-        timestamp: Option<u64>,
-        cache: &mut QueryCache,
-    ) -> Option<(AsyncJobId, u64)> {
-        let result = if self.base.counter.is_some() {
-            let async_job_id = self.base.assigned_async_job;
-            let value = self.flush(cache, false);
-            Some((async_job_id, value))
-        } else {
-            None
-        };
-        self.base.counter = counter;
-        self.base.timestamp = timestamp;
-        result
-    }
-
     pub fn size_in_bytes(&self) -> u64 {
         self.base.size_in_bytes()
     }
 
-    pub fn flush(&mut self, cache: &mut QueryCache, r#async: bool) -> u64 {
-        let slice_counter = self
-            .base
-            .counter
-            .as_ref()
-            .map(|counter| counter.wait_pending())
-            .unwrap_or(false)
-            && cache.legacy.stream(self.query_type).is_enabled();
+    fn flush_base<F>(
+        base: &mut CachedQueryBase<HostCounterHandle>,
+        query_type: QueryType,
+        cache: &mut QueryCacheLegacy<Self, HostCounterHandle>,
+        any_command_queued: bool,
+        make_counter: &mut F,
+    ) -> u64
+    where
+        F: FnMut(Option<HostCounterHandle>, QueryType) -> HostCounterHandle,
+    {
+        let slice_counter = base.wait_pending() && cache.stream(query_type).is_enabled();
         if slice_counter {
-            cache.disable_stream(self.query_type);
+            cache.disable_stream(query_type, any_command_queued);
         }
-        let value = self
-            .base
-            .counter
-            .as_ref()
-            .map(|counter| counter.query(r#async))
-            .unwrap_or(0);
+        // Eden's OpenGL override intentionally ignores its `async` argument
+        // and calls `CachedQueryBase::Flush()` with the default `false`.
+        let value = base.flush(false);
         if slice_counter {
-            cache.enable_stream(self.query_type);
-        }
-        if !r#async {
-            if let Some(memory_manager) = cache.channel_memory_manager.as_ref() {
-                let mm = memory_manager.lock();
-                mm.write_block_unsafe(self.base.gpu_addr, &value.to_le_bytes());
-                if let Some(timestamp) = self.base.timestamp {
-                    mm.write_block_unsafe(self.base.gpu_addr + 8, &timestamp.to_le_bytes());
-                }
-            }
+            cache.enable_stream(query_type, make_counter);
         }
         value
+    }
+}
+
+impl LegacyCachedQuery<HostCounterHandle> for CachedQuery {
+    fn new(query_type: QueryType, cpu_addr: u64, host_ptr: *mut u8) -> Self {
+        Self::new(query_type, cpu_addr, host_ptr)
+    }
+
+    fn cpu_addr(&self) -> u64 {
+        self.cpu_addr()
+    }
+
+    fn size_in_bytes(&self) -> u64 {
+        self.size_in_bytes()
+    }
+
+    fn assigned_async_job(&self) -> AsyncJobId {
+        self.base.async_job()
+    }
+
+    fn set_async_job(&mut self, async_job_id: AsyncJobId) {
+        self.base.set_async_job(async_job_id);
+    }
+
+    fn bind_counter<F>(
+        &mut self,
+        counter: Option<HostCounterHandle>,
+        timestamp: Option<u64>,
+        cache: &mut QueryCacheLegacy<Self, HostCounterHandle>,
+        any_command_queued: bool,
+        make_counter: &mut F,
+    ) -> Option<(AsyncJobId, u64)>
+    where
+        F: FnMut(Option<HostCounterHandle>, QueryType) -> HostCounterHandle,
+    {
+        let query_type = self.query_type;
+        self.base.bind_counter(counter, timestamp, |base| {
+            Self::flush_base(base, query_type, cache, any_command_queued, make_counter)
+        })
+    }
+
+    fn flush<F>(
+        &mut self,
+        cache: &mut QueryCacheLegacy<Self, HostCounterHandle>,
+        _async: bool,
+        any_command_queued: bool,
+        make_counter: &mut F,
+    ) -> u64
+    where
+        F: FnMut(Option<HostCounterHandle>, QueryType) -> HostCounterHandle,
+    {
+        Self::flush_base(
+            &mut self.base,
+            self.query_type,
+            cache,
+            any_command_queued,
+            make_counter,
+        )
     }
 }
 
@@ -539,6 +427,7 @@ impl CachedQuery {
 mod tests {
     use super::*;
     use crate::control::channel_state::ChannelState;
+    use crate::control::channel_state_cache::ChannelCacheAccessor;
     use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
     use crate::memory_manager::MemoryManager;
     use parking_lot::Mutex as ParkingMutex;
@@ -574,6 +463,11 @@ mod tests {
     }
 
     #[test]
+    fn count_query_target_uses_upstream_soft_fallback() {
+        assert_eq!(get_target(QueryType::Count), 0);
+    }
+
+    #[test]
     fn bind_to_channel_wires_channel_memory_manager_through_legacy_owner() {
         let mut cache = QueryCache::new_for_test();
         let mm = Arc::new(ParkingMutex::new(MemoryManager::new(17)));
@@ -585,14 +479,20 @@ mod tests {
         cache.bind_to_channel(channel.bind_id);
 
         let bound = cache
-            .channel_memory_manager
-            .as_ref()
+            .legacy
+            .channel_caches
+            .current_channel_state()
+            .and_then(ChannelCacheAccessor::gpu_memory_arc)
             .expect("channel memory manager should be bound");
-        assert!(Arc::ptr_eq(bound, &mm));
+        assert!(Arc::ptr_eq(&bound, &mm));
         assert_eq!(cache.legacy.channel_caches.program_id, 0x1234);
 
         cache.erase_channel(channel.bind_id);
-        assert!(cache.channel_memory_manager.is_none());
+        assert!(cache
+            .legacy
+            .channel_caches
+            .current_channel_state()
+            .is_none());
     }
 
     #[test]
@@ -611,10 +511,12 @@ mod tests {
         cache.erase_channel(other_channel.bind_id);
 
         let current = cache
-            .channel_memory_manager
-            .as_ref()
+            .legacy
+            .channel_caches
+            .current_channel_state()
+            .and_then(ChannelCacheAccessor::gpu_memory_arc)
             .expect("bound memory manager must survive another channel's release");
-        assert!(Arc::ptr_eq(current, &bound_mm));
+        assert!(Arc::ptr_eq(&current, &bound_mm));
     }
 
     #[test]
@@ -622,7 +524,13 @@ mod tests {
         let mut cache = QueryCache::new_for_test();
         let cpu_addr = 0x5510_6000u64;
         let page = cpu_addr >> 12;
-        let async_job_id = AsyncJobId(7);
+        let mut query_backing = [0xffu8; 16];
+        let async_job_id = cache.legacy.slot_async_jobs.lock().insert(AsyncJob {
+            collected: false,
+            value: 99,
+            query_location: cpu_addr,
+            timestamp: Some(0x1234),
+        });
 
         cache.legacy.cached_queries.insert(
             page,
@@ -630,21 +538,12 @@ mod tests {
                 query_type: QueryType::SamplesPassed,
                 base: CachedQueryBase {
                     cpu_addr,
-                    gpu_addr: 0x5038_50000,
+                    host_ptr: query_backing.as_mut_ptr(),
                     counter: None,
                     timestamp: Some(0x1234),
                     assigned_async_job: async_job_id,
                 },
             }],
-        );
-        cache.legacy.slot_async_jobs.lock().insert(
-            async_job_id,
-            AsyncJob {
-                collected: false,
-                value: 99,
-                query_location: cpu_addr,
-                timestamp: Some(0x1234),
-            },
         );
         cache.legacy.uncommitted_flushes = Some(vec![async_job_id]);
 
@@ -653,7 +552,7 @@ mod tests {
         assert!(!cache.has_uncommitted_flushes());
         assert!(cache.should_wait_async_flushes());
 
-        cache.pop_async_flushes();
+        cache.pop_async_flushes(false);
 
         assert!(!cache.should_wait_async_flushes());
         assert!(cache
@@ -663,31 +562,40 @@ mod tests {
             .map(|queries| queries.is_empty())
             .unwrap_or(true));
         let async_jobs = cache.legacy.slot_async_jobs.lock();
-        let job = async_jobs
-            .get(&async_job_id)
-            .expect("async job retained until writeback");
+        let job = async_jobs.get(async_job_id);
         assert!(job.collected);
         assert_eq!(job.value, 0);
+        assert_eq!(&query_backing[0..8], &0u64.to_ne_bytes());
     }
 
     #[test]
     fn sync_flush_writes_immediate_guest_value_and_timestamp() {
         let mut cache = QueryCache::new_for_test();
-        let (mm, backing) = make_query_memory_manager(0x5038_50000, 0x5510_6000, 0x1000);
-        cache.channel_memory_manager = Some(mm);
+        let (mm, mut backing) = make_query_memory_manager(0x5038_50000, 0x5510_6000, 0x1000);
 
         let mut query = CachedQuery {
             query_type: QueryType::SamplesPassed,
             base: CachedQueryBase {
                 cpu_addr: 0x5510_6000,
-                gpu_addr: 0x5038_50000,
+                host_ptr: backing.as_mut_ptr(),
                 counter: None,
                 timestamp: Some(0x1122_3344_5566_7788),
-                assigned_async_job: AsyncJobId(0),
+                assigned_async_job: NULL_ASYNC_JOB_ID,
             },
         };
 
-        let value = query.flush(&mut cache, false);
+        // `MemoryManager::ReadBlock` reaches this flush while already holding
+        // the channel memory-manager mutex. Eden writes through the retained
+        // host pointer, so the flush must not try to acquire that mutex again.
+        let _memory_manager_guard = mm.lock();
+        let mut unexpected_counter = |_, _| panic!("counter factory must remain unused");
+        let value = LegacyCachedQuery::flush(
+            &mut query,
+            &mut cache.legacy,
+            false,
+            false,
+            &mut unexpected_counter,
+        );
         assert_eq!(value, 0);
 
         assert_eq!(&backing[0..8], &0u64.to_le_bytes());
@@ -699,16 +607,23 @@ mod tests {
         let mut cache = QueryCache::new_for_test();
         let hit_page = 0x5510_6000u64 >> 12;
         let cold_page = 0x6610_6000u64 >> 12;
+        let mut hit_backing = [0u8; 8];
+        let async_job_id = cache.legacy.slot_async_jobs.lock().insert(AsyncJob {
+            collected: false,
+            value: 0,
+            query_location: 0x5510_6000,
+            timestamp: None,
+        });
         cache.legacy.cached_queries.insert(
             hit_page,
             vec![CachedQuery {
                 query_type: QueryType::SamplesPassed,
                 base: CachedQueryBase {
                     cpu_addr: 0x5510_6000,
-                    gpu_addr: 0x5038_50000,
+                    host_ptr: hit_backing.as_mut_ptr(),
                     counter: None,
                     timestamp: None,
-                    assigned_async_job: AsyncJobId(7),
+                    assigned_async_job: async_job_id,
                 },
             }],
         );
@@ -717,14 +632,39 @@ mod tests {
             vec![CachedQuery::new(
                 QueryType::SamplesPassed,
                 0x6610_6000,
-                0x6038_50000,
+                std::ptr::null_mut(),
             )],
         );
 
-        cache.flush_region(0x5510_6000, 8);
+        cache.flush_region(0x5510_6000, 8, false);
 
         assert!(!cache.legacy.cached_queries.contains_key(&hit_page));
         assert!(cache.legacy.cached_queries.contains_key(&cold_page));
+    }
+
+    #[test]
+    fn flush_region_removes_query_without_async_job_after_soft_assert() {
+        let mut cache = QueryCache::new_for_test();
+        let cpu_addr = 0x5510_6000u64;
+        let page = cpu_addr >> 12;
+        let mut backing = [0u8; 8];
+        cache.legacy.cached_queries.insert(
+            page,
+            vec![CachedQuery {
+                query_type: QueryType::SamplesPassed,
+                base: CachedQueryBase {
+                    cpu_addr,
+                    host_ptr: backing.as_mut_ptr(),
+                    counter: None,
+                    timestamp: None,
+                    assigned_async_job: NULL_ASYNC_JOB_ID,
+                },
+            }],
+        );
+
+        cache.flush_region(cpu_addr, 8, false);
+
+        assert!(!cache.legacy.cached_queries.contains_key(&page));
     }
 
     #[test]
@@ -732,7 +672,7 @@ mod tests {
         let mut cache = QueryCache::new_for_test();
         cache.commit_async_flushes();
         assert!(!cache.should_wait_async_flushes());
-        cache.pop_async_flushes();
+        cache.pop_async_flushes(false);
         assert!(!cache.should_wait_async_flushes());
     }
 }

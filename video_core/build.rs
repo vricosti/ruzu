@@ -143,6 +143,14 @@ fn compile_vulkan_present_shaders(manifest_dir: &std::path::Path) {
             "convert_s8d24_to_abgr8.frag",
         ),
         (
+            "CONVERT_MSAA_TO_NON_MSAA_FRAG_SPV",
+            "convert_msaa_to_non_msaa.frag",
+        ),
+        (
+            "CONVERT_NON_MSAA_TO_MSAA_FRAG_SPV",
+            "convert_non_msaa_to_msaa.frag",
+        ),
+        (
             "CONVERT_MSAA_TO_NON_MSAA_COMP_SPV",
             "convert_msaa_to_non_msaa.comp",
         ),
@@ -151,6 +159,10 @@ fn compile_vulkan_present_shaders(manifest_dir: &std::path::Path) {
             "convert_non_msaa_to_msaa.comp",
         ),
         ("ASTC_DECODER_COMP_SPV", "astc_decoder.comp"),
+        (
+            "BLOCK_LINEAR_UNSWIZZLE_3D_BCN_COMP_SPV",
+            "block_linear_unswizzle_3d_bcn.comp",
+        ),
         ("VULKAN_QUAD_INDEXED_COMP_SPV", "vulkan_quad_indexed.comp"),
         ("VULKAN_UINT8_COMP_SPV", "vulkan_uint8.comp"),
         (
@@ -188,6 +200,19 @@ fn compile_vulkan_present_shaders(manifest_dir: &std::path::Path) {
         ),
         ("PRESENT_BICUBIC_FRAG_SPV", "present_bicubic.frag"),
         ("PRESENT_GAUSSIAN_FRAG_SPV", "present_gaussian.frag"),
+        ("PRESENT_AREA_FRAG_SPV", "present_area.frag"),
+        ("PRESENT_BSPLINE_FRAG_SPV", "present_bspline.frag"),
+        ("PRESENT_LANCZOS_FRAG_SPV", "present_lanczos.frag"),
+        ("PRESENT_MITCHELL_FRAG_SPV", "present_mitchell.frag"),
+        ("PRESENT_MMPX_FRAG_SPV", "present_mmpx.frag"),
+        ("PRESENT_SPLINE1_FRAG_SPV", "present_spline1.frag"),
+        ("PRESENT_ZERO_TANGENT_FRAG_SPV", "present_zero_tangent.frag"),
+        ("SGSR1_SHADER_VERT_SPV", "sgsr1_shader.vert"),
+        ("SGSR1_SHADER_MOBILE_FRAG_SPV", "sgsr1_shader_mobile.frag"),
+        (
+            "SGSR1_SHADER_MOBILE_EDGE_DIRECTION_FRAG_SPV",
+            "sgsr1_shader_mobile_edge_direction.frag",
+        ),
         (
             "VULKAN_PRESENT_SCALEFORCE_FP16_FRAG_SPV",
             "vulkan_present_scaleforce_fp16.frag",

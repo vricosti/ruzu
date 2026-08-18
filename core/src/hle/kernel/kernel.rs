@@ -2751,6 +2751,17 @@ impl KernelCore {
         }
     }
 
+    /// Remove a process from the kernel-global process list.
+    ///
+    /// Upstream: `KernelCore::RemoveProcess`.
+    pub fn remove_process(&self, process: &Arc<ProcessLock>) {
+        let _guard = self.process_list_lock.lock().unwrap();
+        self.process_list
+            .lock()
+            .unwrap()
+            .retain(|registered| !Arc::ptr_eq(registered, process));
+    }
+
     /// Return the live kernel process list.
     ///
     /// Upstream returns a `std::list<KScopedAutoObject<KProcess>>` copy. Cloning

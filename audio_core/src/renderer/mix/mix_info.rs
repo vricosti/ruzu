@@ -34,6 +34,9 @@ pub struct InDirtyParameter {
     pub _unk08: [u8; 0x18],
 }
 
+const _: () = assert!(std::mem::size_of::<InParameter>() == 0x930);
+const _: () = assert!(std::mem::size_of::<InDirtyParameter>() == 0x20);
+
 #[derive(Debug, Clone)]
 pub struct MixInfo {
     pub volume: f32,

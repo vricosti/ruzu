@@ -1149,7 +1149,7 @@ impl Default for ShaderCache {
 mod tests {
     use super::*;
     use crate::engines::engine_interface::EngineInterface;
-    use crate::engines::kepler_compute::QueueMetaData;
+    use crate::engines::kepler_compute::LaunchParams;
     use crate::engines::maxwell_3d::Maxwell3D;
     use crate::memory_manager::MemoryManager;
     use crate::shader_environment::GenericEnvironment;
@@ -1170,6 +1170,40 @@ mod tests {
             let count = available.min(dst.len());
             dst[..count].copy_from_slice(&backing[offset..offset + count]);
         })
+    }
+
+    fn make_owner_backed_memory_manager(
+        gpu_base: u64,
+        device_addr: u64,
+        backing: &[u8],
+    ) -> (
+        Arc<ParkingLotMutex<MemoryManager>>,
+        Arc<MaxwellDeviceMemoryManager>,
+    ) {
+        let device_memory = Arc::new(MaxwellDeviceMemoryManager::default());
+        device_memory.smmu_set_physical_base_for_test(backing.as_ptr() as usize);
+        device_memory.smmu_map_with_cpu_backing(
+            device_addr,
+            backing.as_ptr(),
+            0x4000_0000,
+            backing.len(),
+            1,
+            true,
+        );
+        let memory_manager = Arc::new(ParkingLotMutex::new(
+            MemoryManager::new_with_geometry_and_device_memory(
+                1,
+                Arc::clone(&device_memory),
+                40,
+                0x1_0000_0000,
+                16,
+                12,
+            ),
+        ));
+        memory_manager
+            .lock()
+            .map(gpu_base, device_addr, backing.len() as u64, 0, false);
+        (memory_manager, device_memory)
     }
 
     #[test]
@@ -1262,7 +1296,7 @@ mod tests {
     fn make_shader_info_registers_analyzed_shader() {
         let program_base = 0x1_0000_0000;
         let sentinel_offset = 0x80usize;
-        let sentinel = 0xE2400FFF00000F00u64;
+        let sentinel = 0xE2400FFFFF87000Fu64;
 
         let mut backing = vec![0u8; 0x2000];
         backing[sentinel_offset..sentinel_offset + 8].copy_from_slice(&sentinel.to_le_bytes());
@@ -1292,13 +1326,11 @@ mod tests {
 
     #[test]
     fn make_shader_info_slow_path_walks_branch_target_before_hashing() {
-        const BRA_TOP10: u64 = 0x324;
-        const EXIT_TOP10: u64 = 0x34C;
         const PRED_PT: u64 = 7;
         const FLOW_T: u64 = 15;
 
-        fn encode_control_flow(top10: u64, branch_offset: i32) -> u64 {
-            (top10 << 54)
+        fn encode_control_flow(opcode_top16: u64, branch_offset: i32) -> u64 {
+            (opcode_top16 << 48)
                 | (((branch_offset as u32 as u64) & 0x00FF_FFFF) << 20)
                 | (PRED_PT << 16)
                 | FLOW_T
@@ -1306,8 +1338,8 @@ mod tests {
 
         let program_base = 0x2_0000_0000;
         let mut backing = vec![0u8; 0x80];
-        let bra = encode_control_flow(BRA_TOP10, 0x18);
-        let exit = encode_control_flow(EXIT_TOP10, 0);
+        let bra = encode_control_flow(0xE240, 0x18);
+        let exit = encode_control_flow(0xE300, 0);
         backing[0x00..0x08].copy_from_slice(&bra.to_le_bytes());
         backing[0x20..0x28].copy_from_slice(&exit.to_le_bytes());
         let backing = Arc::new(backing);
@@ -1340,14 +1372,11 @@ mod tests {
         backing[0x180..0x188].copy_from_slice(&0xE2400FFFFF87000Fu64.to_le_bytes());
         let backing = Arc::new(backing);
 
-        let memory_manager = Arc::new(ParkingLotMutex::new(MemoryManager::new(0)));
-        memory_manager
-            .lock()
-            .map(gpu_base, cpu_base, 0x2000, 0, false);
+        let (memory_manager, device_memory) =
+            make_owner_backed_memory_manager(gpu_base, cpu_base, backing.as_slice());
 
         let mut maxwell = Maxwell3D::new();
         maxwell.set_memory_manager(Arc::clone(&memory_manager));
-        maxwell.set_guest_memory_reader(make_cpu_reader(cpu_base, Arc::clone(&backing)));
         <Maxwell3D as EngineInterface>::call_method(&mut maxwell, 0x582, 1, true);
         <Maxwell3D as EngineInterface>::call_method(&mut maxwell, 0x583, 0, true);
         <Maxwell3D as EngineInterface>::call_method(&mut maxwell, 0x810, 1 | (1 << 4), true);
@@ -1359,7 +1388,7 @@ mod tests {
         channel.maxwell_3d = Some(Box::new(maxwell));
         channel.kepler_compute = Some(Box::default());
 
-        let mut cache = ShaderCache::default();
+        let mut cache = ShaderCache::new(device_memory);
         cache.create_channel(&channel);
         cache.bind_to_channel(7);
 
@@ -1403,14 +1432,11 @@ mod tests {
         backing[0x180..0x188].copy_from_slice(&0xE2400FFFFF87000Fu64.to_le_bytes());
         let backing = Arc::new(backing);
 
-        let memory_manager = Arc::new(ParkingLotMutex::new(MemoryManager::new(0)));
-        memory_manager
-            .lock()
-            .map(gpu_base, cpu_base, 0x2000, 0, false);
+        let (memory_manager, device_memory) =
+            make_owner_backed_memory_manager(gpu_base, cpu_base, backing.as_slice());
 
         let mut maxwell = Maxwell3D::new();
         maxwell.set_memory_manager(Arc::clone(&memory_manager));
-        maxwell.set_guest_memory_reader(make_cpu_reader(cpu_base, Arc::clone(&backing)));
 
         let mut channel = ChannelState::new(9);
         channel.program_id = 0x5678;
@@ -1423,17 +1449,17 @@ mod tests {
             .expect("compute engine should exist for bound-channel shader-cache test");
         kepler.call_method(0x582, 1, true);
         kepler.call_method(0x583, 0, true);
-        kepler.launch_description = QueueMetaData {
+        kepler.launch_description = LaunchParams {
             program_start: 0x100,
             block_dim_x: 32,
             block_dim_y: 1,
             block_dim_z: 1,
             shared_alloc: 0x80,
             local_pos_alloc: 0x40,
-            ..QueueMetaData::default()
+            ..LaunchParams::default()
         };
 
-        let mut cache = ShaderCache::default();
+        let mut cache = ShaderCache::new(device_memory);
         cache.create_channel(&channel);
         cache.bind_to_channel(9);
 

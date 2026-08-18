@@ -26,6 +26,7 @@ mod gtk_compat;
 mod i18n;
 mod loading_screen;
 mod main_window;
+mod multiplayer;
 #[cfg(target_os = "macos")]
 mod render_window;
 #[cfg(target_os = "windows")]
@@ -132,6 +133,7 @@ fn main() -> glib::ExitCode {
 
     configuration::qt_config::load_ui_language();
     configuration::qt_config::load_view_values();
+    configuration::qt_config::load_multiplayer_values();
     let interface_language = uisettings::with(|v| v.language.get_value().clone());
     i18n::set_language(&interface_language);
 

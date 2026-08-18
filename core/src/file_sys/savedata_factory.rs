@@ -115,7 +115,7 @@ impl SaveDataFactory {
     pub fn get_save_data_space_id_path(space: SaveDataSpaceId) -> &'static str {
         match space {
             SaveDataSpaceId::System => "/system/",
-            SaveDataSpaceId::User => "/user/",
+            SaveDataSpaceId::User | SaveDataSpaceId::SdUser => "/user/",
             SaveDataSpaceId::Temporary => "/temp/",
             _ => {
                 log::error!("Unrecognized SaveDataSpaceId: {:?}", space);
@@ -351,6 +351,10 @@ mod tests {
         );
         assert_eq!(
             SaveDataFactory::get_save_data_space_id_path(SaveDataSpaceId::User),
+            "/user/"
+        );
+        assert_eq!(
+            SaveDataFactory::get_save_data_space_id_path(SaveDataSpaceId::SdUser),
             "/user/"
         );
         assert_eq!(

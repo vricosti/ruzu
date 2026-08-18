@@ -91,9 +91,9 @@ fn optimization_flags_from_mask(mask: u32) -> OptimizationFlag {
     flags
 }
 
-fn upstream_optimization_config_from_settings() -> (OptimizationFlag, bool) {
-    let settings = common::settings::values();
-
+fn upstream_optimization_config_from_settings(
+    settings: &common::settings::Values,
+) -> (OptimizationFlag, bool) {
     if *settings.cpu_debug_mode.get_value() {
         let mut flags = optimization_flags_from_mask(0x3F);
         if !*settings.cpuopt_block_linking.get_value() {
@@ -144,7 +144,6 @@ fn upstream_optimization_config_from_settings() -> (OptimizationFlag, bool) {
             flags |= OptimizationFlag::UNSAFE_UNFUSE_FMA;
             flags |= OptimizationFlag::UNSAFE_IGNORE_STANDARD_FPCR_VALUE;
             flags |= OptimizationFlag::UNSAFE_INACCURATE_NAN;
-            flags |= OptimizationFlag::UNSAFE_IGNORE_GLOBAL_MONITOR;
         }
         CpuAccuracy::Paranoid => {
             flags = OptimizationFlag::NO_OPTIMIZATIONS;
@@ -2503,8 +2502,7 @@ impl ArmDynarmic32 {
         // `Memory::SetCurrentPageTable`. In Rust the page-table path remains
         // optional while the fastmem arena base is available directly through
         // the per-process Memory bridge, matching ArmDynarmic64's wiring.
-        let use_page_table_fastmem = should_use_page_table_fastmem();
-        let (mut page_table_pointer, fastmem_pointer): (Option<*const u8>, Option<*mut u8>) =
+        let (mut page_table_pointer, mut fastmem_pointer): (Option<*const u8>, Option<*mut u8>) =
             if std::env::var_os("RUZU_NO_FASTMEM").is_some() {
                 (None, None)
             } else {
@@ -2525,15 +2523,6 @@ impl ArmDynarmic32 {
                     .filter(|p| !p.is_null());
                 (page_table_pointer, fastmem_pointer)
             };
-        // Upstream wires `page_table` whenever the process page table exists.
-        // On Apple Silicon the host page size is 16 KiB, so the mmap-backed
-        // 4 KiB fastmem arena is unavailable; the page-table path is the
-        // upstream-shaped fast path that does not depend on 4 KiB host aliases.
-        // Keep RUZU_A32_LEGACY_FASTMEM as an escape hatch while Linux/x64 keeps
-        // its previously validated default.
-        if !use_page_table_fastmem {
-            page_table_pointer = None;
-        }
 
         let svc_swi = Arc::new(AtomicU32::new(0));
         let last_exception_address = Arc::new(AtomicU64::new(0));
@@ -2546,6 +2535,7 @@ impl ArmDynarmic32 {
             debugger_enabled,
         );
 
+        let settings = common::settings::values();
         let (optimizations, unsafe_optimizations) = if let Some(mask) =
             std::env::var("RUZU_A32_OPTIMIZATION_MASK")
                 .ok()
@@ -2570,7 +2560,7 @@ impl ArmDynarmic32 {
         {
             (OptimizationFlag::NO_OPTIMIZATIONS, false)
         } else {
-            upstream_optimization_config_from_settings()
+            upstream_optimization_config_from_settings(&settings)
         };
 
         // Upstream `ArmDynarmic32::MakeJit` uses 128 MiB on ARM64 hosts and
@@ -2581,7 +2571,33 @@ impl ArmDynarmic32 {
         } else {
             512 * 1024 * 1024
         };
-        let settings = common::settings::values();
+        let mut fastmem_exclusive_access =
+            fastmem_pointer.is_some() && !exclusive_monitor.is_null();
+        let mut recompile_on_exclusive_fastmem_failure = true;
+        let mut only_detect_misalignment_via_page_table_on_page_boundary = true;
+
+        if *settings.cpu_debug_mode.get_value() {
+            if !*settings.cpuopt_page_tables.get_value() {
+                page_table_pointer = None;
+            }
+            if !*settings.cpuopt_reduce_misalign_checks.get_value() {
+                only_detect_misalignment_via_page_table_on_page_boundary = false;
+            }
+            if !*settings.cpuopt_fastmem.get_value() {
+                fastmem_pointer = None;
+                fastmem_exclusive_access = false;
+            }
+            if !*settings.cpuopt_fastmem_exclusives.get_value() {
+                fastmem_exclusive_access = false;
+            }
+            if !*settings.cpuopt_recompile_exclusives.get_value() {
+                recompile_on_exclusive_fastmem_failure = false;
+            }
+        }
+        if !common::settings::is_fastmem_enabled(&settings) {
+            fastmem_pointer = None;
+            fastmem_exclusive_access = false;
+        }
         let check_halt_on_memory_access = debugger_enabled
             || (*settings.cpu_debug_mode.get_value()
                 && !*settings.cpuopt_ignore_memory_aborts.get_value());
@@ -2621,26 +2637,21 @@ impl ArmDynarmic32 {
             // instead of faulting. This is independent of the free/debug page
             // rejection above (that stays driven by `page_table_pointer_mask_bits`
             // + `recompile_on_fastmem_failure`).
-            memory: if use_page_table_fastmem {
-                rdynarmic::backend::x64::emit_context::MemoryEmitConfig {
-                    fastmem_address_space_bits: 32,
-                    silently_mirror_fastmem: true,
-                    fastmem_exclusive_access: fastmem_pointer.is_some()
-                        && !exclusive_monitor.is_null(),
-                    recompile_on_exclusive_fastmem_failure: true,
-                    recompile_on_fastmem_failure: true,
-                    page_table_present: page_table_pointer.is_some(),
-                    page_table_address_space_bits: 32,
-                    silently_mirror_page_table: true,
-                    absolute_offset_page_table: true,
-                    page_table_pointer_mask_bits: PageInfo::ATTRIBUTE_BITS as u32,
-                    detect_misaligned_access_via_page_table: 16 | 32 | 64 | 128,
-                    only_detect_misalignment_via_page_table_on_page_boundary: true,
-                    check_halt_on_memory_access,
-                    processor_id: core_index as usize,
-                }
-            } else {
-                rdynarmic::backend::x64::emit_context::MemoryEmitConfig::default()
+            memory: rdynarmic::backend::x64::emit_context::MemoryEmitConfig {
+                fastmem_address_space_bits: 32,
+                silently_mirror_fastmem: true,
+                fastmem_exclusive_access,
+                recompile_on_exclusive_fastmem_failure,
+                recompile_on_fastmem_failure: true,
+                page_table_present: page_table_pointer.is_some(),
+                page_table_address_space_bits: 32,
+                silently_mirror_page_table: true,
+                absolute_offset_page_table: true,
+                page_table_pointer_mask_bits: PageInfo::ATTRIBUTE_BITS as u32,
+                detect_misaligned_access_via_page_table: 16 | 32 | 64 | 128,
+                only_detect_misalignment_via_page_table_on_page_boundary,
+                check_halt_on_memory_access,
+                processor_id: core_index as usize,
             },
         };
 
@@ -3145,12 +3156,6 @@ impl ArmInterface for ArmDynarmic32 {
     }
 }
 
-fn should_use_page_table_fastmem() -> bool {
-    std::env::var_os("RUZU_A32_LEGACY_FASTMEM").is_none()
-        && (std::env::var_os("RUZU_A32_PAGE_TABLE_FASTMEM").is_some()
-            || cfg!(all(target_os = "macos", target_arch = "aarch64")))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3175,16 +3180,16 @@ mod tests {
     }
 
     #[test]
-    fn page_table_fastmem_default_matches_platform_policy() {
-        if std::env::var_os("RUZU_A32_LEGACY_FASTMEM").is_some()
-            || std::env::var_os("RUZU_A32_PAGE_TABLE_FASTMEM").is_some()
-        {
-            return;
-        }
+    fn auto_optimization_config_matches_upstream_a32() {
+        let mut settings = common::settings::Values::default();
+        settings.cpu_debug_mode.set_value(false);
+        settings.cpu_accuracy.set_value(CpuAccuracy::Auto);
 
-        assert_eq!(
-            should_use_page_table_fastmem(),
-            cfg!(all(target_os = "macos", target_arch = "aarch64"))
-        );
+        let (flags, unsafe_optimizations) = upstream_optimization_config_from_settings(&settings);
+        assert!(unsafe_optimizations);
+        assert!(flags.contains(OptimizationFlag::UNSAFE_UNFUSE_FMA));
+        assert!(flags.contains(OptimizationFlag::UNSAFE_IGNORE_STANDARD_FPCR_VALUE));
+        assert!(flags.contains(OptimizationFlag::UNSAFE_INACCURATE_NAN));
+        assert!(!flags.contains(OptimizationFlag::UNSAFE_IGNORE_GLOBAL_MONITOR));
     }
 }

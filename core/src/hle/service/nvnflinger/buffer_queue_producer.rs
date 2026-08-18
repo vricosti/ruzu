@@ -87,23 +87,6 @@ fn trace_dequeue_return_for_present(seq: u64, status: Status, slot: i32, flags: 
 }
 
 fn stop_unimplemented_transact(code: u32, name: &str) -> ! {
-    #[cfg(not(test))]
-    {
-        let path = std::path::Path::new(".agents/buffer_queue_unimplemented_state.md");
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        let _ = std::fs::write(
-            path,
-            format!(
-                "# BufferQueueProducer unimplemented transaction\n\n\
-                 - transaction: {name}\n\
-                 - code: {code}\n\
-                 - upstream: BufferQueueProducer::Transact falls through to ASSERT_MSG(false, \"Unimplemented TransactionId {{}}\", code) for this transaction\n\
-                 - rust: stopped before returning a silent Binder status\n"
-            ),
-        );
-    }
     panic!(
         "BufferQueueProducer::transact unimplemented transaction {} ({})",
         name, code
@@ -111,23 +94,6 @@ fn stop_unimplemented_transact(code: u32, name: &str) -> ! {
 }
 
 fn stop_unimplemented_connect_listener(code: u32) -> ! {
-    #[cfg(not(test))]
-    {
-        let path = std::path::Path::new(".agents/buffer_queue_unimplemented_state.md");
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        let _ = std::fs::write(
-            path,
-            format!(
-                "# BufferQueueProducer unimplemented Connect listener\n\n\
-                 - transaction: Connect\n\
-                 - code: {code}\n\
-                 - upstream: BufferQueueProducer::Transact calls UNIMPLEMENTED_IF_MSG(enable_listener, \"Listener is unimplemented!\")\n\
-                 - rust: stopped before accepting a Connect listener path as implemented\n"
-            ),
-        );
-    }
     panic!("BufferQueueProducer::transact Connect listener is unimplemented");
 }
 
@@ -855,10 +821,13 @@ impl BufferQueueProducer {
             return (Status::BadValue, QueueBufferOutput::new());
         }
 
-        inner.slots[s].buffer_state = super::buffer_slot::BufferState::Queued;
-        inner.slots[s].fence = fence;
         inner.frame_counter += 1;
+        inner.slots[s].buffer_state = super::buffer_slot::BufferState::Queued;
         inner.slots[s].frame_number = inner.frame_counter;
+        inner.slots[s].queue_time = timestamp;
+        inner.slots[s].presentation_time =
+            common::cpu_features::G_WALL_CLOCK.get_time_ns().as_nanos() as i64;
+        inner.slots[s].fence = fence;
 
         let frame_num = inner.frame_counter;
         let item = super::buffer_item::BufferItem {
@@ -905,13 +874,19 @@ impl BufferQueueProducer {
         } else {
             let front_is_droppable = inner.queue[0].is_droppable;
             if front_is_droppable {
-                let (front_slot, front_still_tracking) = {
+                let (front_slot, front_frame_number, front_still_tracking) = {
                     let front = &inner.queue[0];
-                    (front.slot, inner.still_tracking(front))
+                    (front.slot, front.frame_number, inner.still_tracking(front))
                 };
                 if front_still_tracking {
                     inner.slots[front_slot as usize].buffer_state =
                         super::buffer_slot::BufferState::Free;
+                    if *common::settings::values().enable_buffer_history.get_value() {
+                        self.core.update_history(
+                            front_frame_number,
+                            super::buffer_slot::BufferState::Free,
+                        );
+                    }
                     inner.slots[front_slot as usize].frame_number = 0;
                 }
                 inner.queue[0] = item;
@@ -920,6 +895,14 @@ impl BufferQueueProducer {
                 inner.queue.push(item);
                 frame_available_listener = inner.consumer_listener.clone();
             }
+        }
+        if *common::settings::values().enable_buffer_history.get_value() {
+            self.core.push_history(
+                inner.frame_counter,
+                inner.slots[s].queue_time,
+                inner.slots[s].presentation_time,
+                super::buffer_slot::BufferState::Queued,
+            );
         }
         inner.buffer_has_been_queued = true;
         let queue_len = inner.queue.len() as u64;
@@ -1428,7 +1411,28 @@ impl IBinder for BufferQueueProducer {
                 status = self.set_buffer_count(buffer_count);
             }
             x if x == TransactionId::GetBufferHistory as u32 => {
-                log::warn!("BufferQueueProducer::transact GetBufferHistory (STUBBED)");
+                if *common::settings::values().enable_buffer_history.get_value() {
+                    log::debug!("BufferQueueProducer::transact GetBufferHistory");
+                    let request = parcel_in.read::<i32>();
+                    if request <= 0 {
+                        parcel_out.write(&Status::BadValue);
+                        parcel_out.write(&0i32);
+                    } else {
+                        let mut snapshot = {
+                            let history = self.core.buffer_history.lock().unwrap();
+                            history.map.values().copied().collect::<Vec<_>>()
+                        };
+                        snapshot.sort_by(|a, b| b.frame_number.cmp(&a.frame_number));
+                        let limit = request.min(snapshot.len() as i32);
+                        parcel_out.write(&Status::NoError);
+                        parcel_out.write(&limit);
+                        for info in snapshot.iter().take(limit as usize) {
+                            parcel_out.write(info);
+                        }
+                    }
+                } else {
+                    log::debug!("BufferQueueProducer::transact GetBufferHistory (STUBBED)");
+                }
             }
             x if x == TransactionId::DetachNextBuffer as u32 => {
                 stop_unimplemented_transact(code, "DetachNextBuffer");
@@ -1680,6 +1684,48 @@ mod tests {
         Arc::new(Mutex::new(ServiceContext::new(
             "BufferQueueProducerTest".to_string(),
         )))
+    }
+
+    fn enable_buffer_history_for_test() -> (bool, bool) {
+        let previous = {
+            let values = common::settings::values();
+            (
+                *values.enable_buffer_history.get_value_global(),
+                values.enable_buffer_history.using_global(),
+            )
+        };
+        let mut values = common::settings::values_mut();
+        values.enable_buffer_history.set_global(true);
+        values.enable_buffer_history.set_value(true);
+        previous
+    }
+
+    fn restore_buffer_history_after_test(previous: (bool, bool)) {
+        let mut values = common::settings::values_mut();
+        values.enable_buffer_history.setting.set_value(previous.0);
+        values.enable_buffer_history.set_global(previous.1);
+    }
+
+    fn get_buffer_history_request(count: i32) -> Vec<u8> {
+        let mut parcel = Vec::new();
+        parcel.extend_from_slice(&16u32.to_ne_bytes());
+        parcel.extend_from_slice(&16u32.to_ne_bytes());
+        parcel.extend_from_slice(&0u32.to_ne_bytes());
+        parcel.extend_from_slice(&32u32.to_ne_bytes());
+        parcel.extend_from_slice(&0u32.to_ne_bytes());
+        parcel.extend_from_slice(&0u32.to_ne_bytes());
+        parcel.extend_from_slice(&0u16.to_ne_bytes());
+        parcel.extend_from_slice(&0u16.to_ne_bytes());
+        parcel.extend_from_slice(&count.to_ne_bytes());
+        parcel
+    }
+
+    fn read_i32(bytes: &[u8], offset: usize) -> i32 {
+        i32::from_ne_bytes(bytes[offset..offset + 4].try_into().unwrap())
+    }
+
+    fn read_u64(bytes: &[u8], offset: usize) -> u64 {
+        u64::from_ne_bytes(bytes[offset..offset + 8].try_into().unwrap())
     }
 
     #[test]
@@ -1954,6 +2000,58 @@ mod tests {
 
         let (status, _) = producer.queue_buffer(slot, &QueueBufferInput::default());
         assert_eq!(status, Status::NoError);
+    }
+
+    #[test]
+    fn queue_buffer_records_enabled_history_with_host_presentation_time() {
+        let previous = enable_buffer_history_for_test();
+        let core = BufferQueueCore::new();
+        install_test_consumer(&core);
+        let producer = BufferQueueProducer::new(test_service_context(), core.clone(), test_nvmap());
+        let buffer = Arc::new(NvGraphicBuffer::new(16, 16, PixelFormat::Rgba8888, 0));
+        assert_eq!(
+            producer.set_preallocated_buffer(0, Some(buffer)),
+            Status::NoError
+        );
+        let (status, slot, _) = producer.dequeue_buffer(false, 16, 16, PixelFormat::Rgba8888, 0);
+        assert_eq!(status, Status::NoError.into());
+        assert_eq!(producer.request_buffer(slot).0, Status::NoError);
+
+        let mut input = QueueBufferInput::default();
+        input.timestamp = 123_456;
+        assert_eq!(producer.queue_buffer(slot, &input).0, Status::NoError);
+
+        let history = core.buffer_history.lock().unwrap();
+        let info = history.map.get(&1).expect("queued frame history");
+        assert_eq!(info.queue_time, 123_456);
+        assert!(info.presentation_time > 0);
+        assert_eq!(info.state, super::super::buffer_slot::BufferState::Queued);
+        drop(history);
+        restore_buffer_history_after_test(previous);
+    }
+
+    #[test]
+    fn get_buffer_history_transaction_returns_newest_first_with_exact_payload() {
+        let previous = enable_buffer_history_for_test();
+        let core = BufferQueueCore::new();
+        core.push_history(1, 10, 100, super::super::buffer_slot::BufferState::Queued);
+        core.push_history(2, 20, 200, super::super::buffer_slot::BufferState::Free);
+        core.push_history(3, 30, 300, super::super::buffer_slot::BufferState::Acquired);
+        let producer = BufferQueueProducer::new(test_service_context(), core, test_nvmap());
+        let parcel = get_buffer_history_request(2);
+        let mut reply = [0u8; 256];
+
+        IBinder::transact(&producer, 17, &parcel, &mut reply, 0);
+
+        let data_offset = u32::from_ne_bytes(reply[4..8].try_into().unwrap()) as usize;
+        assert_eq!(read_i32(&reply, data_offset), Status::NoError as i32);
+        assert_eq!(read_i32(&reply, data_offset + 4), 2);
+        assert_eq!(read_u64(&reply, data_offset + 8), 3);
+        assert_eq!(read_u64(&reply, data_offset + 40), 2);
+        assert_eq!(&reply[data_offset + 36..data_offset + 40], &[0; 4]);
+        assert_eq!(&reply[data_offset + 68..data_offset + 72], &[0; 4]);
+        assert_eq!(read_i32(&reply, data_offset + 72), Status::NoError as i32);
+        restore_buffer_history_after_test(previous);
     }
 
     #[test]

@@ -1,18 +1,42 @@
-use crate::adsp::apps::opus::opus_decode_object::{DecodeObjectHeader, OpusDecodeObject};
+use crate::adsp::apps::opus::opus_decode_object::{
+    OpusDecodeObject, OPUS_INVALID_PACKET, OPUS_INVALID_STATE, OPUS_OK,
+};
 use crate::adsp::apps::opus::opus_multistream_decode_object::OpusMultiStreamDecodeObject;
 use crate::adsp::apps::opus::shared_memory::SharedMemoryHandle;
 use crate::adsp::mailbox::{Direction as MailboxDirection, Mailbox};
-use crate::errors::{RESULT_BUFFER_TOO_SMALL, RESULT_LIB_OPUS_INVALID_STATE};
-use crate::opus::parameters::{OpusPacketHeader, OPUS_STREAM_COUNT_MAX};
+use crate::opus::parameters::OPUS_STREAM_COUNT_MAX;
 use crate::SharedSystem;
 use common::thread::set_current_thread_name;
 use common::ResultCode;
 use parking_lot::Mutex;
 use std::collections::HashMap;
-use std::mem::size_of;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
+
+const OPUS_BUFFER_TOO_SMALL: i32 = -2;
+
+fn is_valid_channel_count(channel_count: i32) -> bool {
+    channel_count == 1 || channel_count == 2
+}
+
+fn is_valid_multi_stream_channel_count(channel_count: i32) -> bool {
+    channel_count <= OPUS_STREAM_COUNT_MAX as i32
+}
+
+fn is_valid_multi_stream_stream_counts(total_stream_count: i32, stereo_stream_count: i32) -> bool {
+    is_valid_multi_stream_channel_count(total_stream_count)
+        && total_stream_count > 0
+        && stereo_stream_count >= 0
+        && stereo_stream_count <= total_stream_count
+}
+
+fn soft_assert(condition: bool, expression: &str) {
+    if !condition {
+        // Eden's ASSERT logs and continues unless use_debug_asserts is enabled.
+        log::error!("audio_core/adsp/apps/opus/opus_decoder.cpp: assert {expression}");
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Direction {
@@ -62,12 +86,24 @@ pub struct OpusDecoder {
 }
 
 struct DecoderState {
-    decoders: HashMap<u64, ActiveDecoder>,
+    decoders: HashMap<DecoderKey, ActiveDecoder>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct DecoderKey {
+    shared_memory: usize,
+    buffer: u64,
 }
 
 enum ActiveDecoder {
-    Single(OpusDecodeObject),
-    MultiStream(OpusMultiStreamDecodeObject),
+    Single {
+        object: OpusDecodeObject,
+        channel_count: u32,
+    },
+    MultiStream {
+        object: OpusMultiStreamDecodeObject,
+        channel_count: u32,
+    },
 }
 
 impl DecoderState {
@@ -75,6 +111,13 @@ impl DecoderState {
         Self {
             decoders: HashMap::new(),
         }
+    }
+}
+
+fn decoder_key(shared_memory: &SharedMemoryHandle, buffer: u64) -> DecoderKey {
+    DecoderKey {
+        shared_memory: Arc::as_ptr(shared_memory) as usize,
+        buffer,
     }
 }
 
@@ -187,41 +230,35 @@ impl OpusDecoder {
     ) {
         set_current_thread_name("DSP_OpusDecoder_Init");
 
-        while !stop_requested.load(Ordering::SeqCst) {
-            let Some(message) = mailbox.receive_with_stop(MailboxDirection::Dsp, &stop_requested)
-            else {
-                return;
-            };
-            if message != Message::Start as u32 {
-                continue;
-            }
-
-            let thread = {
-                let system = system.clone();
-                let mailbox = mailbox.clone();
-                let running = running.clone();
-                let stop_requested = stop_requested.clone();
-                let shared_memory = shared_memory.clone();
-                let state = state.clone();
-                thread::Builder::new()
-                    .name("DSP_OpusDecoder_Main".to_string())
-                    .spawn(move || {
-                        Self::main(
-                            system,
-                            mailbox,
-                            running,
-                            stop_requested,
-                            shared_memory,
-                            state,
-                        )
-                    })
-                    .expect("failed to spawn DSP opus main thread")
-            };
-            *main_thread.lock() = Some(thread);
-            running.store(true, Ordering::SeqCst);
-            mailbox.send(MailboxDirection::Host, Message::StartOK as u32);
+        let Some(message) = mailbox.receive_with_stop(MailboxDirection::Dsp, &stop_requested)
+        else {
+            return;
+        };
+        if message != Message::Start as u32 {
+            log::error!(
+                "DSP OpusDecoder failed to receive Start message. Opus initialization failed."
+            );
             return;
         }
+
+        let main_mailbox = mailbox.clone();
+        let main_running = running.clone();
+        let thread = thread::Builder::new()
+            .name("DSP_OpusDecoder_Main".to_string())
+            .spawn(move || {
+                Self::main(
+                    system,
+                    main_mailbox,
+                    main_running,
+                    stop_requested,
+                    shared_memory,
+                    state,
+                )
+            })
+            .expect("failed to spawn DSP opus main thread");
+        *main_thread.lock() = Some(thread);
+        running.store(true, Ordering::SeqCst);
+        mailbox.send(MailboxDirection::Host, Message::StartOK as u32);
     }
 
     fn main(
@@ -302,6 +339,7 @@ impl OpusDecoder {
                 | Message::InitializeMultiStreamDecodeObjectOK
                 | Message::ShutdownMultiStreamDecodeObjectOK
                 | Message::DecodeInterleavedForMultiStreamOK => {
+                    log::error!("Invalid OpusDecoder command {:?}", message);
                     continue;
                 }
                 Message::Shutdown => unreachable!(),
@@ -314,8 +352,12 @@ impl OpusDecoder {
 
     fn process_get_work_buffer_size(shared_memory: &Arc<Mutex<SharedMemoryHandle>>) {
         let binding = shared_memory.lock().clone();
-        let channel_count = binding.lock().host_send_data[0] as u32;
-        let size = OpusDecodeObject::get_work_buffer_size(channel_count);
+        let channel_count = binding.lock().host_send_data[0] as i32;
+        soft_assert(
+            is_valid_channel_count(channel_count),
+            "IsValidChannelCount(channel_count)",
+        );
+        let size = OpusDecodeObject::get_work_buffer_size(channel_count as u32);
         binding.lock().dsp_return_data[0] = size as u64;
     }
 
@@ -324,12 +366,16 @@ impl OpusDecoder {
     ) {
         let binding = shared_memory.lock().clone();
         let shared = binding.lock();
-        let total_stream_count = shared.host_send_data[0] as u32;
-        let stereo_stream_count = shared.host_send_data[1] as u32;
+        let total_stream_count = shared.host_send_data[0] as i32;
+        let stereo_stream_count = shared.host_send_data[1] as i32;
         drop(shared);
+        soft_assert(
+            is_valid_multi_stream_stream_counts(total_stream_count, stereo_stream_count),
+            "IsValidMultiStreamStreamCounts(total_stream_count, stereo_stream_count)",
+        );
         let size = OpusMultiStreamDecodeObject::get_work_buffer_size(
-            total_stream_count,
-            stereo_stream_count,
+            total_stream_count as u32,
+            stereo_stream_count as u32,
         );
         binding.lock().dsp_return_data[0] = size as u64;
     }
@@ -342,68 +388,42 @@ impl OpusDecoder {
         let shared = binding.lock();
         let buffer = shared.host_send_data[0];
         let buffer_size = shared.host_send_data[1];
-        let sample_rate = shared.host_send_data[2] as u32;
-        let channel_count = shared.host_send_data[3] as u32;
+        let sample_rate = shared.host_send_data[2] as i32;
+        let channel_count = shared.host_send_data[3] as i32;
         drop(shared);
+        let key = decoder_key(&binding, buffer);
+
+        soft_assert(sample_rate >= 0, "sample_rate >= 0");
+        soft_assert(
+            is_valid_channel_count(channel_count),
+            "IsValidChannelCount(channel_count)",
+        );
+        soft_assert(
+            buffer_size >= OpusDecodeObject::get_work_buffer_size(channel_count as u32) as u64,
+            "buffer_size >= OpusDecodeObject::GetWorkBufferSize(channel_count)",
+        );
 
         let result = {
             let mut state = state.lock();
-            let required_size = OpusDecodeObject::get_work_buffer_size(channel_count);
-            if required_size != 0 && buffer_size < required_size as u64 {
-                RESULT_BUFFER_TOO_SMALL
-            } else if state.decoders.contains_key(&buffer) {
-                if OpusDecodeObject::matches_config(
-                    &binding.lock(),
-                    buffer,
-                    sample_rate,
-                    channel_count,
-                    buffer_size,
-                ) {
-                    ResultCode::SUCCESS
-                } else {
-                    let mut decode_object = OpusDecodeObject::initialize(
-                        buffer,
-                        buffer,
-                        state
-                            .decoders
-                            .remove(&buffer)
-                            .and_then(|decoder| match decoder {
-                                ActiveDecoder::Single(object) => Some(object),
-                                ActiveDecoder::MultiStream(_) => None,
-                            }),
-                    );
-                    let result =
-                        decode_object.initialize_decoder(sample_rate, channel_count, buffer_size);
-                    if result.is_success() {
-                        state
-                            .decoders
-                            .insert(buffer, ActiveDecoder::Single(decode_object));
-                    }
-                    result
-                }
+            if state.decoders.contains_key(&key) {
+                OPUS_OK
             } else {
                 let mut decode_object = OpusDecodeObject::initialize(buffer, buffer, None);
                 let result =
-                    decode_object.initialize_decoder(sample_rate, channel_count, buffer_size);
-                if result.is_success() {
-                    state
-                        .decoders
-                        .insert(buffer, ActiveDecoder::Single(decode_object));
+                    decode_object.initialize_decoder(sample_rate as u32, channel_count as u32);
+                if result == OPUS_OK {
+                    state.decoders.insert(
+                        key,
+                        ActiveDecoder::Single {
+                            object: decode_object,
+                            channel_count: channel_count as u32,
+                        },
+                    );
                 }
                 result
             }
         };
-        let mut shared = binding.lock();
-        if result.is_success() {
-            let _ = OpusDecodeObject::write_successful_header(
-                &mut shared,
-                buffer,
-                sample_rate,
-                channel_count,
-                buffer_size,
-            );
-        }
-        shared.dsp_return_data[0] = result.raw() as u64;
+        binding.lock().dsp_return_data[0] = result as i64 as u64;
     }
 
     fn process_initialize_multi_stream_decode_object(
@@ -414,92 +434,56 @@ impl OpusDecoder {
         let shared = binding.lock();
         let buffer = shared.host_send_data[0];
         let buffer_size = shared.host_send_data[1];
-        let sample_rate = shared.host_send_data[2] as u32;
-        let channel_count = shared.host_send_data[3] as u32;
-        let total_stream_count = shared.host_send_data[4] as u32;
-        let stereo_stream_count = shared.host_send_data[5] as u32;
+        let sample_rate = shared.host_send_data[2] as i32;
+        let channel_count = shared.host_send_data[3] as i32;
+        let total_stream_count = shared.host_send_data[4] as i32;
+        let stereo_stream_count = shared.host_send_data[5] as i32;
         let mut mappings = [0u8; OPUS_STREAM_COUNT_MAX + 1];
         mappings.copy_from_slice(&shared.channel_mapping);
         drop(shared);
+        let key = decoder_key(&binding, buffer);
+
+        soft_assert(
+            is_valid_multi_stream_stream_counts(total_stream_count, stereo_stream_count),
+            "IsValidMultiStreamStreamCounts(total_stream_count, stereo_stream_count)",
+        );
+        soft_assert(sample_rate >= 0, "sample_rate >= 0");
+        soft_assert(
+            buffer_size
+                >= OpusMultiStreamDecodeObject::get_work_buffer_size(
+                    total_stream_count as u32,
+                    stereo_stream_count as u32,
+                ) as u64,
+            "buffer_size >= OpusMultiStreamDecodeObject::GetWorkBufferSize(total_stream_count, stereo_stream_count)",
+        );
 
         let result = {
             let mut state = state.lock();
-            let required_size = OpusMultiStreamDecodeObject::get_work_buffer_size(
-                total_stream_count,
-                stereo_stream_count,
-            );
-            if required_size != 0 && buffer_size < required_size as u64 {
-                RESULT_BUFFER_TOO_SMALL
-            } else if state.decoders.contains_key(&buffer) {
-                if OpusMultiStreamDecodeObject::matches_config(
-                    &binding.lock(),
-                    buffer,
-                    sample_rate,
-                    channel_count,
-                    total_stream_count,
-                    stereo_stream_count,
-                    buffer_size,
-                ) {
-                    ResultCode::SUCCESS
-                } else {
-                    let mut decode_object = OpusMultiStreamDecodeObject::initialize(
-                        buffer,
-                        buffer,
-                        state
-                            .decoders
-                            .remove(&buffer)
-                            .and_then(|decoder| match decoder {
-                                ActiveDecoder::MultiStream(object) => Some(object),
-                                ActiveDecoder::Single(_) => None,
-                            }),
-                    );
-                    let result = decode_object.initialize_decoder(
-                        sample_rate,
-                        total_stream_count,
-                        channel_count,
-                        stereo_stream_count,
-                        &mappings[..channel_count as usize],
-                        buffer_size,
-                    );
-                    if result.is_success() {
-                        state
-                            .decoders
-                            .insert(buffer, ActiveDecoder::MultiStream(decode_object));
-                    }
-                    result
-                }
+            if state.decoders.contains_key(&key) {
+                OPUS_OK
             } else {
                 let mut decode_object =
                     OpusMultiStreamDecodeObject::initialize(buffer, buffer, None);
                 let result = decode_object.initialize_decoder(
-                    sample_rate,
-                    total_stream_count,
-                    channel_count,
-                    stereo_stream_count,
+                    sample_rate as u32,
+                    total_stream_count as u32,
+                    channel_count as u32,
+                    stereo_stream_count as u32,
                     &mappings[..channel_count as usize],
-                    buffer_size,
                 );
-                if result.is_success() {
-                    state
-                        .decoders
-                        .insert(buffer, ActiveDecoder::MultiStream(decode_object));
+                if result == OPUS_OK {
+                    state.decoders.insert(
+                        key,
+                        ActiveDecoder::MultiStream {
+                            object: decode_object,
+                            channel_count: channel_count as u32,
+                        },
+                    );
                 }
                 result
             }
         };
-        let mut shared = binding.lock();
-        if result.is_success() {
-            let _ = OpusMultiStreamDecodeObject::write_successful_header(
-                &mut shared,
-                buffer,
-                sample_rate,
-                channel_count,
-                total_stream_count,
-                stereo_stream_count,
-                buffer_size,
-            );
-        }
-        shared.dsp_return_data[0] = result.raw() as u64;
+        binding.lock().dsp_return_data[0] = result as i64 as u64;
     }
 
     fn process_shutdown_decode_object(
@@ -507,28 +491,27 @@ impl OpusDecoder {
         state: &Arc<Mutex<DecoderState>>,
     ) {
         let binding = shared_memory.lock().clone();
-        let (buffer, buffer_size) = {
+        let buffer = {
             let shared = binding.lock();
-            (shared.host_send_data[0], shared.host_send_data[1])
+            shared.host_send_data[0]
         };
+        let key = decoder_key(&binding, buffer);
         let result = {
             let mut state = state.lock();
-            if let Some(active_decoder) = state.decoders.get_mut(&buffer) {
+            if let Some(active_decoder) = state.decoders.get_mut(&key) {
                 let result = match active_decoder {
-                    ActiveDecoder::Single(object) => {
-                        object.shutdown_with_header(&mut binding.lock(), buffer, buffer_size)
-                    }
-                    ActiveDecoder::MultiStream(_) => RESULT_LIB_OPUS_INVALID_STATE,
+                    ActiveDecoder::Single { object, .. } => object.shutdown(),
+                    ActiveDecoder::MultiStream { object, .. } => object.shutdown(),
                 };
-                if result.is_success() {
-                    let _ = state.decoders.remove(&buffer);
+                if result == OPUS_OK {
+                    let _ = state.decoders.remove(&key);
                 }
                 result
             } else {
-                ResultCode::SUCCESS
+                OPUS_OK
             }
         };
-        binding.lock().dsp_return_data[0] = result.raw() as u64;
+        binding.lock().dsp_return_data[0] = result as i64 as u64;
     }
 
     fn process_shutdown_multi_stream_decode_object(
@@ -536,28 +519,27 @@ impl OpusDecoder {
         state: &Arc<Mutex<DecoderState>>,
     ) {
         let binding = shared_memory.lock().clone();
-        let (buffer, buffer_size) = {
+        let buffer = {
             let shared = binding.lock();
-            (shared.host_send_data[0], shared.host_send_data[1])
+            shared.host_send_data[0]
         };
+        let key = decoder_key(&binding, buffer);
         let result = {
             let mut state = state.lock();
-            if let Some(active_decoder) = state.decoders.get_mut(&buffer) {
+            if let Some(active_decoder) = state.decoders.get_mut(&key) {
                 let result = match active_decoder {
-                    ActiveDecoder::MultiStream(object) => {
-                        object.shutdown_with_header(&mut binding.lock(), buffer, buffer_size)
-                    }
-                    ActiveDecoder::Single(_) => RESULT_LIB_OPUS_INVALID_STATE,
+                    ActiveDecoder::MultiStream { object, .. } => object.shutdown(),
+                    ActiveDecoder::Single { object, .. } => object.shutdown(),
                 };
-                if result.is_success() {
-                    let _ = state.decoders.remove(&buffer);
+                if result == OPUS_OK {
+                    let _ = state.decoders.remove(&key);
                 }
                 result
             } else {
-                ResultCode::SUCCESS
+                OPUS_OK
             }
         };
-        binding.lock().dsp_return_data[0] = result.raw() as u64;
+        binding.lock().dsp_return_data[0] = result as i64 as u64;
     }
 
     fn process_decode_interleaved(
@@ -589,6 +571,7 @@ impl OpusDecoder {
         };
 
         let binding = shared_memory.lock().clone();
+        let key = decoder_key(&binding, buffer);
         let input = binding
             .lock()
             .read_transfer(input_data, input_data_size)
@@ -598,132 +581,81 @@ impl OpusDecoder {
         let decode_start_time = system.get().core_timing().get_global_time_us().as_micros() as u64;
 
         let mut decoded_samples = 0;
-        let mut time_taken = 0;
-        let mut decoded_final_range = None;
-        let result = if input.len() <= size_of::<OpusPacketHeader>() {
-            RESULT_BUFFER_TOO_SMALL
-        } else {
+        let (result, channel_count) = {
             let mut state = state.lock();
-            if let Some(active_decoder) = state.decoders.get_mut(&buffer) {
-                let header = read_header(&input);
-                let payload_end = size_of::<OpusPacketHeader>() + header.size as usize;
-                if payload_end > input.len() {
-                    RESULT_BUFFER_TOO_SMALL
-                } else {
-                    let payload = &input[size_of::<OpusPacketHeader>()..payload_end];
-                    match active_decoder {
-                        ActiveDecoder::Single(object) if !multi_stream => object
-                            .decode_interleaved_message(
-                                &binding.lock(),
-                                buffer,
-                                payload,
-                                &mut output,
-                                &mut decoded_samples,
-                                &mut time_taken,
-                                header.final_range,
-                                final_range,
-                                reset_requested,
-                                &mut decoded_final_range,
-                            ),
-                        ActiveDecoder::MultiStream(object) if multi_stream => object
-                            .decode_interleaved_message(
-                                &binding.lock(),
-                                buffer,
-                                payload,
-                                &mut output,
-                                &mut decoded_samples,
-                                &mut time_taken,
-                                header.final_range,
-                                final_range,
-                                reset_requested,
-                                &mut decoded_final_range,
-                            ),
-                        _ => RESULT_LIB_OPUS_INVALID_STATE,
+            match state.decoders.get_mut(&key) {
+                Some(ActiveDecoder::Single {
+                    object,
+                    channel_count,
+                }) if !multi_stream => {
+                    let mut result = OPUS_OK;
+                    if reset_requested {
+                        result = object.reset_decoder();
                     }
+                    if result == OPUS_OK {
+                        result = object.decode(&mut decoded_samples, &mut output, &input);
+                    }
+                    if result == OPUS_OK
+                        && final_range != 0
+                        && object.get_final_range() != final_range
+                    {
+                        result = OPUS_INVALID_PACKET;
+                    }
+                    (result, *channel_count)
                 }
-            } else {
-                RESULT_LIB_OPUS_INVALID_STATE
+                Some(ActiveDecoder::MultiStream {
+                    object,
+                    channel_count,
+                }) if multi_stream => {
+                    let mut result = OPUS_OK;
+                    if reset_requested {
+                        result = object.reset_decoder();
+                    }
+                    if result == OPUS_OK {
+                        result = object.decode(&mut decoded_samples, &mut output, &input);
+                    }
+                    if result == OPUS_OK
+                        && final_range != 0
+                        && object.get_final_range() != final_range
+                    {
+                        result = OPUS_INVALID_PACKET;
+                    }
+                    (result, *channel_count)
+                }
+                _ => (OPUS_INVALID_STATE, 0),
             }
         };
 
         let mut shared = binding.lock();
         let decode_end_time = system.get().core_timing().get_global_time_us().as_micros() as u64;
-        let core_timing_time_taken = decode_end_time.saturating_sub(decode_start_time);
-        if core_timing_time_taken != 0 {
-            time_taken = core_timing_time_taken;
-        }
-        if result.is_success() {
-            let channel_count = DecodeObjectHeader::read(&shared, buffer)
-                .map(|header| header.channel_count.max(1) as usize)
-                .unwrap_or(1);
-            let output_bytes = decoded_samples as usize * size_of::<i16>() * channel_count;
-            let write_size = output_bytes.min(output.len()).min(output_data_size);
-            if !shared.write_transfer(output_data, &output[..write_size]) {
-                shared.dsp_return_data[0] = RESULT_BUFFER_TOO_SMALL.raw() as u64;
+        let time_taken = decode_end_time.wrapping_sub(decode_start_time);
+        if result == OPUS_OK {
+            let output_bytes = (decoded_samples as usize)
+                .wrapping_mul(std::mem::size_of::<i16>())
+                .wrapping_mul(channel_count as usize);
+            if output_bytes > output.len()
+                || output_bytes > output_data_size
+                || !shared.write_transfer(output_data, &output[..output_bytes])
+            {
+                shared.dsp_return_data[0] = OPUS_BUFFER_TOO_SMALL as i64 as u64;
                 shared.dsp_return_data[1] = 0;
                 shared.dsp_return_data[2] = 0;
                 return;
             }
-            let final_range_to_write =
-                decoded_final_range.unwrap_or_else(|| read_header(&input).final_range);
-            let _ =
-                DecodeObjectHeader::write_final_range(&mut shared, buffer, final_range_to_write);
         }
         Self::write_decode_result(&mut shared, result, decoded_samples, time_taken);
     }
 
     fn process_map_memory(
-        shared_memory: &Arc<Mutex<SharedMemoryHandle>>,
-        state: &Arc<Mutex<DecoderState>>,
+        _shared_memory: &Arc<Mutex<SharedMemoryHandle>>,
+        _state: &Arc<Mutex<DecoderState>>,
     ) {
-        let binding = shared_memory.lock().clone();
-        let (buffer, buffer_size) = {
-            let shared = binding.lock();
-            (shared.host_send_data[0], shared.host_send_data[1])
-        };
-        let result = {
-            let state = state.lock();
-            if state.decoders.contains_key(&buffer) {
-                let mut shared = binding.lock();
-                if let Some(ActiveDecoder::Single(_)) = state.decoders.get(&buffer) {
-                    OpusDecodeObject::map_memory(&mut shared, buffer, buffer_size, true)
-                } else if let Some(ActiveDecoder::MultiStream(_)) = state.decoders.get(&buffer) {
-                    OpusMultiStreamDecodeObject::map_memory(&mut shared, buffer, buffer_size, true)
-                } else {
-                    RESULT_LIB_OPUS_INVALID_STATE
-                }
-            } else {
-                RESULT_LIB_OPUS_INVALID_STATE
-            }
-        };
-        binding.lock().dsp_return_data[0] = result.raw() as u64;
     }
 
     fn process_unmap_memory(
-        shared_memory: &Arc<Mutex<SharedMemoryHandle>>,
-        state: &Arc<Mutex<DecoderState>>,
+        _shared_memory: &Arc<Mutex<SharedMemoryHandle>>,
+        _state: &Arc<Mutex<DecoderState>>,
     ) {
-        let binding = shared_memory.lock().clone();
-        let (buffer, buffer_size) = {
-            let shared = binding.lock();
-            (shared.host_send_data[0], shared.host_send_data[1])
-        };
-        let result = {
-            let state = state.lock();
-            if state.decoders.contains_key(&buffer) {
-                let mut shared = binding.lock();
-                if let Some(ActiveDecoder::Single(_)) = state.decoders.get(&buffer) {
-                    OpusDecodeObject::map_memory(&mut shared, buffer, buffer_size, false)
-                } else if let Some(ActiveDecoder::MultiStream(_)) = state.decoders.get(&buffer) {
-                    OpusMultiStreamDecodeObject::map_memory(&mut shared, buffer, buffer_size, false)
-                } else {
-                    RESULT_LIB_OPUS_INVALID_STATE
-                }
-            } else {
-                RESULT_LIB_OPUS_INVALID_STATE
-            }
-        };
-        binding.lock().dsp_return_data[0] = result.raw() as u64;
     }
 
     fn decode_message(raw: u32) -> Message {
@@ -758,11 +690,11 @@ impl OpusDecoder {
 
     fn write_decode_result(
         shared: &mut crate::adsp::apps::opus::SharedMemory,
-        result: ResultCode,
+        result: i32,
         decoded_samples: u32,
         time_taken: u64,
     ) {
-        shared.dsp_return_data[0] = result.raw() as u64;
+        shared.dsp_return_data[0] = result as i64 as u64;
         shared.dsp_return_data[1] = decoded_samples as u64;
         shared.dsp_return_data[2] = time_taken;
     }
@@ -783,23 +715,9 @@ impl From<Direction> for MailboxDirection {
     }
 }
 
-fn read_header(input_data: &[u8]) -> OpusPacketHeader {
-    let mut header = OpusPacketHeader::default();
-    if input_data.len() >= size_of::<OpusPacketHeader>() {
-        header.size =
-            u32::from_ne_bytes(input_data[0..4].try_into().unwrap_or([0; 4])).swap_bytes();
-        header.final_range =
-            u32::from_ne_bytes(input_data[4..8].try_into().unwrap_or([0; 4])).swap_bytes();
-    }
-    header
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::adsp::apps::opus::opus_decode_object::{
-        DecodeObjectHeader, DECODE_OBJECT_MAGIC, FLAG_INITIALIZED, FLAG_MAPPED, FLAG_MULTI_STREAM,
-    };
     use crate::adsp::apps::opus::SharedMemory;
     use std::sync::atomic::AtomicBool;
 
@@ -807,12 +725,8 @@ mod tests {
         crate::make_test_system()
     }
 
-    fn packet_with_payload(size: usize) -> Vec<u8> {
-        let mut packet = Vec::with_capacity(size_of::<OpusPacketHeader>() + size);
-        packet.extend_from_slice(&(size as u32).to_be_bytes());
-        packet.extend_from_slice(&0u32.to_be_bytes());
-        packet.extend((0..size).map(|i| i as u8));
-        packet
+    fn opus_silence_packet() -> Vec<u8> {
+        vec![0xF8, 0xFF, 0xFE]
     }
 
     #[test]
@@ -860,7 +774,10 @@ mod tests {
             Message::GetWorkBufferSizeOK
         );
 
-        assert_eq!(shared_memory.lock().dsp_return_data[0], 0x4000);
+        assert_eq!(
+            shared_memory.lock().dsp_return_data[0],
+            OpusDecodeObject::get_work_buffer_size(2) as u64
+        );
     }
 
     #[test]
@@ -870,7 +787,7 @@ mod tests {
         {
             let mut shared = shared_memory.lock();
             shared.host_send_data[0] = 0x1000;
-            shared.host_send_data[1] = 0x6000;
+            shared.host_send_data[1] = 0x10000;
             shared.host_send_data[2] = 48_000;
             shared.host_send_data[3] = 2;
         }
@@ -888,7 +805,7 @@ mod tests {
             ResultCode::SUCCESS.raw() as u64
         );
 
-        let packet = packet_with_payload(64);
+        let packet = opus_silence_packet();
         {
             let mut shared = shared_memory.lock();
             assert!(shared.write_transfer(0x40, &packet));
@@ -1012,7 +929,7 @@ mod tests {
             ResultCode::SUCCESS.raw() as u64
         );
 
-        let packet = packet_with_payload(64);
+        let packet = opus_silence_packet();
         {
             let mut shared = shared_memory.lock();
             assert!(shared.write_transfer(0x40, &packet));
@@ -1055,7 +972,7 @@ mod tests {
     }
 
     #[test]
-    fn initialize_decode_object_rejects_too_small_buffer() {
+    fn initialize_decode_object_continues_after_soft_buffer_assert() {
         let mut decoder = OpusDecoder::new(make_system());
         let shared_memory = Arc::new(Mutex::new(SharedMemory::new(0x2000)));
         {
@@ -1074,14 +991,11 @@ mod tests {
             decoder.receive(Direction::Host),
             Message::InitializeDecodeObjectOK
         );
-        assert_eq!(
-            shared_memory.lock().dsp_return_data[0],
-            RESULT_BUFFER_TOO_SMALL.raw() as u64
-        );
+        assert_eq!(shared_memory.lock().dsp_return_data[0], OPUS_OK as u64);
     }
 
     #[test]
-    fn shutdown_decode_object_rejects_multistream_entry() {
+    fn shutdown_decode_object_accepts_multistream_entry_like_upstream_destructor() {
         let mut decoder = OpusDecoder::new(make_system());
         let shared_memory = Arc::new(Mutex::new(SharedMemory::new(0x20000)));
         {
@@ -1121,345 +1035,7 @@ mod tests {
         );
         assert_eq!(
             shared_memory.lock().dsp_return_data[0],
-            RESULT_LIB_OPUS_INVALID_STATE.raw() as u64
-        );
-    }
-
-    #[test]
-    fn initialize_decode_object_writes_header_into_workbuffer() {
-        let mut decoder = OpusDecoder::new(make_system());
-        let shared_memory = Arc::new(Mutex::new(SharedMemory::new(0x20000)));
-        {
-            let mut shared = shared_memory.lock();
-            shared.host_send_data[0] = 0x1000;
-            shared.host_send_data[1] = 0x6000;
-            shared.host_send_data[2] = 48_000;
-            shared.host_send_data[3] = 2;
-        }
-        decoder.set_shared_memory(shared_memory.clone());
-
-        decoder.send(Direction::Dsp, Message::Start);
-        assert_eq!(decoder.receive(Direction::Host), Message::StartOK);
-        decoder.send(Direction::Dsp, Message::InitializeDecodeObject);
-        assert_eq!(
-            decoder.receive(Direction::Host),
-            Message::InitializeDecodeObjectOK
-        );
-
-        let header = {
-            let shared = shared_memory.lock();
-            DecodeObjectHeader::read(&shared, 0x1000).unwrap()
-        };
-        assert_eq!(header.magic, DECODE_OBJECT_MAGIC);
-        assert_eq!(header.sample_rate, 48_000);
-        assert_eq!(header.channel_count, 2);
-        assert_eq!(header.total_stream_count, 0);
-        assert_eq!(header.stereo_stream_count, 0);
-        assert_eq!(header.buffer_size, 0x6000);
-        assert_eq!(header.flags, FLAG_INITIALIZED | FLAG_MAPPED);
-    }
-
-    #[test]
-    fn reinitialize_decode_object_with_different_sample_rate_rebuilds_header() {
-        let mut decoder = OpusDecoder::new(make_system());
-        let shared_memory = Arc::new(Mutex::new(SharedMemory::new(0x20000)));
-        decoder.set_shared_memory(shared_memory.clone());
-
-        decoder.send(Direction::Dsp, Message::Start);
-        assert_eq!(decoder.receive(Direction::Host), Message::StartOK);
-
-        {
-            let mut shared = shared_memory.lock();
-            shared.host_send_data[0] = 0x1000;
-            shared.host_send_data[1] = 0x6000;
-            shared.host_send_data[2] = 48_000;
-            shared.host_send_data[3] = 2;
-        }
-        decoder.send(Direction::Dsp, Message::InitializeDecodeObject);
-        assert_eq!(
-            decoder.receive(Direction::Host),
-            Message::InitializeDecodeObjectOK
-        );
-        assert_eq!(
-            shared_memory.lock().dsp_return_data[0],
             ResultCode::SUCCESS.raw() as u64
-        );
-
-        {
-            let mut shared = shared_memory.lock();
-            shared.host_send_data[2] = 24_000;
-        }
-        decoder.send(Direction::Dsp, Message::InitializeDecodeObject);
-        assert_eq!(
-            decoder.receive(Direction::Host),
-            Message::InitializeDecodeObjectOK
-        );
-        assert_eq!(
-            shared_memory.lock().dsp_return_data[0],
-            ResultCode::SUCCESS.raw() as u64
-        );
-
-        let header = {
-            let shared = shared_memory.lock();
-            DecodeObjectHeader::read(&shared, 0x1000).unwrap()
-        };
-        assert_eq!(header.sample_rate, 24_000);
-        assert_eq!(header.channel_count, 2);
-        assert_eq!(header.flags, FLAG_INITIALIZED | FLAG_MAPPED);
-    }
-
-    #[test]
-    fn reinitialize_multi_stream_with_different_layout_rebuilds_header() {
-        let mut decoder = OpusDecoder::new(make_system());
-        let shared_memory = Arc::new(Mutex::new(SharedMemory::new(0x20000)));
-        decoder.set_shared_memory(shared_memory.clone());
-
-        decoder.send(Direction::Dsp, Message::Start);
-        assert_eq!(decoder.receive(Direction::Host), Message::StartOK);
-
-        {
-            let mut shared = shared_memory.lock();
-            shared.host_send_data[0] = 0x2000;
-            shared.host_send_data[1] = 0x8000;
-            shared.host_send_data[2] = 48_000;
-            shared.host_send_data[3] = 2;
-            shared.host_send_data[4] = 1;
-            shared.host_send_data[5] = 1;
-            shared.channel_mapping[0] = 0;
-            shared.channel_mapping[1] = 1;
-        }
-        decoder.send(Direction::Dsp, Message::InitializeMultiStreamDecodeObject);
-        assert_eq!(
-            decoder.receive(Direction::Host),
-            Message::InitializeMultiStreamDecodeObjectOK
-        );
-        assert_eq!(
-            shared_memory.lock().dsp_return_data[0],
-            ResultCode::SUCCESS.raw() as u64
-        );
-
-        {
-            let mut shared = shared_memory.lock();
-            shared.host_send_data[3] = 3;
-            shared.host_send_data[4] = 2;
-            shared.host_send_data[5] = 1;
-            shared.channel_mapping[0] = 0;
-            shared.channel_mapping[1] = 1;
-            shared.channel_mapping[2] = 2;
-        }
-        decoder.send(Direction::Dsp, Message::InitializeMultiStreamDecodeObject);
-        assert_eq!(
-            decoder.receive(Direction::Host),
-            Message::InitializeMultiStreamDecodeObjectOK
-        );
-        assert_eq!(
-            shared_memory.lock().dsp_return_data[0],
-            ResultCode::SUCCESS.raw() as u64
-        );
-
-        let header = {
-            let shared = shared_memory.lock();
-            DecodeObjectHeader::read(&shared, 0x2000).unwrap()
-        };
-        assert_eq!(header.sample_rate, 48_000);
-        assert_eq!(header.channel_count, 3);
-        assert_eq!(header.total_stream_count, 2);
-        assert_eq!(header.stereo_stream_count, 1);
-        assert_eq!(
-            header.flags,
-            FLAG_INITIALIZED | FLAG_MULTI_STREAM | FLAG_MAPPED
-        );
-    }
-
-    #[test]
-    fn unmap_memory_clears_mapped_flag_and_map_memory_restores_it() {
-        let mut decoder = OpusDecoder::new(make_system());
-        let shared_memory = Arc::new(Mutex::new(SharedMemory::new(0x20000)));
-        decoder.set_shared_memory(shared_memory.clone());
-
-        decoder.send(Direction::Dsp, Message::Start);
-        assert_eq!(decoder.receive(Direction::Host), Message::StartOK);
-
-        {
-            let mut shared = shared_memory.lock();
-            shared.host_send_data[0] = 0x1000;
-            shared.host_send_data[1] = 0x6000;
-            shared.host_send_data[2] = 48_000;
-            shared.host_send_data[3] = 2;
-        }
-        decoder.send(Direction::Dsp, Message::InitializeDecodeObject);
-        assert_eq!(
-            decoder.receive(Direction::Host),
-            Message::InitializeDecodeObjectOK
-        );
-
-        {
-            let mut shared = shared_memory.lock();
-            shared.host_send_data[0] = 0x1000;
-            shared.host_send_data[1] = 0x6000;
-        }
-        decoder.send(Direction::Dsp, Message::UnmapMemory);
-        assert_eq!(decoder.receive(Direction::Host), Message::UnmapMemoryOK);
-        assert_eq!(
-            shared_memory.lock().dsp_return_data[0],
-            ResultCode::SUCCESS.raw() as u64
-        );
-        {
-            let shared = shared_memory.lock();
-            let header = DecodeObjectHeader::read(&shared, 0x1000).unwrap();
-            assert!(!header.is_mapped());
-        }
-
-        {
-            let mut shared = shared_memory.lock();
-            shared.host_send_data[0] = 0x1000;
-            shared.host_send_data[1] = 0x6000;
-        }
-        decoder.send(Direction::Dsp, Message::MapMemory);
-        assert_eq!(decoder.receive(Direction::Host), Message::MapMemoryOK);
-        assert_eq!(
-            shared_memory.lock().dsp_return_data[0],
-            ResultCode::SUCCESS.raw() as u64
-        );
-        {
-            let shared = shared_memory.lock();
-            let header = DecodeObjectHeader::read(&shared, 0x1000).unwrap();
-            assert!(header.is_mapped());
-        }
-    }
-
-    #[test]
-    fn decode_rejects_unmapped_workbuffer_header() {
-        let mut decoder = OpusDecoder::new(make_system());
-        let shared_memory = Arc::new(Mutex::new(SharedMemory::new(0x20000)));
-        decoder.set_shared_memory(shared_memory.clone());
-
-        decoder.send(Direction::Dsp, Message::Start);
-        assert_eq!(decoder.receive(Direction::Host), Message::StartOK);
-
-        {
-            let mut shared = shared_memory.lock();
-            shared.host_send_data[0] = 0x1000;
-            shared.host_send_data[1] = 0x6000;
-            shared.host_send_data[2] = 48_000;
-            shared.host_send_data[3] = 2;
-        }
-        decoder.send(Direction::Dsp, Message::InitializeDecodeObject);
-        assert_eq!(
-            decoder.receive(Direction::Host),
-            Message::InitializeDecodeObjectOK
-        );
-
-        {
-            let mut shared = shared_memory.lock();
-            let mut header = DecodeObjectHeader::read(&shared, 0x1000).unwrap();
-            header.flags &= !FLAG_MAPPED;
-            let _ = header.write(&mut shared, 0x1000);
-            let packet = packet_with_payload(64);
-            assert!(shared.write_transfer(0x40, &packet));
-            shared.host_send_data[0] = 0x1000;
-            shared.host_send_data[1] = 0x40;
-            shared.host_send_data[2] = packet.len() as u64;
-            shared.host_send_data[3] = 0x400;
-            shared.host_send_data[4] = 0x1000;
-            shared.host_send_data[5] = 0;
-            shared.host_send_data[6] = 0;
-        }
-
-        decoder.send(Direction::Dsp, Message::DecodeInterleaved);
-        assert_eq!(
-            decoder.receive(Direction::Host),
-            Message::DecodeInterleavedOK
-        );
-        assert_eq!(
-            shared_memory.lock().dsp_return_data[0],
-            RESULT_LIB_OPUS_INVALID_STATE.raw() as u64
-        );
-    }
-
-    #[test]
-    fn successful_shutdown_clears_workbuffer_header() {
-        let mut decoder = OpusDecoder::new(make_system());
-        let shared_memory = Arc::new(Mutex::new(SharedMemory::new(0x20000)));
-        {
-            let mut shared = shared_memory.lock();
-            shared.host_send_data[0] = 0x1000;
-            shared.host_send_data[1] = 0x6000;
-            shared.host_send_data[2] = 48_000;
-            shared.host_send_data[3] = 2;
-        }
-        decoder.set_shared_memory(shared_memory.clone());
-
-        decoder.send(Direction::Dsp, Message::Start);
-        assert_eq!(decoder.receive(Direction::Host), Message::StartOK);
-        decoder.send(Direction::Dsp, Message::InitializeDecodeObject);
-        assert_eq!(
-            decoder.receive(Direction::Host),
-            Message::InitializeDecodeObjectOK
-        );
-
-        {
-            let mut shared = shared_memory.lock();
-            shared.host_send_data[0] = 0x1000;
-            shared.host_send_data[1] = 0x6000;
-        }
-        decoder.send(Direction::Dsp, Message::ShutdownDecodeObject);
-        assert_eq!(
-            decoder.receive(Direction::Host),
-            Message::ShutdownDecodeObjectOK
-        );
-
-        let header = {
-            let shared = shared_memory.lock();
-            DecodeObjectHeader::read(&shared, 0x1000).unwrap()
-        };
-        assert_eq!(header.magic, 0);
-        assert_eq!(header.flags, 0);
-    }
-
-    #[test]
-    fn decode_rejects_invalid_workbuffer_header_even_with_live_decoder_entry() {
-        let mut decoder = OpusDecoder::new(make_system());
-        let shared_memory = Arc::new(Mutex::new(SharedMemory::new(0x20000)));
-        {
-            let mut shared = shared_memory.lock();
-            shared.host_send_data[0] = 0x1000;
-            shared.host_send_data[1] = 0x6000;
-            shared.host_send_data[2] = 48_000;
-            shared.host_send_data[3] = 2;
-        }
-        decoder.set_shared_memory(shared_memory.clone());
-
-        decoder.send(Direction::Dsp, Message::Start);
-        assert_eq!(decoder.receive(Direction::Host), Message::StartOK);
-        decoder.send(Direction::Dsp, Message::InitializeDecodeObject);
-        assert_eq!(
-            decoder.receive(Direction::Host),
-            Message::InitializeDecodeObjectOK
-        );
-
-        {
-            let mut shared = shared_memory.lock();
-            let _ = DecodeObjectHeader::default().write(&mut shared, 0x1000);
-            let packet = packet_with_payload(64);
-            assert!(shared.write_transfer(0x40, &packet));
-            shared.host_send_data[0] = 0x1000;
-            shared.host_send_data[1] = 0x40;
-            shared.host_send_data[2] = packet.len() as u64;
-            shared.host_send_data[3] = 0x400;
-            shared.host_send_data[4] = 0x1000;
-            shared.host_send_data[5] = 0;
-            shared.host_send_data[6] = 0;
-        }
-
-        decoder.send(Direction::Dsp, Message::DecodeInterleaved);
-        assert_eq!(
-            decoder.receive(Direction::Host),
-            Message::DecodeInterleavedOK
-        );
-        assert_eq!(
-            shared_memory.lock().dsp_return_data[0],
-            RESULT_LIB_OPUS_INVALID_STATE.raw() as u64
         );
     }
 }

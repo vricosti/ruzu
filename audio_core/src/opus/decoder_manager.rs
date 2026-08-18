@@ -17,11 +17,7 @@ pub struct OpusDecoderManager {
 }
 
 impl OpusDecoderManager {
-    pub fn new() -> Self {
-        Self::new_with_hardware_opus(HardwareOpus::new())
-    }
-
-    pub fn new_with_hardware_opus(hardware_opus: HardwareOpus) -> Self {
+    fn new_with_hardware_opus(hardware_opus: HardwareOpus) -> Self {
         let mut required_workbuffer_sizes = [0; MAX_CHANNELS];
         for channel in 0..MAX_CHANNELS {
             required_workbuffer_sizes[channel] =
@@ -69,16 +65,16 @@ impl OpusDecoderManager {
 
         let mut work_buffer_size =
             self.required_workbuffer_sizes[params.channel_count as usize - 1];
-        let frame_size = if params.use_large_frame_size {
+        let frame_size: u32 = if params.use_large_frame_size {
             5760
         } else {
             1920
         };
-        let frame_samples = (frame_size as u64 * params.channel_count as u64)
+        let frame_samples = frame_size.wrapping_mul(params.channel_count) as u64
             / (48_000 / params.sample_rate) as u64;
         work_buffer_size = work_buffer_size
-            .saturating_add(align_up(frame_samples, 64) as u32)
-            .saturating_add(0x600);
+            .wrapping_add(align_up(frame_samples, 64) as u32)
+            .wrapping_add(0x600);
         *out_size = work_buffer_size;
         ResultCode::SUCCESS
     }
@@ -131,15 +127,17 @@ impl OpusDecoderManager {
             params.total_stream_count,
             params.stereo_stream_count,
         );
-        let frame_size = if params.use_large_frame_size {
+        let frame_size: u32 = if params.use_large_frame_size {
             5760
         } else {
             1920
         };
         work_buffer_size = work_buffer_size
-            .saturating_add(align_up(1500 * params.total_stream_count as u64, 64) as u32)
-            .saturating_add(align_up(
-                (frame_size as u64 * params.channel_count as u64)
+            .wrapping_add(
+                align_up(1500u32.wrapping_mul(params.total_stream_count) as u64, 64) as u32,
+            )
+            .wrapping_add(align_up(
+                frame_size.wrapping_mul(params.channel_count) as u64
                     / (48_000 / params.sample_rate) as u64,
                 64,
             ) as u32);
@@ -147,7 +145,8 @@ impl OpusDecoderManager {
         ResultCode::SUCCESS
     }
 
-    pub fn required_workbuffer_sizes(&self) -> [u32; MAX_CHANNELS] {
+    #[cfg(test)]
+    fn required_workbuffer_sizes(&self) -> [u32; MAX_CHANNELS] {
         self.required_workbuffer_sizes
     }
 }
@@ -171,13 +170,7 @@ fn is_valid_stream_count(
 ) -> bool {
     total_stream_count > 0
         && stereo_stream_count <= total_stream_count
-        && total_stream_count.saturating_add(stereo_stream_count) <= channel_count
-}
-
-impl Default for OpusDecoderManager {
-    fn default() -> Self {
-        Self::new()
-    }
+        && total_stream_count.wrapping_add(stereo_stream_count) <= channel_count
 }
 
 #[cfg(test)]
@@ -185,9 +178,19 @@ mod tests {
     use super::*;
     use crate::adsp::apps::opus::{Direction, Message};
 
+    fn test_manager() -> OpusDecoderManager {
+        let decoder = Arc::new(Mutex::new(AdspOpusDecoder::new(crate::make_test_system())));
+        {
+            let decoder = decoder.lock();
+            decoder.send(Direction::Dsp, Message::Start);
+            assert_eq!(decoder.receive(Direction::Host), Message::StartOK);
+        }
+        OpusDecoderManager::new_from_adsp(decoder)
+    }
+
     #[test]
     fn get_work_buffer_size_rejects_invalid_channel_count() {
-        let manager = OpusDecoderManager::new();
+        let manager = test_manager();
         let params = OpusParametersEx {
             sample_rate: 48_000,
             channel_count: 3,
@@ -204,7 +207,7 @@ mod tests {
 
     #[test]
     fn get_work_buffer_size_rejects_invalid_sample_rate() {
-        let manager = OpusDecoderManager::new();
+        let manager = test_manager();
         let params = OpusParametersEx {
             sample_rate: 44_100,
             channel_count: 2,
@@ -221,7 +224,7 @@ mod tests {
 
     #[test]
     fn get_work_buffer_size_matches_zuyu_formula() {
-        let manager = OpusDecoderManager::new();
+        let manager = test_manager();
         let params = OpusParametersEx {
             sample_rate: 24_000,
             channel_count: 2,
@@ -243,7 +246,7 @@ mod tests {
 
     #[test]
     fn get_work_buffer_size_for_multi_stream_rejects_invalid_channel_count() {
-        let manager = OpusDecoderManager::new();
+        let manager = test_manager();
         let params = OpusMultiStreamParametersEx {
             sample_rate: 48_000,
             channel_count: 0,
@@ -261,7 +264,7 @@ mod tests {
 
     #[test]
     fn get_work_buffer_size_for_multi_stream_rejects_invalid_stream_count() {
-        let manager = OpusDecoderManager::new();
+        let manager = test_manager();
         let params = OpusMultiStreamParametersEx {
             sample_rate: 48_000,
             channel_count: 2,
@@ -279,7 +282,7 @@ mod tests {
 
     #[test]
     fn get_work_buffer_size_for_multi_stream_matches_zuyu_formula() {
-        let manager = OpusDecoderManager::new();
+        let manager = test_manager();
         let params = OpusMultiStreamParametersEx {
             sample_rate: 48_000,
             channel_count: 6,
@@ -315,7 +318,13 @@ mod tests {
         let manager = OpusDecoderManager::new_from_adsp(decoder);
         let sizes = manager.required_workbuffer_sizes();
 
-        assert_eq!(sizes[0], 0x2000);
-        assert_eq!(sizes[1], 0x4000);
+        assert_eq!(
+            sizes[0],
+            crate::adsp::apps::opus::opus_decode_object::OpusDecodeObject::get_work_buffer_size(1)
+        );
+        assert_eq!(
+            sizes[1],
+            crate::adsp::apps::opus::opus_decode_object::OpusDecodeObject::get_work_buffer_size(2)
+        );
     }
 }

@@ -1,5 +1,6 @@
 pub mod asimd;
 pub mod asimd_three_regs;
+pub mod asimd_two_regs_misc;
 pub mod asimd_two_regs_shift;
 pub mod barrier;
 pub mod branch;
@@ -709,6 +710,7 @@ fn translate_arm_instruction(
         VLDM => vfp::arm_vldm(ir, decoded),
         // ASIMD
         ASIMD_VMOV_imm => asimd::arm_asimd_vmov_imm(ir, decoded),
+        ASIMD_VMOVN => asimd_two_regs_misc::arm_asimd_vmovn(ir, decoded),
         // ASIMD three-register same (integer)
         ASIMD_VHADD => asimd_three_regs::arm_asimd_vhadd(ir, decoded),
         ASIMD_VQADD => asimd_three_regs::arm_asimd_vqadd(ir, decoded),
@@ -780,6 +782,7 @@ fn translate_arm_instruction(
         ASIMD_VTBX => asimd::arm_asimd_vtbx(ir, decoded),
         ASIMD_SHR => asimd_two_regs_shift::arm_asimd_shr(ir, decoded),
         ASIMD_SRA => asimd_two_regs_shift::arm_asimd_sra(ir, decoded),
+        ASIMD_VSHRN => asimd_two_regs_shift::arm_asimd_vshrn(ir, decoded),
         ASIMD_VSHL_imm => asimd_two_regs_shift::arm_asimd_vshl_imm(ir, decoded),
         ASIMD_VSLI => asimd_two_regs_shift::arm_asimd_vsli(ir, decoded),
         ASIMD_VSRI => asimd_two_regs_shift::arm_asimd_vsri(ir, decoded),

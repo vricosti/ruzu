@@ -12,6 +12,7 @@ use std::sync::Arc;
 use crate::framebuffer_config::{BlendMode as FramebufferBlendMode, FramebufferConfig};
 use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
 use crate::present::{PresentFilters, ScalingFilter};
+use crate::vulkan_common::vulkan_device::Device;
 use crate::vulkan_common::vulkan_memory_allocator::MemoryAllocator;
 
 use super::present::filters;
@@ -75,16 +76,11 @@ pub struct BlitScreen {
     window_adapt: Option<WindowAdaptPass>,
     layers: Vec<Layer>,
     filters: &'static PresentFilters,
-    supports_float16: bool,
 }
 
 impl BlitScreen {
     /// Port of `BlitScreen::BlitScreen`.
-    pub fn new(
-        device: ash::Device,
-        filters: &'static PresentFilters,
-        supports_float16: bool,
-    ) -> Self {
+    pub fn new(device: ash::Device, filters: &'static PresentFilters) -> Self {
         BlitScreen {
             device,
             image_count: 1,
@@ -94,13 +90,13 @@ impl BlitScreen {
             window_adapt: None,
             layers: Vec::new(),
             filters,
-            supports_float16,
         }
     }
 
     /// Port of `BlitScreen::DrawToFrame` for present-manager frames.
     pub fn draw_to_present_frame(
         &mut self,
+        device: &Device,
         rasterizer: &mut RasterizerVulkan,
         scheduler: &mut Scheduler,
         present_manager: &mut PresentManager,
@@ -140,7 +136,7 @@ impl BlitScreen {
 
         if resource_update_required {
             self.wait_idle(scheduler, present_manager);
-            self.set_window_adapt_pass();
+            self.set_window_adapt_pass(device);
 
             if presentation_recreate_required {
                 if let Some(ref window_adapt) = self.window_adapt {
@@ -157,6 +153,7 @@ impl BlitScreen {
 
         let frame = BlitFrame::from(present_manager.frame(frame_index));
         self.draw_to_frame(
+            device,
             rasterizer,
             scheduler,
             present_manager,
@@ -176,6 +173,7 @@ impl BlitScreen {
     /// recreating resources as needed when the swapchain format/size changes.
     pub fn draw_to_frame(
         &mut self,
+        device: &Device,
         rasterizer: &mut RasterizerVulkan,
         scheduler: &mut Scheduler,
         present_manager: &PresentManager,
@@ -218,7 +216,7 @@ impl BlitScreen {
             self.wait_idle(scheduler, present_manager);
 
             // Update window adapt pass
-            self.set_window_adapt_pass();
+            self.set_window_adapt_pass(device);
 
             // Recreate frame if needed
             if presentation_recreate_required {
@@ -245,7 +243,7 @@ impl BlitScreen {
                     window_adapt.get_descriptor_set_layout(),
                     self.filters,
                     allocator,
-                    self.supports_float16,
+                    device.is_float16_supported(),
                 ));
             }
         }
@@ -284,7 +282,6 @@ impl BlitScreen {
                 &blend_modes,
                 frame.framebuffer,
                 render_area,
-                [0.0, 0.0, 0.0, 1.0],
             );
         }
 
@@ -298,6 +295,7 @@ impl BlitScreen {
     /// Port of `BlitScreen::CreateFramebuffer`.
     pub fn create_framebuffer(
         &mut self,
+        device: &Device,
         scheduler: &mut Scheduler,
         present_manager: &PresentManager,
         image_view: vk::ImageView,
@@ -313,7 +311,7 @@ impl BlitScreen {
             || format_updated
         {
             self.wait_idle(scheduler, present_manager);
-            self.set_window_adapt_pass();
+            self.set_window_adapt_pass(device);
         }
 
         let render_pass = self
@@ -333,29 +331,47 @@ impl BlitScreen {
     // --- Private ---
 
     /// Port of `BlitScreen::SetWindowAdaptPass`.
-    fn set_window_adapt_pass(&mut self) {
+    fn set_window_adapt_pass(&mut self, device: &Device) {
         self.layers.clear();
         let filter = self.current_scaling_filter();
         self.scaling_filter = Some(filter);
 
         self.window_adapt = Some(match filter {
             ScalingFilter::NearestNeighbor => {
-                filters::make_nearest_neighbor(&self.device, self.swapchain_view_format)
+                filters::make_nearest_neighbor(device, self.swapchain_view_format)
             }
-            ScalingFilter::Bicubic => {
-                filters::make_bicubic(&self.device, self.swapchain_view_format)
-            }
-            ScalingFilter::Gaussian => {
-                filters::make_gaussian(&self.device, self.swapchain_view_format)
-            }
-            ScalingFilter::ScaleForce => filters::make_scale_force(
-                &self.device,
+            ScalingFilter::Bicubic => filters::make_bicubic(
+                device,
                 self.swapchain_view_format,
-                self.supports_float16,
+                filters::CubicFilterWeights::CatmullRom,
             ),
-            ScalingFilter::Fsr | ScalingFilter::Bilinear => {
-                filters::make_bilinear(&self.device, self.swapchain_view_format)
+            ScalingFilter::ZeroTangent => filters::make_bicubic(
+                device,
+                self.swapchain_view_format,
+                filters::CubicFilterWeights::ZeroTangentCardinal,
+            ),
+            ScalingFilter::BSpline => filters::make_bicubic(
+                device,
+                self.swapchain_view_format,
+                filters::CubicFilterWeights::BSpline,
+            ),
+            ScalingFilter::Mitchell => filters::make_bicubic(
+                device,
+                self.swapchain_view_format,
+                filters::CubicFilterWeights::MitchellNetravali,
+            ),
+            ScalingFilter::Spline1 => filters::make_spline1(device, self.swapchain_view_format),
+            ScalingFilter::Gaussian => filters::make_gaussian(device, self.swapchain_view_format),
+            ScalingFilter::Lanczos => filters::make_lanczos(device, self.swapchain_view_format),
+            ScalingFilter::ScaleForce => {
+                filters::make_scale_force(device, self.swapchain_view_format)
             }
+            ScalingFilter::Area => filters::make_area(device, self.swapchain_view_format),
+            ScalingFilter::Mmpx => filters::make_mmpx(device, self.swapchain_view_format),
+            ScalingFilter::Fsr
+            | ScalingFilter::Sgsr
+            | ScalingFilter::SgsrEdge
+            | ScalingFilter::Bilinear => filters::make_bilinear(device, self.swapchain_view_format),
         });
     }
 

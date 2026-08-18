@@ -6,8 +6,12 @@
 use crate::common::fp::fpcr::Fpcr;
 use crate::common::fp::fpsr::Fpsr;
 use crate::common::fp::op::fp_convert::fp_convert;
+use crate::common::fp::op::fp_mul_add::{fp_mul_add, fp_mul_sub};
 use crate::common::fp::op::fp_recip_estimate::fp_recip_estimate;
+use crate::common::fp::op::fp_recip_exponent::fp_recip_exponent;
+use crate::common::fp::op::fp_recip_step_fused::fp_recip_step_fused;
 use crate::common::fp::op::fp_rsqrt_estimate::fp_rsqrt_estimate;
+use crate::common::fp::op::fp_rsqrt_step_fused::fp_rsqrt_step_fused;
 use crate::common::fp::op::fp_to_fixed::fp_to_fixed;
 use crate::common::fp::rounding_mode::RoundingMode;
 
@@ -191,73 +195,36 @@ pub extern "C" fn fp_recip_estimate64(bits: u64, fpcr: u32, fpsr_exc: *mut u32) 
     }
 }
 
-/// ARM FPRecipExponent32: return 2^(-floor(log2(|x|))-1).
-pub extern "C" fn fp_recip_exponent32(bits: u32) -> u32 {
-    let exp = (bits >> 23) & 0xFF;
-    let sign = bits & 0x8000_0000;
-    if exp == 0xFF {
-        // Inf/NaN → preserve sign, set exp to 0
-        return sign;
+pub extern "C" fn fp_recip_exponent32(bits: u32, fpcr: u32, fpsr_exc: *mut u32) -> u32 {
+    unsafe {
+        with_fpsr(fpsr_exc, |fpsr| {
+            fp_recip_exponent(bits, Fpcr::new(fpcr), fpsr)
+        })
     }
-    if exp == 0 {
-        // Denorm/zero → Inf with sign
-        return sign | 0x7F80_0000;
-    }
-    // Result exponent = 253 - exp (0xFE - 1 - exp)
-    let result_exp = (0xFE - exp) & 0xFF;
-    sign | (result_exp << 23)
 }
 
-/// ARM FPRecipExponent64.
-pub extern "C" fn fp_recip_exponent64(bits: u64) -> u64 {
-    let exp = (bits >> 52) & 0x7FF;
-    let sign = bits & 0x8000_0000_0000_0000;
-    if exp == 0x7FF {
-        return sign;
+pub extern "C" fn fp_recip_exponent64(bits: u64, fpcr: u32, fpsr_exc: *mut u32) -> u64 {
+    unsafe {
+        with_fpsr(fpsr_exc, |fpsr| {
+            fp_recip_exponent(bits, Fpcr::new(fpcr), fpsr)
+        })
     }
-    if exp == 0 {
-        return sign | 0x7FF0_0000_0000_0000;
-    }
-    let result_exp = (0x7FE - exp) & 0x7FF;
-    sign | (result_exp << 52)
 }
 
-/// ARM FPRecipStepFused32: (2.0 - a*b) as fused operation.
-pub extern "C" fn fp_recip_step_fused32(a: u32, b: u32) -> u32 {
-    let fa = f32::from_bits(a);
-    let fb = f32::from_bits(b);
-
-    let a_zero = fa == 0.0 || fa == -0.0;
-    let b_inf = fb.is_infinite();
-    let a_inf = fa.is_infinite();
-    let b_zero = fb == 0.0 || fb == -0.0;
-
-    if (a_zero && b_inf) || (a_inf && b_zero) {
-        return 2.0f32.to_bits();
+pub extern "C" fn fp_recip_step_fused32(a: u32, b: u32, fpcr: u32, fpsr_exc: *mut u32) -> u32 {
+    unsafe {
+        with_fpsr(fpsr_exc, |fpsr| {
+            fp_recip_step_fused(a, b, Fpcr::new(fpcr), fpsr)
+        })
     }
-
-    // Use f64 for fused precision
-    let result = 2.0f64 - (fa as f64) * (fb as f64);
-    (result as f32).to_bits()
 }
 
-/// ARM FPRecipStepFused64: (2.0 - a*b) as fused operation.
-pub extern "C" fn fp_recip_step_fused64(a: u64, b: u64) -> u64 {
-    let fa = f64::from_bits(a);
-    let fb = f64::from_bits(b);
-
-    let a_zero = fa == 0.0 || fa == -0.0;
-    let b_inf = fb.is_infinite();
-    let a_inf = fa.is_infinite();
-    let b_zero = fb == 0.0 || fb == -0.0;
-
-    if (a_zero && b_inf) || (a_inf && b_zero) {
-        return 2.0f64.to_bits();
+pub extern "C" fn fp_recip_step_fused64(a: u64, b: u64, fpcr: u32, fpsr_exc: *mut u32) -> u64 {
+    unsafe {
+        with_fpsr(fpsr_exc, |fpsr| {
+            fp_recip_step_fused(a, b, Fpcr::new(fpcr), fpsr)
+        })
     }
-
-    // Best we can do without 128-bit FP
-    let product = fa * fb;
-    (2.0f64 - product).to_bits()
 }
 
 /// ARM FPRSqrtEstimate32.
@@ -278,40 +245,20 @@ pub extern "C" fn fp_rsqrt_estimate64(bits: u64, fpcr: u32, fpsr_exc: *mut u32) 
     }
 }
 
-/// ARM FPRSqrtStepFused32: (3.0 - a*b) / 2.0 as fused operation.
-pub extern "C" fn fp_rsqrt_step_fused32(a: u32, b: u32) -> u32 {
-    let fa = f32::from_bits(a);
-    let fb = f32::from_bits(b);
-
-    let a_zero = fa == 0.0 || fa == -0.0;
-    let b_inf = fb.is_infinite();
-    let a_inf = fa.is_infinite();
-    let b_zero = fb == 0.0 || fb == -0.0;
-
-    if (a_zero && b_inf) || (a_inf && b_zero) {
-        return 1.5f32.to_bits();
+pub extern "C" fn fp_rsqrt_step_fused32(a: u32, b: u32, fpcr: u32, fpsr_exc: *mut u32) -> u32 {
+    unsafe {
+        with_fpsr(fpsr_exc, |fpsr| {
+            fp_rsqrt_step_fused(a, b, Fpcr::new(fpcr), fpsr)
+        })
     }
-
-    let result = (3.0f64 - (fa as f64) * (fb as f64)) / 2.0;
-    (result as f32).to_bits()
 }
 
-/// ARM FPRSqrtStepFused64: (3.0 - a*b) / 2.0 as fused operation.
-pub extern "C" fn fp_rsqrt_step_fused64(a: u64, b: u64) -> u64 {
-    let fa = f64::from_bits(a);
-    let fb = f64::from_bits(b);
-
-    let a_zero = fa == 0.0 || fa == -0.0;
-    let b_inf = fb.is_infinite();
-    let a_inf = fa.is_infinite();
-    let b_zero = fb == 0.0 || fb == -0.0;
-
-    if (a_zero && b_inf) || (a_inf && b_zero) {
-        return 1.5f64.to_bits();
+pub extern "C" fn fp_rsqrt_step_fused64(a: u64, b: u64, fpcr: u32, fpsr_exc: *mut u32) -> u64 {
+    unsafe {
+        with_fpsr(fpsr_exc, |fpsr| {
+            fp_rsqrt_step_fused(a, b, Fpcr::new(fpcr), fpsr)
+        })
     }
-
-    let product = fa * fb;
-    ((3.0f64 - product) / 2.0).to_bits()
 }
 
 // ---------------------------------------------------------------------------
@@ -374,26 +321,20 @@ pub extern "C" fn fp_recip_estimate16(bits: u64, fpcr: u32, fpsr_exc: *mut u32) 
 }
 
 /// FPRecipExponent16.
-pub extern "C" fn fp_recip_exponent16(bits: u64) -> u64 {
-    let h = bits as u16;
-    let exp = (h >> 10) & 0x1F;
-    let sign = h & 0x8000;
-    if exp == 0x1F {
-        return sign as u64;
+pub extern "C" fn fp_recip_exponent16(bits: u64, fpcr: u32, fpsr_exc: *mut u32) -> u64 {
+    unsafe {
+        with_fpsr(fpsr_exc, |fpsr| {
+            fp_recip_exponent(bits as u16, Fpcr::new(fpcr), fpsr) as u64
+        })
     }
-    if exp == 0 {
-        return (sign | 0x7C00) as u64;
-    }
-    let result_exp = (0x1E - exp) & 0x1F;
-    (sign | (result_exp << 10)) as u64
 }
 
-/// FPRecipStepFused16: (2.0 - a*b) for f16.
-pub extern "C" fn fp_recip_step_fused16(a: u64, b: u64) -> u64 {
-    let fa = f16_to_f32(a as u16) as f64;
-    let fb = f16_to_f32(b as u16) as f64;
-    let result = 2.0 - fa * fb;
-    f32_to_f16(result as f32) as u64
+pub extern "C" fn fp_recip_step_fused16(a: u64, b: u64, fpcr: u32, fpsr_exc: *mut u32) -> u64 {
+    unsafe {
+        with_fpsr(fpsr_exc, |fpsr| {
+            fp_recip_step_fused(a as u16, b as u16, Fpcr::new(fpcr), fpsr) as u64
+        })
+    }
 }
 
 /// FPRSqrtEstimate16.
@@ -405,12 +346,12 @@ pub extern "C" fn fp_rsqrt_estimate16(bits: u64, fpcr: u32, fpsr_exc: *mut u32) 
     }
 }
 
-/// FPRSqrtStepFused16: (3.0 - a*b) / 2.0 for f16.
-pub extern "C" fn fp_rsqrt_step_fused16(a: u64, b: u64) -> u64 {
-    let fa = f16_to_f32(a as u16) as f64;
-    let fb = f16_to_f32(b as u16) as f64;
-    let result = (3.0 - fa * fb) / 2.0;
-    f32_to_f16(result as f32) as u64
+pub extern "C" fn fp_rsqrt_step_fused16(a: u64, b: u64, fpcr: u32, fpsr_exc: *mut u32) -> u64 {
+    unsafe {
+        with_fpsr(fpsr_exc, |fpsr| {
+            fp_rsqrt_step_fused(a as u16, b as u16, Fpcr::new(fpcr), fpsr) as u64
+        })
+    }
 }
 
 /// FPMulAdd16: fused multiply-add for f16.
@@ -430,6 +371,38 @@ pub extern "C" fn fp_mul_sub16(addend: u64, a: u64, b: u64) -> u64 {
     let fc = f16_to_f32(addend as u16) as f64;
     let result = fc + (-fa) * fb;
     f32_to_f16(result as f32) as u64
+}
+
+pub extern "C" fn fp_mul_add32(addend: u32, a: u32, b: u32, fpcr: u32, fpsr_exc: *mut u32) -> u32 {
+    unsafe {
+        with_fpsr(fpsr_exc, |fpsr| {
+            fp_mul_add(addend, a, b, Fpcr::new(fpcr), fpsr)
+        })
+    }
+}
+
+pub extern "C" fn fp_mul_add64(addend: u64, a: u64, b: u64, fpcr: u32, fpsr_exc: *mut u32) -> u64 {
+    unsafe {
+        with_fpsr(fpsr_exc, |fpsr| {
+            fp_mul_add(addend, a, b, Fpcr::new(fpcr), fpsr)
+        })
+    }
+}
+
+pub extern "C" fn fp_mul_sub32(addend: u32, a: u32, b: u32, fpcr: u32, fpsr_exc: *mut u32) -> u32 {
+    unsafe {
+        with_fpsr(fpsr_exc, |fpsr| {
+            fp_mul_sub(addend, a, b, Fpcr::new(fpcr), fpsr)
+        })
+    }
+}
+
+pub extern "C" fn fp_mul_sub64(addend: u64, a: u64, b: u64, fpcr: u32, fpsr_exc: *mut u32) -> u64 {
+    unsafe {
+        with_fpsr(fpsr_exc, |fpsr| {
+            fp_mul_sub(addend, a, b, Fpcr::new(fpcr), fpsr)
+        })
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -652,109 +625,6 @@ pub extern "C" fn fp_fixed_u64_to_double(bits: u64, fbits: u64) -> u64 {
     result.to_bits()
 }
 
-// ---------------------------------------------------------------------------
-// CRC32 ISO (polynomial 0x04C11DB7) — software implementation
-// ---------------------------------------------------------------------------
-
-/// ISO CRC32 lookup table (standard Ethernet polynomial).
-const CRC32_ISO_TABLE: [u32; 256] = {
-    let mut table = [0u32; 256];
-    let mut i = 0u32;
-    while i < 256 {
-        let mut crc = i;
-        let mut j = 0;
-        while j < 8 {
-            if crc & 1 != 0 {
-                crc = (crc >> 1) ^ 0xEDB88320;
-            } else {
-                crc >>= 1;
-            }
-            j += 1;
-        }
-        table[i as usize] = crc;
-        i += 1;
-    }
-    table
-};
-
-/// Software CRC32-ISO for 8-bit data.
-pub extern "C" fn crc32_iso8(crc: u64, data: u64) -> u64 {
-    let mut c = crc as u32;
-    let b = data as u8;
-    c = CRC32_ISO_TABLE[((c ^ b as u32) & 0xFF) as usize] ^ (c >> 8);
-    c as u64
-}
-
-/// Software CRC32-ISO for 16-bit data.
-pub extern "C" fn crc32_iso16(crc: u64, data: u64) -> u64 {
-    let mut c = crc as u32;
-    let d = data as u16;
-    for i in 0..2u32 {
-        let b = ((d >> (i * 8)) & 0xFF) as u8;
-        c = CRC32_ISO_TABLE[((c ^ b as u32) & 0xFF) as usize] ^ (c >> 8);
-    }
-    c as u64
-}
-
-/// Software CRC32-ISO for 32-bit data.
-pub extern "C" fn crc32_iso32(crc: u64, data: u64) -> u64 {
-    let mut c = crc as u32;
-    let d = data as u32;
-    for i in 0..4u32 {
-        let b = ((d >> (i * 8)) & 0xFF) as u8;
-        c = CRC32_ISO_TABLE[((c ^ b as u32) & 0xFF) as usize] ^ (c >> 8);
-    }
-    c as u64
-}
-
-/// Software CRC32-ISO for 64-bit data.
-pub extern "C" fn crc32_iso64(crc: u64, data: u64) -> u64 {
-    let mut c = crc as u32;
-    for i in 0..8u32 {
-        let b = ((data >> (i * 8)) & 0xFF) as u8;
-        c = CRC32_ISO_TABLE[((c ^ b as u32) & 0xFF) as usize] ^ (c >> 8);
-    }
-    c as u64
-}
-
-// ---------------------------------------------------------------------------
-// SM4 S-box lookup
-// ---------------------------------------------------------------------------
-
-const SM4_SBOX: [u8; 256] = [
-    0xD6, 0x90, 0xE9, 0xFE, 0xCC, 0xE1, 0x3D, 0xB7, 0x16, 0xB6, 0x14, 0xC2, 0x28, 0xFB, 0x2C, 0x05,
-    0x2B, 0x67, 0x9A, 0x76, 0x2A, 0xBE, 0x04, 0xC3, 0xAA, 0x44, 0x13, 0x26, 0x49, 0x86, 0x06, 0x99,
-    0x9C, 0x42, 0x50, 0xF4, 0x91, 0xEF, 0x98, 0x7A, 0x33, 0x54, 0x0B, 0x43, 0xED, 0xCF, 0xAC, 0x62,
-    0xE4, 0xB3, 0x1C, 0xA9, 0xC9, 0x08, 0xE8, 0x95, 0x80, 0xDF, 0x94, 0xFA, 0x75, 0x8F, 0x3F, 0xA6,
-    0x47, 0x07, 0xA7, 0xFC, 0xF3, 0x73, 0x17, 0xBA, 0x83, 0x59, 0x3C, 0x19, 0xE6, 0x85, 0x4F, 0xA8,
-    0x68, 0x6B, 0x81, 0xB2, 0x71, 0x64, 0xDA, 0x8B, 0xF8, 0xEB, 0x0F, 0x4B, 0x70, 0x56, 0x9D, 0x35,
-    0x1E, 0x24, 0x0E, 0x5E, 0x63, 0x58, 0xD1, 0xA2, 0x25, 0x22, 0x7C, 0x3B, 0x01, 0x21, 0x78, 0x87,
-    0xD4, 0x00, 0x46, 0x57, 0x9F, 0xD3, 0x27, 0x52, 0x4C, 0x36, 0x02, 0xE7, 0xA0, 0xC4, 0xC8, 0x9E,
-    0xEA, 0xBF, 0x8A, 0xD2, 0x40, 0xC7, 0x38, 0xB5, 0xA3, 0xF7, 0xF2, 0xCE, 0xF9, 0x61, 0x15, 0xA1,
-    0xE0, 0xAE, 0x5D, 0xA4, 0x9B, 0x34, 0x1A, 0x55, 0xAD, 0x93, 0x32, 0x30, 0xF5, 0x8C, 0xB1, 0xE3,
-    0x1D, 0xF6, 0xE2, 0x2E, 0x82, 0x66, 0xCA, 0x60, 0xC0, 0x29, 0x23, 0xAB, 0x0D, 0x53, 0x4E, 0x6F,
-    0xD5, 0xDB, 0x37, 0x45, 0xDE, 0xFD, 0x8E, 0x2F, 0x03, 0xFF, 0x6A, 0x72, 0x6D, 0x6C, 0x5B, 0x51,
-    0x8D, 0x1B, 0xAF, 0x92, 0xBB, 0xDD, 0xBC, 0x7F, 0x11, 0xD9, 0x5C, 0x41, 0x1F, 0x10, 0x5A, 0xD8,
-    0x0A, 0xC1, 0x31, 0x88, 0xA5, 0xCD, 0x7B, 0xBD, 0x2D, 0x74, 0xD0, 0x12, 0xB8, 0xE5, 0xB4, 0xB0,
-    0x89, 0x69, 0x97, 0x4A, 0x0C, 0x96, 0x77, 0x7E, 0x65, 0xB9, 0xF1, 0x09, 0xC5, 0x6E, 0xC6, 0x84,
-    0x18, 0xF0, 0x7D, 0xEC, 0x3A, 0xDC, 0x4D, 0x20, 0x79, 0xEE, 0x5F, 0x3E, 0xD7, 0xCB, 0x39, 0x48,
-];
-
-/// SM4 S-box substitution on a 128-bit value.
-/// Applies the SM4 S-box to each byte of the 128-bit input.
-pub extern "C" fn sm4_access_sbox(input_lo: u64, input_hi: u64) -> u64 {
-    // Process low 64 bits, return low 64 bits of result
-    // The full 128-bit operation is split across two calls
-    let mut result = 0u64;
-    for i in 0..8 {
-        let byte_val = ((input_lo >> (i * 8)) & 0xFF) as usize;
-        result |= (SM4_SBOX[byte_val] as u64) << (i * 8);
-    }
-    // Also process hi for the upper result
-    let _ = input_hi;
-    result
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -814,7 +684,8 @@ mod tests {
     fn test_fp_recip_step_fused32_zero_inf() {
         let zero = 0.0f32.to_bits();
         let inf = f32::INFINITY.to_bits();
-        let result = f32::from_bits(fp_recip_step_fused32(zero, inf));
+        let mut fpsr = 0;
+        let result = f32::from_bits(fp_recip_step_fused32(zero, inf, 0, &mut fpsr));
         assert_eq!(result, 2.0);
     }
 
@@ -822,8 +693,36 @@ mod tests {
     fn test_fp_rsqrt_step_fused32_zero_inf() {
         let zero = 0.0f32.to_bits();
         let inf = f32::INFINITY.to_bits();
-        let result = f32::from_bits(fp_rsqrt_step_fused32(zero, inf));
+        let mut fpsr = 0;
+        let result = f32::from_bits(fp_rsqrt_step_fused32(zero, inf, 0, &mut fpsr));
         assert_eq!(result, 1.5);
+    }
+
+    #[test]
+    fn reciprocal_step_wrappers_apply_fpcr_and_preserve_sticky_fpsr() {
+        let mut fpsr = 1 << 1;
+        let snan = 0x7f80_0001u32;
+        assert_eq!(
+            fp_recip_step_fused32(snan, 1.0f32.to_bits(), 0, &mut fpsr),
+            0xffc0_0001
+        );
+        assert_eq!(fpsr, (1 << 1) | 1);
+
+        let mut fpsr = 0;
+        let result = fp_rsqrt_step_fused32(1, 1.0f32.to_bits(), 1 << 24, &mut fpsr);
+        assert_eq!(result, 1.5f32.to_bits());
+        assert_eq!(fpsr & (1 << 7), 1 << 7);
+    }
+
+    #[test]
+    fn reciprocal_exponent_wrappers_process_nan_and_denormal() {
+        let mut fpsr = 0;
+        assert_eq!(fp_recip_exponent32(0x7f80_0001, 0, &mut fpsr), 0x7fc0_0001);
+        assert_eq!(fpsr & 1, 1);
+
+        let mut fpsr = 0;
+        assert_eq!(fp_recip_exponent32(1, 1 << 24, &mut fpsr), 0x7f00_0000);
+        assert_eq!(fpsr & (1 << 7), 1 << 7);
     }
 
     #[test]
@@ -850,20 +749,43 @@ mod tests {
     }
 
     #[test]
-    fn test_crc32_iso8() {
-        let result = crc32_iso8(0xFFFF_FFFF, 0x00);
-        assert_ne!(result, 0);
+    fn fp_mul_add_wrappers_preserve_fused_arm_semantics() {
+        let mut fpsr_exc = 0;
+        assert_eq!(
+            fp_mul_add32(
+                1.0f32.to_bits(),
+                2.0f32.to_bits(),
+                3.0f32.to_bits(),
+                0,
+                &mut fpsr_exc,
+            ),
+            7.0f32.to_bits()
+        );
+        assert_eq!(
+            fp_mul_sub64(
+                7.0f64.to_bits(),
+                2.0f64.to_bits(),
+                3.0f64.to_bits(),
+                0,
+                &mut fpsr_exc,
+            ),
+            1.0f64.to_bits()
+        );
+        assert_eq!(fpsr_exc, 0);
     }
 
     #[test]
-    fn test_crc32_iso_known_value() {
-        // CRC32 of "123456789" should be 0xCBF43926
-        let data = b"123456789";
-        let mut crc = 0xFFFF_FFFFu64;
-        for &b in data {
-            crc = crc32_iso8(crc, b as u64);
-        }
-        assert_eq!(crc as u32 ^ 0xFFFF_FFFF, 0xCBF4_3926);
+    fn fp_mul_add_wrapper_updates_the_jit_fpsr() {
+        let mut fpsr_exc = 1 << 1;
+        let result = fp_mul_add32(
+            0xffc1_2345,
+            f32::INFINITY.to_bits(),
+            0.0f32.to_bits(),
+            0,
+            &mut fpsr_exc,
+        );
+        assert_eq!(result, 0x7fc0_0000);
+        assert_eq!(fpsr_exc, (1 << 1) | 1);
     }
 
     #[test]
@@ -876,12 +798,5 @@ mod tests {
     fn test_fp_fixed_u64_to_single_keeps_full_width() {
         let bits = fp_fixed_u64_to_single(1_000_000, 0);
         assert_eq!(f32::from_bits(bits as u32), 1_000_000.0);
-    }
-
-    #[test]
-    fn test_sm4_sbox_lookup() {
-        // SM4 S-box: input 0x00 → 0xD6
-        assert_eq!(SM4_SBOX[0x00], 0xD6);
-        assert_eq!(SM4_SBOX[0x01], 0x90);
     }
 }

@@ -130,11 +130,16 @@ mod tests {
     use std::collections::HashMap;
 
     struct TestEnvironment {
+        texture_pass_caches: crate::environment::TexturePassCaches,
         instructions: HashMap<u32, u64>,
         sph: ProgramHeader,
     }
 
     impl Environment for TestEnvironment {
+        fn texture_pass_caches(&mut self) -> &mut crate::environment::TexturePassCaches {
+            &mut self.texture_pass_caches
+        }
+
         fn read_instruction(&mut self, address: u32) -> u64 {
             self.instructions.get(&address).copied().unwrap_or_default()
         }
@@ -225,6 +230,7 @@ mod tests {
         instructions.insert(ldc.offset(), 0xEF94_0010_0C07_0C0C);
         instructions.insert(brx.offset(), 0xE250_0FFF_BE87_0C0F);
         let mut env = TestEnvironment {
+            texture_pass_caches: Default::default(),
             instructions,
             sph: ProgramHeader::default(),
         };

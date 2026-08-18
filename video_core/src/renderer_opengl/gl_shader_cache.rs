@@ -6,13 +6,15 @@
 //! OpenGL shader cache -- manages compilation and caching of graphics and compute pipelines.
 
 use std::collections::HashMap;
+use std::panic::{catch_unwind, resume_unwind, take_hook, AssertUnwindSafe};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::ptr::NonNull;
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 
-use common::settings_enums::ShaderBackend;
+use common::hash::BuildUnorderedDenseHasher;
+use common::settings_enums::RendererBackend;
 use common::thread_worker::StatefulThreadWorker;
-use common::{cityhash::city_hash64, trace};
 use shader_recompiler::environment::Environment;
 use shader_recompiler::frontend::translate_program::{
     convert_legacy_to_generic, generate_geometry_passthrough, merge_dual_vertex_programs,
@@ -24,15 +26,9 @@ use shader_recompiler::pipeline_cache::translate_program_from_env_with_host_info
 use shader_recompiler::profile::Profile as ShaderProfile;
 use shader_recompiler::runtime_info::{InputTopology, RuntimeInfo, TessPrimitive, TessSpacing};
 use shader_recompiler::shader_info::Info as ShaderInfo;
-use shader_recompiler::{
-    compile_dual_vertex_shader_glsl_at_offset_with_bindings_and_host_info,
-    compile_shader_glsl_at_offset_with_bindings_and_host_info,
-    compile_shader_glsl_at_offset_with_bindings_and_texture_bound_and_host_info,
-    compile_shader_glsl_at_offset_with_bindings_and_texture_bound_and_sph_and_host_info,
-    compile_shader_glsl_from_env_with_bindings_and_host_info, CompiledGlslShader, ShaderStage,
-};
+use shader_recompiler::ShaderStage;
 
-use crate::engines::kepler_compute::QueueMetaData;
+use crate::engines::kepler_compute::LaunchParams;
 use crate::rasterizer_interface::{
     DiskResourceLoadCallback, DiskResourceLoadStop, LoadCallbackStage,
 };
@@ -46,161 +42,123 @@ use crate::shader_environment::{
 };
 use crate::shader_notify::ShaderNotifyHandle;
 use crate::transform_feedback;
-use shader_recompiler::program_header::ProgramHeader;
 
-fn parse_hash_env(name: &str) -> Option<u64> {
-    std::env::var(name).ok().and_then(|value| {
-        let value = value.trim();
-        let hex = value
-            .strip_prefix("0x")
-            .or_else(|| value.strip_prefix("0X"));
-        match hex {
-            Some(hex) => u64::from_str_radix(hex, 16).ok(),
-            None => value.parse::<u64>().ok(),
-        }
-    })
+fn compute_pipeline_key_bytes(key: &ComputePipelineKey) -> &[u8] {
+    unsafe {
+        std::slice::from_raw_parts(
+            (key as *const ComputePipelineKey).cast::<u8>(),
+            std::mem::size_of::<ComputePipelineKey>(),
+        )
+    }
 }
 
-fn patch_fragment_debug_by_source_hash(stage: ShaderStage, source: String) -> String {
-    if stage != ShaderStage::Fragment {
-        return source;
+fn graphics_pipeline_key_bytes(key: &GraphicsPipelineKey) -> &[u8] {
+    unsafe {
+        std::slice::from_raw_parts(
+            (key as *const GraphicsPipelineKey).cast::<u8>(),
+            std::mem::size_of::<GraphicsPipelineKey>(),
+        )
     }
-    let Some(target_hash) = parse_hash_env("RUZU_FRAGMENT_DEBUG_SOURCE_HASH") else {
-        return source;
-    };
-    let source_hash = city_hash64(source.as_bytes());
-    if source_hash != target_hash {
-        return source;
-    }
-    let Some(main_index) = source.rfind("void main(){") else {
-        log::warn!(
-            "[FRAGMENT_DEBUG_HASH] hash=0x{:016X} matched but no main body was found",
-            source_hash
-        );
-        return source;
-    };
-
-    let mode =
-        std::env::var("RUZU_FRAGMENT_DEBUG_HASH_MODE").unwrap_or_else(|_| "green".to_string());
-    let replacement = match mode.as_str() {
-        "tex0_center" => "void main(){\nfrag_color0=texture(tex0,vec2(0.5,0.5));\nreturn;\n}\n",
-        "tex0_attr0" => "void main(){\nfrag_color0=texture(tex0,in_attr0.xy);\nreturn;\n}\n",
-        "cbuf3" => {
-            "void main(){\nfrag_color0=vec4(abs(fs_cbuf3[0].x),abs(fs_cbuf3[0].y),abs(fs_cbuf3[1].z),abs(fs_cbuf3[1].w));\nreturn;\n}\n"
-        }
-        "cbuf3b" => {
-            "void main(){\nfrag_color0=vec4(abs(fs_cbuf3[0].z),abs(fs_cbuf3[0].w),abs(fs_cbuf3[1].w),1.0);\nreturn;\n}\n"
-        }
-        "tex0_attr1" => "void main(){\nfrag_color0=texture(tex0,in_attr1.xy);\nreturn;\n}\n",
-        "uv" => {
-            "void main(){\nvec2 ruzu_uv=in_attr1.xy;\nfrag_color0=vec4(fract(ruzu_uv),0.0,1.0);\nreturn;\n}\n"
-        }
-        "attr0" => "void main(){\nfrag_color0=abs(in_attr0);\nreturn;\n}\n",
-        "tex1_attr0" => "void main(){\nfrag_color0=texture(tex1,in_attr0.xy);\nreturn;\n}\n",
-        "tex2_attr0" => "void main(){\nfrag_color0=texture(tex2,in_attr0.xy);\nreturn;\n}\n",
-        "tex2_lod0_attr0" => {
-            "void main(){\nfrag_color0=textureLod(tex2,in_attr0.xy,0.0);\nreturn;\n}\n"
-        }
-        "tex2_lod1_attr0" => {
-            "void main(){\nfrag_color0=textureLod(tex2,in_attr0.xy,1.0);\nreturn;\n}\n"
-        }
-        "alpha_one" => {
-            "void main(){\nvec4 c=texture(tex0,in_attr1.xy);\nfrag_color0=vec4(c.rgb,1.0);\nreturn;\n}\n"
-        }
-        "red" => "void main(){\nfrag_color0=vec4(1.0,0.0,0.0,1.0);\nreturn;\n}\n",
-        _ => "void main(){\nfrag_color0=vec4(0.0,1.0,0.0,1.0);\nreturn;\n}\n",
-    };
-    log::warn!(
-        "[FRAGMENT_DEBUG_HASH] hash=0x{:016X} mode={} patched fragment shader",
-        source_hash,
-        mode
-    );
-    format!("{}{}", &source[..main_index], replacement)
 }
 
-fn trace_fragment_source_hash(key: &GraphicsPipelineKey, stage: ShaderStage, source: &str) {
-    if stage != ShaderStage::Fragment
-        || std::env::var_os("RUZU_TRACE_FRAGMENT_SOURCE_HASH").is_none()
-    {
-        return;
-    }
-    log::warn!(
-        "[FRAGMENT_SOURCE_HASH] key_hash=0x{:016X} unique_hash=0x{:016X} source_hash=0x{:016X} len={}",
-        key.hash_key(),
-        key.unique_hashes[5],
-        city_hash64(source.as_bytes()),
-        source.len()
-    );
+fn read_compute_pipeline_key(file: &mut std::fs::File) -> std::io::Result<ComputePipelineKey> {
+    use std::io::Read;
+
+    let mut key = ComputePipelineKey::default();
+    let bytes = unsafe {
+        std::slice::from_raw_parts_mut(
+            (&mut key as *mut ComputePipelineKey).cast::<u8>(),
+            std::mem::size_of::<ComputePipelineKey>(),
+        )
+    };
+    file.read_exact(bytes)?;
+    Ok(key)
 }
 
+fn read_graphics_pipeline_key(file: &mut std::fs::File) -> std::io::Result<GraphicsPipelineKey> {
+    use std::io::Read;
+
+    let mut key = GraphicsPipelineKey::default();
+    let bytes = unsafe {
+        std::slice::from_raw_parts_mut(
+            (&mut key as *mut GraphicsPipelineKey).cast::<u8>(),
+            std::mem::size_of::<GraphicsPipelineKey>(),
+        )
+    };
+    file.read_exact(bytes)?;
+    Ok(key)
+}
+
+/// One-time installation of the OpenGL shader-exception panic-hook filter.
+/// Upstream catches `Shader::Exception` at both pipeline creation boundaries;
+/// typed Rust shader panics are the direct equivalent.
+static SHADER_EXCEPTION_HOOK_INSTALL: std::sync::Once = std::sync::Once::new();
+
+thread_local! {
+    static IN_SHADER_EXCEPTION_SCOPE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn shader_exception_message(payload: &(dyn std::any::Any + Send)) -> Option<String> {
+    use shader_recompiler::exception::{
+        InvalidArgument, LogicError, NotImplementedException, RuntimeError, ShaderException,
+    };
+
+    if let Some(error) = payload.downcast_ref::<ShaderException>() {
+        Some(error.to_string())
+    } else if let Some(error) = payload.downcast_ref::<LogicError>() {
+        Some(error.to_string())
+    } else if let Some(error) = payload.downcast_ref::<RuntimeError>() {
+        Some(error.to_string())
+    } else if let Some(error) = payload.downcast_ref::<NotImplementedException>() {
+        Some(error.to_string())
+    } else {
+        payload
+            .downcast_ref::<InvalidArgument>()
+            .map(ToString::to_string)
+    }
+}
+
+/// Rust equivalent of `catch (Shader::Exception&)` in Eden's OpenGL
+/// `CreateGraphicsPipeline` and `CreateComputePipeline`. Non-shader panics
+/// remain fatal to the worker and are resumed unchanged.
+fn catch_shader_exception<F, T>(f: F) -> Result<T, String>
+where
+    F: FnOnce() -> T,
+{
+    SHADER_EXCEPTION_HOOK_INSTALL.call_once(|| {
+        let previous = take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            let is_shader_exception = shader_exception_message(info.payload()).is_some();
+            if !IN_SHADER_EXCEPTION_SCOPE.with(std::cell::Cell::get) || !is_shader_exception {
+                previous(info);
+            }
+        }));
+    });
+
+    IN_SHADER_EXCEPTION_SCOPE.with(|flag| flag.set(true));
+    let result = catch_unwind(AssertUnwindSafe(f));
+    IN_SHADER_EXCEPTION_SCOPE.with(|flag| flag.set(false));
+    match result {
+        Ok(value) => Ok(value),
+        Err(payload) => match shader_exception_message(payload.as_ref()) {
+            Some(message) => Err(message),
+            None => resume_unwind(payload),
+        },
+    }
+}
+
+use super::gl_buffer_cache::BufferCache as OpenGLBufferCache;
 use super::gl_compute_pipeline::{ComputePipeline, ComputePipelineKey, ComputeProgramBackend};
 use super::gl_device::Device;
-use super::gl_graphics_pipeline::{GraphicsPipeline, GraphicsPipelineKey};
+use super::gl_graphics_pipeline::{
+    GraphicsPipeline, GraphicsPipelineKey, NUM_STAGES as NUM_GRAPHICS_STAGES,
+};
+use super::gl_shader_manager::ProgramManagerHandle;
+use super::gl_state_tracker::StateTracker;
+use super::gl_texture_cache::TextureCache as OpenGLTextureCache;
 
 /// Cache version for serialized pipeline data.
-pub const CACHE_VERSION: u32 = 10;
-
-static SHADER_PIPELINE_LAST_STAGE: AtomicU64 = AtomicU64::new(0);
-static GL_PIPELINE_TRACE_OBSERVED: AtomicU64 = AtomicU64::new(0);
-static GL_PIPELINE_TRACE_SEQ: AtomicU64 = AtomicU64::new(0);
-static SHADER_PIPELINE_STAGE_COUNTS: [AtomicU64; 12] = [
-    AtomicU64::new(0),
-    AtomicU64::new(0),
-    AtomicU64::new(0),
-    AtomicU64::new(0),
-    AtomicU64::new(0),
-    AtomicU64::new(0),
-    AtomicU64::new(0),
-    AtomicU64::new(0),
-    AtomicU64::new(0),
-    AtomicU64::new(0),
-    AtomicU64::new(0),
-    AtomicU64::new(0),
-];
-
-fn trace_gl_pipeline(
-    stage: u64,
-    key: &GraphicsPipelineKey,
-    cache_len: usize,
-    aux0: u64,
-    aux1: u64,
-    aux2: u64,
-) {
-    if !trace::is_enabled(trace::cat::GL_PIPELINE) {
-        return;
-    }
-    if matches!(stage, 1 | 2) && std::env::var_os("RUZU_TRACE_GL_PIPELINE_HITS").is_none() {
-        return;
-    }
-    let observed = GL_PIPELINE_TRACE_OBSERVED.fetch_add(1, Ordering::Relaxed);
-    let skip = std::env::var("RUZU_TRACE_GL_PIPELINE_SKIP")
-        .ok()
-        .and_then(|value| value.parse::<u64>().ok())
-        .unwrap_or(0);
-    if observed < skip {
-        return;
-    }
-    let seq = GL_PIPELINE_TRACE_SEQ.fetch_add(1, Ordering::Relaxed);
-    let _ = trace::emit_raw(
-        trace::cat::GL_PIPELINE,
-        &[
-            stage,
-            seq,
-            cache_len as u64,
-            key.raw as u64,
-            key.hash_key(),
-            key.unique_hashes[0],
-            key.unique_hashes[1],
-            key.unique_hashes[2],
-            key.unique_hashes[3],
-            key.unique_hashes[4],
-            key.unique_hashes[5],
-            aux0,
-            aux1,
-            aux2,
-        ],
-    );
-}
+const CACHE_VERSION: u32 = 15;
 
 /// Port of the OpenGL-specific `Shader::Profile` construction in upstream
 /// `gl_shader_cache.cpp`.
@@ -242,22 +200,59 @@ fn opengl_shader_profile(device: &Device) -> ShaderProfile {
         ignore_nan_fp_comparisons: true,
         gl_max_compute_smem_size: device.max_compute_shared_memory_size(),
         min_ssbo_alignment: device.shader_storage_buffer_alignment() as u64,
-        max_user_clip_distances: 8,
+        max_user_clip_distances: device
+            .max_user_clip_distances()
+            .min(crate::engines::maxwell_3d::NUM_CLIP_DISTANCES),
         ..ShaderProfile::default()
     }
 }
 
 fn opengl_host_translate_info(device: &Device) -> HostTranslateInfo {
-    HostTranslateInfo {
+    let mut host_info = HostTranslateInfo {
+        min_ssbo_alignment: device.shader_storage_buffer_alignment() as u64,
+        max_per_stage_descriptor_sampled_images: HostTranslateInfo::DEFAULT_DESCRIPTOR_LIMIT,
+        max_per_stage_resources: HostTranslateInfo::DEFAULT_DESCRIPTOR_LIMIT,
+        max_descriptor_set_samplers: HostTranslateInfo::DEFAULT_DESCRIPTOR_LIMIT,
+        max_descriptor_set_uniform_buffers: HostTranslateInfo::DEFAULT_DESCRIPTOR_LIMIT,
+        max_descriptor_set_uniform_buffers_dynamic: HostTranslateInfo::DEFAULT_DESCRIPTOR_LIMIT,
+        max_descriptor_set_storage_buffers: HostTranslateInfo::DEFAULT_DESCRIPTOR_LIMIT,
+        max_descriptor_set_storage_buffers_dynamic: HostTranslateInfo::DEFAULT_DESCRIPTOR_LIMIT,
+        max_descriptor_set_sampled_images: HostTranslateInfo::DEFAULT_DESCRIPTOR_LIMIT,
+        max_descriptor_set_storage_images: HostTranslateInfo::DEFAULT_DESCRIPTOR_LIMIT,
+        max_descriptor_set_input_attachements: HostTranslateInfo::DEFAULT_DESCRIPTOR_LIMIT,
         support_float64: true,
         support_float16: false,
         support_int64: device.has_shader_int64(),
         needs_demote_reorder: device.is_amd(),
         support_snorm_render_buffer: false,
         support_viewport_index_layer: device.has_vertex_viewport_layer(),
-        min_ssbo_alignment: device.shader_storage_buffer_alignment(),
         support_geometry_shader_passthrough: device.has_geometry_shader_passthrough(),
         support_conditional_barrier: device.supports_conditional_barriers(),
+    };
+    host_info.apply_descriptor_limit_policy();
+    host_info
+}
+
+fn make_compute_runtime_info(
+    info: &ShaderInfo,
+    max_glasm_storage_buffer_blocks: u32,
+) -> RuntimeInfo {
+    let mut runtime_info = RuntimeInfo::default();
+    let num_storage_buffers =
+        shader_recompiler::shader_info::num_descriptors(&info.storage_buffers_descriptors);
+    runtime_info.glasm_use_storage_buffers = num_storage_buffers <= max_glasm_storage_buffer_blocks;
+    runtime_info
+}
+
+/// Mechanical form of the backend `switch` in Eden's compute-pipeline
+/// creation path. Capability validation belongs to `Device`; it must not
+/// silently replace a requested GLASM pipeline with GLSL here.
+fn compute_program_backend(shader_backend: RendererBackend) -> ComputeProgramBackend {
+    match shader_backend {
+        RendererBackend::OpenGlGlsl => ComputeProgramBackend::Glsl,
+        RendererBackend::OpenGlGlasm => ComputeProgramBackend::Glasm,
+        RendererBackend::OpenGlSpirV => ComputeProgramBackend::SpirV,
+        _ => unreachable!("OpenGL shader cache requires an OpenGL backend"),
     }
 }
 
@@ -274,52 +269,8 @@ fn test_opengl_shader_profile() -> ShaderProfile {
         has_broken_unsigned_image_offsets: true,
         has_broken_signed_operations: true,
         ignore_nan_fp_comparisons: true,
-        max_user_clip_distances: 8,
+        max_user_clip_distances: crate::engines::maxwell_3d::NUM_CLIP_DISTANCES,
         ..ShaderProfile::default()
-    }
-}
-
-fn record_shader_pipeline_stage(stage: usize) {
-    if std::env::var_os("RUZU_PROFILE_SHADER_PIPELINE_STALL").is_none() {
-        return;
-    }
-    SHADER_PIPELINE_LAST_STAGE.store(stage as u64, Ordering::Relaxed);
-    if let Some(counter) = SHADER_PIPELINE_STAGE_COUNTS.get(stage) {
-        counter.fetch_add(1, Ordering::Relaxed);
-    }
-}
-
-pub fn dump_shader_pipeline_stall_profile() {
-    if SHADER_PIPELINE_STAGE_COUNTS[0].load(Ordering::Relaxed) == 0 {
-        return;
-    }
-    const NAMES: [&str; 12] = [
-        "current_enter",
-        "before_refresh_stages",
-        "after_refresh_stages",
-        "after_maxwell_lookup",
-        "after_key_build",
-        "cache_hit",
-        "before_slow_path",
-        "slow_path_enter",
-        "slow_path_cache_hit",
-        "before_create_pipeline",
-        "after_create_pipeline",
-        "slow_path_exit",
-    ];
-    let last_stage = SHADER_PIPELINE_LAST_STAGE.load(Ordering::Relaxed) as usize;
-    let last_stage_name = NAMES.get(last_stage).copied().unwrap_or("unknown");
-    eprintln!(
-        "[SHADER_PIPELINE_STALL_PROFILE] last_stage={} ({})",
-        last_stage, last_stage_name
-    );
-    for (index, name) in NAMES.iter().enumerate() {
-        eprintln!(
-            "[SHADER_PIPELINE_STALL_PROFILE]   {:02} {:<24} {}",
-            index,
-            name,
-            SHADER_PIPELINE_STAGE_COUNTS[index].load(Ordering::Relaxed)
-        );
     }
 }
 
@@ -327,14 +278,20 @@ pub fn dump_shader_pipeline_stall_profile() {
 ///
 /// Corresponds to `OpenGL::ShaderCache`.
 pub struct ShaderCache {
+    /// Stable non-owning counterparts of Eden's constructor-owned cache and
+    /// manager references. `RasterizerOpenGL` owns the boxed caches and the
+    /// renderer owns the state tracker for longer than this shader cache.
+    texture_cache: Option<NonNull<OpenGLTextureCache>>,
+    buffer_cache: Option<NonNull<OpenGLBufferCache>>,
+    program_manager: Option<ProgramManagerHandle>,
+    state_tracker: Option<NonNull<StateTracker>>,
     /// Whether to use asynchronous shader compilation.
-    pub use_asynchronous_shaders: bool,
+    use_asynchronous_shaders: bool,
     /// Whether a strict GL context is required for compilation.
-    pub strict_context_required: bool,
+    strict_context_required: bool,
     profile: ShaderProfile,
     host_info: HostTranslateInfo,
     use_assembly_shaders: bool,
-    shader_backend: ShaderBackend,
     max_glasm_storage_buffer_blocks: u32,
 
     /// Current graphics pipeline key.
@@ -349,19 +306,14 @@ pub struct ShaderCache {
     shader_notify: Option<ShaderNotifyHandle>,
 
     /// Cache of compiled graphics pipelines.
-    graphics_cache: HashMap<GraphicsPipelineKey, GraphicsPipeline>,
+    graphics_cache:
+        HashMap<GraphicsPipelineKey, Option<Box<GraphicsPipeline>>, BuildUnorderedDenseHasher>,
     /// Cache of compiled compute pipelines.
-    compute_cache: HashMap<ComputePipelineKey, ComputePipeline>,
+    compute_cache:
+        HashMap<ComputePipelineKey, Option<Box<ComputePipeline>>, BuildUnorderedDenseHasher>,
 
     /// Path to the on-disk shader cache file.
     shader_cache_filename: PathBuf,
-
-    /// Owning thread for this cache instance. First call to a mutating method
-    /// stores the current thread id; subsequent calls assert it hasn't changed.
-    /// Used to verify the "concurrent HashMap access" hypothesis behind the
-    /// thread ids touch the cache, the plain `HashMap` is unsafe.
-    /// 0 = unowned; otherwise hash of `ThreadId`.
-    owner_tid_hash: std::sync::atomic::AtomicU64,
 }
 
 #[derive(Clone)]
@@ -369,10 +321,19 @@ struct DiskBuildConfig {
     profile: ShaderProfile,
     host_info: HostTranslateInfo,
     use_assembly_shaders: bool,
-    shader_backend: ShaderBackend,
     max_glasm_storage_buffer_blocks: u32,
     shader_notify: Option<ShaderNotifyHandle>,
+    texture_cache: Option<NonNull<OpenGLTextureCache>>,
+    buffer_cache: Option<NonNull<OpenGLBufferCache>>,
+    program_manager: Option<ProgramManagerHandle>,
+    state_tracker: Option<NonNull<StateTracker>>,
 }
+
+// The pointers are the same stable, renderer-thread-owned references that
+// Eden captures through `this` while shader workers compile pipeline objects.
+// Worker code never dereferences the caches; the completed pipeline returns to
+// the renderer thread before Configure uses them.
+unsafe impl Send for DiskBuildConfig {}
 
 enum DiskPipelineBuildResult {
     Compute(ComputePipelineKey, ComputePipeline),
@@ -404,9 +365,12 @@ impl ShaderCache {
             false,
         );
         cache.use_assembly_shaders = config.use_assembly_shaders;
-        cache.shader_backend = config.shader_backend;
         cache.max_glasm_storage_buffer_blocks = config.max_glasm_storage_buffer_blocks;
         cache.shader_notify = config.shader_notify;
+        cache.texture_cache = config.texture_cache;
+        cache.buffer_cache = config.buffer_cache;
+        cache.program_manager = config.program_manager.clone();
+        cache.state_tracker = config.state_tracker;
         cache
     }
 
@@ -433,6 +397,10 @@ impl ShaderCache {
     /// Corresponds to `ShaderCache::ShaderCache()`.
     pub fn new(
         device: &Device,
+        texture_cache: &mut OpenGLTextureCache,
+        buffer_cache: &mut OpenGLBufferCache,
+        program_manager: ProgramManagerHandle,
+        state_tracker: &mut StateTracker,
         context_factory: Option<SharedContextFactory>,
         shader_notify: ShaderNotifyHandle,
     ) -> Self {
@@ -443,9 +411,12 @@ impl ShaderCache {
             device.strict_context_required(),
         );
         cache.use_assembly_shaders = device.use_assembly_shaders();
-        cache.shader_backend = device.shader_backend();
         cache.max_glasm_storage_buffer_blocks = device.max_glasm_storage_buffer_blocks();
         cache.shader_notify = Some(shader_notify);
+        cache.texture_cache = Some(NonNull::from(texture_cache));
+        cache.buffer_cache = Some(NonNull::from(buffer_cache));
+        cache.program_manager = Some(program_manager);
+        cache.state_tracker = Some(NonNull::from(state_tracker));
         cache.context_factory = context_factory.clone();
         if cache.use_asynchronous_shaders {
             if let Some(factory) = context_factory {
@@ -468,29 +439,31 @@ impl ShaderCache {
         cache
     }
 
-    pub(crate) fn new_with_profile(
+    fn new_with_profile(
         profile: ShaderProfile,
         host_info: HostTranslateInfo,
         use_asynchronous_shaders: bool,
         strict_context_required: bool,
     ) -> Self {
         Self {
+            texture_cache: None,
+            buffer_cache: None,
+            program_manager: None,
+            state_tracker: None,
             use_asynchronous_shaders,
             strict_context_required,
             profile,
             host_info,
             use_assembly_shaders: false,
-            shader_backend: ShaderBackend::Glsl,
             max_glasm_storage_buffer_blocks: 0,
             graphics_key: GraphicsPipelineKey::default(),
             current_pipeline: None,
             workers: None,
             context_factory: None,
             shader_notify: None,
-            graphics_cache: HashMap::new(),
-            compute_cache: HashMap::new(),
+            graphics_cache: HashMap::with_hasher(BuildUnorderedDenseHasher),
+            compute_cache: HashMap::with_hasher(BuildUnorderedDenseHasher),
             shader_cache_filename: PathBuf::new(),
-            owner_tid_hash: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -502,52 +475,6 @@ impl ShaderCache {
             false,
             false,
         )
-    }
-
-    /// Assert that this cache is only ever accessed from a single thread.
-    /// If a second thread touches the cache, panic with both thread ids so
-    /// we can identify the concurrent caller.
-    ///
-    /// SIGSEGV hypothesis: if multiple threads access `graphics_cache`/`compute_cache`,
-    /// the plain `HashMap` corrupts under concurrent insert/get, eventually
-    /// jumping into stale code with wrong stack alignment.
-    ///
-    /// Gated behind `RUZU_ASSERT_SHADER_CACHE_OWNER=1` so it can be enabled
-    /// only for diagnostic runs (no overhead in normal use).
-    fn assert_single_owner(&self, site: &'static str) {
-        if std::env::var_os("RUZU_ASSERT_SHADER_CACHE_OWNER").is_none() {
-            return;
-        }
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
-        use std::sync::atomic::Ordering;
-        let mut h = DefaultHasher::new();
-        std::thread::current().id().hash(&mut h);
-        let tid_hash = h.finish().max(1); // 0 = unowned sentinel
-                                          // Try to publish ownership on first call (compare_exchange 0 -> tid_hash).
-        let prev = self
-            .owner_tid_hash
-            .compare_exchange(0, tid_hash, Ordering::AcqRel, Ordering::Acquire)
-            .unwrap_or_else(|x| x);
-        if prev == 0 {
-            // We became the owner. First access; nothing to assert.
-            eprintln!(
-                "[SHADER_CACHE_OWNER] claim site={} thread={:?} tid_hash=0x{:x}",
-                site,
-                std::thread::current().id(),
-                tid_hash
-            );
-            return;
-        }
-        if prev != tid_hash {
-            panic!(
-                "[SHADER_CACHE_OWNER] violation: site={} expected_tid_hash=0x{:x} this_thread={:?} this_tid_hash=0x{:x}",
-                site,
-                prev,
-                std::thread::current().id(),
-                tid_hash
-            );
-        }
     }
 
     /// Load disk resources for a given title.
@@ -582,18 +509,16 @@ impl ShaderCache {
             || stop_loading.load(Ordering::Acquire),
             &self.shader_cache_filename,
             CACHE_VERSION,
-            Box::new(|file, env| match ComputePipelineKey::read_from_file(file) {
+            Box::new(|file, env| match read_compute_pipeline_key(file) {
                 Ok(key) => compute_entries.borrow_mut().push((key, env)),
                 Err(error) => log::error!("Failed to read OpenGL compute pipeline key: {error}"),
             }),
-            Box::new(
-                |file, envs| match GraphicsPipelineKey::read_from_file(file) {
-                    Ok(key) => graphics_entries.borrow_mut().push((key, envs)),
-                    Err(error) => {
-                        log::error!("Failed to read OpenGL graphics pipeline key: {error}")
-                    }
-                },
-            ),
+            Box::new(|file, envs| match read_graphics_pipeline_key(file) {
+                Ok(key) => graphics_entries.borrow_mut().push((key, envs)),
+                Err(error) => {
+                    log::error!("Failed to read OpenGL graphics pipeline key: {error}")
+                }
+            }),
         );
 
         let compute_entries = compute_entries.into_inner();
@@ -601,67 +526,65 @@ impl ShaderCache {
         let total = compute_entries.len() + graphics_entries.len();
 
         if self.workers.is_none() && !self.strict_context_required {
-            if let Some(factory) = self.context_factory.clone() {
-                let worker_count = std::thread::available_parallelism()
-                    .map_or(1, usize::from)
-                    .max(2)
-                    - 1;
-                self.workers = Some(StatefulThreadWorker::new(
-                    worker_count,
-                    "GlShaderBuilder".to_string(),
-                    move || ShaderContext::new(&factory),
-                ));
-            }
+            let factory = self
+                .context_factory
+                .clone()
+                .expect("OpenGL shader loading requires the renderer's shared-context factory");
+            let worker_count = std::thread::available_parallelism()
+                .map_or(1, usize::from)
+                .max(2)
+                - 1;
+            self.workers = Some(StatefulThreadWorker::new(
+                worker_count,
+                "GlShaderBuilder".to_string(),
+                move || ShaderContext::new(&factory),
+            ));
         }
 
-        if self.strict_context_required || self.workers.is_none() {
-            callback(LoadCallbackStage::Build, 0, total);
+        if self.strict_context_required {
+            let factory = self
+                .context_factory
+                .as_ref()
+                .expect("strict OpenGL shader loading requires a shared-context factory");
+            let mut strict_context = ShaderContext::new(factory);
             for (key, env) in compute_entries {
-                if stop_loading.load(Ordering::Acquire) {
-                    break;
-                }
-                if self.compute_cache.contains_key(&key) {
-                    continue;
-                }
+                strict_context.pools.release_contents();
                 let mut env = ComputeEnvironment::from_file_environment(env);
                 if let Some(pipeline) =
-                    self.create_compute_pipeline_from_environment(&key, &mut env, false)
+                    self.create_compute_pipeline_from_environment(&key, &mut env, true)
                 {
-                    self.compute_cache.insert(key, pipeline);
+                    self.compute_cache
+                        .entry(key)
+                        .or_insert(Some(Box::new(pipeline)));
                 }
             }
             for (key, envs) in graphics_entries {
-                if stop_loading.load(Ordering::Acquire) {
-                    break;
-                }
-                if self.graphics_cache.contains_key(&key) {
-                    continue;
-                }
+                strict_context.pools.release_contents();
                 let mut environments = Self::graphics_environments_from_files(envs);
                 let saved_key = std::mem::replace(&mut self.graphics_key, key);
-                let pipeline = self.create_graphics_pipeline_from_environments(&mut environments);
+                let pipeline =
+                    self.create_graphics_pipeline_from_environments(&mut environments, false, true);
                 self.graphics_key = saved_key;
-                if let Some(mut pipeline) = pipeline {
-                    if let Err((stage, error)) = pipeline.build_from_sources() {
-                        log::error!(
-                            "Failed to build cached OpenGL graphics pipeline stage {}: {}",
-                            stage,
-                            error
-                        );
-                        continue;
-                    }
-                    self.graphics_cache.insert(key, pipeline);
+                if let Some(pipeline) = pipeline {
+                    self.graphics_cache
+                        .entry(key)
+                        .or_insert(Some(Box::new(pipeline)));
                 }
             }
-            callback(LoadCallbackStage::Build, total, total);
+            log::info!("Total OpenGL pipeline count: {total}");
+            callback(LoadCallbackStage::Build, 0, total);
+            return;
         } else {
             let config = DiskBuildConfig {
                 profile: self.profile.clone(),
                 host_info: self.host_info.clone(),
                 use_assembly_shaders: self.use_assembly_shaders,
-                shader_backend: self.shader_backend,
                 max_glasm_storage_buffer_blocks: self.max_glasm_storage_buffer_blocks,
                 shader_notify: self.shader_notify,
+                texture_cache: self.texture_cache,
+                buffer_cache: self.buffer_cache,
+                program_manager: self.program_manager.clone(),
+                state_tracker: self.state_tracker,
             };
             let results = Arc::new(Mutex::new(Vec::<DiskPipelineBuildResult>::new()));
             let state = Arc::new(Mutex::new(DiskResourceLoadState::default()));
@@ -669,12 +592,6 @@ impl ShaderCache {
             let mut queued_total = 0usize;
 
             for (key, env) in compute_entries {
-                if stop_loading.load(Ordering::Acquire) {
-                    break;
-                }
-                if self.compute_cache.contains_key(&key) {
-                    continue;
-                }
                 let config = config.clone();
                 let results = Arc::clone(&results);
                 let state = Arc::clone(&state);
@@ -700,12 +617,6 @@ impl ShaderCache {
             }
 
             for (key, envs) in graphics_entries {
-                if stop_loading.load(Ordering::Acquire) {
-                    break;
-                }
-                if self.graphics_cache.contains_key(&key) {
-                    continue;
-                }
                 let config = config.clone();
                 let results = Arc::clone(&results);
                 let state = Arc::clone(&state);
@@ -715,20 +626,15 @@ impl ShaderCache {
                     let mut cache = Self::disk_worker_cache(&config);
                     cache.graphics_key = key;
                     let mut environments = Self::graphics_environments_from_files(envs);
-                    if let Some(mut pipeline) =
-                        cache.create_graphics_pipeline_from_environments(&mut environments)
-                    {
-                        match pipeline.build_from_sources_for_shared_context() {
-                            Ok(()) => results
-                                .lock()
-                                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                                .push(DiskPipelineBuildResult::Graphics(key, pipeline)),
-                            Err((stage, error)) => log::error!(
-                                "Failed to build cached OpenGL graphics pipeline stage {}: {}",
-                                stage,
-                                error
-                            ),
-                        }
+                    if let Some(pipeline) = cache.create_graphics_pipeline_from_environments(
+                        &mut environments,
+                        false,
+                        true,
+                    ) {
+                        results
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .push(DiskPipelineBuildResult::Graphics(key, pipeline));
                     }
                     state
                         .lock()
@@ -738,6 +644,7 @@ impl ShaderCache {
                 queued_total += 1;
             }
 
+            log::info!("Total OpenGL pipeline count: {queued_total}");
             {
                 let mut state = state
                     .lock()
@@ -754,10 +661,14 @@ impl ShaderCache {
             {
                 match result {
                     DiskPipelineBuildResult::Compute(key, pipeline) => {
-                        self.compute_cache.entry(key).or_insert(pipeline);
+                        self.compute_cache
+                            .entry(key)
+                            .or_insert(Some(Box::new(pipeline)));
                     }
                     DiskPipelineBuildResult::Graphics(key, pipeline) => {
-                        self.graphics_cache.entry(key).or_insert(pipeline);
+                        self.graphics_cache
+                            .entry(key)
+                            .or_insert(Some(Box::new(pipeline)));
                     }
                 }
             }
@@ -765,27 +676,21 @@ impl ShaderCache {
         if !self.use_asynchronous_shaders {
             self.workers = None;
         }
-        log::info!("Total OpenGL pipeline count: {total}");
     }
 
     /// Shared-owner runtime path matching upstream `OpenGL::ShaderCache`'s
     /// inherited `VideoCommon::ShaderCache` usage more closely than the local
     /// address-only fallback.
-    pub fn current_graphics_pipeline_with_shared_cache(
+    pub fn current_graphics_pipeline(
         &mut self,
         shared_cache: &mut SharedShaderCache,
     ) -> Option<&mut GraphicsPipeline> {
-        self.assert_single_owner("current_graphics_pipeline_with_shared_cache");
-        record_shader_pipeline_stage(0);
-        record_shader_pipeline_stage(1);
         if !shared_cache.refresh_stages(&mut self.graphics_key.unique_hashes) {
             self.current_pipeline = None;
             return None;
         }
-        record_shader_pipeline_stage(2);
 
         let maxwell3d = shared_cache.current_maxwell3d()?;
-        record_shader_pipeline_stage(3);
         self.graphics_key.raw = 0;
         self.graphics_key.set_early_z(maxwell3d.mandated_early_z());
         self.graphics_key
@@ -803,40 +708,23 @@ impl ShaderCache {
         if self.graphics_key.xfb_enabled() {
             self.graphics_key.xfb_state = maxwell3d.transform_feedback_state();
         }
-        record_shader_pipeline_stage(4);
 
         let key = self.graphics_key;
         self.current_pipeline = Some(key);
         let maxwell3d = shared_cache.current_maxwell3d();
-        trace_gl_pipeline(1, &key, self.graphics_cache.len(), 0, 0, 0);
 
         if self.graphics_cache.contains_key(&key) {
-            trace_gl_pipeline(2, &key, self.graphics_cache.len(), 0, 0, 0);
-            record_shader_pipeline_stage(5);
-            let pipeline = self.graphics_cache.get_mut(&key).unwrap();
+            let pipeline = self.graphics_cache.get_mut(&key).unwrap().as_deref_mut()?;
             return Self::built_pipeline(self.use_asynchronous_shaders, maxwell3d, pipeline);
         }
-
-        trace_gl_pipeline(3, &key, self.graphics_cache.len(), 0, 0, 0);
-        record_shader_pipeline_stage(6);
-        self.current_graphics_pipeline_slow_path_with_shared_cache(shared_cache)
+        self.current_graphics_pipeline_slow_path(shared_cache)
     }
 
-    /// Get the current compute pipeline.
-    ///
-    /// Port of `ShaderCache::CurrentComputePipeline()`.
-    pub fn current_compute_pipeline(&mut self) -> Option<&mut ComputePipeline> {
-        self.assert_single_owner("current_compute_pipeline");
-        None
-    }
-
-    /// Shared-owner runtime path matching upstream
-    /// `OpenGL::ShaderCache::CurrentComputePipeline()`.
-    pub fn current_compute_pipeline_with_shared_cache(
+    /// Port of `OpenGL::ShaderCache::CurrentComputePipeline()`.
+    pub fn current_compute_pipeline(
         &mut self,
         shared_cache: &mut SharedShaderCache,
     ) -> Option<&mut ComputePipeline> {
-        self.assert_single_owner("current_compute_pipeline_with_shared_cache");
         let (shader_hash, shader_size) = {
             let shader = shared_cache.compute_shader()?;
             (shader.unique_hash, shader.size_bytes)
@@ -850,42 +738,35 @@ impl ShaderCache {
             qmd,
         );
         if self.compute_cache.contains_key(&key) {
-            return self.compute_cache.get_mut(&key);
+            return self.compute_cache.get_mut(&key)?.as_deref_mut();
         }
-        let pipeline =
-            self.create_compute_pipeline_with_shared_cache(shared_cache, &key, shader_size)?;
-        self.compute_cache.insert(key, pipeline);
-        self.compute_cache.get_mut(&key)
+        self.compute_cache.insert(key, None);
+        let pipeline = self.create_compute_pipeline(shared_cache, &key, shader_size);
+        if let Some(pipeline) = pipeline {
+            self.compute_cache.insert(key, Some(Box::new(pipeline)));
+        }
+        self.compute_cache.get_mut(&key)?.as_deref_mut()
     }
 
-    fn current_graphics_pipeline_slow_path_with_shared_cache(
+    fn current_graphics_pipeline_slow_path(
         &mut self,
         shared_cache: &mut SharedShaderCache,
     ) -> Option<&mut GraphicsPipeline> {
-        self.assert_single_owner("current_graphics_pipeline_slow_path_with_shared_cache");
-        record_shader_pipeline_stage(7);
         let key = self.graphics_key;
         self.current_pipeline = Some(key);
         let maxwell3d = shared_cache.current_maxwell3d();
-        trace_gl_pipeline(1, &key, self.graphics_cache.len(), 2, 0, 0);
 
         if self.graphics_cache.contains_key(&key) {
-            trace_gl_pipeline(2, &key, self.graphics_cache.len(), 2, 0, 0);
-            record_shader_pipeline_stage(8);
-            let pipeline = self.graphics_cache.get_mut(&key).unwrap();
+            let pipeline = self.graphics_cache.get_mut(&key).unwrap().as_deref_mut()?;
             return Self::built_pipeline(self.use_asynchronous_shaders, maxwell3d, pipeline);
         }
-
-        trace_gl_pipeline(4, &key, self.graphics_cache.len(), 2, 0, 0);
-        record_shader_pipeline_stage(9);
-        let pipeline = self.create_graphics_pipeline_with_shared_cache(shared_cache)?;
-        trace_gl_pipeline(5, &key, self.graphics_cache.len(), 2, 0, 0);
-        record_shader_pipeline_stage(10);
-        self.graphics_cache.insert(key, pipeline);
-        trace_gl_pipeline(6, &key, self.graphics_cache.len(), 2, 0, 0);
-        let inserted = self.graphics_cache.get_mut(&key).expect("just inserted");
+        self.graphics_cache.insert(key, None);
+        let pipeline = self.create_graphics_pipeline(shared_cache);
+        if let Some(pipeline) = pipeline {
+            self.graphics_cache.insert(key, Some(Box::new(pipeline)));
+        }
+        let inserted = self.graphics_cache.get_mut(&key)?.as_deref_mut()?;
         let result = Self::built_pipeline(self.use_asynchronous_shaders, maxwell3d, inserted);
-        record_shader_pipeline_stage(11);
         result
     }
 
@@ -904,9 +785,6 @@ impl ShaderCache {
         let Some(maxwell3d) = maxwell3d else {
             return None;
         };
-        if maxwell3d.zeta_enable() {
-            return None;
-        }
         let draw_state = maxwell3d.draw_manager_state();
         if draw_state.index_buffer.count <= 6 || draw_state.vertex_buffer.count <= 6 {
             return Some(pipeline);
@@ -914,17 +792,21 @@ impl ShaderCache {
         None
     }
 
-    fn create_graphics_pipeline_with_shared_cache(
+    fn create_graphics_pipeline(
         &mut self,
         shared_cache: &SharedShaderCache,
     ) -> Option<GraphicsPipeline> {
         let mut environments = GraphicsEnvironments::default();
         shared_cache.get_graphics_environments(&mut environments, &self.graphics_key.unique_hashes);
-        let pipeline = self.create_graphics_pipeline_from_environments(&mut environments);
+        let pipeline = self.create_graphics_pipeline_from_environments(
+            &mut environments,
+            self.use_asynchronous_shaders,
+            false,
+        );
         if pipeline.is_some() && !self.shader_cache_filename.as_os_str().is_empty() {
             let envs = environments.span();
             serialize_pipeline(
-                self.graphics_key.to_cache_bytes(),
+                graphics_pipeline_key_bytes(&self.graphics_key),
                 &envs,
                 &self.shader_cache_filename,
                 CACHE_VERSION,
@@ -936,616 +818,119 @@ impl ShaderCache {
     fn create_graphics_pipeline_from_environments(
         &mut self,
         environments: &mut GraphicsEnvironments,
+        use_shader_workers: bool,
+        force_context_flush: bool,
     ) -> Option<GraphicsPipeline> {
-        trace_gl_pipeline(4, &self.graphics_key, self.graphics_cache.len(), 3, 0, 0);
-        let mut pipeline = GraphicsPipeline::new(self.graphics_key, self.shader_notify);
-        let program_backend = match self.shader_backend {
-            ShaderBackend::Glsl => GraphicsProgramBackend::Glsl,
-            ShaderBackend::Glasm => GraphicsProgramBackend::Glasm,
-            ShaderBackend::SpirV => GraphicsProgramBackend::SpirV,
-        };
-        pipeline.set_program_backend(program_backend, self.max_glasm_storage_buffer_blocks);
-        if program_backend != GraphicsProgramBackend::Glsl {
-            return self.create_graphics_pipeline_from_environments_binary_backend(
+        match catch_shader_exception(|| {
+            self.create_graphics_pipeline_from_environments_unchecked(
                 environments,
-                pipeline,
-                program_backend,
-            );
+                use_shader_workers,
+                force_context_flush,
+            )
+        }) {
+            Ok(pipeline) => pipeline,
+            Err(error) => {
+                log::error!("{error}");
+                None
+            }
         }
-        let uses_vertex_a = self.graphics_key.unique_hashes[0] != 0;
-        let uses_vertex_b = self.graphics_key.unique_hashes[1] != 0;
-
-        const STAGE_LAYOUT: &[(usize, ShaderStage, usize)] = &[
-            (1, ShaderStage::VertexB, 0),
-            (2, ShaderStage::TessellationControl, 1),
-            (3, ShaderStage::TessellationEval, 2),
-            (4, ShaderStage::Geometry, 3),
-            (5, ShaderStage::Fragment, 4),
-        ];
-        let mut bindings = shader_recompiler::backend::bindings::Bindings::default();
-        let mut infos: [Option<ShaderInfo>; 5] = Default::default();
-
-        if uses_vertex_a && uses_vertex_b {
-            trace_gl_pipeline(
-                7,
-                &self.graphics_key,
-                self.graphics_cache.len(),
-                ShaderStage::VertexA as u64,
-                ShaderStage::VertexB as u64,
-                0,
-            );
-            let va_env = environments.envs[0].generic_environment_mut();
-            if va_env.cached_code_slice().is_empty() && va_env.analyze().is_none() {
-                log::warn!("gl_shader_cache: shared environment analyze failed for VertexA");
-                trace_gl_pipeline(
-                    10,
-                    &self.graphics_key,
-                    self.graphics_cache.len(),
-                    ShaderStage::VertexA as u64,
-                    0,
-                    0,
-                );
-                return Some(pipeline);
-            }
-            let va_code = va_env.cached_instruction_slice().to_vec();
-            let va_start = va_env.cached_instruction_start();
-
-            let vb_env = environments.envs[1].generic_environment_mut();
-            if vb_env.cached_code_slice().is_empty() && vb_env.analyze().is_none() {
-                log::warn!("gl_shader_cache: shared environment analyze failed for VertexB");
-                trace_gl_pipeline(
-                    10,
-                    &self.graphics_key,
-                    self.graphics_cache.len(),
-                    ShaderStage::VertexB as u64,
-                    1,
-                    0,
-                );
-                return Some(pipeline);
-            }
-            let runtime_info =
-                Self::make_runtime_info(&self.graphics_key, ShaderStage::VertexB, None);
-            let compiled = compile_dual_vertex_shader_glsl_at_offset_with_bindings_and_host_info(
-                &va_code,
-                va_start,
-                vb_env.cached_instruction_slice(),
-                vb_env.cached_instruction_start(),
-                &self.profile,
-                &runtime_info,
-                &mut bindings,
-                &self.host_info,
-            );
-            trace_gl_pipeline(
-                8,
-                &self.graphics_key,
-                self.graphics_cache.len(),
-                ShaderStage::VertexB as u64,
-                compiled.source.len() as u64,
-                0,
-            );
-            let mut previous_info = compiled.info.clone();
-            let mut layer_source_info = previous_info
-                .requires_layer_emulation
-                .then(|| previous_info.clone());
-            infos[0] = Some(previous_info.clone());
-            let mut final_source =
-                patch_fragment_debug_by_source_hash(ShaderStage::VertexB, compiled.source);
-            if std::env::var_os("RUZU_FORCE_FULLSCREEN_VS").is_some() {
-                if let Some(idx) = final_source.rfind("void main(){") {
-                    let head = &final_source[..idx];
-                    let new_body = if std::env::var_os("RUZU_FORCE_FULLSCREEN_VS_READ_ATTR")
-                        .is_some()
-                    {
-                        "void main(){\nvec4 ruzu_dummy=in_attr0;\nfloat ruzu_sink=ruzu_dummy.x*0.0;\nvec2 p=vec2(float((gl_VertexID<<1)&2),float(gl_VertexID&2));\ngl_Position=vec4(p*2.0-1.0+ruzu_sink,0.0,1.0);\nreturn;\n}\n"
-                    } else {
-                        "void main(){\nvec2 p=vec2(float((gl_VertexID<<1)&2),float(gl_VertexID&2));\ngl_Position=vec4(p*2.0-1.0,0.0,1.0);\nreturn;\n}\n"
-                    };
-                    final_source = format!("{}{}", head, new_body);
-                    log::warn!("[FORCE_FS_VS] patched dual vertex shader (envs path)");
-                }
-            }
-            if std::env::var_os("RUZU_FORCE_VERTEX_ZW").is_some() {
-                if let Some(idx) = final_source.rfind("return;") {
-                    let head = &final_source[..idx];
-                    let tail = &final_source[idx..];
-                    final_source =
-                        format!("{}gl_Position.z=0.0;\ngl_Position.w=1.0;\n{}", head, tail);
-                    log::warn!("[FORCE_VERTEX_ZW] patched dual vertex shader (envs path)");
-                }
-            }
-            if std::env::var_os("RUZU_FORCE_VERTEX_XY").is_some() {
-                if let Some(idx) = final_source.rfind("return;") {
-                    let head = &final_source[..idx];
-                    let tail = &final_source[idx..];
-                    final_source = format!(
-                        "{}vec2 ruzu_p=vec2(float((gl_VertexID<<1)&2),float(gl_VertexID&2));\ngl_Position.xy=ruzu_p*2.0-1.0;\n{}",
-                        head, tail
-                    );
-                    log::warn!("[FORCE_VERTEX_XY] patched dual vertex shader (envs path)");
-                }
-            }
-            if std::env::var_os("RUZU_FORCE_VERTEX_OUT_ZERO").is_some() {
-                if let Some(idx) = final_source.rfind("return;") {
-                    let head = &final_source[..idx];
-                    let tail = &final_source[idx..];
-                    final_source = format!("{}out_attr0=vec4(0.0);\n{}", head, tail);
-                    log::warn!("[FORCE_VERTEX_OUT_ZERO] patched dual vertex shader (envs path)");
-                }
-            }
-            if std::env::var_os("RUZU_DUMP_GLSL_FINAL").is_some() {
-                use std::sync::atomic::{AtomicUsize, Ordering};
-                static FINAL_COUNT: AtomicUsize = AtomicUsize::new(0);
-                let idx = FINAL_COUNT.fetch_add(1, Ordering::Relaxed);
-                let path = format!("/tmp/ruzu_glsl_final_{:04}_VertexB.glsl", idx);
-                let _ = std::fs::write(&path, &final_source);
-                log::warn!(
-                    "[GLSL_FINAL_DUMP] stage=VertexB idx={} bytes={} path={}",
-                    idx,
-                    final_source.len(),
-                    path
-                );
-            }
-            pipeline.glsl_sources[0] = Some(final_source);
-
-            for &(slot, _stage, gl_slot) in STAGE_LAYOUT {
-                let is_emulated_geometry = slot == 4
-                    && self.graphics_key.unique_hashes[slot] == 0
-                    && layer_source_info.is_some();
-                if (self.graphics_key.unique_hashes[slot] == 0 && !is_emulated_geometry)
-                    || slot == 1
-                {
-                    continue;
-                }
-                if is_emulated_geometry {
-                    let source_info = layer_source_info
-                        .as_ref()
-                        .expect("checked by is_emulated_geometry");
-                    let compiled = self.emit_layer_passthrough_geometry_glsl(
-                        source_info,
-                        Some(&previous_info),
-                        &mut bindings,
-                    );
-                    trace_gl_pipeline(
-                        11,
-                        &self.graphics_key,
-                        self.graphics_cache.len(),
-                        ShaderStage::Geometry as u64,
-                        slot as u64,
-                        compiled.source.len() as u64,
-                    );
-                    previous_info = compiled.info.clone();
-                    infos[gl_slot] = Some(previous_info.clone());
-                    pipeline.glsl_sources[gl_slot] = Some(compiled.source);
-                    continue;
-                }
-
-                let env = &mut environments.envs[slot];
-                let actual_stage = env.generic_environment().shader_stage();
-                trace_gl_pipeline(
-                    9,
-                    &self.graphics_key,
-                    self.graphics_cache.len(),
-                    actual_stage as u64,
-                    slot as u64,
-                    gl_slot as u64,
-                );
-                if env.generic_environment().cached_code_slice().is_empty()
-                    && env.generic_environment_mut().analyze().is_none()
-                {
-                    log::warn!(
-                        "gl_shader_cache: shared environment analyze failed for stage {:?}",
-                        actual_stage
-                    );
-                    trace_gl_pipeline(
-                        10,
-                        &self.graphics_key,
-                        self.graphics_cache.len(),
-                        actual_stage as u64,
-                        slot as u64,
-                        gl_slot as u64,
-                    );
-                    continue;
-                }
-
-                let runtime_info =
-                    Self::make_runtime_info(&self.graphics_key, actual_stage, Some(&previous_info));
-                let compiled = self.compile_stage_glsl_from_env_with_runtime_info(
-                    env,
-                    &runtime_info,
-                    &mut bindings,
-                );
-                trace_gl_pipeline(
-                    11,
-                    &self.graphics_key,
-                    self.graphics_cache.len(),
-                    actual_stage as u64,
-                    slot as u64,
-                    compiled.source.len() as u64,
-                );
-                trace_fragment_source_hash(&self.graphics_key, actual_stage, &compiled.source);
-                previous_info = compiled.info.clone();
-                if previous_info.requires_layer_emulation {
-                    layer_source_info = Some(previous_info.clone());
-                }
-                infos[gl_slot] = Some(previous_info.clone());
-                let mut final_source =
-                    patch_fragment_debug_by_source_hash(actual_stage, compiled.source);
-                if std::env::var_os("RUZU_FORCE_GREEN_FRAGMENT").is_some()
-                    && format!("{:?}", actual_stage) == "Fragment"
-                {
-                    if let Some(idx) = final_source.rfind("void main(){") {
-                        let head = &final_source[..idx];
-                        let new_body =
-                            "void main(){\nfrag_color0=vec4(0.0,1.0,0.0,1.0);\nreturn;\n}\n";
-                        let new_source = format!("{}{}", head, new_body);
-                        log::warn!("[FORCE_GREEN] patched fragment shader (envs path)");
-                        final_source = new_source;
-                    }
-                }
-                if std::env::var_os("RUZU_FORCE_BLACK_FRAGMENT").is_some()
-                    && format!("{:?}", actual_stage) == "Fragment"
-                {
-                    if let Some(idx) = final_source.rfind("void main(){") {
-                        let head = &final_source[..idx];
-                        let new_body =
-                            "void main(){\nfrag_color0=vec4(0.0,0.0,0.0,1.0);\nreturn;\n}\n";
-                        let new_source = format!("{}{}", head, new_body);
-                        log::warn!("[FORCE_BLACK] patched FS (envs path)");
-                        final_source = new_source;
-                    }
-                }
-                if std::env::var_os("RUZU_PROBE_FRAGCOORD").is_some()
-                    && format!("{:?}", actual_stage) == "Fragment"
-                {
-                    if let Some(idx) = final_source.rfind("void main(){") {
-                        let head = &final_source[..idx];
-                        let new_body = "void main(){\nfloat fcw=gl_FragCoord.w;\nfloat zx=fcw==0.0?1.0:0.0;\nfrag_color0=vec4(zx,clamp(fcw,0.0,1.0),0.0,1.0);\nreturn;\n}\n";
-                        let new_source = format!("{}{}", head, new_body);
-                        log::warn!("[PROBE_FRAGCOORD] patched FS (envs path)");
-                        final_source = new_source;
-                    }
-                }
-                if std::env::var_os("RUZU_FORCE_FULLSCREEN_VS").is_some()
-                    && format!("{:?}", actual_stage).contains("Vertex")
-                {
-                    if let Some(idx) = final_source.rfind("void main(){") {
-                        let head = &final_source[..idx];
-                        let new_body = if std::env::var_os("RUZU_FORCE_FULLSCREEN_VS_READ_ATTR")
-                            .is_some()
-                        {
-                            "void main(){\nvec4 ruzu_dummy=in_attr0;\nfloat ruzu_sink=ruzu_dummy.x*0.0;\nvec2 p=vec2(float((gl_VertexID<<1)&2),float(gl_VertexID&2));\ngl_Position=vec4(p*2.0-1.0+ruzu_sink,0.0,1.0);\nreturn;\n}\n"
-                        } else {
-                            "void main(){\nvec2 p=vec2(float((gl_VertexID<<1)&2),float(gl_VertexID&2));\ngl_Position=vec4(p*2.0-1.0,0.0,1.0);\nreturn;\n}\n"
-                        };
-                        let new_source = format!("{}{}", head, new_body);
-                        log::warn!("[FORCE_FS_VS] patched vertex shader (envs path)");
-                        final_source = new_source;
-                    }
-                }
-                if std::env::var_os("RUZU_FORCE_VERTEX_ZW").is_some()
-                    && format!("{:?}", actual_stage).contains("Vertex")
-                {
-                    if let Some(idx) = final_source.rfind("return;") {
-                        let head = &final_source[..idx];
-                        let tail = &final_source[idx..];
-                        final_source =
-                            format!("{}gl_Position.z=0.0;\ngl_Position.w=1.0;\n{}", head, tail);
-                        log::warn!("[FORCE_VERTEX_ZW] patched vertex shader (envs path)");
-                    }
-                }
-                if std::env::var_os("RUZU_FORCE_VERTEX_XY").is_some()
-                    && format!("{:?}", actual_stage).contains("Vertex")
-                {
-                    if let Some(idx) = final_source.rfind("return;") {
-                        let head = &final_source[..idx];
-                        let tail = &final_source[idx..];
-                        final_source = format!(
-                            "{}vec2 ruzu_p=vec2(float((gl_VertexID<<1)&2),float(gl_VertexID&2));\ngl_Position.xy=ruzu_p*2.0-1.0;\n{}",
-                            head, tail
-                        );
-                        log::warn!("[FORCE_VERTEX_XY] patched vertex shader (envs path)");
-                    }
-                }
-                if std::env::var_os("RUZU_FORCE_VERTEX_OUT_ZERO").is_some()
-                    && format!("{:?}", actual_stage).contains("Vertex")
-                {
-                    if let Some(idx) = final_source.rfind("return;") {
-                        let head = &final_source[..idx];
-                        let tail = &final_source[idx..];
-                        final_source = format!("{}out_attr0=vec4(0.0);\n{}", head, tail);
-                        log::warn!("[FORCE_VERTEX_OUT_ZERO] patched vertex shader (envs path)");
-                    }
-                }
-                if std::env::var_os("RUZU_DUMP_GLSL_FINAL").is_some() {
-                    use std::sync::atomic::{AtomicUsize, Ordering};
-                    static FINAL_COUNT: AtomicUsize = AtomicUsize::new(0);
-                    let idx = FINAL_COUNT.fetch_add(1, Ordering::Relaxed);
-                    let path = format!("/tmp/ruzu_glsl_final_{:04}_{:?}.glsl", idx, actual_stage);
-                    let _ = std::fs::write(&path, &final_source);
-                    log::warn!(
-                        "[GLSL_FINAL_DUMP] stage={:?} idx={} bytes={} path={}",
-                        actual_stage,
-                        idx,
-                        final_source.len(),
-                        path
-                    );
-                }
-                pipeline.glsl_sources[gl_slot] = Some(final_source);
-            }
-
-            pipeline.apply_shader_infos(&infos);
-            self.start_graphics_pipeline_build(&mut pipeline);
-            trace_gl_pipeline(5, &self.graphics_key, self.graphics_cache.len(), 3, 1, 0);
-            return Some(pipeline);
-        }
-
-        let mut previous_info: Option<ShaderInfo> = None;
-        let mut layer_source_info: Option<ShaderInfo> = None;
-        for &(slot, _stage, gl_slot) in STAGE_LAYOUT {
-            let is_emulated_geometry = slot == 4
-                && self.graphics_key.unique_hashes[slot] == 0
-                && layer_source_info.is_some();
-            if self.graphics_key.unique_hashes[slot] == 0 && !is_emulated_geometry {
-                continue;
-            }
-            if uses_vertex_a && slot == 1 {
-                continue;
-            }
-            if is_emulated_geometry {
-                let source_info = layer_source_info
-                    .as_ref()
-                    .expect("checked by is_emulated_geometry");
-                let compiled = self.emit_layer_passthrough_geometry_glsl(
-                    source_info,
-                    previous_info.as_ref(),
-                    &mut bindings,
-                );
-                trace_gl_pipeline(
-                    11,
-                    &self.graphics_key,
-                    self.graphics_cache.len(),
-                    ShaderStage::Geometry as u64,
-                    slot as u64,
-                    compiled.source.len() as u64,
-                );
-                previous_info = Some(compiled.info.clone());
-                infos[gl_slot] = Some(compiled.info);
-                pipeline.glsl_sources[gl_slot] = Some(compiled.source);
-                continue;
-            }
-
-            let env = &mut environments.envs[slot];
-            let actual_stage = env.generic_environment().shader_stage();
-            trace_gl_pipeline(
-                9,
-                &self.graphics_key,
-                self.graphics_cache.len(),
-                actual_stage as u64,
-                slot as u64,
-                gl_slot as u64,
-            );
-            if env.generic_environment().cached_code_slice().is_empty()
-                && env.generic_environment_mut().analyze().is_none()
-            {
-                log::warn!(
-                    "gl_shader_cache: shared environment analyze failed for stage {:?}",
-                    actual_stage
-                );
-                trace_gl_pipeline(
-                    10,
-                    &self.graphics_key,
-                    self.graphics_cache.len(),
-                    actual_stage as u64,
-                    slot as u64,
-                    gl_slot as u64,
-                );
-                continue;
-            }
-
-            let runtime_info =
-                Self::make_runtime_info(&self.graphics_key, actual_stage, previous_info.as_ref());
-            let compiled = self.compile_stage_glsl_from_env_with_runtime_info(
-                env,
-                &runtime_info,
-                &mut bindings,
-            );
-            trace_gl_pipeline(
-                11,
-                &self.graphics_key,
-                self.graphics_cache.len(),
-                actual_stage as u64,
-                slot as u64,
-                compiled.source.len() as u64,
-            );
-            trace_fragment_source_hash(&self.graphics_key, actual_stage, &compiled.source);
-            previous_info = Some(compiled.info.clone());
-            if compiled.info.requires_layer_emulation {
-                layer_source_info = Some(compiled.info.clone());
-            }
-            infos[gl_slot] = previous_info.clone();
-            let mut final_source =
-                patch_fragment_debug_by_source_hash(actual_stage, compiled.source);
-            if std::env::var_os("RUZU_FORCE_GREEN_FRAGMENT").is_some()
-                && format!("{:?}", actual_stage) == "Fragment"
-            {
-                if let Some(idx) = final_source.rfind("void main(){") {
-                    let head = &final_source[..idx];
-                    let new_body = "void main(){\nfrag_color0=vec4(0.0,1.0,0.0,1.0);\nreturn;\n}\n";
-                    let new_source = format!("{}{}", head, new_body);
-                    log::warn!("[FORCE_GREEN] patched fragment shader (envs path 2)");
-                    final_source = new_source;
-                }
-            }
-            if std::env::var_os("RUZU_FORCE_BLACK_FRAGMENT").is_some()
-                && format!("{:?}", actual_stage) == "Fragment"
-            {
-                if let Some(idx) = final_source.rfind("void main(){") {
-                    let head = &final_source[..idx];
-                    let new_body = "void main(){\nfrag_color0=vec4(0.0,0.0,0.0,1.0);\nreturn;\n}\n";
-                    let new_source = format!("{}{}", head, new_body);
-                    log::warn!("[FORCE_BLACK] patched FS (envs path 2)");
-                    final_source = new_source;
-                }
-            }
-            if std::env::var_os("RUZU_PROBE_FRAGCOORD").is_some()
-                && format!("{:?}", actual_stage) == "Fragment"
-            {
-                if let Some(idx) = final_source.rfind("void main(){") {
-                    let head = &final_source[..idx];
-                    let new_body = "void main(){\nfloat fcw=gl_FragCoord.w;\nfloat zx=fcw==0.0?1.0:0.0;\nfrag_color0=vec4(zx,clamp(fcw,0.0,1.0),0.0,1.0);\nreturn;\n}\n";
-                    let new_source = format!("{}{}", head, new_body);
-                    log::warn!("[PROBE_FRAGCOORD] patched FS (envs path 2)");
-                    final_source = new_source;
-                }
-            }
-            if std::env::var_os("RUZU_FORCE_FULLSCREEN_VS").is_some()
-                && format!("{:?}", actual_stage).contains("Vertex")
-            {
-                if let Some(idx) = final_source.rfind("void main(){") {
-                    let head = &final_source[..idx];
-                    let new_body = if std::env::var_os("RUZU_FORCE_FULLSCREEN_VS_READ_ATTR")
-                        .is_some()
-                    {
-                        "void main(){\nvec4 ruzu_dummy=in_attr0;\nfloat ruzu_sink=ruzu_dummy.x*0.0;\nvec2 p=vec2(float((gl_VertexID<<1)&2),float(gl_VertexID&2));\ngl_Position=vec4(p*2.0-1.0+ruzu_sink,0.0,1.0);\nreturn;\n}\n"
-                    } else {
-                        "void main(){\nvec2 p=vec2(float((gl_VertexID<<1)&2),float(gl_VertexID&2));\ngl_Position=vec4(p*2.0-1.0,0.0,1.0);\nreturn;\n}\n"
-                    };
-                    let new_source = format!("{}{}", head, new_body);
-                    log::warn!("[FORCE_FS_VS] patched vertex shader (envs path 2)");
-                    final_source = new_source;
-                }
-            }
-            if std::env::var_os("RUZU_FORCE_VERTEX_ZW").is_some()
-                && format!("{:?}", actual_stage).contains("Vertex")
-            {
-                if let Some(idx) = final_source.rfind("return;") {
-                    let head = &final_source[..idx];
-                    let tail = &final_source[idx..];
-                    final_source =
-                        format!("{}gl_Position.z=0.0;\ngl_Position.w=1.0;\n{}", head, tail);
-                    log::warn!("[FORCE_VERTEX_ZW] patched vertex shader (envs path 2)");
-                }
-            }
-            if std::env::var_os("RUZU_FORCE_VERTEX_XY").is_some()
-                && format!("{:?}", actual_stage).contains("Vertex")
-            {
-                if let Some(idx) = final_source.rfind("return;") {
-                    let head = &final_source[..idx];
-                    let tail = &final_source[idx..];
-                    final_source = format!(
-                        "{}vec2 ruzu_p=vec2(float((gl_VertexID<<1)&2),float(gl_VertexID&2));\ngl_Position.xy=ruzu_p*2.0-1.0;\n{}",
-                        head, tail
-                    );
-                    log::warn!("[FORCE_VERTEX_XY] patched vertex shader (envs path 2)");
-                }
-            }
-            if std::env::var_os("RUZU_FORCE_VERTEX_OUT_ZERO").is_some()
-                && format!("{:?}", actual_stage).contains("Vertex")
-            {
-                if let Some(idx) = final_source.rfind("return;") {
-                    let head = &final_source[..idx];
-                    let tail = &final_source[idx..];
-                    final_source = format!("{}out_attr0=vec4(0.0);\n{}", head, tail);
-                    log::warn!("[FORCE_VERTEX_OUT_ZERO] patched vertex shader (envs path 2)");
-                }
-            }
-            if std::env::var_os("RUZU_DUMP_GLSL_FINAL").is_some() {
-                use std::sync::atomic::{AtomicUsize, Ordering};
-                static FINAL_COUNT: AtomicUsize = AtomicUsize::new(0);
-                let idx = FINAL_COUNT.fetch_add(1, Ordering::Relaxed);
-                let path = format!("/tmp/ruzu_glsl_final_{:04}_{:?}.glsl", idx, actual_stage);
-                let _ = std::fs::write(&path, &final_source);
-                log::warn!(
-                    "[GLSL_FINAL_DUMP] stage={:?} idx={} bytes={} path={}",
-                    actual_stage,
-                    idx,
-                    final_source.len(),
-                    path
-                );
-            }
-            pipeline.glsl_sources[gl_slot] = Some(final_source);
-        }
-
-        pipeline.apply_shader_infos(&infos);
-        self.start_graphics_pipeline_build(&mut pipeline);
-        trace_gl_pipeline(5, &self.graphics_key, self.graphics_cache.len(), 3, 2, 0);
-        Some(pipeline)
     }
 
-    fn create_graphics_pipeline_from_environments_binary_backend(
+    #[allow(clippy::too_many_arguments)]
+    fn make_graphics_pipeline(
+        &self,
+        glsl_sources: [Option<String>; NUM_GRAPHICS_STAGES],
+        spirv_sources: [Option<Vec<u32>>; NUM_GRAPHICS_STAGES],
+        infos: &[Option<ShaderInfo>; NUM_GRAPHICS_STAGES],
+        program_backend: GraphicsProgramBackend,
+        use_shader_workers: bool,
+        force_context_flush: bool,
+    ) -> GraphicsPipeline {
+        let thread_worker = if use_shader_workers {
+            Some(
+                self.workers
+                    .as_ref()
+                    .expect("asynchronous OpenGL pipeline creation requires shader workers"),
+            )
+        } else {
+            None
+        };
+        match (
+            self.texture_cache,
+            self.buffer_cache,
+            self.program_manager.as_ref(),
+            self.state_tracker,
+        ) {
+            (
+                Some(texture_cache),
+                Some(buffer_cache),
+                Some(program_manager),
+                Some(state_tracker),
+            ) => GraphicsPipeline::new(
+                texture_cache,
+                buffer_cache,
+                program_manager.clone(),
+                state_tracker,
+                thread_worker,
+                self.shader_notify,
+                glsl_sources,
+                spirv_sources,
+                infos,
+                self.graphics_key,
+                program_backend,
+                self.max_glasm_storage_buffer_blocks,
+                self.use_assembly_shaders,
+                force_context_flush,
+            ),
+            #[cfg(test)]
+            _ => GraphicsPipeline::new_for_test_with_sources(
+                self.graphics_key,
+                self.shader_notify,
+                glsl_sources,
+                spirv_sources,
+                infos,
+                program_backend,
+                self.max_glasm_storage_buffer_blocks,
+                self.use_assembly_shaders,
+            ),
+            #[cfg(not(test))]
+            _ => unreachable!("production OpenGL ShaderCache must retain all pipeline owners"),
+        }
+    }
+
+    fn create_graphics_pipeline_from_environments_unchecked(
         &mut self,
         environments: &mut GraphicsEnvironments,
-        mut pipeline: GraphicsPipeline,
-        backend: GraphicsProgramBackend,
+        use_shader_workers: bool,
+        force_context_flush: bool,
     ) -> Option<GraphicsPipeline> {
+        let pipeline_hash = self.graphics_key.hash_key();
+        log::info!("{:#016x}", pipeline_hash);
+
         let uses_vertex_a = self.graphics_key.unique_hashes[0] != 0;
         let uses_vertex_b = self.graphics_key.unique_hashes[1] != 0;
+        let dump_guest_shaders = *common::settings::values().dump_guest_shaders.get_value();
         let mut programs: [Option<ShaderProgram>; 6] = std::array::from_fn(|_| None);
         let mut total_storage_buffers = 0u32;
+        let mut layer_source_program: Option<ShaderProgram> = None;
 
-        if uses_vertex_a && uses_vertex_b {
-            let (vertex_a_slice, remaining) = environments.envs.split_at_mut(1);
-            let vertex_a_env = &mut vertex_a_slice[0];
-            let vertex_b_env = &mut remaining[0];
-            for (name, env) in [
-                ("VertexA", &mut *vertex_a_env),
-                ("VertexB", &mut *vertex_b_env),
-            ] {
-                if env.generic_environment().cached_code_slice().is_empty()
-                    && env.generic_environment_mut().analyze().is_none()
-                {
-                    log::error!("OpenGL shader environment analysis failed for {}", name);
-                    return None;
-                }
-            }
-            let vertex_a_code = vertex_a_env
-                .generic_environment()
-                .cached_instruction_slice()
-                .to_vec();
-            let vertex_b_code = vertex_b_env
-                .generic_environment()
-                .cached_instruction_slice()
-                .to_vec();
-            let mut vertex_a = translate_program_from_env_with_host_info(
-                &vertex_a_code,
-                vertex_a_env
-                    .generic_environment()
-                    .cached_instruction_start(),
-                vertex_a_env,
-                &self.host_info,
-            );
-            let mut vertex_b = translate_program_from_env_with_host_info(
-                &vertex_b_code,
-                vertex_b_env
-                    .generic_environment()
-                    .cached_instruction_start(),
-                vertex_b_env,
-                &self.host_info,
-            );
-            total_storage_buffers += shader_recompiler::shader_info::num_descriptors(
-                &vertex_b.info.storage_buffers_descriptors,
-            );
-            programs[1] = Some(merge_dual_vertex_programs(&mut vertex_a, &mut vertex_b));
-        }
-
-        let first_index = if uses_vertex_a && uses_vertex_b { 2 } else { 1 };
-        let mut layer_source: Option<ShaderProgram> = programs[1]
-            .as_ref()
-            .filter(|program| program.info.requires_layer_emulation)
-            .cloned();
-        for index in first_index..6 {
-            if self.graphics_key.unique_hashes[index] == 0 {
-                if index == 4 {
-                    if let Some(source) = layer_source.as_ref() {
-                        programs[index] = Some(generate_geometry_passthrough(
-                            &self.host_info,
-                            source,
-                            Self::maxwell_to_output_topology(self.graphics_key.gs_input_topology()),
-                        ));
-                    }
-                }
+        for index in 0..6 {
+            let is_emulated_stage = layer_source_program.is_some()
+                && index == crate::engines::maxwell_3d::ShaderStageType::Geometry as usize;
+            if self.graphics_key.unique_hashes[index] == 0 && is_emulated_stage {
+                programs[index] = Some(generate_geometry_passthrough(
+                    &self.host_info,
+                    layer_source_program
+                        .as_ref()
+                        .expect("layer source checked by is_emulated_stage"),
+                    Self::maxwell_to_output_topology(self.graphics_key.gs_input_topology()),
+                ));
                 continue;
             }
+            if self.graphics_key.unique_hashes[index] == 0 {
+                continue;
+            }
+
             let env = &mut environments.envs[index];
             if env.generic_environment().cached_code_slice().is_empty()
                 && env.generic_environment_mut().analyze().is_none()
@@ -1556,79 +941,125 @@ impl ShaderCache {
                 );
                 return None;
             }
+            if dump_guest_shaders {
+                env.dump(pipeline_hash, self.graphics_key.unique_hashes[index]);
+            }
             let code = env
                 .generic_environment()
                 .cached_instruction_slice()
                 .to_vec();
-            let program = translate_program_from_env_with_host_info(
-                &code,
-                env.generic_environment().cached_instruction_start(),
-                env,
-                &self.host_info,
-            );
-            total_storage_buffers += shader_recompiler::shader_info::num_descriptors(
-                &program.info.storage_buffers_descriptors,
-            );
-            if program.info.requires_layer_emulation {
-                layer_source = Some(program.clone());
+            let start = env.generic_environment().cached_instruction_start();
+
+            if !uses_vertex_a || index != 1 {
+                let program =
+                    translate_program_from_env_with_host_info(&code, start, env, &self.host_info);
+                total_storage_buffers += shader_recompiler::shader_info::num_descriptors(
+                    &program.info.storage_buffers_descriptors,
+                );
+                programs[index] = Some(program);
+            } else {
+                let mut program_va = programs[0]
+                    .take()
+                    .expect("VertexA must be translated before VertexB");
+                let mut program_vb =
+                    translate_program_from_env_with_host_info(&code, start, env, &self.host_info);
+                total_storage_buffers += shader_recompiler::shader_info::num_descriptors(
+                    &program_vb.info.storage_buffers_descriptors,
+                );
+                programs[index] = Some(merge_dual_vertex_programs(
+                    &mut program_va,
+                    &mut program_vb,
+                    env,
+                ));
             }
-            programs[index] = Some(program);
+
+            if programs[index]
+                .as_ref()
+                .is_some_and(|program| program.info.requires_layer_emulation)
+            {
+                layer_source_program = programs[index].clone();
+            }
         }
 
         let glasm_use_storage_buffers =
             total_storage_buffers <= self.max_glasm_storage_buffer_blocks;
+        let program_backend = match *common::settings::values().renderer_backend.get_value() {
+            RendererBackend::OpenGlGlsl => GraphicsProgramBackend::Glsl,
+            RendererBackend::OpenGlGlasm => GraphicsProgramBackend::Glasm,
+            RendererBackend::OpenGlSpirV => GraphicsProgramBackend::SpirV,
+            _ => unreachable!("OpenGL shader cache requires an OpenGL backend"),
+        };
+        let mut infos: [Option<ShaderInfo>; NUM_GRAPHICS_STAGES] = Default::default();
+        let mut glsl_sources: [Option<String>; NUM_GRAPHICS_STAGES] = Default::default();
+        let mut spirv_sources: [Option<Vec<u32>>; NUM_GRAPHICS_STAGES] = Default::default();
         let mut bindings = shader_recompiler::backend::bindings::Bindings::default();
-        let mut infos: [Option<ShaderInfo>; 5] = Default::default();
         let mut previous_info: Option<ShaderInfo> = None;
         let first_index = if uses_vertex_a && uses_vertex_b { 1 } else { 0 };
+
         for index in first_index..6 {
-            let Some(program) = programs[index].as_mut() else {
+            let is_emulated_stage = layer_source_program.is_some()
+                && index == crate::engines::maxwell_3d::ShaderStageType::Geometry as usize;
+            if self.graphics_key.unique_hashes[index] == 0 && !is_emulated_stage {
                 continue;
-            };
+            }
             if index == 0 {
                 log::error!("OpenGL VertexA without VertexB is not supported upstream");
                 return None;
             }
+
+            let program = programs[index]
+                .as_mut()
+                .expect("translated or generated graphics program must exist");
             let stage_index = index - 1;
-            let mut runtime_info =
-                Self::make_runtime_info(&self.graphics_key, program.stage, previous_info.as_ref());
-            runtime_info.glasm_use_storage_buffers = glasm_use_storage_buffers;
-            if backend == GraphicsProgramBackend::Glasm {
-                runtime_info.xfb_varyings.clear();
-                runtime_info.xfb_count = 0;
-                pipeline.glsl_sources[stage_index] =
-                    Some(shader_recompiler::backend::glasm::emit_glasm(
+            let runtime_info = Self::make_runtime_info(
+                &self.graphics_key,
+                program.stage,
+                previous_info.as_ref(),
+                glasm_use_storage_buffers,
+                self.use_assembly_shaders,
+            );
+            match program_backend {
+                GraphicsProgramBackend::Glsl => {
+                    convert_legacy_to_generic(program, &runtime_info);
+                    glsl_sources[stage_index] = Some(shader_recompiler::backend::glsl::emit_glsl(
                         &self.profile,
                         &runtime_info,
                         program,
                         &mut bindings,
                     ));
-            } else {
-                convert_legacy_to_generic(program, &runtime_info);
-                pipeline.spirv_sources[stage_index] =
-                    Some(shader_recompiler::backend::emit_spirv_with_bindings(
-                        program,
-                        &self.profile,
-                        &runtime_info,
-                        &mut bindings,
-                    ));
+                }
+                GraphicsProgramBackend::Glasm => {
+                    glsl_sources[stage_index] =
+                        Some(shader_recompiler::backend::glasm::emit_glasm(
+                            &self.profile,
+                            &runtime_info,
+                            program,
+                            &mut bindings,
+                        ));
+                }
+                GraphicsProgramBackend::SpirV => {
+                    convert_legacy_to_generic(program, &runtime_info);
+                    spirv_sources[stage_index] =
+                        Some(shader_recompiler::backend::emit_spirv_with_bindings(
+                            program,
+                            &self.profile,
+                            &runtime_info,
+                            &mut bindings,
+                        ));
+                }
             }
             infos[stage_index] = Some(program.info.clone());
             previous_info = infos[stage_index].clone();
         }
 
-        pipeline.apply_shader_infos(&infos);
-        self.start_graphics_pipeline_build(&mut pipeline);
-        Some(pipeline)
-    }
-
-    fn start_graphics_pipeline_build(&self, pipeline: &mut GraphicsPipeline) {
-        if pipeline.key.xfb_enabled() && self.use_assembly_shaders {
-            pipeline.generate_transform_feedback_state();
-        }
-        if let Some(worker) = self.workers.as_ref() {
-            pipeline.build_async(worker);
-        }
+        Some(self.make_graphics_pipeline(
+            glsl_sources,
+            spirv_sources,
+            &infos,
+            program_backend,
+            use_shader_workers,
+            force_context_flush,
+        ))
     }
 
     /// Port of upstream `OpenGL::MakeRuntimeInfo(...)` in
@@ -1637,6 +1068,8 @@ impl ShaderCache {
         key: &GraphicsPipelineKey,
         stage: ShaderStage,
         previous_program: Option<&ShaderInfo>,
+        glasm_use_storage_buffers: bool,
+        use_assembly_shaders: bool,
     ) -> RuntimeInfo {
         let mut info = RuntimeInfo::default();
         if let Some(previous_program) = previous_program {
@@ -1650,7 +1083,7 @@ impl ShaderCache {
 
         match stage {
             ShaderStage::VertexB | ShaderStage::Geometry => {
-                if key.xfb_enabled() {
+                if !use_assembly_shaders && key.xfb_enabled() {
                     let (varyings, count) =
                         transform_feedback::make_transform_feedback_varyings(&key.xfb_state);
                     info.xfb_varyings = varyings
@@ -1673,13 +1106,19 @@ impl ShaderCache {
                     0 => TessPrimitive::Isolines,
                     1 => TessPrimitive::Triangles,
                     2 => TessPrimitive::Quads,
-                    _ => TessPrimitive::Triangles,
+                    value => {
+                        log::error!("Invalid Maxwell tessellation domain type {value}");
+                        TessPrimitive::Triangles
+                    }
                 };
                 info.tess_spacing = match key.tessellation_spacing() {
                     0 => TessSpacing::Equal,
                     1 => TessSpacing::FractionalOdd,
                     2 => TessSpacing::FractionalEven,
-                    _ => TessSpacing::Equal,
+                    value => {
+                        log::error!("Invalid Maxwell tessellation spacing {value}");
+                        TessSpacing::Equal
+                    }
                 };
             }
             ShaderStage::Fragment => {
@@ -1693,8 +1132,10 @@ impl ShaderCache {
             1 | 2 | 3 => InputTopology::Lines,
             10 | 11 => InputTopology::LinesAdjacency,
             12 | 13 => InputTopology::TrianglesAdjacency,
-            _ => InputTopology::Triangles,
+            4..=9 | 14 => InputTopology::Triangles,
+            _ => InputTopology::Points,
         };
+        info.glasm_use_storage_buffers = glasm_use_storage_buffers;
 
         info
     }
@@ -1708,175 +1149,9 @@ impl ShaderCache {
         }
     }
 
-    fn emit_layer_passthrough_geometry_glsl(
-        &self,
-        source_info: &ShaderInfo,
-        previous_info: Option<&ShaderInfo>,
-        bindings: &mut shader_recompiler::backend::bindings::Bindings,
-    ) -> CompiledGlslShader {
-        let mut source_program = ShaderProgram::new(ShaderStage::Geometry);
-        source_program.info = source_info.clone();
-        let output_topology =
-            Self::maxwell_to_output_topology(self.graphics_key.gs_input_topology());
-        let mut program =
-            generate_geometry_passthrough(&self.host_info, &source_program, output_topology);
-        let runtime_info =
-            Self::make_runtime_info(&self.graphics_key, ShaderStage::Geometry, previous_info);
-        convert_legacy_to_generic(&mut program, &runtime_info);
-        let source = shader_recompiler::backend::glsl::emit_glsl(
-            &self.profile,
-            &runtime_info,
-            &mut program,
-            bindings,
-        );
-        CompiledGlslShader {
-            source,
-            info: program.info,
-            stage: ShaderStage::Geometry,
-        }
-    }
-
-    /// Translate a single Maxwell shader stage to GLSL via the recompiler.
-    ///
-    /// This is the bridge between `gl_shader_cache` and `shader_recompiler`'s
-    /// GLSL backend. Once Maxwell3D state is plumbed into `ShaderCache`, the
-    /// graphics-pipeline build path will:
-    ///   1. Read the shader bytecode for each enabled stage out of GPU
-    ///      memory at the addresses Maxwell3D advertises in `regs`.
-    ///   2. Call this method per stage to obtain a GLSL source string.
-    ///   3. Hand the strings to `glCreateShader` / `glCompileShader` /
-    ///      `glLinkProgram` and stash the resulting program handles on
-    ///      `GraphicsPipeline`.
-    ///
-    /// Exposed as a `ShaderCache` method (rather than a free function) so
-    /// the eventual real path can pull the active GPU `Profile` and
-    /// per-pipeline `RuntimeInfo` from `self`.
-    pub fn compile_stage_glsl(&self, code: &[u64], stage: ShaderStage) -> CompiledGlslShader {
-        self.compile_stage_glsl_at_offset(code, stage, 0)
-    }
-
-    pub fn compile_stage_glsl_at_offset(
-        &self,
-        code: &[u64],
-        stage: ShaderStage,
-        base_offset: u32,
-    ) -> CompiledGlslShader {
-        let runtime_info = Self::make_runtime_info(&self.graphics_key, stage, None);
-        let mut bindings = shader_recompiler::backend::bindings::Bindings::default();
-        self.compile_stage_glsl_at_offset_with_runtime_info(
-            code,
-            stage,
-            base_offset,
-            None,
-            None,
-            &runtime_info,
-            &mut bindings,
-        )
-    }
-
-    fn compile_stage_glsl_at_offset_with_runtime_info(
-        &self,
-        code: &[u64],
-        stage: ShaderStage,
-        base_offset: u32,
-        texture_bound_buffer: Option<u32>,
-        sph: Option<&ProgramHeader>,
-        runtime_info: &RuntimeInfo,
-        bindings: &mut shader_recompiler::backend::bindings::Bindings,
-    ) -> CompiledGlslShader {
-        let compiled = if let Some(texture_bound_buffer) = texture_bound_buffer {
-            if let Some(sph) = sph {
-                compile_shader_glsl_at_offset_with_bindings_and_texture_bound_and_sph_and_host_info(
-                    code,
-                    stage,
-                    base_offset,
-                    texture_bound_buffer,
-                    sph,
-                    &self.profile,
-                    runtime_info,
-                    bindings,
-                    &self.host_info,
-                )
-            } else {
-                compile_shader_glsl_at_offset_with_bindings_and_texture_bound_and_host_info(
-                    code,
-                    stage,
-                    base_offset,
-                    texture_bound_buffer,
-                    &self.profile,
-                    runtime_info,
-                    bindings,
-                    &self.host_info,
-                )
-            }
-        } else {
-            compile_shader_glsl_at_offset_with_bindings_and_host_info(
-                code,
-                stage,
-                base_offset,
-                &self.profile,
-                runtime_info,
-                bindings,
-                &self.host_info,
-            )
-        };
-        if std::env::var_os("RUZU_DUMP_GLSL").is_some() {
-            use std::sync::atomic::{AtomicUsize, Ordering};
-            static COUNT: AtomicUsize = AtomicUsize::new(0);
-            let idx = COUNT.fetch_add(1, Ordering::Relaxed);
-            let path = format!("/tmp/ruzu_glsl_{:04}_{:?}.glsl", idx, stage);
-            let _ = std::fs::write(&path, &compiled.source);
-            log::warn!(
-                "[GLSL_DUMP] stage={:?} idx={} bytes={} path={}",
-                stage,
-                idx,
-                compiled.source.len(),
-                path
-            );
-        }
-        compiled
-    }
-
-    fn compile_stage_glsl_from_env_with_runtime_info(
-        &self,
-        env: &mut GraphicsEnvironment,
-        runtime_info: &RuntimeInfo,
-        bindings: &mut shader_recompiler::backend::bindings::Bindings,
-    ) -> CompiledGlslShader {
-        let code = env
-            .generic_environment()
-            .cached_instruction_slice()
-            .to_vec();
-        let base_offset = env.generic_environment().cached_instruction_start();
-        let compiled = compile_shader_glsl_from_env_with_bindings_and_host_info(
-            &code,
-            base_offset,
-            env,
-            &self.profile,
-            runtime_info,
-            bindings,
-            &self.host_info,
-        );
-        if std::env::var_os("RUZU_DUMP_GLSL").is_some() {
-            use std::sync::atomic::{AtomicUsize, Ordering};
-            static COUNT: AtomicUsize = AtomicUsize::new(0);
-            let idx = COUNT.fetch_add(1, Ordering::Relaxed);
-            let path = format!("/tmp/ruzu_glsl_{:04}_{:?}.glsl", idx, compiled.stage);
-            let _ = std::fs::write(&path, &compiled.source);
-            log::warn!(
-                "[GLSL_DUMP] stage={:?} idx={} bytes={} path={}",
-                compiled.stage,
-                idx,
-                compiled.source.len(),
-                path
-            );
-        }
-        compiled
-    }
-
     fn compute_pipeline_key_from_shader_and_qmd(
         shader: SharedShaderInfo,
-        qmd: &QueueMetaData,
+        qmd: &LaunchParams,
     ) -> ComputePipelineKey {
         ComputePipelineKey {
             unique_hash: shader.unique_hash,
@@ -1888,7 +1163,7 @@ impl ShaderCache {
     /// Create a new compute pipeline.
     ///
     /// Port of `ShaderCache::CreateComputePipeline(...)`.
-    fn create_compute_pipeline_with_shared_cache(
+    fn create_compute_pipeline(
         &mut self,
         shared_cache: &SharedShaderCache,
         key: &ComputePipelineKey,
@@ -1901,7 +1176,7 @@ impl ShaderCache {
         let pipeline = self.create_compute_pipeline_from_environment(key, &mut env, false);
         if pipeline.is_some() && !self.shader_cache_filename.as_os_str().is_empty() {
             serialize_pipeline(
-                key.to_cache_bytes(),
+                compute_pipeline_key_bytes(key),
                 &[env.generic_environment()],
                 &self.shader_cache_filename,
                 CACHE_VERSION,
@@ -1916,94 +1191,75 @@ impl ShaderCache {
         env: &mut ComputeEnvironment,
         force_context_flush: bool,
     ) -> Option<ComputePipeline> {
+        match catch_shader_exception(|| {
+            self.create_compute_pipeline_from_environment_unchecked(key, env, force_context_flush)
+        }) {
+            Ok(pipeline) => pipeline,
+            Err(error) => {
+                log::error!("{error}");
+                None
+            }
+        }
+    }
+
+    fn create_compute_pipeline_from_environment_unchecked(
+        &mut self,
+        key: &ComputePipelineKey,
+        env: &mut ComputeEnvironment,
+        force_context_flush: bool,
+    ) -> Option<ComputePipeline> {
         let hash = key.hash_key();
         log::info!("0x{:016x}", hash);
 
-        if *common::settings::values().dump_shaders.get_value() {
+        if *common::settings::values().dump_guest_shaders.get_value() {
             env.dump(hash, key.unique_hash);
         }
 
-        let mut bindings = shader_recompiler::backend::bindings::Bindings::default();
-        let runtime_info = RuntimeInfo::default();
         let code = env
             .generic_environment()
             .cached_instruction_slice()
             .to_vec();
         let base_offset = env.generic_environment().cached_instruction_start();
-        let (info, source, spirv_words, backend) = match self.shader_backend {
-            ShaderBackend::Glsl => {
-                let compiled = compile_shader_glsl_from_env_with_bindings_and_host_info(
-                    &code,
-                    base_offset,
-                    env,
+        let mut program =
+            translate_program_from_env_with_host_info(&code, base_offset, env, &self.host_info);
+        let glasm_runtime_info =
+            make_compute_runtime_info(&program.info, self.max_glasm_storage_buffer_blocks);
+        let backend =
+            compute_program_backend(*common::settings::values().renderer_backend.get_value());
+        let (info, source, spirv_words) = match backend {
+            ComputeProgramBackend::Glsl => {
+                let mut bindings = shader_recompiler::backend::bindings::Bindings::default();
+                let source = shader_recompiler::backend::glsl::emit_glsl(
                     &self.profile,
-                    &runtime_info,
+                    &RuntimeInfo::default(),
+                    &mut program,
                     &mut bindings,
-                    &self.host_info,
                 );
-                (
-                    compiled.info,
-                    compiled.source,
-                    Vec::new(),
-                    ComputeProgramBackend::Glsl,
-                )
+                (program.info.clone(), source, Vec::new())
             }
-            ShaderBackend::Glasm if self.use_assembly_shaders => {
-                let mut program = translate_program_from_env_with_host_info(
-                    &code,
-                    base_offset,
-                    env,
-                    &self.host_info,
-                );
+            ComputeProgramBackend::Glasm => {
+                let mut bindings = shader_recompiler::backend::bindings::Bindings::default();
                 let source = shader_recompiler::backend::glasm::emit_glasm(
                     &self.profile,
-                    &runtime_info,
+                    &glasm_runtime_info,
                     &program,
                     &mut bindings,
                 );
-                (
-                    program.info,
-                    source,
-                    Vec::new(),
-                    ComputeProgramBackend::Glasm,
-                )
+                (program.info.clone(), source, Vec::new())
             }
-            ShaderBackend::SpirV => {
-                let mut program = translate_program_from_env_with_host_info(
-                    &code,
-                    base_offset,
-                    env,
-                    &self.host_info,
-                );
-                convert_legacy_to_generic(&mut program, &runtime_info);
-                let spirv_words =
-                    shader_recompiler::backend::emit_spirv(&program, &self.profile, &runtime_info);
-                (
-                    program.info,
-                    String::new(),
-                    spirv_words,
-                    ComputeProgramBackend::SpirV,
-                )
-            }
-            ShaderBackend::Glasm => {
-                let compiled = compile_shader_glsl_from_env_with_bindings_and_host_info(
-                    &code,
-                    base_offset,
-                    env,
+            ComputeProgramBackend::SpirV => {
+                let spirv_words = shader_recompiler::backend::emit_spirv(
+                    &program,
                     &self.profile,
-                    &runtime_info,
-                    &mut bindings,
-                    &self.host_info,
+                    &RuntimeInfo::default(),
                 );
-                (
-                    compiled.info,
-                    compiled.source,
-                    Vec::new(),
-                    ComputeProgramBackend::Glsl,
-                )
+                (program.info.clone(), String::new(), spirv_words)
             }
         };
         Some(ComputePipeline::new_with_backend_state(
+            self.texture_cache?,
+            self.buffer_cache?,
+            self.program_manager.clone()?,
             info,
             &source,
             &spirv_words,
@@ -2014,12 +1270,14 @@ impl ShaderCache {
     }
 
     /// Returns the number of cached graphics pipelines.
-    pub fn graphics_pipeline_count(&self) -> usize {
+    #[cfg(test)]
+    fn graphics_pipeline_count(&self) -> usize {
         self.graphics_cache.len()
     }
 
     /// Returns the number of cached compute pipelines.
-    pub fn compute_pipeline_count(&self) -> usize {
+    #[cfg(test)]
+    fn compute_pipeline_count(&self) -> usize {
         self.compute_cache.len()
     }
 }
@@ -2042,6 +1300,29 @@ mod tests {
     use crate::engines::maxwell_3d::{EngineHint, Maxwell3D, PrimitiveTopology};
     use crate::memory_manager::MemoryManager;
     use parking_lot::Mutex as ParkingLotMutex;
+
+    static RENDERER_BACKEND_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    struct RendererBackendGuard {
+        previous: RendererBackend,
+    }
+
+    impl RendererBackendGuard {
+        fn set(backend: RendererBackend) -> Self {
+            let mut values = common::settings::values_mut();
+            let previous = *values.renderer_backend.get_value();
+            values.renderer_backend.set_value(backend);
+            Self { previous }
+        }
+    }
+
+    impl Drop for RendererBackendGuard {
+        fn drop(&mut self) {
+            common::settings::values_mut()
+                .renderer_backend
+                .set_value(self.previous);
+        }
+    }
 
     fn make_owner_backed_memory_manager(
         gpu_base: u64,
@@ -2097,13 +1378,51 @@ mod tests {
     }
 
     #[test]
+    fn null_pipeline_entries_are_retained_as_upstream_negative_cache_entries() {
+        let mut cache = ShaderCache::new_for_test();
+        cache
+            .graphics_cache
+            .insert(GraphicsPipelineKey::default(), None);
+        cache
+            .compute_cache
+            .insert(ComputePipelineKey::default(), None);
+
+        assert_eq!(cache.graphics_pipeline_count(), 1);
+        assert_eq!(cache.compute_pipeline_count(), 1);
+        assert!(cache
+            .graphics_cache
+            .get(&GraphicsPipelineKey::default())
+            .is_some_and(Option::is_none));
+        assert!(cache
+            .compute_cache
+            .get(&ComputePipelineKey::default())
+            .is_some_and(Option::is_none));
+    }
+
+    #[test]
     fn cache_version() {
-        assert_eq!(CACHE_VERSION, 10);
+        assert_eq!(CACHE_VERSION, 15);
+    }
+
+    #[test]
+    fn compute_backend_selection_never_silently_replaces_glasm() {
+        assert_eq!(
+            compute_program_backend(RendererBackend::OpenGlGlsl),
+            ComputeProgramBackend::Glsl
+        );
+        assert_eq!(
+            compute_program_backend(RendererBackend::OpenGlGlasm),
+            ComputeProgramBackend::Glasm
+        );
+        assert_eq!(
+            compute_program_backend(RendererBackend::OpenGlSpirV),
+            ComputeProgramBackend::SpirV
+        );
     }
 
     #[test]
     fn compute_pipeline_key_matches_upstream_current_compute_pipeline_fields() {
-        let mut qmd = QueueMetaData::default();
+        let mut qmd = LaunchParams::default();
         qmd.shared_alloc = 0x240;
         qmd.block_dim_x = 8;
         qmd.block_dim_y = 4;
@@ -2118,6 +1437,22 @@ mod tests {
         assert_eq!(key.unique_hash, 0x1234_5678_9ABC_DEF0);
         assert_eq!(key.shared_memory_size, 0x240);
         assert_eq!(key.workgroup_size, [8, 4, 2]);
+    }
+
+    #[test]
+    fn compute_glasm_runtime_info_uses_the_same_storage_buffer_limit_as_pipeline() {
+        let mut info = ShaderInfo::default();
+        info.storage_buffers_descriptors.push(
+            shader_recompiler::shader_info::StorageBufferDescriptor {
+                cbuf_index: 0,
+                cbuf_offset: 0,
+                count: 3,
+                is_written: false,
+            },
+        );
+
+        assert!(!make_compute_runtime_info(&info, 2).glasm_use_storage_buffers);
+        assert!(make_compute_runtime_info(&info, 3).glasm_use_storage_buffers);
     }
 
     #[test]
@@ -2141,10 +1476,33 @@ mod tests {
     }
 
     #[test]
+    fn runtime_info_invalid_fields_use_upstream_fallbacks() {
+        let mut key = GraphicsPipelineKey::default();
+        key.set_tessellation_primitive(3);
+        key.set_tessellation_spacing(3);
+        key.set_gs_input_topology(15);
+
+        let info =
+            ShaderCache::make_runtime_info(&key, ShaderStage::TessellationEval, None, false, false);
+
+        assert_eq!(info.tess_primitive, TessPrimitive::Triangles);
+        assert_eq!(info.tess_spacing, TessSpacing::Equal);
+        assert_eq!(info.input_topology, InputTopology::Points);
+    }
+
+    #[test]
     fn shared_cache_path_populates_live_graphics_key_fields_from_maxwell() {
+        let _settings_lock = RENDERER_BACKEND_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _backend = RendererBackendGuard::set(RendererBackend::OpenGlGlsl);
         let gpu_base = 0x1_0000_0000;
         let device_addr = 0x4000;
         let mut backing = vec![0u8; 0x2000];
+        let instruction_offset =
+            0x100 + std::mem::size_of::<shader_recompiler::program_header::ProgramHeader>();
+        backing[instruction_offset + 8..instruction_offset + 16]
+            .copy_from_slice(&0xE300_0000_0007_000Fu64.to_le_bytes());
         backing[0x180..0x188].copy_from_slice(&0xE2400FFFFF87000Fu64.to_le_bytes());
         let memory_manager = make_owner_backed_memory_manager(gpu_base, device_addr, &backing);
 
@@ -2188,75 +1546,71 @@ mod tests {
 
         let mut cache = ShaderCache::new_for_test();
         let pipeline = cache
-            .current_graphics_pipeline_with_shared_cache(&mut shared_cache)
+            .current_graphics_pipeline(&mut shared_cache)
             .expect("shared path should build a pipeline");
 
         assert_eq!(
-            pipeline.key.unique_hashes[1],
+            pipeline.key().unique_hashes[1],
             shared_cache.shader_info_slots()[1]
                 .map(|ptr| unsafe { &*ptr }.unique_hash)
                 .unwrap()
         );
-        assert!(pipeline.key.early_z());
-        assert!(pipeline.key.xfb_enabled());
+        assert!(pipeline.key().early_z());
+        assert!(pipeline.key().xfb_enabled());
         assert_eq!(
-            (pipeline.key.raw >> 2) & 0xF,
+            (pipeline.key().raw >> 2) & 0xF,
             PrimitiveTopology::TriangleStrip as u32
         );
-        assert_eq!((pipeline.key.raw >> 6) & 0x3, 2);
-        assert_eq!((pipeline.key.raw >> 8) & 0x3, 1);
-        assert_eq!((pipeline.key.raw >> 10) & 0x1, 1);
+        assert_eq!((pipeline.key().raw >> 6) & 0x3, 2);
+        assert_eq!((pipeline.key().raw >> 8) & 0x3, 1);
+        assert_eq!((pipeline.key().raw >> 10) & 0x1, 1);
         assert_eq!(
-            (pipeline.key.raw >> 11) & 0x7,
+            (pipeline.key().raw >> 11) & 0x7,
             EngineHint::OnHleMacro as u32
         );
-        assert_eq!(pipeline.key.xfb_state.layouts[0].stream, 3);
-        assert_eq!(pipeline.key.xfb_state.layouts[0].varying_count, 5);
-        assert_eq!(pipeline.key.xfb_state.layouts[0].stride, 0x20);
-        assert_eq!(pipeline.key.xfb_state.varyings[0][0].raw(), 0x0403_0201);
+        assert_eq!(pipeline.key().xfb_state.layouts[0].stream, 3);
+        assert_eq!(pipeline.key().xfb_state.layouts[0].varying_count, 5);
+        assert_eq!(pipeline.key().xfb_state.layouts[0].stride, 0x20);
+        assert_eq!(pipeline.key().xfb_state.varyings[0][0].raw(), 0x0403_0201);
         assert!(
-            pipeline.glsl_sources[0]
-                .as_ref()
+            pipeline
+                .glsl_source_for_test(0)
                 .is_some_and(|source| !source.is_empty()),
             "shared GraphicsEnvironment path must emit VertexB GLSL"
         );
     }
 
     #[test]
-    fn built_pipeline_async_shared_path_blocks_when_depth_is_enabled() {
-        let maxwell = make_maxwell_for_built_pipeline(64, 64, true);
-        let mut pipeline = GraphicsPipeline::new(GraphicsPipelineKey::default(), None);
-        pipeline.set_built_for_test(false);
-        assert!(ShaderCache::built_pipeline(true, Some(&maxwell), &mut pipeline).is_none());
-    }
-
-    #[test]
-    fn built_pipeline_async_shared_path_allows_small_draws() {
-        let maxwell = make_maxwell_for_built_pipeline(4, 64, false);
-        let mut pipeline = GraphicsPipeline::new(GraphicsPipelineKey::default(), None);
+    fn built_pipeline_async_shared_path_allows_small_depth_draws_like_upstream() {
+        let maxwell = make_maxwell_for_built_pipeline(4, 64, true);
+        let mut pipeline = GraphicsPipeline::new_for_test(GraphicsPipelineKey::default(), None);
         pipeline.set_built_for_test(false);
         assert!(ShaderCache::built_pipeline(true, Some(&maxwell), &mut pipeline).is_some());
     }
 
     #[test]
-    fn compile_stage_glsl_emits_non_empty_source_for_empty_code() {
-        let cache = ShaderCache::new_for_test();
-        let compiled = cache.compile_stage_glsl(&[], ShaderStage::VertexB);
-        assert!(
-            !compiled.source.is_empty(),
-            "GLSL bridge should produce non-empty source even for empty bytecode"
-        );
-        assert_eq!(compiled.stage, ShaderStage::VertexB);
+    fn built_pipeline_async_shared_path_allows_small_draws() {
+        let maxwell = make_maxwell_for_built_pipeline(4, 64, false);
+        let mut pipeline = GraphicsPipeline::new_for_test(GraphicsPipelineKey::default(), None);
+        pipeline.set_built_for_test(false);
+        assert!(ShaderCache::built_pipeline(true, Some(&maxwell), &mut pipeline).is_some());
     }
 
     #[test]
     fn opengl_fragment_profile_declares_all_frag_colors() {
         let cache = ShaderCache::new_for_test();
-        let compiled = cache.compile_stage_glsl(&[], ShaderStage::Fragment);
+        let mut program = ShaderProgram::new(ShaderStage::Fragment);
+        let mut bindings = shader_recompiler::backend::bindings::Bindings::default();
+        let source = shader_recompiler::backend::glsl::emit_glsl(
+            &cache.profile,
+            &RuntimeInfo::default(),
+            &mut program,
+            &mut bindings,
+        );
 
         for index in 0..8 {
             assert!(
-                compiled.source.contains(&format!(
+                source.contains(&format!(
                     "layout(location={})out vec4 frag_color{};",
                     index, index
                 )),
@@ -2272,10 +1626,17 @@ mod tests {
         profile.need_declared_frag_colors = false;
         let cache =
             ShaderCache::new_with_profile(profile, HostTranslateInfo::default(), false, false);
-        let compiled = cache.compile_stage_glsl(&[], ShaderStage::Fragment);
+        let mut program = ShaderProgram::new(ShaderStage::Fragment);
+        let mut bindings = shader_recompiler::backend::bindings::Bindings::default();
+        let source = shader_recompiler::backend::glsl::emit_glsl(
+            &cache.profile,
+            &RuntimeInfo::default(),
+            &mut program,
+            &mut bindings,
+        );
 
         assert!(
-            !compiled.source.contains("frag_color7"),
+            !source.contains("frag_color7"),
             "ShaderCache must pass its stored profile to GLSL compilation"
         );
     }
@@ -2301,5 +1662,26 @@ mod tests {
             reports.lock().unwrap().as_slice(),
             &[(LoadCallbackStage::Build, 2, 2)]
         );
+    }
+
+    #[test]
+    fn file_environment_shader_errors_are_caught_like_upstream() {
+        let mut environment =
+            GraphicsEnvironment::from_file_environment(FileEnvironment::default());
+        let result = catch_shader_exception(|| environment.read_texture_pixel_format(7));
+
+        assert_eq!(
+            result,
+            Err("Uncached read texture pixel format".to_string())
+        );
+    }
+
+    #[test]
+    fn shader_exception_scope_does_not_swallow_unrelated_panics() {
+        let result = std::panic::catch_unwind(|| {
+            let _: Result<(), String> = catch_shader_exception(|| panic!("ordinary panic"));
+        });
+
+        assert!(result.is_err());
     }
 }

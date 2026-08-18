@@ -8,9 +8,16 @@
 
 use std::hash::{Hash, Hasher};
 
+use crate::engines::draw_manager::Maxwell3DDrawView;
+#[cfg(test)]
+use crate::engines::draw_manager::{
+    DrawMode, DrawState, IndexBuffer, Maxwell3DDrawRegisters, VertexBuffer,
+};
+#[cfg(test)]
+use crate::engines::maxwell_3d::VertexAttribType;
 use crate::engines::maxwell_3d::{
-    BlendEquation, BlendFactor, BlendInfo, ComparisonOp, CullFace, DepthMode, DrawCall, FrontFace,
-    PolygonMode, PrimitiveTopology, StencilOp, VertexAttribType,
+    BlendEquation, BlendFactor, ComparisonOp, CullFace, DepthMode, FrontFace, PolygonMode,
+    PrimitiveTopology, StencilOp,
 };
 use crate::transform_feedback::{StreamOutLayout, TransformFeedbackLayout, TransformFeedbackState};
 
@@ -43,6 +50,47 @@ const POLYGON_OFFSET_ENABLE_LUT: [usize; 15] = [
     POLYGON, // Patches
 ];
 
+const TOPOLOGY_CLASS_REPRESENTATIVE_LUT: [PrimitiveTopology; 15] = [
+    PrimitiveTopology::Points,
+    PrimitiveTopology::Lines,
+    PrimitiveTopology::LineLoop,
+    PrimitiveTopology::LineStrip,
+    PrimitiveTopology::Triangles,
+    PrimitiveTopology::Triangles,
+    PrimitiveTopology::Triangles,
+    PrimitiveTopology::Triangles,
+    PrimitiveTopology::Triangles,
+    PrimitiveTopology::Triangles,
+    PrimitiveTopology::LinesAdjacency,
+    PrimitiveTopology::LinesAdjacency,
+    PrimitiveTopology::TrianglesAdjacency,
+    PrimitiveTopology::TrianglesAdjacency,
+    PrimitiveTopology::Patches,
+];
+
+fn is_dual_source_blend_factor(factor: BlendFactor) -> bool {
+    matches!(
+        factor,
+        BlendFactor::Src1Color
+            | BlendFactor::OneMinusSrc1Color
+            | BlendFactor::Src1Alpha
+            | BlendFactor::OneMinusSrc1Alpha
+    )
+}
+
+fn attachment0_uses_dual_source_blend(draw: &Maxwell3DDrawView<'_>) -> bool {
+    let blend = draw.blend_at(0);
+    blend.enabled
+        && [
+            blend.color_src,
+            blend.color_dst,
+            blend.alpha_src,
+            blend.alpha_dst,
+        ]
+        .into_iter()
+        .any(is_dual_source_blend_factor)
+}
+
 /// Number of render targets.
 const NUM_RENDER_TARGETS: usize = 8;
 
@@ -64,12 +112,23 @@ const NUM_VIEWPORTS: usize = 16;
 /// Port of `DynamicFeatures` struct from `fixed_pipeline_state.h`.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct DynamicFeatures {
+    pub driver_id: u32,
+    pub driver_version: u32,
     pub has_extended_dynamic_state: bool,
     pub has_extended_dynamic_state_2: bool,
-    pub has_extended_dynamic_state_2_extra: bool,
+    pub has_extended_dynamic_state_2_logic_op: bool,
+    pub has_extended_dynamic_state_2_patch_control_points: bool,
     pub has_extended_dynamic_state_3_blend: bool,
     pub has_extended_dynamic_state_3_enables: bool,
+    pub has_dynamic_state3_depth_clamp_enable: bool,
+    pub has_dynamic_state3_logic_op_enable: bool,
+    pub has_dynamic_state3_line_stipple_enable: bool,
     pub has_dynamic_vertex_input: bool,
+    pub has_color_write_enable: bool,
+    pub has_provoking_vertex: bool,
+    pub has_provoking_vertex_first_mode: bool,
+    pub has_provoking_vertex_last_mode: bool,
+    pub has_provoking_vertex_tf_preserve: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -126,7 +185,7 @@ pub fn unpack_stencil_op(packed: u32) -> StencilOp {
         StencilOp::Incr,
         StencilOp::Decr,
     ];
-    LUT[packed as usize % LUT.len()]
+    LUT[packed as usize]
 }
 
 /// Port of `FixedPipelineState::PackCullFace`.
@@ -143,7 +202,7 @@ pub fn pack_cull_face(cull: CullFace) -> u32 {
 /// Port of `FixedPipelineState::UnpackCullFace`.
 pub fn unpack_cull_face(packed: u32) -> CullFace {
     const LUT: [CullFace; 3] = [CullFace::Front, CullFace::Back, CullFace::FrontAndBack];
-    LUT[packed as usize % LUT.len()]
+    LUT[packed as usize]
 }
 
 /// Port of `FixedPipelineState::PackFrontFace`.
@@ -177,7 +236,8 @@ pub fn unpack_polygon_mode(packed: u32) -> PolygonMode {
     match packed {
         0 => PolygonMode::Point,
         1 => PolygonMode::Line,
-        _ => PolygonMode::Fill,
+        2 => PolygonMode::Fill,
+        _ => panic!("invalid packed polygon mode {packed}"),
     }
 }
 
@@ -185,11 +245,7 @@ pub fn unpack_polygon_mode(packed: u32) -> PolygonMode {
 ///
 /// Logic ops are GL-encoded starting at 0x1500.
 pub fn pack_logic_op(op: u32) -> u32 {
-    if op >= 0x1500 {
-        op - 0x1500
-    } else {
-        op
-    }
+    op.wrapping_sub(0x1500)
 }
 
 /// Port of `FixedPipelineState::UnpackLogicOp`.
@@ -217,7 +273,7 @@ pub fn unpack_blend_equation(packed: u32) -> BlendEquation {
         BlendEquation::Min,
         BlendEquation::Max,
     ];
-    LUT[packed as usize % LUT.len()]
+    LUT[packed as usize]
 }
 
 /// Port of `FixedPipelineState::PackBlendFactor`.
@@ -268,8 +324,8 @@ pub fn unpack_blend_factor(packed: u32) -> BlendFactor {
         BlendFactor::ConstantAlpha,
         BlendFactor::OneMinusConstantAlpha,
     ];
-    debug_assert!((packed as usize) < LUT.len());
-    LUT[packed as usize % LUT.len()]
+    assert!((packed as usize) < LUT.len());
+    LUT[packed as usize]
 }
 
 // ---------------------------------------------------------------------------
@@ -305,6 +361,39 @@ impl Default for BlendingAttachment {
 }
 
 impl BlendingAttachment {
+    /// Port of `FixedPipelineState::BlendingAttachment::Refresh`.
+    #[inline(never)]
+    fn refresh(&mut self, draw: &Maxwell3DDrawView<'_>, index: usize) {
+        self.raw = 0;
+        let mask = draw.color_mask(index);
+        self.set_mask(mask.r, mask.g, mask.b, mask.a);
+
+        let blend = draw.blend_at(index);
+        if !blend.enabled {
+            return;
+        }
+        if !draw.blend_per_target_enabled()
+            && draw.iterated_blend_enabled()
+            && common::settings::values().use_squashed_iterated_blend
+        {
+            self.set_equation_rgb(BlendEquation::Add);
+            self.set_equation_alpha(BlendEquation::Add);
+            self.set_source_rgb_factor(BlendFactor::One);
+            self.set_dest_rgb_factor(BlendFactor::One);
+            self.set_source_alpha_factor(BlendFactor::OneMinusSrcColor);
+            self.set_dest_alpha_factor(BlendFactor::Zero);
+            self.set_enabled(true);
+            return;
+        }
+        self.set_equation_rgb(blend.color_op);
+        self.set_equation_alpha(blend.alpha_op);
+        self.set_source_rgb_factor(blend.color_src);
+        self.set_dest_rgb_factor(blend.color_dst);
+        self.set_source_alpha_factor(blend.alpha_src);
+        self.set_dest_alpha_factor(blend.alpha_dst);
+        self.set_enabled(true);
+    }
+
     /// Port of `BlendingAttachment::Mask`.
     pub fn mask(&self) -> [bool; 4] {
         [
@@ -540,6 +629,7 @@ pub const STENCIL_BACK: StencilFace = StencilFace { position: 12 };
 /// - bits 6..9   : logic_op (4 bits)
 /// - bit  10     : logic_op_enable
 /// - bit  11     : depth_clamp_disabled
+/// - bit  12     : line_stipple_enable
 ///
 /// raw2 layout:
 /// - bits 0..11  : front stencil face (12 bits)
@@ -563,6 +653,71 @@ impl Default for DynamicState {
 }
 
 impl DynamicState {
+    /// Port of `FixedPipelineState::DynamicState::Refresh`.
+    #[inline(never)]
+    fn refresh(&mut self, draw: &Maxwell3DDrawView<'_>) {
+        let rasterizer = draw.rasterizer();
+        let mut front_face = pack_front_face(rasterizer.front_face);
+        if draw.window_origin_flip_y() {
+            front_face = 1 - front_face;
+        }
+
+        let depth_stencil = draw.depth_stencil();
+        let front = depth_stencil.front;
+        let back = if depth_stencil.stencil_two_side {
+            depth_stencil.back
+        } else {
+            front
+        };
+        self.set_stencil_face(0, front.fail_op, front.zfail_op, front.zpass_op, front.func);
+        self.set_stencil_face(12, back.fail_op, back.zfail_op, back.zpass_op, back.func);
+        self.set_stencil_enable(depth_stencil.stencil_enable);
+        self.set_depth_write_enable(depth_stencil.depth_write_enable);
+        self.set_depth_bounds_enable(draw.depth_bounds_enable());
+        self.set_depth_test_enable(depth_stencil.depth_test_enable);
+        self.set_front_face(unpack_front_face(front_face));
+        self.set_depth_test_func(depth_stencil.depth_func);
+        self.set_cull_face(rasterizer.cull_face);
+        self.set_cull_enable(rasterizer.cull_enable);
+    }
+
+    /// Port of `FixedPipelineState::DynamicState::Refresh2`.
+    #[inline(never)]
+    fn refresh2(
+        &mut self,
+        draw: &Maxwell3DDrawView<'_>,
+        topology: PrimitiveTopology,
+        base_features_supported: bool,
+    ) {
+        self.set_logic_op(draw.logic_op().op);
+        if base_features_supported {
+            return;
+        }
+        let rasterizer = draw.rasterizer();
+        self.set_rasterize_enable(draw.rasterize_enable());
+        self.set_primitive_restart_enable(draw.primitive_restart().enabled);
+        let depth_bias_enable = match POLYGON_OFFSET_ENABLE_LUT[topology as usize] {
+            0 => rasterizer.polygon_offset_point_enable,
+            1 => rasterizer.polygon_offset_line_enable,
+            _ => rasterizer.polygon_offset_fill_enable,
+        };
+        self.set_depth_bias_enable(depth_bias_enable);
+    }
+
+    /// Port of `FixedPipelineState::DynamicState::Refresh3`.
+    #[inline(never)]
+    fn refresh3(&mut self, draw: &Maxwell3DDrawView<'_>, features: &DynamicFeatures) {
+        if !features.has_dynamic_state3_logic_op_enable {
+            self.set_logic_op_enable(draw.logic_op().enabled);
+        }
+        if !features.has_dynamic_state3_depth_clamp_enable {
+            self.set_depth_clamp_disabled(!draw.depth_clamp_enabled());
+        }
+        if !features.has_dynamic_state3_line_stipple_enable {
+            self.set_line_stipple_enable(draw.line_stipple().enabled);
+        }
+    }
+
     // --- raw1 field accessors ---
 
     pub fn cull_face(&self) -> CullFace {
@@ -595,6 +750,10 @@ impl DynamicState {
 
     pub fn depth_clamp_disabled(&self) -> bool {
         (self.raw1 & (1 << 11)) != 0
+    }
+
+    pub fn line_stipple_enable(&self) -> bool {
+        (self.raw1 & (1 << 12)) != 0
     }
 
     // --- raw1 field setters ---
@@ -654,6 +813,14 @@ impl DynamicState {
             self.raw1 |= 1 << 11;
         } else {
             self.raw1 &= !(1 << 11);
+        }
+    }
+
+    pub fn set_line_stipple_enable(&mut self, enable: bool) {
+        if enable {
+            self.raw1 |= 1 << 12;
+        } else {
+            self.raw1 &= !(1 << 12);
         }
     }
 
@@ -772,7 +939,7 @@ pub struct FixedPipelineState {
     /// Bit layout (matches upstream raw1):
     /// - bit  0     : extended_dynamic_state
     /// - bit  1     : extended_dynamic_state_2
-    /// - bit  2     : extended_dynamic_state_2_extra
+    /// - bit  2     : extended_dynamic_state_2_logic_op
     /// - bit  3     : extended_dynamic_state_3_blend
     /// - bit  4     : extended_dynamic_state_3_enables
     /// - bit  5     : dynamic_vertex_input
@@ -805,6 +972,8 @@ pub struct FixedPipelineState {
 
     pub color_formats: [u8; NUM_RENDER_TARGETS],
 
+    pub driver_id: u32,
+    pub driver_version: u32,
     pub alpha_test_ref: u32,
     pub point_size: u32,
     pub viewport_swizzles: [u16; NUM_VIEWPORTS],
@@ -820,6 +989,10 @@ pub struct FixedPipelineState {
     /// Vertex stride is a 12-bit value, we have 4 bits to spare per element.
     pub vertex_strides: [u16; NUM_VERTEX_ARRAYS],
     pub xfb_state: TransformFeedbackState,
+    pub depth_bounds_min: u32,
+    pub depth_bounds_max: u32,
+    pub line_stipple_factor: u32,
+    pub line_stipple_pattern: u32,
 }
 
 impl Default for FixedPipelineState {
@@ -828,6 +1001,8 @@ impl Default for FixedPipelineState {
             raw1: 0,
             raw2: 0,
             color_formats: [0; NUM_RENDER_TARGETS],
+            driver_id: 0,
+            driver_version: 0,
             alpha_test_ref: 0,
             point_size: 0,
             viewport_swizzles: [0; NUM_VIEWPORTS],
@@ -838,6 +1013,10 @@ impl Default for FixedPipelineState {
             binding_divisors: [0; NUM_VERTEX_ARRAYS],
             vertex_strides: [0; NUM_VERTEX_ARRAYS],
             xfb_state: TransformFeedbackState::default(),
+            depth_bounds_min: 0,
+            depth_bounds_max: 0,
+            line_stipple_factor: 0,
+            line_stipple_pattern: 0,
         }
     }
 }
@@ -853,6 +1032,8 @@ impl PartialEq for FixedPipelineState {
         if self.raw1 != rhs.raw1
             || self.raw2 != rhs.raw2
             || self.color_formats != rhs.color_formats
+            || self.driver_id != rhs.driver_id
+            || self.driver_version != rhs.driver_version
             || self.alpha_test_ref != rhs.alpha_test_ref
             || self.point_size != rhs.point_size
             || self.viewport_swizzles != rhs.viewport_swizzles
@@ -869,7 +1050,11 @@ impl PartialEq for FixedPipelineState {
                 && self.attributes == rhs.attributes
                 && self.binding_divisors == rhs.binding_divisors
                 && self.vertex_strides == rhs.vertex_strides
-                && self.xfb_state == rhs.xfb_state;
+                && self.xfb_state == rhs.xfb_state
+                && self.depth_bounds_min == rhs.depth_bounds_min
+                && self.depth_bounds_max == rhs.depth_bounds_max
+                && self.line_stipple_factor == rhs.line_stipple_factor
+                && self.line_stipple_pattern == rhs.line_stipple_pattern;
         }
         if self.dynamic_vertex_input() && self.extended_dynamic_state_3_blend() {
             return true;
@@ -901,6 +1086,8 @@ impl Hash for FixedPipelineState {
         self.raw1.hash(state);
         self.raw2.hash(state);
         self.color_formats.hash(state);
+        self.driver_id.hash(state);
+        self.driver_version.hash(state);
         self.alpha_test_ref.hash(state);
         self.point_size.hash(state);
         self.viewport_swizzles.hash(state);
@@ -913,6 +1100,10 @@ impl Hash for FixedPipelineState {
             self.binding_divisors.hash(state);
             self.vertex_strides.hash(state);
             self.xfb_state.hash(state);
+            self.depth_bounds_min.hash(state);
+            self.depth_bounds_max.hash(state);
+            self.line_stipple_factor.hash(state);
+            self.line_stipple_pattern.hash(state);
             return;
         }
 
@@ -939,13 +1130,13 @@ impl Hash for FixedPipelineState {
 
 impl FixedPipelineState {
     pub const XFB_STATE_SIZE: usize = 4 * 3 * 4 + 4 * 32 * 4;
-    pub const PREFIX_SIZE: usize = 64;
+    pub const PREFIX_SIZE: usize = 72;
     pub const DYNAMIC_STATE_OFFSET: usize = Self::PREFIX_SIZE;
     pub const ATTRIBUTES_OFFSET: usize = Self::DYNAMIC_STATE_OFFSET + 8 + NUM_RENDER_TARGETS * 4;
     pub const VERTEX_STRIDES_OFFSET: usize =
         Self::ATTRIBUTES_OFFSET + NUM_VERTEX_ATTRIBUTES * 4 + NUM_VERTEX_ARRAYS * 4;
     pub const XFB_STATE_OFFSET: usize = Self::VERTEX_STRIDES_OFFSET + NUM_VERTEX_ARRAYS * 2;
-    pub const FULL_SIZE: usize = Self::XFB_STATE_OFFSET + Self::XFB_STATE_SIZE;
+    pub const FULL_SIZE: usize = Self::XFB_STATE_OFFSET + Self::XFB_STATE_SIZE + 4 * 4;
 
     /// Port of upstream `FixedPipelineState::Size`.
     pub fn serialized_size(&self) -> usize {
@@ -965,33 +1156,69 @@ impl FixedPipelineState {
     }
 
     pub fn write_prefix_bytes(&self, out: &mut Vec<u8>) {
-        let mut all = Vec::with_capacity(Self::FULL_SIZE);
-        push_u32(&mut all, self.raw1);
-        push_u32(&mut all, self.raw2);
-        all.extend_from_slice(&self.color_formats);
-        push_u32(&mut all, self.alpha_test_ref);
-        push_u32(&mut all, self.point_size);
-        for value in self.viewport_swizzles {
-            push_u16(&mut all, value);
+        let (all, size) = self.prefix_bytes();
+        out.extend_from_slice(&all[..size]);
+    }
+
+    /// Materialize the byte prefix used by upstream
+    /// `FixedPipelineState::Size()` without a heap allocation.
+    ///
+    /// The C++ key is a trivially-copyable object and CityHash reads this
+    /// prefix directly from its storage. Reden keeps the explicitly packed
+    /// Rust representation, so a fixed stack buffer is the equivalent input.
+    pub fn prefix_bytes(&self) -> ([u8; Self::FULL_SIZE], usize) {
+        let mut all = [0u8; Self::FULL_SIZE];
+        let mut offset = 0usize;
+        macro_rules! append {
+            ($bytes:expr) => {{
+                let bytes = $bytes;
+                let end = offset + bytes.len();
+                all[offset..end].copy_from_slice(&bytes);
+                offset = end;
+            }};
         }
-        push_u64(&mut all, self.attribute_types_or_enabled_divisors);
-        push_u32(&mut all, self.dynamic_state.raw1);
-        push_u32(&mut all, self.dynamic_state.raw2);
+
+        append!(self.raw1.to_le_bytes());
+        append!(self.raw2.to_le_bytes());
+        append!(self.color_formats);
+        append!(self.driver_id.to_le_bytes());
+        append!(self.driver_version.to_le_bytes());
+        append!(self.alpha_test_ref.to_le_bytes());
+        append!(self.point_size.to_le_bytes());
+        for value in self.viewport_swizzles {
+            append!(value.to_le_bytes());
+        }
+        append!(self.attribute_types_or_enabled_divisors.to_le_bytes());
+        append!(self.dynamic_state.raw1.to_le_bytes());
+        append!(self.dynamic_state.raw2.to_le_bytes());
         for value in self.attachments {
-            push_u32(&mut all, value.raw);
+            append!(value.raw.to_le_bytes());
         }
         for value in self.attributes {
-            push_u32(&mut all, value.raw);
+            append!(value.raw.to_le_bytes());
         }
         for value in self.binding_divisors {
-            push_u32(&mut all, value);
+            append!(value.to_le_bytes());
         }
         for value in self.vertex_strides {
-            push_u16(&mut all, value);
+            append!(value.to_le_bytes());
         }
-        write_xfb_state(&mut all, &self.xfb_state);
-        debug_assert_eq!(all.len(), Self::FULL_SIZE);
-        out.extend_from_slice(&all[..self.serialized_size()]);
+        for layout in self.xfb_state.layouts {
+            append!(layout.stream.to_le_bytes());
+            append!(layout.varying_count.to_le_bytes());
+            append!(layout.stride.to_le_bytes());
+        }
+        for buffer in self.xfb_state.varyings {
+            for varying in buffer {
+                append!(varying.raw().to_le_bytes());
+            }
+        }
+        append!(self.depth_bounds_min.to_le_bytes());
+        append!(self.depth_bounds_max.to_le_bytes());
+        append!(self.line_stipple_factor.to_le_bytes());
+        append!(self.line_stipple_pattern.to_le_bytes());
+        debug_assert_eq!(offset, Self::FULL_SIZE);
+        (all, self.serialized_size())
     }
 
     pub fn read_from_file(file: &mut std::fs::File) -> std::io::Result<Self> {
@@ -1001,6 +1228,8 @@ impl FixedPipelineState {
         state.raw1 = read_u32(file)?;
         state.raw2 = read_u32(file)?;
         file.read_exact(&mut state.color_formats)?;
+        state.driver_id = read_u32(file)?;
+        state.driver_version = read_u32(file)?;
         state.alpha_test_ref = read_u32(file)?;
         state.point_size = read_u32(file)?;
         for value in &mut state.viewport_swizzles {
@@ -1033,6 +1262,10 @@ impl FixedPipelineState {
         }
         if size >= Self::FULL_SIZE {
             state.xfb_state = read_xfb_state(file)?;
+            state.depth_bounds_min = read_u32(file)?;
+            state.depth_bounds_max = read_u32(file)?;
+            state.line_stipple_factor = read_u32(file)?;
+            state.line_stipple_pattern = read_u32(file)?;
         }
         Ok(state)
     }
@@ -1047,7 +1280,7 @@ impl FixedPipelineState {
         (self.raw1 & (1 << 1)) != 0
     }
 
-    pub fn extended_dynamic_state_2_extra(&self) -> bool {
+    pub fn extended_dynamic_state_2_logic_op(&self) -> bool {
         (self.raw1 & (1 << 2)) != 0
     }
 
@@ -1061,6 +1294,14 @@ impl FixedPipelineState {
 
     pub fn dynamic_vertex_input(&self) -> bool {
         (self.raw1 & (1 << 5)) != 0
+    }
+
+    pub fn color_write_enable_dynamic(&self) -> bool {
+        (self.raw1 & (1 << 20)) != 0
+    }
+
+    pub fn attachment0_dual_source_blend(&self) -> bool {
+        (self.raw1 & (1 << 21)) != 0
     }
 
     pub fn xfb_enabled(&self) -> bool {
@@ -1111,7 +1352,7 @@ impl FixedPipelineState {
     pub fn set_extended_dynamic_state_2(&mut self, v: bool) {
         self.set_bit_raw1(1, v);
     }
-    pub fn set_extended_dynamic_state_2_extra(&mut self, v: bool) {
+    pub fn set_extended_dynamic_state_2_logic_op(&mut self, v: bool) {
         self.set_bit_raw1(2, v);
     }
     pub fn set_extended_dynamic_state_3_blend(&mut self, v: bool) {
@@ -1122,6 +1363,12 @@ impl FixedPipelineState {
     }
     pub fn set_dynamic_vertex_input(&mut self, v: bool) {
         self.set_bit_raw1(5, v);
+    }
+    pub fn set_color_write_enable_dynamic(&mut self, v: bool) {
+        self.set_bit_raw1(20, v);
+    }
+    pub fn set_attachment0_dual_source_blend(&mut self, v: bool) {
+        self.set_bit_raw1(21, v);
     }
     pub fn set_xfb_enabled(&mut self, v: bool) {
         self.set_bit_raw1(6, v);
@@ -1268,231 +1515,195 @@ impl FixedPipelineState {
         ((self.attribute_types_or_enabled_divisors >> (index * 2)) & 0b11) as u32
     }
 
-    /// Populate from a Maxwell3D DrawCall state snapshot.
-    ///
-    /// This bridges the existing DrawCall-based API to the new bit-packed layout.
-    /// A full port of `FixedPipelineState::Refresh(Maxwell3D&, DynamicFeatures&)`
-    /// requires direct register access; this intermediate form captures the
-    /// essential state from the DrawCall abstraction.
     /// Port of `FixedPipelineState::Refresh(Tegra::Engines::Maxwell3D&,
-    /// DynamicFeatures&)`. Fields covered by a supported dynamic-state
-    /// extension are LEFT AT ZERO, exactly like upstream: they are provided
-    /// dynamically at draw time (`update_dynamic_states`,
-    /// `cmd_bind_vertex_buffers2`), so including their per-draw values in
-    /// the pipeline key explodes one logical pipeline into hundreds of
-    pub fn refresh(&mut self, draw: &DrawCall, features: &DynamicFeatures) {
-        self.raw1 = 0;
-        self.raw2 = 0;
+    /// DynamicFeatures&)`.
+    pub fn refresh(&mut self, draw: &mut Maxwell3DDrawView<'_>, features: &DynamicFeatures) {
+        let topology = draw.draw_state().topology;
 
-        // Upstream assigns the feature flags first (fixed_pipeline_state.cpp:56-61).
+        self.driver_id = features.driver_id;
+        self.driver_version = features.driver_version;
+
+        self.raw1 = 0;
         self.set_extended_dynamic_state(features.has_extended_dynamic_state);
         self.set_extended_dynamic_state_2(features.has_extended_dynamic_state_2);
-        self.set_extended_dynamic_state_2_extra(features.has_extended_dynamic_state_2_extra);
+        self.set_extended_dynamic_state_2_logic_op(features.has_extended_dynamic_state_2_logic_op);
         self.set_extended_dynamic_state_3_blend(features.has_extended_dynamic_state_3_blend);
         self.set_extended_dynamic_state_3_enables(features.has_extended_dynamic_state_3_enables);
+        self.set_color_write_enable_dynamic(features.has_color_write_enable);
         self.set_dynamic_vertex_input(features.has_dynamic_vertex_input);
-
-        self.attribute_types_or_enabled_divisors = 0;
-        self.binding_divisors = [0; NUM_VERTEX_ARRAYS];
-        if features.has_dynamic_vertex_input {
-            for (index, attrib) in draw.vertex_attribs.iter().enumerate() {
-                let ty: u32 = match attrib.attrib_type {
-                    VertexAttribType::SInt => 2,
-                    VertexAttribType::UInt => 3,
-                    VertexAttribType::Invalid => 0,
-                    VertexAttribType::SNorm
-                    | VertexAttribType::UNorm
-                    | VertexAttribType::UScaled
-                    | VertexAttribType::SScaled
-                    | VertexAttribType::Float => 1,
-                };
-                let mask: u32 = if attrib.constant { 0 } else { 0b11 };
-                self.attribute_types_or_enabled_divisors |= u64::from(ty & mask) << (index * 2);
-            }
-        } else {
-            for (index, stream) in draw.vertex_streams.iter().enumerate() {
-                if draw.vertex_stream_instances[index] == 0 {
-                    continue;
-                }
-                self.binding_divisors[index] = stream.frequency;
-                self.attribute_types_or_enabled_divisors |= 1u64 << index;
-            }
-        }
-
-        self.set_topology(draw.topology);
-        self.set_ndc_minus_one_to_one(draw.depth_stencil.depth_mode == DepthMode::MinusOneToOne);
-        self.set_polygon_mode(draw.rasterizer.polygon_mode_front);
-        self.set_tessellation_primitive(draw.tessellation_primitive);
-        self.set_tessellation_spacing(draw.tessellation_spacing);
-        self.set_tessellation_clockwise(draw.tessellation_clockwise);
+        self.set_xfb_enabled(draw.transform_feedback_enabled());
+        self.set_ndc_minus_one_to_one(draw.depth_stencil().depth_mode == DepthMode::MinusOneToOne);
+        self.set_polygon_mode(draw.rasterizer().polygon_mode_front);
+        self.set_tessellation_primitive(draw.tessellation_domain_type());
+        self.set_tessellation_spacing(draw.tessellation_spacing());
+        self.set_tessellation_clockwise(draw.tessellation_clockwise());
         // Upstream subtracts from u32 and assigns the low five bits to the
         // bitfield. Preserve that bit pattern when the reset value is zero.
-        self.set_patch_control_points_minus_one(draw.patch_vertices.wrapping_sub(1));
-        self.set_msaa_mode_raw(draw.anti_alias_samples_mode);
-        self.set_alpha_test_func(if draw.alpha_test_enabled {
-            draw.alpha_test_func
+        self.set_patch_control_points_minus_one(draw.patch_vertices().wrapping_sub(1));
+        self.set_topology(
+            if features.has_extended_dynamic_state && features.has_extended_dynamic_state_2 {
+                TOPOLOGY_CLASS_REPRESENTATIVE_LUT[topology as usize]
+            } else {
+                topology
+            },
+        );
+        self.set_msaa_mode_raw(draw.anti_alias_samples_mode());
+        self.set_attachment0_dual_source_blend(attachment0_uses_dual_source_blend(draw));
+
+        self.raw2 = 0;
+        self.set_alpha_test_func(if draw.alpha_test_enabled() {
+            draw.alpha_test_func()
         } else {
             ComparisonOp::Always
         });
-        self.set_early_z(draw.mandated_early_z);
-        self.set_depth_enabled(draw.zeta.enabled);
-        self.set_depth_format(draw.zeta.format);
-        self.set_y_negate(draw.window_origin_lower_left);
-        self.set_provoking_vertex_last(draw.provoking_vertex_last);
-        self.set_conservative_raster_enable(draw.conservative_raster_enable);
-        self.set_smooth_lines(draw.line_anti_alias_enable);
-        self.set_alpha_to_coverage_enabled(draw.anti_alias_alpha_control.alpha_to_coverage);
-        self.set_alpha_to_one_enabled(draw.anti_alias_alpha_control.alpha_to_one);
-        self.set_app_stage(draw.engine_state as u32);
-        self.alpha_test_ref = draw.alpha_test_ref.to_bits();
-        self.point_size = draw.point_size.to_bits();
-        for (index, viewport) in draw.viewport_transforms.iter().enumerate() {
-            if index >= NUM_VIEWPORTS {
-                break;
+        self.set_early_z(draw.mandated_early_z());
+        let zeta = draw.zeta();
+        self.set_depth_enabled(zeta.enabled);
+        self.set_depth_format(zeta.format);
+        self.set_y_negate(draw.window_origin_lower_left());
+        let mut provoking_vertex_last = false;
+        if features.has_provoking_vertex
+            && (features.has_provoking_vertex_first_mode || features.has_provoking_vertex_last_mode)
+        {
+            provoking_vertex_last = draw.provoking_vertex_last();
+            if draw.transform_feedback_enabled() && !features.has_provoking_vertex_tf_preserve {
+                provoking_vertex_last = false;
             }
-            self.viewport_swizzles[index] = viewport.swizzle as u16;
+            if provoking_vertex_last && !features.has_provoking_vertex_last_mode {
+                provoking_vertex_last = false;
+            } else if !provoking_vertex_last && !features.has_provoking_vertex_first_mode {
+                provoking_vertex_last = true;
+            }
+        }
+        self.set_provoking_vertex_last(provoking_vertex_last);
+        self.set_conservative_raster_enable(draw.conservative_raster_enable());
+        self.set_smooth_lines(draw.line_state().line_anti_alias_enable);
+        let alpha_control = draw.anti_alias_alpha_control();
+        self.set_alpha_to_coverage_enabled(alpha_control.alpha_to_coverage);
+        self.set_alpha_to_one_enabled(alpha_control.alpha_to_one);
+        self.set_app_stage(draw.engine_state() as u32);
+        let depth_bounds = draw.depth_bounds();
+        self.depth_bounds_min = depth_bounds[0] as u32;
+        self.depth_bounds_max = depth_bounds[1] as u32;
+        let line_stipple = draw.line_stipple();
+        self.line_stipple_factor = line_stipple.factor;
+        self.line_stipple_pattern = line_stipple.pattern;
+        for index in 0..NUM_RENDER_TARGETS {
+            self.color_formats[index] = draw.render_target(index).format as u8;
+        }
+        self.alpha_test_ref = draw.alpha_test_ref().to_bits();
+        self.point_size = draw.point_state().point_size.to_bits();
+        if draw.dirty_flag(super::state_tracker::dirty::VERTEX_INPUT) {
+            if features.has_dynamic_vertex_input {
+                // Upstream deliberately leaves VertexInput dirty for the
+                // command-buffer dynamic-state update to consume.
+                const TYPE_LUT: [u32; 8] = [0, 1, 1, 2, 3, 1, 1, 1];
+                self.attribute_types_or_enabled_divisors = 0;
+                for index in 0..NUM_VERTEX_ATTRIBUTES {
+                    let attrib = draw.vertex_attrib_raw(index);
+                    let ty = TYPE_LUT[((attrib >> 27) & 0x7) as usize];
+                    let mask: u32 = if attrib & (1 << 6) != 0 { 0 } else { 0b11 };
+                    self.attribute_types_or_enabled_divisors |= u64::from(ty & mask) << (index * 2);
+                }
+            } else {
+                draw.clear_dirty_flag(super::state_tracker::dirty::VERTEX_INPUT);
+                self.attribute_types_or_enabled_divisors = 0;
+                for index in 0..NUM_VERTEX_ARRAYS {
+                    let stream = draw.vertex_stream(index);
+                    let is_enabled = draw.vertex_stream_instance(index) != 0;
+                    self.binding_divisors[index] = if is_enabled { stream.frequency } else { 0 };
+                    self.attribute_types_or_enabled_divisors |= u64::from(is_enabled) << index;
+                }
+                for index in 0..NUM_VERTEX_ATTRIBUTES {
+                    let attrib = draw.vertex_attrib_raw(index);
+                    self.attributes[index].raw = u32::from(attrib & (1 << 6) == 0)
+                        | ((attrib & 0x1f) << 1)
+                        | (((attrib >> 7) & 0x3fff) << 6)
+                        | (((attrib >> 27) & 0x7) << 20)
+                        | (((attrib >> 21) & 0x3f) << 23);
+                }
+            }
+        }
+        if draw.dirty_flag(super::state_tracker::dirty::VIEWPORT_SWIZZLES) {
+            draw.clear_dirty_flag(super::state_tracker::dirty::VIEWPORT_SWIZZLES);
+            for index in 0..NUM_VIEWPORTS {
+                self.viewport_swizzles[index] = draw.viewport_transform(index).swizzle as u16;
+            }
         }
         // Upstream zeroes dynamic_state then refreshes each group only when
         // the covering extension is NOT supported
         // (fixed_pipeline_state.cpp:142-165):
         //   - !extended_dynamic_state         → DynamicState::Refresh + vertex_strides
-        //   - !extended_dynamic_state_2_extra → DynamicState::Refresh2 (logic_op always;
+        //   - !extended_dynamic_state_2_logic_op → DynamicState::Refresh2 (logic_op always;
         //                                       rasterize/primitive_restart/depth_bias
         //                                       only when !extended_dynamic_state_2)
         //   - !extended_dynamic_state_3_blend → attachments
-        //   - !extended_dynamic_state_3_enables → DynamicState::Refresh3
+        //   - Refresh3 always runs and retains only the granular EDS3 fields
+        //     that the device cannot make dynamic.
         self.dynamic_state = DynamicState::default();
         if !features.has_extended_dynamic_state {
-            // Port of DynamicState::Refresh(regs).
-            self.dynamic_state
-                .set_cull_enable(draw.rasterizer.cull_enable);
-            self.dynamic_state.set_cull_face(draw.rasterizer.cull_face);
-            let mut front_face = pack_front_face(draw.rasterizer.front_face);
-            if draw.window_origin_flip_y {
-                // Upstream flips the packed front-face bit when
-                // `regs.window_origin.flip_y != 0`.
-                front_face = 1 - front_face;
-            }
-            self.dynamic_state
-                .set_front_face(unpack_front_face(front_face));
-            self.dynamic_state
-                .set_depth_test_enable(draw.depth_stencil.depth_test_enable);
-            self.dynamic_state
-                .set_depth_write_enable(draw.depth_stencil.depth_write_enable);
-            self.dynamic_state
-                .set_depth_bounds_enable(draw.depth_bounds_enable);
-            self.dynamic_state
-                .set_depth_test_func(draw.depth_stencil.depth_func);
-            self.dynamic_state
-                .set_stencil_enable(draw.depth_stencil.stencil_enable);
-        }
-        if !features.has_extended_dynamic_state_2_extra {
-            // Port of DynamicState::Refresh2(regs, topology, eds2).
-            self.dynamic_state.set_logic_op(draw.logic_op.op);
-            if !features.has_extended_dynamic_state_2 {
-                let depth_bias_enable = match POLYGON_OFFSET_ENABLE_LUT[draw.topology as usize] {
-                    0 => draw.rasterizer.polygon_offset_point_enable,
-                    1 => draw.rasterizer.polygon_offset_line_enable,
-                    _ => draw.rasterizer.polygon_offset_fill_enable,
-                };
-                self.dynamic_state.set_depth_bias_enable(depth_bias_enable);
-                self.dynamic_state
-                    .set_rasterize_enable(draw.rasterize_enable);
-                self.dynamic_state
-                    .set_primitive_restart_enable(draw.primitive_restart.enabled);
+            self.dynamic_state.refresh(draw);
+            for index in 0..NUM_VERTEX_ARRAYS {
+                self.vertex_strides[index] = draw.vertex_stream(index).stride as u16;
             }
         }
-        if !features.has_extended_dynamic_state_3_enables {
-            // Port of DynamicState::Refresh3(regs).
+        if !features.has_extended_dynamic_state_2_logic_op {
             self.dynamic_state
-                .set_logic_op_enable(draw.logic_op.enabled);
-            self.dynamic_state
-                .set_depth_clamp_disabled(!draw.depth_clamp_enabled);
+                .refresh2(draw, topology, features.has_extended_dynamic_state_2);
         }
-
-        // Populate color formats from render targets
-        for (i, rt) in draw.render_targets.iter().enumerate() {
-            self.color_formats[i] = rt.format as u8;
-        }
-
         // Populate blend attachments.
         // Upstream refreshes them only when !extended_dynamic_state_3_blend.
-        if !features.has_extended_dynamic_state_3_blend {
-            for (i, blend) in draw.blend.iter().enumerate() {
-                let mut att = BlendingAttachment::default();
-                let mask = draw.color_masks[i];
-                // Upstream writes the color mask before returning early when
-                // blending is disabled. The mask is independent pipeline
-                // state and must survive disk-cache reconstruction.
-                att.set_mask(mask.r, mask.g, mask.b, mask.a);
-                if blend.enabled {
-                    att.set_enabled(true);
-                    att.set_equation_rgb(blend.color_op);
-                    att.set_equation_alpha(blend.alpha_op);
-                    att.set_source_rgb_factor(blend.color_src);
-                    att.set_dest_rgb_factor(blend.color_dst);
-                    att.set_source_alpha_factor(blend.alpha_src);
-                    att.set_dest_alpha_factor(blend.alpha_dst);
+        if !features.has_extended_dynamic_state_3_blend
+            && draw.dirty_flag(super::state_tracker::dirty::BLENDING)
+        {
+            draw.clear_dirty_flag(super::state_tracker::dirty::BLENDING);
+            for i in 0..NUM_RENDER_TARGETS {
+                let attachment = &mut self.attachments[i];
+                attachment.refresh(draw, i);
+                let mask = attachment.mask();
+                if features.has_color_write_enable && !mask[0] && !mask[1] && !mask[2] && !mask[3] {
+                    // Upstream makes fully disabled attachments statically writable;
+                    // `VK_EXT_color_write_enable` supplies the actual all-off state.
+                    attachment.set_mask(true, true, true, true);
                 }
-                self.attachments[i] = att;
-            }
-        } else {
-            self.attachments = [BlendingAttachment::default(); NUM_RENDER_TARGETS];
-        }
-
-        // Populate vertex attributes
-        for (i, attrib) in draw.vertex_attribs.iter().enumerate() {
-            if i >= NUM_VERTEX_ATTRIBUTES {
-                break;
-            }
-            let mut va = VertexAttribute::default();
-            va.set_enabled(!attrib.constant);
-            va.set_buffer(attrib.buffer_index as u32);
-            va.set_offset(attrib.offset as u32);
-            // Upstream packs the raw hardware register values
-            // (`attribute.type.Assign(input.type.Value())`), which is what
-            // `VertexAttribType::from_raw` / `VertexAttribSize::from_raw`
-            // expect when the state is read back (disk pipeline rebuild,
-            // `cast_attribute_type_from_state`). Storing the Rust enum
-            // ordinals here shifted every type by one (Float read back as
-            // SScaled) and mapped most sizes to Invalid — cached pipelines
-            // were then rebuilt with wrong or silently dropped vertex
-            // attributes (MoltenVK: "Vertex attribute m_NN is missing from
-            // the vertex descriptor").
-            va.set_type(attrib.attrib_type.to_raw());
-            va.set_size(attrib.size.to_raw());
-            self.attributes[i] = va;
-        }
-
-        // Upstream stores strides only when EDS1 is unavailable. With EDS1,
-        // `VK_DYNAMIC_STATE_VERTEX_INPUT_BINDING_STRIDE` and
-        // `vkCmdBindVertexBuffers2` own the current values.
-        self.vertex_strides = [0; NUM_VERTEX_ARRAYS];
-        if !features.has_extended_dynamic_state {
-            for (index, stream) in draw.vertex_streams.iter().enumerate() {
-                self.vertex_strides[index] = stream.stride as u16;
             }
         }
 
-        self.set_xfb_enabled(draw.transform_feedback_enabled);
+        self.dynamic_state.refresh3(draw, features);
+
         if self.xfb_enabled() {
-            self.xfb_state = draw.transform_feedback_state;
-        } else {
-            self.xfb_state = TransformFeedbackState::default();
+            self.xfb_state = draw.transform_feedback_state();
         }
     }
-}
 
-fn write_xfb_state(out: &mut Vec<u8>, state: &TransformFeedbackState) {
-    for layout in state.layouts {
-        push_u32(out, layout.stream);
-        push_u32(out, layout.varying_count);
-        push_u32(out, layout.stride);
-    }
-    for buffer in state.varyings {
-        for varying in buffer {
-            push_u32(out, varying.raw());
-        }
+    #[cfg(test)]
+    fn refresh_draw_call_for_test(
+        &mut self,
+        draw: &crate::engines::maxwell_3d::DrawCall,
+        features: &DynamicFeatures,
+    ) {
+        let draw_state = DrawState {
+            topology: draw.topology,
+            draw_mode: DrawMode::General,
+            draw_indexed: draw.indexed,
+            base_index: draw.base_vertex as u32,
+            vertex_buffer: VertexBuffer {
+                first: draw.vertex_first,
+                count: draw.vertex_count,
+            },
+            index_buffer: IndexBuffer {
+                first: draw.index_buffer_first,
+                count: draw.index_buffer_count,
+                format: draw.index_format,
+            },
+            base_instance: draw.base_instance,
+            instance_count: draw.instance_count,
+            inline_index_draw_indexes: draw.inline_index_data.clone(),
+        };
+        let registers = Maxwell3DDrawRegisters::from_draw_call(draw);
+        let mut draw_view =
+            Maxwell3DDrawView::with_register_snapshot(&draw_state, draw.indexed, registers);
+        self.refresh(&mut draw_view, features);
     }
 }
 
@@ -1510,18 +1721,6 @@ fn read_xfb_state(file: &mut std::fs::File) -> std::io::Result<TransformFeedback
         }
     }
     Ok(TransformFeedbackState { layouts, varyings })
-}
-
-fn push_u16(out: &mut Vec<u8>, value: u16) {
-    out.extend_from_slice(&value.to_le_bytes());
-}
-
-fn push_u32(out: &mut Vec<u8>, value: u32) {
-    out.extend_from_slice(&value.to_le_bytes());
-}
-
-fn push_u64(out: &mut Vec<u8>, value: u64) {
-    out.extend_from_slice(&value.to_le_bytes());
 }
 
 fn read_u16(file: &mut std::fs::File) -> std::io::Result<u16> {
@@ -1549,10 +1748,11 @@ fn read_u64(file: &mut std::fs::File) -> std::io::Result<u64> {
 mod tests {
     use super::*;
     use crate::engines::maxwell_3d::{
-        AntiAliasAlphaControlInfo, BlendColorInfo, ColorMaskInfo, ConstBufferBinding, DepthMode,
-        DepthStencilInfo, IndexFormat, LogicOpInfo, RasterizerInfo, RenderTargetInfo,
-        RtControlInfo, SamplerBinding, ScissorInfo, ShaderStageInfo, StencilFaceInfo,
-        VertexAttribInfo, VertexAttribSize, VertexStreamInfo, ViewportInfo, ZetaInfo,
+        AntiAliasAlphaControlInfo, BlendColorInfo, BlendInfo, ColorMaskInfo, ConstBufferBinding,
+        DepthMode, DepthStencilInfo, DrawCall, IndexFormat, LogicOpInfo, RasterizerInfo,
+        RenderTargetInfo, RtControlInfo, SamplerBinding, ScissorInfo, ShaderStageInfo,
+        StencilFaceInfo, VertexAttribInfo, VertexAttribSize, VertexStreamInfo, ViewportInfo,
+        ZetaInfo,
     };
     use std::collections::hash_map::DefaultHasher;
 
@@ -1564,12 +1764,12 @@ mod tests {
 
     #[test]
     fn fixed_pipeline_state_serialized_offsets_match_upstream() {
-        assert_eq!(FixedPipelineState::DYNAMIC_STATE_OFFSET, 64);
-        assert_eq!(FixedPipelineState::ATTRIBUTES_OFFSET, 104);
-        assert_eq!(FixedPipelineState::VERTEX_STRIDES_OFFSET, 360);
-        assert_eq!(FixedPipelineState::XFB_STATE_OFFSET, 424);
+        assert_eq!(FixedPipelineState::DYNAMIC_STATE_OFFSET, 72);
+        assert_eq!(FixedPipelineState::ATTRIBUTES_OFFSET, 112);
+        assert_eq!(FixedPipelineState::VERTEX_STRIDES_OFFSET, 368);
+        assert_eq!(FixedPipelineState::XFB_STATE_OFFSET, 432);
         assert_eq!(FixedPipelineState::XFB_STATE_SIZE, 560);
-        assert_eq!(FixedPipelineState::FULL_SIZE, 984);
+        assert_eq!(FixedPipelineState::FULL_SIZE, 1008);
 
         let mut state = FixedPipelineState::default();
         assert_eq!(
@@ -1687,6 +1887,9 @@ mod tests {
             window_origin_flip_y: false,
             surface_clip: Default::default(),
             blend: [BlendInfo::default(); NUM_RENDER_TARGETS],
+            blend_per_target_enabled: false,
+            global_blend: BlendInfo::default(),
+            iterated_blend_enabled: false,
             blend_color: BlendColorInfo {
                 r: 0.0,
                 g: 0.0,
@@ -1724,6 +1927,7 @@ mod tests {
             engine_state: crate::engines::maxwell_3d::EngineHint::None,
             provoking_vertex_last: false,
             depth_bounds_enable: false,
+            depth_bounds: [0.0, 1.0],
             mandated_early_z: false,
             alpha_test_enabled: false,
             alpha_test_func: ComparisonOp::Always,
@@ -1736,6 +1940,7 @@ mod tests {
             anti_alias_samples_mode: 0,
             anti_alias_alpha_control: AntiAliasAlphaControlInfo::default(),
             line_anti_alias_enable: false,
+            line_stipple: Default::default(),
             program_base_address: 0,
             cb_bindings: [[ConstBufferBinding::default(); 18]; 5],
             vertex_attribs: Default::default(),
@@ -1755,7 +1960,7 @@ mod tests {
             zeta: ZetaInfo::default(),
             transform_feedback_enabled: false,
             transform_feedback_state: Default::default(),
-            dirty_flags: [false; 256],
+            dirty_flags: [true; 256],
         }
     }
 
@@ -1790,7 +1995,7 @@ mod tests {
         };
 
         let mut state = FixedPipelineState::default();
-        state.refresh(&draw, &DynamicFeatures::default());
+        state.refresh_draw_call_for_test(&draw, &DynamicFeatures::default());
 
         assert_eq!(state.binding_divisors[5], 5);
         assert_ne!(state.attribute_types_or_enabled_divisors & (1 << 5), 0);
@@ -1806,6 +2011,48 @@ mod tests {
         );
         assert_eq!(state.attributes[7].buffer(), 5);
         assert_eq!(state.attributes[7].offset(), 12);
+    }
+
+    #[test]
+    fn refresh_consumes_and_reuses_upstream_dirty_gated_state() {
+        let draw = make_test_draw_call();
+        let draw_state = DrawState {
+            topology: draw.topology,
+            draw_mode: DrawMode::General,
+            draw_indexed: draw.indexed,
+            base_index: draw.base_vertex as u32,
+            vertex_buffer: VertexBuffer {
+                first: draw.vertex_first,
+                count: draw.vertex_count,
+            },
+            index_buffer: IndexBuffer {
+                first: draw.index_buffer_first,
+                count: draw.index_buffer_count,
+                format: draw.index_format,
+            },
+            base_instance: draw.base_instance,
+            instance_count: draw.instance_count,
+            inline_index_draw_indexes: draw.inline_index_data.clone(),
+        };
+        let registers = Maxwell3DDrawRegisters::from_draw_call(&draw);
+        let mut draw_view =
+            Maxwell3DDrawView::with_register_snapshot(&draw_state, draw.indexed, registers);
+        let mut state = FixedPipelineState::default();
+
+        state.refresh(&mut draw_view, &DynamicFeatures::default());
+        let flags = draw_view.dirty_flags();
+        assert!(!flags[super::super::state_tracker::dirty::VERTEX_INPUT as usize]);
+        assert!(!flags[super::super::state_tracker::dirty::VIEWPORT_SWIZZLES as usize]);
+        assert!(!flags[super::super::state_tracker::dirty::BLENDING as usize]);
+
+        state.attributes[0].raw = 0x1234_5678;
+        state.attachments[0].raw = 0x8765_4321;
+        state.viewport_swizzles[0] = 0xCAFE;
+        state.refresh(&mut draw_view, &DynamicFeatures::default());
+
+        assert_eq!(state.attributes[0].raw, 0x1234_5678);
+        assert_eq!(state.attachments[0].raw, 0x8765_4321);
+        assert_eq!(state.viewport_swizzles[0], 0xCAFE);
     }
 
     #[test]
@@ -1828,7 +2075,7 @@ mod tests {
         draw.vertex_attribs[0].size = VertexAttribSize::R32G32B32A32;
 
         let mut state = FixedPipelineState::default();
-        state.refresh(&draw, &DynamicFeatures::default());
+        state.refresh_draw_call_for_test(&draw, &DynamicFeatures::default());
 
         // The packed bits must hold the raw Maxwell encodings (upstream
         // `attribute.type.Assign(input.type.Value())`), so `from_raw` on
@@ -1858,7 +2105,7 @@ mod tests {
         };
 
         let mut state = FixedPipelineState::default();
-        state.refresh(&draw, &DynamicFeatures::default());
+        state.refresh_draw_call_for_test(&draw, &DynamicFeatures::default());
 
         assert!(!state.attachments[0].is_enabled());
         assert_eq!(state.attachments[0].mask(), [true, false, true, false]);
@@ -1879,6 +2126,44 @@ mod tests {
     }
 
     #[test]
+    fn refresh_applies_upstream_squashed_iterated_blend_override() {
+        let previous = common::settings::values().use_squashed_iterated_blend;
+        common::settings::values_mut().use_squashed_iterated_blend = true;
+
+        let mut draw = make_test_draw_call();
+        draw.blend[0] = BlendInfo {
+            enabled: true,
+            separate_alpha: true,
+            color_op: BlendEquation::Subtract,
+            color_src: BlendFactor::SrcAlpha,
+            color_dst: BlendFactor::OneMinusSrcAlpha,
+            alpha_op: BlendEquation::Max,
+            alpha_src: BlendFactor::DstAlpha,
+            alpha_dst: BlendFactor::OneMinusDstAlpha,
+        };
+        draw.global_blend = draw.blend[0];
+        draw.blend_per_target_enabled = false;
+        draw.iterated_blend_enabled = true;
+
+        let mut state = FixedPipelineState::default();
+        state.refresh_draw_call_for_test(&draw, &DynamicFeatures::default());
+        let attachment = state.attachments[0];
+
+        common::settings::values_mut().use_squashed_iterated_blend = previous;
+
+        assert!(attachment.is_enabled());
+        assert_eq!(attachment.equation_rgb(), BlendEquation::Add);
+        assert_eq!(attachment.equation_alpha(), BlendEquation::Add);
+        assert_eq!(attachment.source_rgb_factor(), BlendFactor::One);
+        assert_eq!(attachment.dest_rgb_factor(), BlendFactor::One);
+        assert_eq!(
+            attachment.source_alpha_factor(),
+            BlendFactor::OneMinusSrcColor
+        );
+        assert_eq!(attachment.dest_alpha_factor(), BlendFactor::Zero);
+    }
+
+    #[test]
     fn refresh_leaves_extension_covered_fields_zero_like_upstream() {
         // Upstream fixed_pipeline_state.cpp:142-165: fields covered by a
         // supported dynamic-state extension are never refreshed into the
@@ -1896,7 +2181,7 @@ mod tests {
             ..Default::default()
         };
         let mut state = FixedPipelineState::default();
-        state.refresh(&draw, &features);
+        state.refresh_draw_call_for_test(&draw, &features);
 
         // EDS1-covered dynamic_state fields stay zero…
         assert!(!state.dynamic_state.cull_enable());
@@ -1915,7 +2200,7 @@ mod tests {
             op: 0x1503,
         };
         let mut logic_state = FixedPipelineState::default();
-        logic_state.refresh(&logic_draw, &features);
+        logic_state.refresh_draw_call_for_test(&logic_draw, &features);
         assert!(logic_state.dynamic_state.logic_op_enable());
 
         // Two draws differing only in EDS1-covered dynamic state →
@@ -1925,7 +2210,7 @@ mod tests {
         other_draw.depth_stencil.depth_test_enable = false;
         other_draw.vertex_streams[0].stride = 64;
         let mut other_state = FixedPipelineState::default();
-        other_state.refresh(&other_draw, &features);
+        other_state.refresh_draw_call_for_test(&other_draw, &features);
         assert_eq!(state, other_state);
         assert_eq!(hash_state(&state), hash_state(&other_state));
     }
@@ -1935,13 +2220,15 @@ mod tests {
         let features = DynamicFeatures {
             has_extended_dynamic_state: true,
             has_extended_dynamic_state_2: true,
-            has_extended_dynamic_state_2_extra: true,
+            has_extended_dynamic_state_2_logic_op: true,
             has_extended_dynamic_state_3_blend: false,
             has_extended_dynamic_state_3_enables: true,
+            has_color_write_enable: false,
             has_dynamic_vertex_input: true,
+            ..Default::default()
         };
         let mut state = FixedPipelineState::default();
-        state.refresh(&make_test_draw_call(), &features);
+        state.refresh_draw_call_for_test(&make_test_draw_call(), &features);
 
         assert_eq!(state.raw1 & 0x3f, 0x37);
         assert_eq!(
@@ -1970,8 +2257,14 @@ mod tests {
         draw.rasterizer.polygon_offset_line_enable = false;
         draw.rasterizer.polygon_offset_fill_enable = true;
 
+        let features = DynamicFeatures {
+            has_provoking_vertex: true,
+            has_provoking_vertex_first_mode: true,
+            has_provoking_vertex_last_mode: true,
+            ..Default::default()
+        };
         let mut state = FixedPipelineState::default();
-        state.refresh(&draw, &DynamicFeatures::default());
+        state.refresh_draw_call_for_test(&draw, &features);
 
         assert!(!state.dynamic_state.rasterize_enable());
         assert!(!state.dynamic_state.depth_bias_enable());
@@ -1988,8 +2281,113 @@ mod tests {
         assert_eq!(state.viewport_swizzles[0], 0x3210);
 
         draw.rasterizer.polygon_offset_line_enable = true;
-        state.refresh(&draw, &DynamicFeatures::default());
+        state.refresh_draw_call_for_test(&draw, &features);
         assert!(state.dynamic_state.depth_bias_enable());
+    }
+
+    #[test]
+    fn refresh_collapses_topology_only_when_eds1_and_eds2_are_available() {
+        let mut draw = make_test_draw_call();
+        draw.topology = PrimitiveTopology::TriangleStrip;
+
+        let mut state = FixedPipelineState::default();
+        state.refresh_draw_call_for_test(&draw, &DynamicFeatures::default());
+        assert_eq!(state.topology(), PrimitiveTopology::TriangleStrip);
+
+        state.refresh_draw_call_for_test(
+            &draw,
+            &DynamicFeatures {
+                has_extended_dynamic_state: true,
+                has_extended_dynamic_state_2: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(state.topology(), PrimitiveTopology::Triangles);
+    }
+
+    #[test]
+    fn refresh3_keeps_only_unsupported_granular_state_in_the_key() {
+        let mut draw = make_test_draw_call();
+        draw.logic_op.enabled = true;
+        draw.depth_clamp_enabled = false;
+        draw.line_stipple.enabled = true;
+
+        let mut state = FixedPipelineState::default();
+        state.refresh_draw_call_for_test(
+            &draw,
+            &DynamicFeatures {
+                has_dynamic_state3_logic_op_enable: true,
+                has_dynamic_state3_depth_clamp_enable: false,
+                has_dynamic_state3_line_stipple_enable: true,
+                ..Default::default()
+            },
+        );
+
+        assert!(!state.dynamic_state.logic_op_enable());
+        assert!(state.dynamic_state.depth_clamp_disabled());
+        assert!(!state.dynamic_state.line_stipple_enable());
+    }
+
+    #[test]
+    fn refresh_preserves_upstream_full_state_tail_and_dual_source_bit() {
+        let mut draw = make_test_draw_call();
+        draw.transform_feedback_enabled = true;
+        draw.depth_bounds = [3.75, 9.5];
+        draw.line_stipple.factor = 7;
+        draw.line_stipple.pattern = 0xa55a;
+        draw.blend[0].enabled = true;
+        draw.blend[0].color_src = BlendFactor::Src1Color;
+
+        let mut state = FixedPipelineState::default();
+        state.refresh_draw_call_for_test(
+            &draw,
+            &DynamicFeatures {
+                driver_id: 42,
+                driver_version: 73,
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(state.driver_id, 42);
+        assert_eq!(state.driver_version, 73);
+        assert_eq!(state.depth_bounds_min, 3);
+        assert_eq!(state.depth_bounds_max, 9);
+        assert_eq!(state.line_stipple_factor, 7);
+        assert_eq!(state.line_stipple_pattern, 0xa55a);
+        assert!(state.attachment0_dual_source_blend());
+        assert_eq!(state.serialized_size(), FixedPipelineState::FULL_SIZE);
+    }
+
+    #[test]
+    fn provoking_vertex_falls_back_like_upstream_with_transform_feedback() {
+        let mut draw = make_test_draw_call();
+        draw.provoking_vertex_last = true;
+        draw.transform_feedback_enabled = true;
+
+        let mut state = FixedPipelineState::default();
+        state.refresh_draw_call_for_test(
+            &draw,
+            &DynamicFeatures {
+                has_provoking_vertex: true,
+                has_provoking_vertex_first_mode: true,
+                has_provoking_vertex_last_mode: true,
+                has_provoking_vertex_tf_preserve: false,
+                ..Default::default()
+            },
+        );
+        assert!(!state.provoking_vertex_last());
+
+        state.refresh_draw_call_for_test(
+            &draw,
+            &DynamicFeatures {
+                has_provoking_vertex: true,
+                has_provoking_vertex_first_mode: true,
+                has_provoking_vertex_last_mode: true,
+                has_provoking_vertex_tf_preserve: true,
+                ..Default::default()
+            },
+        );
+        assert!(state.provoking_vertex_last());
     }
 
     #[test]
@@ -1998,7 +2396,7 @@ mod tests {
         draw.patch_vertices = 0;
 
         let mut state = FixedPipelineState::default();
-        state.refresh(&draw, &DynamicFeatures::default());
+        state.refresh_draw_call_for_test(&draw, &DynamicFeatures::default());
 
         // Upstream assigns `(u32{0} - 1)` to a five-bit bitfield.
         assert_eq!(state.patch_control_points_minus_one(), 0x1f);
@@ -2120,11 +2518,11 @@ mod tests {
         draw.window_origin_flip_y = false;
 
         let mut state = FixedPipelineState::default();
-        state.refresh(&draw, &DynamicFeatures::default());
+        state.refresh_draw_call_for_test(&draw, &DynamicFeatures::default());
         assert_eq!(state.dynamic_state.front_face(), FrontFace::CCW);
 
         draw.window_origin_flip_y = true;
-        state.refresh(&draw, &DynamicFeatures::default());
+        state.refresh_draw_call_for_test(&draw, &DynamicFeatures::default());
         assert_eq!(state.dynamic_state.front_face(), FrontFace::CW);
     }
 
@@ -2136,9 +2534,9 @@ mod tests {
         zeta_draw.zeta.format = 7;
 
         let mut no_zeta = FixedPipelineState::default();
-        no_zeta.refresh(&no_zeta_draw, &DynamicFeatures::default());
+        no_zeta.refresh_draw_call_for_test(&no_zeta_draw, &DynamicFeatures::default());
         let mut with_zeta = FixedPipelineState::default();
-        with_zeta.refresh(&zeta_draw, &DynamicFeatures::default());
+        with_zeta.refresh_draw_call_for_test(&zeta_draw, &DynamicFeatures::default());
 
         assert!(!no_zeta.depth_enabled());
         assert_eq!(no_zeta.depth_format(), 0);

@@ -85,8 +85,9 @@ impl Drop for GlxShareGroup {
 }
 
 /// Copyable frontend source for renderer and shader-worker GLX contexts.
-/// The root share group is reference counted; each produced context is tied to
-/// the same X11 child drawable.
+/// The root share group is reference counted. Renderer contexts target the
+/// X11 child window, while shader workers receive private offscreen pbuffers,
+/// matching upstream `OpenGLSharedContext`'s `main_surface` distinction.
 #[derive(Clone)]
 pub struct GlxContextSource {
     display: usize,
@@ -126,7 +127,50 @@ impl GlxContextSource {
         Ok(GlxContext {
             source: self.clone(),
             context: context as usize,
+            drawable: self.window,
+            owns_pbuffer: false,
             swap_interval_initialized: false,
+        })
+    }
+
+    /// Create an offscreen shared context for one shader worker.
+    ///
+    /// Upstream `OpenGLSharedContext(share_context)` constructs a private
+    /// `QOffscreenSurface` when no presentation surface is supplied. Sharing
+    /// the presentation drawable between GLX contexts can serialize unrelated
+    /// worker and render operations in Mesa, including zero-timeout sync
+    /// probes. A one-pixel pbuffer is the direct GLX counterpart.
+    pub fn create_offscreen_context(&self) -> Result<GlxContext, String> {
+        let display = self.display as *mut xlib::Display;
+        let attributes = [glx::GLX_PBUFFER_WIDTH, 1, glx::GLX_PBUFFER_HEIGHT, 1, 0];
+        let pbuffer = unsafe {
+            glx::glXCreatePbuffer(
+                display,
+                self.fb_config as glx::GLXFBConfig,
+                attributes.as_ptr(),
+            )
+        };
+        if pbuffer == 0 {
+            return Err("unable to create an offscreen GLX pbuffer".to_owned());
+        }
+        let context = match create_glx_context(
+            display,
+            self.fb_config as glx::GLXFBConfig,
+            self.share_group.context as glx::GLXContext,
+        ) {
+            Ok(context) => context,
+            Err(error) => {
+                unsafe { glx::glXDestroyPbuffer(display, pbuffer) };
+                return Err(error);
+            }
+        };
+        Ok(GlxContext {
+            source: self.clone(),
+            context: context as usize,
+            drawable: pbuffer,
+            owns_pbuffer: true,
+            // Offscreen contexts never swap, so no swap interval is installed.
+            swap_interval_initialized: true,
         })
     }
 
@@ -147,6 +191,8 @@ impl GlxContextSource {
 pub struct GlxContext {
     source: GlxContextSource,
     context: usize,
+    drawable: glx::GLXDrawable,
+    owns_pbuffer: bool,
     swap_interval_initialized: bool,
 }
 
@@ -154,11 +200,11 @@ unsafe impl Send for GlxContext {}
 
 impl GraphicsContext for GlxContext {
     fn swap_buffers(&mut self) {
+        if self.owns_pbuffer {
+            return;
+        }
         unsafe {
-            glx::glXSwapBuffers(
-                self.source.display as *mut xlib::Display,
-                self.source.window,
-            );
+            glx::glXSwapBuffers(self.source.display as *mut xlib::Display, self.drawable);
         }
     }
 
@@ -166,9 +212,10 @@ impl GraphicsContext for GlxContext {
         let context = self.context as glx::GLXContext;
         unsafe {
             if glx::glXGetCurrentContext() != context
-                && glx::glXMakeCurrent(
+                && glx::glXMakeContextCurrent(
                     self.source.display as *mut xlib::Display,
-                    self.source.window,
+                    self.drawable,
+                    self.drawable,
                     context,
                 ) == 0
             {
@@ -177,10 +224,7 @@ impl GraphicsContext for GlxContext {
             }
         }
         if !self.swap_interval_initialized {
-            set_swap_interval(
-                self.source.display as *mut xlib::Display,
-                self.source.window,
-            );
+            set_swap_interval(self.source.display as *mut xlib::Display, self.drawable);
             self.swap_interval_initialized = true;
         }
     }
@@ -188,8 +232,9 @@ impl GraphicsContext for GlxContext {
     fn done_current(&mut self) {
         unsafe {
             if glx::glXGetCurrentContext() == self.context as glx::GLXContext {
-                glx::glXMakeCurrent(
+                glx::glXMakeContextCurrent(
                     self.source.display as *mut xlib::Display,
+                    0,
                     0,
                     std::ptr::null_mut(),
                 );
@@ -207,6 +252,12 @@ impl Drop for GlxContext {
                     self.source.display as *mut xlib::Display,
                     self.context as glx::GLXContext,
                 );
+                if self.owns_pbuffer && self.drawable != 0 {
+                    glx::glXDestroyPbuffer(
+                        self.source.display as *mut xlib::Display,
+                        self.drawable,
+                    );
+                }
             }
         }
     }
@@ -328,7 +379,7 @@ pub fn attach_render_window(
         glx::GLX_X_RENDERABLE,
         xlib::True,
         glx::GLX_DRAWABLE_TYPE,
-        glx::GLX_WINDOW_BIT,
+        glx::GLX_WINDOW_BIT | glx::GLX_PBUFFER_BIT,
         glx::GLX_RENDER_TYPE,
         glx::GLX_RGBA_BIT,
         glx::GLX_X_VISUAL_TYPE,

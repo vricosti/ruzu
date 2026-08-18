@@ -10,63 +10,23 @@ use ash::vk;
 use log::{debug, trace};
 use std::collections::VecDeque;
 use std::mem::{align_of, size_of, MaybeUninit};
-use std::panic::Location;
 use std::ptr::NonNull;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::sync::atomic::Ordering;
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
 
 use super::command_pool::CommandPool;
+use super::master_semaphore::MasterSemaphore;
 use super::query_cache::{QueryRuntimeState, SamplesQueryState, TfbCounterState};
 use super::state_tracker::StateTracker;
+use super::texture_cache::RenderTargetFramebuffer;
+use crate::texture_cache::types::NUM_RT;
+use crate::vulkan_common::vulkan_wrapper::PIPELINE_STAGE_GRAPHICS_COMPUTE;
 
 pub(crate) type SubmitCallback = Arc<dyn Fn() + Send + Sync>;
 
 const COMMAND_CHUNK_CAPACITY: usize = 0x8000;
 const NO_COMMAND: usize = usize::MAX;
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct CommandTraceLocation {
-    file: &'static str,
-    line: u32,
-}
-
-fn vulkan_submit_trace_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        std::env::var_os("RUZU_VK_TRACE_DRAWS")
-            .is_some_and(|value| !value.is_empty() && value != "0")
-    })
-}
-
-fn format_scheduler_submit_trace(
-    tick: u64,
-    signal_semaphore_count: usize,
-    locations: &[CommandTraceLocation],
-) -> String {
-    let mut counts: Vec<(CommandTraceLocation, usize)> = Vec::new();
-    for &location in locations {
-        if let Some((_, count)) = counts.iter_mut().find(|(known, _)| *known == location) {
-            *count += 1;
-        } else {
-            counts.push((location, 1));
-        }
-    }
-    let callsites = counts
-        .into_iter()
-        .map(|(location, count)| {
-            let file = location
-                .file
-                .rsplit_once("video_core/")
-                .map_or(location.file, |(_, relative)| relative);
-            format!("{file}:{}={count}", location.line)
-        })
-        .collect::<Vec<_>>()
-        .join(",");
-    format!(
-        "[VK_SUBMIT_TRACE] tick={tick} commands={} signal_semaphores={signal_semaphore_count} callsites=[{callsites}]",
-        locations.len()
-    )
-}
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -87,7 +47,6 @@ struct CommandChunk {
     last: usize,
     command_offset: usize,
     submit: Option<SubmitRequest>,
-    trace_locations: Vec<CommandTraceLocation>,
 }
 
 impl CommandChunk {
@@ -102,7 +61,6 @@ impl CommandChunk {
             last: NO_COMMAND,
             command_offset: 0,
             submit: None,
-            trace_locations: Vec::new(),
         }
     }
 
@@ -248,8 +206,9 @@ struct RenderPassState {
     framebuffer: vk::Framebuffer,
     render_area: vk::Rect2D,
     inside_renderpass: bool,
-    images: Vec<vk::Image>,
-    image_ranges: Vec<vk::ImageSubresourceRange>,
+    num_images: usize,
+    images: [vk::Image; NUM_RT + 1],
+    image_ranges: [vk::ImageSubresourceRange; NUM_RT + 1],
 }
 
 /// Port of upstream `Scheduler::State` fields that are independent from the
@@ -259,6 +218,29 @@ struct SchedulerState {
     graphics_pipeline: vk::Pipeline,
     is_rescaling: bool,
     rescaling_defined: bool,
+    descriptor_buffer_chunk: u32,
+    descriptor_buffer_bound: bool,
+}
+
+#[derive(Clone)]
+struct DeferredClear {
+    framebuffer: Option<RenderTargetFramebuffer>,
+    color_clear_mask: u32,
+    color_values: [vk::ClearValue; 8],
+    depth_stencil: bool,
+    depth_stencil_value: vk::ClearValue,
+}
+
+impl Default for DeferredClear {
+    fn default() -> Self {
+        Self {
+            framebuffer: None,
+            color_clear_mask: 0,
+            color_values: [vk::ClearValue::default(); 8],
+            depth_stencil: false,
+            depth_stencil_value: vk::ClearValue::default(),
+        }
+    }
 }
 
 /// Command buffer scheduler with submission tracking.
@@ -267,27 +249,19 @@ struct SchedulerState {
 /// and submits to the GPU queue with tick-based synchronization.
 pub struct Scheduler {
     device: ash::Device,
+    transform_feedback_supported: bool,
+
+    /// Port of upstream `Scheduler::master_semaphore`.
+    master_semaphore: Arc<MasterSemaphore>,
 
     /// Current chunk being recorded to.
     current_chunk: CommandChunk,
-
-    /// Tick-based synchronization (simplified MasterSemaphore).
-    current_tick: Arc<AtomicU64>,
-    submitted_tick: Arc<AtomicU64>,
 
     /// Render pass state.
     rp_state: RenderPassState,
     /// Upstream scheduler-local state invalidated by helper draws.
     state: SchedulerState,
-
-    /// Fence for GPU synchronization (legacy fallback when timeline
-    /// semaphores are unavailable: one submission in flight, wait-before-submit).
-    fence: vk::Fence,
-
-    /// Port of upstream `MasterSemaphore`: a timeline semaphore signalled with
-    /// the tick of each submission, so submissions pipeline without waiting
-    /// for the previous one and completion is queried per tick.
-    timeline_semaphore: Option<vk::Semaphore>,
+    deferred_clear: DeferredClear,
 
     /// Port of upstream `Scheduler::submit_mutex`.
     submit_mutex: Arc<Mutex<()>>,
@@ -312,6 +286,12 @@ pub struct Scheduler {
     /// recording, command-pool rotation, and queue submission.
     worker: Option<Arc<SchedulerWorker>>,
     worker_thread: Option<std::thread::JoinHandle<()>>,
+
+    frame_interval: Duration,
+    start_time: Instant,
+    last_target_fps: f64,
+    max_frame_count: u64,
+    frame_counter: u64,
 }
 
 struct SchedulerWorker {
@@ -334,10 +314,7 @@ struct SchedulerWorkerState {
 /// synchronization objects instead of a pointer into a movable owner.
 #[derive(Clone)]
 pub(crate) struct SchedulerWaitHandle {
-    device: ash::Device,
-    timeline_semaphore: Option<vk::Semaphore>,
-    fence: vk::Fence,
-    worker: Arc<SchedulerWorker>,
+    master_semaphore: Arc<MasterSemaphore>,
 }
 
 impl SchedulerWaitHandle {
@@ -345,23 +322,7 @@ impl SchedulerWaitHandle {
         if tick == 0 {
             return;
         }
-        if let Some(timeline) = self.timeline_semaphore {
-            let semaphores = [timeline];
-            let values = [tick];
-            let wait_info = vk::SemaphoreWaitInfo::builder()
-                .semaphores(&semaphores)
-                .values(&values)
-                .build();
-            if let Err(error) = unsafe { self.device.wait_semaphores(&wait_info, u64::MAX) } {
-                log::error!("Vulkan fence failed waiting for scheduler tick {tick}: {error:?}");
-            }
-            return;
-        }
-
-        self.worker.wait_drained();
-        if let Err(error) = unsafe { self.device.wait_for_fences(&[self.fence], true, u64::MAX) } {
-            log::error!("Vulkan fence failed waiting for scheduler fence: {error:?}");
-        }
+        self.master_semaphore.wait(tick);
     }
 }
 
@@ -381,17 +342,12 @@ struct WorkerContext {
     device: ash::Device,
     device_fault: Option<vk::ExtDeviceFaultFn>,
     device_fault_reported: bool,
-    queue: vk::Queue,
+    master_semaphore: Arc<MasterSemaphore>,
     command_pool: CommandPool,
     current_cmdbuf: vk::CommandBuffer,
     upload_cmdbuf: vk::CommandBuffer,
-    timeline_semaphore: Option<vk::Semaphore>,
-    fence: vk::Fence,
     submit_mutex: Arc<Mutex<()>>,
-    current_tick: Arc<AtomicU64>,
-    submitted_tick: Arc<AtomicU64>,
     on_submit: Arc<Mutex<Option<SubmitCallback>>>,
-    pending_trace_locations: Vec<CommandTraceLocation>,
 }
 
 impl SchedulerWorker {
@@ -448,21 +404,7 @@ impl SchedulerWorker {
             };
 
             let submit = chunk.execute_all(context.current_cmdbuf, context.upload_cmdbuf);
-            context
-                .pending_trace_locations
-                .append(&mut chunk.trace_locations);
             if let Some(submit) = submit {
-                if vulkan_submit_trace_enabled() {
-                    log::info!(
-                        "{}",
-                        format_scheduler_submit_trace(
-                            submit.tick,
-                            submit.signal_semaphores.len(),
-                            &context.pending_trace_locations,
-                        )
-                    );
-                }
-                context.pending_trace_locations.clear();
                 if let Err(error) = context.submit_execution(&submit) {
                     log::error!(
                         "Vulkan worker failed to submit tick {}: {error:?}",
@@ -484,7 +426,6 @@ impl SchedulerWorker {
                 self.drained_cv.notify_all();
             }
         }
-        context.wait_for_gpu();
     }
 }
 
@@ -552,33 +493,9 @@ impl WorkerContext {
         }
     }
 
-    fn known_gpu_tick(&self) -> u64 {
-        if let Some(timeline) = self.timeline_semaphore {
-            return unsafe {
-                self.device
-                    .get_semaphore_counter_value(timeline)
-                    .unwrap_or(0)
-            };
-        }
-        let submitted_tick = self.submitted_tick.load(Ordering::SeqCst);
-        if submitted_tick == 0
-            || unsafe { self.device.get_fence_status(self.fence).unwrap_or(false) }
-        {
-            submitted_tick
-        } else {
-            submitted_tick - 1
-        }
-    }
-
     fn allocate_worker_command_buffer(&mut self) -> Result<(), vk::Result> {
-        let known_gpu_tick = self.known_gpu_tick();
-        let pending_tick = self.current_tick.load(Ordering::SeqCst) + 1;
-        self.current_cmdbuf = self
-            .command_pool
-            .commit_with_ticks(known_gpu_tick, pending_tick);
-        self.upload_cmdbuf = self
-            .command_pool
-            .commit_with_ticks(known_gpu_tick, pending_tick);
+        self.current_cmdbuf = self.command_pool.commit();
+        self.upload_cmdbuf = self.command_pool.commit();
         let begin_info = vk::CommandBufferBeginInfo::builder()
             .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT)
             .build();
@@ -619,74 +536,27 @@ impl WorkerContext {
             callback();
         }
 
-        let cmd_buffers = [self.upload_cmdbuf, self.current_cmdbuf];
-        if let Some(timeline) = self.timeline_semaphore {
-            let mut all_signals = Vec::with_capacity(1 + submit.signal_semaphores.len());
-            all_signals.push(timeline);
-            all_signals.extend_from_slice(&submit.signal_semaphores);
-            let mut signal_values = vec![0u64; all_signals.len()];
-            signal_values[0] = submit.tick;
-            let mut timeline_info =
-                vk::TimelineSemaphoreSubmitInfo::builder().signal_semaphore_values(&signal_values);
-            let submit_info = vk::SubmitInfo::builder()
-                .command_buffers(&cmd_buffers)
-                .signal_semaphores(&all_signals)
-                .push_next(&mut timeline_info)
-                .build();
-            let _submit_lock = self.submit_mutex.lock().unwrap();
-            let result = unsafe {
-                self.device
-                    .queue_submit(self.queue, &[submit_info], vk::Fence::null())
-            };
-            drop(_submit_lock);
-            if result.is_ok() {
-                self.submitted_tick.store(submit.tick, Ordering::SeqCst);
-            }
-            if result == Err(vk::Result::ERROR_DEVICE_LOST) {
-                self.report_device_fault();
-            }
-            result
+        let signal_semaphore = submit
+            .signal_semaphores
+            .first()
+            .copied()
+            .unwrap_or(vk::Semaphore::null());
+        let _submit_lock = self.submit_mutex.lock().unwrap();
+        let result = self.master_semaphore.submit_queue(
+            self.current_cmdbuf,
+            self.upload_cmdbuf,
+            signal_semaphore,
+            vk::Semaphore::null(),
+            submit.tick,
+        );
+        drop(_submit_lock);
+        if result == vk::Result::ERROR_DEVICE_LOST {
+            self.report_device_fault();
+        }
+        if result == vk::Result::SUCCESS {
+            Ok(())
         } else {
-            let submit_info = vk::SubmitInfo::builder()
-                .command_buffers(&cmd_buffers)
-                .signal_semaphores(&submit.signal_semaphores)
-                .build();
-            let result = unsafe {
-                self.device.wait_for_fences(&[self.fence], true, u64::MAX)?;
-                self.device.reset_fences(&[self.fence])?;
-                let _submit_lock = self.submit_mutex.lock().unwrap();
-                self.device
-                    .queue_submit(self.queue, &[submit_info], self.fence)
-            };
-            if result.is_ok() {
-                self.submitted_tick.store(submit.tick, Ordering::SeqCst);
-            }
-            if result == Err(vk::Result::ERROR_DEVICE_LOST) {
-                self.report_device_fault();
-            }
-            result
-        }
-    }
-
-    fn wait_for_gpu(&self) {
-        let tick = self.current_tick.load(Ordering::SeqCst);
-        if tick == 0 {
-            return;
-        }
-        unsafe {
-            if let Some(timeline) = self.timeline_semaphore {
-                let semaphores = [timeline];
-                let values = [tick];
-                let wait_info = vk::SemaphoreWaitInfo::builder()
-                    .semaphores(&semaphores)
-                    .values(&values)
-                    .build();
-                self.device.wait_semaphores(&wait_info, u64::MAX).ok();
-            } else {
-                self.device
-                    .wait_for_fences(&[self.fence], true, u64::MAX)
-                    .ok();
-            }
+            Err(result)
         }
     }
 }
@@ -698,49 +568,41 @@ impl Scheduler {
         queue: vk::Queue,
         graphics_family: u32,
         timeline_semaphore_supported: bool,
+        synchronization2_core: bool,
+        synchronization2_khr: Option<ash::extensions::khr::Synchronization2>,
         device_fault: Option<vk::ExtDeviceFaultFn>,
+        transform_feedback_supported: bool,
     ) -> Result<Self, vk::Result> {
-        let fence_info = vk::FenceCreateInfo::builder()
-            .flags(vk::FenceCreateFlags::SIGNALED)
-            .build();
-        let fence = unsafe { device.create_fence(&fence_info, None)? };
-
-        let timeline_semaphore = if timeline_semaphore_supported {
-            let mut type_info = vk::SemaphoreTypeCreateInfo::builder()
-                .semaphore_type(vk::SemaphoreType::TIMELINE)
-                .initial_value(0)
-                .build();
-            let semaphore_info = vk::SemaphoreCreateInfo::builder()
-                .push_next(&mut type_info)
-                .build();
-            Some(unsafe { device.create_semaphore(&semaphore_info, None)? })
-        } else {
+        if !timeline_semaphore_supported {
             log::warn!(
-                "Scheduler: timeline semaphores unavailable; falling back to                  single-submission fence synchronization"
+                "Scheduler: timeline semaphores unavailable; using the upstream fence fallback"
             );
-            None
-        };
+        }
 
+        let master_semaphore = Arc::new(MasterSemaphore::new(
+            device.clone(),
+            queue,
+            timeline_semaphore_supported,
+            synchronization2_core,
+            synchronization2_khr,
+        ));
         let submit_mutex = Arc::new(Mutex::new(()));
-        let current_tick = Arc::new(AtomicU64::new(0));
-        let submitted_tick = Arc::new(AtomicU64::new(0));
         let on_submit = Arc::new(Mutex::new(None));
         let worker = Arc::new(SchedulerWorker::new());
         let mut worker_context = WorkerContext {
             device: device.clone(),
             device_fault,
             device_fault_reported: false,
-            queue,
-            command_pool: CommandPool::new_with_external_ticks(device.clone(), graphics_family),
+            master_semaphore: Arc::clone(&master_semaphore),
+            command_pool: CommandPool::new(
+                Arc::clone(&master_semaphore),
+                device.clone(),
+                graphics_family,
+            ),
             current_cmdbuf: vk::CommandBuffer::null(),
             upload_cmdbuf: vk::CommandBuffer::null(),
-            timeline_semaphore,
-            fence,
             submit_mutex: Arc::clone(&submit_mutex),
-            current_tick: Arc::clone(&current_tick),
-            submitted_tick: Arc::clone(&submitted_tick),
             on_submit: Arc::clone(&on_submit),
-            pending_trace_locations: Vec::new(),
         };
         worker_context.allocate_worker_command_buffer()?;
         let thread_worker = Arc::clone(&worker);
@@ -751,13 +613,12 @@ impl Scheduler {
 
         Ok(Self {
             device,
+            transform_feedback_supported,
+            master_semaphore,
             current_chunk: CommandChunk::new(),
-            current_tick,
-            submitted_tick,
             rp_state: RenderPassState::default(),
             state: SchedulerState::default(),
-            fence,
-            timeline_semaphore,
+            deferred_clear: DeferredClear::default(),
             submit_mutex,
             on_submit,
             state_tracker: None,
@@ -766,6 +627,11 @@ impl Scheduler {
             query_runtime_state: None,
             worker: Some(worker),
             worker_thread: Some(worker_thread),
+            frame_interval: Duration::ZERO,
+            start_time: Instant::now(),
+            last_target_fps: 0.0,
+            max_frame_count: 0,
+            frame_counter: 0,
         })
     }
 
@@ -780,14 +646,7 @@ impl Scheduler {
 
     pub(crate) fn wait_handle(&self) -> SchedulerWaitHandle {
         SchedulerWaitHandle {
-            device: self.device.clone(),
-            timeline_semaphore: self.timeline_semaphore,
-            fence: self.fence,
-            worker: Arc::clone(
-                self.worker
-                    .as_ref()
-                    .expect("scheduler worker must exist while fences are active"),
-            ),
+            master_semaphore: Arc::clone(&self.master_semaphore),
         }
     }
 
@@ -814,41 +673,156 @@ impl Scheduler {
     }
 
     /// Record a command that only needs the render command buffer.
-    #[track_caller]
     pub fn record(&mut self, cmd: impl FnOnce(vk::CommandBuffer) + Send + 'static) {
         self.record_with_upload(move |render_cmd, _upload_cmd| cmd(render_cmd));
     }
 
     /// Record a command that needs both render and upload command buffers.
-    #[track_caller]
     pub fn record_with_upload(
         &mut self,
         cmd: impl FnOnce(vk::CommandBuffer, vk::CommandBuffer) + Send + 'static,
     ) {
-        let trace_location = if vulkan_submit_trace_enabled() {
-            let caller = Location::caller();
-            Some(CommandTraceLocation {
-                file: caller.file(),
-                line: caller.line(),
-            })
-        } else {
-            None
-        };
         let command = match self.current_chunk.record(cmd) {
-            Ok(()) => {
-                self.current_chunk.trace_locations.extend(trace_location);
-                return;
-            }
+            Ok(()) => return,
             Err(command) => command,
         };
         self.dispatch_work();
         if self.current_chunk.record(command).is_err() {
             panic!("Vulkan scheduler command exceeds the 32 KiB command chunk");
         }
-        self.current_chunk.trace_locations.extend(trace_location);
     }
 
     /// Begin a render pass if not already inside one with matching parameters.
+    /// Port of `Scheduler::RequestRenderpass(const Framebuffer*)`.
+    pub fn request_framebuffer(&mut self, framebuffer: &RenderTargetFramebuffer) {
+        if self
+            .deferred_clear
+            .framebuffer
+            .as_ref()
+            .is_some_and(|pending| pending == framebuffer)
+        {
+            self.realize_deferred_clear();
+            return;
+        }
+        let render_area = vk::Rect2D {
+            offset: vk::Offset2D { x: 0, y: 0 },
+            extent: framebuffer.render_area(),
+        };
+        if self.rp_state.renderpass == framebuffer.render_pass()
+            && self.rp_state.framebuffer == framebuffer.handle()
+            && self.rp_state.render_area.extent.width == render_area.extent.width
+            && self.rp_state.render_area.extent.height == render_area.extent.height
+        {
+            return;
+        }
+        // Ends any active pass and realizes a deferred clear.
+        self.end_render_pass();
+        self.begin_render_pass_impl(
+            framebuffer.handle(),
+            framebuffer.render_pass(),
+            render_area,
+            &[],
+            framebuffer.num_images(),
+            framebuffer.images(),
+            framebuffer.image_ranges(),
+        );
+    }
+
+    /// Port of `Scheduler::DeferColorClear`.
+    pub fn defer_color_clear(
+        &mut self,
+        framebuffer: &RenderTargetFramebuffer,
+        rt_slot: u32,
+        value: vk::ClearValue,
+    ) -> bool {
+        if self.is_inside_renderpass() {
+            return false;
+        }
+        if self
+            .deferred_clear
+            .framebuffer
+            .as_ref()
+            .is_some_and(|pending| pending != framebuffer)
+        {
+            self.realize_deferred_clear();
+            self.end_render_pass();
+        }
+        self.deferred_clear.framebuffer = Some(framebuffer.clone());
+        self.deferred_clear.color_clear_mask |= 1 << rt_slot;
+        self.deferred_clear.color_values[rt_slot as usize] = value;
+        true
+    }
+
+    /// Port of `Scheduler::DeferDepthStencilClear`.
+    pub fn defer_depth_stencil_clear(
+        &mut self,
+        framebuffer: &RenderTargetFramebuffer,
+        value: vk::ClearValue,
+    ) -> bool {
+        if self.is_inside_renderpass() {
+            return false;
+        }
+        if self
+            .deferred_clear
+            .framebuffer
+            .as_ref()
+            .is_some_and(|pending| pending != framebuffer)
+        {
+            self.realize_deferred_clear();
+            self.end_render_pass();
+        }
+        self.deferred_clear.framebuffer = Some(framebuffer.clone());
+        self.deferred_clear.depth_stencil = true;
+        self.deferred_clear.depth_stencil_value = value;
+        true
+    }
+
+    /// Port of `Scheduler::RealizeDeferredClear`.
+    fn realize_deferred_clear(&mut self) {
+        let deferred = std::mem::take(&mut self.deferred_clear);
+        let Some(framebuffer) = deferred.framebuffer else {
+            return;
+        };
+        let mut clear_values = [vk::ClearValue::default(); NUM_RT + 1];
+        let mut clear_value_count = 0;
+        let base = framebuffer.render_pass_key_base();
+        for slot in 0..8 {
+            if base.color_formats[slot] != crate::surface::PixelFormat::Invalid {
+                clear_values[clear_value_count] = deferred.color_values[slot];
+                clear_value_count += 1;
+            }
+        }
+        if base.depth_format != crate::surface::PixelFormat::Invalid {
+            clear_values[clear_value_count] = deferred.depth_stencil_value;
+            clear_value_count += 1;
+        }
+        let color_discard_mask = if framebuffer.discards_msaa_color() {
+            deferred.color_clear_mask
+        } else {
+            0
+        };
+        let renderpass = framebuffer
+            .render_pass_variant(
+                deferred.color_clear_mask,
+                deferred.depth_stencil,
+                color_discard_mask,
+            )
+            .expect("failed to create deferred-clear render-pass variant");
+        self.end_render_pass();
+        self.begin_render_pass_impl(
+            framebuffer.handle(),
+            renderpass,
+            vk::Rect2D {
+                offset: vk::Offset2D { x: 0, y: 0 },
+                extent: framebuffer.render_area(),
+            },
+            &clear_values[..clear_value_count],
+            framebuffer.num_images(),
+            framebuffer.images(),
+            framebuffer.image_ranges(),
+        );
+    }
+
     pub fn request_renderpass(
         &mut self,
         framebuffer: vk::Framebuffer,
@@ -858,44 +832,77 @@ impl Scheduler {
         images: &[vk::Image],
         image_ranges: &[vk::ImageSubresourceRange],
     ) {
-        if self.rp_state.inside_renderpass {
-            // Already in a render pass — check if compatible
-            if self.rp_state.renderpass == renderpass
-                && self.rp_state.framebuffer == framebuffer
-                && self.rp_state.render_area.extent.width == render_area.extent.width
-                && self.rp_state.render_area.extent.height == render_area.extent.height
-            {
-                return;
-            }
-            // Different render pass — end current one first
-            self.request_outside_renderpass();
+        if self.rp_state.renderpass == renderpass
+            && self.rp_state.framebuffer == framebuffer
+            && self.rp_state.render_area.extent.width == render_area.extent.width
+            && self.rp_state.render_area.extent.height == render_area.extent.height
+        {
+            return;
         }
+        self.end_render_pass();
+        self.begin_render_pass_impl(
+            framebuffer,
+            renderpass,
+            render_area,
+            clear_values,
+            images.len(),
+            images,
+            image_ranges,
+        );
+    }
 
+    /// Port of `Scheduler::BeginRenderPassImpl`.
+    fn begin_render_pass_impl(
+        &mut self,
+        framebuffer: vk::Framebuffer,
+        renderpass: vk::RenderPass,
+        render_area: vk::Rect2D,
+        clear_values: &[vk::ClearValue],
+        num_images: usize,
+        images: &[vk::Image],
+        image_ranges: &[vk::ImageSubresourceRange],
+    ) {
         trace!("Scheduler: beginning render pass");
         let device = self.device.clone();
-        let clear_values = clear_values.to_vec();
+        assert!(clear_values.len() <= NUM_RT + 1);
+        assert!(num_images <= NUM_RT + 1);
+        assert!(images.len() >= num_images);
+        assert!(image_ranges.len() >= num_images);
+        let mut values = [vk::ClearValue::default(); NUM_RT + 1];
+        values[..clear_values.len()].copy_from_slice(clear_values);
+        let clear_value_count = clear_values.len();
         self.record(move |cmdbuf| unsafe {
             let rp_begin = vk::RenderPassBeginInfo::builder()
                 .render_pass(renderpass)
                 .framebuffer(framebuffer)
                 .render_area(render_area)
-                .clear_values(&clear_values)
+                .clear_values(&values[..clear_value_count])
                 .build();
             device.cmd_begin_render_pass(cmdbuf, &rp_begin, vk::SubpassContents::INLINE);
         });
 
+        let mut renderpass_images = [vk::Image::null(); NUM_RT + 1];
+        let mut renderpass_image_ranges = [vk::ImageSubresourceRange::default(); NUM_RT + 1];
+        renderpass_images[..num_images].copy_from_slice(&images[..num_images]);
+        renderpass_image_ranges[..num_images].copy_from_slice(&image_ranges[..num_images]);
         self.rp_state = RenderPassState {
             renderpass,
             framebuffer,
             render_area,
             inside_renderpass: true,
-            images: images.to_vec(),
-            image_ranges: image_ranges.to_vec(),
+            num_images,
+            images: renderpass_images,
+            image_ranges: renderpass_image_ranges,
         };
     }
 
     /// End the current render pass if inside one.
     pub fn request_outside_renderpass(&mut self) {
+        self.end_render_pass();
+    }
+
+    fn end_render_pass(&mut self) {
+        self.realize_deferred_clear();
         if !self.rp_state.inside_renderpass {
             return;
         }
@@ -915,50 +922,72 @@ impl Scheduler {
                 });
             }
         }
-        let images = std::mem::take(&mut self.rp_state.images);
-        let image_ranges = std::mem::take(&mut self.rp_state.image_ranges);
+        let num_images = self.rp_state.num_images;
+        let images = self.rp_state.images;
+        let image_ranges = self.rp_state.image_ranges;
+        let transform_feedback_supported = self.transform_feedback_supported;
         let device = self.device.clone();
         self.record(move |cmdbuf| unsafe {
             device.cmd_end_render_pass(cmdbuf);
-            let barriers: Vec<_> = images
-                .iter()
-                .zip(image_ranges.iter())
-                .filter_map(|(&image, &subresource_range)| {
-                    (image != vk::Image::null()).then(|| {
-                        vk::ImageMemoryBarrier::builder()
-                            .src_access_mask(
-                                vk::AccessFlags::COLOR_ATTACHMENT_WRITE
-                                    | vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE,
-                            )
-                            .dst_access_mask(
-                                vk::AccessFlags::SHADER_READ
-                                    | vk::AccessFlags::SHADER_WRITE
-                                    | vk::AccessFlags::COLOR_ATTACHMENT_READ
-                                    | vk::AccessFlags::COLOR_ATTACHMENT_WRITE
-                                    | vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_READ
-                                    | vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE,
-                            )
-                            .old_layout(vk::ImageLayout::GENERAL)
-                            .new_layout(vk::ImageLayout::GENERAL)
-                            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                            .image(image)
-                            .subresource_range(subresource_range)
-                            .build()
-                    })
-                })
-                .collect();
-            if !barriers.is_empty() {
+            let mut barriers = [vk::ImageMemoryBarrier::default(); NUM_RT + 1];
+            for index in 0..num_images {
+                let range = image_ranges[index];
+                let is_color = range.aspect_mask.contains(vk::ImageAspectFlags::COLOR);
+                let is_depth_stencil = range
+                    .aspect_mask
+                    .intersects(vk::ImageAspectFlags::DEPTH | vk::ImageAspectFlags::STENCIL);
+                let src_access_mask = if is_color {
+                    vk::AccessFlags::COLOR_ATTACHMENT_WRITE
+                } else if is_depth_stencil {
+                    vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE
+                } else {
+                    vk::AccessFlags::COLOR_ATTACHMENT_WRITE
+                        | vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE
+                };
+                barriers[index] = vk::ImageMemoryBarrier::builder()
+                    .src_access_mask(src_access_mask)
+                    .dst_access_mask(
+                        vk::AccessFlags::SHADER_READ
+                            | vk::AccessFlags::SHADER_WRITE
+                            | vk::AccessFlags::COLOR_ATTACHMENT_READ
+                            | vk::AccessFlags::COLOR_ATTACHMENT_WRITE
+                            | vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_READ
+                            | vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE,
+                    )
+                    .old_layout(vk::ImageLayout::GENERAL)
+                    .new_layout(vk::ImageLayout::GENERAL)
+                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .image(images[index])
+                    .subresource_range(range)
+                    .build();
+            }
+            device.cmd_pipeline_barrier(
+                cmdbuf,
+                vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS
+                    | vk::PipelineStageFlags::LATE_FRAGMENT_TESTS
+                    | vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+                PIPELINE_STAGE_GRAPHICS_COMPUTE,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &barriers[..num_images],
+            );
+            if transform_feedback_supported {
+                let xfb_output_barrier = vk::MemoryBarrier::builder()
+                    .src_access_mask(vk::AccessFlags::TRANSFORM_FEEDBACK_WRITE_EXT)
+                    .dst_access_mask(
+                        vk::AccessFlags::VERTEX_ATTRIBUTE_READ | vk::AccessFlags::TRANSFER_READ,
+                    )
+                    .build();
                 device.cmd_pipeline_barrier(
                     cmdbuf,
-                    vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS
-                        | vk::PipelineStageFlags::LATE_FRAGMENT_TESTS
-                        | vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
-                    vk::PipelineStageFlags::ALL_COMMANDS,
+                    vk::PipelineStageFlags::TRANSFORM_FEEDBACK_EXT,
+                    vk::PipelineStageFlags::VERTEX_INPUT | vk::PipelineStageFlags::TRANSFER,
                     vk::DependencyFlags::empty(),
+                    &[xfb_output_barrier],
                     &[],
                     &[],
-                    &barriers,
                 );
             }
         });
@@ -989,10 +1018,23 @@ impl Scheduler {
         true
     }
 
+    /// Port of upstream `Scheduler::UpdateDescriptorBufferChunk`.
+    pub fn update_descriptor_buffer_chunk(&mut self, descriptor_chunk: u32) -> bool {
+        if self.state.descriptor_buffer_bound
+            && descriptor_chunk == self.state.descriptor_buffer_chunk
+        {
+            return false;
+        }
+        self.state.descriptor_buffer_bound = true;
+        self.state.descriptor_buffer_chunk = descriptor_chunk;
+        true
+    }
+
     /// Port of upstream `Scheduler::InvalidateState`.
     pub fn invalidate_state(&mut self) {
         self.state.graphics_pipeline = vk::Pipeline::null();
         self.state.rescaling_defined = false;
+        self.state.descriptor_buffer_bound = false;
         if let Some(mut state_tracker) = self.state_tracker {
             unsafe {
                 state_tracker.as_mut().invalidate_command_buffer_state();
@@ -1038,7 +1080,7 @@ impl Scheduler {
     fn flush_impl(&mut self, signal_semaphores: &[vk::Semaphore]) -> u64 {
         self.end_pending_operations();
         self.invalidate_state();
-        let tick = self.current_tick.fetch_add(1, Ordering::SeqCst) + 1;
+        let tick = self.master_semaphore.next_tick();
         self.current_chunk.submit = Some(SubmitRequest {
             signal_semaphores: signal_semaphores.to_vec(),
             tick,
@@ -1071,7 +1113,7 @@ impl Scheduler {
 
     /// Get the current tick value.
     pub fn current_tick(&self) -> u64 {
-        self.current_tick.load(Ordering::SeqCst)
+        self.master_semaphore.current_tick()
     }
 
     /// Last tick the GPU has fully completed.
@@ -1080,87 +1122,61 @@ impl Scheduler {
     /// rings must retire against this value, not against the submission tick:
     /// with pipelined submissions the CPU-side tick runs ahead of the GPU.
     pub fn known_gpu_tick(&self) -> u64 {
-        if let Some(timeline) = self.timeline_semaphore {
-            return unsafe {
-                self.device
-                    .get_semaphore_counter_value(timeline)
-                    .unwrap_or(0)
-            };
-        }
-        // Legacy single-submission fallback: the current tick remains in
-        // flight until the fence is signalled. Older ticks completed before
-        // that submission because this path waits on the same fence before
-        // each queue submit.
-        let submitted_tick = self.submitted_tick.load(Ordering::SeqCst);
-        if submitted_tick == 0
-            || unsafe { self.device.get_fence_status(self.fence).unwrap_or(false) }
-        {
-            submitted_tick
-        } else {
-            submitted_tick - 1
-        }
+        self.master_semaphore.known_gpu_tick()
     }
 
     /// Returns true when the GPU has completed `tick`.
     ///
-    /// Port-facing subset of upstream `Scheduler::IsFree`. This simplified
-    /// scheduler reuses a single fence, waiting on it before every new submit;
-    /// older ticks are therefore complete once a newer tick exists.
+    /// Port of upstream `Scheduler::IsFree` through its owned
+    /// `MasterSemaphore`.
     pub fn is_free(&self, tick: u64) -> bool {
-        if tick == 0 {
-            return true;
-        }
-        if let Some(timeline) = self.timeline_semaphore {
-            // Upstream `MasterSemaphore::IsFree`: the GPU passed `tick` once
-            // the timeline counter reaches it.
-            return unsafe {
-                self.device
-                    .get_semaphore_counter_value(timeline)
-                    .map(|value| value >= tick)
-                    .unwrap_or(false)
-            };
-        }
-        let submitted_tick = self.submitted_tick.load(Ordering::SeqCst);
-        if tick > submitted_tick {
-            return false;
-        }
-        if tick < submitted_tick {
-            return true;
-        }
-        unsafe { self.device.get_fence_status(self.fence).unwrap_or(false) }
+        self.master_semaphore.is_free(tick)
     }
 
     /// Tick that will be signalled by the next `Flush`.
     pub fn pending_tick(&self) -> u64 {
-        self.current_tick() + 1
+        self.current_tick()
     }
 
-    /// Port-facing subset of upstream `Scheduler::Wait`.
+    /// Port of upstream `Scheduler::Wait`.
     pub fn wait(&mut self, tick: u64) {
-        if tick == 0 {
-            return;
-        }
-        if tick > self.current_tick() {
+        self.wait_with_frame_pacing(tick, 0.0);
+    }
+
+    /// Eden `Scheduler::Wait`, including its optional target-FPS pacing.
+    pub fn wait_with_frame_pacing(&mut self, tick: u64, target_fps: f64) {
+        if tick > 0 && tick >= self.current_tick() {
             // The tick has not been submitted yet; flush so it will signal.
             self.flush();
         }
-        if let Some(timeline) = self.timeline_semaphore {
-            let semaphores = [timeline];
-            let values = [tick];
-            let wait_info = vk::SemaphoreWaitInfo::builder()
-                .semaphores(&semaphores)
-                .values(&values)
-                .build();
-            unsafe {
-                self.device.wait_semaphores(&wait_info, u64::MAX).ok();
-            }
-            return;
+        if tick > 0 {
+            self.master_semaphore.wait(tick);
         }
-        self.wait_worker();
-        unsafe {
-            self.device
-                .wait_for_fences(&[self.fence], true, u64::MAX)
-                .ok();
+
+        if *common::settings::values().use_speed_limit.get_value() && target_fps > 0.0 {
+            let now = Instant::now();
+            if self.last_target_fps != target_fps {
+                self.frame_interval = Duration::from_secs_f64(1.0 / target_fps);
+                self.max_frame_count = (0.1 * target_fps) as u64;
+                self.last_target_fps = target_fps;
+                self.frame_counter = 0;
+                self.start_time = now;
+            }
+            self.frame_counter += 1;
+            let target_time =
+                self.start_time + self.frame_interval.mul_f64(self.frame_counter as f64);
+            if target_time >= now {
+                let sleep_time = target_time.duration_since(now);
+                if sleep_time > Duration::from_millis(15) {
+                    std::thread::sleep(sleep_time - Duration::from_millis(1));
+                }
+                while Instant::now() < target_time {
+                    std::thread::yield_now();
+                }
+            } else if self.frame_counter > self.max_frame_count {
+                self.frame_counter = 0;
+                self.start_time = now;
+            }
         }
     }
 }
@@ -1175,32 +1191,13 @@ impl Drop for Scheduler {
                 let _ = handle.join();
             }
         }
-        unsafe {
-            if let Some(timeline) = self.timeline_semaphore {
-                let tick = self.current_tick();
-                if tick > 0 {
-                    let semaphores = [timeline];
-                    let values = [tick];
-                    let wait_info = vk::SemaphoreWaitInfo::builder()
-                        .semaphores(&semaphores)
-                        .values(&values)
-                        .build();
-                    self.device.wait_semaphores(&wait_info, u64::MAX).ok();
-                }
-                self.device.destroy_semaphore(timeline, None);
-            } else {
-                self.device
-                    .wait_for_fences(&[self.fence], true, u64::MAX)
-                    .ok();
-            }
-            self.device.destroy_fence(self.fence, None);
-        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicU64;
 
     #[test]
     fn test_command_chunk_new_is_empty() {
@@ -1214,6 +1211,12 @@ mod tests {
         assert!(!state.inside_renderpass);
         assert_eq!(state.renderpass, vk::RenderPass::null());
         assert_eq!(state.framebuffer, vk::Framebuffer::null());
+        assert_eq!(state.num_images, 0);
+        assert_eq!(state.images, [vk::Image::null(); NUM_RT + 1]);
+        assert!(state
+            .image_ranges
+            .iter()
+            .all(|range| range.aspect_mask.is_empty()));
     }
 
     #[test]
@@ -1246,29 +1249,6 @@ mod tests {
 
         assert!(submit.is_none());
         assert_eq!(*order.lock().unwrap(), [3, 1, 4]);
-    }
-
-    #[test]
-    fn scheduler_submit_trace_groups_callsites_without_losing_command_count() {
-        let locations = [
-            CommandTraceLocation {
-                file: "video_core/src/renderer_vulkan/buffer_cache.rs",
-                line: 42,
-            },
-            CommandTraceLocation {
-                file: "video_core/src/renderer_vulkan/vk_rasterizer.rs",
-                line: 84,
-            },
-            CommandTraceLocation {
-                file: "video_core/src/renderer_vulkan/buffer_cache.rs",
-                line: 42,
-            },
-        ];
-
-        assert_eq!(
-            format_scheduler_submit_trace(1698, 1, &locations),
-            "[VK_SUBMIT_TRACE] tick=1698 commands=3 signal_semaphores=1 callsites=[src/renderer_vulkan/buffer_cache.rs:42=2,src/renderer_vulkan/vk_rasterizer.rs:84=1]"
-        );
     }
 
     #[test]

@@ -9,16 +9,18 @@ use std::collections::HashSet;
 use rxbyak::{dword_ptr, qword_ptr};
 use rxbyak::{JmpType, RegExp, EAX, EBP, EBX, ECX, R12, R15, RAX, RBP, RBX, RCX};
 
+use crate::backend::x64::a64_emit_x64_memory::{gen_fastmem_fallbacks, FastmemFallbacksTable};
 use crate::backend::x64::abi;
 use crate::backend::x64::block_cache::{BlockCache, CachedBlock};
 use crate::backend::x64::block_of_code::{
     BlockOfCode, DispatcherLabels, JitStateOffsets, RunCodeCallbacks, RunCodeFn,
 };
 use crate::backend::x64::emit::emit_block;
-use crate::backend::x64::emit_context::{ArchConfig, EmitConfig, EmitContext};
+use crate::backend::x64::emit_context::{ArchConfig, DeferredEmitCtx, EmitConfig, EmitContext};
 use crate::backend::x64::exception_handler::{
     supports_fastmem, DoNotFastmemMarker, FastmemPatchInfo, FastmemPatchTable,
 };
+use crate::backend::x64::host_feature::HostFeature;
 use crate::backend::x64::hostloc::{HostLoc, ANY_GPR, ANY_XMM, HOST_R13, HOST_R14};
 use crate::backend::x64::jit_state::{A32JitState, RSB_PTR_MASK};
 use crate::backend::x64::patch_info::{
@@ -47,10 +49,10 @@ pub struct FastDispatchEntry {
 const FAST_DISPATCH_TABLE_SIZE: usize = 0x10000;
 const FAST_DISPATCH_TABLE_MASK: u32 = 0xFFFF0;
 
-fn fast_dispatch_hash(location_descriptor: u64, table_ptr: u64) -> u32 {
+fn fast_dispatch_hash(location_descriptor: u64, table_ptr: u64, has_sse42: bool) -> u32 {
     #[cfg(target_arch = "x86_64")]
     {
-        if std::is_x86_feature_detected!("sse4.2") {
+        if has_sse42 {
             return unsafe {
                 std::arch::x86_64::_mm_crc32_u64(location_descriptor, table_ptr) as u32
             };
@@ -75,6 +77,10 @@ pub struct A32EmitX64 {
     pub terminal_handler_pop_rsb_hint: Option<usize>,
     pub terminal_handler_fast_dispatch_hint: Option<usize>,
     pub fast_dispatch_table: Option<Box<[FastDispatchEntry]>>,
+    /// Pre-generated per-register memory callback stubs. Upstream owns the
+    /// corresponding `read_fallbacks`, `write_fallbacks`, and
+    /// `exclusive_write_fallbacks` tables on `A32EmitX64`.
+    pub fastmem_fallbacks: FastmemFallbacksTable,
     /// Fastmem patch info: maps faulting RIP → fallback stub info.
     /// Used by the SIGSEGV handler to redirect fastmem faults to callbacks.
     ///
@@ -135,10 +141,18 @@ impl A32EmitX64 {
             terminal_handler_pop_rsb_hint: None,
             terminal_handler_fast_dispatch_hint: None,
             fast_dispatch_table: None,
+            fastmem_fallbacks: FastmemFallbacksTable::new(),
             fastmem_patches: Box::new(FastmemPatchTable::new()),
             do_not_fastmem: HashSet::new(),
         };
 
+        // Match upstream constructor ordering: fallback tables precede the
+        // terminal handlers in the shared code buffer.
+        emitter.fastmem_fallbacks = gen_fastmem_fallbacks(
+            &mut emitter.code.asm,
+            &emitter.emit_config.callbacks,
+            emitter.emit_config.raw_exclusive_write_callbacks.as_ref(),
+        );
         emitter.gen_terminal_handlers()?;
 
         // Register the JIT code region with the SIGSEGV handler for fastmem fallback.
@@ -196,12 +210,7 @@ impl A32EmitX64 {
     /// Fast cache-only lookup. Returns the entrypoint if the block is already compiled.
     /// Does NOT require mprotect — safe to call while code is in RX mode.
     pub fn lookup_cached_block(&self, location: LocationDescriptor) -> Option<*const u8> {
-        self.cache
-            .get_tagged(
-                &location,
-                crate::backend::x64::block_cache::CacheCallSite::Lookup,
-            )
-            .map(|cached| cached.entrypoint)
+        self.cache.get(&location).map(|cached| cached.entrypoint)
     }
 
     /// Number of compiled blocks in cache.
@@ -231,16 +240,9 @@ impl A32EmitX64 {
         is_read_only: &dyn Fn(u32) -> bool,
     ) -> *const u8 {
         // Check cache first
-        if let Some(cached) = self.cache.get_tagged(
-            &location,
-            crate::backend::x64::block_cache::CacheCallSite::Compile,
-        ) {
+        if let Some(cached) = self.cache.get(&location) {
             return cached.entrypoint;
         }
-
-        // Compile-time accounting starts here (only on cache-miss path).
-        let _compile_start = std::time::Instant::now();
-        let _profile_phases = std::env::var_os("RDYNARMIC_PROFILE_COMPILE").is_some();
 
         // Check space remaining
         if self.code.space_remaining() < MIN_SPACE_REMAINING {
@@ -248,11 +250,9 @@ impl A32EmitX64 {
         }
 
         // Translate: ARM32/Thumb → IR (A32 frontend)
-        let _t_translate_start = std::time::Instant::now();
         let a32_loc = A32LocationDescriptor::from_location(location);
         let pc = a32_loc.pc();
         let mut block = a32_translate(a32_loc, read_code);
-        let _ns_translate = _t_translate_start.elapsed().as_nanos() as u64;
 
         if Self::should_log_compile_range(location) {
             let ops = block
@@ -277,7 +277,15 @@ impl A32EmitX64 {
         }
 
         // Optimize (per-flag, matching upstream dynarmic A32 pipeline order)
-        let _t_opt_start = std::time::Instant::now();
+        opt::polyfill(
+            &mut block,
+            opt::PolyfillOptions {
+                sha256: !self
+                    .code
+                    .has_host_feature(crate::backend::x64::host_feature::HostFeature::SHA),
+                vector_multiply_widen: true,
+            },
+        );
         if self
             .optimizations
             .contains(OptimizationFlag::GET_SET_ELIMINATION)
@@ -298,8 +306,6 @@ impl A32EmitX64 {
         block.rebuild_pseudo_op_links();
         #[cfg(debug_assertions)]
         opt::verification_pass(&mut block);
-        let _ns_optimize = _t_opt_start.elapsed().as_nanos() as u64;
-
         // Build inst_info for register allocator
         let inst_info: Vec<(u32, usize)> = block
             .instructions
@@ -308,12 +314,14 @@ impl A32EmitX64 {
             .collect();
 
         // Emit
-        let _t_emit_start = std::time::Instant::now();
         let (desc, patch_entries, fastmem_entries) = {
+            let host_features = self.code.host_features();
             let mut ctx = EmitContext::with_dispatcher(
                 location,
                 &self.emit_config,
                 ArchConfig::A32,
+                host_features,
+                self.optimizations,
                 self.dispatcher_labels.return_from_run_code,
                 self.code.code_base_ptr(),
             );
@@ -329,9 +337,7 @@ impl A32EmitX64 {
                 let cache_ptr = &self.cache as *const BlockCache;
                 ctx.block_lookup = Some(Box::new(move |loc| {
                     let cache = unsafe { &*cache_ptr };
-                    cache
-                        .get_tagged(&loc, crate::backend::x64::block_cache::CacheCallSite::Chain)
-                        .map(|b| b.entrypoint)
+                    cache.get(&loc).map(|b| b.entrypoint)
                 }));
             }
 
@@ -345,6 +351,8 @@ impl A32EmitX64 {
             ctx.fastmem_available =
                 self.run_code_callbacks.fastmem_pointer.is_some() && supports_fastmem();
             ctx.do_not_fastmem = Some(&self.do_not_fastmem);
+            ctx.fastmem_fallbacks =
+                Some(&self.fastmem_fallbacks as *const FastmemFallbacksTable as *const ());
 
             ctx.block = Some(&block);
 
@@ -359,15 +367,41 @@ impl A32EmitX64 {
                 gprs
             };
 
+            let code_base = self.code.code_base_ptr() as u64;
             let mut ra = RegAlloc::new(&mut self.code.asm, gpr_order, ANY_XMM.to_vec(), inst_info);
             ra.constant_pool = Some(&mut self.code.constant_pool);
             let desc = emit_block(&ctx, &mut ra, &block);
+
+            let drained: Vec<_> = ctx.deferred_emits.borrow_mut().drain(..).collect();
+            {
+                let mut dctx = DeferredEmitCtx {
+                    asm: &mut *ra.asm,
+                    fastmem_patches: &mut self.fastmem_patches,
+                    code_base,
+                };
+                for closure in drained {
+                    closure(&mut dctx);
+                }
+            }
+
             let patch_entries = ctx.take_patch_entries();
             let fastmem_entries = ctx.fastmem_entries.borrow().clone();
             (desc, patch_entries, fastmem_entries)
         };
 
         let entrypoint = unsafe { self.code.code_base_ptr().add(desc.entrypoint_offset) };
+        let end = unsafe { entrypoint.add(desc.size) };
+        crate::backend::x64::perf_map::register(
+            entrypoint,
+            end,
+            &format!(
+                "a32_{}{:08X}_{}_fpcr{:08X}",
+                if a32_loc.t_flag() { "t" } else { "a" },
+                a32_loc.pc(),
+                if a32_loc.e_flag() { "be" } else { "le" },
+                a32_loc.fpscr().value()
+            ),
+        );
         let code_base = self.code.code_base_ptr() as u64;
 
         // Generate inline fallback stubs for each fastmem instruction.
@@ -396,20 +430,6 @@ impl A32EmitX64 {
                 PatchType::Jmp => info.jmp.push(entry.code_offset),
                 PatchType::MovRcx => info.mov_rcx.push(entry.code_offset),
             }
-        }
-
-        let _ns_emit = _t_emit_start.elapsed().as_nanos() as u64;
-
-        // Record compile elapsed-time before inserting.
-        let _compile_ns = _compile_start.elapsed().as_nanos() as u64;
-        self.cache.add_compile_time(_compile_ns);
-
-        if _profile_phases {
-            let n_insts = block.instructions.len();
-            eprintln!(
-                "[RDYN_COMPILE] pc=0x{:08X} insts={} translate_ns={} optimize_ns={} emit_ns={} total_ns={}",
-                pc, n_insts, _ns_translate, _ns_optimize, _ns_emit, _compile_ns
-            );
         }
 
         self.cache.insert(
@@ -614,6 +634,7 @@ impl A32EmitX64 {
     fn gen_terminal_handlers(&mut self) -> Result<(), String> {
         let code_base = self.code.code_base_ptr();
         let rfrc = self.dispatcher_labels.return_from_run_code;
+        let has_sse42 = self.code.has_host_feature(HostFeature::SSE42);
         let asm = &mut self.code.asm;
 
         let pc_offset = A32JitState::reg_offset(15); // R15 = PC
@@ -716,7 +737,7 @@ impl A32EmitX64 {
             .map_err(|e| format!("FD handler: {:?}", e))?;
         #[cfg(target_arch = "x86_64")]
         {
-            if std::is_x86_feature_detected!("sse4.2") {
+            if has_sse42 {
                 asm.crc32(RBP, R12)
                     .map_err(|e| format!("FD handler: {:?}", e))?;
             }
@@ -876,7 +897,11 @@ impl A32EmitX64 {
         if let Some(ref mut table) = self.fast_dispatch_table {
             let desc = location.value();
             let table_ptr = table.as_ptr() as u64;
-            let hash = fast_dispatch_hash(desc, table_ptr) & FAST_DISPATCH_TABLE_MASK;
+            let hash = fast_dispatch_hash(
+                desc,
+                table_ptr,
+                self.code.has_host_feature(HostFeature::SSE42),
+            ) & FAST_DISPATCH_TABLE_MASK;
             let index = (hash >> 4) as usize;
             if index < table.len() && table[index].location_descriptor == desc {
                 table[index].location_descriptor = 0xFFFF_FFFF_FFFF_FFFF;
@@ -935,6 +960,7 @@ impl A32EmitX64 {
         self.clear_fast_dispatch_table();
         self.fastmem_patches.clear();
         self.cache.clear();
+        crate::backend::x64::perf_map::clear();
         self.code.clear_cache();
     }
 

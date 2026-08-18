@@ -36,6 +36,8 @@ pub struct BufferSlot {
     pub needs_cleanup_on_release: bool,
     pub attached_by_consumer: bool,
     pub is_preallocated: bool,
+    pub queue_time: i64,
+    pub presentation_time: i64,
 }
 
 impl Default for BufferSlot {
@@ -50,6 +52,8 @@ impl Default for BufferSlot {
             needs_cleanup_on_release: false,
             attached_by_consumer: false,
             is_preallocated: false,
+            queue_time: 0,
+            presentation_time: 0,
         }
     }
 }

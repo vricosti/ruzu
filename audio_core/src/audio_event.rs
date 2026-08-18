@@ -10,11 +10,21 @@ pub struct Event {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(usize)]
 pub enum Type {
     AudioInManager,
     AudioOutManager,
     FinalOutputRecorderManager,
     Max,
+}
+
+impl Type {
+    pub const ALL: [Self; 4] = [
+        Self::AudioInManager,
+        Self::AudioOutManager,
+        Self::FinalOutputRecorderManager,
+        Self::Max,
+    ];
 }
 
 impl Event {
@@ -27,12 +37,7 @@ impl Event {
     }
 
     pub const fn get_manager_index(&self, event_type: Type) -> usize {
-        match event_type {
-            Type::AudioInManager => 0,
-            Type::AudioOutManager => 1,
-            Type::FinalOutputRecorderManager => 2,
-            Type::Max => 3,
-        }
+        event_type as usize
     }
 
     pub fn set_audio_event(&self, event_type: Type, signalled: bool) {

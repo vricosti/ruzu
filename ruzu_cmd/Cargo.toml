@@ -28,12 +28,8 @@ clap = { workspace = true }
 log = { workspace = true }
 env_logger = { workspace = true }
 rdynarmic = { workspace = true }
-
-[target.'cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd", target_os = "netbsd", target_os = "openbsd", target_os = "dragonfly"))'.dependencies]
-sdl2 = { version = "0.37", features = ["raw-window-handle", "use-pkgconfig"] }
-
-[target.'cfg(target_os = "windows")'.dependencies]
-sdl2.workspace = true
+libc = { workspace = true }
+sdl3.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc = "0.2"

@@ -71,6 +71,8 @@ pub mod zstd_compression;
 // System utilities
 pub mod announce_multiplayer_room;
 pub mod cityhash;
+pub mod common_funcs;
+pub mod cpu_features;
 pub mod dynamic_library;
 pub mod fastmem_registry;
 pub mod hex_util;

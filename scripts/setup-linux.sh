@@ -22,7 +22,7 @@ case "${ID:-}" in
             build-essential ca-certificates clang cmake curl git
             glslang-tools libasound2-dev libavcodec-dev libavutil-dev
             libclang-dev libgtk-4-dev libjack-jackd2-dev libpulse-dev
-            libsdl2-dev libssl-dev libvulkan-dev libx11-dev
+            libssl-dev libvulkan-dev libx11-dev
             ninja-build pkg-config vulkan-tools
         "
         ;;
@@ -33,7 +33,7 @@ case "${ID:-}" in
             curl ffmpeg-free-devel gcc gcc-c++ git
             glslang gtk4-devel jack-audio-connection-kit-devel
             libX11-devel make ninja-build openssl-devel pkgconf-pkg-config
-            pulseaudio-libs-devel SDL2-devel vulkan-headers
+            pulseaudio-libs-devel vulkan-headers
             vulkan-loader-devel vulkan-tools
         "
         ;;
@@ -42,7 +42,7 @@ case "${ID:-}" in
         REQUIRED_PACKAGES="
             base-devel alsa-lib ca-certificates clang cmake curl
             ffmpeg git glslang gtk4 jack2 libpulse libx11 ninja
-            openssl pkgconf sdl2 vulkan-headers vulkan-icd-loader
+            openssl pkgconf vulkan-headers vulkan-icd-loader
             vulkan-tools
         "
         ;;
@@ -54,7 +54,7 @@ case "${ID:-}" in
             gcc gcc-c++ git glslang-devel gtk4-devel
             libX11-devel libjack-devel libopenssl-devel
             libpulse-devel make ninja pkgconf-pkg-config
-            sdl2-compat-devel vulkan-devel vulkan-tools
+            vulkan-devel vulkan-tools
         "
         ;;
     alpine)
@@ -63,7 +63,7 @@ case "${ID:-}" in
             alsa-lib-dev build-base ca-certificates clang clang-dev
             cmake curl ffmpeg-dev git glslang-dev gtk4.0-dev jack-dev
             libx11-dev ninja openssl-dev pkgconf pulseaudio-dev
-            sdl2-dev vulkan-headers vulkan-loader-dev vulkan-tools
+            vulkan-headers vulkan-loader-dev vulkan-tools
         "
         ;;
     *)

@@ -7,8 +7,60 @@ use rxbyak::{R14, R15, RAX, RBX, RSP};
 use crate::backend::x64::abi;
 use crate::backend::x64::callback::Callback;
 use crate::backend::x64::constant_pool::ConstantPool;
+use crate::backend::x64::host_feature::HostFeature;
 use crate::backend::x64::jit_state::A64JitState;
 use crate::backend::x64::stack_layout::StackLayout;
+
+pub(crate) fn get_host_features() -> HostFeature {
+    use rxbyak::util::cpu;
+
+    let cpu_info = cpu::Cpu::new();
+    let mut features = HostFeature::empty();
+
+    let mappings = [
+        (cpu::SSSE3, HostFeature::SSSE3),
+        (cpu::SSE41, HostFeature::SSE41),
+        (cpu::SSE42, HostFeature::SSE42),
+        (cpu::AVX, HostFeature::AVX),
+        (cpu::AVX2, HostFeature::AVX2),
+        (cpu::AVX512F, HostFeature::AVX512F),
+        (cpu::AVX512CD, HostFeature::AVX512CD),
+        (cpu::AVX512VL, HostFeature::AVX512VL),
+        (cpu::AVX512BW, HostFeature::AVX512BW),
+        (cpu::AVX512DQ, HostFeature::AVX512DQ),
+        (cpu::AVX512_BITALG, HostFeature::AVX512BITALG),
+        (cpu::AVX512_VBMI, HostFeature::AVX512VBMI),
+        (cpu::PCLMULQDQ, HostFeature::PCLMULQDQ),
+        (cpu::F16C, HostFeature::F16C),
+        (cpu::FMA, HostFeature::FMA),
+        (cpu::AESNI, HostFeature::AES),
+        (cpu::SHA, HostFeature::SHA),
+        (cpu::POPCNT, HostFeature::POPCNT),
+        (cpu::BMI1, HostFeature::BMI1),
+        (cpu::BMI2, HostFeature::BMI2),
+        (cpu::LZCNT, HostFeature::LZCNT),
+        (cpu::GFNI, HostFeature::GFNI),
+        (cpu::WAITPKG, HostFeature::WAITPKG),
+    ];
+    for (cpu_feature, host_feature) in mappings {
+        if cpu_info.has(cpu_feature) {
+            features |= host_feature;
+        }
+    }
+
+    if cpu_info.has(cpu::BMI2) {
+        if cpu_info.has(cpu::AMD) {
+            let family = cpu_info.family + cpu_info.ext_family;
+            if family >= 0x19 {
+                features |= HostFeature::FAST_BMI2;
+            }
+        } else {
+            features |= HostFeature::FAST_BMI2;
+        }
+    }
+
+    features
+}
 
 /// Field offsets into the JitState struct (A32 or A64).
 /// Passed at construction time to make BlockOfCode architecture-agnostic.
@@ -152,6 +204,8 @@ pub struct BlockOfCode {
     pub(crate) code_begin_offset: usize,
     /// JitState field offsets (architecture-specific: A32 vs A64).
     pub jit_state_offsets: JitStateOffsets,
+    /// Immutable host-capability mask selected once when the code cache is built.
+    host_features: HostFeature,
 }
 
 impl BlockOfCode {
@@ -179,7 +233,16 @@ impl BlockOfCode {
             prelude_complete: false,
             code_begin_offset: 0,
             jit_state_offsets: offsets,
+            host_features: get_host_features(),
         })
+    }
+
+    pub fn has_host_feature(&self, feature: HostFeature) -> bool {
+        self.host_features.contains(feature)
+    }
+
+    pub fn host_features(&self) -> HostFeature {
+        self.host_features
     }
 
     /// Make the code cache writable before emission.

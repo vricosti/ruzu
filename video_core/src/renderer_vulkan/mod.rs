@@ -12,6 +12,7 @@ pub mod buffer_cache_base;
 pub mod command_pool;
 pub mod compute_pass;
 pub mod compute_pipeline;
+pub mod descriptor_buffer;
 pub mod descriptor_pool;
 pub mod fence_manager;
 pub mod fixed_pipeline_state;

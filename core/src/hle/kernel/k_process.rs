@@ -520,6 +520,9 @@ pub struct KProcess {
     pub program_id: u64,
     pub process_id: u64,
     pub code_address: KProcessAddress,
+    pub arg_pointer: KProcessAddress,
+    pub arg_return_address: KProcessAddress,
+    pub main_thread_handle_addr: KProcessAddress,
     pub code_size: usize,
     pub main_thread_stack_size: usize,
     pub max_process_memory: usize,
@@ -660,6 +663,9 @@ impl KProcess {
             program_id: 0,
             process_id: 0,
             code_address: KProcessAddress::default(),
+            arg_pointer: KProcessAddress::default(),
+            arg_return_address: KProcessAddress::default(),
+            main_thread_handle_addr: KProcessAddress::default(),
             code_size: 0,
             main_thread_stack_size: 0,
             max_process_memory: 0,
@@ -832,9 +838,6 @@ impl KProcess {
         );
         self.exclusive_monitor = Some(Box::new(monitor));
 
-        // Register SIGSEGV handler for JIT execution.
-        crate::arm::dynarmic::arm_dynarmic::ScopedJitExecution::register_handler();
-
         // Create one ARM JIT per core.
         let em_ptr =
             self.exclusive_monitor.as_mut().unwrap().as_mut() as *mut DynarmicExclusiveMonitor;
@@ -855,6 +858,7 @@ impl KProcess {
                     shared_memory.clone(),
                     core_timing.clone(),
                     Some(memory.clone()),
+                    self.debugger_enabled,
                 ))
             } else {
                 use crate::arm::dynarmic::arm_dynarmic_32::ArmDynarmic32;
@@ -908,6 +912,18 @@ impl KProcess {
 
     pub fn get_entry_point(&self) -> KProcessAddress {
         self.code_address
+    }
+
+    pub fn set_arg_pointer(&mut self, address: KProcessAddress) {
+        self.arg_pointer = address;
+    }
+
+    pub fn set_arg_return_address(&mut self, address: KProcessAddress) {
+        self.arg_return_address = address;
+    }
+
+    pub fn set_main_thread_handle_addr(&mut self, address: KProcessAddress) {
+        self.main_thread_handle_addr = address;
     }
 
     pub fn get_main_stack_size(&self) -> usize {
@@ -1966,6 +1982,9 @@ impl KProcess {
         self.version = version;
         self.program_id = program_id;
         self.code_address = KProcessAddress::new(code_address);
+        self.arg_pointer = KProcessAddress::default();
+        self.arg_return_address = KProcessAddress::default();
+        self.main_thread_handle_addr = KProcessAddress::default();
         self.code_size = (code_num_pages as usize) * PAGE_SIZE;
         self.is_application = (flags & CreateProcessFlag::IS_APPLICATION.bits()) != 0;
 
@@ -2556,8 +2575,20 @@ impl KProcess {
             let thread_handle = self.handle_table.add(main_object_id)?;
             {
                 let mut thread = main_thread.lock().unwrap();
-                thread.thread_context.r[0] = 0;
-                thread.thread_context.r[1] = thread_handle as u64;
+                if self.arg_pointer.get() != 0 {
+                    thread.thread_context.r[0] = self.arg_pointer.get();
+                    thread.thread_context.r[1] = u64::MAX;
+                    thread.thread_context.lr = self.arg_return_address.get();
+                    if self.main_thread_handle_addr.get() != 0 {
+                        self.write_memory(
+                            self.main_thread_handle_addr.get(),
+                            &thread_handle.to_le_bytes(),
+                        );
+                    }
+                } else {
+                    thread.thread_context.r[0] = 0;
+                    thread.thread_context.r[1] = thread_handle as u64;
+                }
             }
 
             self.change_state(match state {
@@ -3103,6 +3134,11 @@ impl KProcess {
     pub fn write_memory(&mut self, guest_addr: u64, data: &[u8]) {
         if let Some(memory) = self.get_memory() {
             memory.lock().unwrap().write_block(guest_addr, data);
+        } else {
+            self.process_memory
+                .write()
+                .unwrap()
+                .write_block(guest_addr, data);
         }
     }
 
@@ -3470,6 +3506,52 @@ mod tests {
         assert_eq!(
             stack_info.get_permission(),
             KMemoryPermission::USER_READ_WRITE
+        );
+    }
+
+    #[test]
+    fn run_applies_homebrew_entry_arguments_and_real_thread_handle() {
+        let _kernel = kernel_with_application_pool_for_test(0x80000);
+        let process = Arc::new(ProcessLock::from_value(KProcess::new()));
+        let scheduler = Arc::new(Mutex::new(KScheduler::new(0)));
+        let config_addr = 0x180000;
+        let handle_addr = config_addr + 8;
+
+        {
+            let mut process_guard = process.lock().unwrap();
+            process_guard.code_address = KProcessAddress::new(0x100000);
+            process_guard.allocate_code_memory(0x100000, 0x300000);
+            process_guard.bind_self_reference(&process);
+            process_guard.attach_scheduler(&scheduler);
+            process_guard.initialize_thread_local_region_allocation(0x1c0000);
+            process_guard.resource_limit = Some(Arc::new(Mutex::new(
+                create_resource_limit_for_process(0x1_0000_0000),
+            )));
+            process_guard
+                .process_memory
+                .write()
+                .unwrap()
+                .allocate(0x100000, 0x300000);
+            process_guard.set_arg_pointer(KProcessAddress::new(config_addr));
+            process_guard.set_arg_return_address(KProcessAddress::new(0x101234));
+            process_guard.set_main_thread_handle_addr(KProcessAddress::new(handle_addr));
+        }
+
+        let (main_thread, main_thread_handle, _, _) = process
+            .lock()
+            .unwrap()
+            .run(0, 0x100000, 1, 1, false, None)
+            .expect("homebrew process bootstrap should succeed");
+
+        let thread = main_thread.lock().unwrap();
+        assert_eq!(thread.thread_context.r[0], config_addr);
+        assert_eq!(thread.thread_context.r[1], u64::MAX);
+        assert_eq!(thread.thread_context.lr, 0x101234);
+        drop(thread);
+
+        assert_eq!(
+            process.lock().unwrap().read_memory_vec(handle_addr, 4),
+            main_thread_handle.to_le_bytes()
         );
     }
 

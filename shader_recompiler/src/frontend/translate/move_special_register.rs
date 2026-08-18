@@ -115,12 +115,12 @@ pub fn s2r(tv: &mut TranslatorVisitor, insn: u64) {
             tv.ir.composite_extract_u32x2(wg, Value::ImmU32(2))
         }
         SpecialRegister::WscalefactorXy => {
-            log::warn!("S2R: SR_WSCALEFACTOR_XY stubbed, returning 1.0");
-            Value::ImmU32(1.0f32.to_bits())
+            log::warn!("S2R: SR_WSCALEFACTOR_XY stubbed");
+            tv.ir.sr_w_scale_factor_xy()
         }
         SpecialRegister::WscalefactorZ => {
-            log::warn!("S2R: SR_WSCALEFACTOR_Z stubbed, returning 1.0");
-            Value::ImmU32(1.0f32.to_bits())
+            log::warn!("S2R: SR_WSCALEFACTOR_Z stubbed");
+            tv.ir.sr_w_scale_factor_z()
         }
         SpecialRegister::Affinity => {
             log::warn!("S2R: SR_AFFINITY stubbed, returning 0");
@@ -148,4 +148,33 @@ pub fn s2r(tv: &mut TranslatorVisitor, insn: u64) {
     };
 
     tv.set_x(dest_reg, result);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ir::basic_block::Block;
+    use crate::ir::opcodes::Opcode;
+    use crate::ir::program::Program;
+    use crate::ir::types::ShaderStage;
+
+    #[test]
+    fn w_scale_factor_special_registers_survive_to_the_backend() {
+        for (special_register, expected) in [
+            (30u64, Opcode::SRWScaleFactorXY),
+            (31u64, Opcode::SRWScaleFactorZ),
+        ] {
+            let mut program = Program::new(ShaderStage::VertexB);
+            program.blocks.push(Block::new());
+            let mut visitor = TranslatorVisitor::new(&mut program, 0);
+
+            s2r(&mut visitor, special_register << 20);
+
+            let opcodes: Vec<_> = visitor.ir.program.blocks[0]
+                .iter()
+                .map(|inst| inst.opcode)
+                .collect();
+            assert_eq!(opcodes, vec![expected, Opcode::SetRegister]);
+        }
+    }
 }

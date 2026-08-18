@@ -1748,6 +1748,30 @@ mod tests {
     }
 
     #[test]
+    fn test_super_mario_party_vshrn_vmovn_regression_sequence() {
+        let env = TestEnv::new(vec![
+            0xF2E0_3830, // VSHRN.I64 D19, Q8, #32
+            0xF3FA_2220, // VMOVN.I64 D18, Q8
+            0xEAFF_FFFE, // B .
+        ]);
+        let mut jit = make_jit(env);
+        for (index, value) in [0x1111_1111, 0x2222_2222, 0x3333_3333, 0x4444_4444]
+            .into_iter()
+            .enumerate()
+        {
+            jit.set_ext_reg(32 + index, value);
+        }
+        jit.set_pc(0);
+
+        jit.run();
+
+        assert_eq!(jit.get_ext_reg(36), 0x1111_1111);
+        assert_eq!(jit.get_ext_reg(37), 0x3333_3333);
+        assert_eq!(jit.get_ext_reg(38), 0x2222_2222);
+        assert_eq!(jit.get_ext_reg(39), 0x4444_4444);
+    }
+
+    #[test]
     fn test_asimd_vceq_zero_regression_instruction() {
         let env = TestEnv::new(vec![
             0xF3B9_6562, // VCEQ.F32 Q3, Q9, #0

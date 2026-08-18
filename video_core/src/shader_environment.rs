@@ -12,7 +12,7 @@ use std::io::Write;
 use std::path::Path;
 use std::sync::Arc;
 
-use crate::engines::kepler_compute::{KeplerCompute, QmdConstBuffer};
+use crate::engines::kepler_compute::{ConstBufferConfig, KeplerCompute};
 use crate::engines::maxwell_3d::{
     ConstBufferBinding, EngineHint, Maxwell3D, SamplerBinding, ShaderStageType,
 };
@@ -174,6 +174,7 @@ fn dump_impl(
 /// not construct the full channel/MemoryManager owner graph.
 #[derive(Clone)]
 pub struct GenericEnvironment {
+    texture_pass_caches: shader_recompiler::environment::TexturePassCaches,
     program_base: GPUVAddr,
     start_address: u32,
     stage: ShaderStage,
@@ -217,6 +218,7 @@ pub struct GenericEnvironment {
 impl GenericEnvironment {
     pub fn new() -> Self {
         Self {
+            texture_pass_caches: Default::default(),
             program_base: 0,
             start_address: 0,
             stage: ShaderStage::VertexB,
@@ -540,7 +542,17 @@ impl GenericEnvironment {
         raw: u32,
     ) -> TicEntry {
         let (tic_index, _) = texture_pair(raw, via_header_index);
-        assert!(tic_index <= tic_limit);
+        if tic_index > tic_limit {
+            // Upstream uses ASSERT here. ASSERT is fail-soft unless the user
+            // explicitly enables debug asserts, so a Rust `assert!` would
+            // incorrectly kill the GPU thread in normal release builds.
+            log::error!(
+                "shader_environment.cpp: assert handle.first <= tic_limit (tic_index={tic_index:#x}, tic_limit={tic_limit:#x})"
+            );
+            if *common::settings::values().use_debug_asserts.get_value() {
+                panic!("assertion failed: tic_index <= tic_limit");
+            }
+        }
         let mut raw_bytes = [0u8; 32];
         if let Some(gpu_memory) = self.gpu_memory.as_ref() {
             gpu_memory
@@ -796,7 +808,9 @@ impl GraphicsEnvironment {
                 .cbuf_values
                 .get(&make_cbuf_key(cbuf_index, cbuf_offset))
                 .copied()
-                .expect("file environment must contain every referenced cbuf value");
+                .unwrap_or_else(|| {
+                    std::panic::panic_any(LogicError::new("Uncached read texture type"))
+                });
         }
         #[cfg(test)]
         let binding = self.graphics_const_buffer_binding_for_test(cbuf_index);
@@ -845,7 +859,9 @@ impl GraphicsEnvironment {
                 .texture_types
                 .get(&handle)
                 .copied()
-                .expect("file environment must contain every referenced texture type");
+                .unwrap_or_else(|| {
+                    std::panic::panic_any(LogicError::new("Uncached read texture type"))
+                });
         }
         #[cfg(test)]
         let (tex_header_pool_addr, tex_header_pool_limit, via_header_binding) =
@@ -876,7 +892,9 @@ impl GraphicsEnvironment {
                 .texture_pixel_formats
                 .get(&handle)
                 .copied()
-                .expect("file environment must contain every referenced texture format");
+                .unwrap_or_else(|| {
+                    std::panic::panic_any(LogicError::new("Uncached read texture pixel format"))
+                });
         }
         #[cfg(test)]
         let (tex_header_pool_addr, tex_header_pool_limit, via_header_binding) =
@@ -975,6 +993,10 @@ impl Default for GraphicsEnvironment {
 }
 
 impl shader_recompiler::environment::Environment for GraphicsEnvironment {
+    fn texture_pass_caches(&mut self) -> &mut shader_recompiler::environment::TexturePassCaches {
+        &mut self.base.texture_pass_caches
+    }
+
     fn read_instruction(&mut self, address: u32) -> u64 {
         self.base.read_instruction(address)
     }
@@ -1063,7 +1085,7 @@ pub struct ComputeEnvironment {
 #[derive(Clone, Copy)]
 struct ComputeEnvironmentDetachedState {
     const_buffer_enable_mask: u32,
-    const_buffers: [QmdConstBuffer; 8],
+    const_buffers: [ConstBufferConfig; 8],
     tic_address: u64,
     tic_limit: u32,
     linked_tsc: bool,
@@ -1080,7 +1102,7 @@ impl ComputeEnvironment {
             #[cfg(test)]
             detached_state: ComputeEnvironmentDetachedState {
                 const_buffer_enable_mask: 0,
-                const_buffers: [QmdConstBuffer::default(); 8],
+                const_buffers: [ConstBufferConfig::default(); 8],
                 tic_address: 0,
                 tic_limit: 0,
                 linked_tsc: false,
@@ -1121,7 +1143,7 @@ impl ComputeEnvironment {
     }
 
     #[cfg(test)]
-    fn qmd_for_test(&self) -> Option<(u32, [QmdConstBuffer; 8], u64, u32, bool)> {
+    fn qmd_for_test(&self) -> Option<(u32, [ConstBufferConfig; 8], u64, u32, bool)> {
         unsafe { self.kepler_compute.as_ref() }
             .map(|kepler_compute| {
                 let qmd = kepler_compute.launch_description();
@@ -1151,7 +1173,9 @@ impl ComputeEnvironment {
                 .cbuf_values
                 .get(&make_cbuf_key(cbuf_index, cbuf_offset))
                 .copied()
-                .expect("file environment must contain every referenced cbuf value");
+                .unwrap_or_else(|| {
+                    std::panic::panic_any(LogicError::new("Uncached read texture type"))
+                });
         }
         #[cfg(test)]
         let (enable_mask, cbufs, _, _, _) = self
@@ -1192,7 +1216,9 @@ impl ComputeEnvironment {
                 .texture_types
                 .get(&handle)
                 .copied()
-                .expect("file environment must contain every referenced texture type");
+                .unwrap_or_else(|| {
+                    std::panic::panic_any(LogicError::new("Uncached read texture type"))
+                });
         }
         #[cfg(test)]
         let (_, _, tic_address, tic_limit, linked_tsc) = self
@@ -1221,7 +1247,9 @@ impl ComputeEnvironment {
                 .texture_pixel_formats
                 .get(&handle)
                 .copied()
-                .expect("file environment must contain every referenced texture format");
+                .unwrap_or_else(|| {
+                    std::panic::panic_any(LogicError::new("Uncached read texture pixel format"))
+                });
         }
         #[cfg(test)]
         let (_, _, tic_address, tic_limit, linked_tsc) = self
@@ -1274,7 +1302,7 @@ impl ComputeEnvironment {
     }
 
     #[cfg(test)]
-    fn set_detached_const_buffer(&mut self, index: usize, cbuf: QmdConstBuffer) {
+    fn set_detached_const_buffer(&mut self, index: usize, cbuf: ConstBufferConfig) {
         self.detached_state.const_buffers[index] = cbuf;
         self.kepler_compute = std::ptr::null();
     }
@@ -1295,6 +1323,10 @@ impl Default for ComputeEnvironment {
 }
 
 impl shader_recompiler::environment::Environment for ComputeEnvironment {
+    fn texture_pass_caches(&mut self) -> &mut shader_recompiler::environment::TexturePassCaches {
+        &mut self.base.texture_pass_caches
+    }
+
     fn read_instruction(&mut self, address: u32) -> u64 {
         self.base.read_instruction(address)
     }
@@ -1370,6 +1402,7 @@ impl shader_recompiler::environment::Environment for ComputeEnvironment {
 
 /// File-based shader environment for loading from pipeline cache.
 pub struct FileEnvironment {
+    texture_pass_caches: shader_recompiler::environment::TexturePassCaches,
     code: Vec<u64>,
     texture_types: HashMap<u32, TextureType>,
     texture_pixel_formats: HashMap<u32, TexturePixelFormat>,
@@ -1393,6 +1426,7 @@ pub struct FileEnvironment {
 impl FileEnvironment {
     pub fn new() -> Self {
         Self {
+            texture_pass_caches: Default::default(),
             code: Vec::new(),
             texture_types: HashMap::new(),
             texture_pixel_formats: HashMap::new(),
@@ -1567,6 +1601,7 @@ impl FileEnvironment {
     fn into_generic_environment(self) -> GenericEnvironment {
         let has_hle_engine_state = !self.cbuf_replacements.is_empty();
         GenericEnvironment {
+            texture_pass_caches: self.texture_pass_caches,
             program_base: 0,
             start_address: self.start_address,
             stage: self.stage,
@@ -1624,6 +1659,10 @@ impl Default for FileEnvironment {
 }
 
 impl shader_recompiler::environment::Environment for FileEnvironment {
+    fn texture_pass_caches(&mut self) -> &mut shader_recompiler::environment::TexturePassCaches {
+        &mut self.texture_pass_caches
+    }
+
     fn is_file_environment(&self) -> bool {
         true
     }
@@ -1969,6 +2008,58 @@ fn convert_texture_pixel_format(entry: &TicEntry) -> TexturePixelFormat {
     unsafe { std::mem::transmute::<u32, TexturePixelFormat>(pixel_format as u32) }
 }
 
+/// `convert_texture_pixel_format` transmutes a `PixelFormat` straight into a
+/// `TexturePixelFormat`. They are declared in two different crates and neither
+/// references the other, so nothing but this check keeps their discriminants
+/// aligned — and a mismatch is undefined behaviour, not a compile error.
+#[cfg(test)]
+fn assert_pixel_format_layouts_match() {
+    use crate::surface::PixelFormat;
+
+    // Pin the absolute discriminants: comparing the two enums to each other is
+    // not enough, since inserting the same variant into both would keep them
+    // equal while silently invalidating every shader cache on disk.
+    assert_eq!(PixelFormat::E5B9G9R9Float as u32, 94);
+    assert_eq!(PixelFormat::Etc2RgbUnorm as u32, 95);
+    assert_eq!(PixelFormat::D32Float as u32, 105);
+    assert_eq!(PixelFormat::D32FloatS8Uint as u32, 111);
+    assert_eq!(PixelFormat::MaxDepthStencilFormat as u32, 112);
+    assert_eq!(TexturePixelFormat::D32FloatS8Uint as u32, 111);
+
+    // Boundaries around every block that has ever been inserted.
+    let pairs: [(PixelFormat, TexturePixelFormat); 8] = [
+        (
+            PixelFormat::A8B8G8R8Unorm,
+            TexturePixelFormat::A8B8G8R8Unorm,
+        ),
+        (
+            PixelFormat::Astc2d6x5Srgb,
+            TexturePixelFormat::Astc2d6x5Srgb,
+        ),
+        (
+            PixelFormat::E5B9G9R9Float,
+            TexturePixelFormat::E5B9G9R9Float,
+        ),
+        (PixelFormat::Etc2RgbUnorm, TexturePixelFormat::Etc2RgbUnorm),
+        (
+            PixelFormat::EacR11G11Snorm,
+            TexturePixelFormat::EacR11G11Snorm,
+        ),
+        (PixelFormat::D32Float, TexturePixelFormat::D32Float),
+        (PixelFormat::S8Uint, TexturePixelFormat::S8Uint),
+        (
+            PixelFormat::D32FloatS8Uint,
+            TexturePixelFormat::D32FloatS8Uint,
+        ),
+    ];
+    for (surface, shader) in pairs {
+        assert_eq!(
+            surface as u32, shader as u32,
+            "{surface:?} and {shader:?} must share a discriminant"
+        );
+    }
+}
+
 fn is_integer_pixel_format(format: TexturePixelFormat) -> bool {
     matches!(
         format,
@@ -2009,13 +2100,34 @@ fn deserialize_enum_u32<T>(raw: u32, max: u32, type_name: &str) -> std::io::Resu
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn texture_pixel_format_layout_matches_surface_pixel_format() {
+        super::assert_pixel_format_layouts_match();
+    }
     use super::*;
     use crate::engines::engine_interface::EngineInterface;
-    use crate::engines::kepler_compute::{KeplerCompute, QueueMetaData};
+    use crate::engines::kepler_compute::{KeplerCompute, LaunchParams};
     use crate::engines::maxwell_3d::{Maxwell3D, ShaderStageType};
     use crate::memory_manager::MemoryManager;
     use parking_lot::Mutex as ParkingLotMutex;
     use std::sync::Mutex;
+
+    #[test]
+    fn read_texture_info_limit_assert_is_fail_soft_like_upstream() {
+        let reads = Arc::new(Mutex::new(Vec::new()));
+        let reads_clone = Arc::clone(&reads);
+        let reader: GpuMemoryReader = Arc::new(move |gpu_addr, dst| {
+            reads_clone.lock().unwrap().push((gpu_addr, dst.len()));
+            dst.fill(0);
+        });
+        let env = GenericEnvironment::new().with_gpu_read(reader);
+
+        let entry = env.read_texture_info(0x1000, 0x10ff, false, u32::MAX);
+
+        assert!(entry == TicEntry::default());
+        assert_eq!(reads.lock().unwrap().as_slice(), &[(0x0200_0fe0, 32)]);
+    }
 
     /// Build a 64 KiB GPU-memory mock with a Maxwell self-branch sentinel
     /// at byte offset `sentinel_offset` (relative to the program base) and
@@ -2077,7 +2189,7 @@ mod tests {
             MemoryManager::new_with_geometry_and_device_memory(
                 1,
                 Arc::clone(&device_memory),
-                32,
+                40,
                 0x1_0000_0000,
                 16,
                 12,
@@ -2367,19 +2479,10 @@ mod tests {
         let cpu_base = 0xA000;
         let mut backing = vec![0u8; 0x2000];
         backing[0x100..0x104].copy_from_slice(&0xAABBCCDDu32.to_le_bytes());
-        let backing = Arc::new(backing);
-        let reader = Arc::new(move |cpu_addr, dst: &mut [u8]| {
-            let offset = (cpu_addr - cpu_base) as usize;
-            let end = (offset + dst.len()).min(backing.len());
-            if offset < backing.len() {
-                dst[..end - offset].copy_from_slice(&backing[offset..end]);
-            }
-        });
 
         let mut maxwell = Maxwell3D::new();
-        let mm = make_mapped_memory_manager(gpu_base, cpu_base, 0x2000);
+        let mm = make_owner_backed_memory_manager(gpu_base, cpu_base, &backing);
         maxwell.set_memory_manager(Arc::clone(&mm));
-        maxwell.set_guest_memory_reader(reader);
         let mut env =
             GraphicsEnvironment::from_maxwell3d(&maxwell, ShaderStageType::VertexB, gpu_base, 0);
 
@@ -2473,7 +2576,7 @@ mod tests {
             .map(gpu_base, cpu_base, 0x2000, 0, false);
 
         let mut kepler = KeplerCompute::new(Arc::clone(&memory_manager));
-        kepler.launch_description = QueueMetaData {
+        kepler.launch_description = LaunchParams {
             program_start: 0x100,
             shared_alloc: 0x80,
             block_dim_x: 16,
@@ -2482,7 +2585,7 @@ mod tests {
             local_pos_alloc: 0x40,
             local_crs_alloc: 0x20,
             linked_tsc: true,
-            ..QueueMetaData::default()
+            ..LaunchParams::default()
         };
         kepler.call_method(0x582, 0x2, true);
         kepler.call_method(0x583, 0, true);
@@ -2504,7 +2607,7 @@ mod tests {
         let mut env = ComputeEnvironment::from_kepler_compute(&kepler, Arc::clone(&memory_manager));
 
         kepler.launch_description.const_buffer_enable_mask = 1;
-        kepler.launch_description.const_buffers[0] = QmdConstBuffer {
+        kepler.launch_description.const_buffers[0] = ConstBufferConfig {
             address: gpu_base,
             size: 0x400,
         };

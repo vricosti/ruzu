@@ -17,6 +17,16 @@ use super::var_alloc::GlslVarType;
 
 const SWIZZLE: [&str; 4] = ["x", "y", "z", "w"];
 
+/// Port of upstream `EmitSR_WScaleFactorXY`.
+pub fn emit_sr_w_scale_factor_xy(_ctx: &mut EmitContext) {
+    log::warn!("(STUBBED) SR_WScaleFactorXY called");
+}
+
+/// Port of upstream `EmitSR_WScaleFactorZ`.
+pub fn emit_sr_w_scale_factor_z(_ctx: &mut EmitContext) {
+    log::warn!("(STUBBED) SR_WScaleFactorZ called");
+}
+
 fn cbuf_index(offset: u32) -> u32 {
     (offset / 4) % 4
 }
@@ -579,9 +589,17 @@ mod tests {
     use crate::ir::program::ShaderInfoExt;
     use crate::ir::types::ShaderStage;
     use crate::ir::value::{Attribute, InstRef, Value};
-    use crate::ir_opt::optimize;
     use crate::profile::Profile;
     use crate::runtime_info::{AttributeType, CompareFunction, RuntimeInfo};
+
+    fn optimize(program: &mut crate::ir::Program) {
+        crate::frontend::translate_program::optimize_program_without_env(
+            program,
+            &crate::host_translate_info::HostTranslateInfo::default(),
+            None,
+            None,
+        );
+    }
 
     #[test]
     fn glsl_cbuf_load_defines_ssa_value_and_declares_uniform() {

@@ -5,125 +5,10 @@
 //!
 //! Maps Tegra texture format + component types + sRGB flag to `PixelFormat`.
 
-// ── PixelFormat ────────────────────────────────────────────────────────
-// Upstream lives in video_core/surface.h (`VideoCore::Surface::PixelFormat`).
-// Until that module is fully ported we carry the enum here so that all
-// texture_cache files can reference it.  Keep in sync with upstream.
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
-#[repr(u32)]
-#[allow(non_camel_case_types)]
-pub enum PixelFormat {
-    A8B8G8R8Unorm = 0,
-    A8B8G8R8Snorm,
-    A8B8G8R8Sint,
-    A8B8G8R8Uint,
-    R5G6B5Unorm,
-    B5G6R5Unorm,
-    A1R5G5B5Unorm,
-    A2B10G10R10Unorm,
-    A2B10G10R10Uint,
-    A2R10G10B10Unorm,
-    A1B5G5R5Unorm,
-    A5B5G5R1Unorm,
-    R8Unorm,
-    R8Snorm,
-    R8Sint,
-    R8Uint,
-    R16G16B16A16Float,
-    R16G16B16A16Unorm,
-    R16G16B16A16Snorm,
-    R16G16B16A16Sint,
-    R16G16B16A16Uint,
-    B10G11R11Float,
-    R32G32B32A32Uint,
-    Bc1RgbaUnorm,
-    Bc2Unorm,
-    Bc3Unorm,
-    Bc4Unorm,
-    Bc4Snorm,
-    Bc5Unorm,
-    Bc5Snorm,
-    Bc7Unorm,
-    Bc6hUfloat,
-    Bc6hSfloat,
-    Astc2d4x4Unorm,
-    B8G8R8A8Unorm,
-    R32G32B32A32Float,
-    R32G32B32A32Sint,
-    R32G32Float,
-    R32G32Sint,
-    R32Float,
-    R16Float,
-    R16Unorm,
-    R16Snorm,
-    R16Uint,
-    R16Sint,
-    R16G16Unorm,
-    R16G16Float,
-    R16G16Uint,
-    R16G16Sint,
-    R16G16Snorm,
-    R32G32B32Float,
-    A8B8G8R8Srgb,
-    R8G8Unorm,
-    R8G8Snorm,
-    R8G8Sint,
-    R8G8Uint,
-    R32G32Uint,
-    R16G16B16X16Float,
-    R32Uint,
-    R32Sint,
-    Astc2d8x8Unorm,
-    Astc2d8x5Unorm,
-    Astc2d5x4Unorm,
-    B8G8R8A8Srgb,
-    Bc1RgbaSrgb,
-    Bc2Srgb,
-    Bc3Srgb,
-    Bc7Srgb,
-    A4B4G4R4Unorm,
-    G4R4Unorm,
-    Astc2d4x4Srgb,
-    Astc2d8x8Srgb,
-    Astc2d8x5Srgb,
-    Astc2d5x4Srgb,
-    Astc2d5x5Unorm,
-    Astc2d5x5Srgb,
-    Astc2d10x8Unorm,
-    Astc2d10x8Srgb,
-    Astc2d6x6Unorm,
-    Astc2d6x6Srgb,
-    Astc2d10x6Unorm,
-    Astc2d10x6Srgb,
-    Astc2d10x5Unorm,
-    Astc2d10x5Srgb,
-    Astc2d10x10Unorm,
-    Astc2d10x10Srgb,
-    Astc2d12x10Unorm,
-    Astc2d12x10Srgb,
-    Astc2d12x12Unorm,
-    Astc2d12x12Srgb,
-    Astc2d8x6Unorm,
-    Astc2d8x6Srgb,
-    Astc2d6x5Unorm,
-    Astc2d6x5Srgb,
-    E5B9G9R9Float,
-
-    // Depth formats
-    D32Float,
-    D16Unorm,
-    X8D24Unorm,
-    S8Uint,
-    D24UnormS8Uint,
-    S8UintD24Unorm,
-    D32FloatS8Uint,
-
-    MaxDepthStencilFormat,
-
-    #[default]
-    Invalid,
-}
+// `PixelFormat` is defined in `surface.rs`, mirroring upstream's
+// `video_core/surface.h`. Re-exported here so the texture_cache modules that
+// already import it from this file keep resolving.
+pub use crate::surface::PixelFormat;
 
 // ── ComponentType placeholder ──────────────────────────────────────────
 // Upstream: Tegra::Texture::ComponentType
@@ -220,11 +105,6 @@ pub enum TextureFormat {
 }
 
 impl TextureFormat {
-    // Render-target/shader helper alias still used by the current Rust
-    // `shader_environment` bridge. Upstream shader_environment reads a real
-    // TICEntry instead of converting through this alias.
-    pub const A2R10G10B10: Self = Self::ETC2_RGB_PTA;
-
     pub fn from_raw(value: u32) -> Option<Self> {
         match value {
             0x01 => Some(Self::R32G32B32A32),
@@ -352,9 +232,18 @@ fn unimplemented_texture_format(
     alpha: u32,
     is_srgb: bool,
 ) -> PixelFormat {
+    // Upstream's `PixelFormatFromTextureInfo` is `noexcept`: an unknown TIC
+    // tuple reaches `UNIMPLEMENTED_MSG` and then deliberately falls back to
+    // A8B8G8R8_UNORM.  Panicking here kills Reden's GPU thread while Eden
+    // continues compiling the shader with the fallback format.
     log::error!(
-        "PixelFormatFromTextureInfo unimplemented texture format={} srgb={} components=({} {} {} {})",
-        format, is_srgb, red, green, blue, alpha
+        "PixelFormatFromTextureInfo: unimplemented texture format={} srgb={} components=({} {} {} {})",
+        format,
+        is_srgb,
+        red,
+        green,
+        blue,
+        alpha
     );
     PixelFormat::A8B8G8R8Unorm
 }
@@ -467,6 +356,18 @@ pub fn pixel_format_from_texture_info_raw(
         x if x == h_uni!(TF::BC7U, UNORM, srgb) => PixelFormat::Bc7Srgb,
         x if x == h_uni!(TF::BC6H_S16, FLOAT) => PixelFormat::Bc6hSfloat,
         x if x == h_uni!(TF::BC6H_U16, FLOAT) => PixelFormat::Bc6hUfloat,
+        // ETC2
+        x if x == h_uni!(TF::ETC2_RGB, UNORM) => PixelFormat::Etc2RgbUnorm,
+        x if x == h_uni!(TF::ETC2_RGB_PTA, UNORM) => PixelFormat::Etc2RgbPtaUnorm,
+        x if x == h_uni!(TF::ETC2_RGBA, UNORM) => PixelFormat::Etc2RgbaUnorm,
+        x if x == h_uni!(TF::ETC2_RGB, UNORM, srgb) => PixelFormat::Etc2RgbSrgb,
+        x if x == h_uni!(TF::ETC2_RGB_PTA, UNORM, srgb) => PixelFormat::Etc2RgbPtaSrgb,
+        x if x == h_uni!(TF::ETC2_RGBA, UNORM, srgb) => PixelFormat::Etc2RgbaSrgb,
+        // EAC
+        x if x == h_uni!(TF::EAC, UNORM) => PixelFormat::EacR11Unorm,
+        x if x == h_uni!(TF::EAC, SNORM) => PixelFormat::EacR11Snorm,
+        x if x == h_uni!(TF::EACX2, UNORM) => PixelFormat::EacR11G11Unorm,
+        x if x == h_uni!(TF::EACX2, SNORM) => PixelFormat::EacR11G11Snorm,
         // ASTC
         x if x == h_uni!(TF::Astc2d4x4, UNORM) => PixelFormat::Astc2d4x4Unorm,
         x if x == h_uni!(TF::Astc2d4x4, UNORM, srgb) => PixelFormat::Astc2d4x4Srgb,
@@ -530,7 +431,7 @@ mod tests {
                 ComponentType::Float as u32,
                 false,
             ),
-            PixelFormat::A8B8G8R8Unorm
+            PixelFormat::A8B8G8R8Unorm,
         );
     }
 
@@ -538,7 +439,66 @@ mod tests {
     fn unknown_texture_format_uses_upstream_fallback() {
         assert_eq!(
             pixel_format_from_texture_info_raw(0xFFFF_FFFF, 0, 0, 0, 0, false),
-            PixelFormat::A8B8G8R8Unorm
+            PixelFormat::A8B8G8R8Unorm,
+        );
+    }
+
+    #[test]
+    fn zeroed_texture_info_uses_upstream_fallback() {
+        assert_eq!(
+            pixel_format_from_texture_info_raw(0, 0, 0, 0, 0, false),
+            PixelFormat::A8B8G8R8Unorm,
+        );
+    }
+    // The ten ETC2/EAC entries upstream's `PixelFormatFromTextureInfo` maps.
+    // Note upstream's ordering quirk: `ETC2_RGB_PTA` (0x0a) precedes
+    // `ETC2_RGBA` (0x0b) in the switch, and EAC has no sRGB variant.
+    #[test]
+    fn etc2_and_eac_texture_formats_map_like_upstream() {
+        let uni = |format, component, srgb| {
+            pixel_format_from_texture_info(format, component, component, component, component, srgb)
+        };
+        use ComponentType::{Snorm, Unorm};
+
+        assert_eq!(
+            uni(TextureFormat::ETC2_RGB, Unorm, false),
+            PixelFormat::Etc2RgbUnorm
+        );
+        assert_eq!(
+            uni(TextureFormat::ETC2_RGB_PTA, Unorm, false),
+            PixelFormat::Etc2RgbPtaUnorm
+        );
+        assert_eq!(
+            uni(TextureFormat::ETC2_RGBA, Unorm, false),
+            PixelFormat::Etc2RgbaUnorm
+        );
+        assert_eq!(
+            uni(TextureFormat::ETC2_RGB, Unorm, true),
+            PixelFormat::Etc2RgbSrgb
+        );
+        assert_eq!(
+            uni(TextureFormat::ETC2_RGB_PTA, Unorm, true),
+            PixelFormat::Etc2RgbPtaSrgb
+        );
+        assert_eq!(
+            uni(TextureFormat::ETC2_RGBA, Unorm, true),
+            PixelFormat::Etc2RgbaSrgb
+        );
+        assert_eq!(
+            uni(TextureFormat::EAC, Unorm, false),
+            PixelFormat::EacR11Unorm
+        );
+        assert_eq!(
+            uni(TextureFormat::EAC, Snorm, false),
+            PixelFormat::EacR11Snorm
+        );
+        assert_eq!(
+            uni(TextureFormat::EACX2, Unorm, false),
+            PixelFormat::EacR11G11Unorm
+        );
+        assert_eq!(
+            uni(TextureFormat::EACX2, Snorm, false),
+            PixelFormat::EacR11G11Snorm
         );
     }
 }

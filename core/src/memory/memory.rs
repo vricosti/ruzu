@@ -5,10 +5,11 @@
 //! Core::Memory::Memory — bridges KPageTableBase with the dynarmic page table
 //! and the DeviceMemory backing store.
 
-#[cfg(target_os = "linux")]
+#[cfg(target_os = "android")]
 use common::heap_tracker::HeapTracker;
 use common::host_memory::HostMemory;
 use common::page_table::{PageInfo, PageTable, PageType};
+use common::scratch_buffer::ScratchBuffer;
 use std::sync::{
     atomic::{AtomicU64, Ordering},
     Arc, Mutex,
@@ -103,9 +104,9 @@ pub struct Memory {
     device_memory: *const DeviceMemory,
     /// Pointer to the HostMemory buffer (used for fastmem arena base).
     buffer: *const HostMemory,
-    /// On Linux: HeapTracker wrapping HostMemory for separate heap fault handling.
+    /// On Android: HeapTracker wrapping HostMemory for separate heap fault handling.
     /// Upstream: `std::optional<Common::HeapTracker> heap_tracker` + `HeapTracker* buffer`.
-    #[cfg(target_os = "linux")]
+    #[cfg(target_os = "android")]
     heap_tracker: Option<Box<HeapTracker>>,
     /// Current page table (set by SetCurrentPageTable when switching processes).
     current_page_table: *mut PageTable,
@@ -116,6 +117,8 @@ pub struct Memory {
     rasterizer_write_areas: [Mutex<GpuDirtyState>; hardware_properties::NUM_CPU_CORES as usize],
     /// Upstream owner: `std::span<Core::GPUDirtyMemoryManager> gpu_dirty_managers`.
     gpu_dirty_managers: Vec<Arc<GpuDirtyMemoryManager>>,
+    /// Port of upstream `scratch_buffers[Core::Hardware::NUM_CPU_CORES]`.
+    smmu_scratch_buffers: [Mutex<ScratchBuffer<u32>>; hardware_properties::NUM_CPU_CORES as usize],
     /// Serializes non-core host threads sharing the last per-core GPU cache
     /// slot. Upstream owner: `std::mutex sys_core_guard`.
     sys_core_guard: Arc<Mutex<()>>,
@@ -426,12 +429,13 @@ impl Memory {
             system,
             device_memory,
             buffer,
-            #[cfg(target_os = "linux")]
+            #[cfg(target_os = "android")]
             heap_tracker: None,
             current_page_table: std::ptr::null_mut(),
             rasterizer_read_areas: new_rasterizer_read_areas(),
             rasterizer_write_areas: std::array::from_fn(|_| Mutex::new(GpuDirtyState::default())),
             gpu_dirty_managers: Vec::new(),
+            smmu_scratch_buffers: std::array::from_fn(|_| Mutex::new(ScratchBuffer::new())),
             sys_core_guard: Arc::new(Mutex::new(())),
         }
     }
@@ -497,10 +501,10 @@ impl Memory {
             //     page_table.fastmem_arena = nullptr;
             pt.fastmem_arena = unsafe { (*self.buffer).virtual_base_pointer() };
 
-            // On Linux, create a HeapTracker wrapping the HostMemory buffer.
+            // On Android, create a HeapTracker wrapping the HostMemory buffer.
             // Upstream: heap_tracker.emplace(system.DeviceMemory().buffer);
             //           buffer = std::addressof(*heap_tracker);
-            #[cfg(target_os = "linux")]
+            #[cfg(target_os = "android")]
             {
                 let host_mem = unsafe { &mut *(self.buffer as *mut HostMemory) };
                 self.heap_tracker = Some(Box::new(HeapTracker::new(host_mem)));
@@ -840,8 +844,8 @@ impl Memory {
 
         if !page_table.fastmem_arena.is_null() {
             // Upstream: buffer->Map(base, target - DramBase, size, perms, separate_heap)
-            // On Linux, buffer is HeapTracker*; on non-Linux, buffer is HostMemory*.
-            #[cfg(target_os = "linux")]
+            // On Android, buffer is HeapTracker*; elsewhere it is HostMemory*.
+            #[cfg(target_os = "android")]
             if let Some(ref heap_tracker) = self.heap_tracker {
                 heap_tracker.map(
                     base as usize,
@@ -851,7 +855,7 @@ impl Memory {
                     separate_heap,
                 );
             }
-            #[cfg(not(target_os = "linux"))]
+            #[cfg(not(target_os = "android"))]
             unsafe {
                 (*self.buffer).map(
                     base as usize,
@@ -886,11 +890,11 @@ impl Memory {
         );
 
         if !page_table.fastmem_arena.is_null() {
-            #[cfg(target_os = "linux")]
+            #[cfg(target_os = "android")]
             if let Some(ref heap_tracker) = self.heap_tracker {
                 heap_tracker.unmap(base as usize, size as usize, separate_heap);
             }
-            #[cfg(not(target_os = "linux"))]
+            #[cfg(not(target_os = "android"))]
             unsafe {
                 (*self.buffer).unmap(base as usize, size as usize, separate_heap);
             }
@@ -958,9 +962,9 @@ impl Memory {
     /// Matches upstream `Memory::Impl::GetPointerImpl`.
     ///
     /// Returns null if the page is unmapped.
-    /// Route protect calls through HeapTracker on Linux, HostMemory otherwise.
+    /// Route protect calls through HeapTracker on Android, HostMemory otherwise.
     fn protect_buffer(&self, offset: usize, size: usize, perms: MemoryPermission) {
-        #[cfg(target_os = "linux")]
+        #[cfg(target_os = "android")]
         if let Some(ref heap_tracker) = self.heap_tracker {
             heap_tracker.protect(offset, size, perms);
             return;
@@ -1058,7 +1062,13 @@ impl Memory {
     /// matching upstream's `Settings::values.use_reactive_flushing` policy.
     pub fn rasterizer_mark_region_cached(&self, vaddr: u64, size: u64, cached: bool) {
         record_rasterizer_mark_cached_stage(0);
-        if vaddr == 0 || size == 0 || self.current_page_table.is_null() {
+        if vaddr == 0
+            || size == 0
+            || self.current_page_table.is_null()
+            || usize::try_from(size)
+                .map(|size| !self.address_space_contains(vaddr, size))
+                .unwrap_or(true)
+        {
             record_rasterizer_mark_cached_stage(8);
             return;
         }
@@ -1115,8 +1125,9 @@ impl Memory {
                             let encoded = (pointer as usize).wrapping_sub(current_vaddr as usize);
                             entry.store(encoded, PageType::Memory);
                         } else {
-                            // No backing recoverable — fall back to debug.
-                            entry.store(0, PageType::DebugMemory);
+                            // The backing VMA may already have been removed
+                            // while its page table was being updated.
+                            entry.store(0, PageType::Unmapped);
                         }
                     }
                 }
@@ -1125,24 +1136,6 @@ impl Memory {
         }
         record_rasterizer_mark_cached_stage(6);
         record_rasterizer_mark_cached_stage(7);
-    }
-
-    pub fn current_physical_address(&self, vaddr: u64) -> Option<u64> {
-        if self.current_page_table.is_null() {
-            return None;
-        }
-        let pt = unsafe { &*self.current_page_table };
-        let page_idx = (vaddr >> PAGE_BITS) as usize;
-        if page_idx >= pt.backing_addr.size() {
-            return None;
-        }
-        let backing = pt.backing_addr[page_idx];
-        if backing == 0 {
-            return None;
-        }
-        // backing was computed via wrapping_sub in map_pages, so the cancellation
-        // here (backing + vaddr) must also wrap to recover the device address.
-        Some(backing.wrapping_add(vaddr))
     }
 
     fn handle_rasterizer_write(&self, vaddr: u64, size: usize) {
@@ -1164,7 +1157,8 @@ impl Memory {
             let mut do_collection = write_area.last_address == subaddress;
 
             if !do_collection {
-                do_collection = gpu.on_cpu_write(device_addr, size as u64);
+                do_collection =
+                    device_addr != 0 && size != 0 && gpu.on_cpu_write(device_addr, size as u64);
                 if !do_collection {
                     return;
                 }
@@ -1178,15 +1172,9 @@ impl Memory {
         };
 
         if let Some(host1x) = self.system.get().host1x_core() {
-            if host1x.smmu_apply_op_on_host_pointer(host_ptr as usize, &mut write) != 0 {
-                return;
-            }
+            let mut scratch = self.smmu_scratch_buffers[core].lock().unwrap();
+            host1x.smmu_apply_op_on_host_pointer(host_ptr as usize, &mut scratch, &mut write);
         }
-
-        let Some(device_addr) = self.current_physical_address(vaddr) else {
-            return;
-        };
-        write(device_addr);
     }
 
     fn current_host_thread_cache_index(&self) -> usize {
@@ -1227,13 +1215,8 @@ impl Memory {
         };
 
         if let Some(host1x) = self.system.get().host1x_core() {
-            if host1x.smmu_apply_op_on_host_pointer(host_ptr as usize, &mut download) != 0 {
-                return;
-            }
-        }
-
-        if let Some(device_addr) = self.current_physical_address(vaddr) {
-            download(device_addr);
+            let mut scratch = self.smmu_scratch_buffers[core].lock().unwrap();
+            host1x.smmu_apply_op_on_host_pointer(host_ptr as usize, &mut scratch, &mut download);
         }
     }
 
@@ -1372,26 +1355,33 @@ impl Memory {
         let mut ranges: Vec<(u64, usize)> = Vec::new();
         let mut remaining = size;
         let mut vaddr = dest_addr;
+        let core = self.current_host_thread_cache_index();
+        let mut scratch = self.smmu_scratch_buffers[core].lock().unwrap();
 
         while remaining > 0 {
             let page_offset = (vaddr & PAGE_MASK) as usize;
             let block_size = ((PAGE_SIZE as usize) - page_offset).min(remaining);
 
-            if !self.get_pointer_impl(vaddr).is_null()
+            let host_ptr = self.get_pointer_impl(vaddr);
+            if !host_ptr.is_null()
                 && self.page_type_at(vaddr) == Some(PageType::RasterizerCachedMemory)
             {
-                if let Some(device_addr) = self.current_physical_address(vaddr) {
-                    match ranges.last_mut() {
-                        // Merge device-contiguous blocks so phase 2 issues one
-                        // rasterizer notification per range instead of one per
-                        // 4 KiB page.
-                        Some((last_device_addr, last_size))
-                            if *last_device_addr + *last_size as u64 == device_addr =>
-                        {
-                            *last_size += block_size;
-                        }
-                        _ => ranges.push((device_addr, block_size)),
-                    }
+                if let Some(host1x) = self.system.get().host1x_core() {
+                    host1x.smmu_apply_op_on_host_pointer(
+                        host_ptr as usize,
+                        &mut scratch,
+                        &mut |device_addr| match ranges.last_mut() {
+                            // Merge device-contiguous blocks so phase 2 issues one
+                            // rasterizer notification per range instead of one per
+                            // 4 KiB page.
+                            Some((last_device_addr, last_size))
+                                if *last_device_addr + *last_size as u64 == device_addr =>
+                            {
+                                *last_size += block_size;
+                            }
+                            _ => ranges.push((device_addr, block_size)),
+                        },
+                    );
                 }
             }
 
@@ -1399,7 +1389,6 @@ impl Memory {
             remaining -= block_size;
         }
 
-        let core = self.current_host_thread_cache_index();
         let sys_core = hardware_properties::NUM_CPU_CORES as usize - 1;
         RasterizerWriteBatch {
             system: self.system,
@@ -3029,9 +3018,9 @@ mod zero_phys_block_tests {
 mod rasterizer_download_tests {
     use std::sync::{Arc, Mutex};
 
-    use common::page_table::{PageTable, PageType};
+    use common::page_table::{PageInfo, PageTable, PageType};
 
-    use super::{dram_memory_map, DeviceMemory, Memory, PAGE_BITS};
+    use super::{dram_memory_map, DeviceMemory, Memory, PAGE_BITS, PAGE_SIZE};
     use crate::core::{System, SystemRef};
     use crate::gpu_core::{
         FramebufferConfig, GpuChannelHandle, GpuCommandList, GpuCoreInterface,
@@ -3076,6 +3065,7 @@ mod rasterizer_download_tests {
 
     struct FakeGpuCore {
         reads: Arc<Mutex<Vec<(u64, u64)>>>,
+        writes: Arc<Mutex<Vec<(u64, u64)>>>,
         download_size: u64,
     }
 
@@ -3104,8 +3094,9 @@ mod rasterizer_download_tests {
 
         fn request_composite(&self, _layers: Vec<FramebufferConfig>, _fences: Vec<NvFence>) {}
 
-        fn on_cpu_write(&self, _addr: u64, _size: u64) -> bool {
-            false
+        fn on_cpu_write(&self, addr: u64, size: u64) -> bool {
+            self.writes.lock().unwrap().push((addr, size));
+            true
         }
 
         fn on_cpu_read(&self, addr: u64, size: u64) -> RasterizerDownloadArea {
@@ -3198,6 +3189,7 @@ mod rasterizer_download_tests {
         fn smmu_apply_op_on_host_pointer(
             &self,
             host_ptr: usize,
+            _scratch: &mut common::scratch_buffer::ScratchBuffer<u32>,
             operation: &mut dyn FnMut(u64),
         ) -> usize {
             self.applied_host_ptrs.lock().unwrap().push(host_ptr);
@@ -3258,14 +3250,20 @@ mod rasterizer_download_tests {
     #[test]
     fn rasterizer_download_skips_reads_covered_by_current_core_area() {
         let reads = Arc::new(Mutex::new(Vec::new()));
+        let applied_host_ptrs = Arc::new(Mutex::new(Vec::new()));
         let mut system = System::new_for_test();
         system.set_gpu_core(Box::new(FakeGpuCore {
             reads: reads.clone(),
+            writes: Arc::new(Mutex::new(Vec::new())),
             download_size: 0x100,
         }));
 
         let (_device_memory, _page_table, memory, vaddr, device_addr) =
             make_rasterizer_cached_memory(&system);
+        system.set_host1x_core(Box::new(FakeHost1xCore {
+            applied_host_ptrs,
+            aliases: vec![device_addr + 0x20],
+        }));
 
         memory.handle_rasterizer_download(vaddr + 0x20, 4);
         memory.handle_rasterizer_download(vaddr + 0x40, 4);
@@ -3282,6 +3280,7 @@ mod rasterizer_download_tests {
         let mut system = System::new_for_test();
         system.set_gpu_core(Box::new(FakeGpuCore {
             reads: reads.clone(),
+            writes: Arc::new(Mutex::new(Vec::new())),
             download_size: 0x80,
         }));
         system.set_host1x_core(Box::new(FakeHost1xCore {
@@ -3299,23 +3298,162 @@ mod rasterizer_download_tests {
         assert_eq!(&*reads, &[(host1x_device_addr, 4)]);
         assert_ne!(reads[0].0, backing_device_addr + 0x20);
     }
+
+    #[test]
+    fn rasterizer_download_does_not_fallback_to_process_physical_address() {
+        let reads = Arc::new(Mutex::new(Vec::new()));
+        let applied_host_ptrs = Arc::new(Mutex::new(Vec::new()));
+        let mut system = System::new_for_test();
+        system.set_gpu_core(Box::new(FakeGpuCore {
+            reads: reads.clone(),
+            writes: Arc::new(Mutex::new(Vec::new())),
+            download_size: 0x80,
+        }));
+        system.set_host1x_core(Box::new(FakeHost1xCore {
+            applied_host_ptrs: applied_host_ptrs.clone(),
+            aliases: Vec::new(),
+        }));
+
+        let (_device_memory, _page_table, memory, vaddr, _device_addr) =
+            make_rasterizer_cached_memory(&system);
+        memory.handle_rasterizer_download(vaddr + 0x20, 4);
+
+        assert_eq!(applied_host_ptrs.lock().unwrap().len(), 1);
+        assert!(reads.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn rasterizer_write_uses_only_host1x_pointer_aliases() {
+        let writes = Arc::new(Mutex::new(Vec::new()));
+        let applied_host_ptrs = Arc::new(Mutex::new(Vec::new()));
+        let host1x_device_addr = 0x1234_5020;
+        let mut system = System::new_for_test();
+        system.set_gpu_core(Box::new(FakeGpuCore {
+            reads: Arc::new(Mutex::new(Vec::new())),
+            writes: writes.clone(),
+            download_size: 0x80,
+        }));
+        system.set_host1x_core(Box::new(FakeHost1xCore {
+            applied_host_ptrs: applied_host_ptrs.clone(),
+            aliases: vec![host1x_device_addr],
+        }));
+
+        let (_device_memory, _page_table, memory, vaddr, backing_device_addr) =
+            make_rasterizer_cached_memory(&system);
+        memory.handle_rasterizer_write(vaddr + 0x20, 4);
+
+        assert_eq!(applied_host_ptrs.lock().unwrap().len(), 1);
+        assert_eq!(&*writes.lock().unwrap(), &[(host1x_device_addr, 4)]);
+        assert_ne!(host1x_device_addr, backing_device_addr + 0x20);
+    }
+
+    #[test]
+    fn rasterizer_write_does_not_fallback_to_process_physical_address() {
+        let writes = Arc::new(Mutex::new(Vec::new()));
+        let applied_host_ptrs = Arc::new(Mutex::new(Vec::new()));
+        let mut system = System::new_for_test();
+        system.set_gpu_core(Box::new(FakeGpuCore {
+            reads: Arc::new(Mutex::new(Vec::new())),
+            writes: writes.clone(),
+            download_size: 0x80,
+        }));
+        system.set_host1x_core(Box::new(FakeHost1xCore {
+            applied_host_ptrs: applied_host_ptrs.clone(),
+            aliases: Vec::new(),
+        }));
+
+        let (_device_memory, _page_table, memory, vaddr, _device_addr) =
+            make_rasterizer_cached_memory(&system);
+        memory.handle_rasterizer_write(vaddr + 0x20, 4);
+
+        assert_eq!(applied_host_ptrs.lock().unwrap().len(), 1);
+        assert!(writes.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn rasterizer_write_rejects_zero_device_alias_after_page_change() {
+        let writes = Arc::new(Mutex::new(Vec::new()));
+        let mut system = System::new_for_test();
+        system.set_gpu_core(Box::new(FakeGpuCore {
+            reads: Arc::new(Mutex::new(Vec::new())),
+            writes: writes.clone(),
+            download_size: 0x80,
+        }));
+        system.set_host1x_core(Box::new(FakeHost1xCore {
+            applied_host_ptrs: Arc::new(Mutex::new(Vec::new())),
+            aliases: vec![0x1000, 0],
+        }));
+
+        let (_device_memory, _page_table, memory, vaddr, _device_addr) =
+            make_rasterizer_cached_memory(&system);
+        memory.handle_rasterizer_write(vaddr + 0x20, 4);
+
+        assert_eq!(&*writes.lock().unwrap(), &[(0x1000, 4)]);
+    }
+
+    #[test]
+    fn rasterizer_uncache_without_backing_restores_unmapped_page() {
+        let system = System::new_for_test();
+        let (_device_memory, mut page_table, memory, vaddr, _device_addr) =
+            make_rasterizer_cached_memory(&system);
+        let page = (vaddr >> PAGE_BITS) as usize;
+        page_table.backing_addr[page] = 0;
+
+        memory.rasterizer_mark_region_cached(vaddr, PAGE_SIZE, false);
+
+        assert_eq!(
+            PageInfo::extract_type(page_table.pointers[page].raw_value()),
+            PageType::Unmapped
+        );
+    }
+
+    #[test]
+    fn rasterizer_cache_rejects_ranges_outside_address_space() {
+        let system = System::new_for_test();
+        let (_device_memory, page_table, memory, _vaddr, _device_addr) =
+            make_rasterizer_cached_memory(&system);
+        let max_addr = 1u64 << page_table.current_address_space_width_in_bits;
+        let last_page = ((max_addr >> PAGE_BITS) - 1) as usize;
+        page_table.pointers[last_page].store(0x1000, PageType::Memory);
+
+        memory.rasterizer_mark_region_cached(
+            max_addr - PAGE_SIZE as u64,
+            PAGE_SIZE as u64 + 1,
+            true,
+        );
+
+        assert_eq!(
+            PageInfo::extract_type(page_table.pointers[last_page].raw_value()),
+            PageType::Memory
+        );
+    }
+
+    #[cfg(not(target_os = "android"))]
+    #[test]
+    fn separate_heap_fault_handling_is_android_only() {
+        let system = System::new_for_test();
+        let (_device_memory, _page_table, memory, vaddr, _device_addr) =
+            make_rasterizer_cached_memory(&system);
+
+        assert!(!memory.invalidate_separate_heap(vaddr as *const u8));
+    }
 }
 
 impl Memory {
     /// Invalidate a separate heap fault address.
     ///
     /// Upstream: `Memory::InvalidateSeparateHeap(void* fault_address)` (memory.cpp:1104).
-    /// On Linux, delegates to `HeapTracker::DeferredMapSeparateHeap(fault_address)`.
-    /// On non-Linux, returns false.
+    /// On Android, delegates to `HeapTracker::DeferredMapSeparateHeap(fault_address)`.
+    /// On other platforms, returns false.
     pub fn invalidate_separate_heap(&self, fault_address: *const u8) -> bool {
-        #[cfg(target_os = "linux")]
+        #[cfg(target_os = "android")]
         {
             if let Some(ref heap_tracker) = self.heap_tracker {
                 return heap_tracker.deferred_map_separate_heap(fault_address);
             }
             false
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(target_os = "android"))]
         {
             let _ = fault_address;
             false

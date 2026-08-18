@@ -29,7 +29,7 @@ pub trait GpuBackend: Send + Sync {
     fn name(&self) -> &str;
     fn draw(&mut self) {}
     fn clear(&mut self) {}
-    fn dispatch_compute(&mut self) {}
+    fn dispatch_compute(&mut self, _dispatch: &crate::engines::kepler_compute::DispatchCall) {}
     fn copy_buffer(&mut self) {}
     fn blit(&mut self) {}
 }

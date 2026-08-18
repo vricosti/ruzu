@@ -717,6 +717,27 @@ void main() {
 }
 "#;
 
+/// Upstream: `host_shaders/present_area.frag`.
+pub const PRESENT_AREA_FRAG: &str = include_str!("present_area.frag");
+
+/// Upstream: `host_shaders/present_bspline.frag`.
+pub const PRESENT_BSPLINE_FRAG: &str = include_str!("present_bspline.frag");
+
+/// Upstream: `host_shaders/present_lanczos.frag`.
+pub const PRESENT_LANCZOS_FRAG: &str = include_str!("present_lanczos.frag");
+
+/// Upstream: `host_shaders/present_mitchell.frag`.
+pub const PRESENT_MITCHELL_FRAG: &str = include_str!("present_mitchell.frag");
+
+/// Upstream: `host_shaders/present_mmpx.frag`.
+pub const PRESENT_MMPX_FRAG: &str = include_str!("present_mmpx.frag");
+
+/// Upstream: `host_shaders/present_spline1.frag`.
+pub const PRESENT_SPLINE1_FRAG: &str = include_str!("present_spline1.frag");
+
+/// Upstream: `host_shaders/present_zero_tangent.frag`.
+pub const PRESENT_ZERO_TANGENT_FRAG: &str = include_str!("present_zero_tangent.frag");
+
 /// Upstream: `host_shaders/smaa_blending_weight_calculation.frag`
 pub const SMAA_BLENDING_WEIGHT_CALCULATION_FRAG: &str = r#"// SPDX-FileCopyrightText: Copyright 2022 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later

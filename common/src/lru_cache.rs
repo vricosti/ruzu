@@ -1,4 +1,4 @@
-//! Port of zuyu/src/common/lru_cache.h
+//! Port of Eden `src/common/lru_cache.h`.
 //! Status: COMPLET
 //! Derniere synchro: 2026-03-05
 
@@ -28,13 +28,30 @@ pub struct LeastRecentlyUsedCache<O, K> {
     last: Option<usize>,
 }
 
-impl<O: Copy, K: Ord + Copy + Default + Into<i64>> Default for LeastRecentlyUsedCache<O, K> {
+/// Conversion used by upstream's signed-difference age comparison.
+pub trait LruTick: Ord + Copy + Default {
+    fn to_i64(self) -> i64;
+}
+
+impl LruTick for u64 {
+    fn to_i64(self) -> i64 {
+        self as i64
+    }
+}
+
+impl LruTick for i64 {
+    fn to_i64(self) -> i64 {
+        self
+    }
+}
+
+impl<O: Copy, K: LruTick> Default for LeastRecentlyUsedCache<O, K> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<O: Copy, K: Ord + Copy + Default + Into<i64>> LeastRecentlyUsedCache<O, K> {
+impl<O: Copy, K: LruTick> LeastRecentlyUsedCache<O, K> {
     pub fn new() -> Self {
         Self {
             item_pool: VecDeque::new(),
@@ -81,9 +98,9 @@ impl<O: Copy, K: Ord + Copy + Default + Into<i64>> LeastRecentlyUsedCache<O, K> 
     {
         let mut current = self.first;
         while let Some(id) = current {
-            let item_tick: i64 = self.item_pool[id].tick.into();
-            let target_tick: i64 = tick.into();
-            if target_tick - item_tick < 0 {
+            let item_tick = self.item_pool[id].tick.to_i64();
+            let target_tick = tick.to_i64();
+            if target_tick.wrapping_sub(item_tick) < 0 {
                 return;
             }
             let next = self.item_pool[id].next;
@@ -210,5 +227,16 @@ mod tests {
         let mut items = Vec::new();
         cache.for_each_item_below_void(10, |obj| items.push(obj));
         assert_eq!(items, vec![20]);
+    }
+
+    #[test]
+    fn unsigned_threshold_underflow_preserves_upstream_signed_comparison() {
+        let mut cache = LeastRecentlyUsedCache::<u32, u64>::new();
+        cache.insert(10, 0);
+
+        let mut items = Vec::new();
+        cache.for_each_item_below_void(0u64.wrapping_sub(120), |obj| items.push(obj));
+
+        assert!(items.is_empty());
     }
 }

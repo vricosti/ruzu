@@ -10,29 +10,17 @@
 use ash::vk;
 
 use crate::host_shaders::spirv_shaders::{
-    PRESENT_BICUBIC_FRAG_SPV, PRESENT_GAUSSIAN_FRAG_SPV, VULKAN_PRESENT_FRAG_SPV,
-    VULKAN_PRESENT_SCALEFORCE_FP16_FRAG_SPV, VULKAN_PRESENT_SCALEFORCE_FP32_FRAG_SPV,
+    PRESENT_AREA_FRAG_SPV, PRESENT_BICUBIC_FRAG_SPV, PRESENT_BSPLINE_FRAG_SPV,
+    PRESENT_GAUSSIAN_FRAG_SPV, PRESENT_LANCZOS_FRAG_SPV, PRESENT_MITCHELL_FRAG_SPV,
+    PRESENT_MMPX_FRAG_SPV, PRESENT_SPLINE1_FRAG_SPV, PRESENT_ZERO_TANGENT_FRAG_SPV,
+    VULKAN_PRESENT_FRAG_SPV, VULKAN_PRESENT_SCALEFORCE_FP16_FRAG_SPV,
+    VULKAN_PRESENT_SCALEFORCE_FP32_FRAG_SPV,
 };
 use crate::renderer_vulkan::shader_util::build_shader;
+use crate::vulkan_common::vulkan_device::Device;
 
 use super::util;
 use super::window_adapt_pass::WindowAdaptPass;
-
-// ---------------------------------------------------------------------------
-// ScalingFilter enum
-// ---------------------------------------------------------------------------
-
-/// Port of the scaling filter selection from upstream `filters.h`.
-///
-/// Enumerates the available window scaling filters.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ScalingFilter {
-    NearestNeighbor,
-    Bilinear,
-    Bicubic,
-    Gaussian,
-    ScaleForce,
-}
 
 // ---------------------------------------------------------------------------
 // Factory functions
@@ -42,57 +30,124 @@ pub enum ScalingFilter {
 ///
 /// Creates a window adapt pass using nearest-neighbor sampling and
 /// the basic present fragment shader.
-pub fn make_nearest_neighbor(device: &ash::Device, frame_format: vk::Format) -> WindowAdaptPass {
-    let sampler = util::create_nearest_neighbor_sampler(device);
-    let fragment_shader =
-        build_shader(device, VULKAN_PRESENT_FRAG_SPV).expect("Failed to build vulkan_present.frag");
-    WindowAdaptPass::new(device.clone(), frame_format, sampler, fragment_shader)
+pub fn make_nearest_neighbor(device: &Device, frame_format: vk::Format) -> WindowAdaptPass {
+    let logical = device.get_logical();
+    let sampler = util::create_nearest_neighbor_sampler(logical);
+    let fragment_shader = build_shader(logical, VULKAN_PRESENT_FRAG_SPV)
+        .expect("Failed to build vulkan_present.frag");
+    WindowAdaptPass::new(logical.clone(), frame_format, sampler, fragment_shader)
 }
 
 /// Port of `MakeBilinear`.
 ///
 /// Creates a window adapt pass using bilinear sampling and the basic
 /// present fragment shader.
-pub fn make_bilinear(device: &ash::Device, frame_format: vk::Format) -> WindowAdaptPass {
-    let sampler = util::create_bilinear_sampler(device);
-    let fragment_shader =
-        build_shader(device, VULKAN_PRESENT_FRAG_SPV).expect("Failed to build vulkan_present.frag");
-    WindowAdaptPass::new(device.clone(), frame_format, sampler, fragment_shader)
+pub fn make_bilinear(device: &Device, frame_format: vk::Format) -> WindowAdaptPass {
+    let logical = device.get_logical();
+    let sampler = util::create_bilinear_sampler(logical);
+    let fragment_shader = build_shader(logical, VULKAN_PRESENT_FRAG_SPV)
+        .expect("Failed to build vulkan_present.frag");
+    WindowAdaptPass::new(logical.clone(), frame_format, sampler, fragment_shader)
+}
+
+/// Rust counterpart of `VkCubicFilterWeightsQCOM`. ash 0.37 does not expose
+/// that QCOM enum or its sampler pNext structure, so only the extension-defined
+/// default Catmull-Rom weight can use the hardware sampler path.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CubicFilterWeights {
+    CatmullRom,
+    ZeroTangentCardinal,
+    BSpline,
+    MitchellNetravali,
+}
+
+fn uses_hardware_cubic(filter_cubic_supported: bool, weights: CubicFilterWeights) -> bool {
+    filter_cubic_supported && weights == CubicFilterWeights::CatmullRom
 }
 
 /// Port of `MakeBicubic`.
-///
-/// Creates a window adapt pass using bilinear sampling with the
-/// bicubic interpolation fragment shader.
-pub fn make_bicubic(device: &ash::Device, frame_format: vk::Format) -> WindowAdaptPass {
-    let sampler = util::create_bilinear_sampler(device);
-    let fragment_shader = build_shader(device, PRESENT_BICUBIC_FRAG_SPV)
-        .expect("Failed to build present_bicubic.frag");
-    WindowAdaptPass::new(device.clone(), frame_format, sampler, fragment_shader)
+pub fn make_bicubic(
+    device: &Device,
+    frame_format: vk::Format,
+    weights: CubicFilterWeights,
+) -> WindowAdaptPass {
+    let logical = device.get_logical();
+    if uses_hardware_cubic(device.is_ext_filter_cubic_supported(), weights) {
+        let sampler = util::create_cubic_sampler(logical);
+        let fragment_shader = build_shader(logical, VULKAN_PRESENT_FRAG_SPV)
+            .expect("Failed to build vulkan_present.frag");
+        return WindowAdaptPass::new(logical.clone(), frame_format, sampler, fragment_shader);
+    }
+
+    let (shader, shader_name) = match weights {
+        CubicFilterWeights::CatmullRom => (PRESENT_BICUBIC_FRAG_SPV, "present_bicubic.frag"),
+        CubicFilterWeights::ZeroTangentCardinal => {
+            (PRESENT_ZERO_TANGENT_FRAG_SPV, "present_zero_tangent.frag")
+        }
+        CubicFilterWeights::BSpline => (PRESENT_BSPLINE_FRAG_SPV, "present_bspline.frag"),
+        CubicFilterWeights::MitchellNetravali => {
+            (PRESENT_MITCHELL_FRAG_SPV, "present_mitchell.frag")
+        }
+    };
+    let sampler = util::create_bilinear_sampler(logical);
+    let fragment_shader =
+        build_shader(logical, shader).unwrap_or_else(|_| panic!("Failed to build {shader_name}"));
+    WindowAdaptPass::new(logical.clone(), frame_format, sampler, fragment_shader)
+}
+
+fn make_shader_filter(
+    device: &Device,
+    frame_format: vk::Format,
+    shader: &[u32],
+    shader_name: &str,
+) -> WindowAdaptPass {
+    let logical = device.get_logical();
+    let sampler = util::create_bilinear_sampler(logical);
+    let fragment_shader =
+        build_shader(logical, shader).unwrap_or_else(|_| panic!("Failed to build {shader_name}"));
+    WindowAdaptPass::new(logical.clone(), frame_format, sampler, fragment_shader)
+}
+
+/// Port of `MakeSpline1`.
+pub fn make_spline1(device: &Device, frame_format: vk::Format) -> WindowAdaptPass {
+    make_shader_filter(
+        device,
+        frame_format,
+        PRESENT_SPLINE1_FRAG_SPV,
+        "present_spline1.frag",
+    )
 }
 
 /// Port of `MakeGaussian`.
 ///
 /// Creates a window adapt pass using bilinear sampling with the
 /// Gaussian blur fragment shader.
-pub fn make_gaussian(device: &ash::Device, frame_format: vk::Format) -> WindowAdaptPass {
-    let sampler = util::create_bilinear_sampler(device);
-    let fragment_shader = build_shader(device, PRESENT_GAUSSIAN_FRAG_SPV)
+pub fn make_gaussian(device: &Device, frame_format: vk::Format) -> WindowAdaptPass {
+    let logical = device.get_logical();
+    let sampler = util::create_bilinear_sampler(logical);
+    let fragment_shader = build_shader(logical, PRESENT_GAUSSIAN_FRAG_SPV)
         .expect("Failed to build present_gaussian.frag");
-    WindowAdaptPass::new(device.clone(), frame_format, sampler, fragment_shader)
+    WindowAdaptPass::new(logical.clone(), frame_format, sampler, fragment_shader)
+}
+
+/// Port of `MakeLanczos`.
+pub fn make_lanczos(device: &Device, frame_format: vk::Format) -> WindowAdaptPass {
+    make_shader_filter(
+        device,
+        frame_format,
+        PRESENT_LANCZOS_FRAG_SPV,
+        "present_lanczos.frag",
+    )
 }
 
 /// Port of `MakeScaleForce`.
 ///
 /// Creates a window adapt pass using bilinear sampling with the
 /// ScaleForce shader (fp16 preferred, fp32 fallback).
-pub fn make_scale_force(
-    device: &ash::Device,
-    frame_format: vk::Format,
-    supports_float16: bool,
-) -> WindowAdaptPass {
-    let sampler = util::create_bilinear_sampler(device);
-    let (shader_spv, shader_name) = if supports_float16 {
+pub fn make_scale_force(device: &Device, frame_format: vk::Format) -> WindowAdaptPass {
+    let logical = device.get_logical();
+    let sampler = util::create_bilinear_sampler(logical);
+    let (shader_spv, shader_name) = if device.is_float16_supported() {
         (
             VULKAN_PRESENT_SCALEFORCE_FP16_FRAG_SPV,
             "vulkan_present_scaleforce_fp16.frag",
@@ -103,23 +158,46 @@ pub fn make_scale_force(
             "vulkan_present_scaleforce_fp32.frag",
         )
     };
-    let fragment_shader = build_shader(device, shader_spv)
+    let fragment_shader = build_shader(logical, shader_spv)
         .unwrap_or_else(|_| panic!("Failed to build {shader_name}"));
-    WindowAdaptPass::new(device.clone(), frame_format, sampler, fragment_shader)
+    WindowAdaptPass::new(logical.clone(), frame_format, sampler, fragment_shader)
 }
 
-/// Creates the appropriate scaling filter based on the enum variant.
-pub fn make_filter(
-    device: &ash::Device,
-    frame_format: vk::Format,
-    filter: ScalingFilter,
-    supports_float16: bool,
-) -> WindowAdaptPass {
-    match filter {
-        ScalingFilter::NearestNeighbor => make_nearest_neighbor(device, frame_format),
-        ScalingFilter::Bilinear => make_bilinear(device, frame_format),
-        ScalingFilter::Bicubic => make_bicubic(device, frame_format),
-        ScalingFilter::Gaussian => make_gaussian(device, frame_format),
-        ScalingFilter::ScaleForce => make_scale_force(device, frame_format, supports_float16),
+/// Port of `MakeArea`.
+pub fn make_area(device: &Device, frame_format: vk::Format) -> WindowAdaptPass {
+    make_shader_filter(
+        device,
+        frame_format,
+        PRESENT_AREA_FRAG_SPV,
+        "present_area.frag",
+    )
+}
+
+/// Port of `MakeMmpx`; upstream selects a nearest-neighbour sampler for MMPX.
+pub fn make_mmpx(device: &Device, frame_format: vk::Format) -> WindowAdaptPass {
+    let logical = device.get_logical();
+    let sampler = util::create_nearest_neighbor_sampler(logical);
+    let fragment_shader =
+        build_shader(logical, PRESENT_MMPX_FRAG_SPV).expect("Failed to build present_mmpx.frag");
+    WindowAdaptPass::new(logical.clone(), frame_format, sampler, fragment_shader)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{uses_hardware_cubic, CubicFilterWeights};
+
+    #[test]
+    fn hardware_cubic_matches_upstream_without_qcom_weight_bindings() {
+        assert!(uses_hardware_cubic(true, CubicFilterWeights::CatmullRom));
+        assert!(!uses_hardware_cubic(false, CubicFilterWeights::CatmullRom));
+        assert!(!uses_hardware_cubic(
+            true,
+            CubicFilterWeights::ZeroTangentCardinal
+        ));
+        assert!(!uses_hardware_cubic(true, CubicFilterWeights::BSpline));
+        assert!(!uses_hardware_cubic(
+            true,
+            CubicFilterWeights::MitchellNetravali
+        ));
     }
 }

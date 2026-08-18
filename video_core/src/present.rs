@@ -5,50 +5,23 @@
 //!
 //! Presentation filter settings for display and applet capture.
 
-/// Scaling filter types.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ScalingFilter {
-    NearestNeighbor,
-    Bilinear,
-    Bicubic,
-    Gaussian,
-    ScaleForce,
-    Fsr,
-}
-
-/// Anti-aliasing modes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AntiAliasing {
-    None,
-    Fxaa,
-    Smaa,
-}
+// Upstream `PresentFilters` returns the `Settings` enums directly. Re-exporting
+// the common definitions preserves that single owner and prevents renderer-local
+// copies from silently falling out of sync when Eden adds a filter.
+pub use common::settings_enums::{AntiAliasing, ScalingFilter};
 
 /// Get the current scaling filter from settings.
 /// Upstream: reads `Settings::values.scaling_filter.GetValue()`.
 pub fn get_scaling_filter() -> ScalingFilter {
     let settings = common::settings::values();
-    match *settings.scaling_filter.get_value() {
-        common::settings_enums::ScalingFilter::NearestNeighbor => ScalingFilter::NearestNeighbor,
-        common::settings_enums::ScalingFilter::Bilinear => ScalingFilter::Bilinear,
-        common::settings_enums::ScalingFilter::Bicubic => ScalingFilter::Bicubic,
-        common::settings_enums::ScalingFilter::Gaussian => ScalingFilter::Gaussian,
-        common::settings_enums::ScalingFilter::ScaleForce => ScalingFilter::ScaleForce,
-        common::settings_enums::ScalingFilter::Fsr => ScalingFilter::Fsr,
-        _ => ScalingFilter::Bilinear,
-    }
+    *settings.scaling_filter.get_value()
 }
 
 /// Get the current anti-aliasing mode from settings.
 /// Upstream: reads `Settings::values.anti_aliasing.GetValue()`.
 pub fn get_anti_aliasing() -> AntiAliasing {
     let settings = common::settings::values();
-    match *settings.anti_aliasing.get_value() {
-        common::settings_enums::AntiAliasing::None => AntiAliasing::None,
-        common::settings_enums::AntiAliasing::Fxaa => AntiAliasing::Fxaa,
-        common::settings_enums::AntiAliasing::Smaa => AntiAliasing::Smaa,
-        _ => AntiAliasing::None,
-    }
+    *settings.anti_aliasing.get_value()
 }
 
 /// Get the scaling filter for applet capture (always Bilinear).

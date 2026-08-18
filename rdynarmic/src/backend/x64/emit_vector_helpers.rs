@@ -1,4 +1,4 @@
-use rxbyak::{Reg, RegExp, R15};
+use rxbyak::{dword_ptr, qword_ptr, xmmword_ptr, Reg, RegExp, R15, RSP};
 
 use crate::backend::x64::abi;
 use crate::backend::x64::emit_context::EmitContext;
@@ -499,6 +499,94 @@ pub fn emit_fp_one_arg_fallback_with_params(
         .unwrap();
     ra.release_stack_space(frame_size);
     ra.define_value(inst_ref, result);
+}
+
+/// Port of upstream `EmitThreeOpFallbackWithoutRegAlloc`.
+///
+/// The caller has already ended register allocation and preserved the live
+/// caller-save registers. `fpcr_value` and `fpsr_exc_offset` are captured as
+/// plain values so deferred emitters do not retain a borrow of `EmitContext`.
+pub fn emit_three_op_fallback_without_reg_alloc(
+    asm: &mut rxbyak::CodeAssembler,
+    result: Reg,
+    arg1: Reg,
+    arg2: Reg,
+    func: usize,
+    fpcr_value: u32,
+    fpsr_exc_offset: i32,
+) {
+    #[cfg(target_os = "windows")]
+    const STACK_SPACE: usize = 4 * 16;
+    #[cfg(not(target_os = "windows"))]
+    const STACK_SPACE: usize = 3 * 16;
+
+    let frame_size = STACK_SPACE + abi::ABI_SHADOW_SPACE;
+    asm.lea(RSP, qword_ptr(RegExp::from(RSP) - frame_size as i32))
+        .unwrap();
+
+    #[cfg(target_os = "windows")]
+    let result_offset = abi::ABI_SHADOW_SPACE + 16;
+    #[cfg(not(target_os = "windows"))]
+    let result_offset = abi::ABI_SHADOW_SPACE;
+    let arg1_offset = result_offset + 16;
+    let arg2_offset = result_offset + 32;
+
+    asm.lea(
+        abi::ABI_PARAMS[0].to_reg64(),
+        xmmword_ptr(RegExp::from(RSP) + result_offset as i32),
+    )
+    .unwrap();
+    asm.lea(
+        abi::ABI_PARAMS[1].to_reg64(),
+        xmmword_ptr(RegExp::from(RSP) + arg1_offset as i32),
+    )
+    .unwrap();
+    asm.lea(
+        abi::ABI_PARAMS[2].to_reg64(),
+        xmmword_ptr(RegExp::from(RSP) + arg2_offset as i32),
+    )
+    .unwrap();
+    asm.mov(
+        Reg::gpr32(abi::ABI_PARAMS[3].to_reg64().get_idx()),
+        fpcr_value as i32,
+    )
+    .unwrap();
+
+    #[cfg(target_os = "windows")]
+    {
+        asm.lea(rxbyak::RAX, dword_ptr(RegExp::from(R15) + fpsr_exc_offset))
+            .unwrap();
+        asm.mov(
+            qword_ptr(RegExp::from(RSP) + abi::ABI_SHADOW_SPACE as i32),
+            rxbyak::RAX,
+        )
+        .unwrap();
+    }
+    #[cfg(not(target_os = "windows"))]
+    asm.lea(
+        abi::ABI_PARAMS[4].to_reg64(),
+        dword_ptr(RegExp::from(R15) + fpsr_exc_offset),
+    )
+    .unwrap();
+
+    asm.movaps(
+        xmmword_ptr(RegExp::from(abi::ABI_PARAMS[1].to_reg64())),
+        arg1,
+    )
+    .unwrap();
+    asm.movaps(
+        xmmword_ptr(RegExp::from(abi::ABI_PARAMS[2].to_reg64())),
+        arg2,
+    )
+    .unwrap();
+    asm.mov(rxbyak::RAX, func as i64).unwrap();
+    asm.call_reg(rxbyak::RAX).unwrap();
+    asm.movaps(
+        result,
+        xmmword_ptr(RegExp::from(RSP) + result_offset as i32),
+    )
+    .unwrap();
+    asm.add(RSP, frame_size as i32).unwrap();
 }
 
 // ---------------------------------------------------------------------------

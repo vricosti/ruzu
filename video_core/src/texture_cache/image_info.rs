@@ -32,24 +32,6 @@ fn decode_msaa_mode(raw: u32, owner: &str) -> super::samples_helper::MsaaMode {
 }
 
 fn stop_unimplemented_byte_size_to_format(bytes_per_pixel: u32) -> ! {
-    #[cfg(not(test))]
-    {
-        let path = std::path::Path::new(".agents/image_info_unimplemented_state.md");
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        let _ = std::fs::write(
-            path,
-            format!(
-                "# ImageInfo unimplemented byte-size format\n\n\
-                 - function: ByteSizeToFormat\n\
-                 - bytes_per_pixel: {bytes_per_pixel}\n\
-                 - upstream: image_info.cpp reaches UNIMPLEMENTED() before returning PixelFormat::Invalid\n\
-                 - rust: stopped before treating PixelFormat::Invalid as an implemented DMA image format\n"
-            ),
-        );
-    }
-
     panic!("ByteSizeToFormat: unimplemented bpp={bytes_per_pixel}");
 }
 
@@ -189,7 +171,7 @@ impl ImageInfo {
         info.tile_width_spacing = config.tile_width_spacing();
 
         // TextureType → ImageType + size.
-        let texture_type = TextureType::from_raw(config.texture_type()).unwrap_or_else(|| {
+        let mut texture_type = TextureType::from_raw(config.texture_type()).unwrap_or_else(|| {
             panic!(
                 "ImageInfo::from_tic_entry: invalid texture_type={}",
                 config.texture_type()
@@ -204,6 +186,14 @@ impl ImageInfo {
                 config.texture_type()
             );
         }
+        if config.depth() > 1 || config.base_layer() != 0 {
+            texture_type = match texture_type {
+                TextureType::Texture1D => TextureType::Texture1DArray,
+                TextureType::Texture2D => TextureType::Texture2DArray,
+                TextureType::TextureCubemap => TextureType::TextureCubeArray,
+                other => other,
+            };
+        }
         match texture_type {
             TextureType::Texture1D => {
                 assert_eq!(
@@ -216,12 +206,9 @@ impl ImageInfo {
                 info.resources.layers = 1;
             }
             TextureType::Texture1DArray => {
-                if config.base_layer() != 0 {
-                    panic!("ImageInfo::from_tic_entry: Texture1DArray base layer is not zero");
-                }
                 info.image_type = ImageType::E1D;
                 info.size.width = config.width();
-                info.resources.layers = config.depth() as i32;
+                info.resources.layers = (config.base_layer() + config.depth()) as i32;
             }
             TextureType::Texture2D | TextureType::Texture2DNoMipmap => {
                 assert_eq!(
@@ -859,6 +846,42 @@ mod tests {
     }
 
     #[test]
+    fn tic_entry_promotes_nonzero_depth_or_base_layer_like_upstream() {
+        let promoted_1d = tic_for_validation(
+            TextureType::Texture1D as u32,
+            TicHeaderVersion::BlockLinear,
+            2,
+            3,
+            0,
+        );
+        let promoted_2d = tic_for_validation(
+            TextureType::Texture2D as u32,
+            TicHeaderVersion::BlockLinear,
+            2,
+            4,
+            0,
+        );
+        let promoted_cube = tic_for_validation(
+            TextureType::TextureCubemap as u32,
+            TicHeaderVersion::BlockLinear,
+            2,
+            5,
+            0,
+        );
+
+        let info_1d = ImageInfo::from_tic_entry(&promoted_1d);
+        let info_2d = ImageInfo::from_tic_entry(&promoted_2d);
+        let info_cube = ImageInfo::from_tic_entry(&promoted_cube);
+
+        assert_eq!(info_1d.image_type, ImageType::E1D);
+        assert_eq!(info_1d.resources.layers, 5);
+        assert_eq!(info_2d.image_type, ImageType::E2D);
+        assert_eq!(info_2d.resources.layers, 6);
+        assert_eq!(info_cube.image_type, ImageType::E2D);
+        assert_eq!(info_cube.resources.layers, 17);
+    }
+
+    #[test]
     #[should_panic(expected = "invalid texture_type=15")]
     fn tic_entry_invalid_texture_type_is_fatal_like_upstream() {
         let tic = tic_for_validation(15, TicHeaderVersion::BlockLinear, 1, 0, 0);
@@ -867,8 +890,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "PixelFormatFromTextureInfo unimplemented texture format=8")]
-    fn tic_entry_unmapped_raw_format_components_stop_like_upstream_unimplemented() {
+    fn tic_entry_unmapped_raw_format_components_use_upstream_fallback() {
         let word0 = TextureFormat::A8B8G8R8 as u32;
         let word3 = 0;
         let word4 = 63 | ((TextureType::Texture2D as u32) << 23);
@@ -882,7 +904,9 @@ mod tests {
             ],
         };
 
-        let _ = ImageInfo::from_tic_entry(&tic);
+        let info = ImageInfo::from_tic_entry(&tic);
+
+        assert_eq!(info.format, PixelFormat::A8B8G8R8Unorm);
     }
 
     #[test]
@@ -917,34 +941,6 @@ mod tests {
     #[test]
     fn tic_entry_type_validation_guards_are_fatal_like_upstream() {
         let cases = [
-            (
-                TextureType::Texture1D as u32,
-                1,
-                1,
-                0,
-                "Texture1D base layer must be zero",
-            ),
-            (
-                TextureType::Texture1DArray as u32,
-                1,
-                1,
-                0,
-                "Texture1DArray base layer is not zero",
-            ),
-            (
-                TextureType::Texture2D as u32,
-                2,
-                0,
-                0,
-                "Texture2D depth must be one",
-            ),
-            (
-                TextureType::TextureCubemap as u32,
-                2,
-                0,
-                0,
-                "TextureCubemap depth must be one",
-            ),
             (
                 TextureType::TextureCubeArray as u32,
                 1,

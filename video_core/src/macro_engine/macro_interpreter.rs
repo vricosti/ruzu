@@ -1,7 +1,8 @@
 // SPDX-FileCopyrightText: 2025 ruzu contributors
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-//! Port of `video_core/macro/macro_interpreter.h` and `macro_interpreter.cpp`.
+//! Port of `MacroInterpreterImpl` in `video_core/macro.h` and
+//! `video_core/macro.cpp`.
 //!
 //! Software interpreter for Maxwell macro programs. This is the fallback
 //! execution backend when JIT compilation is unavailable or disabled.
@@ -10,23 +11,6 @@ use super::macro_engine::{
     AluOperation, BranchCondition, CachedMacro, MethodAddress, Opcode, Operation, ResultOperation,
     NUM_MACRO_REGISTERS,
 };
-use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::OnceLock;
-
-static MACRO_14F_TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
-static TRACE_MACRO_14F_ENABLED: OnceLock<bool> = OnceLock::new();
-static TRACE_MACRO_FLOW_ENABLED: OnceLock<bool> = OnceLock::new();
-
-#[inline]
-fn trace_macro_14f_enabled() -> bool {
-    *TRACE_MACRO_14F_ENABLED.get_or_init(|| std::env::var_os("RUZU_TRACE_MACRO_14F").is_some())
-}
-
-#[inline]
-fn trace_macro_flow_enabled() -> bool {
-    *TRACE_MACRO_FLOW_ENABLED.get_or_init(|| std::env::var_os("RUZU_TRACE_MACRO_FLOW").is_some())
-}
-
 // ── MacroInterpreterImpl ─────────────────────────────────────────────────────
 
 /// A software-interpreted macro program.
@@ -67,9 +51,6 @@ pub struct MacroInterpreterImpl {
     /// Callback for reading a GPU method register.
     /// Signature: (method) -> value
     method_reader: Option<Box<dyn Fn(u32) -> u32 + Send>>,
-
-    /// Current macro method being executed.
-    current_method: u32,
 }
 
 impl MacroInterpreterImpl {
@@ -88,7 +69,6 @@ impl MacroInterpreterImpl {
             carry_flag: false,
             method_writer: None,
             method_reader: None,
-            current_method: 0,
         }
     }
 
@@ -100,6 +80,11 @@ impl MacroInterpreterImpl {
     /// Set the callback for reading GPU method registers.
     pub fn set_method_reader<F: Fn(u32) -> u32 + Send + 'static>(&mut self, reader: F) {
         self.method_reader = Some(Box::new(reader));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn registers_for_test(&self) -> [u32; NUM_MACRO_REGISTERS] {
+        self.registers
     }
 
     /// Reset the execution engine state, zeroing registers, etc.
@@ -249,6 +234,10 @@ impl MacroInterpreterImpl {
             AluOperation::And => src_a & src_b,
             AluOperation::AndNot => src_a & !src_b,
             AluOperation::Nand => !(src_a & src_b),
+            AluOperation::Invalid => {
+                log::warn!("Unimplemented ALU operation");
+                0
+            }
         }
     }
 
@@ -359,26 +348,11 @@ impl MacroInterpreterImpl {
     /// Port of `MacroInterpreterImpl::Send`.
     fn send(&mut self, value: u32) {
         let address = self.method_address.address();
-        let trace_macro_14f = self.current_method == 0x14F && trace_macro_14f_enabled();
-        let trace_macro_flow = trace_macro_flow_enabled();
-        if trace_macro_14f || trace_macro_flow {
-            let idx = MACRO_14F_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
-            if idx < 2048 {
-                log::info!(
-                    "MacroInterpreterImpl::send method=0x{:X} write#{} addr=0x{:X} value=0x{:08X} increment=0x{:X}",
-                    self.current_method,
-                    idx,
-                    address,
-                    value,
-                    self.method_address.increment()
-                );
-            }
-        }
         if let Some(ref mut writer) = self.method_writer {
             writer(address, value, true);
         }
         // Increment the method address by the method increment.
-        let new_addr = address + self.method_address.increment();
+        let new_addr = address.wrapping_add(self.method_address.increment());
         self.method_address.set_address(new_addr);
     }
 
@@ -414,27 +388,16 @@ impl CachedMacro for MacroInterpreterImpl {
     /// Execute the macro with the given parameters.
     ///
     /// Port of `MacroInterpreterImpl::Execute`.
-    fn execute(&mut self, parameters: &mut [u32], method: u32) {
+    fn execute(&mut self, parameters: &mut [u32], _method: u32) {
         self.reset();
-        self.current_method = method;
 
         self.registers[1] = parameters[0];
-        self.parameters = parameters.to_vec();
+        self.parameters.resize(parameters.len(), 0);
+        self.parameters.copy_from_slice(parameters);
         // Execute the code until we hit an exit condition.
         let mut keep_executing = true;
-        let mut steps: u64 = 0;
         while keep_executing {
             keep_executing = self.step(false);
-            steps += 1;
-            if steps == 1_000_000 {
-                log::warn!(
-                    "MacroInterpreterImpl::execute still running after {} steps pc=0x{:X} code_len={} first=0x{:08X}",
-                    steps,
-                    self.pc,
-                    self.code.len(),
-                    self.code.first().copied().unwrap_or(0)
-                );
-            }
         }
         // Assert that the macro used all the input parameters
         assert_eq!(
@@ -492,6 +455,18 @@ mod tests {
         // But the exit delay slot also runs, so we need the parameter count to match.
         // With Move operations, next_parameter_index stays at 1.
         program.execute(&mut [0x42], 0);
+    }
+
+    #[test]
+    fn interpreter_execute_retains_parameter_capacity_like_upstream_resize() {
+        let exit_nop = 0b1 | (0b001 << 4) | (1 << 7) | (1 << 8);
+        let nop = 0b1 | (0b001 << 4) | (1 << 8);
+        let mut program = MacroInterpreterImpl::new(vec![exit_nop, nop]);
+        program.parameters = Vec::with_capacity(64);
+
+        program.execute(&mut [0x42], 0);
+
+        assert!(program.parameters.capacity() >= 64);
     }
 
     #[test]

@@ -129,6 +129,57 @@ pub struct RendererBaseData {
     pub settings: RendererSettings,
 }
 
+/// Port of upstream `RendererBase::UpdateCurrentFramebufferLayout()`.
+///
+/// Reden's frontend window owns the live layout behind an `RwLock`; updating
+/// that same object is the split-owner equivalent of
+/// `render_window.UpdateCurrentFramebufferLayout(width, height)`.
+pub(crate) fn update_current_framebuffer_layout(
+    framebuffer_layout: &std::sync::RwLock<FramebufferLayout>,
+) {
+    let mut layout = framebuffer_layout.write().unwrap();
+    if layout.width > 0 && layout.height > 0 {
+        *layout = ruzu_core::frontend::framebuffer_layout::default_frame_layout(
+            layout.width,
+            layout.height,
+        );
+    }
+}
+
+#[cfg(test)]
+mod refresh_layout_tests {
+    use super::*;
+    use common::settings_enums::AspectRatio;
+    use std::sync::{Mutex, OnceLock, RwLock};
+
+    #[test]
+    fn update_current_framebuffer_layout_applies_live_aspect_ratio() {
+        static SETTINGS_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        let _guard = SETTINGS_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+
+        let previous = *common::settings::values().aspect_ratio.get_value();
+        common::settings::values_mut()
+            .aspect_ratio
+            .set_value(AspectRatio::R4_3);
+
+        let layout = RwLock::new(FramebufferLayout {
+            width: 1600,
+            height: 900,
+            ..FramebufferLayout::default()
+        });
+        update_current_framebuffer_layout(&layout);
+
+        let layout = layout.read().unwrap();
+        assert_eq!(layout.screen.get_width(), 1200);
+        assert_eq!(layout.screen.get_height(), 900);
+        assert_eq!(layout.screen.left, 200);
+
+        common::settings::values_mut()
+            .aspect_ratio
+            .set_value(previous);
+    }
+}
+
 impl RendererBaseData {
     pub fn new() -> Self {
         Self {

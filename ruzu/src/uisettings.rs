@@ -79,6 +79,17 @@ pub struct Values {
     // ── Screenshots ─────────────────────────────────────────────────────
     pub enable_screenshot_save_as: Setting<bool>,
     pub screenshot_path: Setting<String>,
+
+    // ── Multiplayer ─────────────────────────────────────────────────────
+    // Upstream `UISettings::values.multiplayer_{nickname,ip,port}`, remembered
+    // between runs so the Direct Connect dialog reopens on the last room used.
+    pub multiplayer_nickname: Setting<String>,
+    pub multiplayer_filter_text: Setting<String>,
+    pub multiplayer_filter_games_owned: Setting<bool>,
+    pub multiplayer_filter_hide_empty: Setting<bool>,
+    pub multiplayer_filter_hide_full: Setting<bool>,
+    pub multiplayer_ip: Setting<String>,
+    pub multiplayer_port: Setting<u32>,
     pub screenshot_height: Setting<u32>,
 
     // ── UiGameList ──────────────────────────────────────────────────────
@@ -122,6 +133,21 @@ impl Default for Values {
 
             enable_screenshot_save_as: Setting::new(true, "enable_screenshot_save_as", Screenshots),
             screenshot_path: Setting::new(String::new(), "screenshot_path", Screenshots),
+            multiplayer_nickname: Setting::new(String::new(), "nickname", Multiplayer),
+            multiplayer_filter_text: Setting::new(String::new(), "filter_text", Multiplayer),
+            multiplayer_filter_games_owned: Setting::new(false, "filter_games_owned", Multiplayer),
+            multiplayer_filter_hide_empty: Setting::new(
+                false,
+                "filter_games_hide_empty",
+                Multiplayer,
+            ),
+            multiplayer_filter_hide_full: Setting::new(
+                false,
+                "filter_games_hide_full",
+                Multiplayer,
+            ),
+            multiplayer_ip: Setting::new(String::new(), "ip", Multiplayer),
+            multiplayer_port: Setting::new(24872, "port", Multiplayer),
             screenshot_height: Setting::new(0, "screenshot_height", Screenshots),
 
             show_add_ons: Setting::new(true, "show_add_ons", UiGameList),

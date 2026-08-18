@@ -479,10 +479,11 @@ impl Host1xCoreInterface for Host1x {
     fn smmu_apply_op_on_host_pointer(
         &self,
         host_ptr: usize,
+        scratch: &mut common::scratch_buffer::ScratchBuffer<u32>,
         operation: &mut dyn FnMut(u64),
     ) -> usize {
         self.memory_manager
-            .smmu_apply_op_on_host_pointer(host_ptr as *const u8, operation)
+            .smmu_apply_op_on_host_pointer(host_ptr as *const u8, scratch, operation)
     }
 
     fn bind_device_memory_invalidator(&self, callback: Box<dyn Fn(u64, usize) + Send + Sync>) {

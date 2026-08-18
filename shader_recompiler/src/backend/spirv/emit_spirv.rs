@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2025 ruzu contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! Top-level SPIR-V emission — maps to zuyu's `backend/spirv/emit_spirv.h` and
+//! Top-level SPIR-V emission — maps to upstream `backend/spirv/emit_spirv.h` and
 //! `emit_spirv.cpp`.
 //!
 //! Contains the `EmitSPIRV` entry point and constants for rescaling/render area
@@ -325,6 +325,9 @@ pub(crate) fn setup_capabilities(
     if info.uses_sampled_1d {
         ctx.builder.capability(spirv::Capability::Sampled1D);
     }
+    if info.uses_image_1d {
+        ctx.builder.capability(spirv::Capability::Image1D);
+    }
     if info.uses_sparse_residency {
         ctx.builder.capability(spirv::Capability::SparseResidency);
     }
@@ -361,6 +364,7 @@ pub(crate) fn setup_capabilities(
     }
     if (info.uses_subgroup_vote || info.uses_subgroup_invocation_id || info.uses_subgroup_shuffles)
         && profile.support_vote
+        && profile.supports_subgroup_stage(stage)
     {
         ctx.builder
             .capability(spirv::Capability::GroupNonUniformBallot);
@@ -395,6 +399,28 @@ pub(crate) fn setup_capabilities(
         .capability(spirv::Capability::ImageGatherExtended);
     ctx.builder.capability(spirv::Capability::ImageQuery);
     ctx.builder.capability(spirv::Capability::SampledBuffer);
+    if !ctx.non_uniform_ids.is_empty() {
+        if ctx.profile.supported_spirv < 0x0001_0500 {
+            ctx.builder.extension("SPV_EXT_descriptor_indexing");
+        }
+        ctx.builder.capability(spirv::Capability::ShaderNonUniform);
+        if ctx.uses_nonuniform_sampled_image {
+            ctx.builder
+                .capability(spirv::Capability::SampledImageArrayNonUniformIndexing);
+        }
+        if ctx.uses_nonuniform_storage_image {
+            ctx.builder
+                .capability(spirv::Capability::StorageImageArrayNonUniformIndexing);
+        }
+        if ctx.uses_nonuniform_uniform_texel_buffer {
+            ctx.builder
+                .capability(spirv::Capability::UniformTexelBufferArrayNonUniformIndexing);
+        }
+        if ctx.uses_nonuniform_storage_texel_buffer {
+            ctx.builder
+                .capability(spirv::Capability::StorageTexelBufferArrayNonUniformIndexing);
+        }
+    }
 }
 
 /// Port of upstream `SetupTransformFeedbackCapabilities`.
@@ -407,13 +433,179 @@ fn setup_transform_feedback_capabilities(ctx: &mut SpirvEmitContext, main: spirv
         .execution_mode(main, spirv::ExecutionMode::Xfb, vec![]);
 }
 
+/// Port of upstream `Traverse` and `DefineMain` from `emit_spirv.cpp`.
+fn define_main(ctx: &mut SpirvEmitContext, program: &ir::Program) -> spirv::Word {
+    let syntax_list = if program.syntax_list.is_empty() {
+        let mut list = Vec::with_capacity(program.blocks.len() + 1);
+        for block_idx in 0..program.blocks.len() as u32 {
+            list.push(ir::SyntaxNode::Block(block_idx));
+        }
+        list.push(ir::SyntaxNode::Return);
+        list
+    } else {
+        program.syntax_list.clone()
+    };
+
+    // Upstream creates one Private counter for each Repeat node while
+    // traversing the function. rspirv appends OpVariable to the selected
+    // block once function emission has started, so create the same globals
+    // beforehand and consume them in syntax-list order below.
+    let loop_safety_enabled = !*common::settings::values()
+        .disable_shader_loop_safety_checks
+        .get_value();
+    let repeat_count = syntax_list
+        .iter()
+        .filter(|node| matches!(node, ir::SyntaxNode::Repeat { .. }))
+        .count();
+    let mut safety_counters = Vec::with_capacity(repeat_count);
+    if loop_safety_enabled && repeat_count != 0 {
+        let safety_counter_initial = ctx.builder.constant_bit32(ctx.u32_type, 0x2000);
+        for _ in 0..repeat_count {
+            let safety_counter = ctx.builder.variable(
+                ctx.private_u32_ptr,
+                None,
+                spirv::StorageClass::Private,
+                Some(safety_counter_initial),
+            );
+            if ctx.profile.supported_spirv >= 0x0001_0400 {
+                ctx.interfaces.push(safety_counter);
+            }
+            safety_counters.push(safety_counter);
+        }
+    }
+    let mut safety_counters = safety_counters.into_iter();
+
+    let main = ctx
+        .builder
+        .begin_function(
+            ctx.void_type,
+            None,
+            spirv::FunctionControl::NONE,
+            ctx.void_fn_type,
+        )
+        .unwrap();
+    ctx.block_labels = (0..program.blocks.len())
+        .map(|_| ctx.builder.id())
+        .collect();
+
+    let mut current_block = None;
+    for node in &syntax_list {
+        match *node {
+            ir::SyntaxNode::Block(block_idx) => {
+                let label = ctx.block_labels[block_idx as usize];
+                if current_block.is_some() {
+                    ctx.builder.branch(label).unwrap();
+                }
+                current_block = Some(block_idx);
+                ctx.begin_ir_block(block_idx);
+                ctx.emit_block_instructions(program, block_idx);
+            }
+            ir::SyntaxNode::If { cond, body, merge } => {
+                let if_label = ctx.block_labels[body as usize];
+                let endif_label = ctx.block_labels[merge as usize];
+                let cond = ctx.resolve_value(&cond);
+                ctx.builder
+                    .selection_merge(endif_label, spirv::SelectionControl::NONE)
+                    .unwrap();
+                ctx.builder
+                    .branch_conditional(cond, if_label, endif_label, std::iter::empty())
+                    .unwrap();
+                current_block = None;
+            }
+            ir::SyntaxNode::Loop {
+                body,
+                continue_block,
+                merge,
+            } => {
+                let body_label = ctx.block_labels[body as usize];
+                let continue_label = ctx.block_labels[continue_block as usize];
+                let endloop_label = ctx.block_labels[merge as usize];
+                ctx.builder
+                    .loop_merge(
+                        endloop_label,
+                        continue_label,
+                        spirv::LoopControl::NONE,
+                        std::iter::empty(),
+                    )
+                    .unwrap();
+                ctx.builder.branch(body_label).unwrap();
+                current_block = None;
+            }
+            ir::SyntaxNode::Break { cond, merge, skip } => {
+                let break_label = ctx.block_labels[merge as usize];
+                let skip_label = ctx.block_labels[skip as usize];
+                let cond = ctx.resolve_value(&cond);
+                ctx.builder
+                    .branch_conditional(cond, break_label, skip_label, std::iter::empty())
+                    .unwrap();
+                current_block = None;
+            }
+            ir::SyntaxNode::EndIf { merge } => {
+                if current_block.is_some() {
+                    ctx.builder
+                        .branch(ctx.block_labels[merge as usize])
+                        .unwrap();
+                }
+                current_block = None;
+            }
+            ir::SyntaxNode::Repeat {
+                cond,
+                loop_header,
+                merge,
+            } => {
+                let mut cond = ctx.resolve_value(&cond);
+                if loop_safety_enabled {
+                    let safety_counter = safety_counters
+                        .next()
+                        .expect("one safety counter must exist for each Repeat node");
+                    let old_counter = ctx
+                        .builder
+                        .load(ctx.u32_type, None, safety_counter, None, [])
+                        .unwrap();
+                    let new_counter = ctx
+                        .builder
+                        .i_sub(ctx.u32_type, None, old_counter, ctx.const_one_u32)
+                        .unwrap();
+                    ctx.builder
+                        .store(safety_counter, new_counter, None, [])
+                        .unwrap();
+                    let safety_cond = ctx
+                        .builder
+                        .s_greater_than_equal(ctx.bool_type, None, new_counter, ctx.const_zero_u32)
+                        .unwrap();
+                    cond = ctx
+                        .builder
+                        .logical_and(ctx.bool_type, None, cond, safety_cond)
+                        .unwrap();
+                }
+                let loop_header_label = ctx.block_labels[loop_header as usize];
+                let merge_label = ctx.block_labels[merge as usize];
+                ctx.builder
+                    .branch_conditional(cond, loop_header_label, merge_label, std::iter::empty())
+                    .unwrap();
+                current_block = None;
+            }
+            ir::SyntaxNode::Return => {
+                ctx.builder.ret().unwrap();
+                current_block = None;
+            }
+            ir::SyntaxNode::Unreachable => {
+                ctx.builder.unreachable().unwrap();
+                current_block = None;
+            }
+        }
+    }
+    ctx.builder.end_function().unwrap();
+    main
+}
+
 pub(crate) fn emit_into_context(
     ctx: &mut SpirvEmitContext,
     program: &ir::Program,
     bindings: &mut Bindings,
 ) {
     ctx.define_global_variables(program, bindings);
-    let main = ctx.define_main_function(program);
+    let main = define_main(ctx, program);
     define_entry_point(program, ctx, main);
     let profile = ctx.profile.clone();
     setup_float_controls(&profile, program, ctx, main);
@@ -449,6 +641,7 @@ pub fn emit_spirv_with_bindings(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ir::basic_block::Block;
     use rspirv::dr::Operand;
 
     const MAIN: spirv::Word = 0x100;
@@ -605,5 +798,94 @@ mod tests {
 
         assert!(has_capability(&ctx, spirv::Capability::TransformFeedback));
         assert!(has_execution_mode(&ctx, spirv::ExecutionMode::Xfb, &[]));
+    }
+
+    #[test]
+    fn repeat_emits_upstream_loop_safety_counter() {
+        let mut program = ir::Program::new(ShaderStage::Fragment);
+        program.blocks = vec![Block::new(), Block::new(), Block::new()];
+        program.syntax_list = vec![
+            ir::SyntaxNode::Block(0),
+            ir::SyntaxNode::Loop {
+                body: 1,
+                continue_block: 1,
+                merge: 2,
+            },
+            ir::SyntaxNode::Block(1),
+            ir::SyntaxNode::Repeat {
+                cond: ir::Value::ImmU1(true),
+                loop_header: 0,
+                merge: 2,
+            },
+            ir::SyntaxNode::Block(2),
+            ir::SyntaxNode::Return,
+        ];
+        let profile = Profile {
+            supported_spirv: 0x0001_0400,
+            ..Profile::default()
+        };
+        let mut ctx = SpirvEmitContext::new(&program, &profile, &RuntimeInfo::default());
+
+        define_main(&mut ctx, &program);
+
+        let module = ctx.builder.module_ref();
+        let safety_counter = module
+            .types_global_values
+            .iter()
+            .find(|inst| {
+                inst.class.opcode == spirv::Op::Variable
+                    && matches!(
+                        inst.operands.first(),
+                        Some(Operand::StorageClass(spirv::StorageClass::Private))
+                    )
+            })
+            .expect("Repeat must create a Private safety counter");
+        let initializer = match safety_counter.operands.as_slice() {
+            [Operand::StorageClass(spirv::StorageClass::Private), Operand::IdRef(id)] => *id,
+            operands => panic!("unexpected safety-counter operands: {operands:?}"),
+        };
+        assert!(module.types_global_values.iter().any(|inst| {
+            inst.result_id == Some(initializer)
+                && matches!(inst.operands.as_slice(), [Operand::LiteralBit32(0x2000)])
+        }));
+        assert!(ctx.interfaces.contains(
+            &safety_counter
+                .result_id
+                .expect("OpVariable has a result id")
+        ));
+
+        let emitted_ops = module
+            .functions
+            .iter()
+            .flat_map(|function| function.blocks.iter())
+            .flat_map(|block| block.instructions.iter())
+            .map(|inst| inst.class.opcode)
+            .collect::<Vec<_>>();
+        for opcode in [
+            spirv::Op::Load,
+            spirv::Op::ISub,
+            spirv::Op::Store,
+            spirv::Op::SGreaterThanEqual,
+            spirv::Op::LogicalAnd,
+        ] {
+            assert!(emitted_ops.contains(&opcode), "missing {opcode:?}");
+        }
+    }
+
+    #[test]
+    fn shader_without_repeat_does_not_emit_loop_safety_initializer() {
+        let mut program = ir::Program::new(ShaderStage::Fragment);
+        program.blocks = vec![Block::new()];
+        program.syntax_list = vec![ir::SyntaxNode::Block(0), ir::SyntaxNode::Return];
+        let mut ctx = SpirvEmitContext::new(&program, &Profile::default(), &RuntimeInfo::default());
+
+        define_main(&mut ctx, &program);
+
+        assert!(!ctx
+            .builder
+            .module_ref()
+            .types_global_values
+            .iter()
+            .any(|inst| { matches!(inst.operands.as_slice(), [Operand::LiteralBit32(0x2000)]) }));
     }
 }

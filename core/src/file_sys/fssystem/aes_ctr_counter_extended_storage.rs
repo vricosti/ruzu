@@ -4,7 +4,8 @@
 // Ported from: core/file_sys/fssystem/fssystem_aes_ctr_counter_extended_storage.h / .cpp
 
 use super::bucket_tree::BucketTree;
-use crate::file_sys::vfs::vfs_types::VirtualFile;
+use crate::file_sys::vfs::vfs::VfsFile;
+use crate::file_sys::vfs::vfs_types::{VirtualDir, VirtualFile};
 use common::ResultCode;
 
 pub const BLOCK_SIZE: usize = 0x10;
@@ -261,6 +262,48 @@ impl Default for AesCtrCounterExtendedStorage {
     }
 }
 
+// Upstream derives this interface from `IReadOnlyStorage`; Rust exposes the
+// same ownership boundary through the VFS trait so the NCA driver can compose
+// it with alignment, indirect, and integrity storages.
+impl VfsFile for AesCtrCounterExtendedStorage {
+    fn get_name(&self) -> String {
+        String::from("AesCtrCounterExtendedStorage")
+    }
+
+    fn get_size(&self) -> usize {
+        AesCtrCounterExtendedStorage::get_size(self)
+    }
+
+    fn resize(&self, _new_size: usize) -> bool {
+        false
+    }
+
+    fn get_containing_directory(&self) -> Option<VirtualDir> {
+        None
+    }
+
+    fn is_writable(&self) -> bool {
+        false
+    }
+
+    fn is_readable(&self) -> bool {
+        true
+    }
+
+    fn read(&self, data: &mut [u8], length: usize, offset: usize) -> usize {
+        let actual = length.min(data.len());
+        AesCtrCounterExtendedStorage::read(self, &mut data[..actual], offset)
+    }
+
+    fn write(&self, _data: &[u8], _length: usize, _offset: usize) -> usize {
+        0
+    }
+
+    fn rename(&self, _new_name: &str) -> bool {
+        false
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -309,5 +352,13 @@ mod tests {
     fn test_default() {
         let storage = AesCtrCounterExtendedStorage::default();
         assert!(!storage.is_initialized());
+    }
+
+    #[test]
+    fn read_only_storage_interface_matches_upstream_ownership() {
+        let storage: VirtualFile = std::sync::Arc::new(AesCtrCounterExtendedStorage::new());
+        assert!(storage.is_readable());
+        assert!(!storage.is_writable());
+        assert_eq!(storage.get_name(), "AesCtrCounterExtendedStorage");
     }
 }

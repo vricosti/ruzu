@@ -364,22 +364,7 @@ impl ThreadManager {
                 CommandData::FlushRegion(FlushRegionCommand { addr, size }),
                 false,
             );
-            return;
         }
-        // In async mode with extreme GPU accuracy, upstream does:
-        //   gpu.RequestFlush(addr, size) → TickGPU() → WaitForSyncOperation()
-        // In non-extreme async mode, upstream skips flush entirely.
-        if !settings::is_gpu_level_extreme(&settings::values()) {
-            return;
-        }
-        let Some(gpu) = self.gpu else {
-            log::warn!("ThreadManager::flush_region: GPU pointer not installed");
-            return;
-        };
-        let gpu = unsafe { &*(gpu as *const crate::gpu::Gpu) };
-        let fence = gpu.request_flush(addr, size as usize);
-        self.tick_gpu();
-        gpu.wait_for_sync_operation(fence);
     }
 
     /// Notify rasterizer that a region should be invalidated.
@@ -396,9 +381,23 @@ impl ThreadManager {
     /// Notify rasterizer that a region should be flushed and invalidated.
     /// Matches upstream `ThreadManager::FlushAndInvalidateRegion(DAddr, u64)`.
     ///
-    /// Upstream calls directly on the rasterizer (NOT queued).
-    /// Flush is skipped in async mode (only invalidation runs).
+    /// Upstream flushes at High accuracy, then directly invalidates the rasterizer cache.
     pub fn flush_and_invalidate_region(&self, addr: DAddr, size: u64) {
+        if settings::is_gpu_level_high(&settings::values()) {
+            if !self.is_async {
+                self.push_command(
+                    CommandData::FlushRegion(FlushRegionCommand { addr, size }),
+                    false,
+                );
+            } else if let Some(gpu) = self.gpu {
+                let gpu = unsafe { &*(gpu as *const crate::gpu::Gpu) };
+                let fence = gpu.request_flush(addr, size as usize);
+                self.tick_gpu();
+                gpu.wait_for_sync_operation(fence);
+            } else {
+                log::warn!("ThreadManager::flush_and_invalidate_region: GPU pointer not installed");
+            }
+        }
         if let Some(rasterizer) = self.rasterizer() {
             // Safety: rasterizer pointer is valid for the lifetime of the renderer.
             unsafe { rasterizer.as_mut() }.on_cache_invalidation(addr, size);
@@ -552,7 +551,11 @@ fn run_thread(
                 });
                 // Upstream: rasterizer->FlushRegion(flush.addr, flush.size)
                 if let Some(rasterizer) = rasterizer {
-                    unsafe { rasterizer.as_mut() }.flush_region(flush.addr, flush.size);
+                    unsafe { rasterizer.as_mut() }.flush_region(
+                        flush.addr,
+                        flush.size,
+                        crate::cache_types::CacheType::ALL,
+                    );
                 }
             }
             CommandData::InvalidateRegion(inv) => {

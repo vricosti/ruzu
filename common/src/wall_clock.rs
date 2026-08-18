@@ -2,7 +2,7 @@
 //! Status: COMPLET
 //! Derniere synchro: 2026-03-05
 
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 
 /// CNTPCT_EL0 Frequency = 19.2 MHz
 pub const CNTFRQ: u64 = 19_200_000;
@@ -110,9 +110,7 @@ impl Default for StandardWallClock {
 
 impl WallClock for StandardWallClock {
     fn get_time_ns(&self) -> Duration {
-        SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap_or(Duration::ZERO)
+        Duration::from_nanos(self.get_uptime().max(0) as u64)
     }
 
     fn get_time_us(&self) -> Duration {

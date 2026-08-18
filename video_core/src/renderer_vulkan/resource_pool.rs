@@ -74,14 +74,24 @@ impl ResourcePool {
     /// the pool if necessary. Calls `allocate_fn(begin, end)` when new
     /// resources must be created.
     pub fn commit_resource(&mut self, allocate_fn: &mut dyn FnMut(usize, usize)) -> usize {
-        let ms = self
-            .master_semaphore
-            .as_ref()
-            .expect("ResourcePool: master_semaphore not set");
-
-        // Refresh semaphore to query updated results
-        ms.refresh();
-        self.commit_resource_with_ticks(ms.known_gpu_tick(), ms.current_tick(), allocate_fn)
+        let ms = Arc::clone(
+            self.master_semaphore
+                .as_ref()
+                .expect("ResourcePool: master_semaphore not set"),
+        );
+        let found = self
+            .find_free(ms.known_gpu_tick(), ms.current_tick())
+            .or_else(|| {
+                ms.refresh();
+                self.find_free(ms.known_gpu_tick(), ms.current_tick())
+            });
+        let found = found.unwrap_or_else(|| {
+            let free_resource = self.manage_overflow(allocate_fn);
+            self.ticks[free_resource] = ms.current_tick();
+            free_resource
+        });
+        self.hint_iterator = (found + 1) % self.ticks.len();
+        found
     }
 
     /// `CommitResource` using ticks supplied by the owning scheduler.
@@ -91,37 +101,11 @@ impl ResourcePool {
         current_tick: u64,
         allocate_fn: &mut dyn FnMut(usize, usize),
     ) -> usize {
-        // Search helper: finds a free slot in [begin..end)
-        let search = |ticks: &mut [u64], begin: usize, end: usize| -> Option<usize> {
-            for iterator in begin..end {
-                if gpu_tick >= ticks[iterator] {
-                    ticks[iterator] = current_tick;
-                    return Some(iterator);
-                }
-            }
-            None
-        };
-
-        let ticks_len = self.ticks.len();
-        let hint = self.hint_iterator;
-
-        // Try to find a free resource from the hinted position to the end.
-        let found = search(&mut self.ticks, hint, ticks_len);
-        let found = match found {
-            Some(idx) => idx,
-            None => {
-                // Search from beginning to the hinted position.
-                match search(&mut self.ticks, 0, hint) {
-                    Some(idx) => idx,
-                    None => {
-                        // Both searches failed, the pool is full; handle it.
-                        let free_resource = self.manage_overflow(allocate_fn);
-                        self.ticks[free_resource] = current_tick;
-                        free_resource
-                    }
-                }
-            }
-        };
+        let found = self.find_free(gpu_tick, current_tick).unwrap_or_else(|| {
+            let free_resource = self.manage_overflow(allocate_fn);
+            self.ticks[free_resource] = current_tick;
+            free_resource
+        });
 
         // Free iterator is hinted to the resource after the one that's been committed.
         self.hint_iterator = (found + 1) % self.ticks.len();
@@ -169,6 +153,21 @@ impl ResourcePool {
     }
 
     // --- Private ---
+
+    fn find_free(&mut self, gpu_tick: u64, current_tick: u64) -> Option<usize> {
+        let search = |ticks: &mut [u64], begin: usize, end: usize| -> Option<usize> {
+            for iterator in begin..end {
+                if gpu_tick >= ticks[iterator] {
+                    ticks[iterator] = current_tick;
+                    return Some(iterator);
+                }
+            }
+            None
+        };
+        let ticks_len = self.ticks.len();
+        let hint = self.hint_iterator;
+        search(&mut self.ticks, hint, ticks_len).or_else(|| search(&mut self.ticks, 0, hint))
+    }
 
     /// Port of `ResourcePool::ManageOverflow`.
     fn manage_overflow(&mut self, allocate_fn: &mut dyn FnMut(usize, usize)) -> usize {

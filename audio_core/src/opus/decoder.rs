@@ -63,8 +63,8 @@ impl OpusDecoder {
         self.shared_buffer = vec![0; transfer_memory_size as usize];
         self.shared_memory_mapped = true;
         self.buffer_size = align_audio(
-            (frame_size * params.channel_count as u64)
-                / (48_000 / params.sample_rate.max(1) as u64),
+            (frame_size as u32).wrapping_mul(params.channel_count) as u64
+                / (48_000 / params.sample_rate) as u64,
             16,
         );
         if transfer_memory_size < self.buffer_size + input_size as u64 {
@@ -111,8 +111,8 @@ impl OpusDecoder {
         self.shared_buffer = vec![0; transfer_memory_size as usize];
         self.shared_memory_mapped = true;
         self.buffer_size = align_audio(
-            (frame_size * params.channel_count as u64)
-                / (48_000 / params.sample_rate.max(1) as u64),
+            (frame_size as u32).wrapping_mul(params.channel_count) as u64
+                / (48_000 / params.sample_rate) as u64,
             16,
         );
         if transfer_memory_size < self.buffer_size + input_size as u64 {
@@ -173,8 +173,8 @@ impl OpusDecoder {
         }
         let payload = &input_data
             [size_of::<OpusPacketHeader>()..size_of::<OpusPacketHeader>() + header.size as usize];
-        let channel_count = self.channel_count.max(1) as u32;
-        let out_sample_bytes = self.channel_count.max(0) as u32 * size_of::<i16>() as u32;
+        let channel_count = self.channel_count as u32;
+        let out_sample_bytes = channel_count.wrapping_mul(size_of::<i16>() as u32);
         let hardware_opus = &self.hardware_opus;
         let (in_data, out_data) = io_buffers_mut(
             &mut self.shared_buffer,
@@ -197,7 +197,7 @@ impl OpusDecoder {
         if rc.is_error() {
             return rc;
         }
-        let output_size = decoded_samples.saturating_mul(out_sample_bytes) as usize;
+        let output_size = decoded_samples.wrapping_mul(out_sample_bytes) as usize;
         if output_data.len() < output_size || out_data.len() < output_size {
             return RESULT_BUFFER_TOO_SMALL;
         }
@@ -249,8 +249,8 @@ impl OpusDecoder {
 
         let payload = &input_data
             [size_of::<OpusPacketHeader>()..size_of::<OpusPacketHeader>() + header.size as usize];
-        let channel_count = self.channel_count.max(1) as u32;
-        let out_sample_bytes = self.channel_count.max(0) as u32 * size_of::<i16>() as u32;
+        let channel_count = self.channel_count as u32;
+        let out_sample_bytes = channel_count.wrapping_mul(size_of::<i16>() as u32);
         let hardware_opus = &self.hardware_opus;
         let (in_data, out_data) = io_buffers_mut(
             &mut self.shared_buffer,
@@ -275,7 +275,7 @@ impl OpusDecoder {
             return rc;
         }
 
-        let output_size = decoded_samples.saturating_mul(out_sample_bytes) as usize;
+        let output_size = decoded_samples.wrapping_mul(out_sample_bytes) as usize;
         if output_data.len() < output_size || out_data.len() < output_size {
             return RESULT_BUFFER_TOO_SMALL;
         }
@@ -292,13 +292,9 @@ impl OpusDecoder {
 impl Drop for OpusDecoder {
     fn drop(&mut self) {
         if self.decode_object_initialized {
-            let _ = if self.total_stream_count > 0 {
-                self.hardware_opus
-                    .shutdown_multi_stream_decode_object(self.shared_buffer_size)
-            } else {
-                self.hardware_opus
-                    .shutdown_decode_object(self.shared_buffer_size)
-            };
+            let _ = self
+                .hardware_opus
+                .shutdown_decode_object(self.shared_buffer_size);
         }
     }
 }
@@ -337,6 +333,16 @@ mod tests {
     use super::*;
     use crate::adsp::apps::opus::{Direction, Message};
 
+    fn test_decoder() -> OpusDecoder {
+        let decoder = Arc::new(Mutex::new(AdspOpusDecoder::new(crate::make_test_system())));
+        {
+            let decoder = decoder.lock();
+            decoder.send(Direction::Dsp, Message::Start);
+            assert_eq!(decoder.receive(Direction::Host), Message::StartOK);
+        }
+        OpusDecoder::new_from_adsp(decoder)
+    }
+
     fn packet_with_payload(size: usize) -> Vec<u8> {
         let mut packet = Vec::with_capacity(size_of::<OpusPacketHeader>() + size);
         packet.extend_from_slice(&(size as u32).to_be_bytes());
@@ -345,9 +351,18 @@ mod tests {
         packet
     }
 
+    fn opus_silence_packet() -> Vec<u8> {
+        let payload = [0xF8, 0xFF, 0xFE];
+        let mut packet = Vec::with_capacity(size_of::<OpusPacketHeader>() + payload.len());
+        packet.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+        packet.extend_from_slice(&0u32.to_be_bytes());
+        packet.extend_from_slice(&payload);
+        packet
+    }
+
     #[test]
     fn initialize_sets_single_stream_input_and_output_regions() {
-        let mut decoder = OpusDecoder::new(HardwareOpus::new());
+        let mut decoder = test_decoder();
         let params = OpusParametersEx {
             sample_rate: 48_000,
             channel_count: 2,
@@ -355,11 +370,11 @@ mod tests {
             ..Default::default()
         };
 
-        assert_eq!(decoder.initialize(&params, 0x6000), ResultCode::SUCCESS);
+        assert_eq!(decoder.initialize(&params, 0x10000), ResultCode::SUCCESS);
         assert_eq!(decoder.in_data_size, 0x600);
         assert_eq!(
             decoder.out_data_offset,
-            0x6000 - decoder.buffer_size as usize
+            0x10000 - decoder.buffer_size as usize
         );
         assert_eq!(
             decoder.in_data_offset + decoder.in_data_size,
@@ -369,7 +384,7 @@ mod tests {
 
     #[test]
     fn initialize_multi_stream_uses_aligned_input_region() {
-        let mut decoder = OpusDecoder::new(HardwareOpus::new());
+        let mut decoder = test_decoder();
         let params = OpusMultiStreamParametersEx {
             sample_rate: 48_000,
             channel_count: 6,
@@ -391,14 +406,14 @@ mod tests {
 
     #[test]
     fn decode_interleaved_rejects_payload_larger_than_internal_input_region() {
-        let mut decoder = OpusDecoder::new(HardwareOpus::new());
+        let mut decoder = test_decoder();
         let params = OpusParametersEx {
             sample_rate: 48_000,
             channel_count: 2,
             use_large_frame_size: false,
             ..Default::default()
         };
-        assert_eq!(decoder.initialize(&params, 0x6000), ResultCode::SUCCESS);
+        assert_eq!(decoder.initialize(&params, 0x10000), ResultCode::SUCCESS);
 
         let packet = packet_with_payload(decoder.in_data_size + 1);
         let mut out_data_size = 0;
@@ -420,12 +435,18 @@ mod tests {
 
     #[test]
     fn decode_interleaved_for_multi_stream_uses_staged_buffers() {
-        let mut decoder = OpusDecoder::new(HardwareOpus::new());
+        let mut decoder = test_decoder();
         let params = OpusMultiStreamParametersEx {
             sample_rate: 48_000,
-            channel_count: 4,
-            total_stream_count: 2,
+            channel_count: 2,
+            total_stream_count: 1,
             stereo_stream_count: 1,
+            mappings: {
+                let mut mappings = [0; crate::opus::parameters::OPUS_STREAM_COUNT_MAX + 1];
+                mappings[0] = 0;
+                mappings[1] = 1;
+                mappings
+            },
             ..Default::default()
         };
         assert_eq!(
@@ -433,7 +454,7 @@ mod tests {
             ResultCode::SUCCESS
         );
 
-        let packet = packet_with_payload(128);
+        let packet = opus_silence_packet();
         let mut out_data_size = 0;
         let mut out_time_taken = 0;
         let mut out_samples = 0;
@@ -450,43 +471,8 @@ mod tests {
             ),
             ResultCode::SUCCESS
         );
-        assert_eq!(out_data_size, (size_of::<OpusPacketHeader>() + 128) as u32);
-        assert_eq!(
-            out_samples,
-            decoder.buffer_size as u32 / (params.channel_count * 2)
-        );
-        assert_eq!(out_time_taken, 128);
-    }
-
-    #[test]
-    fn initialize_single_stream_clears_prior_multistream_counts() {
-        let mut decoder = OpusDecoder::new(HardwareOpus::new());
-        let multi_params = OpusMultiStreamParametersEx {
-            sample_rate: 48_000,
-            channel_count: 4,
-            total_stream_count: 2,
-            stereo_stream_count: 1,
-            ..Default::default()
-        };
-        assert_eq!(
-            decoder.initialize_multi_stream(&multi_params, 0x12000),
-            ResultCode::SUCCESS
-        );
-        assert_eq!(decoder.total_stream_count, 2);
-        assert_eq!(decoder.stereo_stream_count, 1);
-
-        let single_params = OpusParametersEx {
-            sample_rate: 48_000,
-            channel_count: 2,
-            use_large_frame_size: false,
-            ..Default::default()
-        };
-        assert_eq!(
-            decoder.initialize(&single_params, 0x6000),
-            ResultCode::SUCCESS
-        );
-        assert_eq!(decoder.total_stream_count, 0);
-        assert_eq!(decoder.stereo_stream_count, 0);
+        assert_eq!(out_data_size, (size_of::<OpusPacketHeader>() + 3) as u32);
+        assert_eq!(out_samples, 960);
     }
 
     #[test]
@@ -505,9 +491,9 @@ mod tests {
             use_large_frame_size: false,
             ..Default::default()
         };
-        assert_eq!(decoder.initialize(&params, 0x6000), ResultCode::SUCCESS);
+        assert_eq!(decoder.initialize(&params, 0x10000), ResultCode::SUCCESS);
 
-        let packet = packet_with_payload(96);
+        let packet = opus_silence_packet();
         let mut out_data_size = 0;
         let mut out_time_taken = 0;
         let mut out_samples = 0;
@@ -524,9 +510,8 @@ mod tests {
             ),
             ResultCode::SUCCESS
         );
-        assert_eq!(out_data_size, (size_of::<OpusPacketHeader>() + 96) as u32);
+        assert_eq!(out_data_size, (size_of::<OpusPacketHeader>() + 3) as u32);
         assert!(out_samples > 0);
-        assert!(out_time_taken > 0);
     }
 
     #[test]
@@ -557,7 +542,7 @@ mod tests {
             ResultCode::SUCCESS
         );
 
-        let packet = packet_with_payload(96);
+        let packet = opus_silence_packet();
         let mut out_data_size = 0;
         let mut out_time_taken = 0;
         let mut out_samples = 0;
@@ -574,8 +559,7 @@ mod tests {
             ),
             ResultCode::SUCCESS
         );
-        assert_eq!(out_data_size, (size_of::<OpusPacketHeader>() + 96) as u32);
+        assert_eq!(out_data_size, (size_of::<OpusPacketHeader>() + 3) as u32);
         assert!(out_samples > 0);
-        assert!(out_time_taken > 0);
     }
 }

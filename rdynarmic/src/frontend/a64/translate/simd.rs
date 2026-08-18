@@ -5,20 +5,6 @@ use crate::frontend::a64::translate::visitor::TranslatorVisitor;
 /// Most SIMD instructions are complex and fall back to interpreter initially.
 /// The most commonly used ones will be JIT-compiled incrementally.
 impl<'a> TranslatorVisitor<'a> {
-    // --- Crypto (AES/SHA) ---
-    pub fn aese(&mut self, _inst: &DecodedInst) -> bool {
-        self.interpret_this_instruction()
-    }
-    pub fn aesd(&mut self, _inst: &DecodedInst) -> bool {
-        self.interpret_this_instruction()
-    }
-    pub fn aesmc(&mut self, _inst: &DecodedInst) -> bool {
-        self.interpret_this_instruction()
-    }
-    pub fn aesimc(&mut self, _inst: &DecodedInst) -> bool {
-        self.interpret_this_instruction()
-    }
-
     // --- DC/IC cache operations (mostly NOP in userspace emulation) ---
     pub fn dc_ivac(&mut self, _inst: &DecodedInst) -> bool {
         true

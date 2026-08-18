@@ -342,6 +342,11 @@ impl IFileSystem {
         let is_domain = ctx
             .get_manager()
             .map_or(false, |m| m.lock().unwrap().is_domain());
+        if object.is_none() && is_domain {
+            // Upstream `WriteOutArgument` always calls `AddDomainObject`, even
+            // when the shared pointer was left null by an error return.
+            ctx.add_null_domain_object();
+        }
         let mut response = CmifResponse::new(ctx, 2, 0, 1);
         response.push_result(result);
         match object {

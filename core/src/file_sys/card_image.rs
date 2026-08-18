@@ -6,6 +6,8 @@
 
 use std::sync::Arc;
 
+use common::common_funcs::make_magic;
+
 use super::content_archive::{NCAContentType, NCA};
 use super::nca_metadata::CNMT;
 use super::partition_filesystem::{PartitionFilesystem, ResultStatus};
@@ -21,11 +23,6 @@ use super::vfs::vfs_vector::VectorVfsDirectory;
 
 const GAMECARD_CERTIFICATE_OFFSET: u64 = 0x7000;
 const PARTITION_NAMES: [&str; 4] = ["update", "normal", "secure", "logo"];
-
-/// Helper to construct a four-character-code magic value from bytes.
-const fn make_magic(a: u8, b: u8, c: u8, d: u8) -> u32 {
-    (a as u32) | ((b as u32) << 8) | ((c as u32) << 16) | ((d as u32) << 24)
-}
 
 const HEAD_MAGIC: u32 = make_magic(b'H', b'E', b'A', b'D');
 

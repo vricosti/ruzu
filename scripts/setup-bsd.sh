@@ -13,7 +13,7 @@ case "$(uname -s)" in
         PACKAGE_MANAGER=freebsd-pkg
         REQUIRED_PACKAGES="
             alsa-lib cmake curl ffmpeg git glslang gtk4 jackit libX11
-            ninja pkgconf pulseaudio sdl2 vulkan-headers vulkan-loader
+            ninja pkgconf pulseaudio vulkan-headers vulkan-loader
             vulkan-tools
         "
         ;;
@@ -21,7 +21,7 @@ case "$(uname -s)" in
         PLATFORM_NAME="NetBSD $(uname -r)"
         PACKAGE_MANAGER=pkgin
         REQUIRED_PACKAGES="
-            SDL2 alsa-lib cmake curl ffmpeg7 git glslang gtk4 jack
+            alsa-lib cmake curl ffmpeg7 git glslang gtk4 jack
             ninja-build openssl pkgconf pulseaudio vulkan-headers
             vulkan-loader
         "
@@ -30,7 +30,7 @@ case "$(uname -s)" in
         PLATFORM_NAME="OpenBSD $(uname -r)"
         PACKAGE_MANAGER=openbsd-pkg
         REQUIRED_PACKAGES="
-            cmake curl ffmpeg git glslang gmake gtk+4 ninja sdl2
+            cmake curl ffmpeg git glslang gmake gtk+4 ninja
             vulkan-headers vulkan-loader
         "
         ;;

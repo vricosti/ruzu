@@ -147,16 +147,6 @@ impl State {
         self.copy_size = regs.line_length_in * regs.line_count;
         self.inner_buffer.resize(self.copy_size as usize, 0);
         self.is_linear = is_linear;
-        if std::env::var_os("RUZU_TRACE_UPLOAD_EXEC").is_some() {
-            log::info!(
-                "engine_upload::process_exec line_length_in={} line_count={} copy_size={} linear={} dest=0x{:X}",
-                regs.line_length_in,
-                regs.line_count,
-                self.copy_size,
-                is_linear,
-                regs.dest.address()
-            );
-        }
     }
 
     /// Append a single data word to the transfer buffer.
@@ -165,8 +155,14 @@ impl State {
     pub fn process_data_word(&mut self, regs: &Registers, data: u32, is_last_call: bool) {
         self.accumulate_word(data);
         if is_last_call {
-            let buffer: Vec<u8> = self.inner_buffer.clone();
-            self.process_data_bytes(regs, &buffer);
+            Self::process_data_bytes(
+                self.is_linear,
+                self.memory_manager.as_ref(),
+                self.rasterizer,
+                &mut self.tmp_buffer,
+                regs,
+                &self.inner_buffer,
+            );
         }
     }
 
@@ -177,8 +173,14 @@ impl State {
         // Safe conversion: reinterpret &[u32] as &[u8] matching C++ reinterpret_cast.
         let byte_view: &[u8] =
             unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4) };
-        let buffer: Vec<u8> = byte_view.to_vec();
-        self.process_data_bytes(regs, &buffer);
+        Self::process_data_bytes(
+            self.is_linear,
+            self.memory_manager.as_ref(),
+            self.rasterizer,
+            &mut self.tmp_buffer,
+            regs,
+            byte_view,
+        );
     }
 
     /// Target GPU virtual address for the current transfer.
@@ -208,41 +210,22 @@ impl State {
     /// Upstream logic:
     ///   - Linear: iterate lines, call rasterizer->AccelerateInlineToMemory per line.
     ///   - Block-linear: compute BPP shift, read GPU memory, swizzle subrect, write back.
-    fn process_data_bytes(&mut self, regs: &Registers, read_buffer: &[u8]) {
+    fn process_data_bytes(
+        is_linear: bool,
+        memory_manager: Option<&Arc<Mutex<crate::memory_manager::MemoryManager>>>,
+        rasterizer: Option<RasterizerHandle>,
+        tmp_buffer: &mut Vec<u8>,
+        regs: &Registers,
+        read_buffer: &[u8],
+    ) {
         let address = regs.dest.address();
-        if std::env::var_os("RUZU_TRACE_UPLOAD_BYTES").is_some() {
-            log::info!(
-                "engine_upload::process_data_bytes target=0x{:X} bytes={} linear={} line_length={} line_count={}",
-                address,
-                read_buffer.len(),
-                self.is_linear,
-                regs.line_length_in,
-                regs.line_count,
-            );
-        }
-        if std::env::var_os("RUZU_TRACE_DMA_FLOW").is_some() {
-            log::info!(
-                "engine_upload::State::process_data_bytes target=0x{:X} bytes={} linear={} line_length={} line_count={} pitch={} width={} height={} depth={} x={} y={}",
-                address,
-                read_buffer.len(),
-                self.is_linear,
-                regs.line_length_in,
-                regs.line_count,
-                regs.dest.pitch,
-                regs.dest.width,
-                regs.dest.height,
-                regs.dest.depth,
-                regs.dest.x,
-                regs.dest.y
-            );
-        }
-        let Some(memory_manager) = self.memory_manager.as_ref().map(Arc::clone) else {
+        let Some(memory_manager) = memory_manager else {
             log::warn!(
                 "engine_upload::State::process_data_bytes: flush skipped (no MemoryManager bound)"
             );
             return;
         };
-        if self.is_linear {
+        if is_linear {
             // Linear copy: iterate lines, call rasterizer->AccelerateInlineToMemory
             // for each line. Upstream:
             //   for (line = 0; line < line_count; ++line) {
@@ -255,17 +238,8 @@ impl State {
                 let start = line * regs.line_length_in as usize;
                 let end = start + regs.line_length_in as usize;
                 if end <= read_buffer.len() {
-                    let mut rasterizer = self.rasterizer.map(|handle| unsafe { handle.as_mut() });
+                    let mut rasterizer = rasterizer.map(|handle| unsafe { handle.as_mut() });
                     if let Some(ref mut rast) = rasterizer {
-                        if std::env::var_os("RUZU_TRACE_INLINE_TO_MEMORY").is_some() {
-                            let ptr = *rast as *mut dyn RasterizerInterface;
-                            log::info!(
-                                "engine_upload::State::process_data_bytes calling_rasterizer ptr={:p} dest=0x{:X} size={}",
-                                ptr,
-                                dest_line,
-                                regs.line_length_in
-                            );
-                        }
                         rast.accelerate_inline_to_memory(
                             dest_line,
                             regs.line_length_in as usize,
@@ -310,14 +284,12 @@ impl State {
 
             // Read existing GPU memory into tmp_buffer. Upstream uses
             // GpuGuestMemoryScoped<SafeReadCachedWrite>.
-            self.tmp_buffer.resize(dst_size, 0);
-            memory_manager
-                .lock()
-                .read_block(address, &mut self.tmp_buffer);
+            tmp_buffer.resize(dst_size, 0);
+            memory_manager.lock().read_block(address, tmp_buffer);
 
             // Swizzle the upload data into the tiled buffer.
             decoders::swizzle_subrect(
-                &mut self.tmp_buffer,
+                tmp_buffer,
                 read_buffer,
                 bytes_per_pixel,
                 width,
@@ -335,7 +307,7 @@ impl State {
             // Write the swizzled buffer back to GPU memory with the upstream cached-write path.
             memory_manager
                 .lock()
-                .write_block_cached(address, &self.tmp_buffer);
+                .write_block_cached(address, tmp_buffer);
         }
     }
 }

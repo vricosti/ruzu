@@ -424,66 +424,126 @@ fn storage_offset(
     ))
 }
 
+fn storage_opcode(opcode: Opcode) -> Opcode {
+    global_to_storage(opcode).unwrap_or_else(|| {
+        std::panic::panic_any(crate::exception::InvalidArgument::new(format!(
+            "Invalid global memory opcode {opcode:?}"
+        )))
+    })
+}
+
+fn replace_load(program: &mut Program, inst: InstRef, storage_index: u32, offset: Value) {
+    let new_opcode = storage_opcode(program.block(inst.block).inst(inst.inst).opcode);
+    let value = insert_before(
+        program,
+        inst,
+        new_opcode,
+        vec![Value::ImmU32(storage_index), offset],
+    );
+    replace_uses_with(program, inst, value);
+    program
+        .block_mut(inst.block)
+        .inst_mut(inst.inst)
+        .invalidate();
+}
+
+fn replace_write(program: &mut Program, inst: InstRef, storage_index: u32, offset: Value) {
+    let source = program.block(inst.block).inst(inst.inst).args[1];
+    let new_opcode = storage_opcode(program.block(inst.block).inst(inst.inst).opcode);
+    insert_before(
+        program,
+        inst,
+        new_opcode,
+        vec![Value::ImmU32(storage_index), offset, source],
+    );
+    program
+        .block_mut(inst.block)
+        .inst_mut(inst.inst)
+        .invalidate();
+}
+
+fn replace_atomic(program: &mut Program, inst: InstRef, storage_index: u32, offset: Value) {
+    let source = program.block(inst.block).inst(inst.inst).args[1];
+    let new_opcode = storage_opcode(program.block(inst.block).inst(inst.inst).opcode);
+    let value = insert_before(
+        program,
+        inst,
+        new_opcode,
+        vec![Value::ImmU32(storage_index), offset, source],
+    );
+    replace_uses_with(program, inst, value);
+    program
+        .block_mut(inst.block)
+        .inst_mut(inst.inst)
+        .invalidate();
+}
+
 fn replace(program: &mut Program, storage_inst: StorageInst, storage_index: u32, offset: Value) {
     let opcode = program
         .block(storage_inst.inst.block)
         .inst(storage_inst.inst.inst)
         .opcode;
-    let Some(new_opcode) = global_to_storage(opcode) else {
-        return;
-    };
-    let is_load = matches!(
-        opcode,
-        Opcode::LoadGlobalU8
-            | Opcode::LoadGlobalS8
-            | Opcode::LoadGlobalU16
-            | Opcode::LoadGlobalS16
-            | Opcode::LoadGlobal32
-            | Opcode::LoadGlobal64
-            | Opcode::LoadGlobal128
-    );
-    let is_write = matches!(
-        opcode,
-        Opcode::WriteGlobalU8
-            | Opcode::WriteGlobalS8
-            | Opcode::WriteGlobalU16
-            | Opcode::WriteGlobalS16
-            | Opcode::WriteGlobal32
-            | Opcode::WriteGlobal64
-            | Opcode::WriteGlobal128
-    );
-    if is_load {
-        let new_value = insert_before(
-            program,
-            storage_inst.inst,
-            new_opcode,
-            vec![Value::ImmU32(storage_index), offset],
-        );
-        replace_uses_with(program, storage_inst.inst, new_value);
-    } else {
-        let value = program
-            .block(storage_inst.inst.block)
-            .inst(storage_inst.inst.inst)
-            .args
-            .get(1)
-            .copied();
-        let Some(value) = value else {
-            return;
-        };
-        let new_value = insert_before(
-            program,
-            storage_inst.inst,
-            new_opcode,
-            vec![Value::ImmU32(storage_index), offset, value],
-        );
-        if !is_write {
-            replace_uses_with(program, storage_inst.inst, new_value);
+    match opcode {
+        Opcode::LoadGlobalS8
+        | Opcode::LoadGlobalU8
+        | Opcode::LoadGlobalS16
+        | Opcode::LoadGlobalU16
+        | Opcode::LoadGlobal32
+        | Opcode::LoadGlobal64
+        | Opcode::LoadGlobal128 => replace_load(program, storage_inst.inst, storage_index, offset),
+        Opcode::WriteGlobalS8
+        | Opcode::WriteGlobalU8
+        | Opcode::WriteGlobalS16
+        | Opcode::WriteGlobalU16
+        | Opcode::WriteGlobal32
+        | Opcode::WriteGlobal64
+        | Opcode::WriteGlobal128 => {
+            replace_write(program, storage_inst.inst, storage_index, offset)
+        }
+        Opcode::GlobalAtomicIAdd32
+        | Opcode::GlobalAtomicSMin32
+        | Opcode::GlobalAtomicUMin32
+        | Opcode::GlobalAtomicSMax32
+        | Opcode::GlobalAtomicUMax32
+        | Opcode::GlobalAtomicInc32
+        | Opcode::GlobalAtomicDec32
+        | Opcode::GlobalAtomicAnd32
+        | Opcode::GlobalAtomicOr32
+        | Opcode::GlobalAtomicXor32
+        | Opcode::GlobalAtomicExchange32
+        | Opcode::GlobalAtomicIAdd64
+        | Opcode::GlobalAtomicSMin64
+        | Opcode::GlobalAtomicUMin64
+        | Opcode::GlobalAtomicSMax64
+        | Opcode::GlobalAtomicUMax64
+        | Opcode::GlobalAtomicAnd64
+        | Opcode::GlobalAtomicOr64
+        | Opcode::GlobalAtomicXor64
+        | Opcode::GlobalAtomicExchange64
+        | Opcode::GlobalAtomicIAdd32x2
+        | Opcode::GlobalAtomicSMin32x2
+        | Opcode::GlobalAtomicUMin32x2
+        | Opcode::GlobalAtomicSMax32x2
+        | Opcode::GlobalAtomicUMax32x2
+        | Opcode::GlobalAtomicAnd32x2
+        | Opcode::GlobalAtomicOr32x2
+        | Opcode::GlobalAtomicXor32x2
+        | Opcode::GlobalAtomicExchange32x2
+        | Opcode::GlobalAtomicAddF32
+        | Opcode::GlobalAtomicAddF16x2
+        | Opcode::GlobalAtomicAddF32x2
+        | Opcode::GlobalAtomicMinF16x2
+        | Opcode::GlobalAtomicMinF32x2
+        | Opcode::GlobalAtomicMaxF16x2
+        | Opcode::GlobalAtomicMaxF32x2 => {
+            replace_atomic(program, storage_inst.inst, storage_index, offset)
+        }
+        _ => {
+            std::panic::panic_any(crate::exception::InvalidArgument::new(format!(
+                "Invalid global memory opcode {opcode:?}"
+            )));
         }
     }
-    program
-        .block_mut(storage_inst.inst.block)
-        .inst_mut(storage_inst.inst.inst)
-        .invalidate();
 }
 
 /// Convert global memory instructions to storage buffer instructions.
@@ -534,7 +594,7 @@ pub fn global_memory_to_storage_buffer_pass(program: &mut Program, host_info: &H
             program,
             storage_inst.inst,
             storage_inst.storage_buffer,
-            host_info.min_ssbo_alignment,
+            host_info.min_ssbo_alignment as u32,
         ) else {
             continue;
         };

@@ -9,8 +9,13 @@
 use std::collections::HashMap;
 
 use super::macro_hle::HleMacro;
+use super::macro_interpreter::MacroInterpreterImpl;
+#[cfg(target_arch = "x86_64")]
+use super::macro_jit_x64::MacroJitX64Impl;
+use crate::engines::engine_interface::EngineInterface;
 use crate::engines::maxwell_3d::Maxwell3D;
 use common::container_hash::hash_u32_slice;
+use common::hash::BuildUnorderedDenseHasher;
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
@@ -68,6 +73,7 @@ pub enum AluOperation {
     And = 10,
     AndNot = 11,
     Nand = 12,
+    Invalid = u32::MAX,
 }
 
 impl AluOperation {
@@ -82,7 +88,7 @@ impl AluOperation {
             10 => Self::And,
             11 => Self::AndNot,
             12 => Self::Nand,
-            _ => Self::Add, // Undefined; upstream has no explicit default
+            _ => Self::Invalid,
         }
     }
 }
@@ -291,22 +297,39 @@ struct CacheInfo {
 ///
 /// Subclasses (interpreter, JIT) provide the `compile` method.
 pub struct MacroEngine {
-    macro_cache: HashMap<u32, CacheInfo>,
-    uploaded_macro_code: HashMap<u32, Vec<u32>>,
+    macro_cache: HashMap<u32, CacheInfo, BuildUnorderedDenseHasher>,
+    uploaded_macro_code: HashMap<u32, Vec<u32>, BuildUnorderedDenseHasher>,
     hle_macros: HleMacro,
-    // In upstream, this holds a reference to Maxwell3D.
-    // That dependency will be wired when engines are integrated.
+    is_interpreted: bool,
+}
+
+#[derive(Clone, Copy)]
+struct Maxwell3DPtr(*mut Maxwell3D);
+
+// The pointer is channel-owned and macro execution is serialized on the GPU
+// thread, matching the lifetime used by upstream MacroEngine::Execute.
+unsafe impl Send for Maxwell3DPtr {}
+
+impl Maxwell3DPtr {
+    unsafe fn call_method(self, address: u32, value: u32) {
+        (&mut *self.0).call_method(address, value, true);
+    }
+
+    unsafe fn get_register_value(self, method: u32) -> u32 {
+        (&*self.0).get_register_value(method)
+    }
 }
 
 impl MacroEngine {
     /// Create a new macro engine.
     ///
-    /// Port of `MacroEngine::MacroEngine(Engines::Maxwell3D&)`.
-    pub fn new() -> Self {
+    /// Port of `MacroEngine::MacroEngine(bool is_interpreted)`.
+    pub fn new(is_interpreted: bool) -> Self {
         Self {
-            macro_cache: HashMap::new(),
-            uploaded_macro_code: HashMap::new(),
+            macro_cache: HashMap::with_hasher(BuildUnorderedDenseHasher),
+            uploaded_macro_code: HashMap::with_hasher(BuildUnorderedDenseHasher),
             hle_macros: HleMacro::new(),
+            is_interpreted,
         }
     }
 
@@ -314,20 +337,36 @@ impl MacroEngine {
         self.hle_macros.set_maxwell_3d(maxwell3d);
     }
 
+    /// Port of upstream `MacroEngine::Compile`.
+    fn compile_backend(
+        is_interpreted: bool,
+        maxwell3d: Maxwell3DPtr,
+        code: &[u32],
+    ) -> Box<dyn CachedMacro> {
+        #[cfg(target_arch = "x86_64")]
+        if !is_interpreted {
+            return Box::new(MacroJitX64Impl::new_with_maxwell(
+                code.to_vec(),
+                maxwell3d.0,
+            ));
+        }
+
+        let mut program = MacroInterpreterImpl::new(code.to_vec());
+        program.set_method_writer(move |address, value, _is_last_call| unsafe {
+            maxwell3d.call_method(address, value);
+        });
+        program.set_method_reader(move |method| unsafe { maxwell3d.get_register_value(method) });
+        Box::new(program)
+    }
+
     /// Store uploaded macro code word.
     ///
     /// Port of `MacroEngine::AddCode`.
     pub fn add_code(&mut self, method: u32, data: u32) {
-        let entry = self.uploaded_macro_code.entry(method).or_default();
-        entry.push(data);
-        if method >= 0x140 && method <= 0x180 {
-            log::info!(
-                "MacroEngine::add_code method=0x{:X} len={} data=0x{:08X}",
-                method,
-                entry.len(),
-                data
-            );
-        }
+        self.uploaded_macro_code
+            .entry(method)
+            .or_default()
+            .push(data);
     }
 
     /// Clear the code associated with a method.
@@ -336,18 +375,29 @@ impl MacroEngine {
     pub fn clear_code(&mut self, method: u32) {
         self.macro_cache.remove(&method);
         self.uploaded_macro_code.remove(&method);
-        if method >= 0x140 && method <= 0x180 {
-            log::info!("MacroEngine::clear_code method=0x{:X}", method);
-        }
     }
 
     /// Compile (if not cached) and execute a macro.
     ///
     /// Port of `MacroEngine::Execute`.
     ///
-    /// The `compile_fn` parameter provides the compilation strategy (interpreter
-    /// or JIT), replacing the virtual `Compile` method from upstream.
-    pub fn execute<F, R>(
+    pub fn execute<R>(
+        &mut self,
+        maxwell3d: *mut Maxwell3D,
+        method: u32,
+        parameters: &mut [u32],
+        refresh_parameters: R,
+    ) where
+        R: FnMut(&mut [u32]),
+    {
+        let is_interpreted = self.is_interpreted;
+        let maxwell3d = Maxwell3DPtr(maxwell3d);
+        self.execute_with_compiler(method, parameters, refresh_parameters, move |code| {
+            Self::compile_backend(is_interpreted, maxwell3d, code)
+        });
+    }
+
+    fn execute_with_compiler<F, R>(
         &mut self,
         method: u32,
         parameters: &mut [u32],
@@ -359,6 +409,9 @@ impl MacroEngine {
     {
         if let Some(cache_info) = self.macro_cache.get_mut(&method) {
             if cache_info.has_hle_program {
+                if *common::settings::values().disable_macro_hle.get_value() {
+                    refresh_parameters(parameters);
+                }
                 if let Some(ref mut hle) = cache_info.hle_program {
                     hle.execute(parameters, method);
                 }
@@ -399,44 +452,15 @@ impl MacroEngine {
                 .clone()
         };
         let hash = hash_macro_code(&code_for_compile);
-        if method == 0x14F || std::env::var_os("RUZU_TRACE_MACRO_FLOW").is_some() {
-            log::info!(
-                "MacroEngine::execute method=0x{:X} code_len={} hash=0x{:016X} mid_method={:?}",
-                method,
-                code_for_compile.len(),
-                hash,
-                mid_method
-            );
-        }
-        if std::env::var_os("RUZU_TRACE_MACRO_HASH").is_some() {
-            let head: String = code_for_compile
-                .iter()
-                .take(8)
-                .map(|w| format!("0x{:08X},", w))
-                .collect();
-            log::info!(
-                "[MACRO_HASH] method=0x{:X} len={} hash=0x{:016X} first8=[{}]",
-                method,
-                code_for_compile.len(),
-                hash,
-                head
-            );
-        }
-
-        let lle_program = compile_fn(&code_for_compile);
-
-        let hle_program = self.hle_macros.get_hle_program(hash);
+        let disable_macro_hle = *common::settings::values().disable_macro_hle.get_value();
+        let hle_program = (!disable_macro_hle)
+            .then(|| self.hle_macros.get_hle_program(hash))
+            .flatten();
         let has_hle = hle_program.is_some();
-        if method == 0x14F || std::env::var_os("RUZU_TRACE_MACRO_FLOW").is_some() {
-            log::info!(
-                "MacroEngine::execute method=0x{:X} has_hle={}",
-                method,
-                has_hle
-            );
-        }
+        let lle_program = (!has_hle).then(|| compile_fn(&code_for_compile));
 
         let cache_info = CacheInfo {
-            lle_program: Some(lle_program),
+            lle_program,
             hle_program,
             hash,
             has_hle_program: has_hle,
@@ -446,27 +470,17 @@ impl MacroEngine {
 
         // Execute the newly compiled macro
         let entry = self.macro_cache.get_mut(&method).unwrap();
+        if !entry.has_hle_program || disable_macro_hle {
+            refresh_parameters(parameters);
+        }
         if entry.has_hle_program {
             if let Some(ref mut hle) = entry.hle_program {
                 hle.execute(parameters, method);
             }
         } else if let Some(ref mut lle) = entry.lle_program {
-            refresh_parameters(parameters);
             lle.execute(parameters, method);
         }
     }
-}
-
-// ── Factory ──────────────────────────────────────────────────────────────────
-
-/// Selects the appropriate macro engine backend.
-///
-/// Port of `Tegra::GetMacroEngine`.
-///
-/// Returns a `MacroEngine` — the caller decides whether to use the interpreter
-/// or JIT compile function.
-pub fn get_macro_engine() -> MacroEngine {
-    MacroEngine::new()
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -517,7 +531,7 @@ mod tests {
 
     #[test]
     fn macro_engine_add_code() {
-        let mut engine = MacroEngine::new();
+        let mut engine = MacroEngine::new(true);
         engine.add_code(0x100, 0xDEADBEEF);
         engine.add_code(0x100, 0xCAFEBABE);
         assert_eq!(
@@ -528,7 +542,7 @@ mod tests {
 
     #[test]
     fn macro_engine_clear_code() {
-        let mut engine = MacroEngine::new();
+        let mut engine = MacroEngine::new(true);
         engine.add_code(0x100, 0xDEADBEEF);
         engine.add_code(0x100, 0xCAFEBABE);
         engine.clear_code(0x100);
@@ -549,10 +563,10 @@ mod tests {
 
         let seen = Arc::new(Mutex::new(Vec::new()));
         let seen_by_macro = Arc::clone(&seen);
-        let mut engine = MacroEngine::new();
+        let mut engine = MacroEngine::new(true);
         engine.add_code(0x100, 0xDEAD_BEEF);
         let mut parameters = [0];
-        engine.execute(
+        engine.execute_with_compiler(
             0x100,
             &mut parameters,
             |parameters| parameters[0] = 0xCAFE_BABE,
@@ -565,14 +579,14 @@ mod tests {
 
     #[test]
     fn macro_engine_execute_rebases_mid_method_inside_uploaded_blob() {
-        let mut engine = MacroEngine::new();
+        let mut engine = MacroEngine::new(true);
         engine.add_code(0x100, 0x11111111);
         engine.add_code(0x100, 0x22222222);
         engine.add_code(0x100, 0x33333333);
 
         let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let captured_compile = std::sync::Arc::clone(&captured);
-        engine.execute(
+        engine.execute_with_compiler(
             0x101,
             &mut [0],
             |_| {},
@@ -591,14 +605,14 @@ mod tests {
 
     #[test]
     fn macro_engine_execute_uses_exact_method_blob_without_contiguous_merge() {
-        let mut engine = MacroEngine::new();
+        let mut engine = MacroEngine::new(true);
         engine.add_code(0x100, 0x11111111);
         engine.add_code(0x101, 0x22222222);
         engine.add_code(0x102, 0x33333333);
 
         let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let captured_compile = std::sync::Arc::clone(&captured);
-        engine.execute(
+        engine.execute_with_compiler(
             0x100,
             &mut [0],
             |_| {},

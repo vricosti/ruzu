@@ -264,6 +264,7 @@ impl<'a> CommandGenerator<'a> {
                 ],
             );
         }
+        self.splitter_context.update_internal_state();
     }
 
     fn generate_voice_command(
@@ -1173,6 +1174,7 @@ impl<'a> CommandGenerator<'a> {
                     input: input_output,
                     output: input_output,
                     biquads: voice.biquads,
+                    biquads_float: voice.biquads_float,
                     states: [
                         self.voice_state_pool.translate(
                             voice_state_addresses.biquad_states[0],
@@ -1187,6 +1189,7 @@ impl<'a> CommandGenerator<'a> {
                     ],
                     needs_init: [!voice.biquad_initialized[0], !voice.biquad_initialized[1]],
                     filter_tap_count: MAX_BIQUAD_FILTERS as u8,
+                    use_float_coefficients: voice.use_float_biquads,
                 }),
                 node_id,
             );
@@ -1203,6 +1206,7 @@ impl<'a> CommandGenerator<'a> {
                     input: input_output,
                     output: input_output,
                     biquad,
+                    biquad_float: voice.biquads_float[biquad_index],
                     state: self.voice_state_pool.translate(
                         voice_state_addresses.biquad_states[biquad_index],
                         (MAX_BIQUAD_FILTERS as u64)
@@ -1210,6 +1214,7 @@ impl<'a> CommandGenerator<'a> {
                     ),
                     needs_init: !voice.biquad_initialized[biquad_index],
                     use_float_processing,
+                    use_float_coefficients: voice.use_float_biquads,
                 }),
                 node_id,
             );
@@ -1528,9 +1533,11 @@ impl<'a> CommandGenerator<'a> {
                         input: mix_info.buffer_offset + i16::from(parameter.inputs[channel]),
                         output: mix_info.buffer_offset + i16::from(parameter.outputs[channel]),
                         biquad: Self::build_biquad_filter_parameter(&parameter),
+                        biquad_float: Default::default(),
                         state,
                         needs_init,
                         use_float_processing: self.behavior.use_biquad_filter_float_processing(),
+                        use_float_coefficients: false,
                     }),
                     mix_info.node_id as u32,
                 );
@@ -1916,6 +1923,12 @@ mod tests {
     use crate::renderer::memory::{MemoryPoolInfo, PoolLocation};
     use crate::renderer::sink::{DeviceInParameter, SinkContext, SinkInfoBase, SinkType};
 
+    fn as_bytes<T>(value: &T) -> &[u8] {
+        unsafe {
+            std::slice::from_raw_parts(value as *const T as *const u8, std::mem::size_of::<T>())
+        }
+    }
+
     fn make_generator<'a>(
         command_buffer: &'a mut CommandBuffer,
         command_list_header: &'a mut CommandListHeader,
@@ -2022,6 +2035,103 @@ mod tests {
         assert!(matches!(entries[1].command, Command::Upsample(_)));
         assert!(matches!(entries[2].command, Command::DeviceSink(_)));
         assert!(entries.iter().all(|entry| entry.node_id == 0x55));
+    }
+
+    #[test]
+    fn voice_generation_advances_splitter_internal_state() {
+        use crate::common::audio_renderer_parameter::{
+            AudioRendererParameterInternal, ExecutionMode,
+        };
+        use crate::common::feature_support::CURRENT_REVISION;
+        use crate::renderer::splitter::splitter_destinations_data::InParameterVersion2b;
+
+        let mut behavior = BehaviorInfo::new();
+        behavior.set_user_lib_revision(CURRENT_REVISION);
+        let params = AudioRendererParameterInternal {
+            sample_rate: 48_000,
+            sample_count: 240,
+            mixes: 1,
+            sub_mixes: 0,
+            voices: 0,
+            sinks: 0,
+            effects: 0,
+            perf_frames: 0,
+            voice_drop_enabled: 0,
+            unk_21: 0,
+            rendering_device: 0,
+            execution_mode: ExecutionMode::Auto,
+            splitter_infos: 1,
+            splitter_destinations: 1,
+            external_context_size: 0,
+            revision: CURRENT_REVISION,
+        };
+        let mut splitter_context = SplitterContext::new();
+        assert!(splitter_context.initialize(&behavior, &params));
+        splitter_context.recompose_destination(0, &[0]);
+
+        let mut first = InParameterVersion2b {
+            magic: crate::common::common::get_splitter_send_data_magic(),
+            id: 0,
+            mix_id: 0,
+            in_use: true,
+            ..Default::default()
+        };
+        first.mix_volumes[0] = 0.25;
+        assert_eq!(
+            splitter_context.update_data(as_bytes(&first), 0, 1),
+            std::mem::size_of::<InParameterVersion2b>() as u32
+        );
+
+        let mut second = first;
+        second.mix_volumes[0] = 0.75;
+        assert_eq!(
+            splitter_context.update_data(as_bytes(&second), 0, 1),
+            std::mem::size_of::<InParameterVersion2b>() as u32
+        );
+        let destination = splitter_context.get_destination_data_mut(0, 0).unwrap();
+        destination.mark_as_need_to_update_internal_state();
+        assert_eq!(destination.get_mix_volume_prev(0), 0.25);
+
+        let mut header = CommandListHeader::default();
+        let estimator = CommandProcessingTimeEstimator::new(&behavior, 240, 1);
+        let mut command_buffer = CommandBuffer::new(4096, estimator);
+        let mut voice_context = VoiceContext::new();
+        let mut mix_context = MixContext::new();
+        let mut effect_context = EffectContext::new();
+        let mut sink_context = SinkContext::default();
+        let mut upsampler_manager = UpsamplerManager::new(1);
+        let depop_buffer = [0i32; MAX_MIX_BUFFERS as usize];
+        let depop_buffer_pool = MemoryPoolInfo::new(PoolLocation::Dsp);
+        let voice_state_pool = MemoryPoolInfo::new(PoolLocation::Dsp);
+        let effect_state_pool = MemoryPoolInfo::new(PoolLocation::Dsp);
+        let effect_result_state_pool = MemoryPoolInfo::new(PoolLocation::Dsp);
+
+        let mut generator = make_generator(
+            &mut command_buffer,
+            &mut header,
+            &behavior,
+            &mut voice_context,
+            &mut mix_context,
+            &mut effect_context,
+            &mut sink_context,
+            &mut splitter_context,
+            &mut upsampler_manager,
+            &depop_buffer,
+            &depop_buffer_pool,
+            &voice_state_pool,
+            &effect_state_pool,
+            &effect_result_state_pool,
+        );
+        generator.generate_voice_commands();
+
+        assert_eq!(
+            generator
+                .splitter_context
+                .get_destination_data(0, 0)
+                .unwrap()
+                .get_mix_volume_prev(0),
+            0.75
+        );
     }
 
     #[test]

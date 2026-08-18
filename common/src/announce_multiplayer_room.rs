@@ -133,7 +133,9 @@ pub trait Backend: Send + Sync {
     fn clear_players(&mut self);
 
     /// Retrieves the list of all rooms from the announce service.
-    fn get_room_list(&self) -> RoomList;
+    /// Upstream `Backend::GetRoomList` is non-const: fetching refreshes the
+    /// client's JWT, so the receiver is mutable here too.
+    fn get_room_list(&mut self) -> RoomList;
 
     /// Sends a delete message to the announce service.
     fn delete(&mut self);
@@ -180,7 +182,7 @@ impl Backend for NullBackend {
 
     fn clear_players(&mut self) {}
 
-    fn get_room_list(&self) -> RoomList {
+    fn get_room_list(&mut self) -> RoomList {
         RoomList::new()
     }
 
@@ -209,7 +211,7 @@ mod tests {
 
     #[test]
     fn test_null_backend_get_room_list_empty() {
-        let backend = NullBackend;
+        let mut backend = NullBackend;
         let rooms = backend.get_room_list();
         assert!(rooms.is_empty());
     }

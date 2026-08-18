@@ -1,14 +1,13 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //
 // Rust/GTK4 counterpart of
-// `/home/vricosti/Dev/emulators/zuyu/src/yuzu/configuration/configure_graphics.cpp`
+// `/home/vricosti/Dev/emulators/eden/src/yuzu/configuration/configure_graphics.cpp`
 // (`ConfigureGraphics`), whose widget tree lives in `configure_graphics.ui`.
 //
-// Two groups: "API Settings" (backend + shader backend / device) and
+// Two groups: "API Settings" (Eden's combined backend + Vulkan device) and
 // "Graphics Settings" (the render options).
 //
-// Upstream swaps the second row of "API Settings" depending on the backend:
-// OpenGL shows "Shader Backend:", Vulkan shows "Device:", Null shows neither
+// Upstream shows the Vulkan device row only for Vulkan
 // (`ConfigureGraphics::UpdateAPILayout`). The VSync combo is likewise rebuilt
 // per backend by `PopulateVSyncModeSelection`, because each backend supports a
 // different subset of the modes.
@@ -26,7 +25,7 @@ use super::shared_translation as tr;
 use super::shared_widget as w;
 
 /// Build the Graphics tab — upstream `ConfigureGraphics`.
-pub fn page(expose_compute_option: impl Fn() + 'static) -> Page {
+pub fn page(expose_compute_option: impl Fn() + 'static, runtime_lock: bool) -> Page {
     let (scroller, column) = w::page();
 
     // --- "API Settings" ---------------------------------------------------
@@ -35,18 +34,10 @@ pub fn page(expose_compute_option: impl Fn() + 'static) -> Page {
     let backend_value = *common::settings::values().renderer_backend.get_value();
     let (backend_row, backend) = w::combo_row(
         "API:",
-        &tr::labels(tr::RENDERER_BACKEND),
-        tr::index_of(tr::RENDERER_BACKEND, &backend_value),
+        &tr::labels(tr::GRAPHICS_API),
+        tr::index_of(tr::GRAPHICS_API, &backend_value),
     );
     api.append(&backend_row);
-
-    let shader_value = *common::settings::values().shader_backend.get_value();
-    let (shader_row, shader) = w::combo_row(
-        "Shader Backend:",
-        &tr::labels(tr::SHADER_BACKEND),
-        tr::index_of(tr::SHADER_BACKEND, &shader_value),
-    );
-    api.append(&shader_row);
 
     // Vulkan physical-device picker, populated from the upstream-owned
     // `VkDeviceInfo::Record` counterpart.
@@ -66,26 +57,23 @@ pub fn page(expose_compute_option: impl Fn() + 'static) -> Page {
         device_labels.push("Device 0".to_string());
     }
     let device_label_refs: Vec<&str> = device_labels.iter().map(String::as_str).collect();
-    let selected_device = (*common::settings::values().vulkan_device.get_value()).max(0) as u32;
+    let selected_device = *common::settings::values().vulkan_device.get_value();
     let (device_row, device) = w::combo_row("Device:", &device_label_refs, selected_device);
     api.append(&device_row);
 
-    // Only one of the two rows is ever visible, matching `UpdateAPILayout`.
-    apply_api_layout(backend_value, &shader_row, &device_row);
+    apply_api_layout(backend_value, &device_row);
+    let configuring_global = common::settings::is_configuring_global();
     let api_uses_global = common::settings::values().renderer_backend.using_global();
-    shader_row.set_sensitive(!api_uses_global);
-    device_row.set_sensitive(!api_uses_global);
+    device_row.set_sensitive(vulkan_device_sensitive(
+        configuring_global,
+        api_uses_global,
+        runtime_lock,
+    ));
 
     column.append(&api_group);
 
     // --- "Graphics Settings" ----------------------------------------------
     let (settings_group, settings) = w::group("Graphics Settings");
-
-    let disk_cache = w::check_row(
-        "Use disk pipeline cache",
-        *common::settings::values().use_disk_shader_cache.get_value(),
-    );
-    settings.append(&disk_cache);
 
     let async_gpu = w::check_row(
         "Use asynchronous GPU emulation",
@@ -93,15 +81,6 @@ pub fn page(expose_compute_option: impl Fn() + 'static) -> Page {
             .use_asynchronous_gpu_emulation
             .get_value(),
     );
-    settings.append(&async_gpu);
-
-    let astc_value = *common::settings::values().accelerate_astc.get_value();
-    let (astc_row, astc) = w::combo_row(
-        "ASTC Decoding Method:",
-        &tr::labels(tr::ASTC_DECODE_MODE),
-        tr::index_of(tr::ASTC_DECODE_MODE, &astc_value),
-    );
-    settings.append(&astc_row);
 
     let initial_vsync_mode =
         setting_to_present_mode(*common::settings::values().vsync_mode.get_value());
@@ -116,15 +95,6 @@ pub fn page(expose_compute_option: impl Fn() + 'static) -> Page {
     let (vsync_row, vsync) = w::combo_row("VSync Mode:", &initial_vsync_refs, initial_vsync_index);
     vsync.set_sensitive(backend_value != RendererBackend::Null);
     let vsync_modes = Rc::new(RefCell::new(initial_present_modes));
-    settings.append(&vsync_row);
-
-    let nvdec_value = *common::settings::values().nvdec_emulation.get_value();
-    let (nvdec_row, nvdec) = w::combo_row(
-        "NVDEC emulation:",
-        &tr::labels(tr::NVDEC_EMULATION),
-        tr::index_of(tr::NVDEC_EMULATION, &nvdec_value),
-    );
-    settings.append(&nvdec_row);
 
     let fullscreen_value = *common::settings::values().fullscreen_mode.get_value();
     let (fullscreen_row, fullscreen) = w::combo_row(
@@ -132,7 +102,6 @@ pub fn page(expose_compute_option: impl Fn() + 'static) -> Page {
         &tr::labels(tr::FULLSCREEN_MODE),
         tr::index_of(tr::FULLSCREEN_MODE, &fullscreen_value),
     );
-    settings.append(&fullscreen_row);
 
     let aspect_value = *common::settings::values().aspect_ratio.get_value();
     let (aspect_row, aspect) = w::combo_row(
@@ -140,7 +109,6 @@ pub fn page(expose_compute_option: impl Fn() + 'static) -> Page {
         &tr::labels(tr::ASPECT_RATIO),
         tr::index_of(tr::ASPECT_RATIO, &aspect_value),
     );
-    settings.append(&aspect_row);
 
     let resolution_value = *common::settings::values().resolution_setup.get_value();
     let (resolution_row, resolution) = w::combo_row(
@@ -148,7 +116,6 @@ pub fn page(expose_compute_option: impl Fn() + 'static) -> Page {
         &tr::labels(tr::RESOLUTION_SETUP),
         tr::index_of(tr::RESOLUTION_SETUP, &resolution_value),
     );
-    settings.append(&resolution_row);
 
     let filter_value = *common::settings::values().scaling_filter.get_value();
     let (filter_row, filter) = w::combo_row(
@@ -156,7 +123,6 @@ pub fn page(expose_compute_option: impl Fn() + 'static) -> Page {
         &tr::labels(tr::SCALING_FILTER),
         tr::index_of(tr::SCALING_FILTER, &filter_value),
     );
-    settings.append(&filter_row);
 
     let aa_value = *common::settings::values().anti_aliasing.get_value();
     let (aa_row, aa) = w::combo_row(
@@ -164,32 +130,47 @@ pub fn page(expose_compute_option: impl Fn() + 'static) -> Page {
         &tr::labels(tr::ANTI_ALIASING),
         tr::index_of(tr::ANTI_ALIASING, &aa_value),
     );
-    settings.append(&aa_row);
 
     let sharpness_value = *common::settings::values().fsr_sharpening_slider.get_value();
+    // Eden keeps the raw 0..=200 setting on the slider, reverses its visual
+    // direction, and presents `(200 - raw) * 0.5` as the percentage.
     let (sharpness_row, sharpness, _) =
-        w::percent_slider_row("FSR Sharpness:", sharpness_value as f64, 0.0, 200.0);
-    settings.append(&sharpness_row);
+        w::reversed_percent_slider_row("FSR Sharpness:", sharpness_value as f64, 0.0, 200.0, 0.5);
 
     let bg_color = gtk::ColorButton::with_rgba(&background_rgba());
     bg_color.set_halign(gtk::Align::Start);
-    settings.append(&w::labeled_row("Background Color:", &bg_color));
+    let bg_row = w::labeled_row("Background Color:", &bg_color);
+
+    // `ConfigureGraphics::Setup` inserts the Renderer-category widgets in
+    // setting-id order. Keep the resulting Eden order from the Properties
+    // dialog rather than the unrelated declaration/construction order here.
+    settings.append(&resolution_row);
+    settings.append(&vsync_row);
+    settings.append(&filter_row);
+    settings.append(&sharpness_row);
+    settings.append(&aspect_row);
+    settings.append(&aa_row);
+    settings.append(&async_gpu);
+    settings.append(&fullscreen_row);
+    settings.append(&bg_row);
 
     column.append(&settings_group);
 
-    // Reveal the shader-backend / device row that matches the chosen API.
+    // Reveal the Vulkan device row only when the selected API is Vulkan.
     {
-        let shader_row = shader_row.clone();
         let device_row = device_row.clone();
         let device = device.clone();
         let vsync = vsync.clone();
         let vsync_modes = Rc::clone(&vsync_modes);
         let device_records = Rc::clone(&device_records);
         backend.connect_selected_notify(move |combo| {
-            let selected = tr::value_at(tr::RENDERER_BACKEND, combo.selected());
-            apply_api_layout(selected, &shader_row, &device_row);
-            shader_row.set_sensitive(true);
-            device_row.set_sensitive(true);
+            let selected = tr::value_at(tr::GRAPHICS_API, combo.selected());
+            apply_api_layout(selected, &device_row);
+            device_row.set_sensitive(vulkan_device_sensitive(
+                configuring_global,
+                api_uses_global,
+                runtime_lock,
+            ));
             repopulate_vsync(
                 &vsync,
                 &vsync_modes,
@@ -206,7 +187,7 @@ pub fn page(expose_compute_option: impl Fn() + 'static) -> Page {
         let vsync_modes = Rc::clone(&vsync_modes);
         let device_records = Rc::clone(&device_records);
         device.connect_selected_notify(move |device| {
-            let selected_backend = tr::value_at(tr::RENDERER_BACKEND, backend.selected());
+            let selected_backend = tr::value_at(tr::GRAPHICS_API, backend.selected());
             repopulate_vsync(
                 &vsync,
                 &vsync_modes,
@@ -218,18 +199,14 @@ pub fn page(expose_compute_option: impl Fn() + 'static) -> Page {
     }
 
     Page::new("Graphics", scroller, move || {
-        let backend_value = tr::value_at(tr::RENDERER_BACKEND, backend.selected());
-        let shader_value = tr::value_at(tr::SHADER_BACKEND, shader.selected());
-        let device_index = device.selected() as i32;
-        let disk = disk_cache.is_active();
+        let backend_value = tr::value_at(tr::GRAPHICS_API, backend.selected());
+        let device_index = device.selected();
         let async_value = async_gpu.is_active();
-        let astc_value = tr::value_at(tr::ASTC_DECODE_MODE, astc.selected());
         let vsync_value = vsync_modes
             .borrow()
             .get(vsync.selected() as usize)
             .copied()
             .map(present_mode_to_setting);
-        let nvdec_value = tr::value_at(tr::NVDEC_EMULATION, nvdec.selected());
         let fullscreen_value = tr::value_at(tr::FULLSCREEN_MODE, fullscreen.selected());
         let aspect_value = tr::value_at(tr::ASPECT_RATIO, aspect.selected());
         let resolution_value = tr::value_at(tr::RESOLUTION_SETUP, resolution.selected());
@@ -240,17 +217,19 @@ pub fn page(expose_compute_option: impl Fn() + 'static) -> Page {
 
         let mut values = common::settings::values_mut();
         values.renderer_backend.set_value(backend_value);
-        values.shader_backend.set_value(shader_value);
-        values.vulkan_device.set_value(device_index);
-        values.use_disk_shader_cache.set_value(disk);
+        // Upstream `ConfigureGraphics::ApplyConfiguration` only publishes the
+        // physical-device combobox while Vulkan is the selected backend. The
+        // hidden row must not overwrite a stored Vulkan device when applying
+        // an OpenGL or Null configuration.
+        if updates_vulkan_device(backend_value) {
+            values.vulkan_device.set_value(device_index);
+        }
         values.use_asynchronous_gpu_emulation.set_value(async_value);
-        values.accelerate_astc.set_value(astc_value);
         if backend_value != RendererBackend::Null {
             if let Some(mode) = vsync_value {
                 values.vsync_mode.set_value(mode);
             }
         }
-        values.nvdec_emulation.set_value(nvdec_value);
         values.fullscreen_mode.set_value(fullscreen_value);
         values.aspect_ratio.set_value(aspect_value);
         values.resolution_setup.set_value(resolution_value);
@@ -267,11 +246,28 @@ pub fn page(expose_compute_option: impl Fn() + 'static) -> Page {
     })
 }
 
-/// Show the row that belongs to `backend` and hide the other — upstream
+/// Show the Vulkan device row only for Vulkan — upstream
 /// `ConfigureGraphics::UpdateAPILayout`.
-fn apply_api_layout(backend: RendererBackend, shader_row: &gtk::Box, device_row: &gtk::Box) {
-    shader_row.set_visible(backend == RendererBackend::OpenGL);
+fn apply_api_layout(backend: RendererBackend, device_row: &gtk::Box) {
     device_row.set_visible(backend == RendererBackend::Vulkan);
+}
+
+/// Upstream `ConfigureGraphics::UpdateAPILayout` disables the physical-device
+/// row only when a per-game configuration inherits the global renderer API.
+/// Global configuration owns the value even though its setting reports that it
+/// is using the global slot.
+fn vulkan_device_sensitive(
+    configuring_global: bool,
+    api_uses_global: bool,
+    runtime_lock: bool,
+) -> bool {
+    (configuring_global || !api_uses_global) && runtime_lock
+}
+
+/// The backend cases which enter the Vulkan-device branch of upstream
+/// `ConfigureGraphics::ApplyConfiguration`.
+fn updates_vulkan_device(backend: RendererBackend) -> bool {
+    backend == RendererBackend::Vulkan
 }
 
 const DEFAULT_PRESENT_MODES: &[vk::PresentModeKHR] =
@@ -315,10 +311,28 @@ fn translate_present_mode(
     backend: RendererBackend,
 ) -> Option<&'static str> {
     match mode {
-        vk::PresentModeKHR::IMMEDIATE if backend == RendererBackend::OpenGL => Some("Off"),
+        vk::PresentModeKHR::IMMEDIATE
+            if matches!(
+                backend,
+                RendererBackend::OpenGlGlsl
+                    | RendererBackend::OpenGlGlasm
+                    | RendererBackend::OpenGlSpirV
+            ) =>
+        {
+            Some("Off")
+        }
         vk::PresentModeKHR::IMMEDIATE => Some("Immediate (VSync Off)"),
         vk::PresentModeKHR::MAILBOX => Some("Mailbox (Recommended)"),
-        vk::PresentModeKHR::FIFO if backend == RendererBackend::OpenGL => Some("On"),
+        vk::PresentModeKHR::FIFO
+            if matches!(
+                backend,
+                RendererBackend::OpenGlGlsl
+                    | RendererBackend::OpenGlGlasm
+                    | RendererBackend::OpenGlSpirV
+            ) =>
+        {
+            Some("On")
+        }
         vk::PresentModeKHR::FIFO => Some("FIFO (VSync On)"),
         vk::PresentModeKHR::FIFO_RELAXED => Some("FIFO Relaxed"),
         _ => None,
@@ -396,11 +410,32 @@ mod tests {
 
     #[test]
     fn opengl_uses_the_two_default_present_modes_and_short_labels() {
-        let modes = present_modes_for(RendererBackend::OpenGL, 0, &[]);
+        let modes = present_modes_for(RendererBackend::OpenGlGlsl, 0, &[]);
         assert_eq!(modes, DEFAULT_PRESENT_MODES);
         assert_eq!(
-            present_mode_labels(&modes, RendererBackend::OpenGL),
+            present_mode_labels(&modes, RendererBackend::OpenGlGlsl),
             ["Off", "On"]
+        );
+    }
+
+    #[test]
+    fn graphics_api_rows_and_discriminants_match_eden() {
+        assert_eq!(
+            tr::labels(tr::GRAPHICS_API),
+            [
+                "Vulkan",
+                "OpenGL GLSL",
+                "OpenGL GLASM (Assembly Shaders, NVIDIA Only)",
+                "OpenGL SPIR-V (Experimental, AMD/Mesa Only)",
+                "Null",
+            ]
+        );
+        assert_eq!(
+            tr::GRAPHICS_API
+                .iter()
+                .map(|(value, _)| *value as u32)
+                .collect::<Vec<_>>(),
+            [1, 0, 3, 4, 2]
         );
     }
 
@@ -415,5 +450,28 @@ mod tests {
             present_modes_for(RendererBackend::Vulkan, 0, &records),
             records[0].vsync_support
         );
+    }
+
+    #[test]
+    fn vulkan_device_sensitivity_matches_upstream_global_inheritance_rule() {
+        assert!(vulkan_device_sensitive(true, true, true));
+        assert!(vulkan_device_sensitive(true, false, true));
+        assert!(!vulkan_device_sensitive(false, true, true));
+        assert!(vulkan_device_sensitive(false, false, true));
+        assert!(!vulkan_device_sensitive(true, false, false));
+        assert!(!vulkan_device_sensitive(false, false, false));
+    }
+
+    #[test]
+    fn hidden_vulkan_device_is_only_applied_for_the_vulkan_backend() {
+        assert!(updates_vulkan_device(RendererBackend::Vulkan));
+        for backend in [
+            RendererBackend::OpenGlGlsl,
+            RendererBackend::OpenGlGlasm,
+            RendererBackend::OpenGlSpirV,
+            RendererBackend::Null,
+        ] {
+            assert!(!updates_vulkan_device(backend));
+        }
     }
 }

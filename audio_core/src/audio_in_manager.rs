@@ -126,7 +126,6 @@ mod tests {
     use crate::r#in::audio_in_system::{AudioInBuffer, AudioInParameter, System as AudioInSystem};
     use crate::sink::sink::new_sink_handle;
     use crate::sink::NullSink;
-    use parking_lot::Mutex;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::thread;
     use std::time::Duration;
@@ -155,7 +154,7 @@ mod tests {
 
         assert!(manager.link_to_manager().is_success());
 
-        let mut in_system = AudioInSystem::new(system, sink, buffer_event.clone(), 0);
+        let mut in_system = AudioInSystem::new(system.clone(), sink, buffer_event.clone(), 0);
         in_system.set_audio_manager(Some(audio_manager.clone()));
         assert!(in_system
             .initialize(
@@ -189,8 +188,8 @@ mod tests {
             ))),
         );
 
-        audio_manager.set_event(AudioEventType::AudioInManager, true);
-        audio_manager.dispatch_events_for_test(false);
+        let _ = system.get().core_timing().advance();
+        audio_manager.dispatch_events_for_test(true);
 
         assert!(wait_for_event(&buffer_event));
     }

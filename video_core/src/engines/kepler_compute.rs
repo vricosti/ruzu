@@ -5,8 +5,7 @@
 //!
 //! Handles compute shader dispatch. When the game writes the LAUNCH register,
 //! a Queue Meta Data (QMD) descriptor is read from GPU memory, parsed, and
-//! recorded as a `DispatchCall`. The backend later consumes these via
-//! `take_dispatch_calls()`.
+//! forwarded immediately to the bound rasterizer, matching upstream.
 
 use std::sync::Arc;
 
@@ -14,7 +13,7 @@ use parking_lot::Mutex;
 
 use super::engine_interface::{EngineInterface, EngineInterfaceState};
 use super::engine_upload;
-use super::{ClassId, Engine, PendingWrite, ENGINE_REG_COUNT};
+use super::{ClassId, Engine, PendingWrite};
 use crate::memory_manager::MemoryManager;
 use crate::rasterizer_interface::{RasterizerHandle, RasterizerInterface};
 use crate::textures::texture::{TicEntry, TscEntry};
@@ -30,11 +29,14 @@ const EXEC_UPLOAD: u32 = 0x6C;
 /// Upload data register, matching upstream `ASSERT_REG_POSITION(data_upload, 0x6D)`.
 const DATA_UPLOAD: u32 = 0x6D;
 
-/// Dispatch trigger — any write to this method queues a compute launch.
+/// Dispatch trigger — any write to this method launches compute immediately.
 const LAUNCH: u32 = 0xAF;
 
+/// Upstream `KeplerCompute::Regs::NUM_REGS`.
+const KEPLER_COMPUTE_REG_COUNT: usize = 0xCF8;
+
 /// QMD address register — bits [31:0] of `regs[0xAD]`, shifted left by 8.
-const QMD_ADDRESS: u32 = 0xAD;
+const LAUNCH_DESC_LOC: u32 = 0xAD;
 
 /// `LaunchParams::grid_dim_x` word index, matching upstream `LAUNCH_REG_INDEX(grid_dim_x)`.
 const LAUNCH_GRID_DIM_X_INDEX: u64 = 0x0C;
@@ -54,37 +56,97 @@ const TEX_CB_INDEX: u32 = 0x982;
 // ── QMD constants and types ─────────────────────────────────────────────────
 
 /// Word count of a Queue Meta Data descriptor (256 bytes / 4).
-const QMD_WORD_COUNT: usize = 64;
+pub const NUM_LAUNCH_PARAMETERS: usize = 0x40;
+
+/// Raw 256-byte launch descriptor layout read by upstream `ProcessLaunch`.
+/// Bit-field aliases are decoded by [`LaunchParams::from_words`].
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct LaunchParamsLayout {
+    _padding_0: [u32; 0x8],
+    program_start: u32,
+    _padding_1: [u32; 0x2],
+    linked_tsc: u32,
+    grid_dim_x: u32,
+    grid_dim_y: u32,
+    _padding_2: [u32; 0x3],
+    shared_alloc: u32,
+    block_dim_x: u32,
+    block_dim_y: u32,
+    const_buffer_enable_mask: u32,
+    _padding_3: [u32; 0x8],
+    const_buffer_config: [u32; NUM_CONST_BUFFERS * 2],
+    local_pos_alloc: u32,
+    local_neg_alloc: u32,
+    local_crs_alloc: u32,
+    _padding_4: [u32; 0x10],
+}
+
+const _: () = {
+    assert!(std::mem::size_of::<LaunchParamsLayout>() == NUM_LAUNCH_PARAMETERS * 4);
+    assert!(std::mem::offset_of!(LaunchParamsLayout, program_start) == 0x8 * 4);
+    assert!(std::mem::offset_of!(LaunchParamsLayout, grid_dim_x) == 0xC * 4);
+    assert!(std::mem::offset_of!(LaunchParamsLayout, shared_alloc) == 0x11 * 4);
+    assert!(std::mem::offset_of!(LaunchParamsLayout, block_dim_x) == 0x12 * 4);
+    assert!(std::mem::offset_of!(LaunchParamsLayout, const_buffer_enable_mask) == 0x14 * 4);
+    assert!(std::mem::offset_of!(LaunchParamsLayout, const_buffer_config) == 0x1D * 4);
+};
+
+impl LaunchParamsLayout {
+    fn as_bytes_mut(&mut self) -> &mut [u8] {
+        // SAFETY: the layout is `repr(C)`, contains only `u32` arrays/fields,
+        // and is fully zero-initialized before the upstream-sized raw read.
+        unsafe {
+            std::slice::from_raw_parts_mut(
+                std::ptr::from_mut(self).cast::<u8>(),
+                std::mem::size_of::<Self>(),
+            )
+        }
+    }
+
+    fn words(&self) -> &[u32; NUM_LAUNCH_PARAMETERS] {
+        // SAFETY: the compile-time size/alignment assertions above establish
+        // an exact contiguous array of 0x40 `u32` words.
+        unsafe { &*std::ptr::from_ref(self).cast::<[u32; NUM_LAUNCH_PARAMETERS]>() }
+    }
+}
+
+/// Corresponds to upstream `KeplerCompute::NumConstBuffers`.
+pub const NUM_CONST_BUFFERS: usize = 8;
 
 /// Constant buffer configuration from a QMD descriptor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct QmdConstBuffer {
+pub struct ConstBufferConfig {
     pub address: u64,
     pub size: u32,
 }
 
 /// Parsed Queue Meta Data (QMD) descriptor — 256-byte structure at a GPU VA.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct QueueMetaData {
+pub struct LaunchParams {
+    pub program_start: u32,
     pub linked_tsc: bool,
     pub grid_dim_x: u32,
     pub grid_dim_y: u32,
     pub grid_dim_z: u32,
+    pub shared_alloc: u32,
     pub block_dim_x: u32,
     pub block_dim_y: u32,
     pub block_dim_z: u32,
-    pub shared_alloc: u32,
-    pub program_start: u32,
     pub const_buffer_enable_mask: u32,
-    pub const_buffers: [QmdConstBuffer; 8],
+    pub cache_layout: u32,
+    pub const_buffers: [ConstBufferConfig; NUM_CONST_BUFFERS],
     pub local_pos_alloc: u32,
+    pub barrier_alloc: u32,
+    pub local_neg_alloc: u32,
     pub local_crs_alloc: u32,
     pub gpr_alloc: u32,
+    pub sass_version: u32,
 }
 
-impl QueueMetaData {
+impl LaunchParams {
     /// Parse a QMD from 64 little-endian u32 words.
-    pub fn from_words(w: &[u32; QMD_WORD_COUNT]) -> Self {
+    pub fn from_words(w: &[u32; NUM_LAUNCH_PARAMETERS]) -> Self {
         // Word 0x08: program_start (full word).
         let program_start = w[0x08];
 
@@ -108,57 +170,65 @@ impl QueueMetaData {
         let block_dim_y = w[0x13] & 0xFFFF;
         let block_dim_z = (w[0x13] >> 16) & 0xFFFF;
 
-        // Word 0x14: const_buffer_enable_mask in bits [7:0].
+        // Word 0x14: const_buffer_enable_mask in bits [7:0], cache_layout in bits [30:29].
         let const_buffer_enable_mask = w[0x14] & 0xFF;
+        let cache_layout = (w[0x14] >> 29) & 0x3;
 
         // Words 0x1D..0x2C: 8 constant buffer configs, 2 words each.
         // Per CB: word0 = addr_low, word1 = addr_high[7:0] | size[31:15].
-        let mut const_buffers = [QmdConstBuffer::default(); 8];
-        for i in 0..8 {
+        let mut const_buffers = [ConstBufferConfig::default(); NUM_CONST_BUFFERS];
+        for i in 0..NUM_CONST_BUFFERS {
             let base = 0x1D + i * 2;
             let addr_low = w[base] as u64;
             let word1 = w[base + 1];
             let addr_high = (word1 & 0xFF) as u64;
             let size = (word1 >> 15) & 0x1FFFF;
-            const_buffers[i] = QmdConstBuffer {
+            const_buffers[i] = ConstBufferConfig {
                 address: (addr_high << 32) | addr_low,
                 size,
             };
         }
 
-        // Word 0x2D: local_pos_alloc in bits [19:0].
+        // Word 0x2D: local_pos_alloc in bits [19:0], barrier_alloc in bits [31:27].
         let local_pos_alloc = w[0x2D] & 0xFFFFF;
+        let barrier_alloc = (w[0x2D] >> 27) & 0x1F;
 
-        // Word 0x2E: gpr_alloc in bits [28:24].
+        // Word 0x2E: local_neg_alloc in bits [19:0], gpr_alloc in bits [28:24].
+        let local_neg_alloc = w[0x2E] & 0xFFFFF;
         let gpr_alloc = (w[0x2E] >> 24) & 0x1F;
 
-        // Word 0x2F: local_crs_alloc in bits [19:0].
+        // Word 0x2F: local_crs_alloc in bits [19:0], sass_version in bits [28:24].
         let local_crs_alloc = w[0x2F] & 0xFFFFF;
+        let sass_version = (w[0x2F] >> 24) & 0x1F;
 
         Self {
+            program_start,
             linked_tsc,
             grid_dim_x,
             grid_dim_y,
             grid_dim_z,
+            shared_alloc,
             block_dim_x,
             block_dim_y,
             block_dim_z,
-            shared_alloc,
-            program_start,
             const_buffer_enable_mask,
+            cache_layout,
             const_buffers,
             local_pos_alloc,
+            barrier_alloc,
+            local_neg_alloc,
             local_crs_alloc,
             gpr_alloc,
+            sass_version,
         }
     }
 }
 
 /// A recorded compute dispatch with all relevant state.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct DispatchCall {
-    pub qmd: QueueMetaData,
-    pub qmd_address: u64,
+    pub launch_description: LaunchParams,
+    pub launch_desc_loc: u64,
     pub indirect_compute_address: Option<u64>,
     pub code_address: u64,
     pub tsc_address: u64,
@@ -175,20 +245,27 @@ struct UploadInfo {
     copy_size: u32,
 }
 
+/// Corresponds to upstream's public anonymous `state` member.
+#[derive(Debug, Clone, Default)]
+pub struct State {
+    pub write_offset: u32,
+    pub copy_size: u32,
+    pub inner_buffer: Vec<u8>,
+}
+
 // ── Engine struct ───────────────────────────────────────────────────────────
 
 pub struct KeplerCompute {
-    regs: Box<[u32; ENGINE_REG_COUNT]>,
+    regs: Box<[u32; KEPLER_COMPUTE_REG_COUNT]>,
     interface_state: EngineInterfaceState,
     memory_manager: Arc<Mutex<MemoryManager>>,
     upload_state: engine_upload::State,
     upload_address: u64,
     uploads: Vec<UploadInfo>,
     /// Port of upstream owner-local `launch_description`.
-    pub launch_description: QueueMetaData,
-    dispatch_calls: Vec<DispatchCall>,
-    /// QMD GPU VA set on LAUNCH write, consumed by execute_pending.
-    pending_launch: Option<u64>,
+    pub launch_description: LaunchParams,
+    /// Preserved owner-local scratch state from upstream.
+    pub state: State,
     /// Port of upstream owner-local `indirect_compute`.
     indirect_compute: Option<u64>,
     rasterizer: Option<RasterizerHandle>,
@@ -200,7 +277,7 @@ impl KeplerCompute {
     /// `System&` dependency remains outside this bounded slice.
     pub fn new(memory_manager: Arc<Mutex<MemoryManager>>) -> Self {
         Self {
-            regs: Box::new([0u32; ENGINE_REG_COUNT]),
+            regs: Box::new([0u32; KEPLER_COMPUTE_REG_COUNT]),
             interface_state: {
                 let mut state = EngineInterfaceState::new();
                 state.execution_mask[EXEC_UPLOAD as usize] = true;
@@ -214,9 +291,8 @@ impl KeplerCompute {
             memory_manager,
             upload_address: 0,
             uploads: Vec::new(),
-            launch_description: QueueMetaData::default(),
-            dispatch_calls: Vec::new(),
-            pending_launch: None,
+            launch_description: LaunchParams::default(),
+            state: State::default(),
             indirect_compute: None,
             rasterizer: None,
         }
@@ -225,9 +301,11 @@ impl KeplerCompute {
     /// Corresponds to upstream `KeplerCompute::CallMethod`.
     pub fn call_method(&mut self, method: u32, argument: u32, _is_last_call: bool) {
         let idx = method as usize;
-        if idx < ENGINE_REG_COUNT {
-            self.regs[idx] = argument;
-        }
+        assert!(
+            idx < KEPLER_COMPUTE_REG_COUNT,
+            "Invalid KeplerCompute register, increase the size of the register array"
+        );
+        self.regs[idx] = argument;
 
         match method {
             EXEC_UPLOAD => {
@@ -249,8 +327,20 @@ impl KeplerCompute {
             }
             LAUNCH => {
                 let qmd_addr = self.launch_desc_address();
-                self.pending_launch = Some(qmd_addr);
-                log::debug!("KeplerCompute: LAUNCH queued, QMD @ 0x{:X}", qmd_addr);
+                for data in &self.uploads {
+                    let offset = data.exec_address.wrapping_sub(qmd_addr);
+                    if offset / std::mem::size_of::<u32>() as u64 == LAUNCH_GRID_DIM_X_INDEX
+                        && self
+                            .memory_manager
+                            .lock()
+                            .is_memory_dirty(data.upload_address, data.copy_size as u64)
+                    {
+                        self.indirect_compute = Some(data.upload_address);
+                    }
+                }
+                self.uploads.clear();
+                self.process_launch();
+                self.indirect_compute = None;
             }
             _ => {}
         }
@@ -264,6 +354,10 @@ impl KeplerCompute {
         amount: u32,
         methods_pending: u32,
     ) {
+        assert!(
+            (amount as usize) <= args.len(),
+            "KeplerCompute multi-method amount exceeds the argument span"
+        );
         if method == DATA_UPLOAD {
             self.upload_address = self.interface_state.current_dma_segment;
             let regs = self.upload_registers();
@@ -272,8 +366,8 @@ impl KeplerCompute {
             return;
         }
 
-        for (i, &arg) in args.iter().take(amount as usize).enumerate() {
-            self.call_method(method, arg, methods_pending.saturating_sub(i as u32) <= 1);
+        for (i, &arg) in args[..amount as usize].iter().enumerate() {
+            self.call_method(method, arg, methods_pending.wrapping_sub(i as u32) <= 1);
         }
     }
 
@@ -283,11 +377,51 @@ impl KeplerCompute {
         self.upload_state.bind_rasterizer(rasterizer);
     }
 
+    /// Corresponds to upstream `KeplerCompute::ProcessLaunch`.
+    fn process_launch(&mut self) {
+        let qmd_addr = self.launch_desc_address();
+        let mut raw = LaunchParamsLayout::default();
+        self.memory_manager
+            .lock()
+            .read_block_unsafe(qmd_addr, raw.as_bytes_mut());
+        self.launch_description = LaunchParams::from_words(raw.words());
+
+        let dispatch = DispatchCall {
+            launch_description: self.launch_description.clone(),
+            launch_desc_loc: qmd_addr,
+            indirect_compute_address: self.indirect_compute,
+            code_address: self.code_address(),
+            tsc_address: self.tsc_address(),
+            tsc_limit: self.tsc_limit(),
+            tic_address: self.tic_address(),
+            tic_limit: self.tic_limit(),
+            tex_cb_index: self.tex_cb_index(),
+        };
+        log::debug!(
+            "KeplerCompute: dispatch grid=({},{},{}) block=({},{},{}) code=0x{:X}",
+            dispatch.launch_description.grid_dim_x,
+            dispatch.launch_description.grid_dim_y,
+            dispatch.launch_description.grid_dim_z,
+            dispatch.launch_description.block_dim_x,
+            dispatch.launch_description.block_dim_y,
+            dispatch.launch_description.block_dim_z,
+            dispatch.code_address,
+        );
+        // SAFETY: ChannelState binds the single renderer owner before GPU
+        // execution and the GPU thread serializes all engine callbacks. This
+        // is the Rust expression of upstream's non-owning mutable pointer.
+        let rasterizer = self
+            .rasterizer
+            .map(|handle| unsafe { handle.as_mut() })
+            .expect("KeplerCompute must be bound to a rasterizer before launch");
+        rasterizer.dispatch_compute(&dispatch);
+    }
+
     // ── Register accessors ──────────────────────────────────────────────
 
     /// GPU VA of the QMD descriptor (regs[0xAD] << 8).
     pub fn launch_desc_address(&self) -> u64 {
-        (self.regs[QMD_ADDRESS as usize] as u64) << 8
+        (self.regs[LAUNCH_DESC_LOC as usize] as u64) << 8
     }
 
     fn upload_registers(&self) -> engine_upload::Registers {
@@ -355,7 +489,7 @@ impl KeplerCompute {
     }
 
     /// Port of upstream `KeplerCompute::GetTICEntry`.
-    pub fn get_tic_entry(&self, tic_index: u32) -> TicEntry {
+    fn get_tic_entry(&self, tic_index: u32) -> TicEntry {
         let tic_address_gpu =
             self.tic_address() + tic_index as u64 * std::mem::size_of::<TicEntry>() as u64;
         let mut bytes = [0u8; std::mem::size_of::<TicEntry>()];
@@ -366,7 +500,7 @@ impl KeplerCompute {
     }
 
     /// Port of upstream `KeplerCompute::GetTSCEntry`.
-    pub fn get_tsc_entry(&self, tsc_index: u32) -> TscEntry {
+    fn get_tsc_entry(&self, tsc_index: u32) -> TscEntry {
         let tsc_address_gpu =
             self.tsc_address() + tsc_index as u64 * std::mem::size_of::<TscEntry>() as u64;
         let mut bytes = [0u8; std::mem::size_of::<TscEntry>()];
@@ -376,13 +510,8 @@ impl KeplerCompute {
         unsafe { std::ptr::read_unaligned(bytes.as_ptr() as *const TscEntry) }
     }
 
-    /// Drain and return all recorded dispatch calls.
-    pub fn take_dispatch_calls(&mut self) -> Vec<DispatchCall> {
-        std::mem::take(&mut self.dispatch_calls)
-    }
-
     /// Port of reading upstream `launch_description`.
-    pub fn launch_description(&self) -> &QueueMetaData {
+    pub fn launch_description(&self) -> &LaunchParams {
         &self.launch_description
     }
 }
@@ -413,9 +542,8 @@ impl EngineInterface for KeplerCompute {
         let sink = std::mem::take(&mut self.interface_state.method_sink);
         for (method, value) in sink {
             let idx = method as usize;
-            if idx < ENGINE_REG_COUNT {
-                self.regs[idx] = value;
-            }
+            assert!(idx < KEPLER_COMPUTE_REG_COUNT);
+            self.regs[idx] = value;
         }
     }
 
@@ -452,69 +580,7 @@ impl Engine for KeplerCompute {
         self.call_method(method, value, true);
     }
 
-    fn execute_pending(&mut self, read_gpu: &dyn Fn(u64, &mut [u8])) -> Vec<PendingWrite> {
-        if let Some(qmd_addr) = self.pending_launch.take() {
-            for data in &self.uploads {
-                let offset = data.exec_address.wrapping_sub(qmd_addr);
-                if offset / std::mem::size_of::<u32>() as u64 == LAUNCH_GRID_DIM_X_INDEX
-                    && self
-                        .memory_manager
-                        .lock()
-                        .is_memory_dirty(data.upload_address, data.copy_size as u64)
-                {
-                    self.indirect_compute = Some(data.upload_address);
-                }
-            }
-            self.uploads.clear();
-
-            // Read 256 bytes (64 words) of QMD from GPU memory.
-            let mut raw = [0u8; QMD_WORD_COUNT * 4];
-            read_gpu(qmd_addr, &mut raw);
-
-            // Convert bytes to u32 words (little-endian).
-            let mut words = [0u32; QMD_WORD_COUNT];
-            for (i, chunk) in raw.chunks_exact(4).enumerate() {
-                words[i] = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
-            }
-
-            let qmd = QueueMetaData::from_words(&words);
-
-            self.launch_description = qmd.clone();
-
-            let dispatch = DispatchCall {
-                qmd,
-                qmd_address: qmd_addr,
-                indirect_compute_address: self.indirect_compute,
-                code_address: self.code_address(),
-                tsc_address: self.tsc_address(),
-                tsc_limit: self.tsc_limit(),
-                tic_address: self.tic_address(),
-                tic_limit: self.tic_limit(),
-                tex_cb_index: self.tex_cb_index(),
-            };
-
-            log::debug!(
-                "KeplerCompute: dispatch grid=({},{},{}) block=({},{},{}) code=0x{:X}",
-                dispatch.qmd.grid_dim_x,
-                dispatch.qmd.grid_dim_y,
-                dispatch.qmd.grid_dim_z,
-                dispatch.qmd.block_dim_x,
-                dispatch.qmd.block_dim_y,
-                dispatch.qmd.block_dim_z,
-                dispatch.code_address,
-            );
-
-            self.dispatch_calls.push(dispatch);
-            if let Some(rasterizer) = self.rasterizer.map(|handle| unsafe { handle.as_mut() }) {
-                let dispatch = self
-                    .dispatch_calls
-                    .last()
-                    .expect("dispatch was just recorded before rasterizer callback");
-                rasterizer.dispatch_compute_with_call(dispatch);
-            }
-            self.indirect_compute = None;
-        }
-
+    fn execute_pending(&mut self, _read_gpu: &dyn Fn(u64, &mut [u8])) -> Vec<PendingWrite> {
         vec![]
     }
 }
@@ -526,7 +592,7 @@ mod tests {
     use crate::engines::fermi_2d::{Config as Fermi2DConfig, Surface as Fermi2DSurface};
     use crate::query_cache::types::QueryPropertiesFlags;
     use crate::rasterizer_interface::RasterizerDownloadArea;
-    use std::cell::Cell;
+    use std::cell::{Cell, RefCell};
 
     fn new_test_engine() -> KeplerCompute {
         KeplerCompute::new(Arc::new(Mutex::new(MemoryManager::new(0))))
@@ -562,22 +628,32 @@ mod tests {
     }
 
     struct TestRasterizer {
+        accelerate_dma: crate::rasterizer_interface::TestAccelerateDMA,
         dirty_addr: u64,
         dirty_size: u64,
         dispatches: Cell<u32>,
+        last_dispatch: RefCell<Option<DispatchCall>>,
     }
 
     impl TestRasterizer {
         fn new(dirty_addr: u64, dirty_size: u64) -> Self {
             Self {
+                accelerate_dma: Default::default(),
                 dirty_addr,
                 dirty_size,
                 dispatches: Cell::new(0),
+                last_dispatch: RefCell::new(None),
             }
         }
     }
 
     impl RasterizerInterface for TestRasterizer {
+        fn access_accelerate_dma(
+            &mut self,
+        ) -> &mut dyn crate::engines::maxwell_dma::AccelerateDMAInterface {
+            &mut self.accelerate_dma
+        }
+
         fn draw(&mut self, _draw_view: Maxwell3DDrawView<'_>, _instance_count: u32) {}
 
         fn draw_texture(
@@ -588,8 +664,9 @@ mod tests {
 
         fn clear(&mut self, _clear_view: Maxwell3DClearView<'_>, _layer_count: u32) {}
 
-        fn dispatch_compute(&mut self) {
+        fn dispatch_compute(&mut self, dispatch: &DispatchCall) {
             self.dispatches.set(self.dispatches.get() + 1);
+            self.last_dispatch.replace(Some(dispatch.clone()));
         }
 
         fn reset_counter(&mut self, _query_type: u32) {}
@@ -631,9 +708,14 @@ mod tests {
 
         fn flush_all(&mut self) {}
 
-        fn flush_region(&mut self, _addr: u64, _size: u64) {}
+        fn flush_region(&mut self, _addr: u64, _size: u64, _which: crate::cache_types::CacheType) {}
 
-        fn must_flush_region(&self, addr: u64, size: u64) -> bool {
+        fn must_flush_region(
+            &self,
+            addr: u64,
+            size: u64,
+            _which: crate::cache_types::CacheType,
+        ) -> bool {
             addr == self.dirty_addr && size == self.dirty_size
         }
 
@@ -645,7 +727,13 @@ mod tests {
             }
         }
 
-        fn invalidate_region(&mut self, _addr: u64, _size: u64) {}
+        fn invalidate_region(
+            &mut self,
+            _addr: u64,
+            _size: u64,
+            _which: crate::cache_types::CacheType,
+        ) {
+        }
 
         fn on_cache_invalidation(&mut self, _addr: u64, _size: u64) {}
 
@@ -659,7 +747,13 @@ mod tests {
 
         fn modify_gpu_memory(&mut self, _as_id: usize, _addr: u64, _size: u64) {}
 
-        fn flush_and_invalidate_region(&mut self, _addr: u64, _size: u64) {}
+        fn flush_and_invalidate_region(
+            &mut self,
+            _addr: u64,
+            _size: u64,
+            _which: crate::cache_types::CacheType,
+        ) {
+        }
 
         fn wait_for_idle(&mut self) {}
 
@@ -713,7 +807,7 @@ mod tests {
     #[test]
     fn test_launch_desc_address() {
         let mut engine = new_test_engine();
-        engine.regs[QMD_ADDRESS as usize] = 0x1234;
+        engine.regs[LAUNCH_DESC_LOC as usize] = 0x1234;
         assert_eq!(engine.launch_desc_address(), 0x1234 << 8);
     }
 
@@ -797,17 +891,19 @@ mod tests {
 
     #[test]
     fn test_qmd_from_words_basic() {
-        let mut w = [0u32; QMD_WORD_COUNT];
+        let mut w = [0u32; NUM_LAUNCH_PARAMETERS];
         w[0x08] = 0x500; // program_start
         w[0x0C] = 64; // grid_dim_x
         w[0x0D] = 32 | (16 << 16); // grid_dim_y=32, grid_dim_z=16
         w[0x11] = 0x1000; // shared_alloc
         w[0x12] = 256 << 16; // block_dim_x=256
         w[0x13] = 4 | (2 << 16); // block_dim_y=4, block_dim_z=2
-        w[0x2D] = 0x400; // local_pos_alloc
-        w[0x2E] = 32 << 24; // gpr_alloc (bits [28:24] → mask 0x1F → 0)
+        w[0x14] = 2 << 29; // cache_layout
+        w[0x2D] = 0x400 | (7 << 27); // local_pos_alloc, barrier_alloc
+        w[0x2E] = 0x300 | (12 << 24); // local_neg_alloc, gpr_alloc
+        w[0x2F] = 0x200 | (4 << 24); // local_crs_alloc, sass_version
 
-        let qmd = QueueMetaData::from_words(&w);
+        let qmd = LaunchParams::from_words(&w);
         assert_eq!(qmd.program_start, 0x500);
         assert_eq!(qmd.grid_dim_x, 64);
         assert_eq!(qmd.grid_dim_y, 32);
@@ -816,14 +912,18 @@ mod tests {
         assert_eq!(qmd.block_dim_x, 256);
         assert_eq!(qmd.block_dim_y, 4);
         assert_eq!(qmd.block_dim_z, 2);
+        assert_eq!(qmd.cache_layout, 2);
         assert_eq!(qmd.local_pos_alloc, 0x400);
-        // gpr_alloc: bits [28:24] of 32<<24 = 0b10_0000 >> 24 = 32, masked &0x1F = 0
-        assert_eq!(qmd.gpr_alloc, 0);
+        assert_eq!(qmd.barrier_alloc, 7);
+        assert_eq!(qmd.local_neg_alloc, 0x300);
+        assert_eq!(qmd.gpr_alloc, 12);
+        assert_eq!(qmd.local_crs_alloc, 0x200);
+        assert_eq!(qmd.sass_version, 4);
     }
 
     #[test]
     fn test_qmd_from_words_const_buffers() {
-        let mut w = [0u32; QMD_WORD_COUNT];
+        let mut w = [0u32; NUM_LAUNCH_PARAMETERS];
         w[0x14] = 0b0000_0101; // enable CB 0 and CB 2
 
         // CB 0 at words 0x1D, 0x1E: addr_low=0x1000, word1: addr_high=1, size=512
@@ -834,7 +934,7 @@ mod tests {
         w[0x21] = 0x2000;
         w[0x22] = 0 | (256 << 15);
 
-        let qmd = QueueMetaData::from_words(&w);
+        let qmd = LaunchParams::from_words(&w);
         assert_eq!(qmd.const_buffer_enable_mask, 0b0000_0101);
         assert_eq!(qmd.const_buffers[0].address, 0x0001_0000_1000);
         assert_eq!(qmd.const_buffers[0].size, 512);
@@ -847,19 +947,19 @@ mod tests {
 
     #[test]
     fn test_qmd_from_words_linked_tsc_and_local_crs_alloc() {
-        let mut w = [0u32; QMD_WORD_COUNT];
+        let mut w = [0u32; NUM_LAUNCH_PARAMETERS];
         w[0x0B] = 1 << 30;
         w[0x2F] = 0x54321;
 
-        let qmd = QueueMetaData::from_words(&w);
+        let qmd = LaunchParams::from_words(&w);
         assert!(qmd.linked_tsc);
         assert_eq!(qmd.local_crs_alloc, 0x54321);
     }
 
     #[test]
     fn test_qmd_from_words_zeros() {
-        let w = [0u32; QMD_WORD_COUNT];
-        let qmd = QueueMetaData::from_words(&w);
+        let w = [0u32; NUM_LAUNCH_PARAMETERS];
+        let qmd = LaunchParams::from_words(&w);
         assert_eq!(qmd.grid_dim_x, 0);
         assert_eq!(qmd.grid_dim_y, 0);
         assert_eq!(qmd.grid_dim_z, 0);
@@ -869,17 +969,21 @@ mod tests {
         assert_eq!(qmd.shared_alloc, 0);
         assert_eq!(qmd.program_start, 0);
         assert_eq!(qmd.const_buffer_enable_mask, 0);
+        assert_eq!(qmd.cache_layout, 0);
         assert_eq!(qmd.local_pos_alloc, 0);
+        assert_eq!(qmd.barrier_alloc, 0);
+        assert_eq!(qmd.local_neg_alloc, 0);
         assert_eq!(qmd.gpr_alloc, 0);
+        assert_eq!(qmd.sass_version, 0);
         for cb in &qmd.const_buffers {
             assert_eq!(cb.address, 0);
             assert_eq!(cb.size, 0);
         }
     }
 
-    /// Helper: build a QMD byte blob from words for use with execute_pending.
-    fn make_qmd_bytes(w: &[u32; QMD_WORD_COUNT]) -> Vec<u8> {
-        let mut bytes = vec![0u8; QMD_WORD_COUNT * 4];
+    /// Helper: build a QMD byte blob from words for owner-backed launch tests.
+    fn make_qmd_bytes(w: &[u32; NUM_LAUNCH_PARAMETERS]) -> Vec<u8> {
+        let mut bytes = vec![0u8; NUM_LAUNCH_PARAMETERS * 4];
         for (i, &word) in w.iter().enumerate() {
             bytes[i * 4..i * 4 + 4].copy_from_slice(&word.to_le_bytes());
         }
@@ -888,7 +992,18 @@ mod tests {
 
     #[test]
     fn test_launch_creates_dispatch() {
-        let mut engine = new_test_engine();
+        let mut qmd_words = [0u32; NUM_LAUNCH_PARAMETERS];
+        qmd_words[0x08] = 0x200; // program_start
+        qmd_words[0x0C] = 8; // grid_dim_x
+        qmd_words[0x0D] = 4 | (2 << 16); // grid_dim_y=4, z=2
+        qmd_words[0x12] = 128 << 16; // block_dim_x=128
+        qmd_words[0x13] = 1 | (1 << 16); // block_dim_y=1, z=1
+        let qmd_bytes = make_qmd_bytes(&qmd_words);
+        let mut backing = vec![0u8; 0x1000];
+        backing[..qmd_bytes.len()].copy_from_slice(&qmd_bytes);
+        let mut engine = new_owner_backed_engine(&backing, 0x10000);
+        let rasterizer = TestRasterizer::new(0, 0);
+        engine.bind_rasterizer(&rasterizer);
 
         // Set up code address.
         engine.regs[CODE_LOC_BASE as usize] = 0x0001;
@@ -904,41 +1019,26 @@ mod tests {
         engine.regs[TEX_CB_INDEX as usize] = 2;
 
         // Prepare QMD at address 0x100 << 8 = 0x10000.
-        engine.regs[QMD_ADDRESS as usize] = 0x100;
+        engine.regs[LAUNCH_DESC_LOC as usize] = 0x100;
 
-        let mut qmd_words = [0u32; QMD_WORD_COUNT];
-        qmd_words[0x08] = 0x200; // program_start
-        qmd_words[0x0C] = 8; // grid_dim_x
-        qmd_words[0x0D] = 4 | (2 << 16); // grid_dim_y=4, z=2
-        qmd_words[0x12] = 128 << 16; // block_dim_x=128
-        qmd_words[0x13] = 1 | (1 << 16); // block_dim_y=1, z=1
-        let qmd_bytes = make_qmd_bytes(&qmd_words);
-
-        // Write LAUNCH.
+        // Upstream dispatches synchronously from the LAUNCH method.
         engine.write_reg(LAUNCH, 1);
 
-        // Execute pending with a mock reader.
-        let writes = engine.execute_pending(&|addr, buf| {
-            assert_eq!(addr, 0x10000);
-            buf[..qmd_bytes.len()].copy_from_slice(&qmd_bytes);
-        });
-        assert!(writes.is_empty());
-
-        let dispatches = engine.take_dispatch_calls();
-        assert_eq!(dispatches.len(), 1);
-        let d = &dispatches[0];
-        assert_eq!(d.qmd_address, 0x10000);
+        assert_eq!(rasterizer.dispatches.get(), 1);
+        let dispatch = rasterizer.last_dispatch.borrow();
+        let d = dispatch.as_ref().expect("LAUNCH must dispatch immediately");
+        assert_eq!(d.launch_desc_loc, 0x10000);
         assert_eq!(d.code_address, 0x0001_0000_A000);
         assert_eq!(d.tsc_address, 0x5000);
         assert_eq!(d.tsc_limit, 32);
         assert_eq!(d.tic_address, 0x6000);
         assert_eq!(d.tic_limit, 64);
         assert_eq!(d.tex_cb_index, 2);
-        assert_eq!(d.qmd.grid_dim_x, 8);
-        assert_eq!(d.qmd.grid_dim_y, 4);
-        assert_eq!(d.qmd.grid_dim_z, 2);
-        assert_eq!(d.qmd.block_dim_x, 128);
-        assert_eq!(d.qmd.program_start, 0x200);
+        assert_eq!(d.launch_description.grid_dim_x, 8);
+        assert_eq!(d.launch_description.grid_dim_y, 4);
+        assert_eq!(d.launch_description.grid_dim_z, 2);
+        assert_eq!(d.launch_description.block_dim_x, 128);
+        assert_eq!(d.launch_description.program_start, 0x200);
         assert_eq!(engine.launch_description.program_start, 0x200);
         assert_eq!(engine.launch_description.grid_dim_x, 8);
         assert_eq!(engine.launch_description.block_dim_x, 128);
@@ -981,7 +1081,7 @@ mod tests {
         let mut rasterizer = TestRasterizer::new(0x8000_0000, 4);
         engine.set_current_dma_segment(0x10000);
 
-        engine.regs[QMD_ADDRESS as usize] = (launch_desc >> 8) as u32;
+        engine.regs[LAUNCH_DESC_LOC as usize] = (launch_desc >> 8) as u32;
         engine.call_method(UPLOAD_REG_OFFSET, 4, true);
         engine.call_method((UPLOAD_REG_OFFSET + 1) as u32, 1, true);
         engine.call_method((UPLOAD_REG_OFFSET + 2) as u32, 0, true);
@@ -1002,11 +1102,6 @@ mod tests {
         engine.bind_rasterizer(&rasterizer);
 
         engine.call_method(LAUNCH, 1, true);
-        let qmd_bytes = make_qmd_bytes(&[0u32; QMD_WORD_COUNT]);
-        engine.execute_pending(&|addr, buf| {
-            assert_eq!(addr, launch_desc);
-            buf.copy_from_slice(&qmd_bytes);
-        });
 
         assert_eq!(rasterizer.dispatches.get(), 1);
         assert_eq!(engine.get_indirect_compute_address(), None);
@@ -1015,47 +1110,28 @@ mod tests {
 
     #[test]
     fn test_multiple_dispatches() {
-        let mut engine = new_test_engine();
-        engine.regs[QMD_ADDRESS as usize] = 0x100;
-
-        let qmd_bytes = make_qmd_bytes(&[0u32; QMD_WORD_COUNT]);
+        let backing = vec![0u8; 0x2000];
+        let mut engine = new_owner_backed_engine(&backing, 0x10000);
+        let rasterizer = TestRasterizer::new(0, 0);
+        engine.bind_rasterizer(&rasterizer);
+        engine.regs[LAUNCH_DESC_LOC as usize] = 0x100;
 
         // First launch.
         engine.write_reg(LAUNCH, 1);
-        engine.execute_pending(&|_addr, buf| {
-            buf[..qmd_bytes.len()].copy_from_slice(&qmd_bytes);
-        });
 
         // Second launch (update QMD address).
-        engine.regs[QMD_ADDRESS as usize] = 0x200;
+        engine.regs[LAUNCH_DESC_LOC as usize] = 0x101;
         engine.write_reg(LAUNCH, 1);
-        engine.execute_pending(&|_addr, buf| {
-            buf[..qmd_bytes.len()].copy_from_slice(&qmd_bytes);
-        });
-
-        let dispatches = engine.take_dispatch_calls();
-        assert_eq!(dispatches.len(), 2);
-        assert_eq!(dispatches[0].qmd_address, 0x100 << 8);
-        assert_eq!(dispatches[1].qmd_address, 0x200 << 8);
-    }
-
-    #[test]
-    fn test_take_dispatch_calls_drains() {
-        let mut engine = new_test_engine();
-        engine.regs[QMD_ADDRESS as usize] = 0x100;
-        let qmd_bytes = make_qmd_bytes(&[0u32; QMD_WORD_COUNT]);
-
-        engine.write_reg(LAUNCH, 1);
-        engine.execute_pending(&|_addr, buf| {
-            buf[..qmd_bytes.len()].copy_from_slice(&qmd_bytes);
-        });
-
-        let first = engine.take_dispatch_calls();
-        assert_eq!(first.len(), 1);
-
-        // Second take should be empty.
-        let second = engine.take_dispatch_calls();
-        assert!(second.is_empty());
+        assert_eq!(rasterizer.dispatches.get(), 2);
+        assert_eq!(
+            rasterizer
+                .last_dispatch
+                .borrow()
+                .as_ref()
+                .expect("second LAUNCH must dispatch")
+                .launch_desc_loc,
+            0x101 << 8
+        );
     }
 
     #[test]
@@ -1079,17 +1155,18 @@ mod tests {
         });
         assert!(writes.is_empty());
 
-        let dispatches = engine.take_dispatch_calls();
-        assert!(dispatches.is_empty());
+        assert_eq!(engine.launch_description, LaunchParams::default());
     }
 
     #[test]
-    fn test_call_method_launch_sets_pending() {
-        let mut engine = new_test_engine();
-        engine.regs[QMD_ADDRESS as usize] = 0x123;
-        assert!(engine.pending_launch.is_none());
+    fn test_call_method_launch_dispatches_immediately() {
+        let backing = vec![0u8; 0x1000];
+        let mut engine = new_owner_backed_engine(&backing, 0x12300);
+        let rasterizer = TestRasterizer::new(0, 0);
+        engine.bind_rasterizer(&rasterizer);
+        engine.regs[LAUNCH_DESC_LOC as usize] = 0x123;
         engine.call_method(LAUNCH, 1, true);
-        assert_eq!(engine.pending_launch, Some(0x123 << 8));
+        assert_eq!(rasterizer.dispatches.get(), 1);
     }
 
     #[test]

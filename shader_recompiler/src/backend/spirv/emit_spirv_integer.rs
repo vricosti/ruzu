@@ -138,6 +138,19 @@ pub fn emit_shift_left_logical_32(ctx: &mut SpirvEmitContext, base: Word, shift:
         .unwrap()
 }
 
+/// SDiv32: signed divide preserving the upstream raw-u32 result bits.
+pub fn emit_sdiv_32(ctx: &mut SpirvEmitContext, lhs: Word, rhs: Word) -> Word {
+    let lhs = ctx.builder.bitcast(ctx.i32_type, None, lhs).unwrap();
+    let rhs = ctx.builder.bitcast(ctx.i32_type, None, rhs).unwrap();
+    let result = ctx.builder.s_div(ctx.i32_type, None, lhs, rhs).unwrap();
+    ctx.builder.bitcast(ctx.u32_type, None, result).unwrap()
+}
+
+/// UDiv32: unsigned divide.
+pub fn emit_udiv_32(ctx: &mut SpirvEmitContext, lhs: Word, rhs: Word) -> Word {
+    ctx.builder.u_div(ctx.u32_type, None, lhs, rhs).unwrap()
+}
+
 /// ShiftLeftLogical64: `OpShiftLeftLogical`.
 pub fn emit_shift_left_logical_64(ctx: &mut SpirvEmitContext, base: Word, shift: Word) -> Word {
     ctx.builder

@@ -13,6 +13,7 @@ use crate::backend::x64::emit_context::{ArchConfig, DeferredEmitCtx, EmitConfig,
 use crate::backend::x64::exception_handler::{
     register_code_block, supports_fastmem, DoNotFastmemMarker, FastmemPatchTable,
 };
+use crate::backend::x64::host_feature::HostFeature;
 use crate::backend::x64::hostloc::{HostLoc, ANY_GPR, ANY_XMM, HOST_R13, HOST_R14};
 use crate::backend::x64::jit_state::{A64JitState, RSB_PTR_MASK};
 use crate::backend::x64::patch_info::{PatchTable, PatchType};
@@ -50,6 +51,19 @@ pub struct FastDispatchEntry {
 const FAST_DISPATCH_TABLE_SIZE: usize = 1 << 20; // 1M entries = 16 MB
 /// Mask for fast dispatch table index (16-byte aligned entries).
 const FAST_DISPATCH_TABLE_MASK: u32 = ((FAST_DISPATCH_TABLE_SIZE - 1) as u32) << 4;
+
+fn fast_dispatch_hash(location_descriptor: u64, table_ptr: u64, has_sse42: bool) -> u32 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if has_sse42 {
+            return unsafe {
+                std::arch::x86_64::_mm_crc32_u64(location_descriptor, table_ptr) as u32
+            };
+        }
+    }
+
+    location_descriptor as u32
+}
 
 /// The block compilation pipeline: translate → optimize → emit → cache.
 ///
@@ -223,12 +237,7 @@ impl A64EmitX64 {
     /// Fast cache-only lookup. Returns the entrypoint if the block is already compiled.
     /// Does NOT require mprotect — safe to call while code is in RX mode.
     pub fn lookup_cached_block(&self, location: LocationDescriptor) -> Option<*const u8> {
-        self.cache
-            .get_tagged(
-                &location,
-                crate::backend::x64::block_cache::CacheCallSite::Lookup,
-            )
-            .map(|cached| cached.entrypoint)
+        self.cache.get(&location).map(|cached| cached.entrypoint)
     }
 
     /// Get or compile a block for the given location.
@@ -242,15 +251,9 @@ impl A64EmitX64 {
         read_code: &MemoryReadCodeFn,
     ) -> *const u8 {
         // Check cache first
-        if let Some(cached) = self.cache.get_tagged(
-            &location,
-            crate::backend::x64::block_cache::CacheCallSite::Compile,
-        ) {
+        if let Some(cached) = self.cache.get(&location) {
             return cached.entrypoint;
         }
-
-        // Compile-time accounting starts here (only on cache-miss path).
-        let _compile_start = std::time::Instant::now();
 
         // Check space remaining — clear cache if low
         if self.code.space_remaining() < MIN_SPACE_REMAINING {
@@ -290,6 +293,15 @@ impl A64EmitX64 {
         }
 
         // Optimize (per-flag, matching dynarmic)
+        opt::polyfill(
+            &mut block,
+            opt::PolyfillOptions {
+                sha256: !self
+                    .code
+                    .has_host_feature(crate::backend::x64::host_feature::HostFeature::SHA),
+                vector_multiply_widen: true,
+            },
+        );
         let skip_getset_at_pc: Vec<u64> = std::env::var("RUZU_SKIP_GETSET_AT_PC")
             .ok()
             .map(|s| {
@@ -356,10 +368,13 @@ impl A64EmitX64 {
         // Emit in a nested scope so ctx is dropped before we call self.patch()
         let (desc, patch_entries) = {
             // Create emit context with dispatcher offsets and block linking
+            let host_features = self.code.host_features();
             let mut ctx = EmitContext::with_dispatcher(
                 location,
                 &self.emit_config,
                 ArchConfig::A64,
+                host_features,
+                self.optimizations,
                 self.dispatcher_labels.return_from_run_code,
                 self.code.code_base_ptr(),
             );
@@ -385,9 +400,7 @@ impl A64EmitX64 {
                 let cache_ptr = &self.cache as *const BlockCache;
                 ctx.block_lookup = Some(Box::new(move |loc| {
                     let cache = unsafe { &*cache_ptr };
-                    cache
-                        .get_tagged(&loc, crate::backend::x64::block_cache::CacheCallSite::Chain)
-                        .map(|b| b.entrypoint)
+                    cache.get(&loc).map(|b| b.entrypoint)
                 }));
             }
 
@@ -454,6 +467,12 @@ impl A64EmitX64 {
 
         // Compute absolute entrypoint
         let entrypoint = unsafe { self.code.code_base_ptr().add(desc.entrypoint_offset) };
+        let end = unsafe { entrypoint.add(desc.size) };
+        crate::backend::x64::perf_map::register(
+            entrypoint,
+            end,
+            &format!("a64_{:016X}_fpcr{:08X}", a64_loc.pc(), a64_loc.fpcr()),
+        );
 
         // Process patch entries from emission
         for entry in &patch_entries {
@@ -465,10 +484,6 @@ impl A64EmitX64 {
                 PatchType::MovRcx => info.mov_rcx.push(entry.code_offset),
             }
         }
-
-        // Record compile elapsed-time before inserting.
-        let _compile_ns = _compile_start.elapsed().as_nanos() as u64;
-        self.cache.add_compile_time(_compile_ns);
 
         // RUZU_DUMP_X64_AT_PC=0xADDR[,0xADDR2,...] — dump emitted x86 bytes
         // for the block whose guest entry PC matches. Useful for debugging
@@ -596,6 +611,7 @@ impl A64EmitX64 {
     fn gen_terminal_handlers(&mut self) -> Result<(), String> {
         let code_base = self.code.code_base_ptr();
         let rfrc = self.dispatcher_labels.return_from_run_code;
+        let has_sse42 = self.code.has_host_feature(HostFeature::SSE42);
         let asm = &mut self.code.asm;
 
         // ---- PopRSBHint handler ----
@@ -610,13 +626,18 @@ impl A64EmitX64 {
         let rsb_ptr_offset = A64JitState::offset_of_rsb_ptr();
         let rsb_loc_offset = A64JitState::offset_of_rsb_location_descriptors();
         let rsb_code_offset = A64JitState::offset_of_rsb_codeptrs();
+        let rbp = RBP;
 
-        // Load PC into RBX
+        // Load and mask PC into RBX. This calculation must remain identical
+        // to A64LocationDescriptor::unique_hash, as in upstream.
         asm.mov(RBX, qword_ptr(RegExp::from(R15) + pc_offset as i32))
+            .map_err(|e| format!("RSB handler: {:?}", e))?;
+        asm.mov(rbp, A64LocationDescriptor::PC_MASK as i64)
+            .map_err(|e| format!("RSB handler: {:?}", e))?;
+        asm.and_(RBX, rbp)
             .map_err(|e| format!("RSB handler: {:?}", e))?;
 
         // Load FPCR, mask, shift, OR into RBX
-        let rbp = RBP;
         asm.mov(rbp, qword_ptr(RegExp::from(R15) + fpcr_offset as i32))
             .map_err(|e| format!("RSB handler: {:?}", e))?;
         asm.and_(rbp, 0x07C8_0000i32)
@@ -705,6 +726,10 @@ impl A64EmitX64 {
         // Build location descriptor from PC + FPCR → RBX (same as RSB)
         asm.mov(RBX, qword_ptr(RegExp::from(R15) + pc_offset as i32))
             .map_err(|e| format!("FastDispatch handler: {:?}", e))?;
+        asm.mov(rbp, A64LocationDescriptor::PC_MASK as i64)
+            .map_err(|e| format!("FastDispatch handler: {:?}", e))?;
+        asm.and_(RBX, rbp)
+            .map_err(|e| format!("FastDispatch handler: {:?}", e))?;
         asm.mov(rbp, qword_ptr(RegExp::from(R15) + fpcr_offset as i32))
             .map_err(|e| format!("FastDispatch handler: {:?}", e))?;
         asm.and_(rbp, 0x07C8_0000i32)
@@ -718,14 +743,15 @@ impl A64EmitX64 {
         asm.mov(R12, table_ptr as i64)
             .map_err(|e| format!("FastDispatch handler: {:?}", e))?;
 
-        // Hash: EBP = (RBX * some_mix) & FAST_DISPATCH_TABLE_MASK
-        // Simple hash: use lower bits of descriptor, masked and aligned
+        // Upstream hashes the location descriptor with the table address via
+        // CRC32 when SSE4.2 is present; without it the descriptor itself is
+        // masked. The invalidation path below performs the identical hash.
         asm.mov(rbp, RBX)
             .map_err(|e| format!("FastDispatch handler: {:?}", e))?;
-        asm.shr(rbp, 2u8)
-            .map_err(|e| format!("FastDispatch handler: {:?}", e))?;
-        asm.xor_(rbp, RBX)
-            .map_err(|e| format!("FastDispatch handler: {:?}", e))?;
+        if has_sse42 {
+            asm.crc32(rbp, R12)
+                .map_err(|e| format!("FastDispatch handler: {:?}", e))?;
+        }
         let ebp = rxbyak::Reg::gpr32(5); // EBP
         asm.and_(ebp, FAST_DISPATCH_TABLE_MASK as i32)
             .map_err(|e| format!("FastDispatch handler: {:?}", e))?;
@@ -799,9 +825,11 @@ impl A64EmitX64 {
 
     /// Invalidate a specific entry in the fast dispatch table.
     fn invalidate_fast_dispatch_entry(&mut self, location: LocationDescriptor) {
+        let has_sse42 = self.code.has_host_feature(HostFeature::SSE42);
         if let Some(ref mut table) = self.fast_dispatch_table {
             let desc = location.value();
-            let hash = ((desc >> 2) ^ desc) as u32 & FAST_DISPATCH_TABLE_MASK;
+            let table_ptr = table.as_ptr() as u64;
+            let hash = fast_dispatch_hash(desc, table_ptr, has_sse42) & FAST_DISPATCH_TABLE_MASK;
             let index = (hash >> 4) as usize;
             if index < table.len() && table[index].location_descriptor == desc {
                 table[index].location_descriptor = 0xFFFF_FFFF_FFFF_FFFF;
@@ -855,6 +883,7 @@ impl A64EmitX64 {
         self.clear_fast_dispatch_table();
         self.cache.clear();
         self.fastmem_patches.clear();
+        crate::backend::x64::perf_map::clear();
         self.code.clear_cache();
         // Re-emit terminal handlers and fastmem fallbacks. Their
         // offsets in the code buffer change, but the SIGSEGV-handler
@@ -1154,6 +1183,8 @@ mod tests {
             loc,
             &emit_config,
             ArchConfig::A64,
+            crate::backend::x64::block_of_code::get_host_features(),
+            OptimizationFlag::NO_OPTIMIZATIONS,
             [100, 200, 300, 400],
             std::ptr::null(),
         );

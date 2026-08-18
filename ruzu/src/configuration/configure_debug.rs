@@ -109,7 +109,7 @@ pub fn page() -> Page {
     );
     let dump_shaders = w::check_row(
         "Dump Game Shaders",
-        *common::settings::values().dump_shaders.get_value(),
+        *common::settings::values().dump_guest_shaders.get_value(),
     );
     let disable_macro_jit = w::check_row(
         "Disable Macro JIT",
@@ -254,7 +254,9 @@ pub fn page() -> Page {
         values
             .disable_buffer_reorder
             .set_value(disable_buffer_reorder.is_active());
-        values.dump_shaders.set_value(dump_shaders.is_active());
+        values
+            .dump_guest_shaders
+            .set_value(dump_shaders.is_active());
         values
             .disable_macro_jit
             .set_value(disable_macro_jit.is_active());

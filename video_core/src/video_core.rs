@@ -35,7 +35,10 @@ pub enum NvdecEmulation {
 ///
 /// This avoids video_core depending on SDL or any windowing library.
 pub fn create_gpu(use_async: bool, use_nvdec: bool, renderer: Box<dyn RendererBase>) -> Gpu {
-    // Upstream: Settings::UpdateRescalingInfo();
+    {
+        let mut values = common::settings::values_mut();
+        common::settings::update_rescaling_info(&mut values);
+    }
     let gpu = Gpu::new(use_async, use_nvdec);
 
     // Upstream flow:

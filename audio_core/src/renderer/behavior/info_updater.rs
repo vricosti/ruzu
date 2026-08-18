@@ -1,4 +1,7 @@
-use crate::common::common::{FINAL_MIX_ID, UNUSED_MIX_ID, UNUSED_SPLITTER_ID};
+use crate::common::common::{
+    CpuAddr, PlayState, SampleFormat, SrcQuality, FINAL_MIX_ID, MAX_BIQUAD_FILTERS, MAX_CHANNELS,
+    MAX_WAVE_BUFFERS, UNUSED_MIX_ID,
+};
 use crate::common::feature_support::check_valid_revision;
 use crate::errors::RESULT_INVALID_UPDATE_INFO;
 use crate::renderer::behavior::behavior_info::{
@@ -25,7 +28,8 @@ use crate::renderer::sink::{SinkContext, SinkInParameter, SinkOutStatus};
 use crate::renderer::splitter::SplitterContext;
 use crate::renderer::upsampler::UpsamplerManager;
 use crate::renderer::voice::voice_info::{
-    InParameter as VoiceInParameter, OutStatus as VoiceOutStatus,
+    BiquadFilterParameter, BiquadFilterParameter2, Flags as VoiceFlags,
+    InParameter as VoiceInParameter, OutStatus as VoiceOutStatus, WaveBufferInternal,
 };
 use crate::renderer::voice::VoiceContext;
 use crate::Result;
@@ -48,6 +52,92 @@ pub struct UpdateDataHeader {
     pub render_info_size: u32,
     pub unk2c: [u8; 0x10],
     pub size: u32,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+#[repr(C)]
+struct VoiceBiquadV2 {
+    enable: bool,
+    reserved1: u8,
+    reserved2: u8,
+    reserved3: u8,
+    b: [f32; 3],
+    a: [f32; 2],
+}
+
+// This deliberately mirrors the function-local VoiceInParameterV2 in Eden's
+// InfoUpdater::UpdateVoices. It is not byte-identical to VoiceInfo::InParameter2:
+// SrcQuality occupies 0x175 here and 0x176 in the public VoiceInfo structure.
+#[derive(Debug, Clone, Copy)]
+#[repr(C)]
+struct VoiceInParameterV2 {
+    id: u32,
+    node_id: u32,
+    is_new: bool,
+    in_use: bool,
+    play_state: PlayState,
+    sample_format: SampleFormat,
+    sample_rate: u32,
+    priority: u32,
+    sort_order: u32,
+    channel_count: u32,
+    pitch: f32,
+    volume: f32,
+    biquads: [VoiceBiquadV2; MAX_BIQUAD_FILTERS as usize],
+    wave_buffer_count: u32,
+    wave_buffer_index: u32,
+    reserved1: u32,
+    src_data_address: CpuAddr,
+    src_data_size: u64,
+    mix_id: i32,
+    splitter_id: u32,
+    wavebuffers: [WaveBufferInternal; MAX_WAVE_BUFFERS as usize],
+    channel_resource_ids: [u32; MAX_CHANNELS],
+    clear_voice_drop: bool,
+    flush_wave_buffer_count: u8,
+    reserved2: u16,
+    flags: VoiceFlags,
+    src_quality: SrcQuality,
+    external_context: u32,
+    external_context_size: u32,
+    reserved3: [u32; 2],
+}
+
+impl Default for VoiceInParameterV2 {
+    fn default() -> Self {
+        Self {
+            id: 0,
+            node_id: 0,
+            is_new: false,
+            in_use: false,
+            play_state: PlayState::Started,
+            sample_format: SampleFormat::Invalid,
+            sample_rate: 0,
+            priority: 0,
+            sort_order: 0,
+            channel_count: 0,
+            pitch: 0.0,
+            volume: 0.0,
+            biquads: [VoiceBiquadV2::default(); MAX_BIQUAD_FILTERS as usize],
+            wave_buffer_count: 0,
+            wave_buffer_index: 0,
+            reserved1: 0,
+            src_data_address: 0,
+            src_data_size: 0,
+            mix_id: 0,
+            splitter_id: 0,
+            wavebuffers: [WaveBufferInternal::default(); MAX_WAVE_BUFFERS as usize],
+            channel_resource_ids: [0; MAX_CHANNELS],
+            clear_voice_drop: false,
+            flush_wave_buffer_count: 0,
+            reserved2: 0,
+            flags: VoiceFlags::default(),
+            src_quality: SrcQuality::Medium,
+            external_context: 0,
+            external_context_size: 0,
+            reserved3: [0; 2],
+        }
+    }
 }
 
 pub struct InfoUpdater<'a> {
@@ -203,19 +293,19 @@ impl<'a> InfoUpdater<'a> {
         memory_pool_count: u32,
     ) -> Result {
         let voice_count = voice_context.get_count();
-        let input_size = voice_count as usize * size_of::<VoiceInParameter>();
+        let use_v2 = self.behavior().is_voice_in_parameter_v2_supported();
+        let input_stride = if use_v2 {
+            size_of::<VoiceInParameterV2>()
+        } else {
+            size_of::<VoiceInParameter>()
+        };
+        let input_size = voice_count as usize * input_stride;
         let output_size = voice_count as usize * size_of::<VoiceOutStatus>();
         if self.input_offset + input_size > self.input_origin.len()
             || self.output_offset + output_size > self.output_origin.len()
         {
             return RESULT_INVALID_UPDATE_INFO;
         }
-        let in_params = unsafe {
-            std::slice::from_raw_parts(
-                self.input_origin[self.input_offset..].as_ptr() as *const VoiceInParameter,
-                voice_count as usize,
-            )
-        };
         for index in 0..voice_count {
             if let Some(info) = voice_context.get_info_mut(index) {
                 info.in_use = false;
@@ -229,7 +319,74 @@ impl<'a> InfoUpdater<'a> {
             self.behavior().is_memory_force_mapping_enabled(),
         );
         let mut new_voice_count = 0u32;
-        for (index, in_param) in in_params.iter().enumerate() {
+        for index in 0..voice_count as usize {
+            let mut float_biquads =
+                [BiquadFilterParameter2::default(); MAX_BIQUAD_FILTERS as usize];
+            let in_param = if use_v2 {
+                let Some(in_v2) = read_pod::<VoiceInParameterV2>(
+                    self.input_origin,
+                    self.input_offset + index * input_stride,
+                ) else {
+                    return RESULT_INVALID_UPDATE_INFO;
+                };
+                let mut legacy_biquads =
+                    [BiquadFilterParameter::default(); MAX_BIQUAD_FILTERS as usize];
+                for filter_index in 0..MAX_BIQUAD_FILTERS as usize {
+                    let source = in_v2.biquads[filter_index];
+                    legacy_biquads[filter_index].enabled = source.enable;
+                    legacy_biquads[filter_index].b = source
+                        .b
+                        .map(|coefficient| (coefficient * 16384.0).clamp(-32768.0, 32767.0) as i16);
+                    legacy_biquads[filter_index].a = source
+                        .a
+                        .map(|coefficient| (coefficient * 16384.0).clamp(-32768.0, 32767.0) as i16);
+                    float_biquads[filter_index] = BiquadFilterParameter2 {
+                        enabled: source.enable,
+                        reserved1: source.reserved1,
+                        reserved2: source.reserved2,
+                        reserved3: source.reserved3,
+                        numerator: source.b,
+                        denominator: source.a,
+                    };
+                }
+                VoiceInParameter {
+                    id: in_v2.id,
+                    node_id: in_v2.node_id,
+                    is_new: in_v2.is_new,
+                    in_use: in_v2.in_use,
+                    play_state: in_v2.play_state,
+                    sample_format: in_v2.sample_format,
+                    sample_rate: in_v2.sample_rate,
+                    priority: in_v2.priority as i32,
+                    sort_order: in_v2.sort_order as i32,
+                    channel_count: in_v2.channel_count,
+                    pitch: in_v2.pitch,
+                    volume: in_v2.volume,
+                    biquads: legacy_biquads,
+                    wave_buffer_count: in_v2.wave_buffer_count,
+                    wave_buffer_index: in_v2.wave_buffer_index as u16,
+                    src_data_address: in_v2.src_data_address,
+                    src_data_size: in_v2.src_data_size,
+                    mix_id: in_v2.mix_id as u32,
+                    splitter_id: in_v2.splitter_id,
+                    wave_buffer_internal: in_v2.wavebuffers,
+                    channel_resource_ids: in_v2.channel_resource_ids,
+                    clear_voice_drop: in_v2.clear_voice_drop,
+                    flush_buffer_count: in_v2.flush_wave_buffer_count,
+                    flags: in_v2.flags,
+                    src_quality: in_v2.src_quality,
+                    ..Default::default()
+                }
+            } else {
+                let Some(in_legacy) = read_pod::<VoiceInParameter>(
+                    self.input_origin,
+                    self.input_offset + index * input_stride,
+                ) else {
+                    return RESULT_INVALID_UPDATE_INFO;
+                };
+                in_legacy
+            };
+
             if !in_param.in_use {
                 continue;
             }
@@ -248,7 +405,13 @@ impl<'a> InfoUpdater<'a> {
             }
 
             let mut update_error = ErrorInfo::default();
-            voice_info.update_parameters(&mut update_error, in_param, &mapper, self.behavior());
+            voice_info.update_parameters(&mut update_error, &in_param, &mapper, self.behavior());
+            if use_v2 {
+                voice_info.use_float_biquads = true;
+                voice_info.biquads_float = float_biquads;
+            } else {
+                voice_info.use_float_biquads = false;
+            }
             if update_error.error_code.is_error() {
                 self.behavior_mut().append_error(update_error);
             }
@@ -257,7 +420,7 @@ impl<'a> InfoUpdater<'a> {
                 [[ErrorInfo::default(); 2]; crate::common::common::MAX_WAVE_BUFFERS as usize];
             voice_info.update_wave_buffers(
                 &mut wavebuffer_errors,
-                in_param,
+                &in_param,
                 &mut voice_states,
                 &mapper,
                 self.behavior(),
@@ -271,7 +434,7 @@ impl<'a> InfoUpdater<'a> {
             }
 
             let mut out_status = VoiceOutStatus::default();
-            voice_info.write_out_status(&mut out_status, in_param, &voice_states);
+            voice_info.write_out_status(&mut out_status, &in_param, &voice_states);
             if self
                 .write_output_at(index * size_of::<VoiceOutStatus>(), &out_status)
                 .is_error()
@@ -1266,9 +1429,9 @@ mod tests {
     }
 
     #[test]
-    fn update_voices_updates_valid_voice_and_sets_active_count() {
+    fn update_voices_legacy_updates_valid_voice_and_sets_active_count() {
         let mut behavior = BehaviorInfo::new();
-        behavior.set_user_lib_revision(CURRENT_REVISION);
+        behavior.set_user_lib_revision(11);
 
         let mut input = Vec::new();
         let header = UpdateDataHeader {
@@ -1299,5 +1462,63 @@ mod tests {
         assert_eq!(voice_context.get_active_count(), 1);
         let out = read_pod::<VoiceOutStatus>(&output, size_of::<UpdateDataHeader>()).unwrap();
         assert_eq!(out.wave_buffers_consumed, 0);
+    }
+
+    #[test]
+    fn update_voices_v2_preserves_native_float_biquads() {
+        let mut behavior = BehaviorInfo::new();
+        behavior.set_user_lib_revision(CURRENT_REVISION);
+
+        let mut input = Vec::new();
+        let header = UpdateDataHeader {
+            revision: behavior.get_process_revision(),
+            voices_size: size_of::<VoiceInParameterV2>() as u32,
+            size: (size_of::<UpdateDataHeader>() + size_of::<VoiceInParameterV2>()) as u32,
+            ..Default::default()
+        };
+        let mut voice = VoiceInParameterV2 {
+            in_use: true,
+            id: 0,
+            channel_count: 1,
+            volume: 0.75,
+            ..Default::default()
+        };
+        voice.biquads[0].enable = true;
+        voice.biquads[0].b = [0.25, -0.5, 1.0];
+        voice.biquads[0].a = [-0.125, 0.75];
+        push_pod(&mut input, &header);
+        push_pod(&mut input, &voice);
+
+        let mut output = vec![0u8; size_of::<UpdateDataHeader>() + size_of::<VoiceOutStatus>()];
+        let mut updater = InfoUpdater::new(&input, &mut output, None, &mut behavior);
+        let mut voice_context = VoiceContext::new();
+        voice_context.initialize(1, 1, 1);
+
+        assert_eq!(
+            updater.update_voices(&mut voice_context, &mut [], 0),
+            ResultCode::SUCCESS
+        );
+        drop(updater);
+
+        let stored = voice_context.get_info(0).unwrap();
+        assert!(stored.use_float_biquads);
+        assert_eq!(stored.biquads_float[0].numerator, [0.25, -0.5, 1.0]);
+        assert_eq!(stored.biquads_float[0].denominator, [-0.125, 0.75]);
+        assert_eq!(stored.biquads[0].b, [4096, -8192, 16384]);
+        assert_eq!(stored.biquads[0].a, [-2048, 12288]);
+    }
+
+    #[test]
+    fn voice_in_parameter_v2_local_layout_matches_upstream_info_updater() {
+        assert_eq!(size_of::<VoiceBiquadV2>(), 0x18);
+        assert_eq!(size_of::<VoiceInParameterV2>(), 0x188);
+        assert_eq!(std::mem::offset_of!(VoiceInParameterV2, biquads), 0x24);
+        assert_eq!(std::mem::offset_of!(VoiceInParameterV2, wavebuffers), 0x78);
+        assert_eq!(std::mem::offset_of!(VoiceInParameterV2, flags), 0x174);
+        assert_eq!(std::mem::offset_of!(VoiceInParameterV2, src_quality), 0x175);
+        assert_eq!(
+            std::mem::offset_of!(VoiceInParameterV2, external_context),
+            0x178
+        );
     }
 }

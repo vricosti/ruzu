@@ -508,16 +508,16 @@ pub fn list_cubeb_sink_devices(capture: bool) -> Vec<String> {
     device_list
 }
 
-/// Check if the cubeb backend is suitable for use.
-pub fn is_cubeb_suitable() -> bool {
+/// Return Cubeb's minimum output latency, matching upstream `GetCubebLatency`.
+pub fn get_cubeb_latency() -> u32 {
     #[cfg(windows)]
     let com_init_result = initialize_com_multithreaded();
 
     let ctx = match Context::init(Some(c"ruzu Latency Getter"), None) {
         Ok(ctx) => ctx,
         Err(_) => {
-            error!("Cubeb failed to init, it is not suitable.");
-            return false;
+            error!("cubeb_init failed");
+            return 10_000;
         }
     };
 
@@ -533,34 +533,11 @@ pub fn is_cubeb_suitable() -> bool {
         .layout(cubeb::ChannelLayout::STEREO)
         .take();
 
-    let latency = match ctx.min_latency(&params) {
+    match ctx.min_latency(&params) {
         Ok(l) => l.max(TARGET_SAMPLE_COUNT * 2),
         Err(_) => {
-            error!("Cubeb could not get min latency, it is not suitable.");
-            return false;
-        }
-    };
-
-    let data_cb = |_: &[i16], _: &mut [i16]| TARGET_SAMPLE_COUNT as isize;
-    let state_cb = |_: cubeb::State| {};
-
-    let mut builder = cubeb::StreamBuilder::<i16>::new();
-    builder
-        .name("Ruzu test")
-        .default_output(&params)
-        .output(cubeb::DeviceId::default(), &params)
-        .latency(latency)
-        .data_callback(data_cb)
-        .state_callback(state_cb);
-
-    match builder.init(&ctx) {
-        Ok(stream) => {
-            drop(stream);
-            true
-        }
-        Err(_) => {
-            error!("Cubeb could not open a device, it is not suitable.");
-            false
+            error!("Error getting minimum Cubeb latency");
+            TARGET_SAMPLE_COUNT * 2
         }
     }
 }

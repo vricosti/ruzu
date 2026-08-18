@@ -10,7 +10,7 @@
 //! physical-base-relative device-address table model is still being ported.
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use common::address_space::FlatAllocator64;
@@ -18,6 +18,8 @@ use common::range_mutex::{RangeMutex, ScopedRangeLock};
 use common::settings::MemoryLayout;
 use ruzu_core::device_memory::DeviceMemory;
 use ruzu_core::memory::memory::Memory;
+
+use crate::buffer_cache::word_manager::DeviceTracker;
 
 /// Number of virtual address bits for the Maxwell device address space.
 ///
@@ -85,10 +87,11 @@ pub struct MaxwellDeviceMemoryManager {
     /// per-process `Memory` owner in place of a raw `Core::Memory::Memory*`.
     smmu_registered_processes: Mutex<SmmuRegisteredProcesses>,
 
-    /// Host backing base for `Core::DeviceMemory`, matching upstream
-    /// `DeviceMemoryManager<Traits>::physical_base`. Set from registered
-    /// process memory owners.
-    smmu_physical_base: Mutex<Option<usize>>,
+    /// Host backing base for `Core::DeviceMemory`, matching upstream's const
+    /// `DeviceMemoryManager<Traits>::physical_base`. Runtime construction sets
+    /// it before sharing the manager; zero is reserved for reduced fixtures
+    /// that do not provide device memory.
+    smmu_physical_base: AtomicUsize,
 
     /// Constructor-time physical reverse-table size. Upstream allocates
     /// `compressed_device_addr` once in `DeviceMemoryManager(...)` from the
@@ -96,8 +99,8 @@ pub struct MaxwellDeviceMemoryManager {
     smmu_physical_page_count: usize,
 
     /// Device page -> compressed physical page (`physical_page + 1`).
-    /// Dense Rust counterpart for upstream `compressed_physical_ptr`.
-    smmu_compressed_physical_ptr: Mutex<DenseDevicePageTable>,
+    /// Atomic dense Rust counterpart for upstream `compressed_physical_ptr`.
+    smmu_compressed_physical_ptr: AtomicDevicePageTable,
 
     /// Device page -> encoded upstream CPU backing metadata. Dense Rust
     /// counterpart for upstream `cpu_backing_address`, initialized to zero.
@@ -112,6 +115,17 @@ pub struct MaxwellDeviceMemoryManager {
     /// counterpart for upstream `compressed_device_addr` plus
     /// `MultiAddressContainer` reverse physical-to-device tracking.
     smmu_reverse_mappings: Mutex<SmmuReverseMappings>,
+
+    /// Port of upstream `mapping_guard`. Serializes complete map, unmap,
+    /// continuity-tracking, and reverse-gather operations.
+    smmu_mapping_guard: Mutex<()>,
+
+    /// Four-entry device-page translation cache (`t_slot` / `cache_cursor`).
+    /// Upstream consults it for single-page reads and clears it after every
+    /// map/unmap operation. Atomic fields provide Rust interior mutability for
+    /// the manager's shared `Arc` ownership without serializing every cache
+    /// hit; contents and replacement are otherwise exact.
+    smmu_translation_cache: TranslationCache,
 }
 
 /// Page size used by the SMMU page table — matches CPU page size so each
@@ -136,6 +150,41 @@ fn smmu_num_pages_for_size(size: usize) -> u64 {
     ((size as u64).wrapping_add(SMMU_PAGE_SIZE - 1)) >> SMMU_PAGE_BITS
 }
 
+struct AtomicDevicePageTable {
+    values: Box<[AtomicU32]>,
+    default_value: u32,
+}
+
+impl AtomicDevicePageTable {
+    fn new(default_value: u32) -> Self {
+        Self {
+            values: std::iter::repeat_with(|| AtomicU32::new(default_value))
+                .take(SMMU_DEVICE_PAGE_COUNT)
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+            default_value,
+        }
+    }
+
+    fn load(&self, page: u64) -> u32 {
+        self.values
+            .get(page as usize)
+            .map_or(self.default_value, |entry| entry.load(Ordering::Acquire))
+    }
+
+    fn store(&self, page: u64, value: u32) {
+        if let Some(entry) = self.values.get(page as usize) {
+            entry.store(value, Ordering::Release);
+        }
+    }
+
+    fn clear(&self, page: u64) -> Option<u32> {
+        let entry = self.values.get(page as usize)?;
+        let old = entry.swap(self.default_value, Ordering::AcqRel);
+        (old != self.default_value).then_some(old)
+    }
+}
+
 struct DenseDevicePageTable {
     values: Vec<u32>,
     default_value: u32,
@@ -156,12 +205,6 @@ impl DenseDevicePageTable {
     fn insert(&mut self, page: u64, value: u32) -> Option<u32> {
         let entry = self.values.get_mut(page as usize)?;
         let old = std::mem::replace(entry, value);
-        (old != self.default_value).then_some(old)
-    }
-
-    fn remove(&mut self, page: &u64) -> Option<u32> {
-        let entry = self.values.get_mut(*page as usize)?;
-        let old = std::mem::replace(entry, self.default_value);
         (old != self.default_value).then_some(old)
     }
 }
@@ -227,6 +270,61 @@ impl DensePhysicalPageTable {
         if let Some(entry) = self.values.get_mut(page as usize) {
             *entry = value;
         }
+    }
+}
+
+#[derive(Default)]
+struct TranslationEntry {
+    guest_page: AtomicU64,
+    host_ptr: AtomicUsize,
+}
+
+struct TranslationCache {
+    slots: [TranslationEntry; 4],
+    cursor: AtomicU32,
+}
+
+impl Default for TranslationCache {
+    fn default() -> Self {
+        Self {
+            slots: std::array::from_fn(|_| TranslationEntry::default()),
+            cursor: AtomicU32::new(0),
+        }
+    }
+}
+
+impl TranslationCache {
+    fn find(&self, guest_page: DAddr) -> Option<usize> {
+        self.slots.iter().find_map(|entry| {
+            let first_host_ptr = entry.host_ptr.load(Ordering::Acquire);
+            if first_host_ptr == 0 || entry.guest_page.load(Ordering::Relaxed) != guest_page {
+                return None;
+            }
+            let second_host_ptr = entry.host_ptr.load(Ordering::Acquire);
+            (first_host_ptr == second_host_ptr).then_some(first_host_ptr)
+        })
+    }
+
+    fn insert(&self, guest_page: DAddr, host_ptr: usize) {
+        let cursor = self
+            .cursor
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cursor| {
+                Some(cursor.wrapping_add(1) & 3)
+            })
+            .unwrap();
+        let slot = cursor as usize;
+        let entry = &self.slots[slot];
+        entry.host_ptr.store(0, Ordering::Release);
+        entry.guest_page.store(guest_page, Ordering::Relaxed);
+        entry.host_ptr.store(host_ptr, Ordering::Release);
+    }
+
+    fn clear(&self) {
+        for entry in &self.slots {
+            entry.host_ptr.store(0, Ordering::Release);
+            entry.guest_page.store(0, Ordering::Relaxed);
+        }
+        self.cursor.store(0, Ordering::Relaxed);
     }
 }
 
@@ -296,6 +394,30 @@ struct MultiAddressContainer {
 }
 
 impl MultiAddressContainer {
+    /// Port of upstream `MultiAddressContainer::GatherValues`.
+    fn gather_values_into(
+        &self,
+        start_entry: u32,
+        buffer: &mut common::scratch_buffer::ScratchBuffer<u32>,
+    ) {
+        buffer.resize(8);
+        let mut index = 0usize;
+        let mut iter_entry = start_entry;
+        loop {
+            let current = self.entry(iter_entry);
+            if buffer.size() < index + 1 {
+                buffer.resize(index + 8);
+            }
+            buffer[index] = current.value;
+            index += 1;
+            if current.next_entry == 0 {
+                break;
+            }
+            iter_entry = current.next_entry;
+        }
+        buffer.resize(index);
+    }
+
     fn gather_values(&self, start_entry: u32) -> Vec<u32> {
         if start_entry == 0 {
             return Vec::new();
@@ -417,16 +539,21 @@ impl SmmuReverseMappings {
             .collect()
     }
 
-    fn gather_device_pages_for_apply(&self, physical_page: u32) -> Vec<u64> {
+    /// Port of the single/multi-address split in upstream `ApplyOpOnPAddr`.
+    /// A single alias is returned directly; only a multi-alias entry touches
+    /// the caller-owned scratch buffer.
+    fn gather_device_pages_for_apply(
+        &self,
+        physical_page: u32,
+        scratch: &mut common::scratch_buffer::ScratchBuffer<u32>,
+    ) -> Option<u32> {
         let base = self.compressed_device_addr.get(physical_page);
         if (base >> MULTI_FLAG_BITS) == 0 {
-            return vec![u64::from(base)];
+            return Some(base);
         }
         self.multi_dev_address
-            .gather_values(base & MULTI_MASK)
-            .into_iter()
-            .map(u64::from)
-            .collect()
+            .gather_values_into(base & MULTI_MASK, scratch);
+        None
     }
 
     fn insert(&mut self, physical_page: u32, device_page: u64) {
@@ -438,9 +565,6 @@ impl SmmuReverseMappings {
         }
 
         if (base >> MULTI_FLAG_BITS) == 0 {
-            if base == device_page {
-                return;
-            }
             let start_id = self.multi_dev_address.register(base);
             self.multi_dev_address.register_after(device_page, start_id);
             self.compressed_device_addr
@@ -449,13 +573,6 @@ impl SmmuReverseMappings {
         }
 
         let start_id = base & MULTI_MASK;
-        if self
-            .multi_dev_address
-            .gather_values(start_id)
-            .contains(&device_page)
-        {
-            return;
-        }
         self.multi_dev_address.register_after(device_page, start_id);
     }
 
@@ -564,13 +681,21 @@ impl Default for MaxwellDeviceMemoryManager {
             flush_region: Mutex::new(None),
             smmu_allocator: Mutex::new(FlatAllocator64::new(SMMU_BASE, SMMU_VA_LIMIT)),
             smmu_registered_processes: Mutex::new(SmmuRegisteredProcesses::default()),
-            smmu_physical_base: Mutex::new(None),
+            smmu_physical_base: AtomicUsize::new(0),
             smmu_physical_page_count: physical_page_count,
-            smmu_compressed_physical_ptr: Mutex::new(DenseDevicePageTable::new(0)),
+            smmu_compressed_physical_ptr: AtomicDevicePageTable::new(0),
             smmu_cpu_backing: Mutex::new(DenseCpuBackingTable::new()),
             smmu_continuity_tracker: Mutex::new(DenseDevicePageTable::new(1)),
             smmu_reverse_mappings: Mutex::new(SmmuReverseMappings::new(physical_page_count)),
+            smmu_mapping_guard: Mutex::new(()),
+            smmu_translation_cache: TranslationCache::default(),
         }
+    }
+}
+
+impl DeviceTracker for MaxwellDeviceMemoryManager {
+    fn update_pages_cached_count(&self, addr: DAddr, size: u64, delta: i32) {
+        MaxwellDeviceMemoryManager::update_pages_cached_count(self, addr, size as usize, delta);
     }
 }
 
@@ -582,8 +707,10 @@ impl MaxwellDeviceMemoryManager {
     /// `device_memory.buffer.BackingBasePointer()` during Host1x construction.
     pub fn new_with_device_memory(device_memory: &DeviceMemory) -> Self {
         let manager = Self::default();
-        *manager.smmu_physical_base.lock().unwrap() =
-            Some(device_memory.buffer.backing_base_pointer() as usize);
+        manager.smmu_physical_base.store(
+            device_memory.buffer.backing_base_pointer() as usize,
+            Ordering::Relaxed,
+        );
         manager
     }
 
@@ -748,12 +875,19 @@ impl MaxwellDeviceMemoryManager {
     pub fn smmu_register_process(&self, memory: Option<Arc<Mutex<Memory>>>) -> u32 {
         if let Some(memory) = memory.as_ref() {
             if let Some(physical_base) = memory.lock().unwrap().device_memory_backing_base() {
-                let mut stored_base = self.smmu_physical_base.lock().unwrap();
-                if stored_base.is_none() {
-                    *stored_base = Some(physical_base);
-                } else {
-                    debug_assert_eq!(*stored_base, Some(physical_base));
+                let stored_base = self.smmu_physical_base.load(Ordering::Relaxed);
+                if stored_base == 0 {
+                    let _ = self.smmu_physical_base.compare_exchange(
+                        0,
+                        physical_base,
+                        Ordering::Relaxed,
+                        Ordering::Relaxed,
+                    );
                 }
+                debug_assert_eq!(
+                    self.smmu_physical_base.load(Ordering::Relaxed),
+                    physical_base
+                );
             }
         }
         self.smmu_registered_processes
@@ -825,9 +959,6 @@ impl MaxwellDeviceMemoryManager {
         asid: u32,
         track: bool,
     ) {
-        if size == 0 {
-            return;
-        }
         let Some(memory) = self.smmu_registered_memory(asid) else {
             log::error!(
                 "SMMU map requested with unregistered ASID {} at daddr=0x{:X} vaddr=0x{:X} size=0x{:X}",
@@ -839,11 +970,9 @@ impl MaxwellDeviceMemoryManager {
             return;
         };
 
+        let _mapping_guard = self.smmu_mapping_guard.lock().unwrap();
         let start_page = d_address >> SMMU_PAGE_BITS;
         let num_pages = smmu_num_pages_for_size(size) as usize;
-        // RUZU_SMMU_PHYS_OFF=1 reverts to pointer-only physical resolution
-        // (A/B aid while the alias-page fallback is being validated).
-        let phys_fallback_enabled = !common::env_flag!("RUZU_SMMU_PHYS_OFF");
         for index in 0..num_pages {
             let page = start_page + index as u64;
             let current_vaddr = virtual_address.wrapping_add((index as u64) << SMMU_PAGE_BITS);
@@ -862,38 +991,18 @@ impl MaxwellDeviceMemoryManager {
                 );
                 continue;
             }
-            // Upstream CPU page-table pointers always live inside the
-            // DeviceMemory backing window, so the physical page is derived
-            // from the pointer. In ruzu some regions are populated with
-            // virtual-alias pointers (outside the backing window); for those,
-            // derive the physical page from the page table's device address
-            // instead — it is the same value upstream would compute.
-            let mut compressed = self.smmu_compressed_physical_for_host_address(host_ptr as usize);
-            if compressed == 0 && phys_fallback_enabled {
-                let phys_addr = {
-                    let memory = memory.lock().unwrap();
-                    memory.current_physical_address(current_vaddr)
-                };
-                if let Some(daddr) = phys_addr {
-                    let offset =
-                        daddr.wrapping_sub(ruzu_core::device_memory::dram_memory_map::BASE);
-                    let phys_page = (offset >> SMMU_PAGE_BITS) as usize;
-                    if phys_page < self.smmu_physical_page_count {
-                        compressed = phys_page as u32 + 1;
-                    }
-                }
-            }
-            self.smmu_map_device_page_compressed(
+            self.smmu_map_device_page(
                 page,
-                compressed,
+                host_ptr,
                 Some(CpuBacking {
                     asid,
                     virtual_address: current_vaddr,
                 }),
             );
         }
+        self.smmu_translation_cache.clear();
         if track {
-            self.smmu_track_continuity_registered(d_address, virtual_address, size, asid);
+            self.smmu_track_continuity_registered_impl(d_address, virtual_address, size, &memory);
         }
     }
 
@@ -903,8 +1012,10 @@ impl MaxwellDeviceMemoryManager {
     }
 
     fn smmu_compressed_physical_from_device_memory(&self, host_address: usize) -> Option<u32> {
-        let physical_base = *self.smmu_physical_base.lock().unwrap();
-        let physical_base = physical_base?;
+        let physical_base = self.smmu_physical_base.load(Ordering::Relaxed);
+        if physical_base == 0 {
+            return None;
+        }
         let raw_physical = host_address.checked_sub(physical_base)?;
         let physical_page = raw_physical >> SMMU_PAGE_BITS;
         if physical_page >= self.smmu_physical_page_count {
@@ -928,13 +1039,12 @@ impl MaxwellDeviceMemoryManager {
         if compressed_physical == 0 {
             return None;
         }
-        if let Some(physical_base) = *self.smmu_physical_base.lock().unwrap() {
-            let physical_page = compressed_physical - 1;
-            if (physical_page as usize) < self.smmu_physical_page_count {
-                return Some(
-                    physical_base + ((physical_page as usize) << SMMU_PAGE_BITS) + page_offset,
-                );
-            }
+        let physical_base = self.smmu_physical_base.load(Ordering::Relaxed);
+        let physical_page = compressed_physical - 1;
+        if physical_base != 0 && (physical_page as usize) < self.smmu_physical_page_count {
+            return Some(
+                physical_base + ((physical_page as usize) << SMMU_PAGE_BITS) + page_offset,
+            );
         }
         None
     }
@@ -942,14 +1052,13 @@ impl MaxwellDeviceMemoryManager {
     #[cfg(test)]
     fn smmu_force_compressed_physical_for_test(&self, device_page: u64, compressed_physical: u32) {
         self.smmu_compressed_physical_ptr
-            .lock()
-            .unwrap()
-            .insert(device_page, compressed_physical);
+            .store(device_page, compressed_physical);
     }
 
     #[cfg(test)]
     pub(crate) fn smmu_set_physical_base_for_test(&self, physical_base: usize) {
-        *self.smmu_physical_base.lock().unwrap() = Some(physical_base);
+        self.smmu_physical_base
+            .store(physical_base, Ordering::Relaxed);
     }
 
     fn smmu_map_internal(
@@ -963,27 +1072,27 @@ impl MaxwellDeviceMemoryManager {
         if size == 0 {
             return;
         }
+        let _mapping_guard = self.smmu_mapping_guard.lock().unwrap();
         let start_page = d_address >> SMMU_PAGE_BITS;
         let end_page = start_page + smmu_num_pages_for_size(size);
         if host_ptr.is_null() {
             self.smmu_clear_compressed_physical_without_invalidation(start_page, end_page);
+            self.smmu_translation_cache.clear();
             if track {
-                self.smmu_track_continuity(d_address, size);
+                self.smmu_track_continuity_impl(d_address, size);
             }
             return;
         }
         let host_base = host_ptr as usize;
         let d_base = start_page << SMMU_PAGE_BITS;
         {
-            let mut compressed_physical = self.smmu_compressed_physical_ptr.lock().unwrap();
             let mut reverse = self.smmu_reverse_mappings.lock().unwrap();
             for page in start_page..end_page {
                 let page_offset = (page << SMMU_PAGE_BITS) - d_base;
                 let host_address = host_base + page_offset as usize;
                 let new_compressed = self.smmu_compressed_physical_for_host_address(host_address);
-                if let Some(old_compressed) = compressed_physical.insert(page, new_compressed) {
-                    Self::smmu_reverse_remove(&mut reverse, old_compressed, page);
-                }
+                self.smmu_compressed_physical_ptr
+                    .store(page, new_compressed);
                 if new_compressed == 0 {
                     continue;
                 }
@@ -994,13 +1103,7 @@ impl MaxwellDeviceMemoryManager {
             let mut backing_table = self.smmu_cpu_backing.lock().unwrap();
             for page in start_page..end_page {
                 let page_offset = (page << SMMU_PAGE_BITS) - d_base;
-                let has_mapped_physical = self
-                    .smmu_compressed_physical_ptr
-                    .lock()
-                    .unwrap()
-                    .get(&page)
-                    .copied()
-                    .is_some_and(|compressed| compressed != 0);
+                let has_mapped_physical = self.smmu_compressed_physical_ptr.load(page) != 0;
                 if !has_mapped_physical {
                     backing_table.remove(&page);
                     continue;
@@ -1014,8 +1117,9 @@ impl MaxwellDeviceMemoryManager {
                 );
             }
         }
+        self.smmu_translation_cache.clear();
         if track {
-            self.smmu_track_continuity(d_address, size);
+            self.smmu_track_continuity_impl(d_address, size);
         }
     }
 
@@ -1026,10 +1130,7 @@ impl MaxwellDeviceMemoryManager {
         cpu_backing: Option<CpuBacking>,
     ) {
         if host_ptr.is_null() {
-            self.smmu_compressed_physical_ptr
-                .lock()
-                .unwrap()
-                .insert(page, 0);
+            self.smmu_compressed_physical_ptr.store(page, 0);
             return;
         }
 
@@ -1037,9 +1138,8 @@ impl MaxwellDeviceMemoryManager {
         self.smmu_map_device_page_compressed(page, new_compressed, cpu_backing);
     }
 
-    /// Same as `smmu_map_device_page` but with a precomputed compressed
-    /// physical page (used when the physical page is derived from the page
-    /// table's device address rather than the host pointer).
+    /// Apply the compressed physical-page and reverse-mapping updates shared
+    /// by the per-page `Map` path and reduced test fixtures.
     fn smmu_map_device_page_compressed(
         &self,
         page: u64,
@@ -1047,11 +1147,9 @@ impl MaxwellDeviceMemoryManager {
         cpu_backing: Option<CpuBacking>,
     ) {
         {
-            let mut compressed_physical = self.smmu_compressed_physical_ptr.lock().unwrap();
             let mut reverse = self.smmu_reverse_mappings.lock().unwrap();
-            if let Some(old_compressed) = compressed_physical.insert(page, new_compressed) {
-                Self::smmu_reverse_remove(&mut reverse, old_compressed, page);
-            }
+            self.smmu_compressed_physical_ptr
+                .store(page, new_compressed);
             if new_compressed != 0 {
                 reverse.insert(new_compressed - 1, page);
             }
@@ -1071,29 +1169,30 @@ impl MaxwellDeviceMemoryManager {
         // Upstream `Map`'s null-backing branch only writes
         // `compressed_physical_ptr[page] = 0` and continues. It does not run
         // the `Unmap` reverse-table or CPU-backing cleanup path.
-        let mut compressed_physical = self.smmu_compressed_physical_ptr.lock().unwrap();
         for page in start_page..end_page {
-            let _ = compressed_physical.remove(&page);
+            self.smmu_compressed_physical_ptr.store(page, 0);
         }
     }
 
     pub fn smmu_track_continuity(&self, d_address: DAddr, size: usize) {
-        if size == 0 {
-            return;
-        }
+        let _mapping_guard = self.smmu_mapping_guard.lock().unwrap();
+        self.smmu_track_continuity_impl(d_address, size);
+    }
+
+    fn smmu_track_continuity_impl(&self, d_address: DAddr, size: usize) {
         let start_page = d_address >> SMMU_PAGE_BITS;
         let end_page = start_page + smmu_num_pages_for_size(size);
-        let compressed_physical = self.smmu_compressed_physical_ptr.lock().unwrap();
         let mut continuity = self.smmu_continuity_tracker.lock().unwrap();
         let mut last_ptr = 0usize;
         let mut page_count = 1u32;
         for page in (start_page..end_page).rev() {
-            let new_ptr = compressed_physical
-                .get(&page)
-                .copied()
-                .and_then(|compressed| self.smmu_host_ptr_from_compressed_physical(compressed, 0))
+            let new_ptr = self
+                .smmu_host_ptr_from_compressed_physical(
+                    self.smmu_compressed_physical_ptr.load(page),
+                    0,
+                )
                 .unwrap_or(0);
-            if new_ptr + SMMU_PAGE_SIZE as usize == last_ptr {
+            if new_ptr.wrapping_add(SMMU_PAGE_SIZE as usize) == last_ptr {
                 page_count += 1;
             } else {
                 page_count = 1;
@@ -1110,9 +1209,6 @@ impl MaxwellDeviceMemoryManager {
         size: usize,
         asid: u32,
     ) {
-        if size == 0 {
-            return;
-        }
         let Some(memory) = self.smmu_registered_memory(asid) else {
             log::error!(
                 "SMMU continuity tracking requested with unregistered ASID {} at daddr=0x{:X} vaddr=0x{:X} size=0x{:X}",
@@ -1123,35 +1219,32 @@ impl MaxwellDeviceMemoryManager {
             );
             return;
         };
+        let _mapping_guard = self.smmu_mapping_guard.lock().unwrap();
+        self.smmu_track_continuity_registered_impl(d_address, virtual_address, size, &memory);
+    }
+
+    fn smmu_track_continuity_registered_impl(
+        &self,
+        d_address: DAddr,
+        virtual_address: u64,
+        size: usize,
+        memory: &Arc<Mutex<Memory>>,
+    ) {
         let start_page = d_address >> SMMU_PAGE_BITS;
         let num_pages = smmu_num_pages_for_size(size) as usize;
         let memory = memory.lock().unwrap();
         let mut continuity = self.smmu_continuity_tracker.lock().unwrap();
-        let mut last_physical_page = None;
+        let mut last_ptr = 0usize;
         let mut page_count = 1u32;
         for index in (0..num_pages).rev() {
             let current_vaddr = virtual_address.wrapping_add((index as u64) << SMMU_PAGE_BITS);
-            let host_ptr = memory.get_pointer_silent(current_vaddr) as usize;
-            let physical_page = self
-                .smmu_compressed_physical_from_device_memory(host_ptr)
-                .map(|compressed| (compressed - 1) as u64)
-                .or_else(|| {
-                    memory
-                        .current_physical_address(current_vaddr)
-                        .and_then(|address| {
-                            address.checked_sub(ruzu_core::device_memory::dram_memory_map::BASE)
-                        })
-                        .map(|offset| offset >> SMMU_PAGE_BITS)
-                });
-            if physical_page
-                .and_then(|page| page.checked_add(1))
-                .is_some_and(|next_page| Some(next_page) == last_physical_page)
-            {
+            let new_ptr = memory.get_pointer_silent(current_vaddr) as usize;
+            if new_ptr.wrapping_add(SMMU_PAGE_SIZE as usize) == last_ptr {
                 page_count += 1;
             } else {
                 page_count = 1;
             }
-            last_physical_page = physical_page;
+            last_ptr = new_ptr;
             continuity.insert(start_page + index as u64, page_count);
         }
     }
@@ -1184,7 +1277,12 @@ impl MaxwellDeviceMemoryManager {
     /// pointer to a physical address and fans out through `compressed_device_addr`;
     /// this port uses the sparse reverse host-page table populated by SMMU map.
     /// Returns the number of device aliases visited.
-    pub fn smmu_apply_op_on_host_pointer<F>(&self, host_ptr: *const u8, mut operation: F) -> usize
+    pub fn smmu_apply_op_on_host_pointer<F>(
+        &self,
+        host_ptr: *const u8,
+        scratch: &mut common::scratch_buffer::ScratchBuffer<u32>,
+        mut operation: F,
+    ) -> usize
     where
         F: FnMut(DAddr),
     {
@@ -1199,17 +1297,31 @@ impl MaxwellDeviceMemoryManager {
         else {
             return 0;
         };
-        let device_pages = self
+        // Upstream `ApplyOpOnPAddr` reads the single-alias entry directly and
+        // only serializes the multi-alias gather.  The Rust reverse table has
+        // its own mutex, so taking `mapping_guard` here is both redundant and
+        // incorrect: CPU memory reads reach this function while holding the
+        // process `Memory` mutex, whereas `Map` holds `mapping_guard` before
+        // resolving process-memory pointers. Taking both in the opposite
+        // order deadlocks (`Memory -> mapping_guard` versus
+        // `mapping_guard -> Memory`). Snapshot only the multi-alias list under
+        // the reverse table's lock; the common single-alias path does not
+        // allocate, matching upstream `ApplyOpOnPAddr`.
+        let single_page = self
             .smmu_reverse_mappings
             .lock()
             .unwrap()
-            .gather_device_pages_for_apply(compressed_physical - 1);
+            .gather_device_pages_for_apply(compressed_physical - 1, scratch);
 
-        for device_page in &device_pages {
-            operation((*device_page << SMMU_PAGE_BITS) + subbits);
+        if let Some(device_page) = single_page {
+            operation((u64::from(device_page) << SMMU_PAGE_BITS) + subbits);
+            return 1;
         }
 
-        device_pages.len()
+        for &device_page in scratch.iter() {
+            operation((u64::from(device_page) << SMMU_PAGE_BITS) + subbits);
+        }
+        scratch.size()
     }
 
     fn smmu_extract_cpu_backing(&self, device_page: u64) -> ExtractedCpuBacking {
@@ -1259,28 +1371,26 @@ impl MaxwellDeviceMemoryManager {
     /// not clear `continuity_tracker` here, so stale continuity counts are
     /// preserved until the next tracked map over the same pages.
     pub fn smmu_unmap(&self, d_address: DAddr, size: usize) {
-        if size == 0 {
-            return;
-        }
         let invalidate_region = self.invalidate_region.lock().unwrap().clone();
         if let Some(callback) = invalidate_region {
             callback(d_address, size);
         }
+        let _mapping_guard = self.smmu_mapping_guard.lock().unwrap();
         let start_page = d_address >> SMMU_PAGE_BITS;
         let end_page = start_page + smmu_num_pages_for_size(size);
-        let mut compressed_physical = self.smmu_compressed_physical_ptr.lock().unwrap();
         let mut reverse = self.smmu_reverse_mappings.lock().unwrap();
         for page in start_page..end_page {
-            if let Some(compressed) = compressed_physical.remove(&page) {
+            if let Some(compressed) = self.smmu_compressed_physical_ptr.clear(page) {
                 Self::smmu_reverse_remove(&mut reverse, compressed, page);
             }
         }
-        drop(compressed_physical);
         drop(reverse);
         let mut backing = self.smmu_cpu_backing.lock().unwrap();
         for page in start_page..end_page {
             backing.remove(&page);
         }
+        drop(backing);
+        self.smmu_translation_cache.clear();
     }
 
     /// Look up the host pointer for a device address via the SMMU page
@@ -1291,14 +1401,11 @@ impl MaxwellDeviceMemoryManager {
     pub fn smmu_get_host_ptr(&self, d_address: DAddr) -> Option<*const u8> {
         let page = d_address >> SMMU_PAGE_BITS;
         let page_offset = (d_address & (SMMU_PAGE_SIZE - 1)) as usize;
-        let compressed_physical = self.smmu_compressed_physical_ptr.lock().unwrap();
-        compressed_physical
-            .get(&page)
-            .copied()
-            .and_then(|compressed| {
-                self.smmu_host_ptr_from_compressed_physical(compressed, page_offset)
-            })
-            .map(|host_ptr| host_ptr as *const u8)
+        self.smmu_host_ptr_from_compressed_physical(
+            self.smmu_compressed_physical_ptr.load(page),
+            page_offset,
+        )
+        .map(|host_ptr| host_ptr as *const u8)
     }
 
     /// Return whether any page in a device-address range has backing memory.
@@ -1320,6 +1427,7 @@ impl MaxwellDeviceMemoryManager {
         false
     }
 
+    #[inline(never)]
     fn smmu_walk_block<F, U>(
         &self,
         d_address: DAddr,
@@ -1331,7 +1439,6 @@ impl MaxwellDeviceMemoryManager {
         F: FnMut(usize, usize, usize),
         U: FnMut(DAddr, usize, usize),
     {
-        let compressed_physical = self.smmu_compressed_physical_ptr.lock().unwrap();
         let continuity = self.smmu_continuity_tracker.lock().unwrap();
         let mut remaining = size;
         let mut buffer_offset = 0usize;
@@ -1342,11 +1449,8 @@ impl MaxwellDeviceMemoryManager {
         while remaining > 0 {
             let requested_pages = continuity.get(&page).copied().unwrap_or(1).max(1) as usize;
             let current_daddr = (page << SMMU_PAGE_BITS) + page_offset as u64;
-            let Some(base_compressed) = compressed_physical
-                .get(&page)
-                .copied()
-                .filter(|compressed| *compressed != 0)
-            else {
+            let base_compressed = self.smmu_compressed_physical_ptr.load(page);
+            if base_compressed == 0 {
                 let copy_amount =
                     ((requested_pages << SMMU_PAGE_BITS) - page_offset).min(remaining);
                 all_mapped = false;
@@ -1356,7 +1460,7 @@ impl MaxwellDeviceMemoryManager {
                 page += requested_pages as u64;
                 page_offset = 0;
                 continue;
-            };
+            }
 
             if let Some(base) = self.smmu_host_ptr_from_compressed_physical(base_compressed, 0) {
                 let bytes_in_span =
@@ -1389,11 +1493,16 @@ impl MaxwellDeviceMemoryManager {
     /// upstream-style continuity segments. Returns `true` if every segment was
     /// mapped.
     pub fn smmu_read_block(&self, d_address: DAddr, output: &mut [u8]) -> bool {
+        self.smmu_flush_region(d_address, output.len());
+        self.smmu_read_block_unsafe(d_address, output)
+    }
+
+    /// Forward `DeviceMemoryManager::FlushRegion` to its bound device interface.
+    pub fn smmu_flush_region(&self, d_address: DAddr, size: usize) {
         let flush_region = self.flush_region.lock().unwrap().clone();
         if let Some(callback) = flush_region {
-            callback(d_address, output.len());
+            callback(d_address, size);
         }
-        self.smmu_read_block_unsafe(d_address, output)
     }
 
     /// Read `output.len()` bytes from a device address without flushing.
@@ -1403,6 +1512,36 @@ impl MaxwellDeviceMemoryManager {
         if output.is_empty() {
             return true;
         }
+
+        let page_offset = (d_address & (SMMU_PAGE_SIZE - 1)) as usize;
+        if output.len() <= SMMU_PAGE_SIZE as usize - page_offset {
+            let guest_page = d_address & !(SMMU_PAGE_SIZE - 1);
+            if let Some(host_ptr) = self.smmu_translation_cache.find(guest_page) {
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        (host_ptr + page_offset) as *const u8,
+                        output.as_mut_ptr(),
+                        output.len(),
+                    );
+                }
+                return true;
+            }
+
+            let page = d_address >> SMMU_PAGE_BITS;
+            let compressed = self.smmu_compressed_physical_ptr.load(page);
+            if let Some(host_ptr) = self.smmu_host_ptr_from_compressed_physical(compressed, 0) {
+                self.smmu_translation_cache.insert(guest_page, host_ptr);
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        (host_ptr + page_offset) as *const u8,
+                        output.as_mut_ptr(),
+                        output.len(),
+                    );
+                }
+                return true;
+            }
+        }
+
         let output_len = output.len();
         let output_ptr = output.as_mut_ptr();
         let all_mapped = self.smmu_walk_block(
@@ -1437,11 +1576,16 @@ impl MaxwellDeviceMemoryManager {
     /// Port of upstream `Core::DeviceMemoryManager<Traits>::WriteBlock`.
     pub fn smmu_write_block(&self, d_address: DAddr, data: &[u8]) -> bool {
         let all_mapped = self.smmu_write_block_unsafe(d_address, data);
+        self.smmu_invalidate_region(d_address, data.len());
+        all_mapped
+    }
+
+    /// Forward `DeviceMemoryManager::InvalidateRegion` to its bound device interface.
+    pub fn smmu_invalidate_region(&self, d_address: DAddr, size: usize) {
         let invalidate_region = self.invalidate_region.lock().unwrap().clone();
         if let Some(callback) = invalidate_region {
-            callback(d_address, data.len());
+            callback(d_address, size);
         }
-        all_mapped
     }
 
     /// Write `data.len()` bytes from `data` to a device address without
@@ -1529,40 +1673,35 @@ impl MaxwellDeviceMemoryManager {
         let mut cache_begin: u64 = 0;
         let mut cache_bytes: u64 = 0;
 
-        // Callbacks carry a raw `*const Memory` (as usize, None for the test
-        // path) instead of the Arc<Mutex<Memory>> so the final loop can mark
-        // regions cached WITHOUT taking the Memory mutex — upstream
-        // MarkRegionCaching is lock-free, and locking here deadlocks against
-        // CPU cores that hold the Memory mutex during guest writes while
-        // invalidating the shader cache (this thread already holds the
-        // shader-cache lock via ShaderCache::register).
-        let mut callbacks: Vec<(Option<usize>, u64, usize, bool)> = Vec::new();
-        let counter_guard = ScopedRangeLock::new(&self.cached_pages_guard, addr, size as u64);
+        // Upstream holds `counter_guard` while it calls MarkRegionCaching and
+        // never materializes a callback list. Keep that lifecycle literally:
+        // the common path performs no heap allocation.
+        let _counter_guard = ScopedRangeLock::new(&self.cached_pages_guard, addr, size as u64);
 
-        fn flush_callbacks(
-            callbacks: &mut Vec<(Option<usize>, u64, usize, bool)>,
-            memory: &Option<usize>,
+        fn release_pending(
+            manager: &MaxwellDeviceMemoryManager,
+            memory: Option<usize>,
             uncache_begin: &mut u64,
             uncache_bytes: &mut u64,
             cache_begin: &mut u64,
             cache_bytes: &mut u64,
         ) {
             if *uncache_bytes > 0 {
-                callbacks.push((
-                    memory.clone(),
+                manager.mark_region_caching(
+                    memory,
                     *uncache_begin << PAGE_BITS,
                     *uncache_bytes as usize,
                     false,
-                ));
+                );
                 *uncache_bytes = 0;
             }
             if *cache_bytes > 0 {
-                callbacks.push((
-                    memory.clone(),
+                manager.mark_region_caching(
+                    memory,
                     *cache_begin << PAGE_BITS,
                     *cache_bytes as usize,
                     true,
-                ));
+                );
                 *cache_bytes = 0;
             }
         }
@@ -1575,9 +1714,9 @@ impl MaxwellDeviceMemoryManager {
         for page in page_begin..page_end {
             let backing = self.smmu_extract_cpu_backing(page);
             if backing.virtual_page == 0 {
-                flush_callbacks(
-                    &mut callbacks,
-                    &current_memory,
+                release_pending(
+                    self,
+                    current_memory,
                     &mut uncache_begin,
                     &mut uncache_bytes,
                     &mut cache_begin,
@@ -1586,9 +1725,9 @@ impl MaxwellDeviceMemoryManager {
                 continue;
             }
             if backing.asid != old_asid || backing.virtual_page != old_vpage.wrapping_add(1) {
-                flush_callbacks(
-                    &mut callbacks,
-                    &current_memory,
+                release_pending(
+                    self,
+                    current_memory,
                     &mut uncache_begin,
                     &mut uncache_bytes,
                     &mut cache_begin,
@@ -1617,12 +1756,12 @@ impl MaxwellDeviceMemoryManager {
                 uncache_bytes += PAGE_SIZE;
             } else if uncache_bytes > 0 {
                 // Non-zero count interrupts an in-progress uncache batch.
-                callbacks.push((
-                    current_memory.clone(),
+                self.mark_region_caching(
+                    current_memory,
                     uncache_begin << PAGE_BITS,
                     uncache_bytes as usize,
                     false,
-                ));
+                );
                 uncache_bytes = 0;
             }
 
@@ -1634,54 +1773,47 @@ impl MaxwellDeviceMemoryManager {
                 cache_bytes += PAGE_SIZE;
             } else if cache_bytes > 0 {
                 // Anything else interrupts the cache batch.
-                callbacks.push((
-                    current_memory.clone(),
+                self.mark_region_caching(
+                    current_memory,
                     cache_begin << PAGE_BITS,
                     cache_bytes as usize,
                     true,
-                ));
+                );
                 cache_bytes = 0;
             }
         }
 
-        flush_callbacks(
-            &mut callbacks,
-            &current_memory,
+        release_pending(
+            self,
+            current_memory,
             &mut uncache_begin,
             &mut uncache_bytes,
             &mut cache_begin,
             &mut cache_bytes,
         );
-        drop(counter_guard);
+    }
 
-        if callbacks.is_empty() {
-            return;
-        }
-        for (memory, address, size, caching) in callbacks {
-            if let Some(memory_raw) = memory {
-                // SAFETY: `memory_raw` points at the `Memory` value inside the
-                // `Arc<Mutex<Memory>>` held by the smmu process registry; the
-                // allocation is stable while the registration lives.
-                // `rasterizer_mark_region_cached` takes `&self` and only
-                // performs atomic page-entry stores plus fastmem mprotect, so
-                // calling it without the mutex matches upstream's lock-free
-                // GPU thread (shader-cache lock held) waited on the Memory
-                // mutex held by a CPU core whose guest write was waiting on
-                // the shader-cache lock via ShaderCache::invalidate_region.
-                unsafe {
-                    (*(memory_raw as *const Memory)).rasterizer_mark_region_cached(
-                        address,
-                        size as u64,
-                        caching,
-                    );
-                }
-            } else {
-                #[cfg(test)]
-                {
-                    let callback_guard = self.mark_region_caching.lock().unwrap();
-                    if let Some(callback) = callback_guard.as_ref() {
-                        callback(address, size, caching);
-                    }
+    /// Rust bridge for upstream `DeviceMethods::MarkRegionCaching`.
+    fn mark_region_caching(&self, memory: Option<usize>, address: u64, size: usize, caching: bool) {
+        if let Some(memory_raw) = memory {
+            // SAFETY: `memory_raw` points at the `Memory` value inside the
+            // `Arc<Mutex<Memory>>` held by the SMMU process registry; the
+            // allocation remains stable while that registration lives.
+            // Eden invokes MarkRegionCaching while holding `counter_guard` and
+            // does not acquire the process Memory mutex.
+            unsafe {
+                (*(memory_raw as *const Memory)).rasterizer_mark_region_cached(
+                    address,
+                    size as u64,
+                    caching,
+                );
+            }
+        } else {
+            #[cfg(test)]
+            {
+                let callback_guard = self.mark_region_caching.lock().unwrap();
+                if let Some(callback) = callback_guard.as_ref() {
+                    callback(address, size, caching);
                 }
             }
         }
@@ -1691,6 +1823,7 @@ impl MaxwellDeviceMemoryManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::buffer_cache::memory_tracker_base::MemoryTrackerBase;
     use common::page_table::{PageTable, PageType};
     use ruzu_core::core::SystemRef;
     use ruzu_core::device_memory::dram_memory_map;
@@ -1777,6 +1910,25 @@ mod tests {
         assert_eq!(
             *calls,
             vec![(0x1000, 0x1000, true), (0x1000, 0x1000, false)]
+        );
+    }
+
+    #[test]
+    fn memory_tracker_forwards_cached_page_updates_to_device_memory() {
+        let mgr = MaxwellDeviceMemoryManager::default();
+        let (cb, log) = recorder();
+        mgr.set_mark_region_caching(cb);
+        let backing = vec![0u8; 0x1000];
+        install_test_physical_base(&mgr, backing.as_ptr());
+        mgr.smmu_map_with_cpu_backing(0x2000, backing.as_ptr(), 0x2000, 0x1000, 3, true);
+
+        let mut memory_tracker = MemoryTrackerBase::new(&mgr);
+        memory_tracker.unmark_region_as_cpu_modified(0x2000, 0x80);
+        memory_tracker.mark_region_as_cpu_modified(0x2000, 0x80);
+
+        assert_eq!(
+            *log.lock().unwrap(),
+            vec![(0x2000, 0x1000, true), (0x2000, 0x1000, false)]
         );
     }
 
@@ -2074,21 +2226,17 @@ mod tests {
     }
 
     #[test]
-    fn smmu_map_does_not_merge_contiguous_aliases_of_discontiguous_physical_pages() {
+    fn smmu_map_does_not_merge_discontiguous_physical_pages() {
         let device_memory = DeviceMemory::with_size(0x10000);
         let mgr = MaxwellDeviceMemoryManager::new_with_device_memory(&device_memory);
         let first_target = dram_memory_map::BASE + 0x2000;
         let second_target = dram_memory_map::BASE + 0x5000;
-        let mut aliases = vec![0u8; 0x2000];
+        let first_host_ptr = unsafe { device_memory.get_pointer(first_target) };
+        let second_host_ptr = unsafe { device_memory.get_pointer(second_target) };
 
         unsafe {
-            std::ptr::write_bytes(device_memory.get_pointer(first_target), 0x11, 0x1000);
-            std::ptr::write_bytes(
-                device_memory.get_pointer(first_target + PAGE_SIZE),
-                0xEE,
-                0x1000,
-            );
-            std::ptr::write_bytes(device_memory.get_pointer(second_target), 0x22, 0x1000);
+            std::ptr::write_bytes(first_host_ptr, 0x11, 0x1000);
+            std::ptr::write_bytes(second_host_ptr, 0x22, 0x1000);
         }
 
         let mut memory = unsafe {
@@ -2105,14 +2253,14 @@ mod tests {
             1,
             first_target,
             PageType::Memory,
-            aliases.as_mut_ptr() as usize,
+            first_host_ptr as usize,
         );
         page_table.map_pages(
             0x4000_1000 >> PAGE_BITS,
             1,
             second_target,
             PageType::Memory,
-            unsafe { aliases.as_mut_ptr().add(PAGE_SIZE as usize) } as usize,
+            second_host_ptr as usize,
         );
         memory.set_current_page_table(&mut *page_table);
 
@@ -2334,7 +2482,7 @@ mod tests {
     }
 
     #[test]
-    fn smmu_reverse_mapping_remap_removes_old_host_page() {
+    fn smmu_reverse_mapping_remap_preserves_old_host_page_like_upstream() {
         let mgr = MaxwellDeviceMemoryManager::default();
         let backing = vec![0u8; 0x5000];
         let old_backing = backing.as_ptr();
@@ -2344,13 +2492,48 @@ mod tests {
         smmu_map_test_backing(&mgr, 0x8000, old_backing, 0x4000_0000, 0x1000);
         smmu_map_test_backing(&mgr, 0x8000, new_backing, 0x4000_3000, 0x1000);
 
-        assert!(mgr
-            .smmu_reverse_device_pages_for_test(old_backing)
-            .is_empty());
+        assert_eq!(
+            mgr.smmu_reverse_device_pages_for_test(old_backing),
+            vec![0x8]
+        );
         assert_eq!(
             mgr.smmu_reverse_device_pages_for_test(new_backing),
             vec![0x8]
         );
+    }
+
+    #[test]
+    fn smmu_reverse_mapping_repeated_map_keeps_duplicate_like_upstream() {
+        let mgr = MaxwellDeviceMemoryManager::default();
+        let backing = vec![0u8; 0x1000];
+        install_test_physical_base(&mgr, backing.as_ptr());
+
+        smmu_map_test_backing(&mgr, 0x8000, backing.as_ptr(), 0x4000_0000, 0x1000);
+        smmu_map_test_backing(&mgr, 0x8000, backing.as_ptr(), 0x4000_0000, 0x1000);
+        assert_eq!(
+            mgr.smmu_reverse_device_pages_for_test(backing.as_ptr()),
+            vec![0x8, 0x8]
+        );
+
+        mgr.smmu_unmap(0x8000, 0x1000);
+        assert_eq!(
+            mgr.smmu_reverse_device_pages_for_test(backing.as_ptr()),
+            vec![0x8]
+        );
+    }
+
+    #[test]
+    fn smmu_unmap_zero_size_still_invalidates_like_upstream() {
+        let mgr = MaxwellDeviceMemoryManager::default();
+        let invalidations = Arc::new(Mutex::new(Vec::new()));
+        let invalidations_clone = Arc::clone(&invalidations);
+        mgr.set_invalidate_region(Box::new(move |addr, size| {
+            invalidations_clone.lock().unwrap().push((addr, size));
+        }));
+
+        mgr.smmu_unmap(0x8000, 0);
+
+        assert_eq!(*invalidations.lock().unwrap(), vec![(0x8000, 0)]);
     }
 
     #[test]
@@ -2412,14 +2595,107 @@ mod tests {
         smmu_map_test_backing(&mgr, 0xA000, aligned_backing, 0x4000_0000, 0x2000);
 
         let mut addresses = Vec::new();
-        let count =
-            mgr.smmu_apply_op_on_host_pointer(unsafe { aligned_backing.add(0x123) }, |addr| {
+        let mut scratch = common::scratch_buffer::ScratchBuffer::new();
+        let count = mgr.smmu_apply_op_on_host_pointer(
+            unsafe { aligned_backing.add(0x123) },
+            &mut scratch,
+            |addr| {
                 addresses.push(addr);
-            });
+            },
+        );
 
         addresses.sort_unstable();
         assert_eq!(count, 2);
         assert_eq!(addresses, vec![0x8123, 0xA123]);
+        assert_eq!(scratch.size(), 2);
+    }
+
+    #[test]
+    fn smmu_apply_op_on_host_pointer_leaves_scratch_untouched_for_single_alias() {
+        let mgr = MaxwellDeviceMemoryManager::default();
+        let backing = vec![0u8; 0x4000];
+        let aligned_backing = ((backing.as_ptr() as usize + SMMU_PAGE_SIZE as usize - 1)
+            & !(SMMU_PAGE_SIZE as usize - 1)) as *const u8;
+        install_test_physical_base(&mgr, aligned_backing);
+        smmu_map_test_backing(&mgr, 0x8000, aligned_backing, 0x4000_0000, 0x1000);
+
+        let mut scratch = common::scratch_buffer::ScratchBuffer::with_capacity(3);
+        scratch[0] = 0xCAFE_BABE;
+        let mut addresses = Vec::new();
+        let count = mgr.smmu_apply_op_on_host_pointer(
+            unsafe { aligned_backing.add(0x123) },
+            &mut scratch,
+            |addr| addresses.push(addr),
+        );
+
+        assert_eq!(count, 1);
+        assert_eq!(addresses, vec![0x8123]);
+        assert_eq!(scratch.size(), 3);
+        assert_eq!(scratch[0], 0xCAFE_BABE);
+    }
+
+    #[test]
+    fn smmu_apply_op_on_host_pointer_does_not_wait_for_mapping_guard() {
+        let mgr = Arc::new(MaxwellDeviceMemoryManager::default());
+        let backing = vec![0u8; 0x4000];
+        let aligned_backing = ((backing.as_ptr() as usize + SMMU_PAGE_SIZE as usize - 1)
+            & !(SMMU_PAGE_SIZE as usize - 1)) as *const u8;
+        install_test_physical_base(&mgr, aligned_backing);
+        smmu_map_test_backing(&mgr, 0x8000, aligned_backing, 0x4000_0000, 0x1000);
+
+        // Eden's `ApplyOpOnPAddr` does not acquire `mapping_guard` for a
+        // single alias.  Holding it here also reproduces the ordering that
+        // deadlocked Bowser's Fury when a CPU memory read entered the apply
+        // path while another host thread was mapping memory.
+        let mapping_guard = mgr.smmu_mapping_guard.lock().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker_mgr = Arc::clone(&mgr);
+        let host_address = aligned_backing as usize;
+        let worker = std::thread::spawn(move || {
+            let mut addresses = Vec::new();
+            let mut scratch = common::scratch_buffer::ScratchBuffer::new();
+            let count = worker_mgr.smmu_apply_op_on_host_pointer(
+                (host_address + 0x80) as *const u8,
+                &mut scratch,
+                |addr| addresses.push(addr),
+            );
+            let _ = tx.send((count, addresses));
+        });
+
+        let result = rx.recv_timeout(std::time::Duration::from_secs(1));
+        drop(mapping_guard);
+        worker.join().unwrap();
+
+        assert_eq!(result.unwrap(), (1, vec![0x8080]));
+    }
+
+    #[test]
+    fn smmu_single_page_read_does_not_wait_for_mapping_guard() {
+        let mgr = Arc::new(MaxwellDeviceMemoryManager::default());
+        let backing = vec![0xA5u8; 0x4000];
+        let aligned_backing = ((backing.as_ptr() as usize + SMMU_PAGE_SIZE as usize - 1)
+            & !(SMMU_PAGE_SIZE as usize - 1)) as *const u8;
+        install_test_physical_base(&mgr, aligned_backing);
+        smmu_map_test_backing(&mgr, 0x8000, aligned_backing, 0x4000_0000, 0x1000);
+        mgr.smmu_translation_cache.clear();
+
+        // Eden serializes Map/Unmap with `mapping_guard`, but its
+        // `tracked_entries[page].compressed_physical_ptr` read is lock-free.
+        // Exercise a translation-cache miss while that writer guard is held.
+        let mapping_guard = mgr.smmu_mapping_guard.lock().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker_mgr = Arc::clone(&mgr);
+        let worker = std::thread::spawn(move || {
+            let mut output = [0u8; 4];
+            let mapped = worker_mgr.smmu_read_block_unsafe(0x8000, &mut output);
+            let _ = tx.send((mapped, output));
+        });
+
+        let result = rx.recv_timeout(std::time::Duration::from_secs(1));
+        drop(mapping_guard);
+        worker.join().unwrap();
+
+        assert_eq!(result.unwrap(), (true, [0xA5; 4]));
     }
 
     #[test]
@@ -2435,18 +2711,18 @@ mod tests {
 
         assert_eq!(
             mgr.smmu_compressed_physical_ptr
-                .lock()
-                .unwrap()
-                .get(&(0x8000 >> SMMU_PAGE_BITS)),
-            Some(&3)
+                .load(0x8000 >> SMMU_PAGE_BITS),
+            3
         );
         assert_eq!(mgr.get_pointer(0x8000), mapped as *mut u8);
         assert_eq!(mgr.smmu_reverse_device_pages_for_test(mapped), vec![0x8]);
 
         let mut addresses = Vec::new();
-        let count = mgr.smmu_apply_op_on_host_pointer(unsafe { mapped.add(0x80) }, |addr| {
-            addresses.push(addr);
-        });
+        let mut scratch = common::scratch_buffer::ScratchBuffer::new();
+        let count =
+            mgr.smmu_apply_op_on_host_pointer(unsafe { mapped.add(0x80) }, &mut scratch, |addr| {
+                addresses.push(addr)
+            });
         assert_eq!(count, 1);
         assert_eq!(addresses, vec![0x8080]);
     }
@@ -2457,9 +2733,9 @@ mod tests {
         let backing = vec![0u8; 0x1000];
 
         let mut called = false;
-        let count = mgr.smmu_apply_op_on_host_pointer(backing.as_ptr(), |_addr| {
-            called = true;
-        });
+        let mut scratch = common::scratch_buffer::ScratchBuffer::new();
+        let count = mgr
+            .smmu_apply_op_on_host_pointer(backing.as_ptr(), &mut scratch, |_addr| called = true);
 
         assert_eq!(count, 0);
         assert!(!called);
@@ -2474,10 +2750,14 @@ mod tests {
         mgr.smmu_set_physical_base_for_test(physical_base);
 
         let mut addresses = Vec::new();
-        let count =
-            mgr.smmu_apply_op_on_host_pointer((physical_base + 0x180) as *const u8, |addr| {
+        let mut scratch = common::scratch_buffer::ScratchBuffer::new();
+        let count = mgr.smmu_apply_op_on_host_pointer(
+            (physical_base + 0x180) as *const u8,
+            &mut scratch,
+            |addr| {
                 addresses.push(addr);
-            });
+            },
+        );
 
         assert_eq!(count, 1);
         assert_eq!(addresses, vec![0x180]);
@@ -2610,6 +2890,37 @@ mod tests {
         assert!(mgr.smmu_read_block(0x8004, &mut output));
         assert_eq!(*flushes.lock().unwrap(), vec![(0x8004, 4)]);
         assert_eq!(output, [0xA5; 4]);
+    }
+
+    #[test]
+    fn single_page_read_cache_is_cleared_by_remap_and_unmap() {
+        let mgr = MaxwellDeviceMemoryManager::default();
+        let mut backing = vec![0u8; 0x2000];
+        backing[0] = 0x11;
+        backing[0x1000] = 0x22;
+        install_test_physical_base(&mgr, backing.as_ptr());
+        smmu_map_test_backing(&mgr, 0x8000, backing.as_ptr(), 0x4000_0000, 0x1000);
+
+        let mut output = [0u8; 1];
+        assert!(mgr.smmu_read_block_unsafe(0x8000, &mut output));
+        assert_eq!(output, [0x11]);
+        assert_eq!(mgr.smmu_translation_cache.cursor.load(Ordering::Relaxed), 1);
+
+        smmu_map_test_backing(
+            &mgr,
+            0x8000,
+            unsafe { backing.as_ptr().add(0x1000) },
+            0x5000_0000,
+            0x1000,
+        );
+        assert_eq!(mgr.smmu_translation_cache.cursor.load(Ordering::Relaxed), 0);
+        assert!(mgr.smmu_read_block_unsafe(0x8000, &mut output));
+        assert_eq!(output, [0x22]);
+
+        mgr.smmu_unmap(0x8000, 0x1000);
+        assert_eq!(mgr.smmu_translation_cache.cursor.load(Ordering::Relaxed), 0);
+        assert!(!mgr.smmu_read_block_unsafe(0x8000, &mut output));
+        assert_eq!(output, [0]);
     }
 
     #[test]

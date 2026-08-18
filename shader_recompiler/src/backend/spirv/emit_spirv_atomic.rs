@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2025 ruzu contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! SPIR-V atomic operation emission — maps to zuyu's
+//! SPIR-V atomic operation emission — maps to upstream
 //! `backend/spirv/emit_spirv_atomic.cpp`.
 //!
 //! Handles atomic operations on shared memory and storage buffers (SSBOs).
@@ -36,7 +36,7 @@ fn shared_pointer_at(ctx: &mut SpirvEmitContext, offset: Word, index_offset: u32
             .i_add(ctx.u32_type, None, index, index_offset)
             .unwrap();
     }
-    let indices = if ctx.profile.support_explicit_workgroup_layout {
+    let indices = if ctx.uses_explicit_workgroup_layout {
         vec![ctx.const_zero_u32, index]
     } else {
         vec![index]
@@ -159,7 +159,7 @@ pub fn emit_shared_atomic_exchange_64(
     offset: Word,
     value: Word,
 ) -> Word {
-    if ctx.profile.support_int64_atomics && ctx.profile.support_explicit_workgroup_layout {
+    if ctx.profile.support_shared_int64_atomics && ctx.uses_explicit_workgroup_layout {
         let shift = ctx.constant_u32(3);
         let index = ctx
             .builder
@@ -894,13 +894,67 @@ mod tests {
         let profile = Profile {
             supported_spirv: 0x0001_0400,
             support_int64: true,
-            support_int64_atomics: true,
+            support_shared_int64_atomics: true,
             support_explicit_workgroup_layout: true,
             ..Profile::default()
         };
         let ctx = emit_exchange_64(profile);
         assert!(contains_opcode(&ctx, spirv::Op::AtomicExchange));
         assert_ne!(ctx.shared_memory_u64, 0);
+    }
+
+    /// Upstream gates the native path on `support_shared_int64_atomics`, not on
+    /// the buffer-side `support_int64_atomics`. A device offering only the
+    /// latter must take the non-atomic fallback.
+    #[test]
+    fn shared_exchange_64_ignores_buffer_only_int64_atomics() {
+        let profile = Profile {
+            supported_spirv: 0x0001_0400,
+            support_int64: true,
+            support_int64_atomics: true,
+            support_explicit_workgroup_layout: true,
+            ..Profile::default()
+        };
+        let ctx = emit_exchange_64(profile);
+        assert!(!contains_opcode(&ctx, spirv::Op::AtomicExchange));
+    }
+
+    /// Upstream reads the *effective* `uses_explicit_workgroup_layout`, which
+    /// also requires the 8-bit sub-capability when the program uses int8.
+    #[test]
+    fn shared_exchange_64_falls_back_without_workgroup_layout_8bit_access() {
+        let profile = Profile {
+            supported_spirv: 0x0001_0400,
+            support_int8: true,
+            support_int64: true,
+            support_shared_int64_atomics: true,
+            support_explicit_workgroup_layout: true,
+            support_workgroup_layout_8bit_access: false,
+            ..Profile::default()
+        };
+        let mut program = ir::Program::new(ShaderStage::Compute);
+        program.shared_memory_size = 64;
+        program.info.uses_int8 = true;
+        program.info.uses_int64 = true;
+        program.info.uses_int64_bit_atomics = true;
+        let mut ctx = SpirvEmitContext::new(&program, &profile, &RuntimeInfo::default());
+        ctx.define_global_variables(&program, &mut Bindings::default());
+        assert!(!ctx.uses_explicit_workgroup_layout);
+        ctx.builder
+            .begin_function(
+                ctx.void_type,
+                None,
+                spirv::FunctionControl::NONE,
+                ctx.void_fn_type,
+            )
+            .unwrap();
+        ctx.builder.begin_block(None).unwrap();
+        let offset = ctx.const_zero_u32;
+        let value = ctx.builder.undef(ctx.u64_type, None);
+        emit_shared_atomic_exchange_64(&mut ctx, offset, value);
+        ctx.builder.ret().unwrap();
+        ctx.builder.end_function().unwrap();
+        assert!(!contains_opcode(&ctx, spirv::Op::AtomicExchange));
     }
 
     #[test]

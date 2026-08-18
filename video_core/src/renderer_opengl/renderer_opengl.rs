@@ -6,9 +6,7 @@
 //! OpenGL GPU renderer — provides an alternative backend to Vulkan.
 //!
 use std::ffi::CStr;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock};
-use std::time::Instant;
+use std::sync::{Arc, OnceLock, RwLock};
 
 use log::{debug, info};
 use thiserror::Error;
@@ -25,19 +23,13 @@ use super::{
 };
 
 use crate::capture;
-use crate::engines::maxwell_3d::DrawCall;
-use crate::engines::Framebuffer;
 use crate::framebuffer_config::FramebufferConfig;
 use crate::host1x::syncpoint_manager::SyncpointManager;
 use crate::present::{PRESENT_FILTERS_FOR_APPLET_CAPTURE, PRESENT_FILTERS_FOR_DISPLAY};
 use crate::rasterizer_interface::RasterizerInterface;
 use crate::renderer_base::{RendererBase, RendererBaseData};
-use common::telemetry::{FieldType, FieldValue};
-use ruzu_core::frontend::framebuffer_layout::{
-    default_frame_layout, FramebufferLayout, ScreenUndocked,
-};
+use ruzu_core::frontend::framebuffer_layout::FramebufferLayout;
 use ruzu_core::frontend::graphics_context::GraphicsContext;
-use ruzu_core::telemetry_session::TelemetrySession;
 
 const GL_VERTEX_ATTRIB_ARRAY_UNIFIED_NV: u32 = 0x8F1E;
 const GL_ELEMENT_ARRAY_UNIFIED_NV: u32 = 0x8F1F;
@@ -72,6 +64,45 @@ fn gl_string(name: u32) -> String {
     }
 }
 
+/// Upstream anonymous-namespace `GetSource`.
+fn debug_source(source: u32) -> &'static str {
+    match source {
+        gl::DEBUG_SOURCE_API => "API",
+        gl::DEBUG_SOURCE_WINDOW_SYSTEM => "WINDOW_SYSTEM",
+        gl::DEBUG_SOURCE_SHADER_COMPILER => "SHADER_COMPILER",
+        gl::DEBUG_SOURCE_THIRD_PARTY => "THIRD_PARTY",
+        gl::DEBUG_SOURCE_APPLICATION => "APPLICATION",
+        gl::DEBUG_SOURCE_OTHER => "OTHER",
+        _ => {
+            log::error!("Unknown OpenGL debug source 0x{source:x}");
+            "Unknown source"
+        }
+    }
+}
+
+/// Upstream anonymous-namespace `GetType`.
+fn debug_type(gltype: u32) -> &'static str {
+    match gltype {
+        gl::DEBUG_TYPE_ERROR => "ERROR",
+        gl::DEBUG_TYPE_DEPRECATED_BEHAVIOR => "DEPRECATED_BEHAVIOR",
+        gl::DEBUG_TYPE_UNDEFINED_BEHAVIOR => "UNDEFINED_BEHAVIOR",
+        gl::DEBUG_TYPE_PORTABILITY => "PORTABILITY",
+        gl::DEBUG_TYPE_PERFORMANCE => "PERFORMANCE",
+        gl::DEBUG_TYPE_OTHER => "OTHER",
+        gl::DEBUG_TYPE_MARKER => "MARKER",
+        _ => {
+            log::error!("Unknown OpenGL debug type 0x{gltype:x}");
+            "Unknown type"
+        }
+    }
+}
+
+fn framebuffer_layout_for_present(
+    framebuffer_layout: &RwLock<FramebufferLayout>,
+) -> FramebufferLayout {
+    framebuffer_layout.read().unwrap().clone()
+}
+
 fn has_gl_extension(name: &str) -> bool {
     unsafe {
         let mut count = 0;
@@ -83,294 +114,10 @@ fn has_gl_extension(name: &str) -> bool {
     }
 }
 
-fn add_telemetry_fields(
-    telemetry_session: &mut TelemetrySession,
-    vendor: &str,
-    model: &str,
-    version: &str,
-) {
-    let field = FieldType::UserSystem;
-    telemetry_session.add_field(field, "GPU_Vendor", FieldValue::String(vendor.to_string()));
-    telemetry_session.add_field(field, "GPU_Model", FieldValue::String(model.to_string()));
-    telemetry_session.add_field(
-        field,
-        "GPU_OpenGL_Version",
-        FieldValue::String(version.to_string()),
-    );
-}
-
-static PRESENT_COUNT: AtomicU64 = AtomicU64::new(0);
-static PRESENT_TOTAL_US: AtomicU64 = AtomicU64::new(0);
-static PRESENT_MAX_US: AtomicU64 = AtomicU64::new(0);
-static PRESENT_MAKE_CURRENT_US: AtomicU64 = AtomicU64::new(0);
-static PRESENT_CAPTURE_US: AtomicU64 = AtomicU64::new(0);
-static PRESENT_SCREENSHOT_US: AtomicU64 = AtomicU64::new(0);
-static PRESENT_DRAW_SCREEN_US: AtomicU64 = AtomicU64::new(0);
-static PRESENT_TICK_FRAME_US: AtomicU64 = AtomicU64::new(0);
-static PRESENT_SWAP_BUFFERS_US: AtomicU64 = AtomicU64::new(0);
-static PRESENT_PPM_DUMPED: AtomicBool = AtomicBool::new(false);
-static PRESENT_PPM_CALL_COUNT: AtomicU64 = AtomicU64::new(0);
-
-fn present_profile_enabled() -> bool {
-    std::env::var_os("RUZU_PROFILE_PRESENT").is_some()
-}
-
-fn update_max(target: &AtomicU64, value: u64) {
-    let mut current = target.load(Ordering::Relaxed);
-    while value > current {
-        match target.compare_exchange_weak(current, value, Ordering::Relaxed, Ordering::Relaxed) {
-            Ok(_) => break,
-            Err(next) => current = next,
-        }
-    }
-}
-
-fn elapsed_us(start: Instant) -> u64 {
-    start.elapsed().as_micros().min(u128::from(u64::MAX)) as u64
-}
-
-fn emit_present_composite(
-    stage: u64,
-    frame: u64,
-    framebuffers: u64,
-    current_frame: u64,
-    draw_count: u64,
-    width: u64,
-    height: u64,
-    gl_error: u64,
-) {
-    if !common::trace::is_enabled(common::trace::cat::PRESENT_COMPOSITE) {
-        return;
-    }
-    let _ = common::trace::emit_raw(
-        common::trace::cat::PRESENT_COMPOSITE,
-        &[
-            stage,
-            frame,
-            framebuffers,
-            current_frame,
-            draw_count,
-            width,
-            height,
-            gl_error,
-        ],
-    );
-}
-
-fn dump_present_ppm_once(
-    current_frame: u64,
-    draw_count: u64,
-    layout: &FramebufferLayout,
-) -> Option<u64> {
-    let path = if let Some(path) = std::env::var_os("RUZU_DUMP_PRESENT_PPM") {
-        path
-    } else if let Some(dir) = std::env::var_os("RUZU_DUMP_PRESENT_PPM_DIR") {
-        let dir = std::path::PathBuf::from(dir);
-        if let Err(err) = std::fs::create_dir_all(&dir) {
-            log::warn!("[PRESENT_PPM] failed to create {}: {}", dir.display(), err);
-            return None;
-        }
-        dir.join("present.ppm").into_os_string()
-    } else {
-        return None;
-    };
-    let present_index = PRESENT_PPM_CALL_COUNT.fetch_add(1, Ordering::Relaxed);
-    let target_present_indices = std::env::var("RUZU_DUMP_PRESENT_PPM_INDICES")
-        .ok()
-        .map(|spec| {
-            spec.split(',')
-                .filter_map(|value| value.trim().parse::<u64>().ok())
-                .collect::<Vec<_>>()
-        });
-    let target_present_index = std::env::var("RUZU_DUMP_PRESENT_PPM_INDEX")
-        .ok()
-        .and_then(|value| value.parse::<u64>().ok());
-    let target_present_start = std::env::var("RUZU_DUMP_PRESENT_PPM_START")
-        .ok()
-        .and_then(|value| value.parse::<u64>().ok());
-    let target_present_end = std::env::var("RUZU_DUMP_PRESENT_PPM_END")
-        .ok()
-        .and_then(|value| value.parse::<u64>().ok());
-    let target_present_every = std::env::var("RUZU_DUMP_PRESENT_PPM_EVERY")
-        .ok()
-        .and_then(|value| value.parse::<u64>().ok());
-    let target_frame = std::env::var("RUZU_DUMP_PRESENT_PPM_FRAME")
-        .ok()
-        .and_then(|value| value.parse::<u64>().ok())
-        .unwrap_or(0);
-    let target_draw_indices = std::env::var("RUZU_DUMP_PRESENT_PPM_DRAW_INDICES")
-        .ok()
-        .map(|spec| {
-            spec.split(',')
-                .filter_map(|value| value.trim().parse::<u64>().ok())
-                .collect::<Vec<_>>()
-        });
-    let target_draw_min = std::env::var("RUZU_DUMP_PRESENT_PPM_DRAW_MIN")
-        .ok()
-        .and_then(|value| value.parse::<u64>().ok());
-    let target_draw_max = std::env::var("RUZU_DUMP_PRESENT_PPM_DRAW_MAX")
-        .ok()
-        .and_then(|value| value.parse::<u64>().ok());
-    let multi_index_match = target_present_indices
-        .as_ref()
-        .is_some_and(|indices| indices.contains(&present_index));
-    let range_index_match = target_present_start.is_some_and(|start| {
-        present_index >= start
-            && target_present_end.is_none_or(|end| present_index <= end)
-            && target_present_every
-                .is_none_or(|every| every != 0 && (present_index - start) % every == 0)
-    });
-    let draw_index_match = target_draw_indices
-        .as_ref()
-        .is_some_and(|indices| indices.contains(&draw_count));
-    let draw_range_match = target_draw_min.is_some_and(|min| draw_count >= min)
-        && target_draw_max.is_none_or(|max| draw_count <= max);
-    let draw_selector_active = target_draw_indices.is_some() || target_draw_min.is_some();
-    let draw_match = draw_index_match || draw_range_match;
-    if target_present_indices.is_some() && !multi_index_match {
-        return None;
-    }
-    if target_present_start.is_some() && !range_index_match {
-        return None;
-    }
-    if draw_selector_active && !draw_match {
-        return None;
-    }
-    if target_present_indices.is_none()
-        && target_present_start.is_none()
-        && !draw_selector_active
-        && (target_present_index.is_some_and(|target| present_index < target)
-            || (target_present_index.is_none() && current_frame < target_frame)
-            || PRESENT_PPM_DUMPED.swap(true, Ordering::Relaxed))
-    {
-        return None;
-    }
-    if layout.width == 0 || layout.height == 0 {
-        return None;
-    }
-    if std::env::var_os("RUZU_DUMP_PRESENT_PPM_LOG").is_some() {
-        eprintln!(
-            "[PRESENT_PPM_DUMP] present_index={} frame={} draw_count={} path={}",
-            present_index,
-            current_frame,
-            draw_count,
-            std::path::Path::new(&path).display()
-        );
-    }
-    let path = if draw_selector_active {
-        let mut output = std::path::PathBuf::from(&path);
-        let stem = output
-            .file_stem()
-            .and_then(|stem| stem.to_str())
-            .unwrap_or("present")
-            .to_string();
-        let ext = output
-            .extension()
-            .and_then(|ext| ext.to_str())
-            .unwrap_or("ppm")
-            .to_string();
-        output.set_file_name(format!("{stem}_{present_index}_draw_{draw_count}.{ext}"));
-        output.into_os_string()
-    } else if multi_index_match || range_index_match {
-        let mut output = std::path::PathBuf::from(&path);
-        let stem = output
-            .file_stem()
-            .and_then(|stem| stem.to_str())
-            .unwrap_or("present")
-            .to_string();
-        let ext = output
-            .extension()
-            .and_then(|ext| ext.to_str())
-            .unwrap_or("ppm")
-            .to_string();
-        output.set_file_name(format!("{stem}_{present_index}.{ext}"));
-        output.into_os_string()
-    } else {
-        path
-    };
-
-    unsafe {
-        let width = layout.width as usize;
-        let height = layout.height as usize;
-        let mut old_pack_buffer = 0;
-        let mut old_pack_alignment = 0;
-        let mut old_pack_row_length = 0;
-        gl::GetIntegerv(gl::PIXEL_PACK_BUFFER_BINDING, &mut old_pack_buffer);
-        gl::GetIntegerv(gl::PACK_ALIGNMENT, &mut old_pack_alignment);
-        gl::GetIntegerv(gl::PACK_ROW_LENGTH, &mut old_pack_row_length);
-        gl::BindBuffer(gl::PIXEL_PACK_BUFFER, 0);
-        gl::PixelStorei(gl::PACK_ALIGNMENT, 1);
-        gl::PixelStorei(gl::PACK_ROW_LENGTH, 0);
-
-        let mut rgba = vec![0u8; width * height * 4];
-        gl::ReadPixels(
-            0,
-            0,
-            width as i32,
-            height as i32,
-            gl::RGBA,
-            gl::UNSIGNED_BYTE,
-            rgba.as_mut_ptr() as *mut _,
-        );
-        let gl_error = gl::GetError();
-
-        gl::BindBuffer(gl::PIXEL_PACK_BUFFER, old_pack_buffer as u32);
-        gl::PixelStorei(gl::PACK_ALIGNMENT, old_pack_alignment);
-        gl::PixelStorei(gl::PACK_ROW_LENGTH, old_pack_row_length);
-
-        let mut ppm = Vec::with_capacity(width * height * 3 + 64);
-        ppm.extend_from_slice(format!("P6\n{} {}\n255\n", width, height).as_bytes());
-        for row in (0..height).rev() {
-            for px in rgba[row * width * 4..(row + 1) * width * 4].chunks_exact(4) {
-                ppm.extend_from_slice(&px[..3]);
-            }
-        }
-        match std::fs::write(&path, ppm) {
-            Ok(()) => info!(
-                "[PRESENT_PPM] wrote {} frame={} present_index={} gl_error=0x{:X}",
-                path.to_string_lossy(),
-                current_frame,
-                present_index,
-                gl_error
-            ),
-            Err(err) => log::warn!(
-                "[PRESENT_PPM] failed to write {}: {}",
-                path.to_string_lossy(),
-                err
-            ),
-        }
-    }
-    Some(present_index)
-}
-
-pub fn dump_present_profile() {
-    if !present_profile_enabled() {
-        return;
-    }
-    let count = PRESENT_COUNT.load(Ordering::Relaxed);
-    let total = PRESENT_TOTAL_US.load(Ordering::Relaxed);
-    let avg = if count != 0 { total / count } else { 0 };
-    eprintln!(
-        "[PRESENT_PROFILE] count={} total_us={} avg_us={} max_us={} make_current_us={} capture_us={} screenshot_us={} draw_screen_us={} tick_frame_us={} swap_buffers_us={}",
-        count,
-        total,
-        avg,
-        PRESENT_MAX_US.load(Ordering::Relaxed),
-        PRESENT_MAKE_CURRENT_US.load(Ordering::Relaxed),
-        PRESENT_CAPTURE_US.load(Ordering::Relaxed),
-        PRESENT_SCREENSHOT_US.load(Ordering::Relaxed),
-        PRESENT_DRAW_SCREEN_US.load(Ordering::Relaxed),
-        PRESENT_TICK_FRAME_US.load(Ordering::Relaxed),
-        PRESENT_SWAP_BUFFERS_US.load(Ordering::Relaxed),
-    );
-}
-
 #[derive(Debug, Error)]
 pub enum OpenGLError {
     #[error("OpenGL initialization failed: {0}")]
     InitFailed(String),
-    #[error("Shader compilation failed: {0}")]
-    ShaderCompileFailed(String),
     #[error("Required GL extension missing: {0}")]
     MissingExtension(String),
 }
@@ -403,8 +150,9 @@ pub struct RendererOpenGL {
     frame_displayed_notify: Arc<dyn Fn() + Send + Sync>,
     /// Common renderer state (frame count, FPS, screenshot settings).
     base_data: RendererBaseData,
-    /// Current framebuffer layout (window size + screen region).
-    framebuffer_layout: FramebufferLayout,
+    /// Frontend framebuffer layout used for upstream
+    /// `emu_window.GetFramebufferLayout()` on every composite.
+    framebuffer_layout: Arc<RwLock<FramebufferLayout>>,
     /// Graphics context for swap buffers / make current. It must outlive all
     /// OpenGL resources above.
     /// Upstream: `std::unique_ptr<Core::Frontend::GraphicsContext> context` in RendererBase.
@@ -421,9 +169,8 @@ impl RendererOpenGL {
     /// `load_fn` is used to load GL function pointers (typically SDL_GL_GetProcAddress).
     /// `context` is the graphics context used for swap buffers and thread binding.
     ///
-    /// Upstream: `RendererOpenGL::RendererOpenGL(telemetry, emu_window, device_memory, gpu, context)`
+    /// Upstream: `RendererOpenGL::RendererOpenGL(emu_window, device_memory, gpu, context)`
     pub fn new<F>(
-        telemetry_session: Option<&mut TelemetrySession>,
         mut load_fn: F,
         syncpoints: Arc<SyncpointManager>,
         device_memory: Arc<crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager>,
@@ -431,6 +178,7 @@ impl RendererOpenGL {
         strict_context_required: bool,
         mut context: Box<dyn GraphicsContext + Send>,
         shared_context_factory: Option<gl_shader_context::SharedContextFactory>,
+        framebuffer_layout: Arc<RwLock<FramebufferLayout>>,
         frame_end_notify: Arc<dyn Fn() + Send + Sync>,
         frame_displayed_notify: Arc<dyn Fn() + Send + Sync>,
     ) -> Result<Self, OpenGLError>
@@ -453,16 +201,6 @@ impl RendererOpenGL {
         let device =
             Box::new(Device::new(strict_context_required).map_err(OpenGLError::InitFailed)?);
         let device_ptr: *const Device = &*device;
-
-        let gl_version = gl_string(gl::VERSION);
-        let gpu_vendor = gl_string(gl::VENDOR);
-        let gpu_model = gl_string(gl::RENDERER);
-        info!("GL_VERSION: {}", gl_version);
-        info!("GL_VENDOR: {}", gpu_vendor);
-        info!("GL_RENDERER: {}", gpu_model);
-        if let Some(telemetry_session) = telemetry_session {
-            add_telemetry_fields(telemetry_session, &gpu_vendor, &gpu_model, &gl_version);
-        }
 
         let program_manager = ProgramManager::new_shared(&device);
 
@@ -496,30 +234,9 @@ impl RendererOpenGL {
         rasterizer.set_device_memory_reader(Arc::clone(&device_memory_reader));
         let rasterizer_ptr: *mut RasterizerOpenGL = &mut *rasterizer;
 
-        // Initialize blit screen pipeline after the rasterizer is heap-stable so
-        // present layers can store the same non-owning rasterizer reference as upstream.
-        let blit_screen = BlitScreen::new(
-            Arc::clone(&program_manager),
-            rasterizer_ptr,
-            state_tracker_ptr,
-            device_ptr,
-            Arc::clone(&device_memory_reader),
-            &PRESENT_FILTERS_FOR_DISPLAY,
-        )
-        .map_err(|e| OpenGLError::ShaderCompileFailed(e))?;
-        let blit_applet = BlitScreen::new(
-            Arc::clone(&program_manager),
-            rasterizer_ptr,
-            state_tracker_ptr,
-            device_ptr,
-            Arc::clone(&device_memory_reader),
-            &PRESENT_FILTERS_FOR_APPLET_CAPTURE,
-        )
-        .map_err(|e| OpenGLError::ShaderCompileFailed(e))?;
-
-        // Set up initial GL state (matching zuyu's RendererOpenGL constructor)
+        // Install the debug callback before constructing the presentation
+        // shaders, matching the first statement in Eden's constructor body.
         unsafe {
-            // Enable debug output if available
             if *common::settings::values().renderer_debug.get_value()
                 && has_gl_extension("GL_KHR_debug")
             {
@@ -528,7 +245,12 @@ impl RendererOpenGL {
                 gl::DebugMessageCallback(Some(gl_debug_callback), std::ptr::null());
                 debug!("OpenGL debug output enabled");
             }
+        }
 
+        Self::add_telemetry_fields();
+
+        // Set up initial GL state before constructing the presentation passes.
+        unsafe {
             // Initialize vertex attributes to (0, 0, 0, 1)
             let mut max_attribs: i32 = 0;
             gl::GetIntegerv(gl::MAX_VERTEX_ATTRIBS, &mut max_attribs);
@@ -556,15 +278,26 @@ impl RendererOpenGL {
                 enable_client_state(GL_VERTEX_ATTRIB_ARRAY_UNIFIED_NV);
                 enable_client_state(GL_ELEMENT_ARRAY_UNIFIED_NV);
             }
-
-            // Set clear color to black
-            gl::ClearColor(0.0, 0.0, 0.0, 1.0);
         }
 
-        info!(
-            "RendererOpenGL initialized: {} ({})",
-            device.renderer_name(),
-            device.vendor_name()
+        // Initialize the presentation passes after all constructor GL state,
+        // as Eden does. The rasterizer is already heap-stable, so layers may
+        // retain its non-owning pointer.
+        let blit_screen = BlitScreen::new(
+            Arc::clone(&program_manager),
+            rasterizer_ptr,
+            state_tracker_ptr,
+            device_ptr,
+            Arc::clone(&device_memory_reader),
+            &PRESENT_FILTERS_FOR_DISPLAY,
+        );
+        let blit_applet = BlitScreen::new(
+            Arc::clone(&program_manager),
+            rasterizer_ptr,
+            state_tracker_ptr,
+            device_ptr,
+            Arc::clone(&device_memory_reader),
+            &PRESENT_FILTERS_FOR_APPLET_CAPTURE,
         );
 
         // Create capture framebuffer and renderbuffer for applet capture layer.
@@ -599,9 +332,19 @@ impl RendererOpenGL {
             frame_end_notify,
             frame_displayed_notify,
             base_data: RendererBaseData::new(),
-            framebuffer_layout: default_frame_layout(ScreenUndocked::WIDTH, ScreenUndocked::HEIGHT),
+            framebuffer_layout,
             context,
         })
+    }
+
+    /// Upstream `RendererOpenGL::AddTelemetryFields`.
+    fn add_telemetry_fields() {
+        let gl_version = gl_string(gl::VERSION);
+        let gpu_vendor = gl_string(gl::VENDOR);
+        let gpu_model = gl_string(gl::RENDERER);
+        info!("GL_VERSION: {}", gl_version);
+        info!("GL_VENDOR: {}", gpu_vendor);
+        info!("GL_RENDERER: {}", gpu_model);
     }
 
     pub fn rasterizer_mut(&mut self) -> &mut RasterizerOpenGL {
@@ -623,143 +366,28 @@ impl RendererOpenGL {
     /// 8. context->SwapBuffers()
     /// 9. render_window.OnFrameDisplayed()
     pub fn composite_impl(&mut self, framebuffers: &[FramebufferConfig]) {
-        let profile = present_profile_enabled();
-        let total_start = if profile { Some(Instant::now()) } else { None };
-        let phase_start = if profile { Some(Instant::now()) } else { None };
+        // Upstream reads `emu_window.GetFramebufferLayout()` for every
+        // composite. The frontend updates this shared value on each resize.
+        let framebuffer_layout = framebuffer_layout_for_present(&self.framebuffer_layout);
         self.context.make_current();
-        if let Some(start) = phase_start {
-            PRESENT_MAKE_CURRENT_US.fetch_add(elapsed_us(start), Ordering::Relaxed);
-        }
-
-        if std::env::var_os("RUZU_TRACE_PRESENT").is_some() {
-            log::info!(
-                "[PRESENT] RendererOpenGL::composite_impl framebuffers={}",
-                framebuffers.len()
-            );
-        }
-        emit_present_composite(
-            0,
-            self.base_data.current_frame.max(0) as u64,
-            framebuffers.len() as u64,
-            self.base_data.current_frame.max(0) as u64,
-            self.rasterizer.total_draw_count(),
-            self.framebuffer_layout.width as u64,
-            self.framebuffer_layout.height as u64,
-            0,
-        );
 
         if framebuffers.is_empty() {
-            emit_present_composite(
-                1,
-                self.base_data.current_frame.max(0) as u64,
-                0,
-                self.base_data.current_frame.max(0) as u64,
-                self.rasterizer.total_draw_count(),
-                self.framebuffer_layout.width as u64,
-                self.framebuffer_layout.height as u64,
-                0,
-            );
             return;
         }
 
-        let phase_start = if profile { Some(Instant::now()) } else { None };
         self.render_applet_capture_layer(framebuffers);
-        if let Some(start) = phase_start {
-            PRESENT_CAPTURE_US.fetch_add(elapsed_us(start), Ordering::Relaxed);
-        }
-        let phase_start = if profile { Some(Instant::now()) } else { None };
         self.render_screenshot(framebuffers);
-        if let Some(start) = phase_start {
-            PRESENT_SCREENSHOT_US.fetch_add(elapsed_us(start), Ordering::Relaxed);
-        }
 
-        // Several Rust-side helper paths still bind framebuffers directly
-        // while upstream routes render-target state through StateTracker.
-        // Invalidate before binding the window framebuffer so BindFramebuffer(0)
-        // cannot be skipped because of a stale cached value.
-        {
-            self.state_tracker.notify_framebuffer();
-            self.state_tracker.bind_framebuffer(0);
-        }
-        let phase_start = if profile { Some(Instant::now()) } else { None };
+        self.state_tracker.bind_framebuffer(0);
         self.blit_screen
-            .draw_screen(framebuffers, &self.framebuffer_layout, false);
-        if let Some(start) = phase_start {
-            PRESENT_DRAW_SCREEN_US.fetch_add(elapsed_us(start), Ordering::Relaxed);
-        }
-        let draw_gl_error = if common::trace::is_enabled(common::trace::cat::PRESENT_COMPOSITE) {
-            unsafe { gl::GetError() as u64 }
-        } else {
-            0
-        };
-        emit_present_composite(
-            2,
-            self.base_data.current_frame.max(0) as u64,
-            framebuffers.len() as u64,
-            self.base_data.current_frame.max(0) as u64,
-            self.rasterizer.total_draw_count(),
-            self.framebuffer_layout.width as u64,
-            self.framebuffer_layout.height as u64,
-            draw_gl_error,
-        );
-        let dumped_present_index = dump_present_ppm_once(
-            self.base_data.current_frame.max(0) as u64,
-            self.rasterizer.total_draw_count(),
-            &self.framebuffer_layout,
-        );
-        if let Some(present_index) = dumped_present_index {
-            if std::env::var_os("RUZU_DUMP_PRESENT_EXTRA_ON_PPM").is_some() {
-                self.rasterizer
-                    .trace_present_images_by_gpu_addr_env(present_index);
-            }
-        }
+            .draw_screen(framebuffers, &framebuffer_layout, false);
 
         self.base_data.current_frame += 1;
 
         (self.frame_end_notify)();
-        let phase_start = if profile { Some(Instant::now()) } else { None };
         self.rasterizer.tick_frame();
-        if let Some(start) = phase_start {
-            PRESENT_TICK_FRAME_US.fetch_add(elapsed_us(start), Ordering::Relaxed);
-        }
 
-        let phase_start = if profile { Some(Instant::now()) } else { None };
-        emit_present_composite(
-            3,
-            self.base_data.current_frame.max(0) as u64,
-            framebuffers.len() as u64,
-            self.base_data.current_frame.max(0) as u64,
-            self.rasterizer.total_draw_count(),
-            self.framebuffer_layout.width as u64,
-            self.framebuffer_layout.height as u64,
-            0,
-        );
         self.context.swap_buffers();
-        emit_present_composite(
-            4,
-            self.base_data.current_frame.max(0) as u64,
-            framebuffers.len() as u64,
-            self.base_data.current_frame.max(0) as u64,
-            self.rasterizer.total_draw_count(),
-            self.framebuffer_layout.width as u64,
-            self.framebuffer_layout.height as u64,
-            0,
-        );
-        if let Some(start) = phase_start {
-            PRESENT_SWAP_BUFFERS_US.fetch_add(elapsed_us(start), Ordering::Relaxed);
-        }
-        if let Some(start) = total_start {
-            let total = elapsed_us(start);
-            PRESENT_COUNT.fetch_add(1, Ordering::Relaxed);
-            PRESENT_TOTAL_US.fetch_add(total, Ordering::Relaxed);
-            update_max(&PRESENT_MAX_US, total);
-        }
-        if std::env::var_os("RUZU_TRACE_PRESENT").is_some() {
-            log::info!(
-                "[PRESENT] RendererOpenGL::composite_impl swapped current_frame={}",
-                self.base_data.current_frame
-            );
-        }
         (self.frame_displayed_notify)();
     }
 
@@ -780,18 +408,8 @@ impl RendererOpenGL {
                 self.capture_renderbuffer.handle,
             );
 
-            let layout = FramebufferLayout {
-                width: capture::LINEAR_WIDTH,
-                height: capture::LINEAR_HEIGHT,
-                screen: ruzu_core::frontend::framebuffer_layout::Rectangle::new(
-                    0,
-                    0,
-                    capture::LINEAR_WIDTH,
-                    capture::LINEAR_HEIGHT,
-                ),
-                is_srgb: false,
-            };
-            self.blit_applet.draw_screen(framebuffers, &layout, true);
+            self.blit_applet
+                .draw_screen(framebuffers, &capture::LAYOUT, true);
 
             gl::BindFramebuffer(gl::READ_FRAMEBUFFER, old_read_fb as u32);
             gl::BindFramebuffer(gl::DRAW_FRAMEBUFFER, old_draw_fb as u32);
@@ -878,19 +496,6 @@ impl RendererOpenGL {
             gl::BindFramebuffer(gl::READ_FRAMEBUFFER, old_read_fb as u32);
             gl::BindFramebuffer(gl::DRAW_FRAMEBUFFER, old_draw_fb as u32);
         }
-    }
-
-    /// Render draw calls from the Maxwell 3D engine.
-    ///
-    /// This is the OpenGL equivalent of `RasterizerVulkan::render_draw_calls()`.
-    pub fn render_draw_calls(
-        &mut self,
-        draw_calls: &[DrawCall],
-        gpu_read: &dyn Fn(u64, &mut [u8]),
-        framebuffer: Option<Framebuffer>,
-    ) -> Option<Framebuffer> {
-        self.rasterizer
-            .render_draw_calls(draw_calls, gpu_read, framebuffer)
     }
 
     /// Get the device info.
@@ -1021,11 +626,7 @@ impl RendererBase for RendererOpenGL {
         // This matches upstream's ReadRasterizer() returning a raw pointer.
         // Cast through a trait reference to create a wide pointer.
         let trait_ref: &dyn RasterizerInterface = &*self.rasterizer;
-        let ptr = trait_ref as *const dyn RasterizerInterface as *mut dyn RasterizerInterface;
-        if std::env::var_os("RUZU_TRACE_RASTERIZER_BIND").is_some() {
-            log::info!("RendererOpenGL::read_rasterizer rasterizer_ptr={:p}", ptr);
-        }
-        ptr
+        trait_ref as *const dyn RasterizerInterface as *mut dyn RasterizerInterface
     }
 
     fn get_device_vendor(&self) -> String {
@@ -1041,22 +642,20 @@ impl RendererBase for RendererOpenGL {
     }
 
     fn refresh_base_settings(&mut self) {
-        // Port of `RendererBase::RefreshBaseSettings()` which calls
-        // `UpdateCurrentFramebufferLayout()`.
-        // Upstream: reads layout from render_window.GetFramebufferLayout()
-        // then calls render_window.UpdateCurrentFramebufferLayout(width, height).
-        // Without EmuWindow reference stored in the renderer, use current layout.
-        let layout = &self.framebuffer_layout;
-        if layout.width > 0 && layout.height > 0 {
-            self.framebuffer_layout = ruzu_core::frontend::framebuffer_layout::default_frame_layout(
-                layout.width,
-                layout.height,
-            );
-        }
+        crate::renderer_base::update_current_framebuffer_layout(&self.framebuffer_layout);
     }
 
     fn is_screenshot_pending(&self) -> bool {
         self.base_data.is_screenshot_pending()
+    }
+}
+
+fn gl_debug_level(severity: gl::types::GLenum) -> log::Level {
+    match severity {
+        gl::DEBUG_SEVERITY_HIGH => log::Level::Error,
+        gl::DEBUG_SEVERITY_MEDIUM => log::Level::Warn,
+        gl::DEBUG_SEVERITY_LOW | gl::DEBUG_SEVERITY_NOTIFICATION => log::Level::Debug,
+        _ => log::Level::Debug,
     }
 }
 
@@ -1076,80 +675,67 @@ extern "system" fn gl_debug_callback(
             .into_owned()
     };
 
-    let source_str = match source {
-        gl::DEBUG_SOURCE_API => "API",
-        gl::DEBUG_SOURCE_WINDOW_SYSTEM => "Window",
-        gl::DEBUG_SOURCE_SHADER_COMPILER => "Shader",
-        gl::DEBUG_SOURCE_THIRD_PARTY => "3rdParty",
-        gl::DEBUG_SOURCE_APPLICATION => "App",
-        _ => "Other",
-    };
+    let source_str = debug_source(source);
+    let type_str = debug_type(gltype);
 
-    let type_str = match gltype {
-        gl::DEBUG_TYPE_ERROR => "Error",
-        gl::DEBUG_TYPE_DEPRECATED_BEHAVIOR => "Deprecated",
-        gl::DEBUG_TYPE_UNDEFINED_BEHAVIOR => "UB",
-        gl::DEBUG_TYPE_PORTABILITY => "Portability",
-        gl::DEBUG_TYPE_PERFORMANCE => "Perf",
-        gl::DEBUG_TYPE_MARKER => "Marker",
-        _ => "Other",
-    };
-
-    match severity {
-        gl::DEBUG_SEVERITY_HIGH => {
-            log::error!("[GL {} {}] {}: {}", source_str, type_str, id, msg);
-        }
-        gl::DEBUG_SEVERITY_MEDIUM => {
-            log::warn!("[GL {} {}] {}: {}", source_str, type_str, id, msg);
-        }
-        gl::DEBUG_SEVERITY_LOW => {
-            debug!("[GL {} {}] {}: {}", source_str, type_str, id, msg);
-        }
-        _ => {
-            // NOTIFICATION severity — too noisy, skip
-        }
-    }
+    log::log!(
+        gl_debug_level(severity),
+        "{} {} {}: {}",
+        source_str,
+        type_str,
+        id,
+        msg
+    );
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use common::telemetry::{Field, VisitorInterface};
-    use std::collections::BTreeMap;
 
     #[test]
-    fn telemetry_fields_match_upstream_names() {
-        struct Collector(BTreeMap<String, FieldValue>);
+    fn composite_layout_observes_frontend_updates() {
+        use ruzu_core::frontend::framebuffer_layout::Rectangle;
 
-        impl VisitorInterface for Collector {
-            fn visit(&mut self, field: &Field) {
-                self.0
-                    .insert(field.get_name().to_string(), field.get_value().clone());
-            }
+        let layout = RwLock::new(FramebufferLayout {
+            width: 1280,
+            height: 720,
+            screen: Rectangle::new(0, 0, 1280, 720),
+            is_srgb: false,
+        });
+        *layout.write().unwrap() = FramebufferLayout {
+            width: 1280,
+            height: 674,
+            screen: Rectangle::new(40, 0, 1240, 674),
+            is_srgb: false,
+        };
 
-            fn complete(&mut self) {}
+        let observed = framebuffer_layout_for_present(&layout);
+        assert_eq!((observed.width, observed.height), (1280, 674));
+        assert_eq!(observed.screen.left, 40);
+        assert_eq!(observed.screen.right, 1240);
+    }
 
-            fn submit_testcase(&mut self) -> bool {
-                false
-            }
-        }
-
-        let mut session = TelemetrySession::new();
-        add_telemetry_fields(&mut session, "Mesa/X.org", "AMD Radeon", "4.6 Mesa 24.0");
-        let mut collector = Collector(BTreeMap::new());
-        session.field_collection().accept(&mut collector);
-
+    #[test]
+    fn debug_notifications_are_not_silently_discarded() {
+        assert_eq!(gl_debug_level(gl::DEBUG_SEVERITY_HIGH), log::Level::Error);
+        assert_eq!(gl_debug_level(gl::DEBUG_SEVERITY_MEDIUM), log::Level::Warn);
+        assert_eq!(gl_debug_level(gl::DEBUG_SEVERITY_LOW), log::Level::Debug);
         assert_eq!(
-            collector.0.get("GPU_Vendor"),
-            Some(&FieldValue::String("Mesa/X.org".to_string()))
+            gl_debug_level(gl::DEBUG_SEVERITY_NOTIFICATION),
+            log::Level::Debug
         );
         assert_eq!(
-            collector.0.get("GPU_Model"),
-            Some(&FieldValue::String("AMD Radeon".to_string()))
+            debug_source(gl::DEBUG_SOURCE_WINDOW_SYSTEM),
+            "WINDOW_SYSTEM"
         );
         assert_eq!(
-            collector.0.get("GPU_OpenGL_Version"),
-            Some(&FieldValue::String("4.6 Mesa 24.0".to_string()))
+            debug_source(gl::DEBUG_SOURCE_SHADER_COMPILER),
+            "SHADER_COMPILER"
         );
+        assert_eq!(
+            debug_type(gl::DEBUG_TYPE_UNDEFINED_BEHAVIOR),
+            "UNDEFINED_BEHAVIOR"
+        );
+        assert_eq!(debug_type(gl::DEBUG_TYPE_PERFORMANCE), "PERFORMANCE");
     }
 }

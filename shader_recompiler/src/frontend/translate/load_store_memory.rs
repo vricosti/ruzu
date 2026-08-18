@@ -6,6 +6,7 @@
 //! Implements LDG and STG (load/store global memory).
 
 use super::{field, TranslatorVisitor};
+use crate::ir::reg::Reg as IrReg;
 use crate::ir::value::Value;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -63,9 +64,9 @@ impl StoreSize {
 }
 
 fn address(tv: &mut TranslatorVisitor, insn: u64) -> Value {
-    let addr_reg = field(insn, 8, 8);
+    let addr_reg = IrReg::from_index(field(insn, 8, 8) as u8);
     let extended = field(insn, 45, 1) != 0;
-    let addr_offset = if addr_reg == 255 {
+    let addr_offset = if addr_reg.is_zero() {
         field(insn, 20, 24) as u64
     } else {
         let raw = field(insn, 20, 24);
@@ -78,15 +79,15 @@ fn address(tv: &mut TranslatorVisitor, insn: u64) -> Value {
     };
 
     let packed = if extended {
-        if addr_reg & 1 != 0 {
+        if !addr_reg.is_aligned(2) {
             panic!("Unaligned LDG/STG address register {}", addr_reg);
         }
-        let lo = tv.x(addr_reg);
-        let hi = tv.x(addr_reg + 1);
+        let lo = tv.x(addr_reg.index() as u32);
+        let hi = tv.x((addr_reg + 1).index() as u32);
         let vector = tv.ir.composite_construct_u32x2(lo, hi);
         tv.ir.pack_uint_2x32(vector)
     } else {
-        let lo = tv.x(addr_reg);
+        let lo = tv.x(addr_reg.index() as u32);
         let vector = tv.ir.composite_construct_u32x2(lo, Value::ImmU32(0));
         tv.ir.pack_uint_2x32(vector)
     };
@@ -102,49 +103,49 @@ fn address(tv: &mut TranslatorVisitor, insn: u64) -> Value {
 ///
 /// Upstream: `TranslatorVisitor::LDG(u64 insn)`
 pub fn ldg(tv: &mut TranslatorVisitor, insn: u64) {
-    let dst = tv.dst_reg(insn);
+    let dst = IrReg::from_index(tv.dst_reg(insn) as u8);
     let address = address(tv, insn);
     let size = LoadSize::from_bits(field(insn, 48, 3));
 
     match size {
         LoadSize::U8 => {
             let val = tv.ir.load_global_u8(address);
-            tv.set_x(dst, val);
+            tv.set_x(dst.index() as u32, val);
         }
         LoadSize::S8 => {
             let val = tv.ir.load_global_s8(address);
-            tv.set_x(dst, val);
+            tv.set_x(dst.index() as u32, val);
         }
         LoadSize::U16 => {
             let val = tv.ir.load_global_u16(address);
-            tv.set_x(dst, val);
+            tv.set_x(dst.index() as u32, val);
         }
         LoadSize::S16 => {
             let val = tv.ir.load_global_s16(address);
-            tv.set_x(dst, val);
+            tv.set_x(dst.index() as u32, val);
         }
         LoadSize::B32 => {
             let val = tv.ir.load_global_32(address);
-            tv.set_x(dst, val);
+            tv.set_x(dst.index() as u32, val);
         }
         LoadSize::B64 => {
-            if dst & 1 != 0 {
+            if !dst.is_aligned(2) {
                 panic!("Unaligned LDG data register {}", dst);
             }
             let vector = tv.ir.load_global_64(address);
             for index in 0..2 {
                 let val = tv.ir.composite_extract_u32x2(vector, Value::ImmU32(index));
-                tv.set_x(dst + index, val);
+                tv.set_x((dst + index as i32).index() as u32, val);
             }
         }
         LoadSize::B128 | LoadSize::U128 => {
-            if dst & 3 != 0 {
+            if !dst.is_aligned(4) {
                 panic!("Unaligned LDG data register {}", dst);
             }
             let vector = tv.ir.load_global_128(address);
             for index in 0..4 {
                 let val = tv.ir.composite_extract_u32x4(vector, Value::ImmU32(index));
-                tv.set_x(dst + index, val);
+                tv.set_x((dst + index as i32).index() as u32, val);
             }
         }
     }
@@ -157,48 +158,48 @@ pub fn ldg(tv: &mut TranslatorVisitor, insn: u64) {
 ///
 /// Upstream: `TranslatorVisitor::STG(u64 insn)`
 pub fn stg(tv: &mut TranslatorVisitor, insn: u64) {
-    let src_data_reg = tv.dst_reg(insn);
+    let src_data_reg = IrReg::from_index(tv.dst_reg(insn) as u8);
     let address = address(tv, insn);
     let size = StoreSize::from_bits(field(insn, 48, 3));
 
     match size {
         StoreSize::U8 => {
-            let data = tv.x(src_data_reg);
+            let data = tv.x(src_data_reg.index() as u32);
             tv.ir.write_global_u8(address, data);
         }
         StoreSize::S8 => {
-            let data = tv.x(src_data_reg);
+            let data = tv.x(src_data_reg.index() as u32);
             tv.ir.write_global_s8(address, data);
         }
         StoreSize::U16 => {
-            let data = tv.x(src_data_reg);
+            let data = tv.x(src_data_reg.index() as u32);
             tv.ir.write_global_u16(address, data);
         }
         StoreSize::S16 => {
-            let data = tv.x(src_data_reg);
+            let data = tv.x(src_data_reg.index() as u32);
             tv.ir.write_global_s16(address, data);
         }
         StoreSize::B32 => {
-            let data = tv.x(src_data_reg);
+            let data = tv.x(src_data_reg.index() as u32);
             tv.ir.write_global_32(address, data);
         }
         StoreSize::B64 => {
-            if src_data_reg & 1 != 0 {
+            if !src_data_reg.is_aligned(2) {
                 panic!("Unaligned STG data register {}", src_data_reg);
             }
-            let x = tv.x(src_data_reg);
-            let y = tv.x(src_data_reg + 1);
+            let x = tv.x(src_data_reg.index() as u32);
+            let y = tv.x((src_data_reg + 1).index() as u32);
             let vector = tv.ir.composite_construct_u32x2(x, y);
             tv.ir.write_global_64(address, vector);
         }
         StoreSize::B128 => {
-            if src_data_reg & 3 != 0 {
+            if !src_data_reg.is_aligned(4) {
                 panic!("Unaligned STG data register {}", src_data_reg);
             }
-            let x = tv.x(src_data_reg);
-            let y = tv.x(src_data_reg + 1);
-            let z = tv.x(src_data_reg + 2);
-            let w = tv.x(src_data_reg + 3);
+            let x = tv.x(src_data_reg.index() as u32);
+            let y = tv.x((src_data_reg + 1).index() as u32);
+            let z = tv.x((src_data_reg + 2).index() as u32);
+            let w = tv.x((src_data_reg + 3).index() as u32);
             let vector = tv.ir.composite_construct_u32x4(x, y, z, w);
             tv.ir.write_global_128(address, vector);
         }
@@ -348,5 +349,31 @@ mod tests {
         let opcodes = opcodes_emitted(&program);
         assert!(opcodes.contains(&Opcode::CompositeConstructU32x4));
         assert!(opcodes.contains(&Opcode::WriteGlobal128));
+    }
+
+    #[test]
+    fn stg_wide_from_rz_is_aligned_and_keeps_all_sources_zero() {
+        for size in [5, 6] {
+            let mut program = fresh_program();
+            let mut tv = TranslatorVisitor::new(&mut program, 0);
+
+            stg(&mut tv, encode_mem(255, 4, 0, true, size));
+
+            let opcodes = opcodes_emitted(&program);
+            let expected_write = if size == 5 {
+                Opcode::WriteGlobal64
+            } else {
+                Opcode::WriteGlobal128
+            };
+            assert!(opcodes.contains(&expected_write));
+            assert_eq!(
+                opcodes
+                    .iter()
+                    .filter(|opcode| **opcode == Opcode::GetRegister)
+                    .count(),
+                2,
+                "only the extended address pair should read registers"
+            );
+        }
     }
 }

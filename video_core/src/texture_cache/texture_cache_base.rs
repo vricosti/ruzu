@@ -15,9 +15,10 @@
 //! The template implementation lives in texture_cache.h (texture_cache.rs).
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::ops::{Deref, DerefMut};
 use std::sync::{Arc, Mutex};
 
-use common::hash::BuildIdentityHasher;
+use common::hash::{BuildIdentityHasher, BuildUnorderedDenseHasher};
 use common::lru_cache::LeastRecentlyUsedCache;
 use parking_lot::{Mutex as ParkingMutex, ReentrantMutex};
 use smallvec::SmallVec;
@@ -32,25 +33,22 @@ use crate::delayed_destruction_ring::DelayedDestructionRing;
 use crate::dirty_flags;
 use crate::engines::draw_manager::Maxwell3DAccess;
 use crate::engines::maxwell_3d::Maxwell3D;
-use crate::framebuffer_config::{BlendMode, FramebufferConfig};
 use crate::memory_manager::MemoryManager;
-use crate::rasterizer_interface::RasterizerDownloadArea;
 use crate::renderer_base::GuestMemoryWriter;
+use crate::textures::workers::ThreadWorker;
 
 use super::descriptor_table::DescriptorTable;
-use super::format_lookup_table::PixelFormat;
 use super::image_base::{
     GPUVAddr, ImageAllocBase, ImageBase, ImageFlagBits, ImageMapView, NullImageParams,
 };
-use super::image_view_base::{ImageViewBase, ImageViewFlagBits, NullImageViewParams};
-use super::image_view_info::{ImageViewInfo, SwizzleSource};
+use super::image_view_base::{ImageViewBase, NullImageViewParams};
 use super::render_targets::RenderTargets;
 use super::types::*;
 
 // ── Constants ──────────────────────────────────────────────────────────
 
 /// Address shift for caching images into a hash table.
-const YUZU_PAGEBITS: u64 = 20;
+pub(super) const YUZU_PAGEBITS: u64 = 20;
 
 // ── ImageViewInOut ─────────────────────────────────────────────────────
 
@@ -66,22 +64,14 @@ pub struct ImageViewInOut {
 
 /// Backend-independent result of `TextureCache<P>::TryFindFramebufferImageView`.
 ///
-/// Upstream returns `P::ImageView*` plus the rescale flag. The Rust cache still
-/// stores only `ImageViewBase`, so the OpenGL backend maps `view_id` to its
-/// backend image-view handle when that storage is available.
+/// Upstream returns `P::ImageView*` plus the rescale flag. Rust returns the
+/// stable typed-slot ID with a snapshot of its common base so callers do not
+/// retain a borrow across backend preparation.
 #[derive(Debug, Clone)]
 pub struct FramebufferImageView {
     pub view_id: ImageViewId,
     pub view: ImageViewBase,
     pub scaled: bool,
-}
-
-fn framebuffer_config_view_format(config: &FramebufferConfig) -> PixelFormat {
-    match config.pixel_format.0 {
-        4 => PixelFormat::R5G6B5Unorm,
-        5 => PixelFormat::B8G8R8A8Unorm,
-        _ => PixelFormat::A8B8G8R8Unorm,
-    }
 }
 
 pub type ImageDownloader =
@@ -103,6 +93,36 @@ pub struct AsyncDecodeOutput {
     pub copies: Vec<BufferImageCopy>,
 }
 
+/// State for an in-flight GPU block-linear 3D unswizzle.
+///
+/// Port of `TextureCache<P>::PendingUnswizzle`, including its backend-specific
+/// `AsyncBuffer` staging allocation.
+pub struct PendingUnswizzle<B = ()> {
+    pub image_id: ImageId,
+    pub info: super::image_info::ImageInfo,
+    pub current_offset: usize,
+    pub total_size: usize,
+    pub staging_buffer: Option<B>,
+    pub last_submitted_offset: usize,
+    pub bytes_per_slice: usize,
+    pub initialized: bool,
+}
+
+impl<B> PendingUnswizzle<B> {
+    pub(super) fn new(image_id: ImageId, info: super::image_info::ImageInfo) -> Self {
+        Self {
+            image_id,
+            info,
+            current_offset: 0,
+            total_size: 0,
+            staging_buffer: None,
+            last_submitted_offset: 0,
+            bytes_per_slice: 0,
+            initialized: false,
+        }
+    }
+}
+
 impl AsyncDecodeContext {
     pub fn new(image_id: ImageId) -> Self {
         Self {
@@ -121,7 +141,7 @@ impl AsyncDecodeContext {
 /// GPU page table: maps a 20-bit-shifted GPU address to a vec of image ids.
 ///
 /// Port of `VideoCommon::TextureCacheGPUMap`.
-pub type TextureCacheGPUMap = HashMap<u64, Vec<ImageId>, BuildIdentityHasher>;
+pub type TextureCacheGPUMap = HashMap<u64, Vec<ImageId>, BuildUnorderedDenseHasher>;
 
 // ── DescriptorSyncRegs ─────────────────────────────────────────────────
 
@@ -178,13 +198,9 @@ pub struct TextureCacheChannelInfo {
     // upstream's `DescriptorTable<T>{gpu_memory}` owner.
     pub graphics_image_table: DescriptorTable<crate::textures::texture::TicEntry>,
     pub graphics_sampler_table: DescriptorTable<crate::textures::texture::TscEntry>,
-    pub graphics_sampler_ids: Vec<SamplerId>,
-    pub graphics_image_view_ids: Vec<ImageViewId>,
 
     pub compute_image_table: DescriptorTable<crate::textures::texture::TicEntry>,
     pub compute_sampler_table: DescriptorTable<crate::textures::texture::TscEntry>,
-    pub compute_sampler_ids: Vec<SamplerId>,
-    pub compute_image_view_ids: Vec<ImageViewId>,
 
     // Per-channel caches. Upstream uses
     //   std::unordered_map<TICEntry, ImageViewId> image_views;
@@ -193,8 +209,10 @@ pub struct TextureCacheChannelInfo {
     // expose manual `Hash`+`PartialEq` impls over `raw`, so the Rust
     // `HashMap` keys them directly — same lookup semantics as upstream's
     // `try_emplace(descriptor)`.
-    pub image_views: HashMap<crate::textures::texture::TicEntry, ImageViewId>,
-    pub samplers: HashMap<crate::textures::texture::TscEntry, SamplerId>,
+    pub image_views: HashMap<crate::textures::texture::TicEntry, ImageViewId, BuildIdentityHasher>,
+    pub samplers: HashMap<crate::textures::texture::TscEntry, SamplerId, BuildIdentityHasher>,
+    pub sampler_ids: HashMap<u32, SamplerId, BuildUnorderedDenseHasher>,
+    pub image_view_ids: HashMap<u32, ImageViewId, BuildUnorderedDenseHasher>,
 
     pub gpu_page_table_index: Option<usize>,
     pub sparse_page_table_index: Option<usize>,
@@ -212,14 +230,12 @@ impl TextureCacheChannelInfo {
             },
             graphics_image_table: DescriptorTable::new(),
             graphics_sampler_table: DescriptorTable::new(),
-            graphics_sampler_ids: Vec::new(),
-            graphics_image_view_ids: Vec::new(),
             compute_image_table: DescriptorTable::new(),
             compute_sampler_table: DescriptorTable::new(),
-            compute_sampler_ids: Vec::new(),
-            compute_image_view_ids: Vec::new(),
-            image_views: HashMap::new(),
-            samplers: HashMap::new(),
+            image_views: HashMap::default(),
+            samplers: HashMap::default(),
+            sampler_ids: HashMap::default(),
+            image_view_ids: HashMap::default(),
             gpu_page_table_index: None,
             sparse_page_table_index: None,
         }
@@ -290,32 +306,383 @@ pub struct PendingDownload {
 pub struct JoinCopy {
     pub is_alias: bool,
     pub id: ImageId,
-    /// Rust backend-split adaptation: upstream consumes `join_copies_to_do`
-    /// synchronously inside `JoinImages`, so it reads `GpuModified` directly
-    /// from the overlap before any deferred refresh/delete boundary can mutate
-    /// flags. Ruzu queues the backend copy tail, therefore the decision must be
-    /// snapshotted at join time.
-    pub gpu_modified_at_join: bool,
-}
-
-#[derive(Debug, Clone)]
-pub struct PendingJoinCopies {
-    pub new_image_id: ImageId,
-    pub copies: Vec<JoinCopy>,
-    pub left_aliased_ids: Vec<ImageId>,
-    pub right_aliased_ids: Vec<ImageId>,
-    pub bad_overlap_ids: Vec<ImageId>,
-    pub alias_indices: HashMap<ImageId, usize>,
-    pub alias_relations_applied: bool,
-}
-
-#[derive(Debug, Clone)]
-pub struct PendingBackendDeletion {
-    pub image_id: ImageId,
-    pub image_view_ids: Vec<ImageViewId>,
 }
 
 // ── TextureCache<P> ────────────────────────────────────────────────────
+
+/// Backend policy used by upstream `TextureCache<P>`.
+///
+/// The associated types mirror `texture_cache_base.h`. Rust represents the
+/// C++ base-class subobject and backend payload next to each other in one slot;
+/// `Deref` exposes the common base to the templated cache implementation.
+pub trait TextureCacheParams {
+    type Runtime;
+    type Image;
+    type ImageAlloc;
+    type ImageView;
+    type Sampler;
+    type Framebuffer;
+    type FramebufferError;
+    type AsyncBuffer;
+    type BufferType;
+
+    const ENABLE_VALIDATION: bool;
+    const FRAMEBUFFER_BLITS: bool;
+    const HAS_EMULATED_COPIES: bool;
+    const HAS_DEVICE_MEMORY_INFO: bool;
+    const IMPLEMENTS_ASYNC_DOWNLOADS: bool;
+
+    /// Construct the concrete object that upstream inserts directly into
+    /// `SlotVector<Image>`.
+    fn create_image(
+        runtime: Option<&mut Self::Runtime>,
+        image_id: ImageId,
+        base: std::ptr::NonNull<ImageBase>,
+    ) -> Self::Image;
+
+    fn set_image_allocation_tick(image: &mut Self::Image, allocation_tick: u64);
+
+    /// Construct the concrete object that upstream inserts directly into
+    /// `SlotVector<ImageView>`.
+    fn create_image_view(
+        runtime: Option<&mut Self::Runtime>,
+        view_id: ImageViewId,
+        base: std::ptr::NonNull<ImageViewBase>,
+        image: Option<&Self::Image>,
+    ) -> Self::ImageView;
+
+    fn create_sampler(
+        runtime: Option<&mut Self::Runtime>,
+        config: &crate::textures::texture::TscEntry,
+    ) -> Self::Sampler;
+
+    /// Construct the concrete object inserted by upstream
+    /// `TextureCache<P>::GetFramebufferId`.
+    fn create_framebuffer(
+        runtime: Option<&mut Self::Runtime>,
+        color_buffers: [Option<std::ptr::NonNull<Self::ImageView>>; NUM_RT],
+        depth_buffer: Option<std::ptr::NonNull<Self::ImageView>>,
+        key: &RenderTargets,
+    ) -> Result<Self::Framebuffer, Self::FramebufferError>;
+
+    fn prepare_image_view(
+        cache: &mut TextureCacheBase<Self>,
+        image_view_id: ImageViewId,
+        is_modification: bool,
+        invalidate: bool,
+    ) where
+        Self: Sized;
+
+    /// Backend-owned `P::Image::ScaleUp` operation. Upstream keeps the
+    /// rescale decision, memory accounting and invalidation in the common
+    /// `TextureCache<P>::ScaleUp` method.
+    fn scale_up_image(cache: &mut TextureCacheBase<Self>, image_id: ImageId, ignore: bool) -> bool
+    where
+        Self: Sized;
+
+    /// Backend-owned `P::Image::ScaleDown` operation. See `scale_up_image`.
+    fn scale_down_image(
+        cache: &mut TextureCacheBase<Self>,
+        image_id: ImageId,
+        ignore: bool,
+    ) -> bool
+    where
+        Self: Sized;
+
+    /// Backend `Runtime::UploadStagingBuffer` primitive used by the common
+    /// `TextureCache<P>` upload paths.
+    fn upload_staging_buffer(
+        cache: &mut TextureCacheBase<Self>,
+        size: usize,
+        deferred: bool,
+    ) -> Self::AsyncBuffer
+    where
+        Self: Sized;
+
+    /// Mutable mapped span of the backend staging allocation.
+    fn staging_mapped_span(buffer: &mut Self::AsyncBuffer) -> &mut [u8];
+
+    /// Backend `Runtime::FreeDeferredStagingBuffer` primitive.
+    fn free_deferred_staging_buffer(
+        cache: &mut TextureCacheBase<Self>,
+        buffer: &mut Self::AsyncBuffer,
+    ) where
+        Self: Sized;
+
+    /// Backend `Runtime::CanUploadMSAA` primitive.
+    fn can_upload_msaa(cache: &TextureCacheBase<Self>) -> bool
+    where
+        Self: Sized;
+
+    /// Backend `Runtime::TransitionImageLayout` primitive.
+    fn transition_image_layout(cache: &mut TextureCacheBase<Self>, image_id: ImageId)
+    where
+        Self: Sized;
+
+    /// Backend `Image::UploadMemory` primitive.
+    fn upload_image(
+        cache: &mut TextureCacheBase<Self>,
+        image_id: ImageId,
+        staging: &Self::AsyncBuffer,
+        copies: &[BufferImageCopy],
+    ) where
+        Self: Sized;
+
+    /// Backend `Runtime::AccelerateImageUpload` primitive.
+    fn accelerate_image_upload(
+        cache: &mut TextureCacheBase<Self>,
+        image_id: ImageId,
+        staging: &Self::AsyncBuffer,
+        swizzles: &[SwizzleParameters],
+        z_start: u32,
+        z_count: u32,
+    ) where
+        Self: Sized;
+
+    /// Backend `Runtime::InsertUploadMemoryBarrier` primitive.
+    fn insert_upload_memory_barrier(cache: &mut TextureCacheBase<Self>)
+    where
+        Self: Sized;
+
+    /// Backend operation used by upstream `CopyImage`.
+    fn copy_image(
+        cache: &mut TextureCacheBase<Self>,
+        dst_id: ImageId,
+        src_id: ImageId,
+        copies: &[ImageCopy],
+    ) where
+        Self: Sized;
+
+    /// Backend operation used by the multisample branch of upstream
+    /// `TextureCache<P>::JoinImages`.
+    fn copy_image_msaa(
+        cache: &mut TextureCacheBase<Self>,
+        dst_id: ImageId,
+        src_id: ImageId,
+        copies: &[ImageCopy],
+    ) where
+        Self: Sized;
+}
+
+/// Rust representation of an upstream backend class inheriting `ImageBase`.
+/// The common and backend portions occupy one slot and therefore share one
+/// publication/destruction lifecycle.
+#[derive(Debug)]
+pub struct ImageSlot<B = ()> {
+    /// The derived/backend portion is declared first so Rust drops it before
+    /// the boxed base, matching C++ derived-destructor then base-destructor
+    /// ordering.
+    pub backend: Option<B>,
+    /// Stable allocation corresponding to the `ImageBase` subobject inherited
+    /// by upstream `P::Image`. Backend payloads may keep a non-owning pointer
+    /// to it while the complete slot moves through slot vectors and delayed
+    /// destruction rings.
+    pub base: Box<ImageBase>,
+}
+
+impl<B> ImageSlot<B> {
+    pub fn pending(base: ImageBase) -> Self {
+        Self {
+            backend: None,
+            base: Box::new(base),
+        }
+    }
+}
+
+impl<B> Deref for ImageSlot<B> {
+    type Target = ImageBase;
+
+    fn deref(&self) -> &Self::Target {
+        self.base.as_ref()
+    }
+}
+
+impl<B> DerefMut for ImageSlot<B> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.base.as_mut()
+    }
+}
+
+impl<B> From<ImageBase> for ImageSlot<B> {
+    fn from(value: ImageBase) -> Self {
+        Self::pending(value)
+    }
+}
+
+#[derive(Debug)]
+pub struct ImageViewSlot<B = ()> {
+    /// Drop the derived/backend portion before its base subobject.
+    pub backend: Option<B>,
+    /// Stable allocation corresponding to upstream's inherited
+    /// `ImageViewBase` subobject. See `ImageSlot::base`.
+    pub base: Box<ImageViewBase>,
+}
+
+impl<B> ImageViewSlot<B> {
+    pub fn pending(base: ImageViewBase) -> Self {
+        Self {
+            backend: None,
+            base: Box::new(base),
+        }
+    }
+}
+
+impl<B> Deref for ImageViewSlot<B> {
+    type Target = ImageViewBase;
+
+    fn deref(&self) -> &Self::Target {
+        self.base.as_ref()
+    }
+}
+
+impl<B> DerefMut for ImageViewSlot<B> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.base.as_mut()
+    }
+}
+
+impl<B> From<ImageViewBase> for ImageViewSlot<B> {
+    fn from(value: ImageViewBase) -> Self {
+        Self::pending(value)
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ImageAllocSlot<B = ()> {
+    pub base: ImageAllocBase,
+    pub backend: Option<B>,
+}
+
+impl<B> Deref for ImageAllocSlot<B> {
+    type Target = ImageAllocBase;
+
+    fn deref(&self) -> &Self::Target {
+        &self.base
+    }
+}
+
+impl<B> DerefMut for ImageAllocSlot<B> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.base
+    }
+}
+
+impl<B> From<ImageAllocBase> for ImageAllocSlot<B> {
+    fn from(value: ImageAllocBase) -> Self {
+        Self {
+            base: value,
+            backend: None,
+        }
+    }
+}
+
+pub struct SamplerSlot<B = ()> {
+    pub config: crate::textures::texture::TscEntry,
+    pub backend: Option<B>,
+}
+
+impl<B> From<crate::textures::texture::TscEntry> for SamplerSlot<B> {
+    fn from(value: crate::textures::texture::TscEntry) -> Self {
+        Self {
+            config: value,
+            backend: None,
+        }
+    }
+}
+
+impl<B> Deref for SamplerSlot<B> {
+    type Target = crate::textures::texture::TscEntry;
+
+    fn deref(&self) -> &Self::Target {
+        &self.config
+    }
+}
+
+/// Backend-neutral policy retained for common-cache unit tests.
+pub struct CommonTextureCacheParams;
+
+impl TextureCacheParams for CommonTextureCacheParams {
+    type Runtime = ();
+    type Image = ();
+    type ImageAlloc = ();
+    type ImageView = ();
+    type Sampler = ();
+    type Framebuffer = ();
+    type FramebufferError = std::convert::Infallible;
+    type AsyncBuffer = ();
+    type BufferType = ();
+
+    const ENABLE_VALIDATION: bool = true;
+    const FRAMEBUFFER_BLITS: bool = false;
+    const HAS_EMULATED_COPIES: bool = false;
+    const HAS_DEVICE_MEMORY_INFO: bool = false;
+    const IMPLEMENTS_ASYNC_DOWNLOADS: bool = false;
+
+    fn create_image(_: Option<&mut ()>, _: ImageId, _: std::ptr::NonNull<ImageBase>) {}
+
+    fn set_image_allocation_tick(_: &mut (), _: u64) {}
+
+    fn create_image_view(
+        _: Option<&mut ()>,
+        _: ImageViewId,
+        _: std::ptr::NonNull<ImageViewBase>,
+        _: Option<&()>,
+    ) {
+    }
+
+    fn create_sampler(_: Option<&mut ()>, _: &crate::textures::texture::TscEntry) {}
+
+    fn create_framebuffer(
+        _: Option<&mut ()>,
+        _: [Option<std::ptr::NonNull<()>>; NUM_RT],
+        _: Option<std::ptr::NonNull<()>>,
+        _: &RenderTargets,
+    ) -> Result<(), std::convert::Infallible> {
+        Ok(())
+    }
+
+    fn prepare_image_view(_: &mut TextureCacheBase<Self>, _: ImageViewId, _: bool, _: bool) {}
+
+    fn scale_up_image(_: &mut TextureCacheBase<Self>, _: ImageId, _: bool) -> bool {
+        false
+    }
+
+    fn scale_down_image(_: &mut TextureCacheBase<Self>, _: ImageId, _: bool) -> bool {
+        false
+    }
+
+    fn upload_staging_buffer(_: &mut TextureCacheBase<Self>, _: usize, _: bool) {}
+
+    fn staging_mapped_span(_: &mut ()) -> &mut [u8] {
+        &mut []
+    }
+
+    fn free_deferred_staging_buffer(_: &mut TextureCacheBase<Self>, _: &mut ()) {}
+
+    fn can_upload_msaa(_: &TextureCacheBase<Self>) -> bool {
+        true
+    }
+
+    fn transition_image_layout(_: &mut TextureCacheBase<Self>, _: ImageId) {}
+
+    fn upload_image(_: &mut TextureCacheBase<Self>, _: ImageId, _: &(), _: &[BufferImageCopy]) {}
+
+    fn accelerate_image_upload(
+        _: &mut TextureCacheBase<Self>,
+        _: ImageId,
+        _: &(),
+        _: &[SwizzleParameters],
+        _: u32,
+        _: u32,
+    ) {
+    }
+
+    fn insert_upload_memory_barrier(_: &mut TextureCacheBase<Self>) {}
+
+    fn copy_image(_: &mut TextureCacheBase<Self>, _: ImageId, _: ImageId, _: &[ImageCopy]) {}
+
+    fn copy_image_msaa(_: &mut TextureCacheBase<Self>, _: ImageId, _: ImageId, _: &[ImageCopy]) {}
+}
 
 /// Memory thresholds (from upstream `TextureCache` template).
 const TARGET_THRESHOLD: i64 = 4 * 1024 * 1024 * 1024; // 4 GiB
@@ -331,31 +698,38 @@ const UNSET_CHANNEL: usize = usize::MAX;
 /// `P` in upstream is a policy class providing associated types
 /// (`Runtime`, `Image`, `ImageView`, `Sampler`, `Framebuffer`, etc.).
 ///
-/// This Rust version uses concrete placeholder types for now;
-/// the generic parameter approach will be refined as backend types are ported.
-pub struct TextureCacheBase {
+pub struct TextureCacheBase<P: TextureCacheParams = CommonTextureCacheParams> {
     // Slot storage
-    pub slot_images: SlotVector<ImageBase>,
+    pub slot_images: SlotVector<ImageSlot<P::Image>>,
     pub slot_map_views: SlotVector<ImageMapView>,
-    pub slot_image_views: SlotVector<ImageViewBase>,
-    pub slot_image_allocs: SlotVector<ImageAllocBase>,
-    /// Slot pool of TSC descriptors keyed by `SamplerId`. Upstream stores
-    /// `P::Sampler` directly (the backend type); ruzu separates the
-    /// abstract `TscEntry` here from the backend `Sampler` which lives in
-    /// the GL wrapper's `HashMap<SamplerId, Sampler>`. Mirrors the
-    /// `slot_images` / `slot_image_views` split.
-    pub slot_samplers: SlotVector<crate::textures::texture::TscEntry>,
+    pub slot_image_views: SlotVector<ImageViewSlot<P::ImageView>>,
+    pub slot_image_allocs: SlotVector<ImageAllocSlot<P::ImageAlloc>>,
+    pub slot_samplers: SlotVector<SamplerSlot<P::Sampler>>,
+    pub slot_framebuffers: SlotVector<P::Framebuffer>,
     pub slot_buffer_downloads: SlotVector<BufferDownload>,
-    // slot_framebuffers: concrete backend objects are still owned by renderer backends.
+
+    // TODO: Upstream notes that this async-download storage should be reworked.
+    pub uncommitted_async_buffers: Vec<P::AsyncBuffer>,
+    pub async_buffers: VecDeque<Vec<P::AsyncBuffer>>,
+    pub async_buffers_death_ring: VecDeque<P::AsyncBuffer>,
 
     // Render state
     pub render_targets: RenderTargets,
+    pub render_targets_serial: u64,
+    pub rt_active_mask: u32,
+    pub rt_image_id: [ImageId; 8],
+    pub rt_depth_image_id: ImageId,
+    pub texture_bindings_serial: u64,
+    pub last_feedback_loop_serial: u64,
+    pub last_feedback_texture_serial: u64,
+    pub last_feedback_loop_result: bool,
+    pub last_framebuffer_id: FramebufferId,
+    pub last_framebuffer_serial: u64,
     /// Upstream keys cached framebuffers by the full `RenderTargets` object.
-    pub framebuffers: HashMap<RenderTargets, FramebufferId>,
-
+    pub framebuffers: HashMap<RenderTargets, FramebufferId, BuildUnorderedDenseHasher>,
     // Page tables
-    pub page_table: HashMap<u64, Vec<ImageMapId>, BuildIdentityHasher>,
-    pub sparse_views: HashMap<ImageId, Vec<ImageMapId>>,
+    pub page_table: HashMap<u64, Vec<ImageMapId>, BuildUnorderedDenseHasher>,
+    pub sparse_views: HashMap<ImageId, Vec<ImageMapId>, BuildUnorderedDenseHasher>,
 
     // Memory tracking
     pub has_deleted_images: bool,
@@ -365,11 +739,12 @@ pub struct TextureCacheBase {
     pub expected_memory: u64,
     pub critical_memory: u64,
     /// Upstream: `Common::LeastRecentlyUsedCache<LRUItemParams> lru_cache`.
-    pub lru_cache: LeastRecentlyUsedCache<ImageId, i64>,
+    pub lru_cache: LeastRecentlyUsedCache<ImageId, u64>,
     /// Upstream: `DelayedDestructionRing<Image, TICKS_TO_DESTROY> sentenced_images`.
-    pub sentenced_images: DelayedDestructionRing<ImageBase, TICKS_TO_DESTROY>,
+    pub sentenced_images: DelayedDestructionRing<ImageSlot<P::Image>, TICKS_TO_DESTROY>,
     /// Upstream: `DelayedDestructionRing<ImageView, TICKS_TO_DESTROY> sentenced_image_view`.
-    pub sentenced_image_view: DelayedDestructionRing<ImageViewBase, TICKS_TO_DESTROY>,
+    pub sentenced_image_view: DelayedDestructionRing<ImageViewSlot<P::ImageView>, TICKS_TO_DESTROY>,
+    pub sentenced_framebuffers: DelayedDestructionRing<P::Framebuffer, TICKS_TO_DESTROY>,
     pub has_broken_texture_view_formats: bool,
     pub has_native_bgr: bool,
 
@@ -380,33 +755,32 @@ pub struct TextureCacheBase {
     // Modification tick
     pub modification_tick: u64,
     pub frame_tick: u64,
+    pub sampler_heap_budget: Option<usize>,
+    pub last_sampler_gc_frame: u64,
 
     // Async decode
     pub async_decodes: Vec<Arc<AsyncDecodeContext>>,
+    pub texture_decode_worker: ThreadWorker,
+
+    // Async GPU unswizzle
+    pub gpu_unswizzle_maxsize: usize,
+    pub swizzle_chunk_size: usize,
+    pub swizzle_slices_per_batch: u32,
+    pub unswizzle_queue: VecDeque<PendingUnswizzle<P::AsyncBuffer>>,
+    pub current_unswizzle_frame: u8,
 
     // Join caching
     pub join_overlap_ids: Vec<ImageId>,
-    pub join_overlaps_found: HashSet<ImageId>,
+    pub join_overlaps_found: HashSet<ImageId, BuildUnorderedDenseHasher>,
     pub join_left_aliased_ids: Vec<ImageId>,
     pub join_right_aliased_ids: Vec<ImageId>,
-    pub join_ignore_textures: HashSet<ImageId>,
+    pub join_ignore_textures: HashSet<ImageId, BuildUnorderedDenseHasher>,
     pub join_bad_overlap_ids: Vec<ImageId>,
     pub join_copies_to_do: Vec<JoinCopy>,
-    pub join_alias_indices: HashMap<ImageId, usize>,
-    pub pending_join_copies: Vec<PendingJoinCopies>,
-    pub pending_backend_insertions: Vec<ImageId>,
-    pub pending_backend_deletions: Vec<PendingBackendDeletion>,
-    /// Rust owner-graph bridge for upstream `TextureCache<P>::JoinImages`.
-    ///
-    /// Upstream owns `Runtime`, backend images, and page-table registration in
-    /// the same method, so `RegisterImage(new_image_id)` happens only after
-    /// `RefreshContents`, rescale, alias/copy relations, deletion, and backend
-    /// copies complete. Backends that own those runtime resources set this and
-    /// complete registration/allocation from their wrapper hook.
-    pub backend_completes_join_images: bool,
+    pub join_alias_indices: HashMap<ImageId, usize, BuildUnorderedDenseHasher>,
 
     // Image alloc table
-    pub image_allocs_table: HashMap<GPUVAddr, ImageAllocId>,
+    pub image_allocs_table: HashMap<GPUVAddr, ImageAllocId, BuildUnorderedDenseHasher>,
     /// Upstream `virtual_invalid_space`, used to allocate stable fake CPU
     /// ranges for images whose GPU address cannot be translated.
     pub virtual_invalid_space: u64,
@@ -454,9 +828,31 @@ pub struct TextureCacheBase {
 
     // Mutex
     pub mutex: ReentrantMutex<()>,
+
+    /// Owned storage behind upstream's `Runtime& runtime`. The Box keeps its
+    /// address stable for backend objects which retain the runtime pointer.
+    /// It is declared after every backend-owned object so it is destroyed
+    /// last, matching the lifetime of upstream's external `Runtime&`.
+    pub runtime: Option<Box<P::Runtime>>,
 }
 
-impl TextureCacheBase {
+impl<P: TextureCacheParams> TextureCacheBase<P> {
+    pub fn bind_runtime(&mut self, runtime: Box<P::Runtime>) {
+        self.runtime = Some(runtime);
+    }
+
+    pub fn runtime(&self) -> &P::Runtime {
+        self.runtime
+            .as_deref()
+            .expect("backend TextureCache runtime must be bound")
+    }
+
+    pub fn runtime_mut(&mut self) -> &mut P::Runtime {
+        self.runtime
+            .as_deref_mut()
+            .expect("backend TextureCache runtime must be bound")
+    }
+
     pub fn create_channel(&mut self, channel: &ChannelState) {
         {
             let channel_caches = &mut self.channel_caches;
@@ -565,15 +961,15 @@ impl TextureCacheBase {
     ///
     /// Port of `TextureCache<P>::TextureCache(Runtime&, MaxwellDeviceMemoryManager&)`.
     /// `device_memory` is the shared `Arc` from `Host1x::memory_manager()`.
-    pub fn new(
+    pub fn new_for_backend(
         device_memory: std::sync::Arc<
             crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager,
         >,
     ) -> Self {
-        Self::new_with_caps(device_memory, false, false)
+        Self::new_with_caps_for_backend(device_memory, false, false)
     }
 
-    pub fn new_with_caps(
+    pub fn new_with_caps_for_backend(
         device_memory: std::sync::Arc<
             crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager,
         >,
@@ -584,17 +980,62 @@ impl TextureCacheBase {
         fallback_channel_state.gpu_page_table_index = Some(0);
         fallback_channel_state.sparse_page_table_index = Some(1);
 
+        use common::settings_enums::{GpuUnswizzle, GpuUnswizzleChunk, GpuUnswizzleSize};
+
+        let settings = common::settings::values();
+        let (gpu_unswizzle_maxsize, swizzle_chunk_size, swizzle_slices_per_batch) =
+            if *settings.gpu_unswizzle_enabled.get_value() {
+                let max_size = match *settings.gpu_unswizzle_texture_size.get_value() {
+                    GpuUnswizzleSize::VerySmall => 16 * 1024 * 1024,
+                    GpuUnswizzleSize::Small => 32 * 1024 * 1024,
+                    GpuUnswizzleSize::Normal => 128 * 1024 * 1024,
+                    GpuUnswizzleSize::Large => 256 * 1024 * 1024,
+                    GpuUnswizzleSize::VeryLarge => 512 * 1024 * 1024,
+                };
+                let chunk_size = match *settings.gpu_unswizzle_stream_size.get_value() {
+                    GpuUnswizzle::VeryLow => 4 * 1024 * 1024,
+                    GpuUnswizzle::Low => 8 * 1024 * 1024,
+                    GpuUnswizzle::Normal => 16 * 1024 * 1024,
+                    GpuUnswizzle::Medium => 32 * 1024 * 1024,
+                    GpuUnswizzle::High => 64 * 1024 * 1024,
+                };
+                let slices = match *settings.gpu_unswizzle_chunk_size.get_value() {
+                    GpuUnswizzleChunk::VeryLow => 32,
+                    GpuUnswizzleChunk::Low => 64,
+                    GpuUnswizzleChunk::Normal => 128,
+                    GpuUnswizzleChunk::Medium => 256,
+                    GpuUnswizzleChunk::High => 512,
+                };
+                (max_size, chunk_size, slices)
+            } else {
+                (0, 0, 0)
+            };
+
         let mut cache = Self {
             slot_images: SlotVector::new(),
             slot_map_views: SlotVector::new(),
             slot_image_views: SlotVector::new(),
             slot_image_allocs: SlotVector::new(),
             slot_samplers: SlotVector::new(),
+            slot_framebuffers: SlotVector::new(),
             slot_buffer_downloads: SlotVector::new(),
+            uncommitted_async_buffers: Vec::new(),
+            async_buffers: VecDeque::new(),
+            async_buffers_death_ring: VecDeque::new(),
             render_targets: RenderTargets::default(),
-            framebuffers: HashMap::new(),
+            render_targets_serial: 0,
+            rt_active_mask: 0,
+            rt_image_id: [ImageId::default(); 8],
+            rt_depth_image_id: ImageId::default(),
+            texture_bindings_serial: 0,
+            last_feedback_loop_serial: 0,
+            last_feedback_texture_serial: 0,
+            last_feedback_loop_result: false,
+            last_framebuffer_id: FramebufferId::default(),
+            last_framebuffer_serial: 0,
+            framebuffers: HashMap::default(),
             page_table: HashMap::default(),
-            sparse_views: HashMap::new(),
+            sparse_views: HashMap::default(),
             has_deleted_images: false,
             is_rescaling: false,
             total_used_memory: 0,
@@ -604,26 +1045,31 @@ impl TextureCacheBase {
             lru_cache: LeastRecentlyUsedCache::new(),
             sentenced_images: DelayedDestructionRing::new(),
             sentenced_image_view: DelayedDestructionRing::new(),
+            sentenced_framebuffers: DelayedDestructionRing::new(),
             has_broken_texture_view_formats,
             has_native_bgr,
             uncommitted_downloads: Vec::new(),
             committed_downloads: VecDeque::new(),
             modification_tick: 0,
             frame_tick: 0,
+            sampler_heap_budget: None,
+            last_sampler_gc_frame: u64::MAX,
             async_decodes: Vec::new(),
+            texture_decode_worker: ThreadWorker::new_named(1, "TextureDecoder"),
+            gpu_unswizzle_maxsize,
+            swizzle_chunk_size,
+            swizzle_slices_per_batch,
+            unswizzle_queue: VecDeque::new(),
+            current_unswizzle_frame: 0,
             join_overlap_ids: Vec::new(),
-            join_overlaps_found: HashSet::new(),
+            join_overlaps_found: HashSet::default(),
             join_left_aliased_ids: Vec::new(),
             join_right_aliased_ids: Vec::new(),
-            join_ignore_textures: HashSet::new(),
+            join_ignore_textures: HashSet::default(),
             join_bad_overlap_ids: Vec::new(),
             join_copies_to_do: Vec::new(),
-            join_alias_indices: HashMap::new(),
-            pending_join_copies: Vec::new(),
-            pending_backend_insertions: Vec::new(),
-            pending_backend_deletions: Vec::new(),
-            backend_completes_join_images: false,
-            image_allocs_table: HashMap::new(),
+            join_alias_indices: HashMap::default(),
+            image_allocs_table: HashMap::default(),
             virtual_invalid_space: 0,
             virtual_invalid_ranges: HashMap::new(),
             swizzle_data_buffer: vec![0u8; 8 * 1024 * 1024], // 8 MiB
@@ -639,16 +1085,19 @@ impl TextureCacheBase {
             channel_caches: ChannelSetupCaches::new(),
             channel_state: fallback_channel_state,
             mutex: ReentrantMutex::new(()),
+            runtime: None,
         };
 
         // Upstream reserves slot 0 for all null resources in
         // `TextureCache<P>::TextureCache`, making NULL_*_ID{0} compile-time
         // constants that are never returned for real resources.
-        let null_image_id = cache.slot_images.insert(ImageBase::null(NullImageParams));
+        let null_image_id = cache
+            .slot_images
+            .insert(ImageBase::null(NullImageParams).into());
         debug_assert_eq!(null_image_id, crate::texture_cache::types::NULL_IMAGE_ID);
         let null_view_id = cache
             .slot_image_views
-            .insert(ImageViewBase::null(NullImageViewParams));
+            .insert(ImageViewBase::null(NullImageViewParams).into());
         debug_assert_eq!(
             null_view_id,
             crate::texture_cache::types::NULL_IMAGE_VIEW_ID
@@ -662,7 +1111,7 @@ impl TextureCacheBase {
             | ((crate::textures::texture::TextureMipmapFilter::Linear as u32) << 6)
             | (1 << 8);
         null_sampler.raw[0] = (word1 as u64) << 32;
-        let null_id = cache.slot_samplers.insert(null_sampler);
+        let null_id = cache.slot_samplers.insert(null_sampler.into());
         debug_assert_eq!(null_id, crate::texture_cache::types::NULL_SAMPLER_ID);
 
         cache
@@ -679,7 +1128,7 @@ impl TextureCacheBase {
     /// Port of the `HAS_DEVICE_MEMORY_INFO` branch in
     /// `TextureCache<P>::TextureCache`.
     pub fn configure_device_memory_budget(&mut self, device_local_memory: u64) {
-        let device_local_memory = device_local_memory.min(i64::MAX as u64) as i64;
+        let device_local_memory = device_local_memory as i64;
         let min_spacing_expected = device_local_memory - 1024 * 1024 * 1024;
         let min_spacing_critical = device_local_memory - 512 * 1024 * 1024;
         let mem_threshold = device_local_memory.min(TARGET_THRESHOLD);
@@ -699,6 +1148,10 @@ impl TextureCacheBase {
         self.total_used_memory = device_memory_usage;
     }
 
+    pub fn set_sampler_heap_budget(&mut self, budget: Option<usize>) {
+        self.sampler_heap_budget = budget;
+    }
+
     /// Notify the cache that a new frame has been queued.
     ///
     /// Port of `TextureCache<P>::TickFrame`.
@@ -707,257 +1160,13 @@ impl TextureCacheBase {
     /// backend framebuffer rings, async decode, and runtime tick before
     /// this method so the frame counter advances in upstream order.
     pub fn tick_frame(&mut self) {
-        self.frame_tick += 1;
-        self.has_deleted_images = false;
-        // In full implementation: check for resolution scaling changes
+        self.frame_tick = self.frame_tick.wrapping_add(1);
     }
 
     pub fn tick_delayed_destruction_rings(&mut self) {
         self.sentenced_images.tick();
+        self.sentenced_framebuffers.tick();
         self.sentenced_image_view.tick();
-    }
-
-    /// Mark images in a range as modified from the CPU.
-    ///
-    /// Port of `TextureCache<P>::WriteMemory`.
-    ///
-    /// In the full implementation, this iterates over all images overlapping
-    /// the given CPU address range and marks them as CPU-modified, scheduling
-    /// them for re-upload on next GPU access.
-    pub fn write_memory(&mut self, cpu_addr: u64, size: usize) {
-        let image_ids = self.collect_images_in_region(cpu_addr, size);
-        for image_id in image_ids {
-            if self.slot_images[image_id]
-                .flags
-                .contains(ImageFlagBits::CPU_MODIFIED)
-            {
-                continue;
-            }
-            self.slot_images[image_id]
-                .flags
-                .insert(ImageFlagBits::CPU_MODIFIED);
-            if self.slot_images[image_id]
-                .flags
-                .contains(ImageFlagBits::TRACKED)
-            {
-                self.untrack_image(image_id);
-            }
-        }
-    }
-
-    /// Download contents of host images to guest memory in a region.
-    ///
-    /// Port of `TextureCache<P>::DownloadMemory`.
-    ///
-    /// In the full implementation, this forces a download of all GPU-modified
-    /// images in the given CPU address range back to guest memory.
-    pub fn download_memory(&mut self, cpu_addr: u64, size: usize) {
-        let Some(downloader) = self.image_downloader.as_ref().cloned() else {
-            if common::env_flag!("RUZU_TRACE_TEXTURE_DOWNLOAD") {
-                log::info!(
-                    "[TEXTURE_DOWNLOAD] miss no_image_downloader cpu=0x{:X} size={}",
-                    cpu_addr,
-                    size
-                );
-            }
-            return;
-        };
-        let Some(writer) = self.guest_memory_writer.as_ref().cloned() else {
-            if common::env_flag!("RUZU_TRACE_TEXTURE_DOWNLOAD") {
-                log::info!(
-                    "[TEXTURE_DOWNLOAD] miss no_guest_memory_writer cpu=0x{:X} size={}",
-                    cpu_addr,
-                    size
-                );
-            }
-            return;
-        };
-
-        let mut images = self.collect_images_in_region(cpu_addr, size);
-        images.retain(|image_id| self.slot_images[*image_id].is_safe_download());
-        if images.is_empty() {
-            return;
-        }
-
-        for &image_id in &images {
-            self.slot_images[image_id]
-                .flags
-                .remove(ImageFlagBits::GPU_MODIFIED);
-        }
-        images.sort_by_key(|&image_id| self.slot_images[image_id].modification_tick);
-
-        for image_id in images {
-            let image = self.slot_images[image_id].clone();
-            let mut staging = vec![0u8; image.unswizzled_size_bytes as usize];
-            if !downloader(image_id, &image, &mut staging) {
-                continue;
-            }
-            let copies = super::util::full_download_copies(&image.info);
-            super::util::swizzle_image(
-                writer.as_ref(),
-                image.cpu_addr,
-                &image.info,
-                &copies,
-                &staging,
-                &mut self.swizzle_data_buffer,
-            );
-        }
-    }
-
-    /// Port of `TextureCache<P>::TryFindFramebufferImageView`.
-    pub fn try_find_framebuffer_image_view(
-        &mut self,
-        config: &FramebufferConfig,
-        cpu_addr: u64,
-    ) -> Option<FramebufferImageView> {
-        if cpu_addr == 0 {
-            return None;
-        }
-
-        let valid_image_ids: Vec<ImageId> = self
-            .collect_images_in_region(cpu_addr, 1)
-            .into_iter()
-            .filter(|&image_id| {
-                let image = &self.slot_images[image_id];
-                image.cpu_addr == cpu_addr && !image.image_view_ids.is_empty()
-            })
-            .collect();
-
-        let image_id = match valid_image_ids.as_slice() {
-            [] => return None,
-            [only] => *only,
-            many => *many
-                .iter()
-                .max_by_key(|&&id| self.slot_images[id].modification_tick)
-                .expect("non-empty image list"),
-        };
-
-        let view_format = framebuffer_config_view_format(config);
-        let mut info = ImageViewInfo::for_render_target(
-            ImageViewType::E2D,
-            view_format,
-            SubresourceRange::default(),
-        );
-        if config.blending == BlendMode::Opaque {
-            info.x_source = SwizzleSource::R as u8;
-            info.y_source = SwizzleSource::G as u8;
-            info.z_source = SwizzleSource::B as u8;
-            info.w_source = SwizzleSource::OneFloat as u8;
-        }
-
-        let existing_view_id = self.slot_images[image_id].find_view(&info);
-        let view_id = if existing_view_id.is_valid() {
-            existing_view_id
-        } else {
-            let image = &self.slot_images[image_id];
-            let view = ImageViewBase::new(&info, &image.info, image_id, image.gpu_addr);
-            let view_id = self.slot_image_views.insert(view);
-            self.slot_images[image_id].insert_view(info, view_id);
-            view_id
-        };
-        if common::env_flag!("RUZU_TRACE_PRESENT_IMG") {
-            let image = &self.slot_images[image_id];
-            log::warn!(
-                "[PRESENT_IMG] cpu=0x{:X} gpu=0x{:X} candidates={} chosen_image={} view_id={} \
-                 num_views_on_image={} all_image_ids={:?} tick={} flags={:?} aliases={} overlaps={} \
-                 format={:?} size={}x{} guest_size={} unswizzled_size={}",
-                cpu_addr,
-                image.gpu_addr,
-                valid_image_ids.len(),
-                image_id.index,
-                view_id.index,
-                image.image_view_ids.len(),
-                valid_image_ids.iter().map(|i| i.index).collect::<Vec<_>>(),
-                image.modification_tick,
-                image.flags,
-                image.aliased_images.len(),
-                image.overlapping_images.len(),
-                image.info.format,
-                image.info.size.width,
-                image.info.size.height,
-                image.guest_size_bytes,
-                image.unswizzled_size_bytes,
-            );
-        }
-        if common::trace::is_enabled(common::trace::cat::PRESENT_IMAGE_SELECT) {
-            let image = &self.slot_images[image_id];
-            let blending = match config.blending {
-                BlendMode::Opaque => 0,
-                BlendMode::Premultiplied => 1,
-                BlendMode::Coverage => 2,
-            };
-            common::trace::emit_raw(
-                common::trace::cat::PRESENT_IMAGE_SELECT,
-                &[
-                    cpu_addr,
-                    image.gpu_addr,
-                    image_id.index as u64,
-                    view_id.index as u64,
-                    valid_image_ids.len() as u64,
-                    image.flags.bits() as u64,
-                    image.modification_tick,
-                    image.aliased_images.len() as u64,
-                    image.overlapping_images.len() as u64,
-                    image.info.size.width as u64,
-                    image.info.size.height as u64,
-                    image.info.format as u64,
-                    config.pixel_format.0 as u64,
-                    blending,
-                ],
-            );
-        }
-        let image = &self.slot_images[image_id];
-        let view = self.slot_image_views[view_id].clone();
-        Some(FramebufferImageView {
-            view_id,
-            view,
-            scaled: image.flags.contains(ImageFlagBits::RESCALED),
-        })
-    }
-
-    /// Collect every `ImageId` whose backing CPU pages overlap the given
-    /// region. Public so backend wrappers (e.g. `renderer_opengl::TextureCache`)
-    /// can implement their own `download_memory` that needs direct access to
-    /// the backend-specific image table — the base callback-based path can't
-    /// borrow that table without interior mutability, so the wrapper does the
-    /// full loop in user code instead.
-    pub fn collect_images_in_region(
-        &mut self,
-        cpu_addr: u64,
-        size: usize,
-    ) -> SmallVec<[ImageId; 32]> {
-        let mut image_ids = SmallVec::new();
-        let mut map_ids = SmallVec::<[ImageMapId; 32]>::new();
-        let page_table = &self.page_table;
-        let slot_map_views = &mut self.slot_map_views;
-        let slot_images = &mut self.slot_images;
-        Self::for_each_cpu_page(cpu_addr, size, |page| {
-            let Some(page_map_ids) = page_table.get(&page) else {
-                return;
-            };
-            for &map_id in page_map_ids {
-                let map = &mut slot_map_views[map_id];
-                if map.picked || !map.overlaps(cpu_addr, size) {
-                    continue;
-                }
-                map.picked = true;
-                map_ids.push(map_id);
-
-                let image = &mut slot_images[map.image_id];
-                if image.flags.contains(ImageFlagBits::PICKED) {
-                    continue;
-                }
-                image.flags.insert(ImageFlagBits::PICKED);
-                image_ids.push(map.image_id);
-            }
-        });
-        for &image_id in &image_ids {
-            slot_images[image_id].flags.remove(ImageFlagBits::PICKED);
-        }
-        for map_id in map_ids {
-            slot_map_views[map_id].picked = false;
-        }
-        image_ids
     }
 
     /// Collect every `ImageId` whose registered GPU pages overlap the given
@@ -997,58 +1206,6 @@ impl TextureCacheBase {
             slot_images[image_id].flags.remove(ImageFlagBits::PICKED);
         }
         image_ids
-    }
-
-    /// Return the CPU/device-memory range that must be downloaded before the
-    /// CPU reads a rasterizer-cached region.
-    ///
-    /// Port of `TextureCache<P>::GetFlushArea`.
-    pub fn get_flush_area(&mut self, cpu_addr: u64, size: usize) -> Option<RasterizerDownloadArea> {
-        let mut area: Option<RasterizerDownloadArea> = None;
-        for image_id in self.collect_images_in_region(cpu_addr, size) {
-            if !self.slot_images[image_id]
-                .flags
-                .contains(ImageFlagBits::GPU_MODIFIED)
-            {
-                continue;
-            }
-            let image = &mut self.slot_images[image_id];
-            let current = area.get_or_insert(RasterizerDownloadArea {
-                start_address: cpu_addr,
-                end_address: cpu_addr + size as u64,
-                preemptive: true,
-            });
-            current.start_address = current.start_address.min(image.cpu_addr);
-            current.end_address = current.end_address.max(image.cpu_addr_end);
-            for &image_view_id in &image.image_view_ids {
-                self.slot_image_views[image_view_id]
-                    .flags
-                    .insert(ImageViewFlagBits::PREEMTIVE_DOWNLOAD);
-            }
-            current.preemptive &= image.info.forced_flushed;
-            image.info.forced_flushed = true;
-        }
-        area
-    }
-
-    /// Remove images in a region.
-    ///
-    /// Port of `TextureCache<P>::UnmapMemory`.
-    pub fn unmap_memory(&mut self, cpu_addr: u64, size: usize) {
-        let deleted_images = self.collect_images_in_region(cpu_addr, size);
-        for image_id in deleted_images {
-            if image_id == crate::texture_cache::types::NULL_IMAGE_ID {
-                continue;
-            }
-            if self.slot_images[image_id]
-                .flags
-                .contains(ImageFlagBits::TRACKED)
-            {
-                self.untrack_image(image_id);
-            }
-            self.unregister_image(image_id);
-            self.delete_image(image_id, false);
-        }
     }
 
     /// Return true when there are uncommitted images to be downloaded.
@@ -1091,28 +1248,85 @@ impl TextureCacheBase {
 
     /// Iterate over all page indices in a CPU address range.
     pub fn for_each_cpu_page(addr: u64, size: usize, mut func: impl FnMut(u64)) {
-        let page_end = (addr + size as u64 - 1) >> YUZU_PAGEBITS;
+        Self::for_each_cpu_page_until(addr, size, |page| {
+            func(page);
+            false
+        });
+    }
+
+    /// Bool-returning specialization of upstream `ForEachCPUPage`.
+    pub(super) fn for_each_cpu_page_until(
+        addr: u64,
+        size: usize,
+        mut func: impl FnMut(u64) -> bool,
+    ) -> bool {
+        let page_end = addr.wrapping_add(size as u64).wrapping_sub(1) >> YUZU_PAGEBITS;
         let mut page = addr >> YUZU_PAGEBITS;
         while page <= page_end {
-            func(page);
+            if func(page) {
+                return true;
+            }
             page += 1;
         }
+        false
     }
 
     /// Iterate over all page indices in a GPU address range.
     pub fn for_each_gpu_page(addr: GPUVAddr, size: usize, mut func: impl FnMut(u64)) {
-        let page_end = (addr + size as u64 - 1) >> YUZU_PAGEBITS;
+        Self::for_each_gpu_page_until(addr, size, |page| {
+            func(page);
+            false
+        });
+    }
+
+    /// Bool-returning specialization of upstream `ForEachGPUPage`.
+    pub(super) fn for_each_gpu_page_until(
+        addr: GPUVAddr,
+        size: usize,
+        mut func: impl FnMut(u64) -> bool,
+    ) -> bool {
+        let page_end = addr.wrapping_add(size as u64).wrapping_sub(1) >> YUZU_PAGEBITS;
         let mut page = addr >> YUZU_PAGEBITS;
         while page <= page_end {
-            func(page);
+            if func(page) {
+                return true;
+            }
             page += 1;
         }
+        false
+    }
+}
+
+impl TextureCacheBase<CommonTextureCacheParams> {
+    pub fn new(
+        device_memory: std::sync::Arc<
+            crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager,
+        >,
+    ) -> Self {
+        Self::new_for_backend(device_memory)
+    }
+
+    pub fn new_with_caps(
+        device_memory: std::sync::Arc<
+            crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager,
+        >,
+        has_broken_texture_view_formats: bool,
+        has_native_bgr: bool,
+    ) -> Self {
+        Self::new_with_caps_for_backend(
+            device_memory,
+            has_broken_texture_view_formats,
+            has_native_bgr,
+        )
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{TextureCacheBase, TextureCacheGPUMap};
+    use super::{
+        CommonTextureCacheParams, ImageSlot, TextureCacheBase, TextureCacheGPUMap,
+        TextureCacheParams, TICKS_TO_DESTROY,
+    };
     use crate::framebuffer_config::FramebufferConfig;
     use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
     use crate::surface::PixelFormat;
@@ -1120,9 +1334,196 @@ mod tests {
     use crate::texture_cache::image_info::ImageInfo;
     use crate::texture_cache::image_view_base::ImageViewBase;
     use crate::texture_cache::image_view_info::ImageViewInfo;
+    use crate::texture_cache::render_targets::RenderTargets;
     use crate::texture_cache::types::{
-        Extent3D, ImageId, ImageType, ImageViewType, SubresourceRange,
+        Extent3D, ImageId, ImageType, ImageViewType, SubresourceRange, NUM_RT,
     };
+
+    struct DropProbe(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+    impl Drop for DropProbe {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    struct TypedSlotTestParams;
+
+    impl TextureCacheParams for TypedSlotTestParams {
+        type Runtime = ();
+        type Image = DropProbe;
+        type ImageAlloc = ();
+        type ImageView = ();
+        type Sampler = DropProbe;
+        type Framebuffer = ();
+        type FramebufferError = std::convert::Infallible;
+        type AsyncBuffer = DropProbe;
+        type BufferType = ();
+
+        const ENABLE_VALIDATION: bool = true;
+        const FRAMEBUFFER_BLITS: bool = false;
+        const HAS_EMULATED_COPIES: bool = false;
+        const HAS_DEVICE_MEMORY_INFO: bool = false;
+        const IMPLEMENTS_ASYNC_DOWNLOADS: bool = false;
+
+        fn create_image(
+            _: Option<&mut ()>,
+            _: ImageId,
+            _: std::ptr::NonNull<ImageBase>,
+        ) -> DropProbe {
+            unreachable!("typed-slot destruction test inserts its payload explicitly")
+        }
+
+        fn set_image_allocation_tick(_: &mut DropProbe, _: u64) {}
+
+        fn create_image_view(
+            _: Option<&mut ()>,
+            _: crate::texture_cache::types::ImageViewId,
+            _: std::ptr::NonNull<ImageViewBase>,
+            _: Option<&DropProbe>,
+        ) {
+        }
+
+        fn create_sampler(_: Option<&mut ()>, _: &crate::textures::texture::TscEntry) -> DropProbe {
+            unreachable!("typed-slot destruction test inserts its payload explicitly")
+        }
+
+        fn create_framebuffer(
+            _: Option<&mut ()>,
+            _: [Option<std::ptr::NonNull<()>>; NUM_RT],
+            _: Option<std::ptr::NonNull<()>>,
+            _: &RenderTargets,
+        ) -> Result<(), std::convert::Infallible> {
+            Ok(())
+        }
+
+        fn prepare_image_view(
+            _: &mut TextureCacheBase<Self>,
+            _: crate::texture_cache::types::ImageViewId,
+            _: bool,
+            _: bool,
+        ) {
+        }
+
+        fn scale_up_image(_: &mut TextureCacheBase<Self>, _: ImageId, _: bool) -> bool {
+            false
+        }
+
+        fn scale_down_image(_: &mut TextureCacheBase<Self>, _: ImageId, _: bool) -> bool {
+            false
+        }
+
+        fn upload_staging_buffer(_: &mut TextureCacheBase<Self>, _: usize, _: bool) -> DropProbe {
+            unreachable!("typed-slot destruction test does not upload images")
+        }
+
+        fn staging_mapped_span(_: &mut DropProbe) -> &mut [u8] {
+            unreachable!("typed-slot destruction test does not map staging buffers")
+        }
+
+        fn free_deferred_staging_buffer(_: &mut TextureCacheBase<Self>, _: &mut DropProbe) {}
+
+        fn can_upload_msaa(_: &TextureCacheBase<Self>) -> bool {
+            true
+        }
+
+        fn transition_image_layout(_: &mut TextureCacheBase<Self>, _: ImageId) {}
+
+        fn upload_image(
+            _: &mut TextureCacheBase<Self>,
+            _: ImageId,
+            _: &DropProbe,
+            _: &[crate::texture_cache::types::BufferImageCopy],
+        ) {
+        }
+
+        fn accelerate_image_upload(
+            _: &mut TextureCacheBase<Self>,
+            _: ImageId,
+            _: &DropProbe,
+            _: &[crate::texture_cache::types::SwizzleParameters],
+            _: u32,
+            _: u32,
+        ) {
+        }
+
+        fn insert_upload_memory_barrier(_: &mut TextureCacheBase<Self>) {}
+
+        fn copy_image(
+            _: &mut TextureCacheBase<Self>,
+            _: ImageId,
+            _: ImageId,
+            _: &[crate::texture_cache::types::ImageCopy],
+        ) {
+        }
+
+        fn copy_image_msaa(
+            _: &mut TextureCacheBase<Self>,
+            _: ImageId,
+            _: ImageId,
+            _: &[crate::texture_cache::types::ImageCopy],
+        ) {
+        }
+    }
+
+    #[test]
+    fn typed_backend_payload_follows_upstream_slot_destruction_lifecycle() {
+        use std::sync::atomic::Ordering;
+
+        let drops = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut cache = TextureCacheBase::<TypedSlotTestParams>::new_for_backend(
+            std::sync::Arc::new(MaxwellDeviceMemoryManager::default()),
+        );
+        let info = ImageInfo {
+            format: PixelFormat::A8B8G8R8Unorm,
+            size: Extent3D {
+                width: 1,
+                height: 1,
+                depth: 1,
+            },
+            ..ImageInfo::default()
+        };
+        let image_id = cache.slot_images.insert(ImageSlot {
+            base: Box::new(ImageBase::new(info, 0x1000, 0x2000)),
+            backend: Some(DropProbe(drops.clone())),
+        });
+        let image = cache.slot_images.take(image_id);
+        cache.sentenced_images.push(image);
+
+        for _ in 1..TICKS_TO_DESTROY {
+            cache.tick_delayed_destruction_rings();
+            assert_eq!(drops.load(Ordering::SeqCst), 0);
+        }
+        cache.tick_delayed_destruction_rings();
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+
+        let sampler_id = cache.slot_samplers.insert(super::SamplerSlot {
+            config: crate::textures::texture::TscEntry::default(),
+            backend: Some(DropProbe(drops.clone())),
+        });
+        cache.slot_samplers.erase(sampler_id);
+        assert_eq!(drops.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn generic_cache_owns_async_buffers_and_pending_unswizzle_staging() {
+        use std::sync::atomic::Ordering;
+
+        let drops = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut cache = TextureCacheBase::<TypedSlotTestParams>::new_for_backend(
+            std::sync::Arc::new(MaxwellDeviceMemoryManager::default()),
+        );
+        cache
+            .uncommitted_async_buffers
+            .push(DropProbe(drops.clone()));
+        let mut task = super::PendingUnswizzle::new(ImageId::default(), ImageInfo::default());
+        task.staging_buffer = Some(DropProbe(drops.clone()));
+        cache.unswizzle_queue.push_back(task);
+
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+        drop(cache);
+        assert_eq!(drops.load(Ordering::SeqCst), 2);
+    }
     use std::hash::{BuildHasher, Hash, Hasher};
     use std::sync::Arc;
 
@@ -1133,13 +1534,29 @@ mod tests {
     }
 
     #[test]
-    fn texture_page_tables_use_upstream_identity_hash() {
+    fn texture_page_tables_use_upstream_unordered_dense_post_mix() {
         let key = 0x1234_5678_9abc_def0;
+        let expected = 0xc27a_443d_5ff2_18e0;
         let gpu_page_table = TextureCacheGPUMap::default();
-        assert_eq!(finish_hash(gpu_page_table.hasher(), key), key);
+        assert_eq!(finish_hash(gpu_page_table.hasher(), key), expected);
 
         let cache = TextureCacheBase::new(Arc::new(MaxwellDeviceMemoryManager::default()));
-        assert_eq!(finish_hash(cache.page_table.hasher(), key), key);
+        assert_eq!(finish_hash(cache.page_table.hasher(), key), expected);
+    }
+
+    #[test]
+    fn page_iteration_preserves_upstream_unsigned_range_wraparound() {
+        let mut cpu_visits = 0;
+        TextureCacheBase::<CommonTextureCacheParams>::for_each_cpu_page(u64::MAX - 3, 8, |_| {
+            cpu_visits += 1
+        });
+        assert_eq!(cpu_visits, 0);
+
+        let mut gpu_visits = 0;
+        TextureCacheBase::<CommonTextureCacheParams>::for_each_gpu_page(u64::MAX - 3, 8, |_| {
+            gpu_visits += 1
+        });
+        assert_eq!(gpu_visits, 0);
     }
 
     #[test]
@@ -1217,14 +1634,14 @@ mod tests {
             };
             let mut image = ImageBase::new(info.clone(), gpu_addr, cpu_addr);
             image.modification_tick = modification_tick;
-            let image_id = cache.slot_images.insert(image);
+            let image_id = cache.slot_images.insert(image.into());
             let view_info = ImageViewInfo::for_render_target(
                 ImageViewType::E2D,
                 PixelFormat::A8B8G8R8Unorm,
                 SubresourceRange::default(),
             );
             let view = ImageViewBase::new(&view_info, &info, image_id, gpu_addr);
-            let view_id = cache.slot_image_views.insert(view);
+            let view_id = cache.slot_image_views.insert(view.into());
             cache.slot_images[image_id].insert_view(view_info, view_id);
             cache.register_image(image_id);
             image_id

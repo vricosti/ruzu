@@ -6,9 +6,7 @@
 //! Base decoder trait and common decode logic. In C++ this is an abstract class
 //! `Tegra::Decoder`; in Rust we use a trait plus a shared helper struct.
 
-use log::error;
-
-use crate::host1x::ffmpeg::ffmpeg::DecodeApi;
+use crate::host1x::ffmpeg::ffmpeg::{DecodeApi, FrameDimensions, FrameOffsets};
 use std::sync::Arc;
 
 use crate::host1x::host1x::FrameQueue;
@@ -50,6 +48,7 @@ pub struct DecoderState {
     pub decode_api: DecodeApi,
     pub initialized: bool,
     pub vp9_hidden_frame: bool,
+    pub frame_dimensions: Option<FrameDimensions>,
     pub id: i32,
     pub memory_manager: Arc<parking_lot::Mutex<MemoryManager>>,
     pub frame_queue: Arc<FrameQueue>,
@@ -66,10 +65,23 @@ impl DecoderState {
             decode_api: DecodeApi::new(),
             initialized: false,
             vp9_hidden_frame: false,
+            frame_dimensions: None,
             id,
             memory_manager,
             frame_queue,
         }
+    }
+
+    pub fn set_frame_dimensions(&mut self, width: i32, height: i32) {
+        if width <= 0 || height <= 0 {
+            self.frame_dimensions = None;
+            return;
+        }
+        self.frame_dimensions = Some(FrameDimensions { width, height });
+    }
+
+    pub fn get_frame_dimensions(&self) -> Option<FrameDimensions> {
+        self.frame_dimensions
     }
 }
 
@@ -87,64 +99,49 @@ pub fn decode(decoder: &mut dyn DecoderImpl, regs: &NvdecRegisters) {
 
     let packet_data = decoder.compose_frame(regs);
 
-    // Send assembled bitstream to decoder.
-    if !decoder.state_mut().decode_api.send_packet(&packet_data) {
-        return;
-    }
-
-    // Only receive/store visible frames.
-    if decoder.state().vp9_hidden_frame {
-        return;
-    }
-
-    // Receive output frame from decoder.
-    let frame = decoder.state_mut().decode_api.receive_frame();
-
-    if decoder.is_interlaced() {
-        let (luma_top, luma_bottom, _chroma_top, _chroma_bottom) =
-            decoder.get_interlaced_offsets(regs);
-
-        if frame.is_none() {
-            error!(
-                "Nvdec {} failed to decode interlaced frame for top 0x{:X} bottom 0x{:X}",
-                id, luma_top, luma_bottom
-            );
-        }
-
-        let frame_copy = frame.clone();
-        if decoder.state().decode_api.using_decode_order() {
-            if let Some(f) = frame {
-                frame_queue.push_decode_order(id, luma_top, f);
-            }
-            if let Some(f) = frame_copy {
-                frame_queue.push_decode_order(id, luma_bottom, f);
-            }
-        } else {
-            if let Some(f) = frame {
-                frame_queue.push_present_order(id, luma_top, f);
-            }
-            if let Some(f) = frame_copy {
-                frame_queue.push_present_order(id, luma_bottom, f);
-            }
-        }
+    let interlaced = decoder.is_interlaced();
+    let mut offsets = FrameOffsets {
+        hidden: decoder.state().vp9_hidden_frame,
+        interlaced,
+        ..FrameOffsets::default()
+    };
+    if interlaced {
+        let (luma, luma_bottom, _, _) = decoder.get_interlaced_offsets(regs);
+        offsets.luma = luma;
+        offsets.luma_bottom = luma_bottom;
     } else {
-        let (luma_offset, _chroma_offset) = decoder.get_progressive_offsets(regs);
+        let (luma, _) = decoder.get_progressive_offsets(regs);
+        offsets.luma = luma;
+    }
+    let frame_dimensions = decoder.state().get_frame_dimensions();
 
-        if frame.is_none() {
-            error!(
-                "Nvdec {} failed to decode progressive frame for luma 0x{:X}",
-                id, luma_offset
-            );
-        }
+    // Send assembled bitstream to decoder.
+    if !decoder
+        .state_mut()
+        .decode_api
+        .send_packet(&packet_data, offsets, frame_dimensions)
+    {
+        return;
+    }
 
-        if decoder.state().decode_api.using_decode_order() {
-            if let Some(f) = frame {
-                frame_queue.push_decode_order(id, luma_offset, f);
+    let using_decode_order = decoder.state().decode_api.using_decode_order();
+    while let Some(result) = decoder.state_mut().decode_api.receive_frame() {
+        let frame = result.frame;
+        let frame_offsets = result.offsets;
+        let push = |luma, frame| {
+            if using_decode_order {
+                frame_queue.push_decode_order(id, luma, frame);
+            } else {
+                frame_queue.push_present_order(id, luma, frame);
             }
+        };
+
+        if frame_offsets.interlaced {
+            let frame_copy = Arc::clone(&frame);
+            push(frame_offsets.luma, frame);
+            push(frame_offsets.luma_bottom, frame_copy);
         } else {
-            if let Some(f) = frame {
-                frame_queue.push_present_order(id, luma_offset, f);
-            }
+            push(frame_offsets.luma, frame);
         }
     }
 }
@@ -152,6 +149,7 @@ pub fn decode(decoder: &mut dyn DecoderImpl, regs: &NvdecRegisters) {
 #[cfg(test)]
 mod tests {
     use super::DecoderState;
+    use crate::host1x::ffmpeg::ffmpeg::FrameDimensions;
     use crate::host1x::host1x::FrameQueue;
     use crate::memory_manager::MemoryManager;
     use std::sync::Arc;
@@ -166,5 +164,26 @@ mod tests {
         assert_eq!(state.id, 3);
         assert!(Arc::ptr_eq(&state.memory_manager, &memory_manager));
         assert!(Arc::ptr_eq(&state.frame_queue, &frame_queue));
+    }
+
+    #[test]
+    fn frame_dimensions_follow_upstream_validation() {
+        let memory_manager = Arc::new(parking_lot::Mutex::new(MemoryManager::new(0)));
+        let frame_queue = Arc::new(FrameQueue::new());
+        let mut state = DecoderState::new(3, memory_manager, frame_queue);
+
+        state.set_frame_dimensions(1920, 1080);
+        assert_eq!(
+            state.get_frame_dimensions(),
+            Some(FrameDimensions {
+                width: 1920,
+                height: 1080,
+            })
+        );
+
+        state.set_frame_dimensions(0, 1080);
+        assert_eq!(state.get_frame_dimensions(), None);
+        state.set_frame_dimensions(1920, -1);
+        assert_eq!(state.get_frame_dimensions(), None);
     }
 }

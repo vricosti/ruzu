@@ -1,13 +1,20 @@
 //! Port of upstream
 //! `dynarmic/frontend/A64/translate/impl/simd_scalar_two_register_misc.cpp`
 //! (subset: ABS_1, NEG_1, FCMEQ_zero_1, FCMGE_zero_2, FCMGT_zero_2,
-//! FCVTZS_int_2, FCVTZU_int_2, SCVTF_int_2, UCVTF_int_2).
+//! FCVTAS_2, FCVTAU_2, FCVTMS_2, FCVTMU_2, FCVTNS_2, FCVTNU_2,
+//! FCVTPS_2, FCVTPU_2, FCVTZS_int_2, FCVTZU_int_2, SCVTF_int_2,
+//! UCVTF_int_2, FRECPE_1, FRECPE_2, FRECPX_1, FRECPX_2, FRSQRTE_1,
+//! FRSQRTE_2).
 
 use crate::frontend::a64::decoder::DecodedInst;
 use crate::frontend::a64::translate::visitor::TranslatorVisitor;
 use crate::frontend::a64::types::Vec;
 
+const ROUND_TO_NEAREST_TIE_EVEN: u8 = 0;
+const ROUND_TOWARDS_PLUS_INFINITY: u8 = 1;
+const ROUND_TOWARDS_MINUS_INFINITY: u8 = 2;
 const ROUND_TOWARDS_ZERO: u8 = 3;
+const ROUND_TO_NEAREST_TIE_AWAY_FROM_ZERO: u8 = 4;
 
 fn current_fpcr_rounding_mode(visitor: &TranslatorVisitor<'_>) -> u8 {
     ((visitor
@@ -183,15 +190,78 @@ impl<'a> TranslatorVisitor<'a> {
     ) -> bool {
         let esize = if sz { 64 } else { 32 };
         let operand = self.v_scalar_read(esize, vn);
-        let elem = self.ir.ir().vector_get_element(esize, operand, 0);
         let result = match (sz, signed) {
-            (true, true) => self.ir.ir().fp_to_fixed_s64(elem, 64, 0, rounding),
-            (true, false) => self.ir.ir().fp_to_fixed_u64(elem, 64, 0, rounding),
-            (false, true) => self.ir.ir().fp_to_fixed_s32(elem, 32, 0, rounding),
-            (false, false) => self.ir.ir().fp_to_fixed_u32(elem, 32, 0, rounding),
+            (true, true) => self.ir.ir().fp_to_fixed_s64(operand, 64, 0, rounding),
+            (true, false) => self.ir.ir().fp_to_fixed_u64(operand, 64, 0, rounding),
+            (false, true) => self.ir.ir().fp_to_fixed_s32(operand, 32, 0, rounding),
+            (false, false) => self.ir.ir().fp_to_fixed_u32(operand, 32, 0, rounding),
         };
         self.v_scalar_write(esize, vd, result);
         true
+    }
+
+    /// FCVTAS (vector, scalar). `010111100z100001110010nnnnnddddd`.
+    pub fn fcvtas_2(&mut self, inst: &DecodedInst) -> bool {
+        let sz = inst.bit(22);
+        let vn = Vec::from_u32(inst.bits(9, 5));
+        let vd = Vec::from_u32(inst.rd());
+        self.scalar_fp_to_fixed(sz, vn, vd, true, ROUND_TO_NEAREST_TIE_AWAY_FROM_ZERO)
+    }
+
+    /// FCVTAU (vector, scalar). `011111100z100001110010nnnnnddddd`.
+    pub fn fcvtau_2(&mut self, inst: &DecodedInst) -> bool {
+        let sz = inst.bit(22);
+        let vn = Vec::from_u32(inst.bits(9, 5));
+        let vd = Vec::from_u32(inst.rd());
+        self.scalar_fp_to_fixed(sz, vn, vd, false, ROUND_TO_NEAREST_TIE_AWAY_FROM_ZERO)
+    }
+
+    /// FCVTMS (vector, scalar). `010111100z100001101110nnnnnddddd`.
+    pub fn fcvtms_2(&mut self, inst: &DecodedInst) -> bool {
+        let sz = inst.bit(22);
+        let vn = Vec::from_u32(inst.bits(9, 5));
+        let vd = Vec::from_u32(inst.rd());
+        self.scalar_fp_to_fixed(sz, vn, vd, true, ROUND_TOWARDS_MINUS_INFINITY)
+    }
+
+    /// FCVTMU (vector, scalar). `011111100z100001101110nnnnnddddd`.
+    pub fn fcvtmu_2(&mut self, inst: &DecodedInst) -> bool {
+        let sz = inst.bit(22);
+        let vn = Vec::from_u32(inst.bits(9, 5));
+        let vd = Vec::from_u32(inst.rd());
+        self.scalar_fp_to_fixed(sz, vn, vd, false, ROUND_TOWARDS_MINUS_INFINITY)
+    }
+
+    /// FCVTNS (vector, scalar). `010111100z100001101010nnnnnddddd`.
+    pub fn fcvtns_2(&mut self, inst: &DecodedInst) -> bool {
+        let sz = inst.bit(22);
+        let vn = Vec::from_u32(inst.bits(9, 5));
+        let vd = Vec::from_u32(inst.rd());
+        self.scalar_fp_to_fixed(sz, vn, vd, true, ROUND_TO_NEAREST_TIE_EVEN)
+    }
+
+    /// FCVTNU (vector, scalar). `011111100z100001101010nnnnnddddd`.
+    pub fn fcvtnu_2(&mut self, inst: &DecodedInst) -> bool {
+        let sz = inst.bit(22);
+        let vn = Vec::from_u32(inst.bits(9, 5));
+        let vd = Vec::from_u32(inst.rd());
+        self.scalar_fp_to_fixed(sz, vn, vd, false, ROUND_TO_NEAREST_TIE_EVEN)
+    }
+
+    /// FCVTPS (vector, scalar). `010111101z100001101010nnnnnddddd`.
+    pub fn fcvtps_2(&mut self, inst: &DecodedInst) -> bool {
+        let sz = inst.bit(22);
+        let vn = Vec::from_u32(inst.bits(9, 5));
+        let vd = Vec::from_u32(inst.rd());
+        self.scalar_fp_to_fixed(sz, vn, vd, true, ROUND_TOWARDS_PLUS_INFINITY)
+    }
+
+    /// FCVTPU (vector, scalar). `011111101z100001101010nnnnnddddd`.
+    pub fn fcvtpu_2(&mut self, inst: &DecodedInst) -> bool {
+        let sz = inst.bit(22);
+        let vn = Vec::from_u32(inst.bits(9, 5));
+        let vd = Vec::from_u32(inst.rd());
+        self.scalar_fp_to_fixed(sz, vn, vd, false, ROUND_TOWARDS_PLUS_INFINITY)
     }
 
     /// FCVTZS (vector, integer, scalar). `010111101z100001101110nnnnnddddd`.
@@ -210,19 +280,81 @@ impl<'a> TranslatorVisitor<'a> {
         self.scalar_fp_to_fixed(sz, vn, vd, false, ROUND_TOWARDS_ZERO)
     }
 
+    /// FRECPE (scalar, half-precision). `0101111011111001110110nnnnnddddd`.
+    pub fn frecpe_1(&mut self, inst: &DecodedInst) -> bool {
+        let vn = Vec::from_u32(inst.bits(9, 5));
+        let vd = Vec::from_u32(inst.rd());
+        let operand = self.v_scalar_read(16, vn);
+        let result = self.ir.ir().fp_recip_estimate(16, operand);
+        self.v_scalar_write(16, vd, result);
+        true
+    }
+
+    /// FRECPE (scalar, single/double). `010111101z100001110110nnnnnddddd`.
+    pub fn frecpe_2(&mut self, inst: &DecodedInst) -> bool {
+        let esize = if inst.bit(22) { 64 } else { 32 };
+        let vn = Vec::from_u32(inst.bits(9, 5));
+        let vd = Vec::from_u32(inst.rd());
+        let operand = self.v_scalar_read(esize, vn);
+        let result = self.ir.ir().fp_recip_estimate(esize, operand);
+        self.v_scalar_write(esize, vd, result);
+        true
+    }
+
+    /// FRECPX (scalar, half-precision). `0101111011111001111110nnnnnddddd`.
+    pub fn frecpx_1(&mut self, inst: &DecodedInst) -> bool {
+        let vn = Vec::from_u32(inst.bits(9, 5));
+        let vd = Vec::from_u32(inst.rd());
+        let operand = self.v_scalar_read(16, vn);
+        let result = self.ir.ir().fp_recip_exponent(16, operand);
+        self.v_scalar_write(16, vd, result);
+        true
+    }
+
+    /// FRECPX (scalar, single/double). `010111101z100001111110nnnnnddddd`.
+    pub fn frecpx_2(&mut self, inst: &DecodedInst) -> bool {
+        let esize = if inst.bit(22) { 64 } else { 32 };
+        let vn = Vec::from_u32(inst.bits(9, 5));
+        let vd = Vec::from_u32(inst.rd());
+        let operand = self.v_scalar_read(esize, vn);
+        let result = self.ir.ir().fp_recip_exponent(esize, operand);
+        self.v_scalar_write(esize, vd, result);
+        true
+    }
+
+    /// FRSQRTE (scalar, half-precision). `0111111011111001110110nnnnnddddd`.
+    pub fn frsqrte_1(&mut self, inst: &DecodedInst) -> bool {
+        let vn = Vec::from_u32(inst.bits(9, 5));
+        let vd = Vec::from_u32(inst.rd());
+        let operand = self.v_scalar_read(16, vn);
+        let result = self.ir.ir().fp_rsqrt_estimate(16, operand);
+        self.v_scalar_write(16, vd, result);
+        true
+    }
+
+    /// FRSQRTE (scalar, single/double). `011111101z100001110110nnnnnddddd`.
+    pub fn frsqrte_2(&mut self, inst: &DecodedInst) -> bool {
+        let esize = if inst.bit(22) { 64 } else { 32 };
+        let vn = Vec::from_u32(inst.bits(9, 5));
+        let vd = Vec::from_u32(inst.rd());
+        let operand = self.v_scalar_read(esize, vn);
+        let result = self.ir.ir().fp_rsqrt_estimate(esize, operand);
+        self.v_scalar_write(esize, vd, result);
+        true
+    }
+
     fn scalar_fixed_to_fp(&mut self, sz: bool, vn: Vec, vd: Vec, signed: bool) -> bool {
         let esize = if sz { 64 } else { 32 };
         let rounding = current_fpcr_rounding_mode(self);
         let operand = self.v_scalar_read(esize, vn);
-        let elem = self.ir.ir().vector_get_element(esize, operand, 0);
         let result = if sz {
             self.ir
                 .ir()
-                .fp_fixed_to_double(elem, 64, signed, 0, rounding)
+                .fp_fixed_to_double(operand, 64, signed, 0, rounding)
         } else {
             self.ir
                 .ir()
-                .fp_fixed_to_single(elem, 32, signed, 0, rounding)
+                .fp_fixed_to_single(operand, 32, signed, 0, rounding)
         };
         self.v_scalar_write(esize, vd, result);
         true
@@ -273,6 +405,86 @@ mod tests {
             (0x5E21_49F0, Opcode::VectorSignedSaturatedNarrowToSigned16),
             (0x7E21_29F0, Opcode::VectorSignedSaturatedNarrowToUnsigned16),
             (0x7E21_49F0, Opcode::VectorUnsignedSaturatedNarrow16),
+        ];
+
+        for (encoding, expected_opcode) in cases {
+            let (block, should_continue) = translate_one(encoding);
+            assert!(should_continue, "encoding 0x{encoding:08X}");
+            assert!(
+                block
+                    .instructions
+                    .iter()
+                    .any(|inst| inst.opcode == expected_opcode),
+                "encoding 0x{encoding:08X} did not emit {expected_opcode:?}"
+            );
+            assert!(!matches!(block.terminal, Terminal::Interpret { .. }));
+        }
+    }
+
+    #[test]
+    fn observed_fcvtns_scalar_encoding_translates_instead_of_interpreting() {
+        let (block, should_continue) = translate_one(0x5E21_A800);
+
+        assert!(should_continue);
+        assert!(block
+            .instructions
+            .iter()
+            .any(|inst| inst.opcode == Opcode::FPSingleToFixedS32));
+        assert!(!matches!(block.terminal, Terminal::Interpret { .. }));
+    }
+
+    #[test]
+    fn scalar_fp_to_integer_rounding_family_uses_matching_ir_opcodes() {
+        let cases = [
+            (0x5E21_A800, Opcode::FPSingleToFixedS32), // FCVTNS S0, S0
+            (0x5E21_B800, Opcode::FPSingleToFixedS32), // FCVTMS S0, S0
+            (0x5E21_C800, Opcode::FPSingleToFixedS32), // FCVTAS S0, S0
+            (0x5EA1_A800, Opcode::FPSingleToFixedS32), // FCVTPS S0, S0
+            (0x7E21_A800, Opcode::FPSingleToFixedU32), // FCVTNU S0, S0
+            (0x7E21_B800, Opcode::FPSingleToFixedU32), // FCVTMU S0, S0
+            (0x7E21_C800, Opcode::FPSingleToFixedU32), // FCVTAU S0, S0
+            (0x7EA1_A800, Opcode::FPSingleToFixedU32), // FCVTPU S0, S0
+            (0x5E61_A800, Opcode::FPDoubleToFixedS64), // FCVTNS D0, D0
+        ];
+
+        for (encoding, expected_opcode) in cases {
+            let (block, should_continue) = translate_one(encoding);
+            assert!(should_continue, "encoding 0x{encoding:08X}");
+            assert!(
+                block
+                    .instructions
+                    .iter()
+                    .any(|inst| inst.opcode == expected_opcode),
+                "encoding 0x{encoding:08X} did not emit {expected_opcode:?}"
+            );
+            assert!(!matches!(block.terminal, Terminal::Interpret { .. }));
+        }
+    }
+
+    #[test]
+    fn observed_frsqrte_scalar_encoding_translates_instead_of_interpreting() {
+        let (block, should_continue) = translate_one(0x7EA1_DA11);
+
+        assert!(should_continue);
+        assert!(block
+            .instructions
+            .iter()
+            .any(|inst| inst.opcode == Opcode::FPRSqrtEstimate32));
+        assert!(!matches!(block.terminal, Terminal::Interpret { .. }));
+    }
+
+    #[test]
+    fn scalar_fp_estimate_family_uses_matching_ir_opcodes() {
+        let cases = [
+            (0x5EF9_D800, Opcode::FPRecipEstimate16),
+            (0x5EA1_D800, Opcode::FPRecipEstimate32),
+            (0x5EE1_D800, Opcode::FPRecipEstimate64),
+            (0x5EF9_F800, Opcode::FPRecipExponent16),
+            (0x5EA1_F800, Opcode::FPRecipExponent32),
+            (0x5EE1_F800, Opcode::FPRecipExponent64),
+            (0x7EF9_D800, Opcode::FPRSqrtEstimate16),
+            (0x7EA1_D800, Opcode::FPRSqrtEstimate32),
+            (0x7EE1_D800, Opcode::FPRSqrtEstimate64),
         ];
 
         for (encoding, expected_opcode) in cases {

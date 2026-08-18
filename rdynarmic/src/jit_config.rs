@@ -312,4 +312,16 @@ impl JitConfig {
         }
         (f & self.optimizations) != OptimizationFlag::NO_OPTIMIZATIONS
     }
+
+    /// Optimization mask visible to backend emitters.
+    ///
+    /// This is the mask-level equivalent of upstream `HasOptimization`: unsafe
+    /// bits never reach an emitter unless the caller explicitly opted in.
+    pub fn effective_optimizations(&self) -> OptimizationFlag {
+        if self.unsafe_optimizations {
+            self.optimizations
+        } else {
+            self.optimizations & OptimizationFlag::ALL_SAFE_OPTIMIZATIONS
+        }
+    }
 }

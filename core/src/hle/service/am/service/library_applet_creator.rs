@@ -1,8 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2024 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-//! Port of zuyu/src/core/hle/service/am/service/library_applet_creator.h
-//! Port of zuyu/src/core/hle/service/am/service/library_applet_creator.cpp
+//! Port of Eden `src/core/hle/service/am/service/library_applet_creator.h` and
+//! `library_applet_creator.cpp`.
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, Weak};
@@ -15,17 +15,20 @@ use crate::hle::service::am::applet_data_broker::AppletDataBroker;
 use crate::hle::service::am::library_applet_storage::{
     create_handle_storage, create_transfer_memory_storage,
 };
+use crate::hle::service::am::process_creation::create_process;
 use crate::hle::service::am::service::library_applet_accessor::ILibraryAppletAccessor;
 use crate::hle::service::am::service::storage::IStorage;
 use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
 use crate::hle::service::ipc_helpers::{RequestParser, ResponseBuilder};
 use crate::hle::service::os::process::Process;
 use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
+use common::settings_enums::AppletMode;
 
 /// IPC command table for ILibraryAppletCreator:
 /// - 0: CreateLibraryApplet
 /// - 1: TerminateAllLibraryApplets
 /// - 2: AreAnyLibraryAppletsLeft
+/// - 3: CreateLibraryAppletEx
 /// - 10: CreateStorage
 /// - 11: CreateTransferMemoryStorage
 /// - 12: CreateHandleStorage
@@ -51,6 +54,11 @@ impl ILibraryAppletCreator {
             ),
             (1, None, "TerminateAllLibraryApplets"),
             (2, None, "AreAnyLibraryAppletsLeft"),
+            (
+                3,
+                Some(Self::create_library_applet_ex_handler),
+                "CreateLibraryAppletEx",
+            ),
             (10, Some(Self::create_storage_handler), "CreateStorage"),
             (
                 11,
@@ -73,27 +81,26 @@ impl ILibraryAppletCreator {
     }
 
     fn should_create_guest_applet(applet_id: AppletId) -> bool {
-        // Upstream only creates a guest applet when the corresponding frontend
-        // setting is LLE. ruzu does not expose those settings yet, so every
-        // applet covered by upstream's frontend settings takes the frontend path.
-        !matches!(
-            applet_id,
-            AppletId::Cabinet
-                | AppletId::Controller
-                | AppletId::DataErase
-                | AppletId::Error
-                | AppletId::NetConnect
-                | AppletId::ProfileSelect
-                | AppletId::SoftwareKeyboard
-                | AppletId::MiiEdit
-                | AppletId::Web
-                | AppletId::Shop
-                | AppletId::PhotoViewer
-                | AppletId::OfflineWeb
-                | AppletId::LoginShare
-                | AppletId::WebAuth
-                | AppletId::MyPage
-        )
+        let values = common::settings::values();
+        let mode = match applet_id {
+            AppletId::Cabinet => *values.cabinet_applet_mode.get_value(),
+            AppletId::Controller => *values.controller_applet_mode.get_value(),
+            AppletId::DataErase => *values.data_erase_applet_mode.get_value(),
+            AppletId::Error => *values.error_applet_mode.get_value(),
+            AppletId::NetConnect => *values.net_connect_applet_mode.get_value(),
+            AppletId::ProfileSelect => *values.player_select_applet_mode.get_value(),
+            AppletId::SoftwareKeyboard => *values.swkbd_applet_mode.get_value(),
+            AppletId::MiiEdit => *values.mii_edit_applet_mode.get_value(),
+            AppletId::Web => *values.web_applet_mode.get_value(),
+            AppletId::Shop => *values.shop_applet_mode.get_value(),
+            AppletId::PhotoViewer => *values.photo_viewer_applet_mode.get_value(),
+            AppletId::OfflineWeb => *values.offline_web_applet_mode.get_value(),
+            AppletId::LoginShare => *values.login_share_applet_mode.get_value(),
+            AppletId::WebAuth => *values.wifi_web_auth_applet_mode.get_value(),
+            AppletId::MyPage => *values.my_page_applet_mode.get_value(),
+            _ => return true,
+        };
+        mode == AppletMode::LLE
     }
 
     fn applet_id_from_raw(value: u32) -> Option<AppletId> {
@@ -203,6 +210,50 @@ impl ILibraryAppletCreator {
         Arc::new(ILibraryAppletAccessor::new(self.system, broker, applet))
     }
 
+    fn create_guest_applet(
+        &self,
+        applet_id: AppletId,
+        mode: LibraryAppletMode,
+    ) -> Option<Arc<ILibraryAppletAccessor>> {
+        let program_id = Self::applet_id_to_program_id(applet_id);
+        if program_id == 0 {
+            return None;
+        }
+
+        let process = create_process(self.system, program_id, 14, 22)?;
+        let applet = Arc::new(Mutex::new(Applet::new(self.system, process, false)));
+        let broker = Arc::new(AppletDataBroker::new());
+
+        {
+            let mut applet_guard = applet.lock().unwrap();
+            applet_guard.program_id = program_id;
+            applet_guard.applet_id = applet_id;
+            applet_guard.applet_type = AppletType::LibraryApplet;
+            applet_guard.library_applet_mode = mode;
+            applet_guard.window_visible = mode != LibraryAppletMode::AllForegroundInitiallyHidden;
+            applet_guard.caller_applet = Arc::downgrade(&self.applet);
+            applet_guard.caller_applet_broker = Some(Arc::clone(&broker));
+        }
+
+        self.applet
+            .lock()
+            .unwrap()
+            .child_applets
+            .push(Arc::clone(&applet));
+        self.window_system
+            .upgrade()
+            .expect("WindowSystem must outlive active AM services")
+            .lock()
+            .unwrap()
+            .track_applet(Arc::clone(&applet), false);
+
+        Some(Arc::new(ILibraryAppletAccessor::new(
+            self.system,
+            broker,
+            applet,
+        )))
+    }
+
     fn create_library_applet_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         let creator =
             unsafe { &*(this as *const dyn ServiceFramework as *const ILibraryAppletCreator) };
@@ -237,10 +288,70 @@ impl ILibraryAppletCreator {
 
         let library_applet: Option<Arc<ILibraryAppletAccessor>> =
             if Self::should_create_guest_applet(applet_id) {
-                // The guest-applet path requires process_creation::CreateProcess and LLE
-                // frontend settings. Those are not wired in ruzu yet, so fall back to the
-                // frontend path exactly like upstream does when LLE is not selected.
+                creator.create_guest_applet(applet_id, mode)
+            } else {
                 None
+            };
+        let library_applet =
+            library_applet.unwrap_or_else(|| creator.create_frontend_applet(applet_id, mode));
+
+        if let Some(thread) = ctx.get_thread() {
+            if let Some(process) = thread
+                .lock()
+                .unwrap()
+                .parent
+                .as_ref()
+                .and_then(|parent| parent.upgrade())
+            {
+                let mut process = process.lock().unwrap();
+                creator
+                    .applet
+                    .lock()
+                    .unwrap()
+                    .signal_library_applet_launchable_event(&mut process);
+            }
+        }
+
+        Self::push_interface_response(ctx, library_applet);
+    }
+
+    fn create_library_applet_ex_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let creator =
+            unsafe { &*(this as *const dyn ServiceFramework as *const ILibraryAppletCreator) };
+        let mut rp = RequestParser::new(ctx);
+        let applet_id_raw = rp.pop_u32();
+        let mode_raw = rp.pop_u32();
+        let thread_id = rp.pop_u64();
+
+        let Some(applet_id) = Self::applet_id_from_raw(applet_id_raw) else {
+            log::error!(
+                "ILibraryAppletCreator::CreateLibraryAppletEx invalid applet_id=0x{:X}",
+                applet_id_raw
+            );
+            let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+            rb.push_result(RESULT_UNKNOWN);
+            return;
+        };
+        let Some(mode) = Self::library_applet_mode_from_raw(mode_raw) else {
+            log::error!(
+                "ILibraryAppletCreator::CreateLibraryAppletEx invalid applet_mode=0x{:X}",
+                mode_raw
+            );
+            let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+            rb.push_result(RESULT_UNKNOWN);
+            return;
+        };
+
+        log::debug!(
+            "ILibraryAppletCreator::CreateLibraryAppletEx called with applet_id={:?} applet_mode={:?} thread_id={}",
+            applet_id,
+            mode,
+            thread_id
+        );
+
+        let library_applet: Option<Arc<ILibraryAppletAccessor>> =
+            if Self::should_create_guest_applet(applet_id) {
+                creator.create_guest_applet(applet_id, mode)
             } else {
                 None
             };
@@ -406,12 +517,15 @@ mod tests {
     }
 
     #[test]
-    fn frontend_configured_applets_do_not_force_guest_creation() {
-        assert!(!ILibraryAppletCreator::should_create_guest_applet(
+    fn applet_modes_select_guest_creation() {
+        assert!(ILibraryAppletCreator::should_create_guest_applet(
             AppletId::MiiEdit
         ));
-        assert!(!ILibraryAppletCreator::should_create_guest_applet(
+        assert!(ILibraryAppletCreator::should_create_guest_applet(
             AppletId::ProfileSelect
+        ));
+        assert!(!ILibraryAppletCreator::should_create_guest_applet(
+            AppletId::Controller
         ));
         assert!(ILibraryAppletCreator::should_create_guest_applet(
             AppletId::QLaunch

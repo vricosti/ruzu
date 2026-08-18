@@ -1080,6 +1080,7 @@ mod tests {
                     state: (&mut biquad_state as *mut BiquadFilterState) as CpuAddr,
                     needs_init: true,
                     use_float_processing: false,
+                    ..Default::default()
                 }),
                 Command::MultiTapBiquadFilter(MultiTapBiquadFilterCommand {
                     input: 0,
@@ -1091,6 +1092,7 @@ mod tests {
                     ],
                     needs_init: [true, true],
                     filter_tap_count: 2,
+                    ..Default::default()
                 }),
             ],
             1,

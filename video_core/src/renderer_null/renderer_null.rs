@@ -224,6 +224,8 @@ mod tests {
             1,
         );
         renderer.rasterizer_mut().flush_all();
-        assert!(!renderer.rasterizer().must_flush_region(0, 0));
+        assert!(!renderer
+            .rasterizer()
+            .must_flush_region(0, 0, crate::cache_types::CacheType::ALL,));
     }
 }

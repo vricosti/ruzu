@@ -11,7 +11,7 @@ use super::opcodes::Opcode;
 use super::program::Program;
 use super::types::FpControl;
 use super::value::{Attribute, InstRef, Patch, Pred, Reg, Value};
-use super::FlowTest;
+use super::{Condition, FlowTest};
 
 /// IR builder that emits instructions into a specific block.
 pub struct Emitter<'a> {
@@ -328,6 +328,18 @@ impl<'a> Emitter<'a> {
         }
     }
 
+    /// Upstream `IREmitter::Condition`.
+    pub fn condition(&mut self, cond: Condition) -> Value {
+        let flow_test = cond.get_flow_test();
+        let (pred, is_negated) = cond.get_pred();
+        let predicate = self.get_pred(Pred(pred as u8), is_negated);
+        if flow_test == FlowTest::T {
+            return predicate;
+        }
+        let flow = self.get_flow_test_result(flow_test);
+        self.logical_and(predicate, flow)
+    }
+
     pub fn get_goto_variable(&mut self, index: u32) -> Value {
         self.emit(Inst::new(
             Opcode::GetGotoVariable,
@@ -478,6 +490,16 @@ impl<'a> Emitter<'a> {
 
     pub fn is_helper_invocation(&mut self) -> Value {
         self.emit(Inst::new(Opcode::IsHelperInvocation, vec![]))
+    }
+
+    /// Port of upstream `IREmitter::SR_WScaleFactorXY`.
+    pub fn sr_w_scale_factor_xy(&mut self) -> Value {
+        self.emit(Inst::new(Opcode::SRWScaleFactorXY, vec![]))
+    }
+
+    /// Port of upstream `IREmitter::SR_WScaleFactorZ`.
+    pub fn sr_w_scale_factor_z(&mut self) -> Value {
+        self.emit(Inst::new(Opcode::SRWScaleFactorZ, vec![]))
     }
 
     // ── Undefined ─────────────────────────────────────────────────────
@@ -1452,6 +1474,64 @@ impl<'a> Emitter<'a> {
         self.emit(Inst::new(Opcode::ConvertF32U32, vec![a]))
     }
 
+    /// Port of upstream `IREmitter::ConvertSToF`.
+    pub fn convert_s_to_f(
+        &mut self,
+        dest_bits: u32,
+        src_bits: u32,
+        value: Value,
+        control: FpControl,
+    ) -> Value {
+        let opcode = match (dest_bits, src_bits) {
+            (16, 8) => Opcode::ConvertF16S8,
+            (16, 16) => Opcode::ConvertF16S16,
+            (16, 32) => Opcode::ConvertF16S32,
+            (16, 64) => Opcode::ConvertF16S64,
+            (32, 8) => Opcode::ConvertF32S8,
+            (32, 16) => Opcode::ConvertF32S16,
+            (32, 32) => Opcode::ConvertF32S32,
+            (32, 64) => Opcode::ConvertF32S64,
+            (64, 8) => Opcode::ConvertF64S8,
+            (64, 16) => Opcode::ConvertF64S16,
+            (64, 32) => Opcode::ConvertF64S32,
+            (64, 64) => Opcode::ConvertF64S64,
+            _ => panic!(
+                "Invalid signed-integer-to-float bit size combination dst={} src={}",
+                dest_bits, src_bits
+            ),
+        };
+        self.emit(Inst::with_flags(opcode, vec![value], control.to_u32()))
+    }
+
+    /// Port of upstream `IREmitter::ConvertUToF`.
+    pub fn convert_u_to_f(
+        &mut self,
+        dest_bits: u32,
+        src_bits: u32,
+        value: Value,
+        control: FpControl,
+    ) -> Value {
+        let opcode = match (dest_bits, src_bits) {
+            (16, 8) => Opcode::ConvertF16U8,
+            (16, 16) => Opcode::ConvertF16U16,
+            (16, 32) => Opcode::ConvertF16U32,
+            (16, 64) => Opcode::ConvertF16U64,
+            (32, 8) => Opcode::ConvertF32U8,
+            (32, 16) => Opcode::ConvertF32U16,
+            (32, 32) => Opcode::ConvertF32U32,
+            (32, 64) => Opcode::ConvertF32U64,
+            (64, 8) => Opcode::ConvertF64U8,
+            (64, 16) => Opcode::ConvertF64U16,
+            (64, 32) => Opcode::ConvertF64U32,
+            (64, 64) => Opcode::ConvertF64U64,
+            _ => panic!(
+                "Invalid unsigned-integer-to-float bit size combination dst={} src={}",
+                dest_bits, src_bits
+            ),
+        };
+        self.emit(Inst::with_flags(opcode, vec![value], control.to_u32()))
+    }
+
     /// Port of upstream `IREmitter::ConvertIToF`.
     pub fn convert_i_to_f(
         &mut self,
@@ -1461,37 +1541,11 @@ impl<'a> Emitter<'a> {
         value: Value,
         control: FpControl,
     ) -> Value {
-        let opcode = match (dest_bits, src_bits, is_signed) {
-            (16, 8, true) => Opcode::ConvertF16S8,
-            (16, 16, true) => Opcode::ConvertF16S16,
-            (16, 32, true) => Opcode::ConvertF16S32,
-            (16, 64, true) => Opcode::ConvertF16S64,
-            (16, 8, false) => Opcode::ConvertF16U8,
-            (16, 16, false) => Opcode::ConvertF16U16,
-            (16, 32, false) => Opcode::ConvertF16U32,
-            (16, 64, false) => Opcode::ConvertF16U64,
-            (32, 8, true) => Opcode::ConvertF32S8,
-            (32, 16, true) => Opcode::ConvertF32S16,
-            (32, 32, true) => Opcode::ConvertF32S32,
-            (32, 64, true) => Opcode::ConvertF32S64,
-            (32, 8, false) => Opcode::ConvertF32U8,
-            (32, 16, false) => Opcode::ConvertF32U16,
-            (32, 32, false) => Opcode::ConvertF32U32,
-            (32, 64, false) => Opcode::ConvertF32U64,
-            (64, 8, true) => Opcode::ConvertF64S8,
-            (64, 16, true) => Opcode::ConvertF64S16,
-            (64, 32, true) => Opcode::ConvertF64S32,
-            (64, 64, true) => Opcode::ConvertF64S64,
-            (64, 8, false) => Opcode::ConvertF64U8,
-            (64, 16, false) => Opcode::ConvertF64U16,
-            (64, 32, false) => Opcode::ConvertF64U32,
-            (64, 64, false) => Opcode::ConvertF64U64,
-            _ => panic!(
-                "Invalid integer-to-float bit size combination dst={} src={}",
-                dest_bits, src_bits
-            ),
-        };
-        self.emit(Inst::with_flags(opcode, vec![value], control.to_u32()))
+        if is_signed {
+            self.convert_s_to_f(dest_bits, src_bits, value, control)
+        } else {
+            self.convert_u_to_f(dest_bits, src_bits, value, control)
+        }
     }
 
     pub fn convert_s32_from_f32(&mut self, a: Value) -> Value {
@@ -3041,5 +3095,39 @@ mod tests {
         emitter.set_pred(Pred::PT, Value::ImmU1(false));
 
         assert!(emitter.program.block(block).is_empty());
+    }
+
+    #[test]
+    fn condition_combines_predicate_with_flow_test_like_upstream() {
+        use crate::ir::condition::{Condition, IrPred};
+
+        let mut program = Program::new(ShaderStage::Fragment);
+        let block = program.add_block();
+        let mut emitter = Emitter::new(&mut program, block);
+
+        let result = emitter.condition(Condition::new(FlowTest::NEU, IrPred::P0, false));
+        let Value::Inst(result_ref) = result else {
+            panic!("condition should produce an instruction");
+        };
+        assert_eq!(
+            emitter.program.block(block).inst(result_ref.inst).opcode,
+            Opcode::LogicalAnd
+        );
+        for opcode in [
+            Opcode::GetPred,
+            Opcode::GetSFlag,
+            Opcode::GetZFlag,
+            Opcode::LogicalNot,
+            Opcode::LogicalOr,
+        ] {
+            assert!(
+                emitter
+                    .program
+                    .block(block)
+                    .iter()
+                    .any(|inst| inst.opcode == opcode),
+                "missing {opcode:?}"
+            );
+        }
     }
 }

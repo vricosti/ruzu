@@ -441,6 +441,36 @@ pub fn create_nearest_neighbor_sampler(device: &ash::Device) -> vk::Sampler {
     }
 }
 
+/// Catmull-Rom subset of upstream `CreateCubicSampler`. Vulkan defines
+/// Catmull-Rom as the default cubic weights, so this path only needs
+/// `VK_EXT_filter_cubic` and does not require the QCOM pNext structure that is
+/// absent from ash 0.37.
+pub fn create_cubic_sampler(device: &ash::Device) -> vk::Sampler {
+    let sampler_ci = vk::SamplerCreateInfo::builder()
+        .mag_filter(vk::Filter::CUBIC_EXT)
+        .min_filter(vk::Filter::CUBIC_EXT)
+        .mipmap_mode(vk::SamplerMipmapMode::NEAREST)
+        .address_mode_u(vk::SamplerAddressMode::CLAMP_TO_BORDER)
+        .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_BORDER)
+        .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_BORDER)
+        .mip_lod_bias(0.0)
+        .anisotropy_enable(false)
+        .max_anisotropy(0.0)
+        .compare_enable(false)
+        .compare_op(vk::CompareOp::NEVER)
+        .min_lod(0.0)
+        .max_lod(0.0)
+        .border_color(vk::BorderColor::FLOAT_OPAQUE_BLACK)
+        .unnormalized_coordinates(false)
+        .build();
+
+    unsafe {
+        device
+            .create_sampler(&sampler_ci, None)
+            .expect("Failed to create cubic sampler")
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Shader module creation
 // ---------------------------------------------------------------------------

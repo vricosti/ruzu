@@ -6,15 +6,82 @@
 //! Abstract environment interface providing access to the shader binary
 //! and GPU state needed during shader translation.
 
+use super::ir::value::{InstRef, Value};
 use super::program_header::ProgramHeader;
 use super::shader_info::{ReplaceConstant, TexturePixelFormat, TextureType};
 use super::stage::Stage;
+use std::collections::HashMap;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct CbufWordKey {
+    pub index: u32,
+    pub offset: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct HandleKey {
+    pub index: u32,
+    pub offset: u32,
+    pub shift_left: u32,
+    pub secondary_index: u32,
+    pub secondary_offset: u32,
+    pub secondary_shift_left: u32,
+    pub count: u32,
+    pub has_secondary: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct ConstBufferAddr {
+    pub index: u32,
+    pub offset: u32,
+    pub shift_left: u32,
+    pub secondary_index: u32,
+    pub secondary_offset: u32,
+    pub secondary_shift_left: u32,
+    pub dynamic_offset: Value,
+    pub count: u32,
+    pub has_secondary: bool,
+}
+
+impl ConstBufferAddr {
+    pub fn bound(index: u32, offset: u32) -> Self {
+        Self {
+            index,
+            offset,
+            shift_left: 0,
+            secondary_index: 0,
+            secondary_offset: 0,
+            secondary_shift_left: 0,
+            dynamic_offset: Value::Void,
+            count: 1,
+            has_secondary: false,
+        }
+    }
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct TexturePassCaches {
+    pub cbuf_word_cache: HashMap<CbufWordKey, u32>,
+    pub handle_cache: HashMap<HandleKey, u32>,
+    pub track_cache: HashMap<InstRef, ConstBufferAddr>,
+}
+
+impl TexturePassCaches {
+    pub fn clear(&mut self) {
+        self.cbuf_word_cache.clear();
+        self.handle_cache.clear();
+        self.track_cache.clear();
+    }
+}
 
 /// Abstract environment for shader recompilation.
 ///
 /// Provides access to shader instructions, constant buffer values,
 /// texture types, and other GPU state needed during translation.
 pub trait Environment {
+    /// Per-environment caches reset and populated by `TexturePass`.
+    fn texture_pass_caches(&mut self) -> &mut TexturePassCaches;
+
     /// Diagnostic discriminator for cache-file shader environments.
     fn is_file_environment(&self) -> bool {
         false

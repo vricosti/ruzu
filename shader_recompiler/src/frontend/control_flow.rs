@@ -13,6 +13,8 @@ use super::instruction::{Instruction, Predicate};
 use super::location::Location;
 use super::maxwell_opcodes::{self, MaxwellOpcode};
 use crate::environment::Environment;
+pub use crate::ir::condition::Condition;
+use crate::ir::condition::IrPred;
 use crate::ir::flow_test::FlowTest;
 
 /// How a basic block ends.
@@ -30,28 +32,6 @@ pub enum EndClass {
     Exit,
     /// Fragment kill/discard.
     Kill,
-}
-
-/// Branch condition.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Condition {
-    /// Predicate index (0-6, or 7 for PT).
-    pub pred: u8,
-    /// Whether the predicate is negated.
-    pub negated: bool,
-}
-
-impl Condition {
-    pub fn always() -> Self {
-        Self {
-            pred: 7,
-            negated: false,
-        }
-    }
-
-    pub fn is_always(&self) -> bool {
-        self.pred == 7 && !self.negated
-    }
 }
 
 /// A basic block in the flat CFG.
@@ -794,21 +774,21 @@ fn is_absolute_jump(opcode: MaxwellOpcode) -> bool {
 }
 
 fn has_flow_test(opcode: MaxwellOpcode) -> bool {
-    matches!(
-        opcode,
+    match opcode {
         MaxwellOpcode::BRA
-            | MaxwellOpcode::BRX
-            | MaxwellOpcode::EXIT
-            | MaxwellOpcode::JMP
-            | MaxwellOpcode::JMX
-            | MaxwellOpcode::KIL
-            | MaxwellOpcode::BRK
-            | MaxwellOpcode::CONT
-            | MaxwellOpcode::LONGJMP
-            | MaxwellOpcode::PRET
-            | MaxwellOpcode::RET
-            | MaxwellOpcode::SYNC
-    )
+        | MaxwellOpcode::BRX
+        | MaxwellOpcode::EXIT
+        | MaxwellOpcode::JMP
+        | MaxwellOpcode::JMX
+        | MaxwellOpcode::KIL
+        | MaxwellOpcode::BRK
+        | MaxwellOpcode::CONT
+        | MaxwellOpcode::LONGJMP
+        | MaxwellOpcode::RET
+        | MaxwellOpcode::SYNC => true,
+        MaxwellOpcode::CAL | MaxwellOpcode::JCAL => false,
+        _ => panic!("invalid branch opcode {opcode:?}"),
+    }
 }
 
 fn branch_offset(pc: Location, inst: Instruction) -> Location {
@@ -820,18 +800,15 @@ fn branch_offset(pc: Location, inst: Instruction) -> Location {
 }
 
 fn condition_from_predicate(pred: Predicate) -> Condition {
-    Condition {
-        pred: pred.index as u8,
-        negated: pred.negated,
-    }
+    Condition::from_pred(IrPred::from_u8(pred.index as u8), pred.negated)
 }
 
 fn condition_from_flow(flow_test: Option<FlowTest>, pred: Predicate) -> Condition {
-    let mut cond = condition_from_predicate(pred);
-    if matches!(flow_test, Some(FlowTest::F)) {
-        cond.negated = !cond.negated;
-    }
-    cond
+    Condition::new(
+        flow_test.unwrap_or(FlowTest::T),
+        IrPred::from_u8(pred.index as u8),
+        pred.negated,
+    )
 }
 
 fn location_to_word_index(location: Location, base_offset: u32) -> u32 {
@@ -905,7 +882,7 @@ pub fn build_cfg(instructions: &[u64]) -> Vec<CfgBlock> {
                 if let Some(pos) = stack.iter().rposition(|entry| entry.kind == kind) {
                     let target = stack[pos].target;
                     block_starts.insert(target);
-                    let cond = decode_predicate(insn);
+                    let cond = decode_condition(insn, opcode.expect("matched flow opcode"));
                     if cond.is_always() {
                         stack.truncate(pos);
                     }
@@ -948,27 +925,27 @@ pub fn build_cfg(instructions: &[u64]) -> Vec<CfgBlock> {
 
         let (end_class, cond) = match last_opcode {
             Some(MaxwellOpcode::BRA) => {
-                let c = decode_predicate(last_insn);
+                let c = decode_condition(last_insn, MaxwellOpcode::BRA);
                 (EndClass::Branch, c)
             }
             Some(MaxwellOpcode::EXIT) => {
-                let c = decode_predicate(last_insn);
+                let c = decode_condition(last_insn, MaxwellOpcode::EXIT);
                 (EndClass::Exit, c)
             }
             Some(MaxwellOpcode::KIL) => {
-                let c = decode_predicate(last_insn);
+                let c = decode_condition(last_insn, MaxwellOpcode::KIL);
                 (EndClass::Kill, c)
             }
             Some(MaxwellOpcode::SYNC) => {
-                let c = decode_predicate(last_insn);
+                let c = decode_condition(last_insn, MaxwellOpcode::SYNC);
                 (EndClass::Branch, c)
             }
             Some(MaxwellOpcode::BRK) => {
-                let c = decode_predicate(last_insn);
+                let c = decode_condition(last_insn, MaxwellOpcode::BRK);
                 (EndClass::Branch, c)
             }
             Some(MaxwellOpcode::CONT) => {
-                let c = decode_predicate(last_insn);
+                let c = decode_condition(last_insn, MaxwellOpcode::CONT);
                 (EndClass::Branch, c)
             }
             Some(MaxwellOpcode::CAL) | Some(MaxwellOpcode::JCAL) => {
@@ -1181,11 +1158,12 @@ fn decode_branch_offset(insn: u64) -> i32 {
 }
 
 /// Decode the predicate condition from bits [19:16] of the instruction.
-fn decode_predicate(insn: u64) -> Condition {
-    let pred_bits = ((insn >> 16) & 0xF) as u8;
-    let pred = pred_bits & 0x7;
-    let negated = pred_bits & 0x8 != 0;
-    Condition { pred, negated }
+fn decode_condition(insn: u64, opcode: MaxwellOpcode) -> Condition {
+    let instruction = Instruction::new(insn);
+    condition_from_flow(
+        has_flow_test(opcode).then(|| instruction.branch_flow_test().unwrap_or(FlowTest::T)),
+        instruction.pred(),
+    )
 }
 
 #[cfg(test)]
@@ -1202,14 +1180,23 @@ mod tests {
     }
 
     #[test]
+    fn branch_condition_preserves_flow_test_and_predicate() {
+        // BRA.NEU P0 from a production fragment shader. Upstream represents
+        // this as IR::Condition{NEU, P0}; dropping NEU changes the branch.
+        let condition = decode_condition(0xE240_0000_0680_000D, MaxwellOpcode::BRA);
+
+        assert_eq!(condition.get_flow_test(), FlowTest::NEU);
+        assert_eq!(condition.get_pred(), (IrPred::P0, false));
+    }
+
+    #[test]
     fn kil_uses_instruction_predicate_like_upstream() {
         let kil_p2_neg = 0xe330_0000_0000_0000u64 | (0b1010u64 << 16);
         let cfg = build_cfg(&[kil_p2_neg]);
 
         assert_eq!(cfg.len(), 1);
         assert_eq!(cfg[0].end_class, EndClass::Kill);
-        assert_eq!(cfg[0].cond.pred, 2);
-        assert!(cfg[0].cond.negated);
+        assert_eq!(cfg[0].cond.get_pred(), (IrPred::P2, true));
     }
 
     #[test]
@@ -1231,8 +1218,7 @@ mod tests {
 
         assert_eq!(cfg[true_target].begin, 13);
         assert_eq!(cfg[false_target].begin, 2);
-        assert_eq!(sync_block.cond.pred, 0);
-        assert!(!sync_block.cond.negated);
+        assert_eq!(sync_block.cond.get_pred(), (IrPred::P0, false));
     }
 
     #[test]

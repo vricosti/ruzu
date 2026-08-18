@@ -1,0 +1,31 @@
+[process]
+executable = "../../target/release/reden"
+rom_path = "/home/vricosti/Games/Emulators/Switch/common/roms/commercial/Mario Kart 8 Deluxe [NSP]/Mario Kart 8 Deluxe [0100152000022000][v0].nsp"
+args = []
+working_directory = "../.."
+log_file = "../../screenshots/reden/mk8d-opengl-memtrack-backtrace-20260818-031200/process.log"
+stop_at = "00:00:15.000"
+terminate_after_timeline = true
+termination_grace_ms = 3000
+
+[process.environment]
+DISPLAY = ":0"
+RUST_LOG = "info"
+RUST_BACKTRACE = "full"
+
+[input]
+default_hold_ms = 100
+restore_config = true
+
+[capture]
+output_directory = "../../screenshots/reden/mk8d-opengl-memtrack-backtrace-20260818-031200"
+target = "window"
+match_process_pid = true
+window_wait_timeout = "00:00:20"
+screenshot_prefix = "mk8d-opengl-memtrack-backtrace"
+times = ["00:00:07.000"]
+
+[video]
+enabled = false
+end = "00:00:14"
+output = "unused.mp4"

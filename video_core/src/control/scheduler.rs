@@ -8,20 +8,12 @@
 //! lock.
 
 use std::collections::HashMap;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 use parking_lot::Mutex;
 
 use super::channel_state::ChannelState;
 use crate::dma_pusher::CommandList;
-
-static TRACE_PULLER_SUBMIT_RANGE_ENABLED: OnceLock<bool> = OnceLock::new();
-
-#[inline]
-fn trace_puller_submit_range_enabled() -> bool {
-    *TRACE_PULLER_SUBMIT_RANGE_ENABLED
-        .get_or_init(|| std::env::var_os("RUZU_TRACE_PULLER_SUBMIT_RANGE").is_some())
-}
 
 // ---------------------------------------------------------------------------
 // Scheduler
@@ -65,23 +57,20 @@ impl Scheduler {
     ///
     /// Corresponds to `Scheduler::Push(s32 channel, CommandList&& entries)`.
     pub fn push(&self, channel: i32, entries: CommandList) {
-        log::trace!(
-            "Scheduler::push channel={} command_lists={} prefetch={}",
-            channel,
-            entries.command_lists.len(),
-            entries.prefetch_command_list.len()
-        );
-        let _lock = self.scheduling_guard.lock();
+        let channel_state = {
+            let _lock = self.scheduling_guard.lock();
+            let channel_state = Arc::clone(
+                self.channels
+                    .get(&channel)
+                    .expect("Scheduler::push: channel not found"),
+            );
 
-        let channel_state = self
-            .channels
-            .get(&channel)
-            .expect("Scheduler::push: channel not found");
-
-        // Safety: gpu pointer is valid for the lifetime of the Scheduler.
-        let gpu = unsafe { &*self.gpu };
-        let bind_id = channel_state.lock().bind_id;
-        gpu.bind_channel(bind_id);
+            // Safety: gpu pointer is valid for the lifetime of the Scheduler.
+            let gpu = unsafe { &*self.gpu };
+            let bind_id = channel_state.lock().bind_id;
+            gpu.bind_channel(bind_id);
+            channel_state
+        };
 
         let mut cs = channel_state.lock();
         let dma_pusher = cs
@@ -89,35 +78,7 @@ impl Scheduler {
             .as_mut()
             .expect("Scheduler::push: dma_pusher not initialized");
         dma_pusher.push(entries);
-
-        let traced_idx = if crate::dma_pusher::puller_trace_submits_limit().is_some()
-            || trace_puller_submit_range_enabled()
-        {
-            let idx = crate::dma_pusher::CURRENT_SUBMIT_INDEX
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            if crate::dma_pusher::should_trace_submit_idx(idx) {
-                let lists = dma_pusher.dma_pushbuffer_len();
-                log::info!(
-                    "[PULLER_TRACE] === SUBMIT #{} channel={} bind_id={} pending_lists={} ===",
-                    idx,
-                    channel,
-                    bind_id,
-                    lists,
-                );
-                crate::dma_pusher::ACTIVE_SUBMIT_IDX
-                    .store(idx as i64, std::sync::atomic::Ordering::SeqCst);
-                Some(idx)
-            } else {
-                None
-            }
-        } else {
-            None
-        };
         dma_pusher.dispatch_calls();
-        if traced_idx.is_some() {
-            crate::dma_pusher::ACTIVE_SUBMIT_IDX
-                .store(i64::MIN, std::sync::atomic::Ordering::SeqCst);
-        }
     }
 
     /// Register a channel with the scheduler.

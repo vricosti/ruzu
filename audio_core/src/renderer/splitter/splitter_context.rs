@@ -26,6 +26,9 @@ pub struct SplitterContext {
     splitter_destinations: Vec<SplitterDestinationData>,
     destinations_count: i32,
     splitter_bug_fixed: bool,
+    splitter_prev_volume_reset_supported: bool,
+    splitter_biquad_param_supported: bool,
+    splitter_float_coeff_supported: bool,
 }
 
 impl SplitterContext {
@@ -96,7 +99,7 @@ impl SplitterContext {
 
     pub fn clear_all_new_connection_flag(&mut self) {
         for splitter_info in &mut self.splitter_infos {
-            splitter_info.clear_new_connection_flag();
+            splitter_info.set_new_connection_flag();
         }
     }
 
@@ -110,6 +113,9 @@ impl SplitterContext {
         self.info_count = 0;
         self.destinations_count = 0;
         self.splitter_bug_fixed = false;
+        self.splitter_prev_volume_reset_supported = false;
+        self.splitter_biquad_param_supported = false;
+        self.splitter_float_coeff_supported = false;
 
         if behavior.is_splitter_supported()
             && params.splitter_infos > 0
@@ -124,6 +130,11 @@ impl SplitterContext {
             self.info_count = params.splitter_infos as i32;
             self.destinations_count = params.splitter_destinations;
             self.splitter_bug_fixed = behavior.is_splitter_bug_fixed();
+            self.splitter_prev_volume_reset_supported =
+                behavior.is_splitter_prev_volume_reset_supported();
+            self.splitter_biquad_param_supported =
+                behavior.is_biquad_filter_parameter_for_splitter_enabled();
+            self.splitter_float_coeff_supported = behavior.is_splitter_destination_v2b_supported();
         }
         true
     }
@@ -194,22 +205,105 @@ impl SplitterContext {
 
     pub fn update_data(&mut self, input: &[u8], mut offset: u32, count: u32) -> u32 {
         for _ in 0..count {
-            let Some(data_header) =
-                read_pod::<super::splitter_destinations_data::InParameter>(input, offset as usize)
-            else {
-                break;
-            };
-            if data_header.magic != get_splitter_send_data_magic() {
-                continue;
+            if !self.splitter_biquad_param_supported {
+                let Some(mut data_header) = read_pod::<
+                    super::splitter_destinations_data::InParameter,
+                >(input, offset as usize) else {
+                    break;
+                };
+                if data_header.magic != get_splitter_send_data_magic() {
+                    continue;
+                }
+                // Upstream spells the upper bound as `id > count`, then indexes
+                // the `count`-element array. Keep the effective array contract
+                // explicit in Rust and reject the one-past-end id.
+                if data_header.id < 0 || data_header.id >= self.destinations_count {
+                    continue;
+                }
+                if !self.splitter_prev_volume_reset_supported {
+                    data_header.reset_prev_volume = false;
+                }
+                if let Some(destination) =
+                    self.splitter_destinations.get_mut(data_header.id as usize)
+                {
+                    destination.update(&data_header);
+                }
+                offset = offset.saturating_add(size_of::<
+                    super::splitter_destinations_data::InParameter,
+                >() as u32);
+            } else if !self.splitter_float_coeff_supported {
+                let Some(data_header) = read_pod::<
+                    super::splitter_destinations_data::InParameterVersion2a,
+                >(input, offset as usize) else {
+                    break;
+                };
+                if data_header.magic != get_splitter_send_data_magic() {
+                    continue;
+                }
+                if data_header.id < 0 || data_header.id >= self.destinations_count {
+                    continue;
+                }
+                let mapped = super::splitter_destinations_data::InParameter {
+                    magic: data_header.magic,
+                    id: data_header.id,
+                    mix_volumes: data_header.mix_volumes,
+                    mix_id: data_header.mix_id,
+                    in_use: data_header.in_use,
+                    reset_prev_volume: self.splitter_prev_volume_reset_supported
+                        && data_header.reset_prev_volume,
+                    _padding: [0; 2],
+                };
+                if let Some(destination) =
+                    self.splitter_destinations.get_mut(data_header.id as usize)
+                {
+                    destination.update(&mapped);
+                    for (output, legacy) in destination
+                        .get_biquad_filters_mut()
+                        .iter_mut()
+                        .zip(data_header.biquad_filters)
+                    {
+                        output.enabled = legacy.enabled;
+                        output.numerator = legacy.b.map(|value| value as f32 / 16384.0);
+                        output.denominator = legacy.a.map(|value| value as f32 / 16384.0);
+                    }
+                }
+                offset = offset.saturating_add(size_of::<
+                    super::splitter_destinations_data::InParameterVersion2a,
+                >() as u32);
+            } else {
+                let Some(data_header) = read_pod::<
+                    super::splitter_destinations_data::InParameterVersion2b,
+                >(input, offset as usize) else {
+                    break;
+                };
+                if data_header.magic != get_splitter_send_data_magic() {
+                    continue;
+                }
+                if data_header.id < 0 || data_header.id >= self.destinations_count {
+                    continue;
+                }
+                let mapped = super::splitter_destinations_data::InParameter {
+                    magic: data_header.magic,
+                    id: data_header.id,
+                    mix_volumes: data_header.mix_volumes,
+                    mix_id: data_header.mix_id,
+                    in_use: data_header.in_use,
+                    reset_prev_volume: self.splitter_prev_volume_reset_supported
+                        && data_header.reset_prev_volume,
+                    _padding: [0; 2],
+                };
+                if let Some(destination) =
+                    self.splitter_destinations.get_mut(data_header.id as usize)
+                {
+                    destination.update(&mapped);
+                    destination
+                        .get_biquad_filters_mut()
+                        .copy_from_slice(&data_header.biquad_filters);
+                }
+                offset = offset.saturating_add(size_of::<
+                    super::splitter_destinations_data::InParameterVersion2b,
+                >() as u32);
             }
-            if data_header.id < 0 || data_header.id >= self.destinations_count {
-                continue;
-            }
-            if let Some(destination) = self.splitter_destinations.get_mut(data_header.id as usize) {
-                destination.update(&data_header);
-            }
-            offset = offset
-                .saturating_add(size_of::<super::splitter_destinations_data::InParameter>() as u32);
         }
 
         offset
@@ -336,6 +430,9 @@ mod tests {
             splitter_destinations: vec![SplitterDestinationData::new(0)],
             destinations_count: 1,
             splitter_bug_fixed: true,
+            splitter_prev_volume_reset_supported: false,
+            splitter_biquad_param_supported: false,
+            splitter_float_coeff_supported: false,
         };
         context.splitter_infos[0].set_destinations(Some(0));
         context.splitter_infos[0].set_destination_count(1);
@@ -434,13 +531,91 @@ mod tests {
     }
 
     #[test]
-    fn clear_all_new_connection_flag_clears_flags() {
+    fn update_data_revision_12_maps_fixed_point_biquads() {
         let mut context = make_context();
-        assert!(context.get_info(0).unwrap().has_new_connection());
+        context.splitter_biquad_param_supported = true;
+        let mut data = splitter_destinations_data::InParameterVersion2a {
+            magic: get_splitter_send_data_magic(),
+            id: 0,
+            mix_id: 7,
+            in_use: true,
+            ..Default::default()
+        };
+        data.biquad_filters[0].enabled = true;
+        data.biquad_filters[0].b = [16384, -8192, 4096];
+        data.biquad_filters[0].a = [-4096, 2048];
+        let input = unsafe {
+            std::slice::from_raw_parts(
+                &data as *const splitter_destinations_data::InParameterVersion2a as *const u8,
+                size_of::<splitter_destinations_data::InParameterVersion2a>(),
+            )
+        };
+
+        assert_eq!(
+            context.update_data(input, 0, 1),
+            size_of::<splitter_destinations_data::InParameterVersion2a>() as u32
+        );
+        let destination = context.get_destination_data(0, 0).unwrap();
+        assert_eq!(destination.get_mix_id(), 7);
+        assert_eq!(
+            destination.get_biquad_filters()[0].numerator,
+            [1.0, -0.5, 0.25]
+        );
+        assert_eq!(
+            destination.get_biquad_filters()[0].denominator,
+            [-0.25, 0.125]
+        );
+    }
+
+    #[test]
+    fn update_data_revision_15_preserves_float_biquads() {
+        let mut context = make_context();
+        context.splitter_biquad_param_supported = true;
+        context.splitter_prev_volume_reset_supported = true;
+        context.splitter_float_coeff_supported = true;
+        let mut data = splitter_destinations_data::InParameterVersion2b {
+            magic: get_splitter_send_data_magic(),
+            id: 0,
+            mix_id: 9,
+            in_use: true,
+            reset_prev_volume: true,
+            ..Default::default()
+        };
+        data.biquad_filters[0].enabled = true;
+        data.biquad_filters[0].numerator = [0.125, -0.25, 0.5];
+        data.biquad_filters[0].denominator = [-0.75, 0.875];
+        let input = unsafe {
+            std::slice::from_raw_parts(
+                &data as *const splitter_destinations_data::InParameterVersion2b as *const u8,
+                size_of::<splitter_destinations_data::InParameterVersion2b>(),
+            )
+        };
+
+        assert_eq!(
+            context.update_data(input, 0, 1),
+            size_of::<splitter_destinations_data::InParameterVersion2b>() as u32
+        );
+        let destination = context.get_destination_data(0, 0).unwrap();
+        assert_eq!(destination.get_mix_id(), 9);
+        assert_eq!(
+            destination.get_biquad_filters()[0].numerator,
+            [0.125, -0.25, 0.5]
+        );
+        assert_eq!(
+            destination.get_biquad_filters()[0].denominator,
+            [-0.75, 0.875]
+        );
+    }
+
+    #[test]
+    fn clear_all_new_connection_flag_matches_upstream_set_behavior() {
+        let mut context = make_context();
+        context.get_info_mut(0).unwrap().clear_new_connection_flag();
+        assert!(!context.get_info(0).unwrap().has_new_connection());
 
         context.clear_all_new_connection_flag();
 
-        assert!(!context.get_info(0).unwrap().has_new_connection());
+        assert!(context.get_info(0).unwrap().has_new_connection());
     }
 
     #[test]

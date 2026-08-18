@@ -97,6 +97,32 @@ pub mod dma {
     }
 }
 
+/// Backend-owned DMA acceleration interface.
+///
+/// This is the Rust counterpart of upstream
+/// `Tegra::Engines::AccelerateDMAInterface` in `maxwell_dma.h`.  The concrete
+/// object belongs to the rasterizer backend; `MaxwellDMA` only obtains it
+/// through `RasterizerInterface::access_accelerate_dma`.
+pub trait AccelerateDMAInterface {
+    fn buffer_copy(&mut self, src_address: u64, dest_address: u64, amount: u64) -> bool;
+
+    fn buffer_clear(&mut self, dst_address: u64, amount: u64, value: u32) -> bool;
+
+    fn image_to_buffer(
+        &mut self,
+        copy_info: &dma::ImageCopy,
+        src: &dma::ImageOperand,
+        dst: &dma::BufferOperand,
+    ) -> bool;
+
+    fn buffer_to_image(
+        &mut self,
+        copy_info: &dma::ImageCopy,
+        src: &dma::BufferOperand,
+        dst: &dma::ImageOperand,
+    ) -> bool;
+}
+
 // ── Register constants (method = byte_offset / 4) ──────────────────────────
 
 const LAUNCH_DMA: u32 = 0xC0;
@@ -311,50 +337,17 @@ impl MaxwellDMA {
         is_pitch_kind(kind)
     }
 
-    fn stop_unimplemented_dma_path(&self, reason: &str) -> ! {
-        #[cfg(not(test))]
-        {
-            let path = std::path::Path::new(".agents/maxwell_dma_unimplemented_state.md");
-            if let Some(parent) = path.parent() {
-                let _ = std::fs::create_dir_all(parent);
-            }
-            let entry = format!(
-                "\n## MaxwellDMA unsupported path\n\
-                 - reason: {}\n\
-                 - launch_dma: 0x{:08X}\n\
-                 - src: 0x{:X}\n\
-                 - dst: 0x{:X}\n\
-                 - pitch_in: {}\n\
-                 - pitch_out: {}\n\
-                 - line_length: {}\n\
-                 - line_count: {}\n\
-                 - multi_line: {}\n\
-                 - src_pitch_layout: {}\n\
-                 - dst_pitch_layout: {}\n\
-                 - remap_enable: {}\n",
-                reason,
-                self.launch_dma(),
-                self.src_addr(),
-                self.dst_addr(),
-                self.pitch_in(),
-                self.pitch_out(),
-                self.line_length(),
-                self.line_count(),
-                self.launch_multi_line_enable(),
-                self.launch_src_is_pitch(),
-                self.launch_dst_is_pitch(),
-                self.launch_remap_enable(),
-            );
-            if let Ok(mut file) = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(path)
-            {
-                use std::io::Write;
-                let _ = file.write_all(entry.as_bytes());
-            }
-        }
-        panic!("MaxwellDMA unsupported path: {}", reason);
+    fn report_unimplemented_dma_path(&self, reason: &str) {
+        // Eden's UNIMPLEMENTED_IF is an ASSERT and therefore reports through
+        // the configured fail-soft policy before continuing.  Do not turn
+        // guest input into a host-side file write or an unconditional panic.
+        log::error!(
+            "MaxwellDMA unsupported path: {} (launch=0x{:08X} src=0x{:X} dst=0x{:X})",
+            reason,
+            self.launch_dma(),
+            self.src_addr(),
+            self.dst_addr(),
+        );
     }
 
     // ── Launch handling ────────────────────────────────────────────────
@@ -466,7 +459,11 @@ impl MaxwellDMA {
         };
         let accelerated = self
             .with_rasterizer_mut(|rasterizer| {
-                rasterizer.accelerate_dma_image_to_buffer(&copy_info, &src_operand, &dst_operand)
+                rasterizer.access_accelerate_dma().image_to_buffer(
+                    &copy_info,
+                    &src_operand,
+                    &dst_operand,
+                )
             })
             .unwrap_or(false);
         if accelerated {
@@ -474,17 +471,17 @@ impl MaxwellDMA {
         }
 
         if src_params.block_size.width() != 0 {
-            self.stop_unimplemented_dma_path(
+            self.report_unimplemented_dma_path(
                 "blocklinear->pitch source block_size.width is not zero",
             );
         }
         if src_params.block_size.depth() != 0 {
-            self.stop_unimplemented_dma_path(
+            self.report_unimplemented_dma_path(
                 "blocklinear->pitch source block_size.depth is not zero",
             );
         }
         if src_params.block_size.depth() == 0 && src_params.depth != 1 {
-            self.stop_unimplemented_dma_path(
+            self.report_unimplemented_dma_path(
                 "blocklinear->pitch source depth must be one when block depth is zero",
             );
         }
@@ -558,12 +555,12 @@ impl MaxwellDMA {
     ) -> Option<Vec<PendingWrite>> {
         let dst_params = self.dst_params();
         if dst_params.block_size.width() != 0 {
-            self.stop_unimplemented_dma_path(
+            self.report_unimplemented_dma_path(
                 "pitch->blocklinear destination block_size.width is not zero",
             );
         }
         if dst_params.layer != 0 {
-            self.stop_unimplemented_dma_path("pitch->blocklinear destination layer is not zero");
+            self.report_unimplemented_dma_path("pitch->blocklinear destination layer is not zero");
         }
 
         let base_bpp = self.base_bytes_per_pixel();
@@ -584,7 +581,11 @@ impl MaxwellDMA {
         };
         let accelerated = self
             .with_rasterizer_mut(|rasterizer| {
-                rasterizer.accelerate_dma_buffer_to_image(&copy_info, &src_operand, &dst_operand)
+                rasterizer.access_accelerate_dma().buffer_to_image(
+                    &copy_info,
+                    &src_operand,
+                    &dst_operand,
+                )
             })
             .unwrap_or(false);
         if accelerated {
@@ -656,7 +657,7 @@ impl MaxwellDMA {
     ) -> Option<Vec<PendingWrite>> {
         let src_params = self.src_params();
         if src_params.block_size.width() != 0 {
-            self.stop_unimplemented_dma_path(
+            self.report_unimplemented_dma_path(
                 "blocklinear->blocklinear source block_size.width is not zero",
             );
         }
@@ -757,17 +758,6 @@ impl MaxwellDMA {
     }
 
     fn log_launch(&self) {
-        if std::env::var_os("RUZU_TRACE_ENGINE_LAUNCH").is_some() {
-            log::info!(
-                "MaxwellDMA::LAUNCH src=0x{:X} dst=0x{:X} pitch_in={} pitch_out={} {}x{}",
-                self.src_addr(),
-                self.dst_addr(),
-                self.pitch_in(),
-                self.pitch_out(),
-                self.line_length(),
-                self.line_count(),
-            );
-        }
         log::debug!(
             "MaxwellDMA: LAUNCH src=0x{:X} dst=0x{:X} pitch_in={} pitch_out={} {}x{}",
             self.src_addr(),
@@ -790,10 +780,6 @@ impl MaxwellDMA {
             || !self.launch_dst_is_pitch()
         {
             return false;
-        }
-
-        if self.launch_data_transfer_type() != LAUNCH_DATA_TRANSFER_NON_PIPELINED {
-            self.stop_unimplemented_dma_path("data_transfer_type is not NON_PIPELINED");
         }
 
         let lines = self.line_count();
@@ -838,37 +824,6 @@ impl MaxwellDMA {
     }
 
     fn collect_launch_writes(&mut self, read_gpu: &dyn Fn(u64, &mut [u8])) -> Vec<PendingWrite> {
-        if let Some(target) = std::env::var("RUZU_TRACE_DMA_DADDR")
-            .ok()
-            .and_then(|value| u64::from_str_radix(value.trim_start_matches("0x"), 16).ok())
-        {
-            let memory_manager = self.memory_manager.lock();
-            if let Some(dst_device) = memory_manager.gpu_to_cpu_address(self.dst_addr()) {
-                let distance = dst_device.abs_diff(target);
-                if distance < 0x40_000 {
-                    log::warn!(
-                        "[DMA_DADDR] target=0x{:X} src_gpu=0x{:X} src_dev={:?} dst_gpu=0x{:X} dst_dev=0x{:X} launch=0x{:08X} line_length={} line_count={} pitch_in={} pitch_out={} src_pitch={} dst_pitch={} remap={}",
-                        target,
-                        self.src_addr(),
-                        memory_manager.gpu_to_cpu_address(self.src_addr()),
-                        self.dst_addr(),
-                        dst_device,
-                        self.launch_dma(),
-                        self.line_length(),
-                        self.line_count(),
-                        self.pitch_in(),
-                        self.pitch_out(),
-                        self.launch_src_is_pitch(),
-                        self.launch_dst_is_pitch(),
-                        self.launch_remap_enable(),
-                    );
-                }
-            }
-        }
-        if self.launch_data_transfer_type() != LAUNCH_DATA_TRANSFER_NON_PIPELINED {
-            self.stop_unimplemented_dma_path("data_transfer_type is not NON_PIPELINED");
-        }
-
         let lines = self.line_count();
         let ll = self.line_length();
         if ll == 0 {
@@ -880,19 +835,25 @@ impl MaxwellDMA {
             let src_addr = self.src_addr();
             let dst_addr = self.dst_addr();
             if self.launch_remap_enable() && self.remap_dst_x() == REMAP_SWIZZLE_CONST_A {
-                assert_eq!(
-                    self.remap_component_size_minus_one(),
-                    3,
-                    "MaxwellDMA single-line remap CONST_A requires 32-bit components"
-                );
+                let component_size = self.remap_component_size_minus_one().wrapping_add(1);
+                if !matches!(component_size, 1 | 2 | 4) {
+                    self.report_unimplemented_dma_path(
+                        "single-line remap CONST_A component size is not 1, 2, or 4",
+                    );
+                }
                 let value = self.remap_consta_value();
-                self.with_rasterizer_mut(|rasterizer| {
-                    rasterizer.accelerate_dma_buffer_clear(dst_addr, ll as u64, value);
-                });
+                if component_size == 4 {
+                    self.with_rasterizer_mut(|rasterizer| {
+                        rasterizer
+                            .access_accelerate_dma()
+                            .buffer_clear(dst_addr, ll as u64, value);
+                    });
+                }
                 let mut data = Vec::with_capacity(ll as usize * std::mem::size_of::<u32>());
                 for _ in 0..ll {
                     data.extend_from_slice(&value.to_le_bytes());
                 }
+                data.truncate(ll as usize * component_size as usize);
                 self.invalidate_gpu_region(dst_addr, data.len() as u64);
                 log::debug!(
                     "MaxwellDMA: single-line remap CONST_A clear executed {} words value=0x{:X} dst=0x{:X}",
@@ -911,7 +872,7 @@ impl MaxwellDMA {
             let is_dst_pitch = self.page_kind_is_pitch(dst_addr);
             if !is_src_pitch || !is_dst_pitch {
                 if ll % 16 != 0 || src_addr % 16 != 0 || dst_addr % 16 != 0 {
-                    self.stop_unimplemented_dma_path(
+                    self.report_unimplemented_dma_path(
                         "single-line MaxwellDMA pitch/blocklinear copy requires 16-byte alignment",
                     );
                 }
@@ -963,7 +924,9 @@ impl MaxwellDMA {
 
             if self
                 .with_rasterizer_mut(|rasterizer| {
-                    rasterizer.accelerate_dma_buffer_copy(src_addr, dst_addr, ll as u64)
+                    rasterizer
+                        .access_accelerate_dma()
+                        .buffer_copy(src_addr, dst_addr, ll as u64)
                 })
                 .unwrap_or(false)
             {
@@ -1188,6 +1151,50 @@ mod tests {
         }
     }
 
+    impl AccelerateDMAInterface for TestRasterizer {
+        fn buffer_copy(&mut self, src_address: u64, dest_address: u64, amount: u64) -> bool {
+            self.calls
+                .lock()
+                .dma_buffer_copies
+                .push((src_address, dest_address, amount));
+            self.accelerate_buffer_copy
+        }
+
+        fn buffer_clear(&mut self, dst_address: u64, amount: u64, value: u32) -> bool {
+            self.calls
+                .lock()
+                .dma_buffer_clears
+                .push((dst_address, amount, value));
+            self.accelerate_buffer_clear
+        }
+
+        fn image_to_buffer(
+            &mut self,
+            copy_info: &dma::ImageCopy,
+            src: &dma::ImageOperand,
+            dst: &dma::BufferOperand,
+        ) -> bool {
+            self.calls
+                .lock()
+                .dma_image_to_buffers
+                .push((*copy_info, *src, *dst));
+            self.accelerate_image_to_buffer
+        }
+
+        fn buffer_to_image(
+            &mut self,
+            copy_info: &dma::ImageCopy,
+            src: &dma::BufferOperand,
+            dst: &dma::ImageOperand,
+        ) -> bool {
+            self.calls
+                .lock()
+                .dma_buffer_to_images
+                .push((*copy_info, *src, *dst));
+            self.accelerate_buffer_to_image
+        }
+    }
+
     impl RasterizerInterface for TestRasterizer {
         fn draw(
             &mut self,
@@ -1201,7 +1208,7 @@ mod tests {
         ) {
         }
         fn clear(&mut self, _clear_view: Maxwell3DClearView<'_>, _layer_count: u32) {}
-        fn dispatch_compute(&mut self) {}
+        fn dispatch_compute(&mut self, _dispatch: &crate::engines::kepler_compute::DispatchCall) {}
         fn reset_counter(&mut self, _query_type: u32) {}
         fn query(
             &mut self,
@@ -1231,10 +1238,15 @@ mod tests {
         fn signal_reference(&mut self) {}
         fn release_fences(&mut self, _force: bool) {}
         fn flush_all(&mut self) {}
-        fn flush_region(&mut self, addr: u64, size: u64) {
+        fn flush_region(&mut self, addr: u64, size: u64, _which: crate::cache_types::CacheType) {
             self.calls.lock().flushes.push((addr, size));
         }
-        fn must_flush_region(&self, _addr: u64, _size: u64) -> bool {
+        fn must_flush_region(
+            &self,
+            _addr: u64,
+            _size: u64,
+            _which: crate::cache_types::CacheType,
+        ) -> bool {
             false
         }
         fn get_flush_area(&self, addr: u64, size: u64) -> RasterizerDownloadArea {
@@ -1244,7 +1256,12 @@ mod tests {
                 preemptive: false,
             }
         }
-        fn invalidate_region(&mut self, addr: u64, size: u64) {
+        fn invalidate_region(
+            &mut self,
+            addr: u64,
+            size: u64,
+            _which: crate::cache_types::CacheType,
+        ) {
             self.calls.lock().invalidations.push((addr, size));
         }
         fn on_cache_invalidation(&mut self, _addr: u64, _size: u64) {}
@@ -1254,7 +1271,13 @@ mod tests {
         fn invalidate_gpu_cache(&mut self) {}
         fn unmap_memory(&mut self, _addr: u64, _size: u64) {}
         fn modify_gpu_memory(&mut self, _as_id: usize, _addr: u64, _size: u64) {}
-        fn flush_and_invalidate_region(&mut self, _addr: u64, _size: u64) {}
+        fn flush_and_invalidate_region(
+            &mut self,
+            _addr: u64,
+            _size: u64,
+            _which: crate::cache_types::CacheType,
+        ) {
+        }
         fn wait_for_idle(&mut self) {}
         fn fragment_barrier(&mut self) {}
         fn tiled_cache_barrier(&mut self) {}
@@ -1267,53 +1290,8 @@ mod tests {
             _memory: &[u8],
         ) {
         }
-        fn accelerate_dma_buffer_copy(
-            &mut self,
-            src_address: u64,
-            dest_address: u64,
-            amount: u64,
-        ) -> bool {
-            self.calls
-                .lock()
-                .dma_buffer_copies
-                .push((src_address, dest_address, amount));
-            self.accelerate_buffer_copy
-        }
-        fn accelerate_dma_buffer_clear(
-            &mut self,
-            dst_address: u64,
-            amount: u64,
-            value: u32,
-        ) -> bool {
-            self.calls
-                .lock()
-                .dma_buffer_clears
-                .push((dst_address, amount, value));
-            self.accelerate_buffer_clear
-        }
-        fn accelerate_dma_image_to_buffer(
-            &mut self,
-            copy_info: &dma::ImageCopy,
-            src: &dma::ImageOperand,
-            dst: &dma::BufferOperand,
-        ) -> bool {
-            self.calls
-                .lock()
-                .dma_image_to_buffers
-                .push((*copy_info, *src, *dst));
-            self.accelerate_image_to_buffer
-        }
-        fn accelerate_dma_buffer_to_image(
-            &mut self,
-            copy_info: &dma::ImageCopy,
-            src: &dma::BufferOperand,
-            dst: &dma::ImageOperand,
-        ) -> bool {
-            self.calls
-                .lock()
-                .dma_buffer_to_images
-                .push((*copy_info, *src, *dst));
-            self.accelerate_buffer_to_image
+        fn access_accelerate_dma(&mut self) -> &mut dyn AccelerateDMAInterface {
+            self
         }
     }
 
@@ -2049,10 +2027,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(
-        expected = "single-line MaxwellDMA pitch/blocklinear copy requires 16-byte alignment"
-    )]
-    fn test_single_line_non_pitch_page_kind_does_not_run_pitch_fallback() {
+    fn test_single_line_non_pitch_alignment_reports_and_continues_like_upstream() {
         let mut eng = new_test_engine();
         {
             let mut mm = eng.memory_manager.lock();
@@ -2068,9 +2043,10 @@ mod tests {
         eng.write_reg(LINE_COUNT, 0);
         eng.write_reg(LAUNCH_DMA, SINGLE_LINE_LAUNCH);
 
-        let _ = eng.execute_pending(&|_, buf| buf.fill(0xAA));
-        let _ = std::fs::remove_file(".agents/maxwell_dma_unimplemented_state.md");
-        let _ = std::fs::remove_file("video_core/.agents/maxwell_dma_unimplemented_state.md");
+        let writes = eng.execute_pending(&|_, buf| buf.fill(0xAA));
+        assert_eq!(writes.len(), 1);
+        assert_eq!(writes[0].gpu_va, 0x8000);
+        assert_eq!(writes[0].data, vec![0xAA; 16]);
     }
 
     #[test]
@@ -2178,8 +2154,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "requires 32-bit components")]
-    fn test_single_line_remap_const_a_requires_u32_component_size_like_upstream() {
+    fn test_single_line_remap_const_a_invalid_size_reports_and_continues_like_upstream() {
         let mut eng = new_test_engine();
 
         eng.write_reg(DST_ADDR_HIGH, 0);
@@ -2188,11 +2163,13 @@ mod tests {
         eng.write_reg(REMAP_CONSTA_VALUE, 0x1122_3344);
         eng.write_reg(
             REMAP_COMPONENTS,
-            REMAP_SWIZZLE_CONST_A | (2 << 16), // Upstream asserts this is 3.
+            REMAP_SWIZZLE_CONST_A | (2 << 16), // Three-byte size triggers upstream ASSERT.
         );
         eng.write_reg(LAUNCH_DMA, SINGLE_LINE_LAUNCH | LAUNCH_REMAP_ENABLE);
 
-        let _ = eng.execute_pending(&|_, _| {});
+        let writes = eng.execute_pending(&|_, _| {});
+        assert_eq!(writes.len(), 1);
+        assert_eq!(writes[0].data, vec![0x44, 0x33, 0x22]);
     }
 
     #[test]
@@ -2426,8 +2403,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "blocklinear->pitch source depth must be one")]
-    fn test_dma_blocklinear_launch_does_not_run_pitch_fallback() {
+    fn test_dma_blocklinear_invalid_depth_reports_and_continues_like_upstream() {
         let mut eng = new_test_engine();
 
         eng.write_reg(SRC_ADDR_HIGH, 0);
@@ -2445,9 +2421,8 @@ mod tests {
                 | LAUNCH_MULTI_LINE_ENABLE,
         );
 
-        let _ = eng.execute_pending(&|_, buf| buf.fill(0xAA));
-        let _ = std::fs::remove_file(".agents/maxwell_dma_unimplemented_state.md");
-        let _ = std::fs::remove_file("video_core/.agents/maxwell_dma_unimplemented_state.md");
+        let writes = eng.execute_pending(&|_, buf| buf.fill(0xAA));
+        assert!(!writes.is_empty());
     }
 
     #[test]

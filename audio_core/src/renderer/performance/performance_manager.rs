@@ -2,10 +2,11 @@ use super::performance_detail::PerformanceDetailType;
 use super::performance_entry::PerformanceEntryType;
 use super::performance_entry_addresses::PerformanceEntryAddresses;
 use crate::common::audio_renderer_parameter::AudioRendererParameterInternal;
-use crate::common::common::{make_magic, CpuAddr};
+use crate::common::common::CpuAddr;
 use crate::renderer::behavior::BehaviorInfo;
 use crate::renderer::memory::{MemoryPoolInfo, PoolLocation, PoolMapper};
 use crate::Result;
+use common::common_funcs::make_magic;
 use common::ResultCode;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -42,6 +43,9 @@ pub struct OutStatus {
     pub history_size: i32,
     pub unk04: [u8; 0xC],
 }
+
+const _: () = assert!(std::mem::size_of::<InParameter>() == 0x10);
+const _: () = assert!(std::mem::size_of::<OutStatus>() == 0x10);
 
 pub struct PerformanceManager {
     initialized: bool,
@@ -199,7 +203,11 @@ impl PerformanceManager {
             }
 
             out_buffer[written..written + header_size].fill(0);
-            self.write_u32_to(out_buffer, written + 0x00, make_magic('P', 'E', 'R', 'F'));
+            self.write_u32_to(
+                out_buffer,
+                written + 0x00,
+                make_magic(b'P', b'E', b'R', b'F'),
+            );
             self.write_u32_to(out_buffer, written + 0x04, out_entry_count);
             self.write_u32_to(out_buffer, written + 0x08, out_detail_count);
             self.write_u32_to(out_buffer, written + 0x0C, (out_offset - written) as u32);
@@ -394,7 +402,7 @@ impl PerformanceManager {
         }
 
         self.current_frame.fill(0);
-        self.write_u32(0x00, make_magic('P', 'E', 'R', 'F'));
+        self.write_u32(0x00, make_magic(b'P', b'E', b'R', b'F'));
         self.write_u32(0x04, 0);
         self.write_u32(0x08, 0);
         self.write_u32(0x0C, self.frame_size as u32);

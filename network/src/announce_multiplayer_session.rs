@@ -58,11 +58,27 @@ impl AnnounceMultiplayerSession {
     ///
     /// NOTE: In the C++ version this takes `RoomNetwork&` and optionally
     /// creates a `WebService::RoomJson` backend when `ENABLE_WEB_SERVICE` is
-    /// defined. Here we default to `NullBackend`.
+    /// defined, from `web_api_url` / username / token. The web service is
+    /// always compiled in here, so the `NullBackend` branch is only taken when
+    /// no announce host is configured.
     pub fn new(_room_network: &RoomNetwork) -> Self {
+        let backend: Box<dyn Backend> = {
+            let values = common::settings::values();
+            let host = values.web_api_url.get_value().clone();
+            if host.is_empty() {
+                Box::new(NullBackend)
+            } else {
+                Box::new(web_service::announce_room_json::RoomJson::new(
+                    &host,
+                    values.yuzu_username.get_value(),
+                    values.yuzu_token.get_value(),
+                ))
+            }
+        };
+
         Self {
             error_callbacks: Mutex::new(Vec::new()),
-            backend: Mutex::new(Box::new(NullBackend)),
+            backend: Mutex::new(backend),
             registered: AtomicBool::new(false),
             running: AtomicBool::new(false),
         }
@@ -136,9 +152,17 @@ impl AnnounceMultiplayerSession {
             !self.is_running(),
             "Credentials can only be updated when session is not running"
         );
-        // NOTE: Would recreate WebService::RoomJson if ENABLE_WEB_SERVICE.
-        // Currently resets to NullBackend.
-        *self.backend.lock() = Box::new(NullBackend);
+        let values = common::settings::values();
+        let host = values.web_api_url.get_value().clone();
+        *self.backend.lock() = if host.is_empty() {
+            Box::new(NullBackend)
+        } else {
+            Box::new(web_service::announce_room_json::RoomJson::new(
+                &host,
+                values.yuzu_username.get_value(),
+                values.yuzu_token.get_value(),
+            ))
+        };
     }
 }
 
@@ -153,13 +177,35 @@ mod tests {
     use super::*;
     use crate::network::RoomNetwork;
 
+    /// Replaces a test that assumed the session always used `NullBackend`.
+    /// The backend now depends on `web_api_url`, so both branches are covered.
     #[test]
-    fn test_session_register_with_null_backend() {
+    fn backend_selection_follows_the_configured_announce_host() {
         let rn = RoomNetwork::new();
+
+        // Empty host: no web service at all, exactly upstream's #else branch.
+        let previous = common::settings::values().web_api_url.get_value().clone();
+        common::settings::values_mut()
+            .web_api_url
+            .set_value(String::new());
         let session = AnnounceMultiplayerSession::new(&rn);
-        // NullBackend returns NoWebservice
-        let result = session.register();
-        assert_eq!(result.result_code, WebResultCode::NoWebservice);
+        assert_eq!(session.register().result_code, WebResultCode::NoWebservice);
+
+        // A configured host builds the RoomJson backend; registering a room
+        // needs credentials, which this test deliberately does not provide, so
+        // it must stop before any request leaves the machine.
+        common::settings::values_mut()
+            .web_api_url
+            .set_value("api.ynet-fun.xyz".to_string());
+        let session = AnnounceMultiplayerSession::new(&rn);
+        assert_eq!(
+            session.register().result_code,
+            WebResultCode::CredentialsMissing
+        );
+
+        common::settings::values_mut()
+            .web_api_url
+            .set_value(previous);
     }
 
     #[test]

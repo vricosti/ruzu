@@ -54,6 +54,8 @@ pub enum RuzuPath {
     NANDDir,
     /// Where play time data is stored.
     PlayTimeDir,
+    /// Where save data is stored.
+    SaveDir,
     /// Where ruzu screenshots are stored.
     ScreenshotsDir,
     /// Where the emulated SDMC is stored.
@@ -142,9 +144,10 @@ impl PathManager {
         self.generate_ruzu_path(RuzuPath::LogDir, &ruzu_path.join(LOG_DIR));
         self.generate_ruzu_path(RuzuPath::NANDDir, &ruzu_path.join(NAND_DIR));
         self.generate_ruzu_path(RuzuPath::PlayTimeDir, &ruzu_path.join(PLAY_TIME_DIR));
+        self.generate_ruzu_path(RuzuPath::SaveDir, &ruzu_path.join(NAND_DIR));
         self.generate_ruzu_path(RuzuPath::ScreenshotsDir, &ruzu_path.join(SCREENSHOTS_DIR));
         self.generate_ruzu_path(RuzuPath::SDMCDir, &ruzu_path.join(SDMC_DIR));
-        self.generate_ruzu_path(RuzuPath::ShaderDir, &ruzu_path.join(SHADER_DIR));
+        self.generate_ruzu_path(RuzuPath::ShaderDir, &ruzu_path_cache.join(SHADER_DIR));
         self.generate_ruzu_path(RuzuPath::TASDir, &ruzu_path.join(TAS_DIR));
         self.generate_ruzu_path(RuzuPath::IconsDir, &ruzu_path.join(ICONS_DIR));
     }
@@ -737,12 +740,16 @@ mod tests {
             root.join(NAND_DIR)
         );
         assert_eq!(
+            manager.get_ruzu_path_impl(RuzuPath::SaveDir),
+            root.join(NAND_DIR)
+        );
+        assert_eq!(
             manager.get_ruzu_path_impl(RuzuPath::SDMCDir),
             root.join(SDMC_DIR)
         );
         assert_eq!(
             manager.get_ruzu_path_impl(RuzuPath::ShaderDir),
-            root.join(SHADER_DIR)
+            root.join(CACHE_DIR).join(SHADER_DIR)
         );
 
         let _ = fs::remove_dir_all(root);

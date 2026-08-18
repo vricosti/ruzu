@@ -5,6 +5,8 @@
 //!
 //! Provides the MappingFactory that handles input mapping registration and configuration.
 
+use std::collections::VecDeque;
+
 use common::param_package::ParamPackage;
 
 use crate::input_engine::{EngineInputType, MappingData};
@@ -12,7 +14,8 @@ use crate::main_common::Polling;
 
 /// Port of `MappingFactory` class from input_mapping.h / input_mapping.cpp
 pub struct MappingFactory {
-    input_queue: Vec<ParamPackage>, // Simplified from SPSCQueue
+    /// FIFO counterpart of upstream's `Common::SPSCQueue`.
+    input_queue: VecDeque<ParamPackage>,
     input_type: Polling::InputType,
     is_enabled: bool,
     first_axis: i32,
@@ -23,7 +26,7 @@ impl MappingFactory {
     /// Port of MappingFactory::MappingFactory
     pub fn new() -> Self {
         Self {
-            input_queue: Vec::new(),
+            input_queue: VecDeque::new(),
             input_type: Polling::InputType::None,
             is_enabled: false,
             first_axis: -1,
@@ -44,7 +47,7 @@ impl MappingFactory {
     /// Returns an input event with mapping information from the input_queue.
     /// Port of MappingFactory::GetNextInput
     pub fn get_next_input(&mut self) -> ParamPackage {
-        self.input_queue.pop().unwrap_or_default()
+        self.input_queue.pop_front().unwrap_or_default()
     }
 
     /// Registers mapping input data from the driver.
@@ -109,7 +112,7 @@ impl MappingFactory {
             }
             _ => return,
         }
-        self.input_queue.push(new_input);
+        self.input_queue.push_back(new_input);
     }
 
     /// Port of MappingFactory::RegisterStick
@@ -129,7 +132,7 @@ impl MappingFactory {
             new_input.set_float("threshold", 0.5);
             new_input.set_float("range", 1.0);
             new_input.set_float("deadzone", 0.0);
-            self.input_queue.push(new_input);
+            self.input_queue.push_back(new_input);
             return;
         }
 
@@ -154,7 +157,7 @@ impl MappingFactory {
             }
             _ => return,
         }
-        self.input_queue.push(new_input);
+        self.input_queue.push_back(new_input);
     }
 
     /// Port of MappingFactory::RegisterMotion
@@ -172,7 +175,7 @@ impl MappingFactory {
             new_input.set_int("motion", 0);
             new_input.set_int("pad", 1);
             new_input.set_float("threshold", 0.001);
-            self.input_queue.push(new_input);
+            self.input_queue.push_back(new_input);
             return;
         }
 
@@ -207,7 +210,7 @@ impl MappingFactory {
             }
             _ => return,
         }
-        self.input_queue.push(new_input);
+        self.input_queue.push_back(new_input);
     }
 
     /// Port of MappingFactory::IsDriverValid
@@ -249,5 +252,35 @@ impl MappingFactory {
 impl Default for MappingFactory {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn button(engine: &str, index: i32) -> MappingData {
+        MappingData {
+            engine: engine.to_string(),
+            r#type: EngineInputType::Button,
+            index,
+            button_value: true,
+            ..MappingData::default()
+        }
+    }
+
+    #[test]
+    fn get_next_input_preserves_upstream_fifo_order() {
+        let mut factory = MappingFactory::new();
+        factory.begin_mapping(Polling::InputType::Button);
+        factory.register_input(&button("sdl", 1));
+        factory.register_input(&button("keyboard", 2));
+
+        let first = factory.get_next_input();
+        let second = factory.get_next_input();
+        assert_eq!(first.get_str("engine", ""), "sdl");
+        assert_eq!(first.get_int("button", -1), 1);
+        assert_eq!(second.get_str("engine", ""), "keyboard");
+        assert_eq!(second.get_int("code", -1), 2);
     }
 }

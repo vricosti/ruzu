@@ -1485,6 +1485,7 @@ mod tests {
                 texture_type: TextureType::Color2D,
                 is_depth: false,
                 is_multisample: true,
+                is_integer: false,
                 has_secondary: false,
                 cbuf_index: 0,
                 cbuf_offset: 0,

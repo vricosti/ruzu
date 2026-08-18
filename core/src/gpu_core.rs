@@ -127,6 +127,11 @@ pub trait GpuCoreInterface: Any + Send {
     /// Mirrors the upstream `GPU::NotifyShutdown()`.
     fn notify_shutdown(&self) {}
 
+    /// Bridges `GPU::Renderer().GetDeviceVendor()` across the split crates.
+    fn get_device_vendor(&self) -> String {
+        String::new()
+    }
+
     /// Mirrors the upstream `GPU::OnCPUWrite(DAddr, u64)`.
     fn on_cpu_write(&self, addr: u64, size: u64) -> bool;
 

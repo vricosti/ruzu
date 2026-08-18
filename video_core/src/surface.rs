@@ -11,7 +11,137 @@
 //! in `surface.h`). This module re-exports it and provides the associated
 //! lookup tables and utility functions.
 
-pub use crate::texture_cache::format_lookup_table::PixelFormat;
+// Upstream defines this enum in `video_core/surface.h`; keep it here so the
+// ordering that every `PixelFormat`-indexed table depends on lives with those
+// tables.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[repr(u32)]
+#[allow(non_camel_case_types)]
+pub enum PixelFormat {
+    A8B8G8R8Unorm = 0,
+    A8B8G8R8Snorm,
+    A8B8G8R8Sint,
+    A8B8G8R8Uint,
+    R5G6B5Unorm,
+    B5G6R5Unorm,
+    A1R5G5B5Unorm,
+    A2B10G10R10Unorm,
+    A2B10G10R10Uint,
+    A2R10G10B10Unorm,
+    A1B5G5R5Unorm,
+    A5B5G5R1Unorm,
+    R8Unorm,
+    R8Snorm,
+    R8Sint,
+    R8Uint,
+    R16G16B16A16Float,
+    R16G16B16A16Unorm,
+    R16G16B16A16Snorm,
+    R16G16B16A16Sint,
+    R16G16B16A16Uint,
+    B10G11R11Float,
+    R32G32B32A32Uint,
+    Bc1RgbaUnorm,
+    Bc2Unorm,
+    Bc3Unorm,
+    Bc4Unorm,
+    Bc4Snorm,
+    Bc5Unorm,
+    Bc5Snorm,
+    Bc7Unorm,
+    Bc6hUfloat,
+    Bc6hSfloat,
+    Astc2d4x4Unorm,
+    B8G8R8A8Unorm,
+    R32G32B32A32Float,
+    R32G32B32A32Sint,
+    R32G32Float,
+    R32G32Sint,
+    R32Float,
+    R16Float,
+    R16Unorm,
+    R16Snorm,
+    R16Uint,
+    R16Sint,
+    R16G16Unorm,
+    R16G16Float,
+    R16G16Uint,
+    R16G16Sint,
+    R16G16Snorm,
+    R32G32B32Float,
+    A8B8G8R8Srgb,
+    R8G8Unorm,
+    R8G8Snorm,
+    R8G8Sint,
+    R8G8Uint,
+    R32G32Uint,
+    R16G16B16X16Float,
+    R32Uint,
+    R32Sint,
+    Astc2d8x8Unorm,
+    Astc2d8x5Unorm,
+    Astc2d5x4Unorm,
+    B8G8R8A8Srgb,
+    Bc1RgbaSrgb,
+    Bc2Srgb,
+    Bc3Srgb,
+    Bc7Srgb,
+    A4B4G4R4Unorm,
+    G4R4Unorm,
+    Astc2d4x4Srgb,
+    Astc2d8x8Srgb,
+    Astc2d8x5Srgb,
+    Astc2d5x4Srgb,
+    Astc2d5x5Unorm,
+    Astc2d5x5Srgb,
+    Astc2d10x8Unorm,
+    Astc2d10x8Srgb,
+    Astc2d6x6Unorm,
+    Astc2d6x6Srgb,
+    Astc2d10x6Unorm,
+    Astc2d10x6Srgb,
+    Astc2d10x5Unorm,
+    Astc2d10x5Srgb,
+    Astc2d10x10Unorm,
+    Astc2d10x10Srgb,
+    Astc2d12x10Unorm,
+    Astc2d12x10Srgb,
+    Astc2d12x12Unorm,
+    Astc2d12x12Srgb,
+    Astc2d8x6Unorm,
+    Astc2d8x6Srgb,
+    Astc2d6x5Unorm,
+    Astc2d6x5Srgb,
+    E5B9G9R9Float,
+
+    // ETC2 / EAC formats. Upstream orders these between `E5B9G9R9_FLOAT` and
+    // `D32_FLOAT` in `PIXEL_FORMAT_LIST`; keep that position so every
+    // `PixelFormat`-indexed table stays aligned with upstream.
+    Etc2RgbUnorm,
+    Etc2RgbaUnorm,
+    Etc2RgbPtaUnorm,
+    Etc2RgbSrgb,
+    Etc2RgbaSrgb,
+    Etc2RgbPtaSrgb,
+    EacR11Unorm,
+    EacR11Snorm,
+    EacR11G11Unorm,
+    EacR11G11Snorm,
+
+    // Depth formats
+    D32Float,
+    D16Unorm,
+    X8D24Unorm,
+    S8Uint,
+    D24UnormS8Uint,
+    S8UintD24Unorm,
+    D32FloatS8Uint,
+
+    MaxDepthStencilFormat,
+
+    #[default]
+    Invalid,
+}
 
 // ---------------------------------------------------------------------------
 // SurfaceType
@@ -85,24 +215,6 @@ pub const MAX_PIXEL_FORMAT: usize = MAX_DEPTH_STENCIL_FORMAT as usize;
 // ---------------------------------------------------------------------------
 
 fn stop_unimplemented_surface_format(kind: &str, format: u32, fallback: PixelFormat) -> ! {
-    #[cfg(not(test))]
-    {
-        let path = std::path::Path::new(".agents/surface_unimplemented_state.md");
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        let _ = std::fs::write(
-            path,
-            format!(
-                "# Surface format conversion unimplemented\n\n\
-                 - kind: {kind}\n\
-                 - format: 0x{format:X}\n\
-                 - upstream_fallback: {fallback:?}\n\
-                 - upstream: surface.cpp reaches UNIMPLEMENTED_MSG before returning the fallback format\n\
-                 - rust: stopped before treating the fallback as an implemented mapping\n"
-            ),
-        );
-    }
     panic!("Surface::{kind} unimplemented format=0x{format:X} fallback={fallback:?}");
 }
 
@@ -298,6 +410,16 @@ pub const BLOCK_WIDTH_TABLE: [u8; MAX_PIXEL_FORMAT] = [
     6,  // ASTC_2D_6X5_UNORM
     6,  // ASTC_2D_6X5_SRGB
     1,  // E5B9G9R9_FLOAT
+    4,  // ETC2_RGB_UNORM
+    4,  // ETC2_RGBA_UNORM
+    4,  // ETC2_RGB_PTA_UNORM
+    4,  // ETC2_RGB_SRGB
+    4,  // ETC2_RGBA_SRGB
+    4,  // ETC2_RGB_PTA_SRGB
+    4,  // EAC_R11_UNORM
+    4,  // EAC_R11_SNORM
+    4,  // EAC_R11G11_UNORM
+    4,  // EAC_R11G11_SNORM
     1,  // D32_FLOAT
     1,  // D16_UNORM
     1,  // X8_D24_UNORM
@@ -419,6 +541,16 @@ pub const BLOCK_HEIGHT_TABLE: [u8; MAX_PIXEL_FORMAT] = [
     5,  // ASTC_2D_6X5_UNORM
     5,  // ASTC_2D_6X5_SRGB
     1,  // E5B9G9R9_FLOAT
+    4,  // ETC2_RGB_UNORM
+    4,  // ETC2_RGBA_UNORM
+    4,  // ETC2_RGB_PTA_UNORM
+    4,  // ETC2_RGB_SRGB
+    4,  // ETC2_RGBA_SRGB
+    4,  // ETC2_RGB_PTA_SRGB
+    4,  // EAC_R11_UNORM
+    4,  // EAC_R11_SNORM
+    4,  // EAC_R11G11_UNORM
+    4,  // EAC_R11G11_SNORM
     1,  // D32_FLOAT
     1,  // D16_UNORM
     1,  // X8_D24_UNORM
@@ -540,6 +672,16 @@ pub const BITS_PER_BLOCK_TABLE: [u16; MAX_PIXEL_FORMAT] = [
     128, // ASTC_2D_6X5_UNORM
     128, // ASTC_2D_6X5_SRGB
     32,  // E5B9G9R9_FLOAT
+    64,  // ETC2_RGB_UNORM
+    128, // ETC2_RGBA_UNORM
+    64,  // ETC2_RGB_PTA_UNORM
+    64,  // ETC2_RGB_SRGB
+    128, // ETC2_RGBA_SRGB
+    64,  // ETC2_RGB_PTA_SRGB
+    64,  // EAC_R11_UNORM
+    64,  // EAC_R11_SNORM
+    128, // EAC_R11G11_UNORM
+    128, // EAC_R11G11_SNORM
     32,  // D32_FLOAT
     16,  // D16_UNORM
     32,  // X8_D24_UNORM
@@ -708,6 +850,28 @@ pub fn is_pixel_format_srgb(format: PixelFormat) -> bool {
             | PixelFormat::Astc2d12x10Srgb
             | PixelFormat::Astc2d8x6Srgb
             | PixelFormat::Astc2d6x5Srgb
+            | PixelFormat::Etc2RgbSrgb
+            | PixelFormat::Etc2RgbaSrgb
+            | PixelFormat::Etc2RgbPtaSrgb
+    )
+}
+
+/// Returns true if the format is an ETC2 or EAC format.
+///
+/// Port of `IsPixelFormatETC2` from `surface.cpp`.
+pub fn is_pixel_format_etc2(format: PixelFormat) -> bool {
+    matches!(
+        format,
+        PixelFormat::Etc2RgbUnorm
+            | PixelFormat::Etc2RgbaUnorm
+            | PixelFormat::Etc2RgbPtaUnorm
+            | PixelFormat::Etc2RgbSrgb
+            | PixelFormat::Etc2RgbaSrgb
+            | PixelFormat::Etc2RgbPtaSrgb
+            | PixelFormat::EacR11Unorm
+            | PixelFormat::EacR11Snorm
+            | PixelFormat::EacR11G11Unorm
+            | PixelFormat::EacR11G11Snorm
     )
 }
 
@@ -1129,5 +1293,63 @@ mod tests {
         assert!(render_target.is_err());
         assert!(depth.is_err());
         assert!(gpu.is_err());
+    }
+    // Ported alongside the ETC2/EAC block. Values come from upstream's
+    // `PIXEL_FORMAT_ELEM(name, block_width, block_height, bits_per_block)`
+    // entries in `surface.h`.
+    #[test]
+    fn etc2_and_eac_block_geometry_matches_upstream() {
+        for format in [
+            PixelFormat::Etc2RgbUnorm,
+            PixelFormat::Etc2RgbaUnorm,
+            PixelFormat::Etc2RgbPtaUnorm,
+            PixelFormat::Etc2RgbSrgb,
+            PixelFormat::Etc2RgbaSrgb,
+            PixelFormat::Etc2RgbPtaSrgb,
+            PixelFormat::EacR11Unorm,
+            PixelFormat::EacR11Snorm,
+            PixelFormat::EacR11G11Unorm,
+            PixelFormat::EacR11G11Snorm,
+        ] {
+            assert_eq!(default_block_width(format), 4, "{format:?}");
+            assert_eq!(default_block_height(format), 4, "{format:?}");
+            assert!(is_pixel_format_etc2(format), "{format:?}");
+        }
+
+        for (format, bits) in [
+            (PixelFormat::Etc2RgbUnorm, 64u16),
+            (PixelFormat::Etc2RgbaUnorm, 128),
+            (PixelFormat::Etc2RgbPtaUnorm, 64),
+            (PixelFormat::Etc2RgbSrgb, 64),
+            (PixelFormat::Etc2RgbaSrgb, 128),
+            (PixelFormat::Etc2RgbPtaSrgb, 64),
+            (PixelFormat::EacR11Unorm, 64),
+            (PixelFormat::EacR11Snorm, 64),
+            (PixelFormat::EacR11G11Unorm, 128),
+            (PixelFormat::EacR11G11Snorm, 128),
+        ] {
+            assert_eq!(BITS_PER_BLOCK_TABLE[format as usize], bits, "{format:?}");
+        }
+    }
+
+    // Upstream `IsPixelFormatSRGB` lists exactly the three ETC2 sRGB formats;
+    // EAC has no sRGB variant.
+    #[test]
+    fn only_the_three_etc2_srgb_formats_are_srgb() {
+        assert!(is_pixel_format_srgb(PixelFormat::Etc2RgbSrgb));
+        assert!(is_pixel_format_srgb(PixelFormat::Etc2RgbaSrgb));
+        assert!(is_pixel_format_srgb(PixelFormat::Etc2RgbPtaSrgb));
+        assert!(!is_pixel_format_srgb(PixelFormat::Etc2RgbUnorm));
+        assert!(!is_pixel_format_srgb(PixelFormat::EacR11Unorm));
+        assert!(!is_pixel_format_srgb(PixelFormat::EacR11G11Snorm));
+    }
+
+    // Guards the table sizes against a future insertion into `PixelFormat`.
+    #[test]
+    fn every_pixel_format_indexed_table_covers_the_whole_enum() {
+        assert_eq!(MAX_PIXEL_FORMAT, 112);
+        assert_eq!(BLOCK_WIDTH_TABLE.len(), MAX_PIXEL_FORMAT);
+        assert_eq!(BLOCK_HEIGHT_TABLE.len(), MAX_PIXEL_FORMAT);
+        assert_eq!(BITS_PER_BLOCK_TABLE.len(), MAX_PIXEL_FORMAT);
     }
 }

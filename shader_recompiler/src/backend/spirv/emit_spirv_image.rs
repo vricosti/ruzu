@@ -1,13 +1,132 @@
 // SPDX-FileCopyrightText: 2025 ruzu contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! SPIR-V image/texture emission — maps to zuyu's
+//! SPIR-V image/texture emission — maps to upstream
 //! `backend/spirv/emit_spirv_image.cpp`.
 //!
 //! Handles texture sampling, image loads, and texture queries.
 
 use super::spirv_emit_context::SpirvEmitContext;
+use crate::ir;
+use crate::profile::Profile;
 use rspirv::spirv::Word;
+
+/// Port of upstream `NonUniformKind`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NonUniformKind {
+    SampledImage,
+    StorageImage,
+    UniformTexelBuffer,
+    StorageTexelBuffer,
+}
+
+/// Port of upstream `IsNonUniformSupported`.
+fn is_non_uniform_supported(profile: &Profile, kind: NonUniformKind) -> bool {
+    match kind {
+        NonUniformKind::SampledImage => profile.support_sampled_image_array_nonuniform_indexing,
+        NonUniformKind::StorageImage => profile.support_storage_image_array_nonuniform_indexing,
+        NonUniformKind::UniformTexelBuffer => {
+            profile.support_uniform_texel_buffer_array_nonuniform_indexing
+        }
+        NonUniformKind::StorageTexelBuffer => {
+            profile.support_storage_texel_buffer_array_nonuniform_indexing
+        }
+    }
+}
+
+/// Port of upstream `DecorateNonUniform`.
+fn decorate_non_uniform(ctx: &mut SpirvEmitContext, object: Word) {
+    if !ctx.non_uniform_ids.insert(object) {
+        return;
+    }
+    ctx.builder
+        .decorate(object, rspirv::spirv::Decoration::NonUniform, vec![]);
+}
+
+/// Port of upstream `MarkNonUniform`.
+fn mark_non_uniform(
+    ctx: &mut SpirvEmitContext,
+    idx: Word,
+    index: ir::Value,
+    kind: NonUniformKind,
+) -> bool {
+    if index.is_immediate() || !is_non_uniform_supported(&ctx.profile, kind) {
+        return false;
+    }
+    decorate_non_uniform(ctx, idx);
+    match kind {
+        NonUniformKind::SampledImage => ctx.uses_nonuniform_sampled_image = true,
+        NonUniformKind::StorageImage => ctx.uses_nonuniform_storage_image = true,
+        NonUniformKind::UniformTexelBuffer => ctx.uses_nonuniform_uniform_texel_buffer = true,
+        NonUniformKind::StorageTexelBuffer => ctx.uses_nonuniform_storage_texel_buffer = true,
+    }
+    true
+}
+
+fn emit_is_scaled(ctx: &mut SpirvEmitContext, index: ir::Value, member_index: u32) -> Word {
+    let ir::Value::ImmU32(index) = index else {
+        panic!("Non-constant texture rescaling");
+    };
+    let word_index = index / 32;
+    let bit_mask = ctx.constant_u32(1u32 << (index % 32));
+    let mask = if ctx.profile.unified_descriptor_binding {
+        let pointer_type = ctx.builder.type_pointer(
+            None,
+            rspirv::spirv::StorageClass::PushConstant,
+            ctx.u32_type,
+        );
+        let member = ctx.constant_u32(member_index);
+        let word = ctx.constant_u32(word_index);
+        let pointer = ctx
+            .builder
+            .access_chain(
+                pointer_type,
+                None,
+                ctx.rescaling_push_constants,
+                vec![member, word],
+            )
+            .unwrap();
+        ctx.builder
+            .load(ctx.u32_type, None, pointer, None, vec![])
+            .unwrap()
+    } else {
+        if word_index != 0 {
+            return ctx.builder.constant_false(ctx.bool_type);
+        }
+        let composite = ctx
+            .builder
+            .load(
+                ctx.f32_vec4_type,
+                None,
+                ctx.rescaling_uniform_constant,
+                None,
+                vec![],
+            )
+            .unwrap();
+        let component = ctx
+            .builder
+            .composite_extract(ctx.f32_type, None, composite, vec![member_index])
+            .unwrap();
+        ctx.builder.bitcast(ctx.u32_type, None, component).unwrap()
+    };
+    let tested = ctx
+        .builder
+        .bitwise_and(ctx.u32_type, None, mask, bit_mask)
+        .unwrap();
+    ctx.builder
+        .i_not_equal(ctx.bool_type, None, tested, ctx.const_zero_u32)
+        .unwrap()
+}
+
+/// Port of upstream `EmitIsTextureScaled`.
+pub fn emit_is_texture_scaled(ctx: &mut SpirvEmitContext, index: ir::Value) -> Word {
+    emit_is_scaled(ctx, index, 0)
+}
+
+/// Port of upstream `EmitIsImageScaled`.
+pub fn emit_is_image_scaled(ctx: &mut SpirvEmitContext, index: ir::Value) -> Word {
+    emit_is_scaled(ctx, index, 1)
+}
 
 /// Emit ImageSampleImplicitLod (TEX/TEXS with implicit LOD).
 ///
@@ -99,7 +218,7 @@ pub fn emit_image_query_dimensions(ctx: &mut SpirvEmitContext, _handle: Word, _l
 use crate::ir::program::Program;
 use crate::ir::types::TextureInstInfo;
 use crate::ir::value::Value;
-use crate::ir::{self, Opcode};
+use crate::ir::Opcode;
 use rspirv::dr::Operand;
 use rspirv::spirv;
 
@@ -503,25 +622,42 @@ fn texture(ctx: &mut SpirvEmitContext, info: TextureInstInfo, index: Value) -> W
         .textures
         .get(info.descriptor_index as usize)
         .expect("SPIR-V: missing texture descriptor");
-    let pointer = if def.count > 1 {
-        let index = ctx.resolve_value(&index);
-        ctx.builder
-            .access_chain(def.pointer_type, None, def.id, vec![index])
-            .unwrap()
+    if def.count > 1 {
+        let idx = ctx.resolve_value(&index);
+        let non_uniform = mark_non_uniform(ctx, idx, index, NonUniformKind::SampledImage);
+        let pointer = ctx
+            .builder
+            .access_chain(def.pointer_type, None, def.id, vec![idx])
+            .unwrap();
+        let object = ctx
+            .builder
+            .load(def.sampled_type, None, pointer, None, vec![])
+            .unwrap();
+        if non_uniform {
+            decorate_non_uniform(ctx, pointer);
+            decorate_non_uniform(ctx, object);
+        }
+        object
     } else {
-        def.id
-    };
-    ctx.builder
-        .load(def.sampled_type, None, pointer, None, vec![])
-        .unwrap()
+        ctx.builder
+            .load(def.sampled_type, None, def.id, None, vec![])
+            .unwrap()
+    }
+}
+
+fn is_texture_integer(ctx: &SpirvEmitContext, info: TextureInstInfo) -> bool {
+    crate::shader_info::TextureType::from_u8(info.texture_type)
+        != crate::shader_info::TextureType::Buffer
+        && ctx
+            .textures
+            .get(info.descriptor_index as usize)
+            .expect("SPIR-V: missing texture descriptor")
+            .is_integer
 }
 
 /// Port of upstream `TextureImage`: load a texel buffer or extract the image
 /// from a combined sampler.
 fn texture_image(ctx: &mut SpirvEmitContext, info: TextureInstInfo, index: Value) -> Word {
-    if !index.is_void() && (!index.is_immediate() || index.imm_u32() != 0) {
-        panic!("SPIR-V: indirect image indexing is not implemented");
-    }
     if crate::shader_info::TextureType::from_u8(info.texture_type)
         == crate::shader_info::TextureType::Buffer
     {
@@ -529,7 +665,23 @@ fn texture_image(ctx: &mut SpirvEmitContext, info: TextureInstInfo, index: Value
             .texture_buffers
             .get(info.descriptor_index as usize)
             .expect("SPIR-V: missing texture-buffer descriptor");
-        assert_eq!(def.count, 1, "SPIR-V: indirect texture sample");
+        if def.count > 1 {
+            let idx = ctx.resolve_value(&index);
+            let non_uniform = mark_non_uniform(ctx, idx, index, NonUniformKind::UniformTexelBuffer);
+            let ptr = ctx
+                .builder
+                .access_chain(ctx.image_buffer_type, None, def.id, vec![idx])
+                .unwrap();
+            let object = ctx
+                .builder
+                .load(ctx.image_buffer_type, None, ptr, None, vec![])
+                .unwrap();
+            if non_uniform {
+                decorate_non_uniform(ctx, ptr);
+                decorate_non_uniform(ctx, object);
+            }
+            return object;
+        }
         return ctx
             .builder
             .load(ctx.image_buffer_type, None, def.id, None, vec![])
@@ -540,7 +692,25 @@ fn texture_image(ctx: &mut SpirvEmitContext, info: TextureInstInfo, index: Value
         .textures
         .get(info.descriptor_index as usize)
         .expect("SPIR-V: missing texture descriptor");
-    assert_eq!(def.count, 1, "SPIR-V: indirect texture sample");
+    if def.count > 1 {
+        let idx = ctx.resolve_value(&index);
+        let non_uniform = mark_non_uniform(ctx, idx, index, NonUniformKind::SampledImage);
+        let ptr = ctx
+            .builder
+            .access_chain(def.pointer_type, None, def.id, vec![idx])
+            .unwrap();
+        let object = ctx
+            .builder
+            .load(def.sampled_type, None, ptr, None, vec![])
+            .unwrap();
+        let image = ctx.builder.image(def.image_type, None, object).unwrap();
+        if non_uniform {
+            decorate_non_uniform(ctx, ptr);
+            decorate_non_uniform(ctx, object);
+            decorate_non_uniform(ctx, image);
+        }
+        return image;
+    }
     let sampled_image = ctx
         .builder
         .load(def.sampled_type, None, def.id, None, vec![])
@@ -553,25 +723,55 @@ fn texture_image(ctx: &mut SpirvEmitContext, info: TextureInstInfo, index: Value
 /// Port of upstream `Image`: load a storage image and preserve whether its
 /// sampled component type is integer.
 fn image(ctx: &mut SpirvEmitContext, info: TextureInstInfo, index: Value) -> (Word, bool) {
-    if !index.is_void() && (!index.is_immediate() || index.imm_u32() != 0) {
-        panic!("SPIR-V: indirect image indexing is not implemented");
-    }
     let texture_type = crate::shader_info::TextureType::from_u8(info.texture_type);
-    let (id, image_type, count, is_integer) =
-        if texture_type == crate::shader_info::TextureType::Buffer {
-            let def = *ctx
-                .image_buffers
-                .get(info.descriptor_index as usize)
-                .expect("SPIR-V: missing image-buffer descriptor");
-            (def.id, def.image_type, def.count, def.is_integer)
+    let is_buffer = texture_type == crate::shader_info::TextureType::Buffer;
+    let (id, image_type, pointer_type, count, is_integer) = if is_buffer {
+        let def = *ctx
+            .image_buffers
+            .get(info.descriptor_index as usize)
+            .expect("SPIR-V: missing image-buffer descriptor");
+        (
+            def.id,
+            def.image_type,
+            def.pointer_type,
+            def.count,
+            def.is_integer,
+        )
+    } else {
+        let def = *ctx
+            .images
+            .get(info.descriptor_index as usize)
+            .expect("SPIR-V: missing image descriptor");
+        (
+            def.id,
+            def.image_type,
+            def.pointer_type,
+            def.count,
+            def.is_integer,
+        )
+    };
+    if count > 1 {
+        let kind = if is_buffer {
+            NonUniformKind::StorageTexelBuffer
         } else {
-            let def = *ctx
-                .images
-                .get(info.descriptor_index as usize)
-                .expect("SPIR-V: missing image descriptor");
-            (def.id, def.image_type, def.count, def.is_integer)
+            NonUniformKind::StorageImage
         };
-    assert_eq!(count, 1, "SPIR-V: indirect image indexing");
+        let idx = ctx.resolve_value(&index);
+        let non_uniform = mark_non_uniform(ctx, idx, index, kind);
+        let ptr = ctx
+            .builder
+            .access_chain(pointer_type, None, id, vec![idx])
+            .unwrap();
+        let image = ctx
+            .builder
+            .load(image_type, None, ptr, None, vec![])
+            .unwrap();
+        if non_uniform {
+            decorate_non_uniform(ctx, ptr);
+            decorate_non_uniform(ctx, image);
+        }
+        return (image, is_integer);
+    }
     let image = ctx
         .builder
         .load(image_type, None, id, None, vec![])
@@ -630,15 +830,22 @@ pub fn emit_image_sample(
 ) {
     let info = TextureInstInfo::from_u32(inst.flags);
     let coord = ctx.resolve_value(inst.arg(1));
+    let is_integer = is_texture_integer(ctx, info);
+    let result_type = if is_integer {
+        ctx.u32_vec4_type
+    } else {
+        ctx.f32_vec4_type
+    };
 
     let sampled_image = texture(ctx, info, *inst.arg(0));
-    let id = if inst.opcode == Opcode::ImageSampleExplicitLod {
+    let explicit_lod = inst.opcode == Opcode::ImageSampleExplicitLod;
+    let mut id = if explicit_lod {
         let lod = ctx.resolve_value(inst.arg(2));
         let operands =
             ImageOperands::for_sample(ctx, program, false, true, false, lod, *inst.arg(3));
         ctx.builder
             .image_sample_explicit_lod(
-                ctx.f32_vec4_type,
+                result_type,
                 None,
                 sampled_image,
                 coord,
@@ -663,7 +870,7 @@ pub fn emit_image_sample(
         );
         ctx.builder
             .image_sample_implicit_lod(
-                ctx.f32_vec4_type,
+                result_type,
                 None,
                 sampled_image,
                 coord,
@@ -684,7 +891,7 @@ pub fn emit_image_sample(
         );
         ctx.builder
             .image_sample_explicit_lod(
-                ctx.f32_vec4_type,
+                result_type,
                 None,
                 sampled_image,
                 coord,
@@ -694,6 +901,17 @@ pub fn emit_image_sample(
             .unwrap()
     };
 
+    #[cfg(target_os = "android")]
+    if explicit_lod && !is_integer && *common::settings::values().fix_bloom_effects.get_value() {
+        let factor = ctx.constant_f32(0.98);
+        id = ctx
+            .builder
+            .vector_times_scalar(ctx.f32_vec4_type, None, id, factor)
+            .unwrap();
+    }
+    if is_integer {
+        id = ctx.builder.bitcast(ctx.f32_vec4_type, None, id).unwrap();
+    }
     let id = decorate_sample(ctx, info, id);
     ctx.set_value(block_idx, inst_idx, id);
 }
@@ -781,6 +999,12 @@ pub fn emit_image_fetch_inst(
     inst_idx: u32,
 ) {
     let info = TextureInstInfo::from_u32(inst.flags);
+    let is_integer = is_texture_integer(ctx, info);
+    let result_type = if is_integer {
+        ctx.u32_vec4_type
+    } else {
+        ctx.f32_vec4_type
+    };
     let coords = ctx.resolve_value(inst.arg(1));
     let coords = add_offset_to_coordinates(ctx, info, coords, inst.arg(2));
 
@@ -805,7 +1029,7 @@ pub fn emit_image_fetch_inst(
     let id = ctx
         .builder
         .image_fetch(
-            ctx.f32_vec4_type,
+            result_type,
             None,
             image,
             coords,
@@ -813,6 +1037,11 @@ pub fn emit_image_fetch_inst(
             operand_ids,
         )
         .unwrap();
+    let id = if is_integer {
+        ctx.builder.bitcast(ctx.f32_vec4_type, None, id).unwrap()
+    } else {
+        id
+    };
 
     ctx.set_value(block_idx, inst_idx, id);
 }
@@ -917,6 +1146,12 @@ pub fn emit_image_gradient_inst(
     inst_idx: u32,
 ) {
     let info = TextureInstInfo::from_u32(inst.flags);
+    let is_integer = is_texture_integer(ctx, info);
+    let sample_type = if is_integer {
+        ctx.u32_vec4_type
+    } else {
+        ctx.f32_vec4_type
+    };
     let coords = ctx.resolve_value(inst.arg(1));
     let derivatives = ctx.resolve_value(inst.arg(2));
     let operands =
@@ -924,9 +1159,7 @@ pub fn emit_image_gradient_inst(
     let sampler = texture(ctx, info, *inst.arg(0));
     let sparse = inst.get_associated_pseudo(Opcode::GetSparseFromOp);
     let id = if let Some(sparse_ref) = sparse {
-        let result_type = ctx
-            .builder
-            .type_struct(vec![ctx.u32_type, ctx.f32_vec4_type]);
+        let result_type = ctx.builder.type_struct(vec![ctx.u32_type, sample_type]);
         let sample = ctx
             .builder
             .image_sparse_sample_explicit_lod(
@@ -949,13 +1182,13 @@ pub fn emit_image_gradient_inst(
             .unwrap();
         ctx.set_value(sparse_ref.block, sparse_ref.inst, resident);
         ctx.builder
-            .composite_extract(ctx.f32_vec4_type, None, sample, vec![1])
+            .composite_extract(sample_type, None, sample, vec![1])
             .unwrap()
     } else {
         let sample = ctx
             .builder
             .image_sample_explicit_lod(
-                ctx.f32_vec4_type,
+                sample_type,
                 None,
                 sampler,
                 coords,
@@ -964,6 +1197,11 @@ pub fn emit_image_gradient_inst(
             )
             .unwrap();
         decorate_sample(ctx, info, sample)
+    };
+    let id = if is_integer {
+        ctx.builder.bitcast(ctx.f32_vec4_type, None, id).unwrap()
+    } else {
+        id
     };
     ctx.set_value(block_idx, inst_idx, id);
 }
@@ -977,6 +1215,12 @@ pub fn emit_image_gather_inst(
     inst_idx: u32,
 ) {
     let info = TextureInstInfo::from_u32(inst.flags);
+    let is_integer = is_texture_integer(ctx, info);
+    let sample_type = if is_integer {
+        ctx.u32_vec4_type
+    } else {
+        ctx.f32_vec4_type
+    };
     let mut coord = ctx.resolve_value(inst.arg(1));
 
     let sampled_image = texture(ctx, info, *inst.arg(0));
@@ -991,9 +1235,7 @@ pub fn emit_image_gather_inst(
         .constant_bit32(ctx.u32_type, info.gather_component as u32);
     let sparse = inst.get_associated_pseudo(Opcode::GetSparseFromOp);
     let id = if let Some(sparse_ref) = sparse {
-        let result_type = ctx
-            .builder
-            .type_struct(vec![ctx.u32_type, ctx.f32_vec4_type]);
+        let result_type = ctx.builder.type_struct(vec![ctx.u32_type, sample_type]);
         let sample = if let Some(dref) = dref {
             ctx.builder
                 .image_sparse_dref_gather(
@@ -1030,13 +1272,13 @@ pub fn emit_image_gather_inst(
             .unwrap();
         ctx.set_value(sparse_ref.block, sparse_ref.inst, resident);
         ctx.builder
-            .composite_extract(ctx.f32_vec4_type, None, sample, vec![1])
+            .composite_extract(sample_type, None, sample, vec![1])
             .unwrap()
     } else if let Some(dref) = dref {
         let sample = ctx
             .builder
             .image_dref_gather(
-                ctx.f32_vec4_type,
+                sample_type,
                 None,
                 sampled_image,
                 coord,
@@ -1050,7 +1292,7 @@ pub fn emit_image_gather_inst(
         let sample = ctx
             .builder
             .image_gather(
-                ctx.f32_vec4_type,
+                sample_type,
                 None,
                 sampled_image,
                 coord,
@@ -1060,6 +1302,11 @@ pub fn emit_image_gather_inst(
             )
             .unwrap();
         decorate_sample(ctx, info, sample)
+    };
+    let id = if is_integer {
+        ctx.builder.bitcast(ctx.f32_vec4_type, None, id).unwrap()
+    } else {
+        id
     };
 
     ctx.set_value(block_idx, inst_idx, id);
@@ -1180,6 +1427,7 @@ mod tests {
             texture_type: TextureType::Color2D,
             is_depth: false,
             is_multisample: false,
+            is_integer: false,
             has_secondary: false,
             cbuf_index: 0,
             cbuf_offset: 0,
@@ -1251,6 +1499,101 @@ mod tests {
         let mut ctx = SpirvEmitContext::new(&program, &profile, &RuntimeInfo::default());
         ctx.emit_program(&program);
         ctx
+    }
+
+    /// Builds a fragment shader sampling texture slot 0 of a descriptor array
+    /// through a dynamically computed index, which is exactly the case upstream
+    /// guards with `MarkNonUniform`.
+    fn dynamic_texture_index_context(profile: Profile) -> SpirvEmitContext {
+        let mut program = Program::new(ShaderStage::Fragment);
+        program.info.texture_descriptors.push(TextureDescriptor {
+            texture_type: TextureType::Color2D,
+            is_depth: false,
+            is_multisample: false,
+            is_integer: false,
+            has_secondary: false,
+            cbuf_index: 0,
+            cbuf_offset: 0,
+            shift_left: 0,
+            secondary_cbuf_index: 0,
+            secondary_cbuf_offset: 0,
+            secondary_shift_left: 0,
+            count: 4,
+            size_shift: 0,
+        });
+        let info = TextureInstInfo {
+            descriptor_index: 0,
+            texture_type: TextureType::Color2D as u8,
+            ..TextureInstInfo::default()
+        };
+        program.blocks.push(Block::new());
+        let block = program.block_mut(0);
+        let coords = block.append_inst(Inst::new(
+            Opcode::CompositeConstructF32x2,
+            vec![Value::ImmF32(0.25), Value::ImmF32(0.75)],
+        ));
+        // A non-immediate index: upstream only decorates NonUniform in this case.
+        let index = block.append_inst(Inst::new(
+            Opcode::BitwiseAnd32,
+            vec![Value::ImmU32(7), Value::ImmU32(3)],
+        ));
+        block.append_inst(Inst::with_flags(
+            Opcode::ImageGather,
+            vec![
+                Value::Inst(InstRef {
+                    block: 0,
+                    inst: index,
+                }),
+                Value::Inst(InstRef {
+                    block: 0,
+                    inst: coords,
+                }),
+                Value::Void,
+                Value::Void,
+            ],
+            info.to_u32(),
+        ));
+        program.syntax_list = vec![SyntaxNode::Block(0), SyntaxNode::Return];
+
+        let mut ctx = SpirvEmitContext::new(&program, &profile, &RuntimeInfo::default());
+        ctx.emit_program(&program);
+        ctx
+    }
+
+    fn non_uniform_decorated_ids(ctx: &SpirvEmitContext) -> usize {
+        ctx.builder
+            .module_ref()
+            .annotations
+            .iter()
+            .filter(|instruction| {
+                instruction.class.opcode == spirv::Op::Decorate
+                    && instruction.operands.iter().any(|operand| {
+                        matches!(operand, Operand::Decoration(spirv::Decoration::NonUniform))
+                    })
+            })
+            .count()
+    }
+
+    #[test]
+    fn dynamic_texture_index_decorates_non_uniform_when_supported() {
+        let ctx = dynamic_texture_index_context(Profile {
+            supported_spirv: 0x0001_0300,
+            support_sampled_image_array_nonuniform_indexing: true,
+            ..Profile::default()
+        });
+        // Upstream decorates the index, the access chain pointer and the loaded
+        // object: three distinct ids.
+        assert_eq!(non_uniform_decorated_ids(&ctx), 3);
+        assert!(ctx.uses_nonuniform_sampled_image);
+        validate_with_external_tool(ctx, "non-uniform-sampled-image");
+    }
+
+    #[test]
+    fn dynamic_texture_index_skips_non_uniform_without_profile_support() {
+        let ctx = dynamic_texture_index_context(Profile::default());
+        assert_eq!(non_uniform_decorated_ids(&ctx), 0);
+        assert!(!ctx.uses_nonuniform_sampled_image);
+        assert!(ctx.non_uniform_ids.is_empty());
     }
 
     #[test]
@@ -1331,6 +1674,7 @@ mod tests {
             texture_type: TextureType::Color2D,
             is_depth: false,
             is_multisample: false,
+            is_integer: false,
             has_secondary: false,
             cbuf_index: 0,
             cbuf_offset: 0,
@@ -1402,6 +1746,7 @@ mod tests {
             texture_type: TextureType::Color2D,
             is_depth: false,
             is_multisample: false,
+            is_integer: false,
             has_secondary: false,
             cbuf_index: 0,
             cbuf_offset: 0,
@@ -1471,6 +1816,74 @@ mod tests {
             )
         }));
         validate_with_external_tool(ctx, "image-gradient");
+    }
+
+    #[test]
+    fn integer_texture_sample_uses_u32_result_then_bitcasts_like_upstream() {
+        let mut program = Program::new(ShaderStage::Fragment);
+        program.info.texture_descriptors.push(TextureDescriptor {
+            texture_type: TextureType::Color2D,
+            is_depth: false,
+            is_multisample: false,
+            is_integer: true,
+            has_secondary: false,
+            cbuf_index: 0,
+            cbuf_offset: 0,
+            shift_left: 0,
+            secondary_cbuf_index: 0,
+            secondary_cbuf_offset: 0,
+            secondary_shift_left: 0,
+            count: 1,
+            size_shift: 0,
+        });
+        let info = TextureInstInfo {
+            descriptor_index: 0,
+            texture_type: TextureType::Color2D as u8,
+            is_integer: true,
+            ..TextureInstInfo::default()
+        };
+        program.blocks.push(Block::new());
+        let block = program.block_mut(0);
+        let coords = block.append_inst(Inst::new(
+            Opcode::CompositeConstructF32x2,
+            vec![Value::ImmF32(0.25), Value::ImmF32(0.75)],
+        ));
+        block.append_inst(Inst::with_flags(
+            Opcode::ImageSampleExplicitLod,
+            vec![
+                Value::Void,
+                Value::Inst(InstRef {
+                    block: 0,
+                    inst: coords,
+                }),
+                Value::ImmF32(0.0),
+                Value::Void,
+            ],
+            info.to_u32(),
+        ));
+        program.syntax_list = vec![SyntaxNode::Block(0), SyntaxNode::Return];
+
+        let mut ctx = SpirvEmitContext::new(&program, &Profile::default(), &RuntimeInfo::default());
+        let u32_vec4_type = ctx.u32_vec4_type;
+        ctx.emit_program(&program);
+
+        let instructions = ctx
+            .builder
+            .module_ref()
+            .functions
+            .iter()
+            .flat_map(|function| function.blocks.iter())
+            .flat_map(|block| block.instructions.iter())
+            .collect::<Vec<_>>();
+        let sample = instructions
+            .iter()
+            .find(|inst| inst.class.opcode == spirv::Op::ImageSampleExplicitLod)
+            .expect("integer sample must be emitted");
+        assert_eq!(sample.result_type, Some(u32_vec4_type));
+        assert!(instructions
+            .iter()
+            .any(|inst| inst.class.opcode == spirv::Op::Bitcast));
+        validate_with_external_tool(ctx, "integer-texture-sample");
     }
 
     #[test]

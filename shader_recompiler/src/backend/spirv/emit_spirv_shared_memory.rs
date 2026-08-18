@@ -56,7 +56,7 @@ fn extract_args(ctx: &mut SpirvEmitContext, offset: Word, mask: u32, count: u32)
 }
 
 pub fn emit_load_shared_u8(ctx: &mut SpirvEmitContext, offset: Word) -> Word {
-    if ctx.profile.support_explicit_workgroup_layout {
+    if ctx.uses_explicit_workgroup_layout {
         let pointer = ctx
             .builder
             .access_chain(
@@ -81,7 +81,7 @@ pub fn emit_load_shared_u8(ctx: &mut SpirvEmitContext, offset: Word) -> Word {
 }
 
 pub fn emit_load_shared_s8(ctx: &mut SpirvEmitContext, offset: Word) -> Word {
-    if ctx.profile.support_explicit_workgroup_layout {
+    if ctx.uses_explicit_workgroup_layout {
         let pointer = ctx
             .builder
             .access_chain(
@@ -106,7 +106,7 @@ pub fn emit_load_shared_s8(ctx: &mut SpirvEmitContext, offset: Word) -> Word {
 }
 
 pub fn emit_load_shared_u16(ctx: &mut SpirvEmitContext, offset: Word) -> Word {
-    if ctx.profile.support_explicit_workgroup_layout {
+    if ctx.uses_explicit_workgroup_layout {
         let pointer = pointer(ctx, ctx.shared_u16, ctx.shared_memory_u16, offset, 1);
         let value = ctx
             .builder
@@ -123,7 +123,7 @@ pub fn emit_load_shared_u16(ctx: &mut SpirvEmitContext, offset: Word) -> Word {
 }
 
 pub fn emit_load_shared_s16(ctx: &mut SpirvEmitContext, offset: Word) -> Word {
-    if ctx.profile.support_explicit_workgroup_layout {
+    if ctx.uses_explicit_workgroup_layout {
         let pointer = pointer(ctx, ctx.shared_u16, ctx.shared_memory_u16, offset, 1);
         let value = ctx
             .builder
@@ -140,7 +140,7 @@ pub fn emit_load_shared_s16(ctx: &mut SpirvEmitContext, offset: Word) -> Word {
 }
 
 pub fn emit_load_shared_u32(ctx: &mut SpirvEmitContext, offset: Word) -> Word {
-    if ctx.profile.support_explicit_workgroup_layout {
+    if ctx.uses_explicit_workgroup_layout {
         let pointer = pointer(ctx, ctx.shared_u32, ctx.shared_memory_u32, offset, 2);
         ctx.builder
             .load(ctx.u32_type, None, pointer, None, vec![])
@@ -151,7 +151,7 @@ pub fn emit_load_shared_u32(ctx: &mut SpirvEmitContext, offset: Word) -> Word {
 }
 
 pub fn emit_load_shared_u64(ctx: &mut SpirvEmitContext, offset: Word) -> Word {
-    if ctx.profile.support_explicit_workgroup_layout {
+    if ctx.uses_explicit_workgroup_layout {
         let pointer = pointer(ctx, ctx.shared_u32x2, ctx.shared_memory_u32x2, offset, 3);
         return ctx
             .builder
@@ -199,7 +199,7 @@ pub fn emit_load_shared_u64(ctx: &mut SpirvEmitContext, offset: Word) -> Word {
 }
 
 pub fn emit_load_shared_u128(ctx: &mut SpirvEmitContext, offset: Word) -> Word {
-    if ctx.profile.support_explicit_workgroup_layout {
+    if ctx.uses_explicit_workgroup_layout {
         let pointer = pointer(ctx, ctx.shared_u32x4, ctx.shared_memory_u32x4, offset, 4);
         return ctx
             .builder
@@ -237,7 +237,7 @@ pub fn emit_load_shared_u128(ctx: &mut SpirvEmitContext, offset: Word) -> Word {
 }
 
 pub fn emit_write_shared_u8(ctx: &mut SpirvEmitContext, offset: Word, value: Word) {
-    if ctx.profile.support_explicit_workgroup_layout {
+    if ctx.uses_explicit_workgroup_layout {
         let pointer = ctx
             .builder
             .access_chain(
@@ -262,7 +262,7 @@ pub fn emit_write_shared_u8(ctx: &mut SpirvEmitContext, offset: Word, value: Wor
 }
 
 pub fn emit_write_shared_u16(ctx: &mut SpirvEmitContext, offset: Word, value: Word) {
-    if ctx.profile.support_explicit_workgroup_layout {
+    if ctx.uses_explicit_workgroup_layout {
         let pointer = pointer(ctx, ctx.shared_u16, ctx.shared_memory_u16, offset, 1);
         let converted = ctx.builder.u_convert(ctx.u16_type, None, value).unwrap();
         ctx.builder.store(pointer, converted, None, vec![]).unwrap();
@@ -279,7 +279,7 @@ pub fn emit_write_shared_u16(ctx: &mut SpirvEmitContext, offset: Word, value: Wo
 }
 
 pub fn emit_write_shared_u32(ctx: &mut SpirvEmitContext, offset: Word, value: Word) {
-    let pointer = if ctx.profile.support_explicit_workgroup_layout {
+    let pointer = if ctx.uses_explicit_workgroup_layout {
         pointer(ctx, ctx.shared_u32, ctx.shared_memory_u32, offset, 2)
     } else {
         let shift = ctx.constant_u32(2);
@@ -300,7 +300,7 @@ pub fn emit_write_shared_u32(ctx: &mut SpirvEmitContext, offset: Word, value: Wo
 }
 
 pub fn emit_write_shared_u64(ctx: &mut SpirvEmitContext, offset: Word, value: Word) {
-    if ctx.profile.support_explicit_workgroup_layout {
+    if ctx.uses_explicit_workgroup_layout {
         let pointer = pointer(ctx, ctx.shared_u32x2, ctx.shared_memory_u32x2, offset, 3);
         ctx.builder.store(pointer, value, None, vec![]).unwrap();
         return;
@@ -328,7 +328,7 @@ pub fn emit_write_shared_u64(ctx: &mut SpirvEmitContext, offset: Word, value: Wo
 }
 
 pub fn emit_write_shared_u128(ctx: &mut SpirvEmitContext, offset: Word, value: Word) {
-    if ctx.profile.support_explicit_workgroup_layout {
+    if ctx.uses_explicit_workgroup_layout {
         let pointer = pointer(ctx, ctx.shared_u32x4, ctx.shared_memory_u32x4, offset, 4);
         ctx.builder.store(pointer, value, None, vec![]).unwrap();
         return;
@@ -470,6 +470,8 @@ mod tests {
             support_int16: true,
             support_int64: true,
             support_explicit_workgroup_layout: true,
+            support_workgroup_layout_8bit_access: true,
+            support_workgroup_layout_16bit_access: true,
             ..Profile::default()
         };
         let mut ctx = SpirvEmitContext::new(&program, &profile, &RuntimeInfo::default());

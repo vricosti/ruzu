@@ -94,6 +94,73 @@ impl std::hash::BuildHasher for BuildIdentityHasher {
     }
 }
 
+/// Post-mixes a hash value exactly as `ankerl::unordered_dense` does when the
+/// upstream hasher does not declare `is_avalanching`.
+///
+/// Eden uses `ankerl::unordered_dense` with both `Common::IdentityHash<u64>`
+/// and `std::hash<ComputePipelineCacheKey>`. Rust's `HashMap` has no equivalent
+/// container-level post-mix hook, so this adapter preserves that part of the
+/// upstream container contract in its `Hasher::finish` implementation.
+#[derive(Debug, Clone, Default)]
+pub struct UnorderedDenseHasher {
+    inner: IdentityHasher,
+}
+
+impl Hasher for UnorderedDenseHasher {
+    fn finish(&self) -> u64 {
+        let product = (self.inner.finish() as u128).wrapping_mul(0x9e37_79b9_7f4a_7c15_u128);
+        (product as u64) ^ (product >> 64) as u64
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        self.inner.write(bytes);
+    }
+
+    fn write_u8(&mut self, i: u8) {
+        self.inner.write_u8(i);
+    }
+    fn write_u16(&mut self, i: u16) {
+        self.inner.write_u16(i);
+    }
+    fn write_u32(&mut self, i: u32) {
+        self.inner.write_u32(i);
+    }
+    fn write_u64(&mut self, i: u64) {
+        self.inner.write_u64(i);
+    }
+    fn write_usize(&mut self, i: usize) {
+        self.inner.write_usize(i);
+    }
+    fn write_i8(&mut self, i: i8) {
+        self.inner.write_i8(i);
+    }
+    fn write_i16(&mut self, i: i16) {
+        self.inner.write_i16(i);
+    }
+    fn write_i32(&mut self, i: i32) {
+        self.inner.write_i32(i);
+    }
+    fn write_i64(&mut self, i: i64) {
+        self.inner.write_i64(i);
+    }
+    fn write_isize(&mut self, i: isize) {
+        self.inner.write_isize(i);
+    }
+}
+
+/// Builds the hasher that reproduces `ankerl::unordered_dense::mixed_hash`
+/// for an upstream hash value written as one integer.
+#[derive(Debug, Clone, Default)]
+pub struct BuildUnorderedDenseHasher;
+
+impl std::hash::BuildHasher for BuildUnorderedDenseHasher {
+    type Hasher = UnorderedDenseHasher;
+
+    fn build_hasher(&self) -> Self::Hasher {
+        UnorderedDenseHasher::default()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -116,5 +183,23 @@ mod tests {
         let mut hasher = build.build_hasher();
         42u64.hash(&mut hasher);
         assert_eq!(hasher.finish(), 42);
+    }
+
+    #[test]
+    fn unordered_dense_post_mix_matches_upstream_wyhash() {
+        use std::hash::BuildHasher;
+
+        let vectors = [
+            (0x0000_0000_0000_0000, 0x0000_0000_0000_0000),
+            (0x0000_0000_0000_0001, 0x9e37_79b9_7f4a_7c15),
+            (0x0000_0000_0000_002a, 0xf519_f86e_e238_5b6b),
+            (0x1234_5678_9abc_def0, 0xc27a_443d_5ff2_18e0),
+            (0xffff_ffff_ffff_ffff, 0xffff_ffff_ffff_ffff),
+        ];
+        for (input, expected) in vectors {
+            let mut hasher = BuildUnorderedDenseHasher.build_hasher();
+            hasher.write_u64(input);
+            assert_eq!(hasher.finish(), expected);
+        }
     }
 }

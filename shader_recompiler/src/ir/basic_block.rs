@@ -11,6 +11,18 @@ use super::instruction::Inst;
 use super::opcodes::Opcode;
 use super::value::{Reg, Value};
 
+/// Stable intrusive-list links for one instruction arena slot.
+///
+/// Eden stores these links in `Inst` through `boost::intrusive::list`. Rust
+/// keeps `InstRef` as an arena index, so the equivalent links live beside the
+/// arena slot and preserve constant-time insertion and removal without moving
+/// the instruction itself.
+#[derive(Debug, Clone, Copy)]
+struct InstructionLink {
+    prev: Option<u32>,
+    next: Option<u32>,
+}
+
 /// A basic block in the IR program.
 #[derive(Debug, Clone)]
 pub struct Block {
@@ -21,13 +33,10 @@ pub struct Block {
     /// upstream pointer-stable instruction identity without requiring a full
     /// intrusive list yet.
     pub instructions: Vec<Option<Inst>>,
-    /// Logical instruction order.
-    ///
-    /// Slot indices stay stable because `Value::Inst(InstRef)` stores them.
-    /// This side list lets passes insert a newly allocated slot before an
-    /// existing slot, matching upstream's pointer-stable intrusive list model
-    /// without shifting `instructions`.
-    instruction_order: Vec<u32>,
+    /// Intrusive logical-order links parallel to `instructions`.
+    instruction_links: Vec<Option<InstructionLink>>,
+    instruction_head: Option<u32>,
+    instruction_tail: Option<u32>,
     /// Immediate predecessor block indices.
     pub imm_predecessors: Vec<u32>,
     /// Immediate successor block indices.
@@ -48,7 +57,9 @@ impl Block {
     pub fn new() -> Self {
         Self {
             instructions: Vec::new(),
-            instruction_order: Vec::new(),
+            instruction_links: Vec::new(),
+            instruction_head: None,
+            instruction_tail: None,
             imm_predecessors: Vec::new(),
             imm_successors: Vec::new(),
             ssa_reg_values: vec![Value::Void; Reg::NUM_REGS],
@@ -62,8 +73,19 @@ impl Block {
     /// Returns the index of the new instruction within this block.
     pub fn append_inst(&mut self, inst: Inst) -> u32 {
         let idx = self.instructions.len() as u32;
+        let prev = self.instruction_tail;
         self.instructions.push(Some(inst));
-        self.instruction_order.push(idx);
+        self.instruction_links
+            .push(Some(InstructionLink { prev, next: None }));
+        if let Some(prev) = prev {
+            self.instruction_links[prev as usize]
+                .as_mut()
+                .expect("live tail must have instruction links")
+                .next = Some(idx);
+        } else {
+            self.instruction_head = Some(idx);
+        }
+        self.instruction_tail = Some(idx);
         idx
     }
 
@@ -75,7 +97,8 @@ impl Block {
 
     /// Insert an instruction at the given position.
     pub fn insert_inst(&mut self, position: usize, inst: Inst) {
-        if position < self.instructions.len() {
+        if position < self.instructions.len() && self.instruction_links[position].as_ref().is_some()
+        {
             self.insert_inst_before(position as u32, inst);
         } else {
             self.append_inst(inst);
@@ -84,14 +107,29 @@ impl Block {
 
     /// Allocate a new stable slot and place it before `before` in logical order.
     pub fn insert_inst_before(&mut self, before: u32, inst: Inst) -> u32 {
+        let before_link = *self
+            .instruction_links
+            .get(before as usize)
+            .and_then(Option::as_ref)
+            .expect("insert_inst_before target must be a live instruction");
         let idx = self.instructions.len() as u32;
         self.instructions.push(Some(inst));
-        let insert_pos = self
-            .instruction_order
-            .iter()
-            .position(|&slot| slot == before)
-            .unwrap_or(self.instruction_order.len());
-        self.instruction_order.insert(insert_pos, idx);
+        self.instruction_links.push(Some(InstructionLink {
+            prev: before_link.prev,
+            next: Some(before),
+        }));
+        if let Some(prev) = before_link.prev {
+            self.instruction_links[prev as usize]
+                .as_mut()
+                .expect("live predecessor must have instruction links")
+                .next = Some(idx);
+        } else {
+            self.instruction_head = Some(idx);
+        }
+        self.instruction_links[before as usize]
+            .as_mut()
+            .expect("insert target must remain live")
+            .prev = Some(idx);
         idx
     }
 
@@ -103,8 +141,90 @@ impl Block {
 
     /// Physically erase an instruction while preserving every other slot index.
     pub fn erase_inst(&mut self, idx: u32) {
+        self.unlink_inst(idx);
         self.instructions[idx as usize] = None;
-        self.instruction_order.retain(|&slot| slot != idx);
+    }
+
+    /// Unlink a stable instruction slot without destroying its instruction.
+    /// This is the indexed equivalent of erasing an intrusive-list iterator
+    /// before reinserting the same `Inst`, as `TryRemoveTrivialPhi` does.
+    pub(crate) fn unlink_inst(&mut self, idx: u32) {
+        let link = self
+            .instruction_links
+            .get_mut(idx as usize)
+            .and_then(Option::take)
+            .expect("unlink_inst target must be a live instruction");
+        if let Some(prev) = link.prev {
+            self.instruction_links[prev as usize]
+                .as_mut()
+                .expect("live predecessor must have instruction links")
+                .next = link.next;
+        } else {
+            self.instruction_head = link.next;
+        }
+        if let Some(next) = link.next {
+            self.instruction_links[next as usize]
+                .as_mut()
+                .expect("live successor must have instruction links")
+                .prev = link.prev;
+        } else {
+            self.instruction_tail = link.prev;
+        }
+    }
+
+    /// Reinsert an unlinked stable slot before `before`, or at the end when
+    /// `before` is `None`.
+    pub(crate) fn relink_inst_before(&mut self, idx: u32, before: Option<u32>) {
+        assert!(
+            self.instructions
+                .get(idx as usize)
+                .is_some_and(Option::is_some),
+            "relink_inst_before source must retain its instruction"
+        );
+        assert!(
+            self.instruction_links
+                .get(idx as usize)
+                .is_some_and(Option::is_none),
+            "relink_inst_before source must be unlinked"
+        );
+        match before {
+            Some(before) => {
+                let before_link = *self
+                    .instruction_links
+                    .get(before as usize)
+                    .and_then(Option::as_ref)
+                    .expect("relink target must be a live instruction");
+                self.instruction_links[idx as usize] = Some(InstructionLink {
+                    prev: before_link.prev,
+                    next: Some(before),
+                });
+                if let Some(prev) = before_link.prev {
+                    self.instruction_links[prev as usize]
+                        .as_mut()
+                        .expect("live predecessor must have instruction links")
+                        .next = Some(idx);
+                } else {
+                    self.instruction_head = Some(idx);
+                }
+                self.instruction_links[before as usize]
+                    .as_mut()
+                    .expect("relink target must remain live")
+                    .prev = Some(idx);
+            }
+            None => {
+                let prev = self.instruction_tail;
+                self.instruction_links[idx as usize] = Some(InstructionLink { prev, next: None });
+                if let Some(prev) = prev {
+                    self.instruction_links[prev as usize]
+                        .as_mut()
+                        .expect("live tail must have instruction links")
+                        .next = Some(idx);
+                } else {
+                    self.instruction_head = Some(idx);
+                }
+                self.instruction_tail = Some(idx);
+            }
+        }
     }
 
     /// Add a successor block (CFG edge).
@@ -138,7 +258,7 @@ impl Block {
 
     /// Whether this block is empty (no instructions).
     pub fn is_empty(&self) -> bool {
-        self.instructions.iter().all(Option::is_none)
+        self.instruction_head.is_none()
     }
 
     /// Number of stable instruction slots in this block.
@@ -148,10 +268,7 @@ impl Block {
 
     /// Number of live instructions in this block.
     pub fn live_len(&self) -> usize {
-        self.instructions
-            .iter()
-            .filter(|inst| inst.is_some())
-            .count()
+        self.indexed_iter().count()
     }
 
     /// Get instruction at index.
@@ -190,100 +307,113 @@ impl Block {
 
     /// Iterate over live instruction slots.
     pub fn indexed_iter(&self) -> impl Iterator<Item = (u32, &Inst)> {
-        self.instruction_order.iter().copied().filter_map(|index| {
-            self.instructions
-                .get(index as usize)
-                .and_then(Option::as_ref)
-                .map(|inst| (index, inst))
+        let links = &self.instruction_links;
+        let instructions = &self.instructions;
+        std::iter::successors(self.instruction_head, move |&index| {
+            links[index as usize].as_ref().and_then(|link| link.next)
+        })
+        .map(move |index| {
+            let inst = instructions[index as usize]
+                .as_ref()
+                .expect("linked instruction slot must be live");
+            (index, inst)
         })
     }
 
     /// Iterate over live instruction slots mutably.
     pub fn indexed_iter_mut(&mut self) -> impl Iterator<Item = (u32, &mut Inst)> {
-        let order = self.instruction_order.clone();
+        let head = self.instruction_head;
+        let links = &self.instruction_links;
         let len = self.instructions.len();
         let instructions = self.instructions.as_mut_ptr();
-        order.into_iter().filter_map(move |index| {
-            if index as usize >= len {
-                return None;
-            }
-            // `instruction_order` is private and maintained as a duplicate-free
-            // list of live stable slots by `append_inst`, `insert_inst_before`,
-            // and `erase_inst`, so yielding mutable references in this order
-            // cannot alias.
-            unsafe {
+        std::iter::successors(head, move |&index| {
+            links[index as usize].as_ref().and_then(|link| link.next)
+        })
+        .map(move |index| {
+            assert!(
+                (index as usize) < len,
+                "linked instruction index out of bounds"
+            );
+            // SAFETY: the private intrusive links contain every live slot at
+            // most once, so traversal never yields two references to one
+            // instruction. The iterator retains the exclusive block borrow.
+            let inst = unsafe {
                 (*instructions.add(index as usize))
                     .as_mut()
-                    .map(|inst| (index, inst))
-            }
+                    .expect("linked instruction slot must be live")
+            };
+            (index, inst)
         })
     }
 
     /// Iterate over live instruction slots in reverse logical order.
     pub fn indexed_rev_iter(&self) -> impl Iterator<Item = (u32, &Inst)> {
-        self.instruction_order
-            .iter()
-            .rev()
-            .copied()
-            .filter_map(|index| {
-                self.instructions
-                    .get(index as usize)
-                    .and_then(Option::as_ref)
-                    .map(|inst| (index, inst))
-            })
+        let links = &self.instruction_links;
+        let instructions = &self.instructions;
+        std::iter::successors(self.instruction_tail, move |&index| {
+            links[index as usize].as_ref().and_then(|link| link.prev)
+        })
+        .map(move |index| {
+            let inst = instructions[index as usize]
+                .as_ref()
+                .expect("linked instruction slot must be live");
+            (index, inst)
+        })
     }
 
     /// Iterate over live instruction slots mutably in reverse logical order.
     pub fn indexed_rev_iter_mut(&mut self) -> impl Iterator<Item = (u32, &mut Inst)> {
-        let order = self.instruction_order.clone();
+        let tail = self.instruction_tail;
+        let links = &self.instruction_links;
         let len = self.instructions.len();
         let instructions = self.instructions.as_mut_ptr();
-        order.into_iter().rev().filter_map(move |index| {
-            if index as usize >= len {
-                return None;
-            }
-            // See `indexed_iter_mut`: the same private duplicate-free order
-            // invariant applies when the traversal direction is reversed.
-            unsafe {
+        std::iter::successors(tail, move |&index| {
+            links[index as usize].as_ref().and_then(|link| link.prev)
+        })
+        .map(move |index| {
+            assert!(
+                (index as usize) < len,
+                "linked instruction index out of bounds"
+            );
+            // SAFETY: see `indexed_iter_mut`; reverse traversal preserves the
+            // same duplicate-free invariant.
+            let inst = unsafe {
                 (*instructions.add(index as usize))
                     .as_mut()
-                    .map(|inst| (index, inst))
-            }
+                    .expect("linked instruction slot must be live")
+            };
+            (index, inst)
         })
     }
 
     /// First live instruction in logical order.
     pub fn front(&self) -> &Inst {
-        let index = *self
-            .instruction_order
-            .first()
+        let index = self
+            .instruction_head
             .expect("front() called on an empty block");
         self.inst(index)
     }
 
     /// First live instruction in logical order.
     pub fn front_mut(&mut self) -> &mut Inst {
-        let index = *self
-            .instruction_order
-            .first()
+        let index = self
+            .instruction_head
             .expect("front_mut() called on an empty block");
         self.inst_mut(index)
     }
 
     /// Last live instruction in logical order.
     pub fn back(&self) -> &Inst {
-        let index = *self
-            .instruction_order
-            .last()
+        let index = self
+            .instruction_tail
             .expect("back() called on an empty block");
         self.inst(index)
     }
 
     /// Last live instruction in logical order.
     pub fn back_mut(&mut self) -> &mut Inst {
-        let index = *self
-            .instruction_order
-            .last()
+        let index = self
+            .instruction_tail
             .expect("back_mut() called on an empty block");
         self.inst_mut(index)
     }
@@ -373,6 +503,59 @@ mod tests {
 
         assert_eq!(order, vec![first, third]);
         assert!(block.instructions[second as usize].is_none());
+    }
+
+    #[test]
+    fn unlink_and_relink_preserve_stable_slot_identity() {
+        let mut block = Block::new();
+        let phi = block.append_inst(Inst::new(Opcode::Phi, vec![]));
+        let first = block.append_inst(Inst::new(Opcode::IAdd32, vec![]));
+        let second = block.append_inst(Inst::new(Opcode::IMul32, vec![]));
+
+        block.unlink_inst(phi);
+        assert_eq!(
+            block
+                .indexed_iter()
+                .map(|(index, _)| index)
+                .collect::<Vec<_>>(),
+            vec![first, second]
+        );
+        assert_eq!(block.inst(phi).opcode, Opcode::Phi);
+
+        block.relink_inst_before(phi, Some(second));
+        assert_eq!(
+            block
+                .indexed_iter()
+                .map(|(index, _)| index)
+                .collect::<Vec<_>>(),
+            vec![first, phi, second]
+        );
+        assert_eq!(phi, 0, "relinking must not change the InstRef slot");
+    }
+
+    #[test]
+    fn repeated_erasure_keeps_forward_and_reverse_links_consistent() {
+        let mut block = Block::new();
+        let slots = (0..128)
+            .map(|_| block.append_inst(Inst::new(Opcode::IAdd32, vec![])))
+            .collect::<Vec<_>>();
+        for &slot in slots.iter().step_by(2) {
+            block.erase_inst(slot);
+        }
+
+        let forward = block
+            .indexed_iter()
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        let reverse = block
+            .indexed_rev_iter()
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            forward,
+            slots.iter().copied().skip(1).step_by(2).collect::<Vec<_>>()
+        );
+        assert_eq!(reverse, forward.iter().rev().copied().collect::<Vec<_>>());
     }
 
     #[test]

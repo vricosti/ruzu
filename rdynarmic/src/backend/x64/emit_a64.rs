@@ -4,6 +4,7 @@ use rxbyak::{JmpType, R15, RAX};
 
 use crate::backend::x64::block_of_code::STACK_LAYOUT_RSP_OFFSET;
 use crate::backend::x64::emit_context::EmitContext;
+use crate::backend::x64::host_feature::HostFeature;
 use crate::backend::x64::hostloc::*;
 use crate::backend::x64::jit_state::A64JitState;
 use crate::backend::x64::nzcv_util;
@@ -328,7 +329,7 @@ pub fn emit_a64_set_q(_ctx: &EmitContext, ra: &mut RegAlloc, _inst_ref: InstRef,
 ///
 /// Upstream: `A64EmitX64::EmitA64GetNZCVRaw` (a64_emit_x64.cpp).
 pub fn emit_a64_get_nzcv_raw(
-    _ctx: &EmitContext,
+    ctx: &EmitContext,
     ra: &mut RegAlloc,
     inst_ref: InstRef,
     _inst: &Inst,
@@ -339,14 +340,23 @@ pub fn emit_a64_get_nzcv_raw(
     ra.asm
         .mov(r32, dword_ptr(RegExp::from(R15) + offset as i32))
         .unwrap();
-    // ((cpsr_nzcv & X64_MASK) * FROM_X64_MULTIPLIER) & ARM_MASK
-    ra.asm.and_(r32, nzcv_util::X64_MASK as i32).unwrap();
-    let tmp = ra.scratch_gpr();
-    ra.asm
-        .mov(tmp.cvt32().unwrap(), nzcv_util::FROM_X64_MULTIPLIER as i32)
-        .unwrap();
-    ra.asm.imul(r32, tmp.cvt32().unwrap()).unwrap();
-    ra.asm.and_(r32, nzcv_util::ARM_MASK as i32).unwrap();
+    if ctx.has_host_feature(HostFeature::FAST_BMI2) {
+        let tmp = ra.scratch_gpr();
+        let tmp32 = tmp.cvt32().unwrap();
+        ra.asm.mov(tmp32, nzcv_util::X64_MASK as i32).unwrap();
+        ra.asm.pext(r32, r32, tmp32).unwrap();
+        ra.asm.shl(r32, 28).unwrap();
+    } else {
+        // ((cpsr_nzcv & X64_MASK) * FROM_X64_MULTIPLIER) & ARM_MASK
+        ra.asm.and_(r32, nzcv_util::X64_MASK as i32).unwrap();
+        let tmp = ra.scratch_gpr();
+        let tmp32 = tmp.cvt32().unwrap();
+        ra.asm
+            .mov(tmp32, nzcv_util::FROM_X64_MULTIPLIER as i32)
+            .unwrap();
+        ra.asm.imul(r32, tmp32).unwrap();
+        ra.asm.and_(r32, nzcv_util::ARM_MASK as i32).unwrap();
+    }
     ra.define_value(inst_ref, result);
 }
 
@@ -358,7 +368,7 @@ pub fn emit_a64_get_nzcv_raw(
 /// variant takes user-visible ARM CPSR.NZCV format and converts it to the
 /// JIT's internal x64 storage format.
 pub fn emit_a64_set_nzcv_raw(
-    _ctx: &EmitContext,
+    ctx: &EmitContext,
     ra: &mut RegAlloc,
     _inst_ref: InstRef,
     inst: &Inst,
@@ -368,14 +378,22 @@ pub fn emit_a64_set_nzcv_raw(
 
     let nzcv = ra.use_scratch_gpr(&mut args[0]);
     let nzcv32 = nzcv.cvt32().unwrap();
-    // ((nzcv >> 28) * TO_X64_MULTIPLIER) & X64_MASK
     ra.asm.shr(nzcv32, 28).unwrap();
-    let tmp = ra.scratch_gpr();
-    ra.asm
-        .mov(tmp.cvt32().unwrap(), nzcv_util::TO_X64_MULTIPLIER as i32)
-        .unwrap();
-    ra.asm.imul(nzcv32, tmp.cvt32().unwrap()).unwrap();
-    ra.asm.and_(nzcv32, nzcv_util::X64_MASK as i32).unwrap();
+    if ctx.has_host_feature(HostFeature::FAST_BMI2) {
+        let tmp = ra.scratch_gpr();
+        let tmp32 = tmp.cvt32().unwrap();
+        ra.asm.mov(tmp32, nzcv_util::X64_MASK as i32).unwrap();
+        ra.asm.pdep(nzcv32, nzcv32, tmp32).unwrap();
+    } else {
+        // ((nzcv >> 28) * TO_X64_MULTIPLIER) & X64_MASK
+        let tmp = ra.scratch_gpr();
+        let tmp32 = tmp.cvt32().unwrap();
+        ra.asm
+            .mov(tmp32, nzcv_util::TO_X64_MULTIPLIER as i32)
+            .unwrap();
+        ra.asm.imul(nzcv32, tmp32).unwrap();
+        ra.asm.and_(nzcv32, nzcv_util::X64_MASK as i32).unwrap();
+    }
     ra.asm
         .mov(dword_ptr(RegExp::from(R15) + offset as i32), nzcv32)
         .unwrap();
@@ -571,7 +589,7 @@ pub fn emit_get_c_flag_from_nzcv(
 /// `ConditionalSelectNZCV` can compare/merge it with values produced by
 /// `GetNZCVFromOp` without a format mismatch.
 pub fn emit_nzcv_from_packed_flags(
-    _ctx: &EmitContext,
+    ctx: &EmitContext,
     ra: &mut RegAlloc,
     inst_ref: InstRef,
     inst: &Inst,
@@ -597,6 +615,15 @@ pub fn emit_nzcv_from_packed_flags(
             .mov(result.cvt32().unwrap(), x64_value as i32)
             .unwrap();
         ra.define_value(inst_ref, result);
+    } else if ctx.has_host_feature(HostFeature::FAST_BMI2) {
+        let nzcv = ra.use_scratch_gpr(&mut args[0]);
+        let nzcv32 = nzcv.cvt32().unwrap();
+        let tmp = ra.scratch_gpr();
+        let tmp32 = tmp.cvt32().unwrap();
+        ra.asm.shr(nzcv32, 28).unwrap();
+        ra.asm.mov(tmp32, nzcv_util::X64_MASK as i32).unwrap();
+        ra.asm.pdep(nzcv32, nzcv32, tmp32).unwrap();
+        ra.define_value(inst_ref, nzcv);
     } else {
         let nzcv = ra.use_scratch_gpr(&mut args[0]);
         let nzcv32 = nzcv.cvt32().unwrap();

@@ -85,6 +85,14 @@ impl Condition {
         Self::from_pred(IrPred::PT, !value)
     }
 
+    pub fn always() -> Self {
+        Self::from_bool(true)
+    }
+
+    pub fn is_always(&self) -> bool {
+        *self == Self::always()
+    }
+
     pub fn get_flow_test(&self) -> FlowTest {
         FlowTest::from_u64(self.flow_test as u64).unwrap_or(FlowTest::T)
     }

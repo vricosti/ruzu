@@ -132,6 +132,10 @@ impl DecoderImpl for Vp8 {
         memory_manager
             .lock()
             .read_block(regs.picture_info_offset().address(), context_bytes);
+        self.state.set_frame_dimensions(
+            self.current_context.frame_width as i32,
+            self.current_context.frame_height as i32,
+        );
 
         let bitstream_size = self.current_context.vld_buffer_size as usize;
         let header_size = if self.current_context.key_frame == 1 {

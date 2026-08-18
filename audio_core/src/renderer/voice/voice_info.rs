@@ -1,6 +1,6 @@
 use crate::common::common::{
     get_sample_format_byte_size, CpuAddr, PlayState, SampleFormat, SrcQuality,
-    HIGHEST_VOICE_PRIORITY, MAX_BIQUAD_FILTERS, MAX_CHANNELS, MAX_WAVE_BUFFERS, UNUSED_MIX_ID,
+    LOWEST_VOICE_PRIORITY, MAX_BIQUAD_FILTERS, MAX_CHANNELS, MAX_WAVE_BUFFERS, UNUSED_MIX_ID,
     UNUSED_SPLITTER_ID,
 };
 use crate::common::wave_buffer::{WaveBufferVersion1, WaveBufferVersion2};
@@ -44,6 +44,17 @@ pub struct BiquadFilterParameter {
     pub _padding: u8,
     pub b: [i16; 3],
     pub a: [i16; 2],
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+#[repr(C)]
+pub struct BiquadFilterParameter2 {
+    pub enabled: bool,
+    pub reserved1: u8,
+    pub reserved2: u8,
+    pub reserved3: u8,
+    pub numerator: [f32; 3],
+    pub denominator: [f32; 2],
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -130,6 +141,84 @@ impl Default for InParameter {
             _unk15d: 0,
             src_quality: SrcQuality::Medium,
             _unk15f: [0; 0x11],
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+#[repr(C)]
+pub struct InParameter2 {
+    pub id: u32,
+    pub node_id: u32,
+    pub is_new: bool,
+    pub in_use: bool,
+    pub play_state: PlayState,
+    pub sample_format: SampleFormat,
+    pub sample_rate: u32,
+    pub priority: i32,
+    pub sort_order: i32,
+    pub channel_count: u32,
+    pub pitch: f32,
+    pub volume: f32,
+    pub biquads: [BiquadFilterParameter2; MAX_BIQUAD_FILTERS as usize],
+    pub wave_buffer_count: u32,
+    pub wave_buffer_index: u32,
+    pub reserved1: u32,
+    pub src_data_address: CpuAddr,
+    pub src_data_size: u64,
+    pub mix_id: u32,
+    pub splitter_id: u32,
+    pub wave_buffer_internal: [WaveBufferInternal; MAX_WAVE_BUFFERS as usize],
+    pub channel_resource_ids: [i32; MAX_CHANNELS],
+    pub clear_voice_drop: bool,
+    pub flush_buffer_count: u8,
+    pub reserved2: u16,
+    pub flags: Flags,
+    pub reserved3: u8,
+    pub src_quality: SrcQuality,
+    pub reserved4: u8,
+    pub external_context: u32,
+    pub external_context_size: u32,
+    pub reserved5: u32,
+    pub reserved6: u32,
+}
+
+impl Default for InParameter2 {
+    fn default() -> Self {
+        Self {
+            id: 0,
+            node_id: 0,
+            is_new: false,
+            in_use: false,
+            play_state: PlayState::Stopped,
+            sample_format: SampleFormat::Invalid,
+            sample_rate: 0,
+            priority: 0,
+            sort_order: 0,
+            channel_count: 0,
+            pitch: 0.0,
+            volume: 0.0,
+            biquads: [BiquadFilterParameter2::default(); MAX_BIQUAD_FILTERS as usize],
+            wave_buffer_count: 0,
+            wave_buffer_index: 0,
+            reserved1: 0,
+            src_data_address: 0,
+            src_data_size: 0,
+            mix_id: 0,
+            splitter_id: 0,
+            wave_buffer_internal: [WaveBufferInternal::default(); MAX_WAVE_BUFFERS as usize],
+            channel_resource_ids: [0; MAX_CHANNELS],
+            clear_voice_drop: false,
+            flush_buffer_count: 0,
+            reserved2: 0,
+            flags: Flags::default(),
+            reserved3: 0,
+            src_quality: SrcQuality::Medium,
+            reserved4: 0,
+            external_context: 0,
+            external_context_size: 0,
+            reserved5: 0,
+            reserved6: 0,
         }
     }
 }
@@ -226,6 +315,8 @@ pub struct VoiceInfo {
     pub volume: f32,
     pub prev_volume: f32,
     pub biquads: [BiquadFilterParameter; MAX_BIQUAD_FILTERS as usize],
+    pub biquads_float: [BiquadFilterParameter2; MAX_BIQUAD_FILTERS as usize],
+    pub use_float_biquads: bool,
     pub wave_buffer_count: u32,
     pub wave_buffer_index: u16,
     pub flags: u16,
@@ -255,12 +346,14 @@ impl Default for VoiceInfo {
             mix_id: UNUSED_MIX_ID,
             current_play_state: ServerPlayState::Stopped,
             last_play_state: ServerPlayState::Started,
-            priority: HIGHEST_VOICE_PRIORITY,
+            priority: LOWEST_VOICE_PRIORITY,
             sort_order: 0,
             pitch: 0.0,
             volume: 0.0,
             prev_volume: 0.0,
             biquads: [BiquadFilterParameter::default(); MAX_BIQUAD_FILTERS as usize],
+            biquads_float: [BiquadFilterParameter2::default(); MAX_BIQUAD_FILTERS as usize],
+            use_float_biquads: false,
             wave_buffer_count: 0,
             wave_buffer_index: 0,
             flags: 0,
@@ -293,7 +386,7 @@ impl VoiceInfo {
         self.current_play_state = ServerPlayState::Stopped;
         self.last_play_state = ServerPlayState::Started;
         self.src_quality = SrcQuality::Medium;
-        self.priority = HIGHEST_VOICE_PRIORITY;
+        self.priority = LOWEST_VOICE_PRIORITY;
         self.sample_format = SampleFormat::Invalid;
         self.sample_rate = 0;
         self.channel_count = 0;
@@ -305,6 +398,8 @@ impl VoiceInfo {
         self.mix_id = UNUSED_MIX_ID;
         self.splitter_id = UNUSED_SPLITTER_ID;
         self.biquads = [BiquadFilterParameter::default(); MAX_BIQUAD_FILTERS as usize];
+        self.biquads_float = [BiquadFilterParameter2::default(); MAX_BIQUAD_FILTERS as usize];
+        self.use_float_biquads = false;
         self.biquad_initialized = [false; MAX_BIQUAD_FILTERS as usize];
         self.voice_dropped = false;
         self.data_unmapped = false;
@@ -768,14 +863,29 @@ mod tests {
     }
 
     #[test]
+    fn initialize_uses_upstream_lowest_voice_priority() {
+        let mut voice = VoiceInfo::default();
+        voice.priority = 1;
+
+        voice.initialize();
+
+        assert_eq!(voice.priority, LOWEST_VOICE_PRIORITY);
+    }
+
+    #[test]
     fn in_parameter_binary_layout_matches_upstream() {
         assert_eq!(size_of::<Flags>(), 0x1);
         assert_eq!(size_of::<BiquadFilterParameter>(), 0xC);
+        assert_eq!(size_of::<BiquadFilterParameter2>(), 0x18);
         assert_eq!(size_of::<WaveBufferInternal>(), 0x38);
         assert_eq!(size_of::<InParameter>(), 0x170);
+        assert_eq!(size_of::<InParameter2>(), 0x188);
         assert_eq!(size_of::<OutStatus>(), 0x10);
         assert_eq!(offset_of!(InParameter, flags), 0x15C);
         assert_eq!(offset_of!(InParameter, src_quality), 0x15E);
         assert_eq!(offset_of!(InParameter, _unk15f), 0x15F);
+        assert_eq!(offset_of!(InParameter2, biquads), 0x24);
+        assert_eq!(offset_of!(InParameter2, wave_buffer_internal), 0x78);
+        assert_eq!(offset_of!(InParameter2, external_context), 0x178);
     }
 }

@@ -6,10 +6,9 @@
 //! Ring-buffered descriptor update queue. Uses a fixed-size payload buffer
 //! that is partitioned into per-frame slices.
 
-use ash::vk;
-use std::ptr::NonNull;
-
 use super::scheduler::Scheduler;
+use crate::vulkan_common::vulkan_device::{Device, DeviceReference};
+use ash::vk;
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -20,20 +19,15 @@ use super::scheduler::Scheduler;
 /// Port of `UpdateDescriptorQueue::FRAMES_IN_FLIGHT`.
 const FRAMES_IN_FLIGHT: usize = 8;
 
-/// Per-frame payload capacity (number of descriptor entries).
+/// Per-frame guest-pipeline payload capacity.
 ///
-/// Port of `UpdateDescriptorQueue::FRAME_PAYLOAD_SIZE`.
-const FRAME_PAYLOAD_SIZE: usize = 0x20000;
+/// Port of `UpdateDescriptorQueue::GUEST_FRAME_PAYLOAD_SIZE`.
+pub const GUEST_FRAME_PAYLOAD_SIZE: usize = 0x80000;
 
-/// Total payload capacity across all frames.
+/// Per-frame internal-compute-pass payload capacity.
 ///
-/// Port of `UpdateDescriptorQueue::PAYLOAD_SIZE`.
-const PAYLOAD_SIZE: usize = FRAME_PAYLOAD_SIZE * FRAMES_IN_FLIGHT;
-
-/// Minimum number of entries required before an overflow check triggers.
-///
-/// Port of `MIN_ENTRIES` from `Acquire()`.
-const MIN_ENTRIES: usize = 0x400;
+/// Port of `UpdateDescriptorQueue::COMPUTE_FRAME_PAYLOAD_SIZE`.
+pub const COMPUTE_FRAME_PAYLOAD_SIZE: usize = 0x20000;
 
 // ---------------------------------------------------------------------------
 // DescriptorUpdateEntry
@@ -50,12 +44,21 @@ const MIN_ENTRIES: usize = 0x400;
 pub struct DescriptorUpdateEmpty;
 
 #[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct DescriptorAddress {
+    pub address: vk::DeviceAddress,
+    pub range: vk::DeviceSize,
+    pub format: vk::Format,
+}
+
+#[repr(C)]
 #[derive(Clone, Copy)]
 pub union DescriptorUpdateEntry {
     pub empty: DescriptorUpdateEmpty,
     pub image: vk::DescriptorImageInfo,
     pub buffer: vk::DescriptorBufferInfo,
     pub texel_buffer: vk::BufferView,
+    pub address: DescriptorAddress,
 }
 
 impl Default for DescriptorUpdateEntry {
@@ -80,14 +83,15 @@ impl Default for DescriptorUpdateEntry {
 /// retrieve the entries written since the last `acquire()` call. Vulkan
 /// consumes that raw payload through a descriptor update template.
 pub struct UpdateDescriptorQueue {
-    /// Scheduler worker owning commands that consume entries from `payload`.
-    ///
-    /// Upstream stores `Scheduler&` and drains its worker before recycling a
-    /// frame slice on overflow.
-    scheduler: NonNull<Scheduler>,
+    device: DeviceReference,
 
     /// Current frame index in the ring buffer.
     frame_index: usize,
+
+    /// Number of descriptor entries reserved for each frame.
+    ///
+    /// Port of upstream `frame_payload_size`.
+    frame_payload_size: usize,
 
     /// Cursor into the payload for writing new entries.
     cursor: usize,
@@ -100,18 +104,27 @@ pub struct UpdateDescriptorQueue {
 
     /// Fixed-size ring buffer of descriptor entries.
     payload: Vec<DescriptorUpdateEntry>,
+    supports_descriptor_buffer: bool,
+    use_descriptor_buffer: bool,
 }
 
 impl UpdateDescriptorQueue {
     /// Port of `UpdateDescriptorQueue::UpdateDescriptorQueue`.
-    pub fn new(scheduler: &mut Scheduler) -> Self {
+    pub fn new(
+        device: &Device,
+        frame_payload_size: usize,
+        supports_descriptor_buffer: bool,
+    ) -> Self {
         Self {
-            scheduler: NonNull::from(scheduler),
+            device: DeviceReference::new(device),
             frame_index: 0,
+            frame_payload_size,
             cursor: 0,
             frame_start: 0,
             upload_start: 0,
-            payload: vec![DescriptorUpdateEntry::default(); PAYLOAD_SIZE],
+            payload: vec![DescriptorUpdateEntry::default(); frame_payload_size * FRAMES_IN_FLIGHT],
+            supports_descriptor_buffer,
+            use_descriptor_buffer: false,
         }
     }
 
@@ -123,7 +136,7 @@ impl UpdateDescriptorQueue {
         if self.frame_index >= FRAMES_IN_FLIGHT {
             self.frame_index = 0;
         }
-        self.frame_start = self.frame_index * FRAME_PAYLOAD_SIZE;
+        self.frame_start = self.frame_index * self.frame_payload_size;
         self.cursor = self.frame_start;
     }
 
@@ -133,16 +146,38 @@ impl UpdateDescriptorQueue {
     ///
     /// If the remaining space in the current frame is insufficient,
     /// waits for the scheduler worker before recycling the frame slice.
-    pub fn acquire(&mut self) {
-        let mut scheduler = self.scheduler;
-        self.acquire_with_wait(|| unsafe {
-            scheduler.as_mut().wait_worker();
-        });
+    pub fn acquire(
+        &mut self,
+        scheduler: &mut Scheduler,
+        required_entries: usize,
+        use_descriptor_buffer: bool,
+    ) {
+        self.use_descriptor_buffer = self.supports_descriptor_buffer && use_descriptor_buffer;
+        self.acquire_with_wait(required_entries, || scheduler.wait_worker());
     }
 
-    fn acquire_with_wait(&mut self, wait_worker: impl FnOnce()) {
-        if (self.cursor - self.frame_start) + MIN_ENTRIES >= FRAME_PAYLOAD_SIZE {
-            log::warn!("UpdateDescriptorQueue: payload overflow, waiting for worker thread");
+    fn acquire_with_wait(&mut self, required_entries: usize, wait_worker: impl FnOnce()) {
+        // Port of the function-local constant in
+        // `UpdateDescriptorQueue::Acquire`.
+        const DEFAULT_REQUIRED_ENTRIES: usize = 0x400;
+        let reserve = if required_entries == 0 {
+            DEFAULT_REQUIRED_ENTRIES
+        } else {
+            required_entries
+        };
+        assert!(
+            reserve < self.frame_payload_size,
+            "descriptor reservation {reserve} >= frame capacity {}",
+            self.frame_payload_size
+        );
+        let used = self.cursor - self.frame_start;
+        if used + reserve >= self.frame_payload_size {
+            log::warn!(
+                "Payload overflow (used={}, reserve={}, capacity={})",
+                used,
+                reserve,
+                self.frame_payload_size
+            );
             wait_worker();
             self.cursor = self.frame_start;
         }
@@ -198,12 +233,75 @@ impl UpdateDescriptorQueue {
         self.cursor += 1;
     }
 
+    pub fn add_buffer_with_address(
+        &mut self,
+        buffer: vk::Buffer,
+        base_address: vk::DeviceAddress,
+        offset: vk::DeviceSize,
+        size: vk::DeviceSize,
+    ) {
+        if !self.use_descriptor_buffer {
+            self.add_buffer(buffer, offset, size);
+            return;
+        }
+        self.payload[self.cursor] = DescriptorUpdateEntry {
+            address: DescriptorAddress {
+                address: if base_address == 0 {
+                    0
+                } else {
+                    base_address + offset
+                },
+                range: if base_address == 0 {
+                    vk::WHOLE_SIZE
+                } else {
+                    size
+                },
+                format: vk::Format::UNDEFINED,
+            },
+        };
+        self.cursor += 1;
+    }
+
     /// Queue a texel buffer descriptor entry.
     ///
     /// Port of `UpdateDescriptorQueue::AddTexelBuffer`.
     pub fn add_texel_buffer(&mut self, texel_buffer: vk::BufferView) {
         self.payload[self.cursor] = DescriptorUpdateEntry { texel_buffer };
         self.cursor += 1;
+    }
+
+    pub fn add_texel_buffer_with_address(
+        &mut self,
+        texel_buffer: vk::BufferView,
+        base_address: vk::DeviceAddress,
+        offset: vk::DeviceSize,
+        size: vk::DeviceSize,
+        format: vk::Format,
+    ) {
+        if !self.use_descriptor_buffer {
+            self.add_texel_buffer(texel_buffer);
+            return;
+        }
+        self.payload[self.cursor] = DescriptorUpdateEntry {
+            address: DescriptorAddress {
+                address: if base_address == 0 {
+                    0
+                } else {
+                    base_address + offset
+                },
+                range: if base_address == 0 {
+                    vk::WHOLE_SIZE
+                } else {
+                    size
+                },
+                format,
+            },
+        };
+        self.cursor += 1;
+    }
+
+    pub fn uses_descriptor_buffer(&self) -> bool {
+        self.use_descriptor_buffer
     }
 
     /// Returns the number of entries written since the last `acquire()`.
@@ -224,35 +322,41 @@ mod tests {
 
     fn test_queue() -> UpdateDescriptorQueue {
         UpdateDescriptorQueue {
-            scheduler: NonNull::dangling(),
+            device: DeviceReference::dangling_for_test(),
             frame_index: 0,
+            frame_payload_size: COMPUTE_FRAME_PAYLOAD_SIZE,
             cursor: 0,
             frame_start: 0,
             upload_start: 0,
-            payload: vec![DescriptorUpdateEntry::default(); PAYLOAD_SIZE],
+            payload: vec![
+                DescriptorUpdateEntry::default();
+                COMPUTE_FRAME_PAYLOAD_SIZE * FRAMES_IN_FLIGHT
+            ],
+            supports_descriptor_buffer: false,
+            use_descriptor_buffer: false,
         }
     }
 
     #[test]
     fn constants_match_upstream() {
         assert_eq!(FRAMES_IN_FLIGHT, 8);
-        assert_eq!(FRAME_PAYLOAD_SIZE, 0x20000);
-        assert_eq!(PAYLOAD_SIZE, FRAME_PAYLOAD_SIZE * FRAMES_IN_FLIGHT);
-        assert_eq!(MIN_ENTRIES, 0x400);
+        assert_eq!(GUEST_FRAME_PAYLOAD_SIZE, 0x80000);
+        assert_eq!(COMPUTE_FRAME_PAYLOAD_SIZE, 0x20000);
         let largest_member = std::mem::size_of::<vk::DescriptorImageInfo>()
             .max(std::mem::size_of::<vk::DescriptorBufferInfo>())
-            .max(std::mem::size_of::<vk::BufferView>());
+            .max(std::mem::size_of::<vk::BufferView>())
+            .max(std::mem::size_of::<DescriptorAddress>());
         assert_eq!(std::mem::size_of::<DescriptorUpdateEntry>(), largest_member);
         assert_eq!(
             std::mem::align_of::<DescriptorUpdateEntry>(),
-            std::mem::align_of::<vk::DescriptorBufferInfo>()
+            std::mem::align_of::<DescriptorAddress>()
         );
     }
 
     #[test]
     fn basic_acquire_and_add() {
         let mut queue = test_queue();
-        queue.acquire_with_wait(|| panic!("worker wait is not needed"));
+        queue.acquire_with_wait(0, || panic!("worker wait is not needed"));
 
         queue.add_buffer(vk::Buffer::null(), 0, 256);
         queue.add_sampled_image(vk::ImageView::null(), vk::Sampler::null());
@@ -271,26 +375,58 @@ mod tests {
         assert_eq!(queue.frame_start, 0);
 
         queue.tick_frame();
-        assert_eq!(queue.frame_start, FRAME_PAYLOAD_SIZE);
-        assert_eq!(queue.cursor, FRAME_PAYLOAD_SIZE);
+        assert_eq!(queue.frame_start, COMPUTE_FRAME_PAYLOAD_SIZE);
+        assert_eq!(queue.cursor, COMPUTE_FRAME_PAYLOAD_SIZE);
 
         // Wrap around
         for _ in 0..FRAMES_IN_FLIGHT {
             queue.tick_frame();
         }
-        assert_eq!(queue.frame_start, FRAME_PAYLOAD_SIZE); // wrapped back to 1
+        assert_eq!(queue.frame_start, COMPUTE_FRAME_PAYLOAD_SIZE); // wrapped back to 1
     }
 
     #[test]
     fn acquire_waits_for_worker_before_recycling_overflowed_frame_slice() {
         let mut queue = test_queue();
-        queue.cursor = FRAME_PAYLOAD_SIZE - MIN_ENTRIES;
+        queue.cursor = COMPUTE_FRAME_PAYLOAD_SIZE - 0x400;
         let mut waits = 0;
 
-        queue.acquire_with_wait(|| waits += 1);
+        queue.acquire_with_wait(0, || waits += 1);
 
         assert_eq!(waits, 1);
         assert_eq!(queue.cursor, queue.frame_start);
         assert_eq!(queue.upload_start, queue.frame_start);
+    }
+
+    #[test]
+    fn acquire_reserves_the_caller_requested_descriptor_count() {
+        let mut queue = test_queue();
+        queue.cursor = COMPUTE_FRAME_PAYLOAD_SIZE - 32;
+        let mut waits = 0;
+
+        queue.acquire_with_wait(64, || waits += 1);
+
+        assert_eq!(waits, 1);
+        assert_eq!(queue.cursor, queue.frame_start);
+        assert_eq!(queue.upload_start, queue.frame_start);
+    }
+
+    #[test]
+    fn descriptor_buffer_addresses_match_upstream_null_and_offset_rules() {
+        let mut queue = test_queue();
+        queue.supports_descriptor_buffer = true;
+        queue.acquire_with_wait(2, || panic!("worker wait is not needed"));
+        queue.use_descriptor_buffer = true;
+
+        queue.add_buffer_with_address(vk::Buffer::null(), 0, 17, 23);
+        queue.add_buffer_with_address(vk::Buffer::null(), 0x1000, 0x40, 0x80);
+
+        let data = queue.update_data();
+        unsafe {
+            assert_eq!((*data).address.address, 0);
+            assert_eq!((*data).address.range, vk::WHOLE_SIZE);
+            assert_eq!((*data.add(1)).address.address, 0x1040);
+            assert_eq!((*data.add(1)).address.range, 0x80);
+        }
     }
 }

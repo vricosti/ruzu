@@ -1,4 +1,5 @@
 use common::alignment::align_up;
+use common::common_funcs::make_magic;
 
 pub type CpuAddr = usize;
 
@@ -96,20 +97,16 @@ pub fn use_old_channel_mapping(inputs: &mut [i16], outputs: &mut [i16]) {
     outputs.swap(old_lfe, new_lfe);
 }
 
-pub const fn make_magic(a: char, b: char, c: char, d: char) -> u32 {
-    (a as u32) | ((b as u32) << 8) | ((c as u32) << 16) | ((d as u32) << 24)
-}
-
 pub const fn get_splitter_in_param_header_magic() -> u32 {
-    make_magic('S', 'N', 'D', 'H')
+    make_magic(b'S', b'N', b'D', b'H')
 }
 
 pub const fn get_splitter_info_magic() -> u32 {
-    make_magic('S', 'N', 'D', 'I')
+    make_magic(b'S', b'N', b'D', b'I')
 }
 
 pub const fn get_splitter_send_data_magic() -> u32 {
-    make_magic('S', 'N', 'D', 'D')
+    make_magic(b'S', b'N', b'D', b'D')
 }
 
 pub const fn get_sample_format_byte_size(format: SampleFormat) -> usize {

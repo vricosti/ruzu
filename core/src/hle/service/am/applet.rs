@@ -104,6 +104,8 @@ pub struct Applet {
     pub friend_invitation_storage_channel_event_handle: Option<Handle>,
     pub health_warning_disappeared_system_event: Option<Arc<Mutex<KReadableEvent>>>,
     pub health_warning_disappeared_system_event_handle: Option<Handle>,
+    pub unknown_event: Option<Arc<Mutex<KReadableEvent>>>,
+    pub unknown_event_handle: Option<Handle>,
     pub library_applet_launchable_event: Option<Arc<Mutex<KReadableEvent>>>,
     pub library_applet_launchable_event_handle: Option<Handle>,
     pub accumulated_suspended_tick_changed_event: Option<Arc<Mutex<KReadableEvent>>>,
@@ -184,6 +186,8 @@ impl Applet {
             friend_invitation_storage_channel_event_handle: None,
             health_warning_disappeared_system_event: None,
             health_warning_disappeared_system_event_handle: None,
+            unknown_event: None,
+            unknown_event_handle: None,
             library_applet_launchable_event: None,
             library_applet_launchable_event_handle: None,
             accumulated_suspended_tick_changed_event: None,
@@ -377,6 +381,19 @@ impl Applet {
             &mut self.health_warning_disappeared_system_event,
             false,
         )
+    }
+
+    pub fn ensure_unknown_event(&mut self, ctx: &HLERequestContext) -> Option<Handle> {
+        Self::ensure_persistent_readable_event(
+            ctx,
+            &mut self.unknown_event,
+            &mut self.unknown_event_handle,
+            false,
+        )
+    }
+
+    pub fn ensure_unknown_event_object_id(&mut self, ctx: &HLERequestContext) -> Option<u64> {
+        Self::ensure_persistent_readable_event_object_id(ctx, &mut self.unknown_event, false)
     }
 
     /// Port of Applet::UpdateSuspensionStateLocked

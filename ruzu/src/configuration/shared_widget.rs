@@ -145,10 +145,17 @@ pub fn spin_row(
     min: f64,
     max: f64,
     step: f64,
+    suffix: &str,
 ) -> (gtk::Box, gtk::SpinButton) {
     let spin = gtk::SpinButton::with_range(min, max, step);
     spin.set_value(value);
-    (labeled_row(label, &spin), spin)
+    if suffix.is_empty() {
+        return (labeled_row(label, &spin), spin);
+    }
+    let control = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+    control.append(&spin);
+    control.append(&gtk::Label::new(Some(suffix)));
+    (labeled_row(label, &control), spin)
 }
 
 /// Slider row with a trailing percentage readout — upstream
@@ -183,6 +190,52 @@ pub fn percent_slider_row(
     holder.append(&readout);
 
     (labeled_row(label, &holder), scale, readout)
+}
+
+/// Reversed integral slider with a scaled percentage readout — upstream
+/// `ConfigurationShared::Widget::CreateSlider` for
+/// `RequestType::ReverseSlider`.
+///
+/// The slider keeps the setting's raw value; only its appearance and feedback
+/// are reversed. This matters for FSR, whose raw `25` is presented as
+/// `(200 - 25) * 0.5 = 88%` and must still serialize back as `25`.
+pub fn reversed_percent_slider_row(
+    label: &str,
+    value: f64,
+    min: f64,
+    max: f64,
+    multiplier: f64,
+) -> (gtk::Box, gtk::Scale, gtk::Label) {
+    let scale = gtk::Scale::with_range(gtk::Orientation::Horizontal, min, max, 1.0);
+    scale.set_value(value);
+    scale.set_draw_value(false);
+    scale.set_inverted(true);
+    scale.set_hexpand(true);
+
+    let readout = gtk::Label::new(Some(&format!(
+        "{}%",
+        reversed_slider_feedback(value, max, multiplier)
+    )));
+    readout.set_width_chars(5);
+    readout.set_xalign(1.0);
+
+    let readout_clone = readout.clone();
+    scale.connect_value_changed(move |scale| {
+        readout_clone.set_text(&format!(
+            "{}%",
+            reversed_slider_feedback(scale.value(), max, multiplier)
+        ));
+    });
+
+    let holder = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    holder.append(&scale);
+    holder.append(&readout);
+
+    (labeled_row(label, &holder), scale, readout)
+}
+
+fn reversed_slider_feedback(value: f64, max: f64, multiplier: f64) -> i64 {
+    ((max - value) * multiplier + 0.5) as i64
 }
 
 /// Path row: an entry plus a `...` browse button — upstream's directory pickers
@@ -242,5 +295,12 @@ mod tests {
     fn index_of_falls_back_to_zero_for_unknown_values() {
         let items = ["a", "b"];
         assert_eq!(index_of(&items, &"z"), 0);
+    }
+
+    #[test]
+    fn reversed_slider_feedback_matches_edens_fsr_presentation() {
+        assert_eq!(reversed_slider_feedback(25.0, 200.0, 0.5), 88);
+        assert_eq!(reversed_slider_feedback(0.0, 200.0, 0.5), 100);
+        assert_eq!(reversed_slider_feedback(200.0, 200.0, 0.5), 0);
     }
 }

@@ -15,7 +15,8 @@ use super::hierarchical_integrity_verification_storage::{
     HierarchicalStorageInformation,
 };
 use super::nca_header::Hash;
-use crate::file_sys::vfs::vfs_types::VirtualFile;
+use crate::file_sys::vfs::vfs::VfsFile;
+use crate::file_sys::vfs::vfs_types::{VirtualDir, VirtualFile};
 use crate::file_sys::vfs::vfs_vector::VectorVfsFile;
 use common::ResultCode;
 
@@ -118,6 +119,47 @@ impl IntegrityRomFsStorage {
 impl Default for IntegrityRomFsStorage {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+// Upstream derives `IntegrityRomFsStorage` from `IStorage`; Rust exposes the
+// same storage owner through the VFS interface used by the NCA driver.
+impl VfsFile for IntegrityRomFsStorage {
+    fn get_name(&self) -> String {
+        String::from("IntegrityRomFsStorage")
+    }
+
+    fn get_size(&self) -> usize {
+        IntegrityRomFsStorage::get_size(self)
+    }
+
+    fn resize(&self, _new_size: usize) -> bool {
+        false
+    }
+
+    fn get_containing_directory(&self) -> Option<VirtualDir> {
+        None
+    }
+
+    fn is_writable(&self) -> bool {
+        false
+    }
+
+    fn is_readable(&self) -> bool {
+        true
+    }
+
+    fn read(&self, data: &mut [u8], length: usize, offset: usize) -> usize {
+        let actual = length.min(data.len());
+        IntegrityRomFsStorage::read(self, &mut data[..actual], offset)
+    }
+
+    fn write(&self, _data: &[u8], _length: usize, _offset: usize) -> usize {
+        0
+    }
+
+    fn rename(&self, _new_name: &str) -> bool {
+        false
     }
 }
 

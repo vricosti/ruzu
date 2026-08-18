@@ -23,43 +23,64 @@
 use crate::query_cache::types::{QueryPropertiesFlags, QueryType};
 
 use std::ptr::NonNull;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Once};
 
 use ash::vk;
 use ash::vk::Handle;
 use log::{debug, info, warn};
+use smallvec::SmallVec;
 use thiserror::Error;
 
+use super::descriptor_buffer::DescriptorBufferRing;
+use super::{blit_image, blit_screen, maxwell_to_vk};
 use crate::buffer_cache::buffer_cache_base::{
     DeviceMemoryAccess, GpuMemoryAccess, ObtainBufferOperation, ObtainBufferSynchronize,
 };
+use crate::cache_types::CacheType;
 use crate::control::channel_state_cache::{ChannelCacheAccessor, ChannelInfo, ChannelSetupCaches};
+use crate::engines::draw_manager::{
+    DrawMode, DrawState, IndexBuffer, Maxwell3DDrawRegisters, Maxwell3DDrawView, VertexBuffer,
+};
 use crate::engines::kepler_compute::DispatchCall;
 use crate::engines::maxwell_3d::{
     BlendEquation, BlendFactor, ComparisonOp, CullFace, DrawCall, FrontFace, PrimitiveTopology,
-    NUM_VIEWPORTS,
+    VertexAttribType, NUM_VIEWPORTS,
 };
-use crate::engines::maxwell_dma::dma;
+use crate::engines::maxwell_dma::{dma, AccelerateDMAInterface};
 use crate::engines::Framebuffer;
 use crate::fence_manager::FenceManager as GenericFenceManager;
 use crate::framebuffer_config::FramebufferConfig;
 use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
 use crate::host1x::syncpoint_manager::SyncpointManager;
 use crate::rasterizer_interface::{RasterizerDownloadArea, RasterizerInterface};
-use crate::texture_cache::texture_cache_base::{DescriptorSyncRegs, ImageViewInOut};
-use crate::texture_cache::types::{SamplerId, NULL_IMAGE_ID, NULL_IMAGE_VIEW_ID};
-use crate::textures::texture::texture_pair;
+use crate::texture_cache::types::NULL_IMAGE_ID;
+use crate::vulkan_common::vulkan_device::{Device, DeviceReference};
 use crate::vulkan_common::vulkan_memory_allocator::MemoryAllocator;
-use shader_recompiler::host_translate_info::HostTranslateInfo;
-use shader_recompiler::shader_info::{num_descriptors, Info as ShaderInfo};
-use shader_recompiler::{PipelineCache as ShaderPipelineCache, Profile};
 
-use super::{blit_image, blit_screen, maxwell_to_vk};
+type VertexInputBindings = SmallVec<[vk::VertexInputBindingDescription2EXT; 32]>;
+type VertexInputAttributes = SmallVec<[vk::VertexInputAttributeDescription2EXT; 32]>;
 
-use super::pipeline_helper::{
-    RescalingPushConstant, NUM_TEXTURE_AND_IMAGE_SCALING_WORDS, RENDERAREA_LAYOUT_OFFSET,
-    RESCALING_LAYOUT_DOWN_FACTOR_OFFSET, RESCALING_LAYOUT_WORDS_OFFSET,
-};
+struct VertexInputDescriptions {
+    bindings: VertexInputBindings,
+    attributes: VertexInputAttributes,
+}
+
+impl VertexInputDescriptions {
+    unsafe fn set(&self, extension: &vk::ExtVertexInputDynamicStateFn, cmdbuf: vk::CommandBuffer) {
+        (extension.cmd_set_vertex_input_ext)(
+            cmdbuf,
+            self.bindings.len() as u32,
+            self.bindings.as_ptr(),
+            self.attributes.len() as u32,
+            self.attributes.as_ptr(),
+        );
+    }
+}
+
+// SAFETY: every description is constructed by ash's builder with `p_next == null`.
+// The remaining fields are owned scalar Vulkan values, and the scheduler moves
+// the payload to its worker before reading and dropping it there.
+unsafe impl Send for VertexInputDescriptions {}
 
 // Rust counterpart of upstream `std::scoped_lock{buffer_cache.mutex,
 // texture_cache.mutex}`. `parking_lot::ReentrantMutex` does not provide a
@@ -100,12 +121,6 @@ impl Drop for GpuTickGuard {
     }
 }
 
-fn bytes_of<T: Sized>(value: &T) -> &[u8] {
-    unsafe {
-        std::slice::from_raw_parts((value as *const T).cast::<u8>(), std::mem::size_of::<T>())
-    }
-}
-
 #[derive(Clone, Copy, Debug)]
 struct DrawParams {
     base_instance: u32,
@@ -116,166 +131,31 @@ struct DrawParams {
     is_indexed: bool,
 }
 
-struct PreparedGraphicsDescriptors {
-    views: [ImageViewInOut; super::graphics_pipeline::MAX_IMAGE_ELEMENTS],
-    samplers: [SamplerId; super::graphics_pipeline::MAX_IMAGE_ELEMENTS],
-    view_count: usize,
-    descriptor_data: Option<DescriptorData>,
-    rescaling_data: [u32; NUM_TEXTURE_AND_IMAGE_SCALING_WORDS],
-}
-
-#[derive(Clone, Copy)]
-struct DescriptorData(*const DescriptorUpdateEntry);
-
-// The queue owns one fixed allocation for its whole lifetime. Its eight-frame
-// ring and `Acquire` worker wait prevent a payload slice from being recycled
-// while a recorded Vulkan command still consumes it, matching upstream's raw
-// `const DescriptorUpdateEntry*` capture in `ConfigureDraw`.
-unsafe impl Send for DescriptorData {}
-
-impl Default for PreparedGraphicsDescriptors {
-    fn default() -> Self {
-        Self {
-            views: [ImageViewInOut::default(); super::graphics_pipeline::MAX_IMAGE_ELEMENTS],
-            samplers: [SamplerId::default(); super::graphics_pipeline::MAX_IMAGE_ELEMENTS],
-            view_count: 0,
-            descriptor_data: None,
-            rescaling_data: [0; NUM_TEXTURE_AND_IMAGE_SCALING_WORDS],
-        }
-    }
-}
-
-fn vulkan_draw_trace_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var_os("RUZU_VK_TRACE_DRAWS").is_some())
-}
-
-fn parse_vulkan_sync_draw_interval(value: Option<&str>) -> Option<u32> {
-    value?.parse::<u32>().ok().filter(|interval| *interval != 0)
-}
-
-fn vulkan_sync_draw_interval() -> Option<u32> {
-    static INTERVAL: OnceLock<Option<u32>> = OnceLock::new();
-    *INTERVAL.get_or_init(|| {
-        std::env::var("RUZU_VK_SYNC_DRAW_INTERVAL")
-            .ok()
-            .as_deref()
-            .and_then(|value| parse_vulkan_sync_draw_interval(Some(value)))
-    })
-}
-
-fn format_vulkan_draw_trace(
-    tick: u64,
-    draw_counter: u32,
-    draw: &DrawCall,
-    params: DrawParams,
-    unique_hashes: &[u64; crate::shader_cache::NUM_PROGRAMS],
-) -> String {
-    let shaders = unique_hashes
-        .iter()
-        .enumerate()
-        .filter(|(_, hash)| **hash != 0)
-        .map(|(stage, hash)| format!("{stage}:0x{hash:016X}"))
-        .collect::<Vec<_>>()
-        .join(",");
-    let vertex_streams = draw
-        .vertex_streams
-        .iter()
-        .filter(|stream| stream.enabled)
-        .map(|stream| {
-            format!(
-                "{}:0x{:X}/{}x{}",
-                stream.index, stream.address, stream.stride, stream.frequency
-            )
-        })
-        .collect::<Vec<_>>()
-        .join(",");
-    let constant_buffers = draw
-        .cb_bindings
-        .iter()
-        .enumerate()
-        .flat_map(|(stage, bindings)| {
-            bindings
-                .iter()
-                .enumerate()
-                .filter(|(_, binding)| binding.enabled)
-                .map(move |(index, binding)| {
-                    format!(
-                        "{stage}:{index}=0x{:X}+0x{:X}",
-                        binding.address, binding.size
-                    )
-                })
-        })
-        .collect::<Vec<_>>()
-        .join(",");
-    format!(
-        "[VK_DRAW_TRACE] tick={tick} draw={draw_counter} shaders=[{shaders}] topology={:?} indexed={} vertices={} instances={} first_index={} base_vertex={} base_instance={} index=0x{:X}..0x{:X}/{} streams=[{vertex_streams}] cbufs=[{constant_buffers}]",
-        draw.topology,
-        params.is_indexed,
-        params.num_vertices,
-        params.num_instances,
-        params.first_index,
-        params.base_vertex,
-        params.base_instance,
-        draw.index_buffer_addr,
-        draw.index_buffer_addr_end,
-        draw.index_buffer_count,
-    )
-}
-
-fn format_descriptor_buffer_infos(buffer_infos: &[vk::DescriptorBufferInfo]) -> String {
-    buffer_infos
-        .iter()
-        .map(|info| {
-            format!(
-                "0x{:X}@0x{:X}+0x{:X}",
-                info.buffer.as_raw(),
-                info.offset,
-                info.range
-            )
-        })
-        .collect::<Vec<_>>()
-        .join(",")
-}
-
-fn format_descriptor_image_infos(image_infos: &[vk::DescriptorImageInfo]) -> String {
-    image_infos
-        .iter()
-        .map(|info| {
-            format!(
-                "s=0x{:X}/v=0x{:X}/l={:?}",
-                info.sampler.as_raw(),
-                info.image_view.as_raw(),
-                info.image_layout
-            )
-        })
-        .collect::<Vec<_>>()
-        .join(",")
-}
-
-fn make_draw_params(draw: &DrawCall) -> DrawParams {
+fn make_draw_params(draw: &Maxwell3DDrawView<'_>, instance_count: u32) -> DrawParams {
+    let draw_state = draw.draw_state();
+    let is_indexed = draw.is_indexed();
     let mut params = DrawParams {
-        base_instance: draw.base_instance,
-        num_instances: draw.instance_count,
-        base_vertex: if draw.indexed {
-            draw.base_vertex
+        base_instance: draw_state.base_instance,
+        num_instances: instance_count,
+        base_vertex: if is_indexed {
+            draw_state.base_index as i32
         } else {
-            draw.vertex_first as i32
+            draw_state.vertex_buffer.first as i32
         },
-        num_vertices: if draw.indexed {
-            draw.index_buffer_count
+        num_vertices: if is_indexed {
+            draw_state.index_buffer.count
         } else {
-            draw.vertex_count
+            draw_state.vertex_buffer.count
         },
-        first_index: if draw.indexed {
-            draw.index_buffer_first
+        first_index: if is_indexed {
+            draw_state.index_buffer.first
         } else {
             0
         },
-        is_indexed: draw.indexed,
+        is_indexed,
     };
 
-    match draw.topology {
+    match draw_state.topology {
         PrimitiveTopology::Quads => {
             params.num_vertices = (params.num_vertices / 4) * 6;
             params.base_vertex = 0;
@@ -374,13 +254,16 @@ fn get_viewport_state(
 }
 
 fn viewport_state(
-    draw: &DrawCall,
+    viewport_transforms: &[crate::engines::maxwell_3d::ViewportTransformInfo; NUM_VIEWPORTS],
+    depth_mode: crate::engines::maxwell_3d::DepthMode,
+    window_origin_lower_left: bool,
+    surface_clip_height: u32,
     index: usize,
     scale: f32,
     depth_range_unrestricted: bool,
     nv_viewport_swizzle: bool,
 ) -> vk::Viewport {
-    let src = draw.viewport_transforms[index];
+    let src = viewport_transforms[index];
     get_viewport_state(
         src.translate_x,
         src.scale_x,
@@ -389,23 +272,48 @@ fn viewport_state(
         src.translate_z,
         src.scale_z,
         scale,
-        draw.depth_stencil.depth_mode == crate::engines::maxwell_3d::DepthMode::MinusOneToOne,
-        draw.window_origin_lower_left,
+        depth_mode == crate::engines::maxwell_3d::DepthMode::MinusOneToOne,
+        window_origin_lower_left,
         !nv_viewport_swizzle && ((src.swizzle >> 4) & 0x7) == 3,
-        draw.surface_clip.height as f32,
+        surface_clip_height as f32,
         !depth_range_unrestricted,
     )
 }
 
-fn scissor_state(draw: &DrawCall, index: usize) -> vk::Rect2D {
-    let src = draw.scissors[index];
-    let clip_height = draw.surface_clip.height as i32;
-    let mut min_y = if draw.window_origin_lower_left {
+fn scissor_state(
+    src: crate::engines::maxwell_3d::ScissorInfo,
+    window_origin_lower_left: bool,
+    surface_clip_height: u32,
+    up_scale: u32,
+    down_shift: u32,
+) -> vk::Rect2D {
+    // Port of upstream `GetScissorState::scale_up`. Keep the signed rounding
+    // behavior literal: fractional downscales must still cover at least one
+    // pixel, including for negative offsets.
+    let scale_up = |value: i32| -> i32 {
+        if value == 0 {
+            return 0;
+        }
+        let upset = value.wrapping_mul(up_scale as i32);
+        let accumulation = if (up_scale >> down_shift) == 0 {
+            upset % 2
+        } else {
+            0
+        };
+        let converted = upset >> down_shift;
+        if value < 0 {
+            (converted - accumulation).min(-1)
+        } else {
+            (converted + accumulation).max(1)
+        }
+    };
+    let clip_height = surface_clip_height as i32;
+    let mut min_y = if window_origin_lower_left {
         clip_height - src.max_y as i32
     } else {
         src.min_y as i32
     };
-    let mut max_y = if draw.window_origin_lower_left {
+    let mut max_y = if window_origin_lower_left {
         clip_height - src.min_y as i32
     } else {
         src.max_y as i32
@@ -416,12 +324,12 @@ fn scissor_state(draw: &DrawCall, index: usize) -> vk::Rect2D {
     if src.enabled {
         vk::Rect2D {
             offset: vk::Offset2D {
-                x: src.min_x as i32,
-                y: min_y,
+                x: scale_up(src.min_x as i32),
+                y: scale_up(min_y),
             },
             extent: vk::Extent2D {
-                width: src.max_x.wrapping_sub(src.min_x),
-                height: max_y.wrapping_sub(min_y) as u32,
+                width: scale_up(src.max_x.wrapping_sub(src.min_x) as i32) as u32,
+                height: scale_up(max_y.wrapping_sub(min_y)) as u32,
             },
         }
     } else {
@@ -435,11 +343,8 @@ fn scissor_state(draw: &DrawCall, index: usize) -> vk::Rect2D {
     }
 }
 use super::blit_image::BlitImageHelper;
-use super::buffer_cache::{
-    BufferCache as DirectBufferCache, BufferCacheRuntime, VulkanCommonBufferCache,
-};
+use super::buffer_cache::{BufferCacheRuntime, VulkanCommonBufferCache};
 use super::descriptor_pool::DescriptorPool;
-use super::graphics_pipeline::GraphicsDescriptorBinding;
 use super::pipeline_cache::PipelineCache as VulkanPipelineCache;
 use super::query_cache::QueryCache as VulkanQueryCache;
 use super::render_pass_cache::RenderPassCache;
@@ -447,7 +352,52 @@ use super::scheduler::Scheduler;
 use super::staging_buffer_pool::StagingBufferPool;
 use super::state_tracker::StateTracker;
 use super::texture_cache::TextureCache;
-use super::update_descriptor::{DescriptorUpdateEntry, UpdateDescriptorQueue};
+use super::update_descriptor::{
+    UpdateDescriptorQueue, COMPUTE_FRAME_PAYLOAD_SIZE, GUEST_FRAME_PAYLOAD_SIZE,
+};
+
+const NEEDS_D24: [u64; 3] = [
+    0x0100_6A80_0016_E000,
+    0x0100_E950_0403_8000,
+    0x0100_A630_1214_E000,
+];
+
+fn supports_primitive_restart(topology: vk::PrimitiveTopology) -> bool {
+    !matches!(
+        topology,
+        vk::PrimitiveTopology::POINT_LIST
+            | vk::PrimitiveTopology::LINE_LIST
+            | vk::PrimitiveTopology::TRIANGLE_LIST
+            | vk::PrimitiveTopology::LINE_LIST_WITH_ADJACENCY
+            | vk::PrimitiveTopology::TRIANGLE_LIST_WITH_ADJACENCY
+            | vk::PrimitiveTopology::PATCH_LIST
+    )
+}
+
+fn depth_bias_constant(
+    depth_bias: f32,
+    zeta_format: u32,
+    supports_d24_depth: bool,
+    program_id: u64,
+) -> f32 {
+    let mut units = depth_bias / 2.0;
+    let is_d24 = matches!(zeta_format, 0x14 | 0x15 | 0x16 | 0x18);
+    if is_d24 && !supports_d24_depth && NEEDS_D24.contains(&program_id) {
+        let rescale_factor = (1u64 << (32 - 24)) as f64 / f32::MAX as f64;
+        units = (units as f64 * rescale_factor) as f32;
+    }
+    units
+}
+
+fn supports_counter_reset(query_type: u32) -> bool {
+    matches!(
+        query_type,
+        x if x == QueryType::ZPassPixelCount64 as u32
+            || x == QueryType::StreamingByteCount as u32
+            || x == QueryType::StreamingPrimitivesSucceeded as u32
+            || x == QueryType::VtgPrimitivesOut as u32
+    )
+}
 
 #[derive(Debug, Error)]
 pub enum RendererError {
@@ -509,14 +459,6 @@ struct DeviceMemoryAccessAdapter {
     device_memory: Arc<MaxwellDeviceMemoryManager>,
 }
 
-fn is_geometry_dirty_flag(index: usize) -> bool {
-    index == crate::dirty_flags::flags::INDEX_BUFFER as usize
-        || index == crate::dirty_flags::flags::VERTEX_BUFFERS as usize
-        || (crate::dirty_flags::flags::VERTEX_BUFFER0 as usize
-            ..=crate::dirty_flags::flags::VERTEX_BUFFER31 as usize)
-            .contains(&index)
-}
-
 impl DeviceMemoryAccess for DeviceMemoryAccessAdapter {
     fn get_pointer(&self, device_addr: u64) -> Option<*const u8> {
         let pointer = self.device_memory.get_pointer(device_addr);
@@ -538,7 +480,13 @@ impl DeviceMemoryAccess for DeviceMemoryAccessAdapter {
 /// shader compilation, pipeline caching, buffer management, dynamic state
 /// tracking, and command batching for efficient GPU rendering.
 pub struct RasterizerVulkan {
-    device: ash::Device,
+    /// Non-owning counterpart of upstream `const Device& device`.
+    ///
+    /// Recorded commands copy this pointer-sized reference and resolve the
+    /// logical Vulkan device when the scheduler executes them. Copying
+    /// `ash::Device` into every command would copy its full dispatch table,
+    /// unlike upstream's pointer capture through `this`.
+    device: DeviceReference,
     instance: ash::Instance,
     physical_device: vk::PhysicalDevice,
     syncpoints: Arc<SyncpointManager>,
@@ -558,6 +506,9 @@ pub struct RasterizerVulkan {
     /// Non-owning counterpart of upstream `StateTracker& state_tracker`.
     state_tracker: OwnerReference<StateTracker>,
     staging_pool: Box<StagingBufferPool>,
+    // Must be destroyed before every stable runtime owner referenced by its
+    // cached GraphicsPipeline objects.
+    pipeline_cache: VulkanPipelineCache,
     // Boxed like `scheduler`/`staging_pool`/`render_pass_cache`: sub-components
     // capture `NonNull` pointers to these during construction (BlitImageHelper
     // and TextureCache point at the descriptor pool and the descriptor queues,
@@ -568,20 +519,24 @@ pub struct RasterizerVulkan {
     descriptor_pool: Box<DescriptorPool>,
     desc_queue: Box<UpdateDescriptorQueue>,
     compute_pass_desc_queue: Box<UpdateDescriptorQueue>,
+    descriptor_buffer_ring: Box<DescriptorBufferRing>,
     blit_image: Box<BlitImageHelper>,
     fallback_uniform_buffer: vk::Buffer,
     fallback_uniform_memory: vk::DeviceMemory,
     fallback_uniform_mapped: *mut u8,
     fallback_sampler: vk::Sampler,
-    render_pass_cache: Box<RenderPassCache>,
     shader_cache: crate::shader_cache::ShaderCache,
-    pipeline_cache: VulkanPipelineCache,
-    buffer_cache: DirectBufferCache,
     query_cache: VulkanQueryCache,
+    accelerate_dma: AccelerateDMA,
     common_buffer_cache: Box<VulkanCommonBufferCache>,
-    texture_cache: TextureCache,
+    texture_cache: Box<TextureCache>,
     fence_manager: GenericFenceManager<VkFence>,
     fence_backend: VkFenceBackend,
+    // Rust drops fields in declaration order. Keep this owner after every
+    // cache that retains a non-owning pointer to it, matching C++ reverse
+    // member destruction where RenderPassCache outlives TextureCache and
+    // PipelineCache.
+    render_pass_cache: Box<RenderPassCache>,
     wfi_event: vk::Event,
 
     // Default render pass for the offscreen framebuffer
@@ -612,27 +567,37 @@ pub struct RasterizerVulkan {
     draw_skipped_pipeline: u64,
     /// Draws redirected to the offscreen framebuffer because no guest
     /// render-target framebuffer could be resolved (diagnostic).
-    draw_offscreen_fallback: u64,
     has_null_descriptor: bool,
+    driver_id: vk::DriverId,
     extended_dynamic_state_supported: bool,
     extended_dynamic_state2_supported: bool,
-    extended_dynamic_state2_extra_supported: bool,
+    extended_dynamic_state2_logic_op_supported: bool,
     extended_dynamic_state3_blending_supported: bool,
     extended_dynamic_state3_enables_supported: bool,
+    color_write_enable_supported: bool,
+    dynamic_state3_support: super::graphics_pipeline::DynamicState3Support,
+    line_rasterization_supported: bool,
+    smooth_lines_supported: bool,
     vertex_input_dynamic_state_supported: bool,
     must_emulate_scaled_formats: bool,
     depth_bounds_supported: bool,
+    supports_d24_depth: bool,
     depth_range_unrestricted: bool,
     nv_viewport_swizzle: bool,
     extended_dynamic_state2: Option<ash::extensions::ext::ExtendedDynamicState2>,
     extended_dynamic_state3: Option<ash::extensions::ext::ExtendedDynamicState3>,
+    color_write_enable: Option<vk::ExtColorWriteEnableFn>,
     vertex_input_dynamic_state: Option<vk::ExtVertexInputDynamicStateFn>,
     draw_indirect_count: Option<ash::extensions::khr::DrawIndirectCount>,
     push_descriptor: Option<ash::extensions::khr::PushDescriptor>,
     max_viewports: u32,
     max_vertex_input_attributes: u32,
     max_vertex_input_bindings: u32,
-
+    max_compute_work_group_count: [u32; 3],
+    topology_list_primitive_restart_supported: bool,
+    patch_list_primitive_restart_supported: bool,
+    transform_feedback_supported: bool,
+    transform_feedback_draw_supported: bool,
     // Channel-bound GPU memory manager, matching upstream rasterizer access to
     // the active channel's Tegra::MemoryManager.
     channel_memory_manager: Option<Arc<parking_lot::Mutex<crate::memory_manager::MemoryManager>>>,
@@ -676,6 +641,118 @@ impl<T> std::ops::DerefMut for OwnerReference<T> {
     }
 }
 
+/// Vulkan DMA accelerator owned by `RasterizerVulkan`.
+///
+/// This preserves Eden's separate `AccelerateDMA` owner and its references to
+/// the buffer cache, texture cache and scheduler.  All three pointees have
+/// stable storage for the rasterizer lifetime.
+struct AccelerateDMA {
+    buffer_cache: NonNull<VulkanCommonBufferCache>,
+    texture_cache: NonNull<TextureCache>,
+    #[allow(dead_code)]
+    scheduler: NonNull<Scheduler>,
+}
+
+impl AccelerateDMA {
+    fn new(
+        buffer_cache: &mut VulkanCommonBufferCache,
+        texture_cache: &mut TextureCache,
+        scheduler: &mut Scheduler,
+    ) -> Self {
+        Self {
+            buffer_cache: NonNull::from(buffer_cache),
+            texture_cache: NonNull::from(texture_cache),
+            scheduler: NonNull::from(scheduler),
+        }
+    }
+
+    fn dma_buffer_image_copy(
+        &mut self,
+        copy_info: &dma::ImageCopy,
+        buffer_operand: &dma::BufferOperand,
+        image_operand: &dma::ImageOperand,
+        is_image_upload: bool,
+    ) -> bool {
+        unsafe {
+            let buffer_cache = self.buffer_cache.as_mut();
+            let texture_cache = self.texture_cache.as_mut();
+            let buffer_mutex: *const _ = &buffer_cache.mutex;
+            let texture_mutex: *const _ = &texture_cache.base.mutex;
+            lock_two_reentrant_mutexes!(buffer_mutex, texture_mutex, _buffer_guard, _texture_guard);
+
+            let image_id = texture_cache
+                .base
+                .dma_image_id(image_operand, is_image_upload);
+            if image_id == NULL_IMAGE_ID {
+                return false;
+            }
+            let buffer_size = buffer_operand.pitch.wrapping_mul(buffer_operand.height);
+            let post_op = if is_image_upload {
+                ObtainBufferOperation::DoNothing
+            } else {
+                ObtainBufferOperation::MarkAsWritten
+            };
+            let (buffer_id, offset) = buffer_cache.obtain_buffer(
+                buffer_operand.address,
+                buffer_size,
+                ObtainBufferSynchronize::FullSynchronize,
+                post_op,
+            );
+            let buffer = vk::Buffer::from_raw(buffer_cache.resolve_backend_buffer_raw(buffer_id));
+            if buffer == vk::Buffer::null() {
+                return false;
+            }
+            texture_cache.dma_buffer_image_copy(
+                copy_info,
+                buffer_operand,
+                image_operand,
+                image_id,
+                buffer,
+                offset as vk::DeviceSize,
+                is_image_upload,
+            )
+        }
+    }
+}
+
+impl AccelerateDMAInterface for AccelerateDMA {
+    fn buffer_copy(&mut self, src_address: u64, dest_address: u64, amount: u64) -> bool {
+        unsafe {
+            let buffer_cache = self.buffer_cache.as_mut();
+            let buffer_mutex: *const _ = &buffer_cache.mutex;
+            let _buffer_guard = (*buffer_mutex).lock();
+            buffer_cache.dma_copy(src_address, dest_address, amount)
+        }
+    }
+
+    fn buffer_clear(&mut self, dst_address: u64, amount: u64, value: u32) -> bool {
+        unsafe {
+            let buffer_cache = self.buffer_cache.as_mut();
+            let buffer_mutex: *const _ = &buffer_cache.mutex;
+            let _buffer_guard = (*buffer_mutex).lock();
+            buffer_cache.dma_clear(dst_address, amount, value)
+        }
+    }
+
+    fn image_to_buffer(
+        &mut self,
+        copy_info: &dma::ImageCopy,
+        src: &dma::ImageOperand,
+        dst: &dma::BufferOperand,
+    ) -> bool {
+        self.dma_buffer_image_copy(copy_info, dst, src, false)
+    }
+
+    fn buffer_to_image(
+        &mut self,
+        copy_info: &dma::ImageCopy,
+        src: &dma::BufferOperand,
+        dst: &dma::ImageOperand,
+    ) -> bool {
+        self.dma_buffer_image_copy(copy_info, src, dst, true)
+    }
+}
+
 #[cfg(test)]
 mod owner_reference_tests {
     use super::OwnerReference;
@@ -694,9 +771,15 @@ mod owner_reference_tests {
 
 impl RasterizerVulkan {
     /// Low-bit mask used by upstream to check every eighth operation.
+    #[cfg(not(target_os = "android"))]
     const DISPATCH_THRESHOLD: u32 = 7;
+    #[cfg(target_os = "android")]
+    const DISPATCH_THRESHOLD: u32 = 3;
     /// Hard flush threshold — full GPU submit every N draws.
+    #[cfg(not(target_os = "android"))]
     const FLUSH_THRESHOLD: u32 = 4096;
+    #[cfg(target_os = "android")]
+    const FLUSH_THRESHOLD: u32 = 512;
 
     /// Create a new RasterizerVulkan.
     ///
@@ -704,16 +787,13 @@ impl RasterizerVulkan {
     /// device and queue.
     pub fn new(
         shader_notify: crate::shader_notify::ShaderNotifyHandle,
+        vulkan_device: &Device,
         instance: ash::Instance,
         physical_device: vk::PhysicalDevice,
-        device: ash::Device,
         driver_id: vk::DriverId,
-        has_broken_parallel_shader_compiling: bool,
         cant_blit_msaa: bool,
         width: u32,
         height: u32,
-        profile: Profile,
-        host_info: HostTranslateInfo,
         depth_bounds_supported: bool,
         depth_range_unrestricted: bool,
         nv_viewport_swizzle: bool,
@@ -725,9 +805,13 @@ impl RasterizerVulkan {
         subgroup_scan_supported: bool,
         conditional_rendering_supported: bool,
         extended_dynamic_state2_supported: bool,
-        extended_dynamic_state2_extra_supported: bool,
+        extended_dynamic_state2_logic_op_supported: bool,
         extended_dynamic_state3_blending_supported: bool,
         extended_dynamic_state3_enables_supported: bool,
+        color_write_enable_supported: bool,
+        dynamic_state3_support: super::graphics_pipeline::DynamicState3Support,
+        line_rasterization_supported: bool,
+        smooth_lines_supported: bool,
         vertex_input_dynamic_state_supported: bool,
         topology_list_primitive_restart_supported: bool,
         patch_list_primitive_restart_supported: bool,
@@ -742,6 +826,7 @@ impl RasterizerVulkan {
         max_viewports: u32,
         max_vertex_input_attributes: u32,
         max_vertex_input_bindings: u32,
+        max_compute_work_group_count: [u32; 3],
         vertex_attribute_divisor_supported: bool,
         provoking_vertex_supported: bool,
         draw_indirect_count_supported: bool,
@@ -757,25 +842,37 @@ impl RasterizerVulkan {
             "RasterizerVulkan: initializing {}x{} renderer",
             width, height
         );
+        let device = vulkan_device.get_logical();
 
         // Create staging buffer pool
-        let mut staging_pool = Box::new(StagingBufferPool::new(
-            device.clone(),
-            instance.clone(),
-            physical_device,
-            scheduler,
-        ));
+        let mut staging_pool = Box::new(
+            StagingBufferPool::new(vulkan_device, memory_allocator, scheduler)
+                .map_err(|error| RendererError::VulkanError(error.result))?,
+        );
 
         // Create descriptor pool. Boxed (with the descriptor queues and the
         // blit helper below) so the `NonNull` pointers captured by
         // sub-components stay valid when the constructed `Self` is moved.
-        let mut descriptor_pool = Box::new(DescriptorPool::new(device.clone(), 64));
+        let mut descriptor_pool = Box::new(DescriptorPool::new(vulkan_device, scheduler));
 
         // Create descriptor update queue
-        let mut desc_queue = Box::new(UpdateDescriptorQueue::new(scheduler));
-        let mut compute_pass_desc_queue = Box::new(UpdateDescriptorQueue::new(scheduler));
+        let mut desc_queue = Box::new(UpdateDescriptorQueue::new(
+            vulkan_device,
+            GUEST_FRAME_PAYLOAD_SIZE,
+            vulkan_device.is_ext_descriptor_buffer_supported(),
+        ));
+        let mut compute_pass_desc_queue = Box::new(UpdateDescriptorQueue::new(
+            vulkan_device,
+            COMPUTE_FRAME_PAYLOAD_SIZE,
+            false,
+        ));
+        let mut descriptor_buffer_ring = Box::new(
+            DescriptorBufferRing::new(vulkan_device, memory_allocator).map_err(|error| {
+                RendererError::InitFailed(format!("descriptor buffer ring: {error:?}"))
+            })?,
+        );
         let mut blit_image = Box::new(BlitImageHelper::new(
-            device.clone(),
+            vulkan_device,
             scheduler,
             descriptor_pool.as_mut(),
             shader_stencil_export_supported,
@@ -797,72 +894,22 @@ impl RasterizerVulkan {
         let fallback_sampler = create_fallback_sampler(&device)?;
 
         // Create render pass cache
-        let mut render_pass_cache = Box::new(RenderPassCache::new(
-            device.clone(),
-            instance.clone(),
-            physical_device,
-        ));
+        let mut render_pass_cache = Box::new(RenderPassCache::new(vulkan_device));
 
-        // Create shader recompiler pipeline cache
-        let shader_cache = ShaderPipelineCache::new(profile.clone());
-        let must_emulate_scaled_formats =
-            must_emulate_scaled_formats || !profile.support_scaled_attributes;
-
-        // Create pipeline cache owner
-        let use_asynchronous_shaders = *common::settings::values()
-            .use_asynchronous_shaders
-            .get_value();
-        let use_vulkan_pipeline_cache = *common::settings::values()
-            .use_vulkan_driver_pipeline_cache
-            .get_value();
-        let pipeline_cache = VulkanPipelineCache::new(
-            device.clone(),
-            descriptor_pool.as_mut(),
-            shader_notify,
-            use_asynchronous_shaders,
-            use_vulkan_pipeline_cache,
-            has_broken_parallel_shader_compiling,
-            shader_cache,
-            profile,
-            host_info,
-            render_pass_cache.as_mut(),
-            extended_dynamic_state_supported,
-            extended_dynamic_state2_supported,
-            extended_dynamic_state2_extra_supported,
-            extended_dynamic_state3_blending_supported,
-            extended_dynamic_state3_enables_supported,
-            vertex_input_dynamic_state_supported,
-            must_emulate_scaled_formats,
-            topology_list_primitive_restart_supported,
-            patch_list_primitive_restart_supported,
-            max_viewports,
-            max_vertex_input_bindings,
-            vertex_attribute_divisor_supported,
-            provoking_vertex_supported,
-            push_descriptor_supported,
-            max_push_descriptors,
-        );
-
-        // Create buffer cache
-        let buffer_cache =
-            DirectBufferCache::new(device.clone(), instance.clone(), physical_device)
-                .map_err(|e| RendererError::InitFailed(format!("buffer cache: {:?}", e)))?;
         // Upstream BufferCacheParams uses
         // MemoryTrackerBase<Tegra::MaxwellDeviceMemoryManager>. Keep the
         // tracker connected to the shared device-memory manager so tracked
         // pages are protected and later CPU writes reach OnCPUWrite.
-        let mut common_buffer_cache =
-            Box::new(VulkanCommonBufferCache::new(device_memory.as_ref()));
         let buffer_runtime = BufferCacheRuntime::new(
-            device.clone(),
+            vulkan_device,
             instance.clone(),
             physical_device,
+            memory_allocator,
             scheduler,
             staging_pool.as_mut(),
             desc_queue.as_mut(),
             compute_pass_desc_queue.as_mut(),
             descriptor_pool.as_ref(),
-            driver_id,
             index_type_uint8_supported,
             has_null_descriptor,
             extended_dynamic_state_supported,
@@ -870,7 +917,10 @@ impl RasterizerVulkan {
             max_vertex_input_bindings,
         )
         .map_err(|e| RendererError::InitFailed(format!("buffer cache runtime: {:?}", e)))?;
-        common_buffer_cache.set_runtime(Box::new(buffer_runtime));
+        let mut common_buffer_cache = Box::new(VulkanCommonBufferCache::new(
+            device_memory.as_ref(),
+            buffer_runtime,
+        ));
         common_buffer_cache.set_device_memory(Box::new(DeviceMemoryAccessAdapter {
             device_memory: Arc::clone(&device_memory),
         }));
@@ -878,34 +928,55 @@ impl RasterizerVulkan {
         // Create texture cache
         let shader_cache = crate::shader_cache::ShaderCache::new(Arc::clone(&device_memory));
 
-        let texture_cache = TextureCache::new(
-            device.clone(),
-            instance.clone(),
-            physical_device,
-            Arc::clone(&device_memory),
-            scheduler,
-            &mut *memory_allocator,
-            staging_pool.as_mut(),
-            blit_image.as_mut(),
-            render_pass_cache.as_mut(),
+        let mut texture_cache = Box::new(
+            TextureCache::new(
+                vulkan_device,
+                device.clone(),
+                instance.clone(),
+                physical_device,
+                Arc::clone(&device_memory),
+                scheduler,
+                &mut *memory_allocator,
+                staging_pool.as_mut(),
+                blit_image.as_mut(),
+                render_pass_cache.as_mut(),
+                descriptor_pool.as_mut(),
+                compute_pass_desc_queue.as_mut(),
+                cant_blit_msaa,
+                image_format_list_supported,
+                optimal_astc_supported,
+                must_emulate_bgr565,
+                ext_4444_formats_supported,
+                custom_border_color_supported,
+                sampler_filter_minmax_supported,
+                vulkan_device.get_sampler_heap_budget(),
+                has_null_descriptor,
+                driver_id == vk::DriverId::NVIDIA_PROPRIETARY,
+            )
+            .map_err(|e| RendererError::InitFailed(format!("texture cache: {:?}", e)))?,
+        );
+
+        // Create the pipeline-cache owner only after the stable cache storage
+        // exists. Its cached GraphicsPipeline objects retain these same four
+        // reference members, matching vk_graphics_pipeline.h.
+        let pipeline_cache = VulkanPipelineCache::new(
+            vulkan_device,
             descriptor_pool.as_mut(),
-            compute_pass_desc_queue.as_mut(),
-            cant_blit_msaa,
-            image_format_list_supported,
-            optimal_astc_supported,
-            must_emulate_bgr565,
-            ext_4444_formats_supported,
-            custom_border_color_supported,
-            sampler_filter_minmax_supported,
-            has_null_descriptor,
-        )
-        .map_err(|e| RendererError::InitFailed(format!("texture cache: {:?}", e)))?;
+            shader_notify,
+            render_pass_cache.as_mut(),
+            scheduler,
+            common_buffer_cache.as_mut(),
+            texture_cache.as_mut(),
+            desc_queue.as_mut(),
+            descriptor_buffer_ring.as_mut(),
+        );
 
         // Create query cache
         let query_cache = VulkanQueryCache::new(
             &instance,
             device.clone(),
             scheduler,
+            staging_pool.as_mut(),
             memory_allocator,
             common_buffer_cache.as_mut(),
             descriptor_pool.as_ref(),
@@ -918,6 +989,11 @@ impl RasterizerVulkan {
             host_query_reset_supported,
         )
         .map_err(|e| RendererError::InitFailed(format!("query cache: {e:?}")))?;
+        let accelerate_dma = AccelerateDMA::new(
+            common_buffer_cache.as_mut(),
+            texture_cache.as_mut(),
+            scheduler,
+        );
 
         let wfi_event_info = vk::EventCreateInfo::default();
         let wfi_event = unsafe {
@@ -957,11 +1033,16 @@ impl RasterizerVulkan {
             .then(|| ash::extensions::khr::DrawIndirectCount::new(&instance, &device));
         let push_descriptor = push_descriptor_supported
             .then(|| ash::extensions::khr::PushDescriptor::new(&instance, &device));
-        let extended_dynamic_state2 = extended_dynamic_state2_extra_supported
+        let extended_dynamic_state2 = extended_dynamic_state2_logic_op_supported
             .then(|| ash::extensions::ext::ExtendedDynamicState2::new(&instance, &device));
         let extended_dynamic_state3 = (extended_dynamic_state3_blending_supported
             || extended_dynamic_state3_enables_supported)
             .then(|| ash::extensions::ext::ExtendedDynamicState3::new(&instance, &device));
+        let color_write_enable = color_write_enable_supported.then(|| {
+            vk::ExtColorWriteEnableFn::load(|name| unsafe {
+                std::mem::transmute(instance.get_device_proc_addr(device.handle(), name.as_ptr()))
+            })
+        });
         let vertex_input_dynamic_state = vertex_input_dynamic_state_supported.then(|| {
             vk::ExtVertexInputDynamicStateFn::load(|name| unsafe {
                 std::mem::transmute(instance.get_device_proc_addr(device.handle(), name.as_ptr()))
@@ -970,7 +1051,7 @@ impl RasterizerVulkan {
 
         let fence_wait_handle = scheduler.wait_handle();
         Ok(Self {
-            device,
+            device: DeviceReference::new(vulkan_device),
             instance,
             physical_device,
             syncpoints,
@@ -980,9 +1061,11 @@ impl RasterizerVulkan {
             memory_allocator: NonNull::from(&mut *memory_allocator),
             state_tracker: OwnerReference::new(state_tracker),
             staging_pool,
+            pipeline_cache,
             descriptor_pool,
             desc_queue,
             compute_pass_desc_queue,
+            descriptor_buffer_ring,
             blit_image,
             fallback_uniform_buffer,
             fallback_uniform_memory,
@@ -990,8 +1073,7 @@ impl RasterizerVulkan {
             fallback_sampler,
             render_pass_cache,
             shader_cache,
-            pipeline_cache,
-            buffer_cache,
+            accelerate_dma,
             common_buffer_cache,
             texture_cache,
             query_cache,
@@ -1015,26 +1097,37 @@ impl RasterizerVulkan {
             draw_counter: 0,
             draw_sequence: 0,
             draw_skipped_pipeline: 0,
-            draw_offscreen_fallback: 0,
             has_null_descriptor,
+            driver_id,
             extended_dynamic_state_supported,
             extended_dynamic_state2_supported,
-            extended_dynamic_state2_extra_supported,
+            extended_dynamic_state2_logic_op_supported,
             extended_dynamic_state3_blending_supported,
             extended_dynamic_state3_enables_supported,
+            color_write_enable_supported,
+            dynamic_state3_support,
+            line_rasterization_supported,
+            smooth_lines_supported,
             vertex_input_dynamic_state_supported,
             must_emulate_scaled_formats,
             depth_bounds_supported,
+            supports_d24_depth: vulkan_device.supports_d24_depth_buffer(),
             depth_range_unrestricted,
             nv_viewport_swizzle,
             extended_dynamic_state2,
             extended_dynamic_state3,
+            color_write_enable,
             vertex_input_dynamic_state,
             draw_indirect_count,
             push_descriptor,
             max_viewports: max_viewports.min(NUM_VIEWPORTS as u32).max(1),
             max_vertex_input_attributes,
             max_vertex_input_bindings,
+            max_compute_work_group_count,
+            topology_list_primitive_restart_supported,
+            patch_list_primitive_restart_supported,
+            transform_feedback_supported,
+            transform_feedback_draw_supported: vulkan_device.is_transform_feedback_draw_supported(),
             channel_memory_manager: None,
             gpu_tick_callback: None,
             invalidate_gpu_cache_callback: None,
@@ -1070,70 +1163,29 @@ impl RasterizerVulkan {
     ///
     /// Ref: zuyu RasterizerVulkan::Draw() — compiles/caches pipeline,
     /// updates dynamic state via dirty flags, binds resources, records draw.
-    fn draw_prepared(
+    fn prepare_draw(
         &mut self,
-        draw: &DrawCall,
+        draw: &mut Maxwell3DDrawView<'_>,
+        instance_count: u32,
         zpass_pixel_count_enabled: bool,
         indirect_params: Option<crate::engines::draw_manager::IndirectParams>,
         dirty_flags: &mut [bool; 256],
-        engine_dirty_flags: Option<std::ptr::NonNull<[bool; 256]>>,
         read_gpu: &dyn Fn(u64, &mut [u8]),
         read_gpu_unsafe: &dyn Fn(u64, &mut [u8]) -> bool,
     ) {
+        let _gpu_tick_guard = GpuTickGuard(self.gpu_tick_callback.clone());
         // 1. Periodic flush
         self.flush_work();
+        if let Some(memory_manager) = self.channel_memory_manager.as_ref().cloned() {
+            memory_manager.lock().flush_caching();
+        }
 
         // 2. Compile or lookup cached pipeline
-        let known_gpu_tick = self.scheduler.known_gpu_tick();
-        let pending_tick = self.scheduler.pending_tick();
         let pipeline_result = self
             .pipeline_cache
-            .current_graphics_pipeline_with_shared_cache(draw, &mut self.shader_cache);
-        let (
-            pipeline_waiter,
-            pipeline_layout,
-            descriptor_set_layout,
-            descriptor_update_template,
-            uses_push_descriptor,
-            descriptor_set,
-            descriptor_bindings,
-            stage_infos,
-            enabled_uniform_buffer_masks,
-            uniform_buffer_sizes,
-            uses_render_area,
-            _uses_rescaling_uniform,
-            unique_hashes,
-        ) = match pipeline_result {
-            Some((gp, _fixed_state)) => {
-                let descriptor_set = if gp.uses_push_descriptor {
-                    None
-                } else {
-                    match gp.commit_descriptor_set(known_gpu_tick, pending_tick) {
-                        Ok(set) => set,
-                        Err(error) => {
-                            warn!(
-                                "RasterizerVulkan: failed to commit graphics descriptor set: {error:?}"
-                            );
-                            return;
-                        }
-                    }
-                };
-                (
-                    gp.build_waiter(),
-                    gp.pipeline_layout,
-                    gp.descriptor_set_layout,
-                    gp.descriptor_update_template,
-                    gp.uses_push_descriptor,
-                    descriptor_set,
-                    Arc::clone(&gp.descriptor_bindings),
-                    Arc::clone(&gp.stage_infos),
-                    gp.enabled_uniform_buffer_masks,
-                    gp.uniform_buffer_sizes,
-                    gp.uses_render_area,
-                    gp.uses_rescaling_uniform,
-                    gp.key().unique_hashes,
-                )
-            }
+            .current_graphics_pipeline(draw, &mut self.shader_cache);
+        let gp = match pipeline_result {
+            Some(gp) => gp,
             None => {
                 self.draw_skipped_pipeline = self.draw_skipped_pipeline.wrapping_add(1);
                 // A skipped draw leaves the previous frame's pixels in place;
@@ -1144,30 +1196,19 @@ impl RasterizerVulkan {
                         "[DRAW_SKIP] #{} pipeline compilation failed (draw={} rt0=0x{:X} fmt={} topology={:?} indexed={})",
                         self.draw_skipped_pipeline,
                         self.draw_counter,
-                        draw.render_targets[0].address,
-                        draw.render_targets[0].format,
-                        draw.topology,
-                        draw.indexed,
+                        draw.render_target(0).address,
+                        draw.render_target(0).format,
+                        draw.draw_state().topology,
+                        draw.is_indexed(),
                     );
                 }
                 return;
             }
         };
-        let trace_draw = vulkan_draw_trace_enabled();
-        let clear_values = [
-            vk::ClearValue {
-                color: vk::ClearColorValue {
-                    float32: [0.0, 0.0, 0.0, 1.0],
-                },
-            },
-            vk::ClearValue {
-                depth_stencil: vk::ClearDepthStencilValue {
-                    depth: 1.0,
-                    stencil: 0,
-                },
-            },
-        ];
-        let draw_params = make_draw_params(draw);
+        // `FixedPipelineState::Refresh` consumes live Maxwell dirty flags
+        // before Configure. Mirror those changes into the draw-scoped array
+        // without aliasing the array with the live register view.
+        *dirty_flags = *draw.dirty_flags();
         // Serialize every common-buffer-cache access on this draw
         // (uniform/storage descriptor binding AND the geometry binding below)
         // against concurrent CPU-write invalidation. A guest write on another
@@ -1177,7 +1218,7 @@ impl RasterizerVulkan {
         // validate_index is a debug_assert). Without this lock the GPU thread
         // can index a slot the CPU thread just freed -> SlotVector panic /
         // use-after-free. The mutexes are reentrant, so the texture lock taken
-        // inside `bind_graphics_descriptors` is fine. Matches the locking the
+        // inside `GraphicsPipeline::configure` is fine. Matches the locking the
         // async-flush paths already use for these two caches.
         let bc_draw_texture_mutex: *const _ = &self.texture_cache.base.mutex;
         let bc_draw_buffer_mutex: *const _ = &self.common_buffer_cache.mutex;
@@ -1187,104 +1228,29 @@ impl RasterizerVulkan {
             _bc_draw_buffer_guard,
             _bc_draw_texture_guard
         );
-        // Upstream `GraphicsPipeline::ConfigureImpl` updates all buffer
-        // bindings once, then binds geometry before the per-stage buffers.
-        let prepared_descriptors = self.bind_graphics_descriptors(
-            descriptor_set_layout,
-            descriptor_bindings.as_slice(),
-            stage_infos.as_ref(),
-            &enabled_uniform_buffer_masks,
-            &uniform_buffer_sizes,
-            draw,
-            draw.indexed,
-            read_gpu,
-            read_gpu_unsafe,
-        );
-        let Some(prepared_descriptors) = prepared_descriptors else {
-            warn!("RasterizerVulkan: draw skipped because descriptor preparation failed");
-            return;
-        };
-        if !uses_push_descriptor
-            && required_descriptor_set_missing(
-                descriptor_set_layout,
-                descriptor_bindings.len(),
-                descriptor_set,
-            )
-        {
-            warn!("RasterizerVulkan: draw skipped because required descriptors are incomplete");
-            return;
-        }
-
-        // Upstream GraphicsPipeline::ConfigureImpl resolves image views before
-        // UpdateRenderTargets. Resolving a view may join/delete cached images
-        // and dirty the render-target bindings, so taking the framebuffer
-        // snapshot any earlier can leave this draw targeting a stale image.
-        let target_fb = self
-            .texture_cache
-            .update_render_targets_and_get_rt0_framebuffer(
-                &crate::engines::draw_manager::Maxwell3DRenderTargets {
-                    rt_control: draw.rt_control,
-                    render_targets: draw.render_targets,
-                    zeta: draw.zeta,
-                    anti_alias_samples_mode: 0,
-                    surface_clip: draw.surface_clip,
-                },
+        if let Some(gpu_memory) = self.channel_memory_manager.as_ref().cloned() {
+            gp.set_engine(
+                draw,
                 dirty_flags,
-                read_gpu_unsafe,
-                false,
-                None,
+                gpu_memory,
+                self.push_descriptor.clone(),
+                self.fallback_sampler,
             );
-        if self
-            .texture_cache
-            .base
-            .check_feedback_loop(&prepared_descriptors.views)
-        {
-            self.texture_cache.barrier_feedback_loop();
-        }
-        let target_has_depth = target_fb.as_ref().is_some_and(|target| target.has_depth);
-        let target_num_color = target_fb
-            .as_ref()
-            .map(|target| target.num_color)
-            .unwrap_or(1);
-        let render_pass = target_fb
-            .as_ref()
-            .map(|target| target.render_pass)
-            .unwrap_or(self.default_render_pass);
-        let (framebuffer, extent, rp_images, rp_image_ranges) = if let Some(target) = target_fb {
-            self.texture_cache
-                .prepare_render_targets_for_render(&target.image_ids);
-            (
-                target.framebuffer,
-                target.extent,
-                target.images,
-                target.image_ranges,
-            )
         } else {
-            self.draw_offscreen_fallback = self.draw_offscreen_fallback.wrapping_add(1);
-            if self.draw_offscreen_fallback <= 16 || self.draw_offscreen_fallback.is_power_of_two()
-            {
-                log::warn!(
-                    "[DRAW_OFFSCREEN] #{} no guest framebuffer resolved (draw={} rt0=0x{:X} fmt={})",
-                    self.draw_offscreen_fallback,
-                    self.draw_counter,
-                    draw.render_targets[0].address,
-                    draw.render_targets[0].format,
-                );
-            }
-            (
-                self.offscreen_fb,
-                vk::Extent2D {
-                    width: self.fb_width,
-                    height: self.fb_height,
-                },
-                Vec::new(),
-                Vec::new(),
-            )
-        };
-        let render_area = vk::Rect2D {
-            offset: vk::Offset2D { x: 0, y: 0 },
-            extent,
-        };
+            gp.set_engine_with_readers(
+                draw,
+                dirty_flags,
+                read_gpu,
+                read_gpu_unsafe,
+                self.push_descriptor.clone(),
+                self.fallback_sampler,
+            );
+        }
+        if !gp.configure(draw.is_indexed()) {
+            self.draw_skipped_pipeline = self.draw_skipped_pipeline.wrapping_add(1);
+            warn!("RasterizerVulkan: draw skipped because graphics pipeline configuration failed");
+            return;
+        }
         let indirect_binding = indirect_params.map(|params| {
             let (buffer_id, offset) = self.common_buffer_cache.get_draw_indirect_buffer();
             let buffer = vk::Buffer::from_raw(
@@ -1312,81 +1278,14 @@ impl RasterizerVulkan {
         // Configure AND draw_func (vk_rasterizer.cpp:223-233). Releasing after
         // binding would still let a concurrent CPU-write free a slot the draw
         // depends on before it is recorded. RAII drops them on every exit,
-        // including the early-return trace-stub path.
-
-        // Upstream `GraphicsPipeline::ConfigureImpl` resolves and snapshots
-        // every guest resource before `ConfigureDraw` records the wait for an
-        // asynchronously-built pipeline. Waiting before descriptor/geometry
-        // preparation lets the guest recycle a uniform-buffer ring while the
-        // occurrence 4 and its short-lived transition effects disappear.
-        let Some(pipeline) = pipeline_waiter.pipeline_handle() else {
-            self.draw_skipped_pipeline = self.draw_skipped_pipeline.wrapping_add(1);
-            if self.draw_skipped_pipeline <= 16 || self.draw_skipped_pipeline.is_power_of_two() {
-                log::warn!(
-                    "[DRAW_SKIP] #{} pipeline build failed asynchronously after resource preparation (draw={} rt0=0x{:X} fmt={} topology={:?} indexed={})",
-                    self.draw_skipped_pipeline,
-                    self.draw_counter,
-                    draw.render_targets[0].address,
-                    draw.render_targets[0].format,
-                    draw.topology,
-                    draw.indexed,
-                );
-            }
-            return;
-        };
-        // Build clear values indexed by attachment: one per colour attachment
-        // (ignored by the LOAD colour attachments, but the array must be long
-        // enough to index the CLEAR depth attachment at index `num_color`),
-        // then the depth clear value when a depth attachment is bound.
-        let render_pass_clears: Vec<vk::ClearValue> = if render_pass == self.default_render_pass {
-            clear_values.to_vec()
-        } else {
-            let mut clears = vec![clear_values[0]; target_num_color.max(1) as usize];
-            if target_has_depth {
-                clears.push(clear_values[1]);
-            }
-            clears
-        };
-        self.scheduler.request_renderpass(
-            framebuffer,
-            render_pass,
-            render_area,
-            &render_pass_clears,
-            &rp_images,
-            &rp_image_ranges,
-        );
-        self.push_graphics_push_constants(
-            pipeline,
-            pipeline_layout,
-            descriptor_set_layout,
-            descriptor_update_template,
-            uses_push_descriptor,
-            descriptor_set,
-            prepared_descriptors.descriptor_data,
-            prepared_descriptors.rescaling_data,
-            draw,
-            uses_render_area,
-        );
-
-        // `bind_graphics_descriptors` has just run the common buffer cache's
-        // `UpdateGraphicsBuffers`, which consumes these live Maxwell dirty
-        // flags before Eden calls `UpdateDynamicStates`.
-        dirty_flags[crate::dirty_flags::flags::INDEX_BUFFER as usize] = false;
-        dirty_flags[crate::dirty_flags::flags::VERTEX_BUFFERS as usize] = false;
-        for index in
-            crate::dirty_flags::flags::VERTEX_BUFFER0..=crate::dirty_flags::flags::VERTEX_BUFFER31
-        {
-            dirty_flags[index as usize] = false;
-        }
+        // including every early-return path.
 
         // 6. Update dynamic states via dirty flags. Upstream requests the
         // render pass in `GraphicsPipeline::ConfigureDraw` before
         // `RasterizerVulkan::UpdateDynamicStates`.
-        self.update_dynamic_states(draw, dirty_flags, engine_dirty_flags);
-
+        self.update_dynamic_states(draw, dirty_flags);
         self.query_cache.notify_segment(true);
-        self.query_cache
-            .handle_transform_feedback(&mut self.scheduler);
+        self.handle_transform_feedback();
         self.query_cache.counter_enable(
             &mut self.scheduler,
             QueryType::ZPassPixelCount64 as u32,
@@ -1394,18 +1293,6 @@ impl RasterizerVulkan {
         );
 
         // 7. Issue draw call
-        if trace_draw {
-            info!(
-                "{}",
-                format_vulkan_draw_trace(
-                    self.scheduler.pending_tick(),
-                    self.draw_counter,
-                    draw,
-                    draw_params,
-                    &unique_hashes,
-                )
-            );
-        }
         if let Some((params, buffer, offset, count)) = indirect_binding {
             if buffer == vk::Buffer::null() {
                 warn!("RasterizerVulkan::draw_indirect skipped: missing indirect buffer");
@@ -1463,8 +1350,9 @@ impl RasterizerVulkan {
                     }
                 });
             } else {
-                let device = self.device.clone();
+                let device = self.device;
                 self.scheduler.record(move |cmdbuf| unsafe {
+                    let device = device.get().get_logical();
                     if params.is_indexed {
                         device.cmd_draw_indexed_indirect(
                             cmdbuf,
@@ -1484,139 +1372,67 @@ impl RasterizerVulkan {
                     }
                 });
             }
-        } else if draw_params.is_indexed {
-            let device = self.device.clone();
-            self.scheduler.record(move |cmdbuf| unsafe {
-                device.cmd_draw_indexed(
-                    cmdbuf,
-                    draw_params.num_vertices,
-                    draw_params.num_instances,
-                    draw_params.first_index,
-                    draw_params.base_vertex,
-                    draw_params.base_instance,
-                );
-            });
         } else {
-            let device = self.device.clone();
-            self.scheduler.record(move |cmdbuf| unsafe {
-                device.cmd_draw(
-                    cmdbuf,
-                    draw_params.num_vertices,
-                    draw_params.num_instances,
-                    draw_params.base_vertex as u32,
-                    draw_params.base_instance,
-                );
-            });
-        }
-        if let Some(interval) = vulkan_sync_draw_interval() {
-            if self.draw_counter % interval == 0 {
-                info!(
-                    "[VK_DRAW_SYNC] tick={} draw={} interval={interval}",
-                    self.scheduler.pending_tick(),
-                    self.draw_counter,
-                );
-                self.finish();
-            }
-        }
-    }
-
-    fn push_graphics_push_constants(
-        &mut self,
-        pipeline: vk::Pipeline,
-        pipeline_layout: vk::PipelineLayout,
-        descriptor_set_layout: vk::DescriptorSetLayout,
-        descriptor_update_template: vk::DescriptorUpdateTemplate,
-        uses_push_descriptor: bool,
-        descriptor_set: Option<vk::DescriptorSet>,
-        descriptor_data: Option<DescriptorData>,
-        rescaling_data: [u32; NUM_TEXTURE_AND_IMAGE_SCALING_WORDS],
-        draw: &DrawCall,
-        uses_render_area: bool,
-    ) {
-        let render_area = [
-            draw.surface_clip.width as f32,
-            draw.surface_clip.height as f32,
-            0.0,
-            0.0,
-        ];
-        let is_rescaling = self.texture_cache.base.is_rescaling;
-        let update_rescaling = self.scheduler.update_rescaling(is_rescaling);
-        let scale_down_factor = if is_rescaling {
-            common::settings::values().resolution_info.down_factor
-        } else {
-            1.0
-        };
-        let bind_pipeline = self.scheduler.update_graphics_pipeline(pipeline);
-        let device = self.device.clone();
-        let push_descriptor = self.push_descriptor.clone();
-        self.scheduler.record(move |cmdbuf| unsafe {
-            if bind_pipeline {
-                device.cmd_bind_pipeline(cmdbuf, vk::PipelineBindPoint::GRAPHICS, pipeline);
-            }
-            device.cmd_push_constants(
-                cmdbuf,
-                pipeline_layout,
-                vk::ShaderStageFlags::ALL_GRAPHICS,
-                RESCALING_LAYOUT_WORDS_OFFSET,
-                bytes_of(&rescaling_data),
-            );
-
-            if update_rescaling {
-                device.cmd_push_constants(
-                    cmdbuf,
-                    pipeline_layout,
-                    vk::ShaderStageFlags::ALL_GRAPHICS,
-                    RESCALING_LAYOUT_DOWN_FACTOR_OFFSET,
-                    bytes_of(&scale_down_factor),
-                );
-            }
-
-            if uses_render_area {
-                device.cmd_push_constants(
-                    cmdbuf,
-                    pipeline_layout,
-                    vk::ShaderStageFlags::ALL_GRAPHICS,
-                    RENDERAREA_LAYOUT_OFFSET,
-                    bytes_of(&render_area),
-                );
-            }
-            if descriptor_set_layout == vk::DescriptorSetLayout::null() {
-                return;
-            }
-            let descriptor_data = descriptor_data
-                .expect("graphics descriptor layout requires descriptor update payload")
-                .0
-                .cast::<std::ffi::c_void>();
-            if uses_push_descriptor {
-                push_descriptor
-                    .as_ref()
-                    .expect("push-descriptor pipeline requires VK_KHR_push_descriptor")
-                    .cmd_push_descriptor_set_with_template(
+            let draw_params = make_draw_params(draw, instance_count);
+            if draw_params.is_indexed {
+                let device = self.device;
+                self.scheduler.record(move |cmdbuf| unsafe {
+                    let device = device.get().get_logical();
+                    device.cmd_draw_indexed(
                         cmdbuf,
-                        descriptor_update_template,
-                        pipeline_layout,
-                        0,
-                        descriptor_data,
+                        draw_params.num_vertices,
+                        draw_params.num_instances,
+                        draw_params.first_index,
+                        draw_params.base_vertex,
+                        draw_params.base_instance,
                     );
-            } else if let Some(descriptor_set) = descriptor_set {
-                device.update_descriptor_set_with_template(
-                    descriptor_set,
-                    descriptor_update_template,
-                    descriptor_data,
-                );
-                device.cmd_bind_descriptor_sets(
-                    cmdbuf,
-                    vk::PipelineBindPoint::GRAPHICS,
-                    pipeline_layout,
-                    0,
-                    &[descriptor_set],
-                    &[],
-                );
+                });
+            } else {
+                let device = self.device;
+                self.scheduler.record(move |cmdbuf| unsafe {
+                    let device = device.get().get_logical();
+                    device.cmd_draw(
+                        cmdbuf,
+                        draw_params.num_vertices,
+                        draw_params.num_instances,
+                        draw_params.base_vertex as u32,
+                        draw_params.base_instance,
+                    );
+                });
             }
-        });
+        }
     }
 
-    /// Port of upstream `RasterizerVulkan::FlushWork`.
+    /// Port of `RasterizerVulkan::HandleTransformFeedback`.
+    fn handle_transform_feedback(&mut self) {
+        let Some((enabled, supported, tessellation_enabled)) =
+            self.query_cache.transform_feedback_status()
+        else {
+            return;
+        };
+        if !supported {
+            static WARN_UNSUPPORTED: Once = Once::new();
+            WARN_UNSUPPORTED.call_once(|| {
+                if enabled {
+                    warn!(
+                        "Transform feedback requested by guest but VK_EXT_transform_feedback is unavailable; queries disabled"
+                    );
+                } else {
+                    info!("VK_EXT_transform_feedback not available on device");
+                }
+            });
+            return;
+        }
+        self.query_cache.counter_enable(
+            &mut self.scheduler,
+            QueryType::StreamingByteCount as u32,
+            enabled,
+        );
+        if enabled && tessellation_enabled {
+            warn!("Transform feedback with tessellation shaders is not implemented");
+        }
+    }
+
     fn flush_work(&mut self) {
         self.draw_counter = self.draw_counter.wrapping_add(1);
         if self.draw_counter & Self::DISPATCH_THRESHOLD != Self::DISPATCH_THRESHOLD {
@@ -1629,7 +1445,6 @@ impl RasterizerVulkan {
         self.scheduler.flush();
         self.draw_counter = 0;
         self.state_tracker.invalidate_command_buffer_state();
-        self.staging_pool.new_frame();
     }
 
     /// Submit and wait for all GPU work to complete.
@@ -1638,7 +1453,6 @@ impl RasterizerVulkan {
         self.scheduler.finish();
         self.draw_counter = 0;
         self.state_tracker.invalidate_command_buffer_state();
-        self.staging_pool.new_frame();
     }
 
     fn should_wait_async_flushes(&self) -> bool {
@@ -1683,6 +1497,16 @@ impl RasterizerVulkan {
             self.common_buffer_cache.commit_async_flushes();
         }
         self.query_cache.commit_async_flushes();
+    }
+
+    /// Callback adaptation of upstream `FenceManager::SignalOrdering`, which
+    /// locks only the buffer cache and calls `BufferCache::AccumulateFlushes`.
+    fn accumulate_flushes(&mut self) {
+        unsafe {
+            let buffer_mutex: *const _ = &self.common_buffer_cache.mutex;
+            let _buffer_guard = (*buffer_mutex).lock();
+            self.common_buffer_cache.accumulate_flushes();
+        }
     }
 
     fn queue_fence(&mut self, fence: &mut VkFence) {
@@ -1732,10 +1556,11 @@ impl RasterizerVulkan {
                 depth: 1,
             })
             .build();
-        let device = self.device.clone();
+        let device = self.device;
         let offscreen_image = self.offscreen_image;
         let readback_buffer = self.readback_buffer;
         self.scheduler.record(move |cmdbuf| unsafe {
+            let device = device.get().get_logical();
             device.cmd_copy_image_to_buffer(
                 cmdbuf,
                 offscreen_image,
@@ -1804,15 +1629,36 @@ impl RasterizerVulkan {
             true
         };
         for draw in draws {
-            // Legacy batch path: no live engine to propagate consumed dirty
-            // flags back to, so consume a per-draw copy.
+            // Legacy Reden-only batch path: reconstruct the draw view which
+            // the live rasterizer receives directly from Maxwell3D.
+            let draw_state = DrawState {
+                topology: draw.topology,
+                draw_mode: DrawMode::General,
+                draw_indexed: draw.indexed,
+                base_index: draw.base_vertex as u32,
+                vertex_buffer: VertexBuffer {
+                    first: draw.vertex_first,
+                    count: draw.vertex_count,
+                },
+                index_buffer: IndexBuffer {
+                    first: draw.index_buffer_first,
+                    count: draw.index_buffer_count,
+                    format: draw.index_format,
+                },
+                base_instance: draw.base_instance,
+                instance_count: draw.instance_count,
+                inline_index_draw_indexes: draw.inline_index_data.clone(),
+            };
+            let registers = Maxwell3DDrawRegisters::from_draw_call(draw);
+            let mut draw_view =
+                Maxwell3DDrawView::with_register_snapshot(&draw_state, draw.indexed, registers);
             let mut dirty_flags = draw.dirty_flags;
-            self.draw_prepared(
-                draw,
+            self.prepare_draw(
+                &mut draw_view,
+                draw.instance_count,
                 false,
                 None,
                 &mut dirty_flags,
-                None,
                 read_gpu,
                 &read_gpu_unsafe,
             );
@@ -1831,14 +1677,25 @@ impl RasterizerVulkan {
 
     // ── Dynamic state update methods ──────────────────────────────────────
 
+    #[inline(never)]
     fn update_dynamic_states(
         &mut self,
-        draw: &DrawCall,
+        draw: &mut Maxwell3DDrawView<'_>,
         dirty_flags: &mut [bool; 256],
-        engine_dirty_flags: Option<NonNull<[bool; 256]>>,
     ) {
-        self.update_viewports(draw);
-        self.update_scissors(draw);
+        use super::state_tracker::dirty;
+
+        let topology = draw.draw_state().topology;
+        let topology_changed = self.state_tracker.change_primitive_topology(topology);
+        if topology_changed {
+            dirty_flags[dirty::DEPTH_BIAS_ENABLE as usize] = true;
+            dirty_flags[dirty::PRIMITIVE_RESTART_ENABLE as usize] = true;
+            draw.set_dirty_flag(dirty::DEPTH_BIAS_ENABLE);
+            draw.set_dirty_flag(dirty::PRIMITIVE_RESTART_ENABLE);
+        }
+
+        self.update_viewports_state(draw);
+        self.update_scissors_state(draw);
         self.update_depth_bias(draw);
         self.update_blend_constants(draw);
         self.update_depth_bounds(draw);
@@ -1855,33 +1712,75 @@ impl RasterizerVulkan {
                 self.update_depth_test_enable(draw);
                 self.update_depth_write_enable(draw);
                 self.update_stencil_test_enable(draw);
-                if self.extended_dynamic_state2_supported {
-                    self.update_primitive_restart_enable(draw);
-                    self.update_rasterizer_discard_enable(draw);
-                    self.update_depth_bias_enable(draw);
-                }
-                if self.extended_dynamic_state3_enables_supported {
-                    self.update_logic_op_enable(draw);
-                    self.update_depth_clamp_enable(draw);
-                }
             }
-            if self.extended_dynamic_state2_extra_supported {
-                self.update_logic_op(draw);
-            }
-            if self.extended_dynamic_state3_blending_supported {
-                self.update_blending(draw);
+            if topology_changed {
+                let topology = maxwell_to_vk::primitive_topology(topology);
+                let device = self.device;
+                self.scheduler.record(move |cmdbuf| unsafe {
+                    let device = device.get().get_logical();
+                    device.cmd_set_primitive_topology(cmdbuf, topology);
+                });
             }
         }
+        if self.extended_dynamic_state2_supported {
+            self.update_primitive_restart_enable(draw);
+            self.update_rasterizer_discard_enable(draw);
+            self.update_depth_bias_enable(draw);
+        }
+        if self.extended_dynamic_state2_logic_op_supported {
+            self.update_logic_op(draw);
+        }
+        if self.extended_dynamic_state3_enables_supported {
+            // AMD workaround: LogicOp is incompatible with float render
+            // targets. Keep the driver guard outside the attribute scan, as
+            // upstream does, and persist the resulting register mutation.
+            if matches!(
+                self.driver_id,
+                vk::DriverId::AMD_OPEN_SOURCE | vk::DriverId::AMD_PROPRIETARY
+            ) {
+                let has_float_attribute = (0..32).any(|index| {
+                    // Upstream reads the `VertexAttribute::type` bitfield
+                    // directly from `regs.vertex_attrib_format` here.
+                    ((draw.vertex_attrib_raw(index) >> 27) & 0x7)
+                        == VertexAttribType::Float.to_raw()
+                });
+                if draw.logic_op().enabled {
+                    draw.set_logic_op_enabled(!has_float_attribute);
+                }
+            }
+            self.update_logic_op_enable(draw);
+            self.update_depth_clamp_enable(draw);
+            self.update_line_rasterization_mode(draw);
+            self.update_line_stipple_enable(draw);
+            self.update_conservative_rasterization_mode(draw);
+            self.update_alpha_to_coverage_enable(draw);
+            self.update_alpha_to_one_enable(draw);
+        }
+        if self.extended_dynamic_state3_blending_supported {
+            self.update_blending(draw);
+        } else if self.color_write_enable_supported {
+            self.update_color_write_enable(draw);
+        }
         if self.vertex_input_dynamic_state_supported {
-            self.update_vertex_input(draw, dirty_flags, engine_dirty_flags);
+            let has_dynamic_vertex_input = self
+                .pipeline_cache
+                .current_graphics_pipeline(draw, &mut self.shader_cache)
+                .is_some_and(|pipeline| pipeline.has_dynamic_vertex_input());
+            if has_dynamic_vertex_input {
+                self.update_vertex_input(draw, dirty_flags);
+            }
         }
     }
 
-    fn update_logic_op_enable(&mut self, draw: &DrawCall) {
+    #[inline(never)]
+    fn update_logic_op_enable(&mut self, draw: &Maxwell3DDrawView<'_>) {
         if !self.state_tracker.touch_logic_op_enable() {
             return;
         }
-        let enabled = draw.logic_op.enabled;
+        if !self.dynamic_state3_support.logic_op_enable {
+            return;
+        }
+        let enabled = draw.logic_op().enabled;
         let extension = self
             .extended_dynamic_state3
             .as_ref()
@@ -1892,11 +1791,15 @@ impl RasterizerVulkan {
         });
     }
 
-    fn update_depth_clamp_enable(&mut self, draw: &DrawCall) {
+    #[inline(never)]
+    fn update_depth_clamp_enable(&mut self, draw: &Maxwell3DDrawView<'_>) {
         if !self.state_tracker.touch_depth_clamp_enable() {
             return;
         }
-        let enabled = draw.depth_clamp_enabled;
+        if !self.dynamic_state3_support.depth_clamp_enable {
+            return;
+        }
+        let enabled = draw.depth_clamp_enabled();
         let extension = self
             .extended_dynamic_state3
             .as_ref()
@@ -1907,11 +1810,151 @@ impl RasterizerVulkan {
         });
     }
 
-    fn update_logic_op(&mut self, draw: &DrawCall) {
+    #[inline(never)]
+    fn update_conservative_rasterization_mode(&mut self, draw: &Maxwell3DDrawView<'_>) {
+        if !self.state_tracker.touch_conservative_rasterization_mode()
+            || !self.dynamic_state3_support.conservative_rasterization_mode
+        {
+            return;
+        }
+        let mode = if draw.conservative_raster_enable() {
+            vk::ConservativeRasterizationModeEXT::OVERESTIMATE
+        } else {
+            vk::ConservativeRasterizationModeEXT::DISABLED
+        };
+        let extension = self
+            .extended_dynamic_state3
+            .as_ref()
+            .expect("dynamic state 3 loader missing")
+            .clone();
+        self.scheduler.record(move |cmdbuf| unsafe {
+            extension.cmd_set_conservative_rasterization_mode(cmdbuf, mode);
+        });
+    }
+
+    #[inline(never)]
+    fn update_line_rasterization_mode(&mut self, draw: &Maxwell3DDrawView<'_>) {
+        if !self.line_rasterization_supported
+            || !self.state_tracker.touch_line_rasterization_mode()
+            || !self.dynamic_state3_support.line_rasterization_mode
+        {
+            return;
+        }
+        let mode = if draw.line_state().line_anti_alias_enable && self.smooth_lines_supported {
+            vk::LineRasterizationModeEXT::RECTANGULAR_SMOOTH
+        } else {
+            vk::LineRasterizationModeEXT::RECTANGULAR
+        };
+        let extension = self
+            .extended_dynamic_state3
+            .as_ref()
+            .expect("dynamic state 3 loader missing")
+            .clone();
+        self.scheduler.record(move |cmdbuf| unsafe {
+            extension.cmd_set_line_rasterization_mode(cmdbuf, mode);
+        });
+    }
+
+    #[inline(never)]
+    fn update_line_stipple_enable(&mut self, draw: &Maxwell3DDrawView<'_>) {
+        if !self.state_tracker.touch_line_stipple_enable()
+            || !self.dynamic_state3_support.line_stipple_enable
+        {
+            return;
+        }
+        let enabled = draw.line_stipple().enabled;
+        let extension = self
+            .extended_dynamic_state3
+            .as_ref()
+            .expect("dynamic state 3 loader missing")
+            .clone();
+        self.scheduler.record(move |cmdbuf| unsafe {
+            extension.cmd_set_line_stipple_enable(cmdbuf, enabled);
+        });
+    }
+
+    #[inline(never)]
+    fn update_alpha_to_coverage_enable(&mut self, draw: &mut Maxwell3DDrawView<'_>) {
+        if !self.state_tracker.touch_alpha_to_coverage_enable()
+            || !self.dynamic_state3_support.alpha_to_coverage_enable
+        {
+            return;
+        }
+        let enabled = self
+            .pipeline_cache
+            .current_graphics_pipeline(draw, &mut self.shader_cache)
+            .is_some_and(|pipeline| pipeline.supports_alpha_to_coverage())
+            && draw.anti_alias_alpha_control().alpha_to_coverage;
+        let extension = self
+            .extended_dynamic_state3
+            .as_ref()
+            .expect("dynamic state 3 loader missing")
+            .clone();
+        self.scheduler.record(move |cmdbuf| unsafe {
+            extension.cmd_set_alpha_to_coverage_enable(cmdbuf, enabled);
+        });
+    }
+
+    #[inline(never)]
+    fn update_alpha_to_one_enable(&mut self, draw: &mut Maxwell3DDrawView<'_>) {
+        if !self.state_tracker.touch_alpha_to_one_enable() {
+            return;
+        }
+        if !self.dynamic_state3_support.alpha_to_one_enable {
+            static WARN_ALPHA_TO_ONE: std::sync::Once = std::sync::Once::new();
+            WARN_ALPHA_TO_ONE.call_once(|| {
+                warn!("Alpha-to-one is not supported on this device; forcing it disabled");
+            });
+            return;
+        }
+        let enabled = self
+            .pipeline_cache
+            .current_graphics_pipeline(draw, &mut self.shader_cache)
+            .is_some_and(|pipeline| pipeline.supports_alpha_to_one())
+            && draw.anti_alias_alpha_control().alpha_to_one;
+        let extension = self
+            .extended_dynamic_state3
+            .as_ref()
+            .expect("dynamic state 3 loader missing")
+            .clone();
+        self.scheduler.record(move |cmdbuf| unsafe {
+            extension.cmd_set_alpha_to_one_enable(cmdbuf, enabled);
+        });
+    }
+
+    #[inline(never)]
+    fn update_color_write_enable(&mut self, draw: &Maxwell3DDrawView<'_>) {
+        if !self.state_tracker.touch_color_mask() {
+            return;
+        }
+        let enables = std::array::from_fn::<_, 8, _>(|index| {
+            let mask = draw.color_mask(index);
+            if mask.r || mask.g || mask.b || mask.a {
+                vk::TRUE
+            } else {
+                vk::FALSE
+            }
+        });
+        let functions = self
+            .color_write_enable
+            .as_ref()
+            .expect("color-write-enable loader missing")
+            .clone();
+        self.scheduler.record(move |cmdbuf| unsafe {
+            (functions.cmd_set_color_write_enable_ext)(
+                cmdbuf,
+                enables.len() as u32,
+                enables.as_ptr(),
+            );
+        });
+    }
+
+    #[inline(never)]
+    fn update_logic_op(&mut self, draw: &Maxwell3DDrawView<'_>) {
         if !self.state_tracker.touch_logic_op() {
             return;
         }
-        let raw = draw.logic_op.op;
+        let raw = draw.logic_op().op;
         let op = if (0x1500..0x1510).contains(&raw) {
             vk::LogicOp::from_raw((raw - 0x1500) as i32)
         } else {
@@ -1927,7 +1970,8 @@ impl RasterizerVulkan {
         });
     }
 
-    fn update_blending(&mut self, draw: &DrawCall) {
+    #[inline(never)]
+    fn update_blending(&mut self, draw: &Maxwell3DDrawView<'_>) {
         if !self.state_tracker.touch_blending() {
             return;
         }
@@ -1939,7 +1983,7 @@ impl RasterizerVulkan {
 
         if self.state_tracker.touch_color_mask() {
             let masks = std::array::from_fn::<_, 8, _>(|index| {
-                let mask = draw.color_masks[index];
+                let mask = draw.color_mask(index);
                 let mut flags = vk::ColorComponentFlags::empty();
                 if mask.r {
                     flags |= vk::ColorComponentFlags::R;
@@ -1962,7 +2006,13 @@ impl RasterizerVulkan {
         }
 
         if self.state_tracker.touch_blend_enable() {
-            let enables = std::array::from_fn::<_, 8, _>(|index| draw.blend[index].enabled.into());
+            let enables = std::array::from_fn::<_, 8, _>(|index| {
+                let format = crate::surface::pixel_format_from_render_target_format(
+                    draw.render_target(index).format,
+                );
+                (!crate::surface::is_pixel_format_integer(format) && draw.blend_at(index).enabled)
+                    .into()
+            });
             let extension = extension.clone();
             self.scheduler.record(move |cmdbuf| unsafe {
                 extension.cmd_set_color_blend_enable(cmdbuf, 0, &enables);
@@ -1970,29 +2020,42 @@ impl RasterizerVulkan {
         }
 
         if self.state_tracker.touch_blend_equations() {
-            let equations = std::array::from_fn::<_, 8, _>(|index| {
-                let blend = draw.blend[index];
-                vk::ColorBlendEquationEXT {
+            let blend_equation =
+                |blend: crate::engines::maxwell_3d::BlendInfo| vk::ColorBlendEquationEXT {
                     src_color_blend_factor: maxwell_to_vk::blend_factor(blend.color_src),
                     dst_color_blend_factor: maxwell_to_vk::blend_factor(blend.color_dst),
                     color_blend_op: maxwell_to_vk::blend_equation(blend.color_op),
                     src_alpha_blend_factor: maxwell_to_vk::blend_factor(blend.alpha_src),
                     dst_alpha_blend_factor: maxwell_to_vk::blend_factor(blend.alpha_dst),
                     alpha_blend_op: maxwell_to_vk::blend_equation(blend.alpha_op),
-                }
-            });
+                };
+            let equations = if !draw.blend_per_target_enabled() {
+                let first = if draw.iterated_blend_enabled()
+                    && common::settings::values().use_squashed_iterated_blend
+                {
+                    vk::ColorBlendEquationEXT {
+                        src_color_blend_factor: vk::BlendFactor::ONE,
+                        dst_color_blend_factor: vk::BlendFactor::ONE,
+                        color_blend_op: vk::BlendOp::ADD,
+                        src_alpha_blend_factor: vk::BlendFactor::ONE_MINUS_SRC_COLOR,
+                        dst_alpha_blend_factor: vk::BlendFactor::ZERO,
+                        alpha_blend_op: vk::BlendOp::ADD,
+                    }
+                } else {
+                    blend_equation(draw.global_blend())
+                };
+                [first; 8]
+            } else {
+                std::array::from_fn::<_, 8, _>(|index| blend_equation(draw.blend_at(index)))
+            };
             self.scheduler.record(move |cmdbuf| unsafe {
                 extension.cmd_set_color_blend_equation(cmdbuf, 0, &equations);
             });
         }
     }
 
-    fn update_vertex_input(
-        &mut self,
-        draw: &DrawCall,
-        dirty_flags: &mut [bool; 256],
-        engine_dirty_flags: Option<NonNull<[bool; 256]>>,
-    ) {
+    #[inline(never)]
+    fn update_vertex_input(&mut self, draw: &Maxwell3DDrawView<'_>, dirty_flags: &mut [bool; 256]) {
         use super::state_tracker::dirty;
 
         let vertex_input_dirty = dirty_flags[dirty::VERTEX_INPUT as usize];
@@ -2002,192 +2065,191 @@ impl RasterizerVulkan {
         }
         dirty_flags[dirty::VERTEX_INPUT as usize] = false;
 
-        let mut bindings = Vec::with_capacity(32);
-        let mut attributes = Vec::with_capacity(32);
+        let mut bindings = VertexInputBindings::new();
+        let mut attributes = VertexInputAttributes::new();
         let max_attributes = 32usize.min(self.max_vertex_input_attributes as usize);
         let max_bindings = 32usize.min(self.max_vertex_input_bindings as usize);
 
         for index in 0..max_attributes {
-            let attribute = draw.vertex_attribs[index];
+            let attribute = draw.vertex_attrib(index);
             let binding = attribute.buffer_index as usize;
             if attribute.constant || binding >= max_bindings {
                 continue;
             }
-            attributes.push((
-                index as u32,
-                binding as u32,
-                maxwell_to_vk::vertex_format(
-                    self.must_emulate_scaled_formats,
-                    attribute.attrib_type,
-                    attribute.size,
-                ),
-                attribute.offset,
-            ));
+            attributes.push(
+                vk::VertexInputAttributeDescription2EXT::builder()
+                    .location(index as u32)
+                    .binding(binding as u32)
+                    .format(maxwell_to_vk::vertex_format(
+                        self.must_emulate_scaled_formats,
+                        attribute.attrib_type,
+                        attribute.size,
+                    ))
+                    .offset(attribute.offset)
+                    .build(),
+            );
         }
 
         for binding in 0..max_bindings {
-            let stream = draw.vertex_streams[binding];
-            let is_instanced = draw.vertex_stream_instances[binding] != 0;
-            bindings.push((
-                binding as u32,
-                stream.stride,
-                is_instanced,
-                if is_instanced { stream.frequency } else { 1 },
-            ));
+            let stream = draw.vertex_stream(binding);
+            let is_instanced = draw.vertex_stream_instance(binding) != 0;
+            bindings.push(
+                vk::VertexInputBindingDescription2EXT::builder()
+                    .binding(binding as u32)
+                    .stride(stream.stride)
+                    .input_rate(if is_instanced {
+                        vk::VertexInputRate::INSTANCE
+                    } else {
+                        vk::VertexInputRate::VERTEX
+                    })
+                    .divisor(if is_instanced { stream.frequency } else { 1 })
+                    .build(),
+            );
         }
 
         for index in 0..32 {
             dirty_flags[dirty::VERTEX_ATTRIBUTE_0 as usize + index] = false;
+        }
+        for index in 0..32 {
             dirty_flags[dirty::VERTEX_BINDING_0 as usize + index] = false;
         }
-        if let Some(mut flags) = engine_dirty_flags {
-            unsafe {
-                flags.as_mut()[dirty::VERTEX_INPUT as usize..=dirty::VERTEX_BINDING_31 as usize]
-                    .copy_from_slice(
-                        &dirty_flags
-                            [dirty::VERTEX_INPUT as usize..=dirty::VERTEX_BINDING_31 as usize],
-                    );
-            }
-        }
-
         let extension = self
             .vertex_input_dynamic_state
             .as_ref()
             .expect("vertex input dynamic state loader missing")
             .clone();
+        let descriptions = VertexInputDescriptions {
+            bindings,
+            attributes,
+        };
         self.scheduler.record(move |cmdbuf| unsafe {
-            let binding_descriptions = bindings
-                .into_iter()
-                .map(|(binding, stride, is_instanced, divisor)| {
-                    vk::VertexInputBindingDescription2EXT::builder()
-                        .binding(binding)
-                        .stride(stride)
-                        .input_rate(if is_instanced {
-                            vk::VertexInputRate::INSTANCE
-                        } else {
-                            vk::VertexInputRate::VERTEX
-                        })
-                        .divisor(divisor)
-                        .build()
-                })
-                .collect::<Vec<_>>();
-            let attribute_descriptions = attributes
-                .into_iter()
-                .map(|(location, binding, format, offset)| {
-                    vk::VertexInputAttributeDescription2EXT::builder()
-                        .location(location)
-                        .binding(binding)
-                        .format(format)
-                        .offset(offset)
-                        .build()
-                })
-                .collect::<Vec<_>>();
-            (extension.cmd_set_vertex_input_ext)(
-                cmdbuf,
-                binding_descriptions.len() as u32,
-                binding_descriptions.as_ptr(),
-                attribute_descriptions.len() as u32,
-                attribute_descriptions.as_ptr(),
-            );
+            descriptions.set(&extension, cmdbuf);
         });
     }
 
-    fn update_primitive_restart_enable(&mut self, draw: &DrawCall) {
+    #[inline(never)]
+    fn update_primitive_restart_enable(&mut self, draw: &Maxwell3DDrawView<'_>) {
         if !self.state_tracker.touch_primitive_restart_enable() {
             return;
         }
-        let enabled = draw.primitive_restart.enabled;
-        let device = self.device.clone();
+        let mut enabled = draw.primitive_restart().enabled;
+        if self.driver_id == vk::DriverId::MOLTENVK {
+            enabled = true;
+        } else if enabled {
+            let topology = maxwell_to_vk::primitive_topology(draw.draw_state().topology);
+            enabled = (topology != vk::PrimitiveTopology::PATCH_LIST
+                && self.topology_list_primitive_restart_supported)
+                || supports_primitive_restart(topology)
+                || (topology == vk::PrimitiveTopology::PATCH_LIST
+                    && self.patch_list_primitive_restart_supported);
+        }
+        let device = self.device;
         self.scheduler.record(move |cmdbuf| unsafe {
+            let device = device.get().get_logical();
             device.cmd_set_primitive_restart_enable(cmdbuf, enabled);
         });
     }
 
-    fn update_cull_mode(&mut self, draw: &DrawCall) {
+    #[inline(never)]
+    fn update_cull_mode(&mut self, draw: &Maxwell3DDrawView<'_>) {
         if !self.state_tracker.touch_cull_mode() {
             return;
         }
-        let cull_mode = if draw.rasterizer.cull_enable {
-            maxwell_to_vk::cull_face(draw.rasterizer.cull_face)
+        let rasterizer = draw.rasterizer();
+        let cull_mode = if rasterizer.cull_enable {
+            maxwell_to_vk::cull_face(rasterizer.cull_face)
         } else {
             vk::CullModeFlags::NONE
         };
-        let device = self.device.clone();
+        let device = self.device;
         self.scheduler.record(move |cmdbuf| unsafe {
+            let device = device.get().get_logical();
             device.cmd_set_cull_mode(cmdbuf, cull_mode);
         });
     }
 
-    fn update_depth_bounds_test_enable(&mut self, draw: &DrawCall) {
+    #[inline(never)]
+    fn update_depth_bounds_test_enable(&mut self, draw: &Maxwell3DDrawView<'_>) {
         if !self.state_tracker.touch_depth_bounds_test_enable() {
             return;
         }
-        let mut enabled = draw.depth_bounds_enable;
+        let mut enabled = draw.depth_bounds_enable();
         if enabled && !self.depth_bounds_supported {
             warn!("Depth bounds is enabled but not supported");
             enabled = false;
         }
-        let device = self.device.clone();
+        let device = self.device;
         self.scheduler.record(move |cmdbuf| unsafe {
+            let device = device.get().get_logical();
             device.cmd_set_depth_bounds_test_enable(cmdbuf, enabled);
         });
     }
 
-    fn update_depth_test_enable(&mut self, draw: &DrawCall) {
+    #[inline(never)]
+    fn update_depth_test_enable(&mut self, draw: &Maxwell3DDrawView<'_>) {
         if !self.state_tracker.touch_depth_test_enable() {
             return;
         }
-        let enabled = draw.depth_stencil.depth_test_enable;
-        let device = self.device.clone();
+        let enabled = draw.depth_stencil().depth_test_enable;
+        let device = self.device;
         self.scheduler.record(move |cmdbuf| unsafe {
+            let device = device.get().get_logical();
             device.cmd_set_depth_test_enable(cmdbuf, enabled);
         });
     }
 
-    fn update_depth_write_enable(&mut self, draw: &DrawCall) {
+    #[inline(never)]
+    fn update_depth_write_enable(&mut self, draw: &Maxwell3DDrawView<'_>) {
         if !self.state_tracker.touch_depth_write_enable() {
             return;
         }
-        let enabled = draw.depth_stencil.depth_write_enable;
-        let device = self.device.clone();
+        let enabled = draw.depth_stencil().depth_write_enable;
+        let device = self.device;
         self.scheduler.record(move |cmdbuf| unsafe {
+            let device = device.get().get_logical();
             device.cmd_set_depth_write_enable(cmdbuf, enabled);
         });
     }
 
-    fn update_stencil_test_enable(&mut self, draw: &DrawCall) {
+    #[inline(never)]
+    fn update_stencil_test_enable(&mut self, draw: &Maxwell3DDrawView<'_>) {
         if !self.state_tracker.touch_stencil_test_enable() {
             return;
         }
-        let enabled = draw.depth_stencil.stencil_enable;
-        let device = self.device.clone();
+        let enabled = draw.depth_stencil().stencil_enable;
+        let device = self.device;
         self.scheduler.record(move |cmdbuf| unsafe {
+            let device = device.get().get_logical();
             device.cmd_set_stencil_test_enable(cmdbuf, enabled);
         });
     }
 
-    fn update_rasterizer_discard_enable(&mut self, draw: &DrawCall) {
+    #[inline(never)]
+    fn update_rasterizer_discard_enable(&mut self, draw: &Maxwell3DDrawView<'_>) {
         if !self.state_tracker.touch_rasterizer_discard_enable() {
             return;
         }
-        let enabled = !draw.rasterize_enable;
-        let device = self.device.clone();
+        let enabled = !draw.rasterize_enable();
+        let device = self.device;
         self.scheduler.record(move |cmdbuf| unsafe {
+            let device = device.get().get_logical();
             device.cmd_set_rasterizer_discard_enable(cmdbuf, enabled);
         });
     }
 
-    fn update_depth_bias_enable(&mut self, draw: &DrawCall) {
+    #[inline(never)]
+    fn update_depth_bias_enable(&mut self, draw: &Maxwell3DDrawView<'_>) {
         if !self.state_tracker.touch_depth_bias_enable() {
             return;
         }
-        let enabled = match draw.topology {
-            PrimitiveTopology::Points => draw.rasterizer.polygon_offset_point_enable,
+        let rasterizer = draw.rasterizer();
+        let enabled = match draw.draw_state().topology {
+            PrimitiveTopology::Points => rasterizer.polygon_offset_point_enable,
             PrimitiveTopology::Lines
             | PrimitiveTopology::LineLoop
             | PrimitiveTopology::LineStrip
             | PrimitiveTopology::LinesAdjacency
-            | PrimitiveTopology::LineStripAdjacency => draw.rasterizer.polygon_offset_line_enable,
+            | PrimitiveTopology::LineStripAdjacency => rasterizer.polygon_offset_line_enable,
             PrimitiveTopology::Triangles
             | PrimitiveTopology::TriangleStrip
             | PrimitiveTopology::TriangleFan
@@ -2196,52 +2258,60 @@ impl RasterizerVulkan {
             | PrimitiveTopology::Polygon
             | PrimitiveTopology::TrianglesAdjacency
             | PrimitiveTopology::TriangleStripAdjacency
-            | PrimitiveTopology::Patches => draw.rasterizer.polygon_offset_fill_enable,
+            | PrimitiveTopology::Patches => rasterizer.polygon_offset_fill_enable,
         };
-        let device = self.device.clone();
+        let device = self.device;
         self.scheduler.record(move |cmdbuf| unsafe {
+            let device = device.get().get_logical();
             device.cmd_set_depth_bias_enable(cmdbuf, enabled);
         });
     }
 
-    fn update_depth_compare_op(&mut self, draw: &DrawCall) {
+    #[inline(never)]
+    fn update_depth_compare_op(&mut self, draw: &Maxwell3DDrawView<'_>) {
         if !self.state_tracker.touch_depth_compare_op() {
             return;
         }
-        let op = maxwell_to_vk::comparison_op(draw.depth_stencil.depth_func);
-        let device = self.device.clone();
+        let op = maxwell_to_vk::comparison_op(draw.depth_stencil().depth_func);
+        let device = self.device;
         self.scheduler.record(move |cmdbuf| unsafe {
+            let device = device.get().get_logical();
             device.cmd_set_depth_compare_op(cmdbuf, op);
         });
     }
 
-    fn update_front_face(&mut self, draw: &DrawCall) {
+    #[inline(never)]
+    fn update_front_face(&mut self, draw: &Maxwell3DDrawView<'_>) {
         if !self.state_tracker.touch_front_face() {
             return;
         }
-        let mut front_face = maxwell_to_vk::front_face(draw.rasterizer.front_face);
-        if draw.window_origin_flip_y {
+        let mut front_face = maxwell_to_vk::front_face(draw.rasterizer().front_face);
+        if draw.window_origin_flip_y() {
             front_face = if front_face == vk::FrontFace::CLOCKWISE {
                 vk::FrontFace::COUNTER_CLOCKWISE
             } else {
                 vk::FrontFace::CLOCKWISE
             };
         }
-        let device = self.device.clone();
+        let device = self.device;
         self.scheduler.record(move |cmdbuf| unsafe {
+            let device = device.get().get_logical();
             device.cmd_set_front_face(cmdbuf, front_face);
         });
     }
 
-    fn update_stencil_op(&mut self, draw: &DrawCall) {
+    #[inline(never)]
+    fn update_stencil_op(&mut self, draw: &Maxwell3DDrawView<'_>) {
         if !self.state_tracker.touch_stencil_op() {
             return;
         }
-        let front = draw.depth_stencil.front;
-        let back = draw.depth_stencil.back;
-        let two_side = draw.depth_stencil.stencil_two_side;
-        let device = self.device.clone();
+        let depth_stencil = draw.depth_stencil();
+        let front = depth_stencil.front;
+        let back = depth_stencil.back;
+        let two_side = depth_stencil.stencil_two_side;
+        let device = self.device;
         self.scheduler.record(move |cmdbuf| unsafe {
+            let device = device.get().get_logical();
             if two_side {
                 device.cmd_set_stencil_op(
                     cmdbuf,
@@ -2272,19 +2342,50 @@ impl RasterizerVulkan {
         });
     }
 
-    fn update_viewports(&mut self, draw: &DrawCall) {
+    #[inline(never)]
+    fn update_viewports_state(&mut self, draw: &Maxwell3DDrawView<'_>) {
         if !self.state_tracker.touch_viewports() {
             return;
         }
-        let viewports = if !draw.viewport_scale_offset_enabled {
-            vec![vk::Viewport {
-                x: draw.surface_clip.x as f32,
-                y: draw.surface_clip.y as f32,
-                width: (draw.surface_clip.width as f32).max(1.0),
-                height: (draw.surface_clip.height as f32).max(1.0),
+        let viewport_transforms = draw.viewport_transforms();
+        self.record_viewports(
+            &viewport_transforms,
+            draw.viewport_scale_offset_enabled(),
+            draw.window_origin_lower_left(),
+            draw.surface_clip(),
+            draw.depth_mode(),
+        );
+    }
+
+    /// Mechanical Rust helper shared by the draw and clear snapshots. Upstream
+    /// passes the same mutable Maxwell register object to `UpdateViewportsState`.
+    fn record_viewports(
+        &mut self,
+        viewport_transforms: &[crate::engines::maxwell_3d::ViewportTransformInfo; NUM_VIEWPORTS],
+        viewport_scale_offset_enabled: bool,
+        window_origin_lower_left: bool,
+        surface_clip: crate::engines::maxwell_3d::SurfaceClipInfo,
+        depth_mode: crate::engines::maxwell_3d::DepthMode,
+    ) {
+        // Upstream dirties scissors whenever viewports are consumed. Both
+        // states depend on viewport-scale enable and surface-clip registers.
+        self.state_tracker.invalidate_scissors();
+        let viewports = if !viewport_scale_offset_enabled {
+            let mut y = surface_clip.y as f32;
+            let mut height = (surface_clip.height as f32).max(1.0);
+            if window_origin_lower_left {
+                y += height;
+                height = -height;
+            }
+            let viewport = vk::Viewport {
+                x: surface_clip.x as f32,
+                y,
+                width: (surface_clip.width as f32).max(1.0),
+                height,
                 min_depth: 0.0,
                 max_depth: 1.0,
-            }]
+            };
+            vec![viewport; self.max_viewports as usize]
         } else {
             let scale = if self.texture_cache.base.is_rescaling {
                 common::settings::values().resolution_info.up_factor
@@ -2293,7 +2394,10 @@ impl RasterizerVulkan {
             };
             std::array::from_fn::<_, { NUM_VIEWPORTS }, _>(|index| {
                 viewport_state(
-                    draw,
+                    viewport_transforms,
+                    depth_mode,
+                    window_origin_lower_left,
+                    surface_clip.height,
                     index,
                     scale,
                     self.depth_range_unrestricted,
@@ -2302,96 +2406,133 @@ impl RasterizerVulkan {
             })[..self.max_viewports as usize]
                 .to_vec()
         };
-        let device = self.device.clone();
+        let device = self.device;
         self.scheduler.record(move |cmdbuf| unsafe {
+            let device = device.get().get_logical();
             device.cmd_set_viewport(cmdbuf, 0, &viewports);
         });
     }
 
-    fn update_scissors(&mut self, draw: &DrawCall) {
+    #[inline(never)]
+    fn update_scissors_state(&mut self, draw: &Maxwell3DDrawView<'_>) {
         if !self.state_tracker.touch_scissors() {
             return;
         }
-        let scissor = if !draw.viewport_scale_offset_enabled {
+        let surface_clip = draw.surface_clip();
+        let viewport_scale_offset_enabled = draw.viewport_scale_offset_enabled();
+        let window_origin_lower_left = draw.window_origin_lower_left();
+        let scissor = if !viewport_scale_offset_enabled {
+            let height = surface_clip.height.max(1);
+            let y = if window_origin_lower_left {
+                surface_clip
+                    .height
+                    .wrapping_sub(surface_clip.y.wrapping_add(height))
+            } else {
+                surface_clip.y
+            };
             vk::Rect2D {
                 offset: vk::Offset2D {
-                    x: draw.surface_clip.x as i32,
-                    y: draw.surface_clip.y as i32,
+                    x: surface_clip.x as i32,
+                    y: y as i32,
                 },
                 extent: vk::Extent2D {
-                    width: draw.surface_clip.width.max(1),
-                    height: draw.surface_clip.height.max(1),
+                    width: surface_clip.width.max(1),
+                    height,
                 },
             }
-        } else if draw.scissors[0].enabled {
-            scissor_state(draw, 0)
         } else {
-            scissor_state(draw, 0)
+            vk::Rect2D::default()
         };
-        let scissors = if draw.viewport_scale_offset_enabled {
-            std::array::from_fn::<_, { NUM_VIEWPORTS }, _>(|index| scissor_state(draw, index))
-                [..self.max_viewports as usize]
+        let scissors = if viewport_scale_offset_enabled {
+            let resolution = &common::settings::values().resolution_info;
+            let (up_scale, down_shift) = if self.texture_cache.base.is_rescaling {
+                (resolution.up_scale, resolution.down_shift)
+            } else {
+                (1, 0)
+            };
+            std::array::from_fn::<_, { NUM_VIEWPORTS }, _>(|index| {
+                scissor_state(
+                    draw.scissor(index),
+                    window_origin_lower_left,
+                    surface_clip.height,
+                    up_scale,
+                    down_shift,
+                )
+            })[..self.max_viewports as usize]
                 .to_vec()
         } else {
-            vec![scissor]
+            vec![scissor; self.max_viewports as usize]
         };
-        let device = self.device.clone();
+        let device = self.device;
         self.scheduler.record(move |cmdbuf| unsafe {
+            let device = device.get().get_logical();
             device.cmd_set_scissor(cmdbuf, 0, &scissors);
         });
     }
 
-    fn update_depth_bias(&mut self, draw: &DrawCall) {
+    #[inline(never)]
+    fn update_depth_bias(&mut self, draw: &Maxwell3DDrawView<'_>) {
         if !self.state_tracker.touch_depth_bias() {
             return;
         }
-        let constant = draw.rasterizer.depth_bias;
-        let clamp = draw.rasterizer.depth_bias_clamp;
-        let slope = draw.rasterizer.slope_scale_depth_bias;
-        let device = self.device.clone();
+        // Upstream Maxwell depth-bias units are halved before being passed to
+        // Vulkan (`RasterizerVulkan::UpdateDepthBias`).
+        let rasterizer = draw.rasterizer();
+        let constant = depth_bias_constant(
+            rasterizer.depth_bias,
+            draw.zeta().format,
+            self.supports_d24_depth,
+            self.channel_caches.program_id,
+        );
+        let clamp = rasterizer.depth_bias_clamp;
+        let slope = rasterizer.slope_scale_depth_bias;
+        let device = self.device;
         self.scheduler.record(move |cmdbuf| unsafe {
+            let device = device.get().get_logical();
             device.cmd_set_depth_bias(cmdbuf, constant, clamp, slope);
         });
     }
 
-    fn update_blend_constants(&mut self, draw: &DrawCall) {
+    #[inline(never)]
+    fn update_blend_constants(&mut self, draw: &Maxwell3DDrawView<'_>) {
         if !self.state_tracker.touch_blend_constants() {
             return;
         }
-        let blend_constants = [
-            draw.blend_color.r,
-            draw.blend_color.g,
-            draw.blend_color.b,
-            draw.blend_color.a,
-        ];
-        let device = self.device.clone();
+        let blend_color = draw.blend_color();
+        let blend_constants = [blend_color.r, blend_color.g, blend_color.b, blend_color.a];
+        let device = self.device;
         self.scheduler.record(move |cmdbuf| unsafe {
+            let device = device.get().get_logical();
             device.cmd_set_blend_constants(cmdbuf, &blend_constants);
         });
     }
 
     fn record_stencil_reference(&mut self, face: vk::StencilFaceFlags, value: u32) {
-        let device = self.device.clone();
+        let device = self.device;
         self.scheduler.record(move |cmdbuf| unsafe {
+            let device = device.get().get_logical();
             device.cmd_set_stencil_reference(cmdbuf, face, value);
         });
     }
 
     fn record_stencil_write_mask(&mut self, face: vk::StencilFaceFlags, value: u32) {
-        let device = self.device.clone();
+        let device = self.device;
         self.scheduler.record(move |cmdbuf| unsafe {
+            let device = device.get().get_logical();
             device.cmd_set_stencil_write_mask(cmdbuf, face, value);
         });
     }
 
     fn record_stencil_compare_mask(&mut self, face: vk::StencilFaceFlags, value: u32) {
-        let device = self.device.clone();
+        let device = self.device;
         self.scheduler.record(move |cmdbuf| unsafe {
+            let device = device.get().get_logical();
             device.cmd_set_stencil_compare_mask(cmdbuf, face, value);
         });
     }
 
-    fn update_stencil_faces(&mut self, draw: &DrawCall) {
+    #[inline(never)]
+    fn update_stencil_faces(&mut self, draw: &Maxwell3DDrawView<'_>) {
         if !self.state_tracker.touch_stencil_properties() {
             return;
         }
@@ -2399,573 +2540,172 @@ impl RasterizerVulkan {
         let mut update_write_mask = self.state_tracker.touch_stencil_write_mask();
         let mut update_compare_masks = self.state_tracker.touch_stencil_compare();
 
+        let depth_stencil = draw.depth_stencil();
         if self
             .state_tracker
-            .touch_stencil_side(draw.depth_stencil.stencil_two_side)
+            .touch_stencil_side(depth_stencil.stencil_two_side)
         {
             update_references = true;
             update_write_mask = true;
             update_compare_masks = true;
         }
 
-        let front = draw.depth_stencil.front;
-        let back = draw.depth_stencil.back;
+        let front = depth_stencil.front;
+        let back = depth_stencil.back;
 
         if update_references {
-            if draw.depth_stencil.stencil_two_side && front.ref_value != back.ref_value {
-                if self
-                    .state_tracker
-                    .check_stencil_reference_front(front.ref_value)
-                {
-                    self.record_stencil_reference(vk::StencilFaceFlags::FRONT, front.ref_value);
-                }
-                if self
-                    .state_tracker
-                    .check_stencil_reference_back(back.ref_value)
-                {
-                    self.record_stencil_reference(vk::StencilFaceFlags::BACK, back.ref_value);
-                }
-            } else if self
+            let back_value = if depth_stencil.stencil_two_side {
+                back.ref_value
+            } else {
+                front.ref_value
+            };
+            let front_changed = self
                 .state_tracker
-                .check_stencil_reference_front(front.ref_value)
-            {
+                .check_stencil_reference_front(front.ref_value);
+            let back_changed = self.state_tracker.check_stencil_reference_back(back_value);
+            if front_changed || back_changed {
+                let split = depth_stencil.stencil_two_side && front.ref_value != back.ref_value;
                 self.record_stencil_reference(
-                    vk::StencilFaceFlags::FRONT_AND_BACK,
+                    if split {
+                        vk::StencilFaceFlags::FRONT
+                    } else {
+                        vk::StencilFaceFlags::FRONT_AND_BACK
+                    },
                     front.ref_value,
                 );
+                if split {
+                    self.record_stencil_reference(vk::StencilFaceFlags::BACK, back.ref_value);
+                }
             }
         }
 
         if update_write_mask {
-            if draw.depth_stencil.stencil_two_side && front.write_mask != back.write_mask {
-                if self
-                    .state_tracker
-                    .check_stencil_write_mask_front(front.write_mask)
-                {
-                    self.record_stencil_write_mask(vk::StencilFaceFlags::FRONT, front.write_mask);
-                }
-                if self
-                    .state_tracker
-                    .check_stencil_write_mask_back(back.write_mask)
-                {
-                    self.record_stencil_write_mask(vk::StencilFaceFlags::BACK, back.write_mask);
-                }
-            } else if self
+            let back_value = if depth_stencil.stencil_two_side {
+                back.write_mask
+            } else {
+                front.write_mask
+            };
+            let front_changed = self
                 .state_tracker
-                .check_stencil_write_mask_front(front.write_mask)
-            {
+                .check_stencil_write_mask_front(front.write_mask);
+            let back_changed = self.state_tracker.check_stencil_write_mask_back(back_value);
+            if front_changed || back_changed {
+                let split = depth_stencil.stencil_two_side && front.write_mask != back.write_mask;
                 self.record_stencil_write_mask(
-                    vk::StencilFaceFlags::FRONT_AND_BACK,
+                    if split {
+                        vk::StencilFaceFlags::FRONT
+                    } else {
+                        vk::StencilFaceFlags::FRONT_AND_BACK
+                    },
                     front.write_mask,
                 );
+                if split {
+                    self.record_stencil_write_mask(vk::StencilFaceFlags::BACK, back.write_mask);
+                }
             }
         }
 
         if update_compare_masks {
-            if draw.depth_stencil.stencil_two_side && front.func_mask != back.func_mask {
-                if self
-                    .state_tracker
-                    .check_stencil_compare_mask_front(front.func_mask)
-                {
-                    self.record_stencil_compare_mask(vk::StencilFaceFlags::FRONT, front.func_mask);
-                }
-                if self
-                    .state_tracker
-                    .check_stencil_compare_mask_back(back.func_mask)
-                {
-                    self.record_stencil_compare_mask(vk::StencilFaceFlags::BACK, back.func_mask);
-                }
-            } else if self
+            let back_value = if depth_stencil.stencil_two_side {
+                back.func_mask
+            } else {
+                front.func_mask
+            };
+            let front_changed = self
                 .state_tracker
-                .check_stencil_compare_mask_front(front.func_mask)
-            {
+                .check_stencil_compare_mask_front(front.func_mask);
+            let back_changed = self
+                .state_tracker
+                .check_stencil_compare_mask_back(back_value);
+            if front_changed || back_changed {
+                let split = depth_stencil.stencil_two_side && front.func_mask != back.func_mask;
                 self.record_stencil_compare_mask(
-                    vk::StencilFaceFlags::FRONT_AND_BACK,
+                    if split {
+                        vk::StencilFaceFlags::FRONT
+                    } else {
+                        vk::StencilFaceFlags::FRONT_AND_BACK
+                    },
                     front.func_mask,
                 );
+                if split {
+                    self.record_stencil_compare_mask(vk::StencilFaceFlags::BACK, back.func_mask);
+                }
             }
         }
 
         self.state_tracker.clear_stencil_reset();
     }
 
-    fn update_depth_bounds(&mut self, _draw: &DrawCall) {
+    #[inline(never)]
+    fn update_depth_bounds(&mut self, draw: &Maxwell3DDrawView<'_>) {
         if !self.state_tracker.touch_depth_bounds() {
             return;
         }
-        // Depth bounds test not currently used, but set safe defaults
-        let device = self.device.clone();
+        let [min, max] = draw.depth_bounds();
+        let device = self.device;
         self.scheduler.record(move |cmdbuf| unsafe {
-            device.cmd_set_depth_bounds(cmdbuf, 0.0, 1.0);
+            let device = device.get().get_logical();
+            device.cmd_set_depth_bounds(cmdbuf, min, max);
         });
     }
 
-    fn update_line_width(&mut self, draw: &DrawCall) {
+    #[inline(never)]
+    fn update_line_width(&mut self, draw: &Maxwell3DDrawView<'_>) {
         if !self.state_tracker.touch_line_width() {
             return;
         }
-        let width = draw.rasterizer.line_width_smooth.max(1.0);
-        let device = self.device.clone();
+        let rasterizer = draw.rasterizer();
+        let width = if draw.line_state().line_anti_alias_enable {
+            rasterizer.line_width_smooth
+        } else {
+            rasterizer.line_width_aliased
+        };
+        let device = self.device;
         self.scheduler.record(move |cmdbuf| unsafe {
+            let device = device.get().get_logical();
             device.cmd_set_line_width(cmdbuf, width);
         });
-    }
-
-    fn bind_graphics_texture_buffer_view(
-        &mut self,
-        stage: usize,
-        index: usize,
-        view: ImageViewInOut,
-        is_written: bool,
-        is_image: bool,
-    ) {
-        let (gpu_addr, size, format) = if view.id.is_valid() && view.id != NULL_IMAGE_VIEW_ID {
-            let base = &self.texture_cache.base.slot_image_views[view.id];
-            (
-                base.gpu_addr,
-                crate::surface::bytes_per_block(base.format).saturating_mul(base.size.width),
-                base.format as u32,
-            )
-        } else {
-            (0, 0, crate::surface::PixelFormat::Invalid as u32)
-        };
-        self.common_buffer_cache.bind_graphics_texture_buffer(
-            stage, index, gpu_addr, size, format, is_written, is_image,
-        );
-    }
-
-    fn bind_graphics_descriptors(
-        &mut self,
-        descriptor_set_layout: vk::DescriptorSetLayout,
-        descriptor_bindings: &[GraphicsDescriptorBinding],
-        stage_infos: &[Option<ShaderInfo>; 5],
-        enabled_uniform_buffer_masks: &[u32; crate::buffer_cache::buffer_cache_base::NUM_STAGES
-             as usize],
-        uniform_buffer_sizes: &crate::buffer_cache::buffer_cache_base::UniformBufferSizes,
-        draw: &DrawCall,
-        is_indexed: bool,
-        read_gpu: &dyn Fn(u64, &mut [u8]),
-        read_gpu_unsafe: &dyn Fn(u64, &mut [u8]) -> bool,
-    ) -> Option<PreparedGraphicsDescriptors> {
-        let mut prepared = PreparedGraphicsDescriptors::default();
-        self.common_buffer_cache
-            .set_uniform_buffers_state(enabled_uniform_buffer_masks, uniform_buffer_sizes);
-
-        if descriptor_set_layout == vk::DescriptorSetLayout::null()
-            || descriptor_bindings.is_empty()
-        {
-            self.common_buffer_cache.update_graphics_buffers(is_indexed);
-            self.common_buffer_cache
-                .bind_host_geometry_buffers(is_indexed);
-            return Some(prepared);
-        }
-
-        self.texture_cache
-            .base
-            .synchronize_graphics_descriptors(DescriptorSyncRegs {
-                sampler_binding_via_header: matches!(
-                    draw.sampler_binding,
-                    crate::engines::maxwell_3d::SamplerBinding::ViaHeaderBinding
-                ),
-                tex_header_addr: draw.tex_header_pool_addr,
-                tex_header_limit: draw.tex_header_pool_limit,
-                tex_sampler_addr: draw.tex_sampler_pool_addr,
-                tex_sampler_limit: draw.tex_sampler_pool_limit,
-            });
-
-        let via_header_index = matches!(
-            draw.sampler_binding,
-            crate::engines::maxwell_3d::SamplerBinding::ViaHeaderBinding
-        );
-        let read_u32 = |addr: u64| -> u32 {
-            let mut bytes = [0u8; 4];
-            read_gpu(addr, &mut bytes);
-            u32::from_le_bytes(bytes)
-        };
-        let read_stage_handle = |stage: usize,
-                                 cbuf_index: u32,
-                                 cbuf_offset: u32,
-                                 size_shift: u32,
-                                 element: u32,
-                                 has_secondary: bool,
-                                 shift_left: u32,
-                                 secondary_cbuf_index: u32,
-                                 secondary_cbuf_offset: u32,
-                                 secondary_shift_left: u32|
-         -> Option<(u32, u32)> {
-            let index_offset = element.checked_shl(size_shift)?;
-            let cbuf = draw.cb_bindings[stage].get(cbuf_index as usize)?;
-            if !cbuf.enabled {
-                log::error!(
-                    "shader descriptor references disabled CBUF {} in stage {}",
-                    cbuf_index,
-                    stage
-                );
-                return None;
-            }
-            let addr = cbuf
-                .address
-                .wrapping_add(cbuf_offset.checked_add(index_offset)? as u64);
-            if !has_secondary {
-                return Some(texture_pair(read_u32(addr), via_header_index));
-            }
-            let secondary = draw.cb_bindings[stage].get(secondary_cbuf_index as usize)?;
-            if !secondary.enabled {
-                log::error!(
-                    "shader descriptor references disabled secondary CBUF {} in stage {}",
-                    secondary_cbuf_index,
-                    stage
-                );
-                return None;
-            }
-            let secondary_addr = secondary
-                .address
-                .wrapping_add(secondary_cbuf_offset.checked_add(index_offset)? as u64);
-            Some(texture_pair(
-                (read_u32(addr) << shift_left) | (read_u32(secondary_addr) << secondary_shift_left),
-                via_header_index,
-            ))
-        };
-
-        let required_views = stage_infos
-            .iter()
-            .flatten()
-            .map(|info| {
-                num_descriptors(&info.texture_buffer_descriptors)
-                    + num_descriptors(&info.image_buffer_descriptors)
-                    + num_descriptors(&info.texture_descriptors)
-                    + num_descriptors(&info.image_descriptors)
-            })
-            .sum::<u32>() as usize;
-        let required_samplers = stage_infos
-            .iter()
-            .flatten()
-            .map(|info| num_descriptors(&info.texture_descriptors))
-            .sum::<u32>() as usize;
-        if required_views > super::graphics_pipeline::MAX_IMAGE_ELEMENTS
-            || required_samplers > super::graphics_pipeline::MAX_IMAGE_ELEMENTS
-        {
-            log::error!(
-                "graphics pipeline descriptor arrays exceed MAX_IMAGE_ELEMENTS: views={} samplers={} max={}",
-                required_views,
-                required_samplers,
-                super::graphics_pipeline::MAX_IMAGE_ELEMENTS
-            );
-            return None;
-        }
-
-        let mut sampler_count = 0usize;
-        let mut view_count = 0usize;
-        for (stage, info) in stage_infos.iter().enumerate() {
-            let Some(info) = info else {
-                continue;
-            };
-            self.common_buffer_cache
-                .unbind_graphics_storage_buffers(stage);
-            for (ssbo_index, desc) in info.storage_buffers_descriptors.iter().enumerate() {
-                if desc.count != 1 {
-                    log::error!(
-                        "storage buffer descriptor count is {}, expected 1",
-                        desc.count
-                    );
-                }
-                self.common_buffer_cache.bind_graphics_storage_buffer(
-                    stage,
-                    ssbo_index,
-                    desc.cbuf_index,
-                    desc.cbuf_offset,
-                    desc.is_written,
-                );
-            }
-
-            let mut add_view = |tic_id: u32, blacklist: bool| {
-                prepared.views[view_count] = ImageViewInOut {
-                    index: tic_id,
-                    blacklist,
-                    id: NULL_IMAGE_VIEW_ID,
-                };
-                view_count += 1;
-            };
-            for desc in &info.texture_buffer_descriptors {
-                for element in 0..desc.count {
-                    let (tic_id, _) = read_stage_handle(
-                        stage,
-                        desc.cbuf_index,
-                        desc.cbuf_offset,
-                        desc.size_shift,
-                        element,
-                        desc.has_secondary,
-                        desc.shift_left,
-                        desc.secondary_cbuf_index,
-                        desc.secondary_cbuf_offset,
-                        desc.secondary_shift_left,
-                    )
-                    .unwrap_or_default();
-                    add_view(tic_id, false);
-                }
-            }
-            for desc in &info.image_buffer_descriptors {
-                for element in 0..desc.count {
-                    let (tic_id, _) = read_stage_handle(
-                        stage,
-                        desc.cbuf_index,
-                        desc.cbuf_offset,
-                        desc.size_shift,
-                        element,
-                        false,
-                        0,
-                        0,
-                        0,
-                        0,
-                    )
-                    .unwrap_or_default();
-                    add_view(tic_id, false);
-                }
-            }
-            for desc in &info.texture_descriptors {
-                for element in 0..desc.count {
-                    let (tic_id, tsc_id) = read_stage_handle(
-                        stage,
-                        desc.cbuf_index,
-                        desc.cbuf_offset,
-                        desc.size_shift,
-                        element,
-                        desc.has_secondary,
-                        desc.shift_left,
-                        desc.secondary_cbuf_index,
-                        desc.secondary_cbuf_offset,
-                        desc.secondary_shift_left,
-                    )
-                    .unwrap_or_default();
-                    add_view(tic_id, false);
-                    prepared.samplers[sampler_count] =
-                        self.texture_cache.base.get_graphics_sampler_id(tsc_id);
-                    sampler_count += 1;
-                }
-            }
-            for desc in &info.image_descriptors {
-                for element in 0..desc.count {
-                    let (tic_id, _) = read_stage_handle(
-                        stage,
-                        desc.cbuf_index,
-                        desc.cbuf_offset,
-                        desc.size_shift,
-                        element,
-                        false,
-                        0,
-                        0,
-                        0,
-                        0,
-                    )
-                    .unwrap_or_default();
-                    add_view(tic_id, desc.is_written);
-                }
-            }
-        }
-        prepared.view_count = view_count;
-        let has_images = stage_infos
-            .iter()
-            .flatten()
-            .any(|info| !info.image_descriptors.is_empty());
-        self.texture_cache
-            .fill_graphics_image_views(&mut prepared.views[..view_count], has_images);
-
-        let mut view_cursor = 0usize;
-        for (stage, info) in stage_infos.iter().enumerate() {
-            let Some(info) = info else {
-                continue;
-            };
-            self.common_buffer_cache
-                .unbind_graphics_texture_buffers(stage);
-            let mut binding_index = 0usize;
-            for desc in &info.texture_buffer_descriptors {
-                for _ in 0..desc.count {
-                    self.bind_graphics_texture_buffer_view(
-                        stage,
-                        binding_index,
-                        prepared.views[view_cursor],
-                        false,
-                        false,
-                    );
-                    binding_index += 1;
-                    view_cursor += 1;
-                }
-            }
-            for desc in &info.image_buffer_descriptors {
-                for _ in 0..desc.count {
-                    self.bind_graphics_texture_buffer_view(
-                        stage,
-                        binding_index,
-                        prepared.views[view_cursor],
-                        desc.is_written,
-                        true,
-                    );
-                    binding_index += 1;
-                    view_cursor += 1;
-                }
-            }
-            view_cursor += num_descriptors(&info.texture_descriptors) as usize;
-            view_cursor += num_descriptors(&info.image_descriptors) as usize;
-        }
-
-        for stage in 0..enabled_uniform_buffer_masks.len() {
-            let mut bits = enabled_uniform_buffer_masks[stage];
-            let mut index = 0u32;
-            while bits != 0 {
-                let skip = bits.trailing_zeros();
-                index += skip;
-                bits >>= skip;
-                let binding = draw.cb_bindings[stage][index as usize];
-                if binding.enabled && binding.address != 0 && binding.size != 0 {
-                    self.common_buffer_cache.bind_graphics_uniform_buffer(
-                        stage,
-                        index,
-                        binding.address,
-                        binding.size,
-                    );
-                } else {
-                    self.common_buffer_cache
-                        .disable_graphics_uniform_buffer(stage, index);
-                }
-                index += 1;
-                bits >>= 1;
-            }
-        }
-
-        self.common_buffer_cache.update_graphics_buffers(is_indexed);
-        self.common_buffer_cache
-            .bind_host_geometry_buffers(is_indexed);
-        self.desc_queue.acquire();
-
-        let mut rescaling = RescalingPushConstant::new();
-        let mut sampler_cursor = 0usize;
-        view_cursor = 0;
-        for (stage, info) in stage_infos.iter().enumerate() {
-            let Some(info) = info else {
-                continue;
-            };
-            self.common_buffer_cache.bind_host_stage_buffers(stage);
-            view_cursor += num_descriptors(&info.texture_buffer_descriptors) as usize;
-            view_cursor += num_descriptors(&info.image_buffer_descriptors) as usize;
-            for desc in &info.texture_descriptors {
-                for _ in 0..desc.count {
-                    let view_id = prepared.views[view_cursor].id;
-                    let image_view = self
-                        .texture_cache
-                        .materialize_sampled_image_view(view_id, desc.texture_type, read_gpu_unsafe)
-                        .unwrap_or_else(|| {
-                            self.texture_cache.null_image_view_handle(desc.texture_type)
-                        });
-                    let supports_anisotropy = view_id.is_valid()
-                        && view_id != NULL_IMAGE_VIEW_ID
-                        && self.texture_cache.base.slot_image_views[view_id].supports_anisotropy();
-                    let sampler = self
-                        .texture_cache
-                        .sampler(prepared.samplers[sampler_cursor])
-                        .map(|sampler| {
-                            if sampler.has_added_anisotropy() && !supports_anisotropy {
-                                sampler.handle_with_default_anisotropy()
-                            } else {
-                                sampler.handle()
-                            }
-                        })
-                        .unwrap_or(self.fallback_sampler);
-                    self.desc_queue.add_sampled_image(image_view, sampler);
-                    rescaling
-                        .push_texture(self.texture_cache.base.is_rescaling_image_view(view_id));
-                    view_cursor += 1;
-                    sampler_cursor += 1;
-                }
-            }
-            for desc in &info.image_descriptors {
-                for _ in 0..desc.count {
-                    let view_id = prepared.views[view_cursor].id;
-                    let image_view = if view_id.is_valid() && view_id != NULL_IMAGE_VIEW_ID {
-                        let _ = self.texture_cache.materialize_sampled_image_view(
-                            view_id,
-                            desc.texture_type,
-                            read_gpu_unsafe,
-                        );
-                        if desc.is_written {
-                            let image_id =
-                                self.texture_cache.base.slot_image_views[view_id].image_id;
-                            if image_id.is_valid() && image_id != NULL_IMAGE_ID {
-                                self.texture_cache.base.mark_modification_by_id(image_id);
-                            }
-                        }
-                        self.texture_cache
-                            .image_view_storage_view(view_id, desc.texture_type, desc.format)
-                            .or_else(|| {
-                                self.texture_cache
-                                    .null_storage_image_view(desc.texture_type, desc.format)
-                            })
-                            .unwrap_or(vk::ImageView::null())
-                    } else {
-                        self.texture_cache
-                            .null_storage_image_view(desc.texture_type, desc.format)
-                            .unwrap_or(vk::ImageView::null())
-                    };
-                    self.desc_queue.add_image(image_view);
-                    rescaling.push_image(self.texture_cache.base.is_rescaling_image_view(view_id));
-                    view_cursor += 1;
-                }
-            }
-        }
-        let expected_descriptor_count = descriptor_bindings
-            .iter()
-            .map(|binding| binding.descriptor_count as usize)
-            .sum::<usize>();
-        if self.desc_queue.pending_count() != expected_descriptor_count {
-            log::error!(
-                "descriptor payload/layout mismatch: queued={} expected={}",
-                self.desc_queue.pending_count(),
-                expected_descriptor_count
-            );
-            return None;
-        }
-        prepared.descriptor_data = Some(DescriptorData(self.desc_queue.update_data()));
-        prepared.rescaling_data = *rescaling.data();
-        Some(prepared)
     }
 
     // ── Framebuffer resize ────────────────────────────────────────────────
 
     fn resize_framebuffer(&mut self, new_width: u32, new_height: u32) -> Result<(), RendererError> {
+        let device = self.device.get().get_logical();
         unsafe {
-            self.device.device_wait_idle().ok();
+            device.device_wait_idle().ok();
         }
 
         // Destroy old resources
         unsafe {
-            self.device.destroy_framebuffer(self.offscreen_fb, None);
-            self.device.destroy_image_view(self.offscreen_view, None);
-            self.device.destroy_image(self.offscreen_image, None);
-            self.device.free_memory(self.offscreen_memory, None);
-            self.device.destroy_image_view(self.depth_view, None);
-            self.device.destroy_image(self.depth_image, None);
-            self.device.free_memory(self.depth_memory, None);
-            self.device.unmap_memory(self.readback_memory);
-            self.device.destroy_buffer(self.readback_buffer, None);
-            self.device.free_memory(self.readback_memory, None);
+            device.destroy_framebuffer(self.offscreen_fb, None);
+            device.destroy_image_view(self.offscreen_view, None);
+            device.destroy_image(self.offscreen_image, None);
+            device.free_memory(self.offscreen_memory, None);
+            device.destroy_image_view(self.depth_view, None);
+            device.destroy_image(self.depth_image, None);
+            device.free_memory(self.depth_memory, None);
+            device.unmap_memory(self.readback_memory);
+            device.destroy_buffer(self.readback_buffer, None);
+            device.free_memory(self.readback_memory, None);
         }
 
         // Create new resources
         let (oi, om, ov) = create_color_attachment(
             &self.instance,
             self.physical_device,
-            &self.device,
+            device,
             new_width,
             new_height,
         )?;
         let (di, dm, dv) = create_depth_attachment(
             &self.instance,
             self.physical_device,
-            &self.device,
+            device,
             new_width,
             new_height,
         )?;
         let fb = create_framebuffer(
-            &self.device,
+            device,
             self.default_render_pass,
             ov,
             dv,
@@ -2977,7 +2717,7 @@ impl RasterizerVulkan {
         let (rb, rm, rp) = create_host_buffer(
             &self.instance,
             self.physical_device,
-            &self.device,
+            device,
             readback_size,
             vk::BufferUsageFlags::TRANSFER_DST,
         )?;
@@ -3016,7 +2756,7 @@ impl RasterizerVulkan {
         if framebuffer_addr == 0 {
             return None;
         }
-        let texture_cache: *mut TextureCache = &mut self.texture_cache;
+        let texture_cache: *mut TextureCache = &mut *self.texture_cache;
         // Upstream keeps TextureCache::mutex locked for the complete
         // AccelerateDisplay operation. Releasing it after the lookup lets the
         // GPU thread delete and recycle the returned ImageId before its image
@@ -3079,12 +2819,6 @@ impl RasterizerInterface for RasterizerVulkan {
         mut draw_view: crate::engines::draw_manager::Maxwell3DDrawView<'_>,
         instance_count: u32,
     ) {
-        let _gpu_tick_guard = GpuTickGuard(self.gpu_tick_callback.clone());
-        // Upstream `RasterizerVulkan::PrepareDraw` flushes cached GPU-memory
-        // writes before descriptors/textures are consumed by the draw.
-        if let Some(mm) = self.channel_memory_manager.as_ref().cloned() {
-            mm.lock().flush_caching();
-        }
         let draw_indexed = draw_view.is_indexed();
         self.draw_sequence = self.draw_sequence.wrapping_add(1);
         debug!(
@@ -3095,9 +2829,7 @@ impl RasterizerInterface for RasterizerVulkan {
             warn!("RasterizerVulkan::draw skipped: no bound channel memory manager");
             return;
         };
-        let engine_dirty_flags = draw_view.dirty_flags_ptr();
         let zpass_pixel_count_enabled = draw_view.zpass_pixel_count_enabled();
-        let draw_call = draw_view.draw_call_snapshot(instance_count);
         let read_gpu = |gpu_va: u64, output: &mut [u8]| {
             memory_manager.lock().read_block(gpu_va, output);
         };
@@ -3107,42 +2839,24 @@ impl RasterizerInterface for RasterizerVulkan {
                 .lock()
                 .read_block_unsafe(gpu_va, output)
         };
-        let mut dirty_flags = draw_call.dirty_flags;
-        self.draw_prepared(
-            &draw_call,
+        let original_dirty_flags = *draw_view.dirty_flags();
+        let mut dirty_flags = original_dirty_flags;
+        self.prepare_draw(
+            &mut draw_view,
+            instance_count,
             zpass_pixel_count_enabled,
             None,
             &mut dirty_flags,
-            engine_dirty_flags,
             &read_gpu,
             &read_gpu_unsafe,
         );
-        // Upstream backends consume `maxwell3d->dirty.flags` in place (e.g.
-        // TextureCache::UpdateRenderTargets clears Dirty::RenderTargets on the
-        // live engine). The snapshot in `draw_call` is a copy, so propagate
-        // the flags the backend consumed back to the engine — otherwise every
-        // draw re-runs the full render-target resolution.
-        for (index, dirty) in dirty_flags.iter().enumerate() {
-            // The common buffer cache consumes geometry flags directly through
-            // the channel-bound Maxwell3D. Replaying the pre-draw snapshot here
-            // would erase an invalidation raised during the draw's FlushWork.
-            if engine_dirty_flags.is_some() && is_geometry_dirty_flag(index) {
-                continue;
-            }
-            if !dirty && draw_call.dirty_flags[index] {
-                draw_view.clear_dirty_flag(index as u8);
-            }
-        }
+        propagate_consumed_dirty_flags(&mut draw_view, &original_dirty_flags, &dirty_flags);
     }
 
     fn draw_indirect(
         &mut self,
         mut indirect_view: crate::engines::draw_manager::Maxwell3DIndirectView<'_>,
     ) {
-        let _gpu_tick_guard = GpuTickGuard(self.gpu_tick_callback.clone());
-        if let Some(mm) = self.channel_memory_manager.as_ref().cloned() {
-            mm.lock().flush_caching();
-        }
         let params = *indirect_view.params();
         let Some(memory_manager) = self.channel_memory_manager.as_ref().cloned() else {
             warn!("RasterizerVulkan::draw_indirect skipped: no bound channel memory manager");
@@ -3150,9 +2864,7 @@ impl RasterizerInterface for RasterizerVulkan {
         };
 
         self.draw_sequence = self.draw_sequence.wrapping_add(1);
-        let engine_dirty_flags = indirect_view.dirty_flags_ptr();
         let zpass_pixel_count_enabled = indirect_view.draw_view_mut().zpass_pixel_count_enabled();
-        let draw_call = indirect_view.draw_call_snapshot();
         let read_gpu = |gpu_va: u64, output: &mut [u8]| {
             memory_manager.lock().read_block(gpu_va, output);
         };
@@ -3172,26 +2884,24 @@ impl RasterizerInterface for RasterizerVulkan {
         };
         self.common_buffer_cache
             .set_draw_indirect(Some(cache_params));
-        let mut dirty_flags = draw_call.dirty_flags;
-        self.draw_prepared(
-            &draw_call,
+        let original_dirty_flags = *indirect_view.draw_view_mut().dirty_flags();
+        let mut dirty_flags = original_dirty_flags;
+        let instance_count = indirect_view.draw_view_mut().draw_state().instance_count;
+        self.prepare_draw(
+            indirect_view.draw_view_mut(),
+            instance_count,
             zpass_pixel_count_enabled,
             Some(params),
             &mut dirty_flags,
-            engine_dirty_flags,
             &read_gpu,
             &read_gpu_unsafe,
         );
+        propagate_consumed_dirty_flags(
+            indirect_view.draw_view_mut(),
+            &original_dirty_flags,
+            &dirty_flags,
+        );
         self.common_buffer_cache.set_draw_indirect(None);
-
-        for (index, dirty) in dirty_flags.iter().enumerate() {
-            if engine_dirty_flags.is_some() && is_geometry_dirty_flag(index) {
-                continue;
-            }
-            if !dirty && draw_call.dirty_flags[index] {
-                indirect_view.clear_dirty_flag(index as u8);
-            }
-        }
     }
 
     fn draw_texture(
@@ -3202,12 +2912,10 @@ impl RasterizerInterface for RasterizerVulkan {
         self.flush_work();
 
         let draw_texture_state = draw_texture_view.draw_texture_state();
-        let dynamic_state = draw_texture_view.draw_call_snapshot();
         let render_targets = draw_texture_view.render_targets();
         let descriptor_sync_regs = draw_texture_view.descriptor_sync_regs();
-        let mut dirty_flags = draw_texture_view.dirty_flags();
-        let original_dirty_flags = dirty_flags;
-        let engine_dirty_flags = draw_texture_view.dirty_flags_ptr();
+        let original_dirty_flags = *draw_texture_view.dirty_flags();
+        let mut dirty_flags = original_dirty_flags;
 
         let Some(memory_manager) = self.channel_memory_manager.as_ref().cloned() else {
             log::warn!("RasterizerVulkan::draw_texture skipped: no bound channel memory manager");
@@ -3224,26 +2932,23 @@ impl RasterizerInterface for RasterizerVulkan {
         self.texture_cache
             .base
             .synchronize_graphics_descriptors(descriptor_sync_regs);
-        let Some(framebuffer) = self
-            .texture_cache
-            .update_render_targets_and_get_rt0_framebuffer(
-                &render_targets,
-                &mut dirty_flags,
-                &read_gpu_unsafe,
-                false,
-                None,
-            )
-        else {
-            log::warn!("RasterizerVulkan::draw_texture skipped: no framebuffer");
+        if !self.texture_cache.update_render_targets(
+            &render_targets,
+            &mut dirty_flags,
+            &read_gpu_unsafe,
+            false,
+            None,
+        ) {
+            log::warn!("RasterizerVulkan::draw_texture skipped: render-target update failed");
             return;
-        };
-        self.update_dynamic_states(&dynamic_state, &mut dirty_flags, engine_dirty_flags);
-        self.query_cache.notify_segment(true);
-        for (index, dirty) in dirty_flags.iter().enumerate() {
-            if !dirty && original_dirty_flags[index] {
-                draw_texture_view.clear_dirty_flag(index as u8);
-            }
         }
+        self.update_dynamic_states(draw_texture_view.draw_view_mut(), &mut dirty_flags);
+        propagate_consumed_dirty_flags(
+            draw_texture_view.draw_view_mut(),
+            &original_dirty_flags,
+            &dirty_flags,
+        );
+        self.query_cache.notify_segment(true);
         self.query_cache.counter_enable(
             &mut self.scheduler,
             QueryType::ZPassPixelCount64 as u32,
@@ -3252,8 +2957,7 @@ impl RasterizerInterface for RasterizerVulkan {
 
         let sampler_id = self
             .texture_cache
-            .base
-            .get_graphics_sampler_id(draw_texture_state.src_sampler);
+            .get_sampler_id(draw_texture_state.src_sampler, false);
         let Some(sampler) = self.texture_cache.sampler_handle(sampler_id) else {
             log::warn!(
                 "RasterizerVulkan::draw_texture skipped: invalid sampler {}",
@@ -3263,7 +2967,7 @@ impl RasterizerInterface for RasterizerVulkan {
         };
         let Some(texture) = self
             .texture_cache
-            .draw_texture_source(draw_texture_state.src_texture, &read_gpu_unsafe)
+            .draw_texture_source(draw_texture_state.src_texture)
         else {
             log::warn!(
                 "RasterizerVulkan::draw_texture skipped: invalid texture {}",
@@ -3271,12 +2975,19 @@ impl RasterizerInterface for RasterizerVulkan {
             );
             return;
         };
-        self.texture_cache
-            .prepare_render_targets_for_render(&framebuffer.image_ids);
+        let framebuffer = match self.texture_cache.get_framebuffer() {
+            Ok(framebuffer) => framebuffer,
+            Err(error) => {
+                log::warn!(
+                    "RasterizerVulkan::draw_texture skipped: framebuffer creation failed: {error:?}"
+                );
+                return;
+            }
+        };
 
         let cache_is_rescaling = self.texture_cache.base.is_rescaling;
         let src_rescaling = cache_is_rescaling && texture.is_rescaled;
-        let dst_rescaling = cache_is_rescaling && framebuffer.is_rescaled;
+        let dst_rescaling = cache_is_rescaling && framebuffer.is_rescaled();
         let resolution = common::settings::values().resolution_info.clone();
         let scale_src = |value: f32| {
             let value = value as i32;
@@ -3336,7 +3047,6 @@ impl RasterizerInterface for RasterizerVulkan {
         mut clear_view: crate::engines::draw_manager::Maxwell3DClearView<'_>,
         layer_count: u32,
     ) {
-        let _gpu_tick_guard = GpuTickGuard(self.gpu_tick_callback.clone());
         // Preserve upstream ordering: submit pending work before flushing the
         // channel GPU-memory cache.
         self.flush_work();
@@ -3357,7 +3067,7 @@ impl RasterizerInterface for RasterizerVulkan {
         }
 
         let render_targets = clear_view.render_targets();
-        let mut dirty_flags = clear_view.dirty_flags();
+        let mut dirty_flags = *clear_view.dirty_flags();
         let Some(memory_manager) = self.channel_memory_manager.as_ref().cloned() else {
             warn!("RasterizerVulkan::clear skipped: no bound channel memory manager");
             return;
@@ -3375,15 +3085,15 @@ impl RasterizerInterface for RasterizerVulkan {
         // alias synchronization is iterating slot_images.
         let texture_cache_mutex: *const _ = &self.texture_cache.base.mutex;
         let _texture_cache_guard = unsafe { (*texture_cache_mutex).lock() };
-        let target = self
-            .texture_cache
-            .update_render_targets_and_get_rt0_framebuffer(
-                &render_targets,
-                &mut dirty_flags,
-                &read_gpu_unsafe,
-                true,
-                clear_scissor,
-            );
+        if !self.texture_cache.update_render_targets(
+            &render_targets,
+            &mut dirty_flags,
+            &read_gpu_unsafe,
+            true,
+            clear_scissor,
+        ) {
+            return;
+        }
         // Same live-flag propagation as the draw path: the snapshot copy must
         // not swallow the flags consumed by UpdateRenderTargets.
         for (index, dirty) in dirty_flags.iter().enumerate() {
@@ -3391,72 +3101,119 @@ impl RasterizerInterface for RasterizerVulkan {
                 clear_view.clear_dirty_flag(index as u8);
             }
         }
-        let Some(target) = target else {
-            return;
-        };
-        let framebuffer = target.framebuffer;
-        let render_area = target.extent;
-        self.texture_cache
-            .prepare_render_targets_for_render(&target.image_ids);
-        let clear_values = [
-            vk::ClearValue {
-                color: vk::ClearColorValue {
-                    float32: clear_state.color,
-                },
-            },
-            vk::ClearValue {
-                depth_stencil: vk::ClearDepthStencilValue {
-                    depth: clear_state.depth,
-                    stencil: clear_state.stencil as u32,
-                },
-            },
-        ];
-        let mut render_pass_clears = vec![clear_values[0]; target.num_color.max(1) as usize];
-        if target.has_depth {
-            render_pass_clears.push(clear_values[1]);
-        }
-        self.scheduler.request_outside_renderpass();
-        self.scheduler.request_renderpass(
-            framebuffer,
-            target.render_pass,
-            vk::Rect2D {
-                offset: vk::Offset2D { x: 0, y: 0 },
-                extent: render_area,
-            },
-            &render_pass_clears,
-            &target.images,
-            &target.image_ranges,
-        );
-
-        let clear_rect_2d = if clear_view.use_scissor() {
-            let scissor = clear_view.scissor(0);
-            let offset_x = scissor.min_x.min(render_area.width) as i32;
-            let offset_y = scissor.min_y.min(render_area.height) as i32;
-            let max_x = scissor.max_x.min(render_area.width);
-            let max_y = scissor.max_y.min(render_area.height);
-            vk::Rect2D {
-                offset: vk::Offset2D {
-                    x: offset_x,
-                    y: offset_y,
-                },
-                extent: vk::Extent2D {
-                    width: max_x.saturating_sub(offset_x as u32),
-                    height: max_y.saturating_sub(offset_y as u32),
-                },
+        let target = match self.texture_cache.get_framebuffer() {
+            Ok(target) => target,
+            Err(error) => {
+                warn!("RasterizerVulkan::clear skipped: framebuffer creation failed: {error:?}");
+                return;
             }
+        };
+        let render_area = target.render_area();
+        let color_full_channels = use_r && use_g && use_b && use_a;
+        let depth_stencil = clear_view.depth_stencil();
+        let stencil_mask = depth_stencil.front.write_mask;
+        let stencil_partial = use_stencil
+            && target.has_aspect_stencil_bit()
+            && stencil_mask != 0xFF
+            && stencil_mask != 0;
+        let ds_used = use_depth || use_stencil;
+        let ds_deferrable = !ds_used
+            || ((!target.has_aspect_depth_bit() || use_depth)
+                && (!target.has_aspect_stencil_bit() || use_stencil)
+                && !stencil_partial);
+        let clear_layer = (clear_state.flags >> 10) & 0xFFFF;
+        const ENABLE_DEFERRED_CLEAR: bool = true;
+        let can_defer_clear = ENABLE_DEFERRED_CLEAR
+            && !clear_view.use_scissor()
+            && clear_layer == 0
+            && !self.scheduler.is_inside_renderpass()
+            && (!use_color || color_full_channels)
+            && ds_deferrable;
+        if !can_defer_clear {
+            self.scheduler.request_framebuffer(&target);
+        }
+
+        self.query_cache.notify_segment(true);
+        self.query_cache.counter_enable(
+            &mut self.scheduler,
+            QueryType::ZPassPixelCount64 as u32,
+            clear_view.zpass_pixel_count_enabled(),
+        );
+        let resolution = &common::settings::values().resolution_info;
+        let (up_scale, down_shift) = if self.texture_cache.base.is_rescaling {
+            (resolution.up_scale, resolution.down_shift)
+        } else {
+            (1, 0)
+        };
+        if self.state_tracker.touch_viewports() {
+            let viewport_transforms = clear_view.viewport_transforms();
+            self.record_viewports(
+                &viewport_transforms,
+                clear_view.viewport_scale_offset_enabled(),
+                clear_view.window_origin_lower_left(),
+                render_targets.surface_clip,
+                clear_view.depth_mode(),
+            );
+        }
+
+        let mut clear_rect_2d = if clear_view.use_scissor() {
+            scissor_state(
+                clear_view.scissor(0),
+                clear_view.window_origin_lower_left(),
+                render_targets.surface_clip.height,
+                up_scale,
+                down_shift,
+            )
         } else {
             vk::Rect2D {
                 offset: vk::Offset2D { x: 0, y: 0 },
-                extent: render_area,
+                extent: vk::Extent2D {
+                    width: i32::MAX as u32,
+                    height: i32::MAX as u32,
+                },
             }
         };
+        let clamp_axis = |offset: &mut i32, extent: &mut u32, limit: u32| {
+            if *extent == 0 {
+                *offset = (*offset).clamp(0, limit as i32);
+                return;
+            }
+            if *offset < 0 {
+                let shrink = (*extent).min(offset.wrapping_neg() as u32);
+                *extent -= shrink;
+                *offset = 0;
+            }
+            if limit == 0 {
+                *offset = 0;
+                *extent = 0;
+                return;
+            }
+            if *offset >= limit as i32 {
+                *offset = limit as i32;
+                *extent = 0;
+                return;
+            }
+            if (*offset as u64) + (*extent as u64) > limit as u64 {
+                *extent = limit - *offset as u32;
+            }
+        };
+        clamp_axis(
+            &mut clear_rect_2d.offset.x,
+            &mut clear_rect_2d.extent.width,
+            render_area.width,
+        );
+        clamp_axis(
+            &mut clear_rect_2d.offset.y,
+            &mut clear_rect_2d.extent.height,
+            render_area.height,
+        );
         if clear_rect_2d.extent.width == 0 || clear_rect_2d.extent.height == 0 {
             return;
         }
 
         let clear_rect = vk::ClearRect {
             rect: clear_rect_2d,
-            base_array_layer: ((clear_state.flags >> 10) & 0xFFFF),
+            base_array_layer: clear_layer,
             layer_count,
         };
         let color_attachment = ((clear_state.flags >> 6) & 0xF) as usize;
@@ -3466,7 +3223,10 @@ impl RasterizerInterface for RasterizerVulkan {
                 render_targets.render_targets[color_attachment].format,
             );
             let clear_value = make_color_clear_value(format, clear_state.color);
-            if use_r && use_g && use_b && use_a {
+            if color_full_channels && can_defer_clear {
+                self.scheduler
+                    .defer_color_clear(&target, color_attachment as u32, clear_value);
+            } else if color_full_channels {
                 attachments.push(vk::ClearAttachment {
                     aspect_mask: vk::ImageAspectFlags::COLOR,
                     color_attachment: color_attachment as u32,
@@ -3496,77 +3256,174 @@ impl RasterizerInterface for RasterizerVulkan {
             }
         }
         let mut depth_stencil_aspects = vk::ImageAspectFlags::empty();
-        if target.has_depth && use_depth {
+        if target.has_aspect_depth_bit() && use_depth {
             depth_stencil_aspects |= vk::ImageAspectFlags::DEPTH;
         }
-        if target.has_stencil && use_stencil {
+        if target.has_aspect_stencil_bit() && use_stencil {
             depth_stencil_aspects |= vk::ImageAspectFlags::STENCIL;
         }
         if !depth_stencil_aspects.is_empty() {
-            attachments.push(vk::ClearAttachment {
-                aspect_mask: depth_stencil_aspects,
-                color_attachment: 0,
-                clear_value: vk::ClearValue {
-                    depth_stencil: vk::ClearDepthStencilValue {
-                        depth: clear_state.depth,
-                        stencil: clear_state.stencil as u32,
+            if stencil_partial {
+                let dst_region = blit_image::Region2D {
+                    start: blit_image::Offset2D {
+                        x: clear_rect.rect.offset.x,
+                        y: clear_rect.rect.offset.y,
                     },
-                },
-            });
+                    end: blit_image::Offset2D {
+                        x: clear_rect.rect.offset.x + clear_rect.rect.extent.width as i32,
+                        y: clear_rect.rect.offset.y + clear_rect.rect.extent.height as i32,
+                    },
+                };
+                self.blit_image.clear_depth_stencil(
+                    target.blit_framebuffer_info(),
+                    use_depth,
+                    clear_state.depth,
+                    stencil_mask as u8,
+                    clear_state.stencil as u32,
+                    depth_stencil.front.func_mask,
+                    &dst_region,
+                );
+            } else if can_defer_clear {
+                self.scheduler.defer_depth_stencil_clear(
+                    &target,
+                    vk::ClearValue {
+                        depth_stencil: vk::ClearDepthStencilValue {
+                            depth: clear_state.depth,
+                            stencil: clear_state.stencil as u32,
+                        },
+                    },
+                );
+            } else {
+                attachments.push(vk::ClearAttachment {
+                    aspect_mask: depth_stencil_aspects,
+                    color_attachment: 0,
+                    clear_value: vk::ClearValue {
+                        depth_stencil: vk::ClearDepthStencilValue {
+                            depth: clear_state.depth,
+                            stencil: clear_state.stencil as u32,
+                        },
+                    },
+                });
+            }
         }
         if attachments.is_empty() {
             return;
         }
 
-        let device = self.device.clone();
+        let device = self.device;
         self.scheduler.record(move |cmdbuf| unsafe {
+            let device = device.get().get_logical();
             device.cmd_clear_attachments(cmdbuf, &attachments, &[clear_rect]);
         });
     }
 
-    fn dispatch_compute(&mut self) {
-        let _gpu_tick_guard = GpuTickGuard(self.gpu_tick_callback.clone());
-        debug!("RasterizerVulkan::dispatch_compute");
-    }
-
-    fn dispatch_compute_with_call(&mut self, dispatch: &DispatchCall) {
-        let _gpu_tick_guard = GpuTickGuard(self.gpu_tick_callback.clone());
+    fn dispatch_compute(&mut self, dispatch: &DispatchCall) {
         self.flush_work();
         if let Some(mm) = self.channel_memory_manager.as_ref().cloned() {
             mm.lock().flush_caching();
         }
 
-        let Some(current_pipeline) = self
+        let Some(mut current_pipeline) = self
             .pipeline_cache
-            .current_compute_pipeline_with_shared_cache(&mut self.shader_cache)
+            .current_compute_pipeline(&mut self.shader_cache)
         else {
             return;
         };
+        let Some(memory_manager) = self.channel_memory_manager.as_ref().cloned() else {
+            return;
+        };
+        let read_gpu = |address: u64, output: &mut [u8]| {
+            memory_manager.lock().read_block_unsafe(address, output)
+        };
+        let buffer_cache_mutex: *const _ = Arc::as_ptr(&self.common_buffer_cache.mutex);
+        let texture_cache_mutex: *const _ = &self.texture_cache.base.mutex;
+        lock_two_reentrant_mutexes!(
+            buffer_cache_mutex,
+            texture_cache_mutex,
+            _buffer_cache_guard,
+            _texture_cache_guard
+        );
+        let configured = unsafe { current_pipeline.owner_mut() }.configure(
+            dispatch,
+            &mut self.scheduler,
+            &mut self.common_buffer_cache,
+            &mut self.texture_cache,
+            self.fallback_sampler,
+            self.push_descriptor.clone(),
+            &read_gpu,
+        );
+        if !configured {
+            return;
+        }
+        let compute_pipeline = unsafe { current_pipeline.owner_mut() }.pipeline_state();
 
-        if current_pipeline.requires_descriptor_binding {
+        if let Some(indirect_address) = dispatch.indirect_compute_address {
+            let (buffer_id, offset) = self.common_buffer_cache.obtain_buffer(
+                indirect_address,
+                12,
+                ObtainBufferSynchronize::FullSynchronize,
+                ObtainBufferOperation::DiscardWrite,
+            );
+            let raw_buffer = self
+                .common_buffer_cache
+                .resolve_backend_buffer_raw(buffer_id);
+            if raw_buffer == 0 {
+                return;
+            }
+            let indirect_buffer = vk::Buffer::from_raw(raw_buffer);
+            let device = self.device;
+            self.scheduler.request_outside_renderpass();
+            self.scheduler.record(move |cmdbuf| unsafe {
+                if *compute_pipeline.lock().unwrap() == vk::Pipeline::null() {
+                    return;
+                }
+                let device = device.get().get_logical();
+                device.cmd_dispatch_indirect(cmdbuf, indirect_buffer, offset as u64);
+            });
             return;
         }
 
-        if dispatch.indirect_compute_address.is_some() {
-            return;
-        }
-
-        let device = self.device.clone();
-        let pipeline = current_pipeline.pipeline;
         let dim = [
-            dispatch.qmd.grid_dim_x,
-            dispatch.qmd.grid_dim_y,
-            dispatch.qmd.grid_dim_z,
+            dispatch.launch_description.grid_dim_x,
+            dispatch.launch_description.grid_dim_y,
+            dispatch.launch_description.grid_dim_z,
         ];
+        let max_dim = self.max_compute_work_group_count;
+        if dim[0] > max_dim[0] || dim[1] > max_dim[1] || dim[2] > max_dim[2] {
+            return;
+        }
+        let barrier_device = self.device;
         self.scheduler.request_outside_renderpass();
         self.scheduler.record(move |cmdbuf| unsafe {
-            device.cmd_bind_pipeline(cmdbuf, vk::PipelineBindPoint::COMPUTE, pipeline);
+            let barrier_device = barrier_device.get().get_logical();
+            let barrier = vk::MemoryBarrier::builder()
+                .src_access_mask(vk::AccessFlags::MEMORY_WRITE)
+                .dst_access_mask(vk::AccessFlags::MEMORY_READ)
+                .build();
+            barrier_device.cmd_pipeline_barrier(
+                cmdbuf,
+                vk::PipelineStageFlags::ALL_GRAPHICS
+                    | vk::PipelineStageFlags::COMPUTE_SHADER
+                    | vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::DependencyFlags::empty(),
+                &[barrier],
+                &[],
+                &[],
+            );
+        });
+        let device = self.device;
+        self.scheduler.record(move |cmdbuf| unsafe {
+            if *compute_pipeline.lock().unwrap() == vk::Pipeline::null() {
+                return;
+            }
+            let device = device.get().get_logical();
             device.cmd_dispatch(cmdbuf, dim[0], dim[1], dim[2]);
         });
     }
 
     fn reset_counter(&mut self, query_type: u32) {
-        if query_type != QueryType::ZPassPixelCount64 as u32 {
+        if !supports_counter_reset(query_type) {
             debug!(
                 "RasterizerVulkan::reset_counter unimplemented counter reset={}",
                 query_type
@@ -3598,16 +3455,15 @@ impl RasterizerInterface for RasterizerVulkan {
         );
     }
 
-    fn bind_graphics_uniform_buffer(
-        &mut self,
-        _stage: usize,
-        _index: u32,
-        _gpu_addr: u64,
-        _size: u32,
-    ) {
+    fn bind_graphics_uniform_buffer(&mut self, stage: usize, index: u32, gpu_addr: u64, size: u32) {
+        self.common_buffer_cache
+            .bind_graphics_uniform_buffer(stage, index, gpu_addr, size);
     }
 
-    fn disable_graphics_uniform_buffer(&mut self, _stage: usize, _index: u32) {}
+    fn disable_graphics_uniform_buffer(&mut self, stage: usize, index: u32) {
+        self.common_buffer_cache
+            .disable_graphics_uniform_buffer(stage, index);
+    }
 
     fn signal_fence(&mut self, func: Box<dyn FnOnce() + Send>) {
         let this = self as *mut Self;
@@ -3619,7 +3475,7 @@ impl RasterizerInterface for RasterizerVulkan {
             move || unsafe { (*this).should_wait_async_flushes() },
             move |fence| unsafe { (*this).is_fence_signaled(fence) },
             move || unsafe { (*(this_for_pop as *mut Self)).pop_async_flushes() },
-            move || unsafe { (*this).draw_counter != 0 || (*this).should_flush_async() },
+            move || unsafe { (*this).should_flush_async() },
             move || unsafe { (*this).commit_async_flushes() },
             move || unsafe { (*this).flush_commands() },
             move || unsafe { (*this).invalidate_gpu_cache() },
@@ -3646,7 +3502,7 @@ impl RasterizerInterface for RasterizerVulkan {
             move || unsafe { (*this).should_wait_async_flushes() },
             move |fence| unsafe { (*this).is_fence_signaled(fence) },
             move || unsafe { (*(this_for_pop as *mut Self)).pop_async_flushes() },
-            move || unsafe { (*this).draw_counter != 0 || (*this).should_flush_async() },
+            move || unsafe { (*this).should_flush_async() },
             move || unsafe { (*this).commit_async_flushes() },
             move || unsafe { (*this).flush_commands() },
             move || unsafe { (*this).invalidate_gpu_cache() },
@@ -3662,7 +3518,7 @@ impl RasterizerInterface for RasterizerVulkan {
             move || unsafe { (*this).should_wait_async_flushes() },
             move |fence| unsafe { (*this).is_fence_signaled(fence) },
             move || unsafe { (*(this_for_pop as *mut Self)).pop_async_flushes() },
-            move || unsafe { (*this).draw_counter != 0 || (*this).should_flush_async() },
+            move || unsafe { (*this).should_flush_async() },
             move || unsafe { (*this).commit_async_flushes() },
             move || unsafe { (*this).flush_commands() },
             move || unsafe { (*this).invalidate_gpu_cache() },
@@ -3680,39 +3536,40 @@ impl RasterizerInterface for RasterizerVulkan {
             move |fence| unsafe { (*this).is_fence_signaled(fence) },
             move |fence| unsafe { (*this).wait_fence(fence) },
             move || unsafe { (*(this_for_pop as *mut Self)).pop_async_flushes() },
-            move || unsafe { (*this).draw_counter != 0 || (*this).should_flush_async() },
+            move || unsafe { (*this).should_flush_async() },
             move || unsafe { (*this).commit_async_flushes() },
             move || unsafe { (*this).flush_commands() },
             move || unsafe { (*this).invalidate_gpu_cache() },
         );
     }
 
-    fn flush_all(&mut self) {
-        self.scheduler.flush();
-    }
+    fn flush_all(&mut self) {}
 
-    fn flush_region(&mut self, addr: u64, size: u64) {
+    fn flush_region(&mut self, addr: u64, size: u64, which: CacheType) {
         if addr == 0 || size == 0 {
             return;
         }
-        unsafe {
-            let _lo_tex = common::lock_order::guard("texture_cache");
-            let texture_mutex: *const _ = &self.texture_cache.base.mutex;
-            let _texture_guard = (*texture_mutex).lock();
-            self.texture_cache.download_memory(addr, size as usize);
+        if which.contains(CacheType::TEXTURE_CACHE) {
+            unsafe {
+                let texture_mutex: *const _ = &self.texture_cache.base.mutex;
+                let _texture_guard = (*texture_mutex).lock();
+                self.texture_cache.download_memory(addr, size as usize);
+            }
         }
-        unsafe {
-            let _lo_buf = common::lock_order::guard("buffer_cache");
-            let buffer_mutex: *const _ = &self.common_buffer_cache.mutex;
-            let _buffer_guard = (*buffer_mutex).lock();
-            self.common_buffer_cache.download_memory(addr, size);
+        if which.contains(CacheType::BUFFER_CACHE) {
+            unsafe {
+                let buffer_mutex: *const _ = &self.common_buffer_cache.mutex;
+                let _buffer_guard = (*buffer_mutex).lock();
+                self.common_buffer_cache.download_memory(addr, size);
+            }
         }
-        self.query_cache.flush_region(addr, size as usize);
+        if which.contains(CacheType::QUERY_CACHE) {
+            self.query_cache.flush_region(addr, size as usize);
+        }
     }
 
-    fn must_flush_region(&self, addr: u64, size: u64) -> bool {
-        {
-            let _lo_buf = common::lock_order::guard("buffer_cache");
+    fn must_flush_region(&self, addr: u64, size: u64, which: CacheType) -> bool {
+        if which.contains(CacheType::BUFFER_CACHE) {
             let _buffer_guard = self.common_buffer_cache.mutex.lock();
             if self
                 .common_buffer_cache
@@ -3724,14 +3581,26 @@ impl RasterizerInterface for RasterizerVulkan {
         if !common::settings::is_gpu_level_high(&common::settings::values()) {
             return false;
         }
-        let _lo_tex = common::lock_order::guard("texture_cache");
-        let _texture_guard = self.texture_cache.base.mutex.lock();
-        self.texture_cache
-            .base
-            .is_region_gpu_modified(addr, size as usize)
+        if which.contains(CacheType::TEXTURE_CACHE) {
+            let _texture_guard = self.texture_cache.base.mutex.lock();
+            return self
+                .texture_cache
+                .base
+                .is_region_gpu_modified(addr, size as usize);
+        }
+        false
     }
 
     fn get_flush_area(&self, addr: u64, size: u64) -> RasterizerDownloadArea {
+        unsafe {
+            let texture_mutex: *const _ = &self.texture_cache.base.mutex;
+            let _texture_guard = (*texture_mutex).lock();
+            let texture_cache: *mut TextureCache =
+                &*self.texture_cache as *const TextureCache as *mut TextureCache;
+            if let Some(area) = (*texture_cache).base.get_flush_area(addr, size as usize) {
+                return area;
+            }
+        }
         const PAGE: u64 = 4096;
         RasterizerDownloadArea {
             start_address: addr & !(PAGE - 1),
@@ -3740,27 +3609,51 @@ impl RasterizerInterface for RasterizerVulkan {
         }
     }
 
-    fn invalidate_region(&mut self, addr: u64, size: u64) {
+    fn invalidate_region(&mut self, addr: u64, size: u64, which: CacheType) {
         if addr == 0 || size == 0 {
             return;
         }
+        if which.contains(CacheType::TEXTURE_CACHE) {
+            unsafe {
+                let texture_mutex: *const _ = &self.texture_cache.base.mutex;
+                let _texture_guard = (*texture_mutex).lock();
+                self.texture_cache.base.write_memory(addr, size as usize);
+            }
+        }
+        if which.contains(CacheType::BUFFER_CACHE) {
+            unsafe {
+                let buffer_mutex: *const _ = &self.common_buffer_cache.mutex;
+                let _buffer_guard = (*buffer_mutex).lock();
+                self.common_buffer_cache.write_memory(addr, size);
+            }
+        }
+        if which.contains(CacheType::QUERY_CACHE) {
+            self.query_cache.invalidate_region(addr, size as usize);
+        }
+        if which.contains(CacheType::SHADER_CACHE) {
+            self.shader_cache.invalidate_region(addr, size as usize);
+        }
+    }
+
+    fn inner_invalidation(&mut self, sequences: &[(u64, usize)]) {
         unsafe {
-            let _lo_tex = common::lock_order::guard("texture_cache");
             let texture_mutex: *const _ = &self.texture_cache.base.mutex;
             let _texture_guard = (*texture_mutex).lock();
-            self.texture_cache.base.write_memory(addr, size as usize);
+            for &(addr, size) in sequences {
+                self.texture_cache.base.write_memory(addr, size);
+            }
         }
         unsafe {
-            let _lo_buf = common::lock_order::guard("buffer_cache");
             let buffer_mutex: *const _ = &self.common_buffer_cache.mutex;
             let _buffer_guard = (*buffer_mutex).lock();
-            self.common_buffer_cache.write_memory(addr, size);
+            for &(addr, size) in sequences {
+                self.common_buffer_cache.write_memory(addr, size as u64);
+            }
         }
-        // Geometry is still bound through the reduced GPU-VA keyed cache.
-        // Keep it coherent until BindHostGeometryBuffers owns this path.
-        self.buffer_cache.write_memory(addr, size);
-        self.query_cache.invalidate_region(addr, size as usize);
-        self.shader_cache.invalidate_region(addr, size as usize);
+        for &(addr, size) in sequences {
+            self.query_cache.invalidate_region(addr, size);
+            self.shader_cache.invalidate_region(addr, size);
+        }
     }
 
     fn on_cache_invalidation(&mut self, addr: u64, size: u64) {
@@ -3768,37 +3661,29 @@ impl RasterizerInterface for RasterizerVulkan {
             return;
         }
         unsafe {
-            let _lo_tex = common::lock_order::guard("texture_cache");
             let texture_mutex: *const _ = &self.texture_cache.base.mutex;
             let _texture_guard = (*texture_mutex).lock();
             self.texture_cache.base.write_memory(addr, size as usize);
         }
         unsafe {
-            let _lo_buf = common::lock_order::guard("buffer_cache");
             let buffer_mutex: *const _ = &self.common_buffer_cache.mutex;
             let _buffer_guard = (*buffer_mutex).lock();
             self.common_buffer_cache.write_memory(addr, size);
         }
-        self.buffer_cache.write_memory(addr, size);
         self.shader_cache.on_cache_invalidation(addr, size as usize);
     }
 
     fn on_cpu_write(&mut self, addr: u64, size: u64) -> bool {
-        if addr == 0 || size == 0 {
-            return false;
-        }
+        debug_assert!(addr != 0 || size != 0);
         let buffer_handled = unsafe {
-            let _lo_buf = common::lock_order::guard("buffer_cache");
             let buffer_mutex: *const _ = &self.common_buffer_cache.mutex;
             let _buffer_guard = (*buffer_mutex).lock();
             self.common_buffer_cache.on_cpu_write(addr, size)
         };
-        self.buffer_cache.write_memory(addr, size);
         if buffer_handled {
             return true;
         }
         unsafe {
-            let _lo_tex = common::lock_order::guard("texture_cache");
             let texture_mutex: *const _ = &self.texture_cache.base.mutex;
             let _texture_guard = (*texture_mutex).lock();
             self.texture_cache.base.write_memory(addr, size as usize);
@@ -3814,33 +3699,36 @@ impl RasterizerInterface for RasterizerVulkan {
     }
 
     fn unmap_memory(&mut self, addr: u64, size: u64) {
-        if addr == 0 || size == 0 {
-            return;
-        }
         unsafe {
-            let _lo_tex = common::lock_order::guard("texture_cache");
             let texture_mutex: *const _ = &self.texture_cache.base.mutex;
             let _texture_guard = (*texture_mutex).lock();
             self.texture_cache.base.unmap_memory(addr, size as usize);
         }
         unsafe {
-            let _lo_buf = common::lock_order::guard("buffer_cache");
             let buffer_mutex: *const _ = &self.common_buffer_cache.mutex;
             let _buffer_guard = (*buffer_mutex).lock();
             self.common_buffer_cache.write_memory(addr, size);
         }
-        self.buffer_cache.write_memory(addr, size);
         self.shader_cache.on_cache_invalidation(addr, size as usize);
     }
 
-    fn modify_gpu_memory(&mut self, _as_id: usize, _addr: u64, _size: u64) {}
+    fn modify_gpu_memory(&mut self, as_id: usize, addr: u64, size: u64) {
+        let texture_mutex: *const _ = &self.texture_cache.base.mutex;
+        let _texture_guard = unsafe { (*texture_mutex).lock() };
+        self.texture_cache
+            .base
+            .unmap_gpu_memory(as_id, addr, size as usize);
+    }
 
-    fn flush_and_invalidate_region(&mut self, addr: u64, size: u64) {
-        self.invalidate_region(addr, size);
+    fn flush_and_invalidate_region(&mut self, addr: u64, size: u64, which: CacheType) {
+        if common::settings::is_gpu_level_high(&common::settings::values()) {
+            self.flush_region(addr, size, which);
+        }
+        self.invalidate_region(addr, size, which);
     }
 
     fn wait_for_idle(&mut self) {
-        let flags = vk::PipelineStageFlags::DRAW_INDIRECT
+        let mut flags = vk::PipelineStageFlags::DRAW_INDIRECT
             | vk::PipelineStageFlags::VERTEX_INPUT
             | vk::PipelineStageFlags::VERTEX_SHADER
             | vk::PipelineStageFlags::TESSELLATION_CONTROL_SHADER
@@ -3849,13 +3737,17 @@ impl RasterizerInterface for RasterizerVulkan {
             | vk::PipelineStageFlags::FRAGMENT_SHADER
             | vk::PipelineStageFlags::COMPUTE_SHADER
             | vk::PipelineStageFlags::TRANSFER;
+        if self.transform_feedback_supported {
+            flags |= vk::PipelineStageFlags::TRANSFORM_FEEDBACK_EXT;
+        }
 
         self.query_cache.notify_wfi();
 
-        let device = self.device.clone();
+        let device = self.device;
         let event = self.wfi_event;
         self.scheduler.request_outside_renderpass();
         self.scheduler.record(move |cmdbuf| unsafe {
+            let device = device.get().get_logical();
             device.cmd_set_event(cmdbuf, event, flags);
             device.cmd_wait_events(
                 cmdbuf,
@@ -3873,7 +3765,7 @@ impl RasterizerInterface for RasterizerVulkan {
             move || unsafe { (*this).should_wait_async_flushes() },
             move |fence| unsafe { (*this).is_fence_signaled(fence) },
             move || unsafe { (*(this_for_pop as *mut Self)).pop_async_flushes() },
-            move || unsafe { (*this).commit_async_flushes() },
+            move || unsafe { (*this).accumulate_flushes() },
         );
     }
 
@@ -3887,6 +3779,10 @@ impl RasterizerInterface for RasterizerVulkan {
     fn tiled_cache_barrier(&mut self) {}
 
     fn flush_commands(&mut self) {
+        if self.draw_counter == 0 {
+            return;
+        }
+        self.draw_counter = 0;
         self.scheduler.flush();
     }
 
@@ -3898,21 +3794,19 @@ impl RasterizerInterface for RasterizerVulkan {
         // and in-flight frames overwrite each other's descriptor payload.
         self.desc_queue.tick_frame();
         self.compute_pass_desc_queue.tick_frame();
+        self.descriptor_buffer_ring.tick_frame();
         self.state_tracker.invalidate_command_buffer_state();
+        self.fence_manager.tick_frame();
         self.staging_pool.new_frame();
         // Retire delayed-destruction rings against GPU completion, not the
         // submission counter (pipelined submissions run ahead of the GPU).
         let known_gpu_tick = self.scheduler.known_gpu_tick();
         unsafe {
-            let _lo_tex = common::lock_order::guard("texture_cache");
             let texture_mutex: *const _ = &self.texture_cache.base.mutex;
             let _texture_guard = (*texture_mutex).lock();
             self.texture_cache.tick_frame(known_gpu_tick);
         }
-        self.buffer_cache
-            .tick_frame(known_gpu_tick, self.scheduler.pending_tick());
         unsafe {
-            let _lo_buf = common::lock_order::guard("buffer_cache");
             let buffer_mutex: *const _ = &self.common_buffer_cache.mutex;
             let _buffer_guard = (*buffer_mutex).lock();
             self.common_buffer_cache.tick_frame();
@@ -3922,7 +3816,6 @@ impl RasterizerInterface for RasterizerVulkan {
     fn initialize_channel(&mut self, channel: &mut crate::control::channel_state::ChannelState) {
         self.channel_caches.create_channel(channel);
         self.texture_cache.create_channel(channel);
-        self.buffer_cache.create_channel(channel);
         self.common_buffer_cache.create_channel(channel);
         self.shader_cache.create_channel(channel);
         self.pipeline_cache.create_channel(channel);
@@ -3933,7 +3826,6 @@ impl RasterizerInterface for RasterizerVulkan {
     fn bind_channel(&mut self, channel: &mut crate::control::channel_state::ChannelState) {
         self.channel_caches.bind_to_channel(channel.bind_id);
         self.texture_cache.bind_to_channel(channel.bind_id);
-        self.buffer_cache.bind_to_channel(channel.bind_id);
         self.common_buffer_cache.bind_to_channel(channel.bind_id);
         self.shader_cache.bind_to_channel(channel.bind_id);
         self.pipeline_cache.bind_to_channel(channel.bind_id);
@@ -3954,7 +3846,6 @@ impl RasterizerInterface for RasterizerVulkan {
         self.state_tracker.release_channel(channel_id);
         self.channel_caches.erase_channel(channel_id);
         self.texture_cache.erase_channel(channel_id);
-        self.buffer_cache.erase_channel(channel_id);
         self.common_buffer_cache.erase_channel(channel_id);
         self.shader_cache.erase_channel(channel_id);
         self.pipeline_cache.erase_channel(channel_id);
@@ -3971,7 +3862,7 @@ impl RasterizerInterface for RasterizerVulkan {
         let Some(mm) = self.channel_memory_manager.as_ref().cloned() else {
             return false;
         };
-        let texture_cache: *mut TextureCache = &mut self.texture_cache;
+        let texture_cache: *mut TextureCache = &mut *self.texture_cache;
         unsafe {
             let _texture_lock = (*texture_cache).base.mutex.lock();
             (*texture_cache).blit_image(
@@ -3988,129 +3879,12 @@ impl RasterizerInterface for RasterizerVulkan {
         }
     }
 
-    fn accelerate_dma_buffer_copy(
-        &mut self,
-        src_address: u64,
-        dest_address: u64,
-        amount: u64,
-    ) -> bool {
-        unsafe {
-            let buffer_mutex: *const _ = &self.common_buffer_cache.mutex;
-            let _buffer_guard = (*buffer_mutex).lock();
-            self.common_buffer_cache
-                .dma_copy(src_address, dest_address, amount)
-        }
-    }
-
-    fn accelerate_dma_buffer_clear(&mut self, dst_address: u64, amount: u64, value: u32) -> bool {
-        unsafe {
-            let buffer_mutex: *const _ = &self.common_buffer_cache.mutex;
-            let _buffer_guard = (*buffer_mutex).lock();
-            self.common_buffer_cache
-                .dma_clear(dst_address, amount, value)
-        }
-    }
-
-    fn accelerate_dma_image_to_buffer(
-        &mut self,
-        copy_info: &dma::ImageCopy,
-        src: &dma::ImageOperand,
-        dst: &dma::BufferOperand,
-    ) -> bool {
-        let Some(mm) = self.channel_memory_manager.as_ref().cloned() else {
-            return false;
-        };
-        unsafe {
-            let buffer_mutex: *const _ = &self.common_buffer_cache.mutex;
-            let texture_mutex: *const _ = &self.texture_cache.base.mutex;
-            lock_two_reentrant_mutexes!(buffer_mutex, texture_mutex, _buffer_guard, _texture_guard);
-
-            let image_id = self.texture_cache.base.dma_image_id(src, false);
-            if image_id == NULL_IMAGE_ID {
-                return false;
-            }
-
-            let buffer_size = dst.pitch.saturating_mul(dst.height);
-            let (buffer_id, offset) = self.common_buffer_cache.obtain_buffer(
-                dst.address,
-                buffer_size,
-                ObtainBufferSynchronize::FullSynchronize,
-                ObtainBufferOperation::MarkAsWritten,
-            );
-            let raw_buffer = self
-                .common_buffer_cache
-                .resolve_backend_buffer_raw(buffer_id);
-            let buffer = vk::Buffer::from_raw(raw_buffer);
-            if buffer == vk::Buffer::null() {
-                return false;
-            }
-
-            let read_gpu_unsafe =
-                |gpu_addr: u64, out: &mut [u8]| mm.lock().read_block_unsafe(gpu_addr, out);
-            self.texture_cache.dma_buffer_image_copy(
-                copy_info,
-                dst,
-                src,
-                image_id,
-                buffer,
-                offset as vk::DeviceSize,
-                false,
-                &read_gpu_unsafe,
-            )
-        }
-    }
-
-    fn accelerate_dma_buffer_to_image(
-        &mut self,
-        copy_info: &dma::ImageCopy,
-        src: &dma::BufferOperand,
-        dst: &dma::ImageOperand,
-    ) -> bool {
-        let Some(mm) = self.channel_memory_manager.as_ref().cloned() else {
-            return false;
-        };
-        unsafe {
-            let buffer_mutex: *const _ = &self.common_buffer_cache.mutex;
-            let texture_mutex: *const _ = &self.texture_cache.base.mutex;
-            lock_two_reentrant_mutexes!(buffer_mutex, texture_mutex, _buffer_guard, _texture_guard);
-
-            let image_id = self.texture_cache.base.dma_image_id(dst, true);
-            if image_id == NULL_IMAGE_ID {
-                return false;
-            }
-
-            let buffer_size = src.pitch.saturating_mul(src.height);
-            let (buffer_id, offset) = self.common_buffer_cache.obtain_buffer(
-                src.address,
-                buffer_size,
-                ObtainBufferSynchronize::FullSynchronize,
-                ObtainBufferOperation::DoNothing,
-            );
-            let raw_buffer = self
-                .common_buffer_cache
-                .resolve_backend_buffer_raw(buffer_id);
-            let buffer = vk::Buffer::from_raw(raw_buffer);
-            if buffer == vk::Buffer::null() {
-                return false;
-            }
-
-            let read_gpu_unsafe =
-                |gpu_addr: u64, out: &mut [u8]| mm.lock().read_block_unsafe(gpu_addr, out);
-            self.texture_cache.dma_buffer_image_copy(
-                copy_info,
-                src,
-                dst,
-                image_id,
-                buffer,
-                offset as vk::DeviceSize,
-                true,
-                &read_gpu_unsafe,
-            )
-        }
+    fn access_accelerate_dma(&mut self) -> &mut dyn AccelerateDMAInterface {
+        &mut self.accelerate_dma
     }
 
     fn accelerate_inline_to_memory(&mut self, address: u64, copy_size: usize, memory: &[u8]) {
-        let copy_size = copy_size.min(memory.len());
+        debug_assert!(copy_size <= memory.len());
         if copy_size == 0 {
             return;
         }
@@ -4121,7 +3895,12 @@ impl RasterizerInterface for RasterizerVulkan {
 
         let mm = mm.lock();
         let cpu_addr = mm.gpu_to_cpu_address(address);
-        let input = &memory[..copy_size];
+        // SAFETY: upstream accepts a span whose backing allocation is required
+        // to contain copy_size bytes and forwards memory.data() plus copy_size
+        // without a runtime bounds check. The debug assertion diagnoses a
+        // broken caller contract without adding release-only truncation or a
+        // Rust bounds panic that upstream does not have.
+        let input = unsafe { std::slice::from_raw_parts(memory.as_ptr(), copy_size) };
         if cpu_addr.is_none() {
             mm.write_block(address, input);
             return;
@@ -4131,7 +3910,6 @@ impl RasterizerInterface for RasterizerVulkan {
 
         let cpu_addr = cpu_addr.unwrap();
         unsafe {
-            let _lo_buf = common::lock_order::guard("buffer_cache");
             let buffer_mutex: *const _ = &self.common_buffer_cache.mutex;
             let _buffer_guard = (*buffer_mutex).lock();
             if !self
@@ -4143,7 +3921,6 @@ impl RasterizerInterface for RasterizerVulkan {
             }
         }
         unsafe {
-            let _lo_tex = common::lock_order::guard("texture_cache");
             let texture_mutex: *const _ = &self.texture_cache.base.mutex;
             let _texture_guard = (*texture_mutex).lock();
             self.texture_cache.base.write_memory(cpu_addr, copy_size);
@@ -4151,35 +3928,41 @@ impl RasterizerInterface for RasterizerVulkan {
         self.shader_cache.invalidate_region(cpu_addr, copy_size);
         self.query_cache.invalidate_region(cpu_addr, copy_size);
     }
+
+    fn has_draw_transform_feedback(&self) -> bool {
+        self.transform_feedback_draw_supported
+    }
 }
 
 impl Drop for RasterizerVulkan {
     fn drop(&mut self) {
+        // Port of `RasterizerVulkan::~RasterizerVulkan`. `finish()` realizes
+        // deferred clears while their framebuffer and render-pass-cache owners
+        // are still alive, submits the command chunk, and waits for completion.
+        self.scheduler.wait_worker();
+        self.scheduler.finish();
+        let device = self.device.get().get_logical();
         unsafe {
-            self.device.device_wait_idle().ok();
+            device.unmap_memory(self.readback_memory);
+            device.destroy_buffer(self.readback_buffer, None);
+            device.free_memory(self.readback_memory, None);
 
-            self.device.unmap_memory(self.readback_memory);
-            self.device.destroy_buffer(self.readback_buffer, None);
-            self.device.free_memory(self.readback_memory, None);
+            device.destroy_sampler(self.fallback_sampler, None);
+            device.unmap_memory(self.fallback_uniform_memory);
+            device.destroy_buffer(self.fallback_uniform_buffer, None);
+            device.free_memory(self.fallback_uniform_memory, None);
 
-            self.device.destroy_sampler(self.fallback_sampler, None);
-            self.device.unmap_memory(self.fallback_uniform_memory);
-            self.device
-                .destroy_buffer(self.fallback_uniform_buffer, None);
-            self.device.free_memory(self.fallback_uniform_memory, None);
+            device.destroy_framebuffer(self.offscreen_fb, None);
+            device.destroy_image_view(self.offscreen_view, None);
+            device.destroy_image(self.offscreen_image, None);
+            device.free_memory(self.offscreen_memory, None);
 
-            self.device.destroy_framebuffer(self.offscreen_fb, None);
-            self.device.destroy_image_view(self.offscreen_view, None);
-            self.device.destroy_image(self.offscreen_image, None);
-            self.device.free_memory(self.offscreen_memory, None);
+            device.destroy_image_view(self.depth_view, None);
+            device.destroy_image(self.depth_image, None);
+            device.free_memory(self.depth_memory, None);
 
-            self.device.destroy_image_view(self.depth_view, None);
-            self.device.destroy_image(self.depth_image, None);
-            self.device.free_memory(self.depth_memory, None);
-
-            self.device.destroy_event(self.wfi_event, None);
-            self.device
-                .destroy_render_pass(self.default_render_pass, None);
+            device.destroy_event(self.wfi_event, None);
+            device.destroy_render_pass(self.default_render_pass, None);
         }
     }
 }
@@ -4262,6 +4045,18 @@ pub(crate) fn map_blend_equation(eq: BlendEquation) -> vk::BlendOp {
         BlendEquation::ReverseSubtract => vk::BlendOp::REVERSE_SUBTRACT,
         BlendEquation::Min => vk::BlendOp::MIN,
         BlendEquation::Max => vk::BlendOp::MAX,
+    }
+}
+
+fn propagate_consumed_dirty_flags(
+    draw: &mut Maxwell3DDrawView<'_>,
+    original: &[bool; 256],
+    current: &[bool; 256],
+) {
+    for (index, (&was_dirty, &is_dirty)) in original.iter().zip(current).enumerate() {
+        if was_dirty && !is_dirty {
+            draw.clear_dirty_flag(index as u8);
+        }
     }
 }
 
@@ -4561,14 +4356,6 @@ fn null_buffer_descriptor(
     }
 }
 
-fn required_descriptor_set_missing(
-    layout: vk::DescriptorSetLayout,
-    binding_count: usize,
-    descriptor_set: Option<vk::DescriptorSet>,
-) -> bool {
-    layout != vk::DescriptorSetLayout::null() && binding_count != 0 && descriptor_set.is_none()
-}
-
 fn create_host_buffer(
     instance: &ash::Instance,
     physical_device: vk::PhysicalDevice,
@@ -4629,6 +4416,20 @@ mod tests {
     use super::*;
 
     #[test]
+    fn rasterizer_borrows_upstream_device_owner() {
+        fn device_reference(rasterizer: &RasterizerVulkan) -> DeviceReference {
+            rasterizer.device
+        }
+        fn require_signature(_: fn(&RasterizerVulkan) -> DeviceReference) {}
+
+        require_signature(device_reference);
+        assert_eq!(
+            std::mem::size_of::<DeviceReference>(),
+            std::mem::size_of::<usize>()
+        );
+    }
+
+    #[test]
     fn test_map_topology() {
         assert_eq!(
             map_topology(PrimitiveTopology::Triangles),
@@ -4655,153 +4456,6 @@ mod tests {
             null_buffer_descriptor(false, fallback),
             (fallback, 0, 0x10000)
         );
-    }
-
-    #[test]
-    fn descriptor_trace_preserves_handles_offsets_and_ranges() {
-        let infos = [
-            vk::DescriptorBufferInfo {
-                buffer: vk::Buffer::from_raw(0x1234),
-                offset: 0x80,
-                range: 0x400,
-            },
-            vk::DescriptorBufferInfo {
-                buffer: vk::Buffer::null(),
-                offset: 0,
-                range: 1,
-            },
-        ];
-        assert_eq!(
-            format_descriptor_buffer_infos(&infos),
-            "0x1234@0x80+0x400,0x0@0x0+0x1"
-        );
-    }
-
-    #[test]
-    fn sync_draw_interval_is_opt_in_and_rejects_zero_or_invalid_values() {
-        assert_eq!(parse_vulkan_sync_draw_interval(None), None);
-        assert_eq!(parse_vulkan_sync_draw_interval(Some("")), None);
-        assert_eq!(parse_vulkan_sync_draw_interval(Some("invalid")), None);
-        assert_eq!(parse_vulkan_sync_draw_interval(Some("0")), None);
-        assert_eq!(parse_vulkan_sync_draw_interval(Some("1")), Some(1));
-        assert_eq!(parse_vulkan_sync_draw_interval(Some("32")), Some(32));
-    }
-
-    #[test]
-    fn incomplete_required_descriptor_set_skips_draw() {
-        let layout = vk::DescriptorSetLayout::from_raw(0x1234);
-        let set = vk::DescriptorSet::from_raw(0x5678);
-        assert!(required_descriptor_set_missing(layout, 1, None));
-        assert!(!required_descriptor_set_missing(layout, 1, Some(set)));
-        assert!(!required_descriptor_set_missing(
-            vk::DescriptorSetLayout::null(),
-            1,
-            None
-        ));
-        assert!(!required_descriptor_set_missing(layout, 0, None));
-    }
-
-    #[test]
-    fn graphics_descriptors_use_vulkan_texture_cache_view_wrapper() {
-        let source = include_str!("vk_rasterizer.rs");
-        let function = source
-            .split("fn bind_graphics_descriptors")
-            .nth(1)
-            .expect("bind_graphics_descriptors must exist")
-            .split("// ── Framebuffer resize")
-            .next()
-            .expect("bind_graphics_descriptors boundary must exist");
-
-        assert!(function.contains("self.texture_cache\n            .fill_graphics_image_views"));
-        assert!(!function.contains(
-            "self.texture_cache\n            .base\n            .fill_graphics_image_views"
-        ));
-        assert!(function.contains("null_image_view_handle"));
-        assert!(function.contains("null_storage_image_view"));
-        assert!(
-            !function.contains("self.offscreen_view"),
-            "the framebuffer attachment is not a legal sampled/storage fallback"
-        );
-    }
-
-    #[test]
-    fn graphics_views_are_resolved_before_render_targets() {
-        let source = include_str!("vk_rasterizer.rs");
-        let function = source
-            .split("fn draw_prepared")
-            .nth(1)
-            .expect("draw_prepared must exist")
-            .split("pub fn read_framebuffer")
-            .next()
-            .expect("draw_prepared boundary must exist");
-        let bind = function
-            .find("self.bind_graphics_descriptors")
-            .expect("graphics views must be resolved");
-        let update = function
-            .find(".update_render_targets_and_get_rt0_framebuffer")
-            .expect("render targets must be updated");
-        let feedback = function
-            .find(".check_feedback_loop(&prepared_descriptors.views)")
-            .expect("feedback loops must be checked");
-
-        assert!(
-            bind < update,
-            "image views must be resolved before render targets"
-        );
-        assert!(
-            update < feedback,
-            "feedback loops require current render targets"
-        );
-    }
-
-    #[test]
-    fn prepare_draw_orders_query_segments_like_upstream() {
-        let source = include_str!("vk_rasterizer.rs");
-        let function = source
-            .split("fn draw_prepared")
-            .nth(1)
-            .expect("draw_prepared must exist")
-            .split("fn push_graphics_push_constants")
-            .next()
-            .expect("draw_prepared boundary must exist");
-        let clear_geometry = function
-            .find("dirty_flags[crate::dirty_flags::flags::VERTEX_BUFFERS")
-            .expect("buffer-cache geometry dirty state must be consumed");
-        let dynamic = function
-            .find("self.update_dynamic_states")
-            .expect("dynamic state update must exist");
-        let segment = function
-            .find("self.query_cache.notify_segment(true)")
-            .expect("draw segment notification must exist");
-        let transform_feedback = function
-            .find(".handle_transform_feedback")
-            .expect("transform-feedback handling must exist");
-        let zpass = function
-            .find("QueryType::ZPassPixelCount64")
-            .expect("ZPass enable must exist");
-
-        assert!(clear_geometry < dynamic);
-        assert!(dynamic < segment);
-        assert!(segment < transform_feedback);
-        assert!(transform_feedback < zpass);
-    }
-
-    #[test]
-    fn dynamic_vertex_input_rebuilds_the_complete_description() {
-        let source = include_str!("vk_rasterizer.rs");
-        let function = source
-            .split("fn update_vertex_input")
-            .nth(1)
-            .expect("update_vertex_input must exist")
-            .split("fn update_primitive_restart_enable")
-            .next()
-            .expect("update_vertex_input boundary must exist");
-
-        assert!(function.contains("for index in 0..max_attributes"));
-        assert!(function.contains("for binding in 0..max_bindings"));
-        assert!(function.contains("attribute.constant || binding >= max_bindings"));
-        assert!(function.contains("VERTEX_BUFFERS"));
-        assert!(!function.contains("highest_dirty_attr"));
     }
 
     #[test]
@@ -4881,27 +4535,34 @@ mod tests {
     }
 
     #[test]
-    fn geometry_dirty_range_matches_upstream_common_flags() {
-        assert!(is_geometry_dirty_flag(
-            crate::dirty_flags::flags::INDEX_BUFFER as usize
-        ));
-        assert!(is_geometry_dirty_flag(
-            crate::dirty_flags::flags::VERTEX_BUFFERS as usize
-        ));
-        assert!(is_geometry_dirty_flag(
-            crate::dirty_flags::flags::VERTEX_BUFFER31 as usize
-        ));
-        assert!(!is_geometry_dirty_flag(
-            crate::dirty_flags::flags::RENDER_TARGETS as usize
-        ));
-    }
+    fn scissor_rescaling_matches_upstream_signed_rounding() {
+        use crate::engines::maxwell_3d::{
+            Maxwell3D, DRAW_BEGIN, DRAW_END, SCISSOR_BASE, SURFACE_CLIP_BASE, WINDOW_ORIGIN,
+        };
+        use crate::engines::Engine;
 
-    #[test]
-    fn runtime_has_no_graphics_engine_snapshot_adapter() {
-        let source = include_str!("vk_rasterizer.rs");
-        let runtime = source.split("#[cfg(test)]").next().unwrap_or(source);
-        assert!(!runtime.contains("VulkanDrawStateEngineAdapter"));
-        assert!(!runtime.contains("set_engine_state(Box::new"));
+        let mut engine = Maxwell3D::new();
+        engine.write_reg(SURFACE_CLIP_BASE, 20 << 16);
+        engine.write_reg(SURFACE_CLIP_BASE + 1, 20 << 16);
+        engine.write_reg(WINDOW_ORIGIN, 1);
+        engine.write_reg(SCISSOR_BASE, 1);
+        engine.write_reg(SCISSOR_BASE + 1, 3 | (7 << 16));
+        engine.write_reg(SCISSOR_BASE + 2, 5 | (9 << 16));
+        engine.write_reg(DRAW_BEGIN, PrimitiveTopology::Triangles as u32);
+        engine.write_reg(DRAW_END, 0);
+
+        let draw = engine.take_draw_calls().remove(0);
+        let scissor = scissor_state(
+            draw.scissors[0],
+            draw.window_origin_lower_left,
+            draw.surface_clip.height,
+            1,
+            1,
+        );
+        assert_eq!(scissor.offset.x, 2);
+        assert_eq!(scissor.offset.y, 6);
+        assert_eq!(scissor.extent.width, 2);
+        assert_eq!(scissor.extent.height, 2);
     }
 
     #[test]
@@ -4920,5 +4581,87 @@ mod tests {
             assert_eq!(uint_value.color.uint32, [4, 8, 12, 16]);
             assert_eq!(sint_value.color.int32, [-7, 0, 7, -3]);
         }
+    }
+
+    #[test]
+    fn primitive_restart_topology_filter_matches_upstream() {
+        assert!(!supports_primitive_restart(
+            vk::PrimitiveTopology::POINT_LIST
+        ));
+        assert!(!supports_primitive_restart(
+            vk::PrimitiveTopology::TRIANGLE_LIST
+        ));
+        assert!(!supports_primitive_restart(
+            vk::PrimitiveTopology::PATCH_LIST
+        ));
+        assert!(supports_primitive_restart(
+            vk::PrimitiveTopology::TRIANGLE_STRIP
+        ));
+        assert!(supports_primitive_restart(
+            vk::PrimitiveTopology::LINE_STRIP_WITH_ADJACENCY
+        ));
+    }
+
+    #[test]
+    fn vertex_input_descriptions_keep_upstream_capacity_inline() {
+        let mut bindings = VertexInputBindings::new();
+        let mut attributes = VertexInputAttributes::new();
+        for index in 0..32 {
+            bindings.push(
+                vk::VertexInputBindingDescription2EXT::builder()
+                    .binding(index)
+                    .build(),
+            );
+            attributes.push(
+                vk::VertexInputAttributeDescription2EXT::builder()
+                    .location(index)
+                    .build(),
+            );
+        }
+        assert!(!bindings.spilled());
+        assert!(!attributes.spilled());
+    }
+
+    #[test]
+    fn d24_depth_bias_workaround_matches_upstream_title_gate() {
+        let ordinary = depth_bias_constant(4.0, 0x14, false, 0);
+        let native_d24 = depth_bias_constant(4.0, 0x14, true, NEEDS_D24[0]);
+        let adjusted = depth_bias_constant(4.0, 0x14, false, NEEDS_D24[0]);
+
+        assert_eq!(ordinary, 2.0);
+        assert_eq!(native_d24, 2.0);
+        assert_eq!(adjusted, (2.0_f64 * 256.0 / f32::MAX as f64) as f32);
+    }
+
+    #[test]
+    fn counter_reset_filter_matches_upstream_switch() {
+        assert!(supports_counter_reset(QueryType::ZPassPixelCount64 as u32));
+        assert!(supports_counter_reset(QueryType::StreamingByteCount as u32));
+        assert!(supports_counter_reset(
+            QueryType::StreamingPrimitivesSucceeded as u32
+        ));
+        assert!(supports_counter_reset(QueryType::VtgPrimitivesOut as u32));
+        assert!(!supports_counter_reset(QueryType::Payload as u32));
+        assert!(!supports_counter_reset(
+            QueryType::StreamingPrimitivesNeeded as u32
+        ));
+    }
+
+    #[test]
+    fn dirty_flag_bridge_only_consumes_flags_dirty_at_draw_entry() {
+        let draw_state = DrawState::default();
+        let mut registers = Maxwell3DDrawRegisters::default();
+        registers.dirty_flags[7] = true;
+        let mut draw = Maxwell3DDrawView::with_register_snapshot(&draw_state, false, registers);
+        let original = *draw.dirty_flags();
+        let mut current = original;
+        current[7] = false;
+        current[8] = false;
+        draw.set_dirty_flag(8);
+
+        propagate_consumed_dirty_flags(&mut draw, &original, &current);
+
+        assert!(!draw.dirty_flag(7));
+        assert!(draw.dirty_flag(8));
     }
 }

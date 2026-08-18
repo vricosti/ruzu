@@ -433,13 +433,14 @@ mod tests {
             state: 0x44,
             needs_init: true,
             use_float_processing: false,
+            ..Default::default()
         });
         let mut output = [0xAAu8; std::mem::size_of::<BiquadFilterPayload>()];
 
         let written = command.write_payload(&mut output);
 
         assert_eq!(written, output.len());
-        assert_eq!(&output[written - 6..written], &[0; 6]);
+        assert_eq!(&output[written - 5..written], &[0; 5]);
     }
 
     #[test]

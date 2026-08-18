@@ -1,17 +1,5 @@
 # ruzu
 
-> ### ⚠️ This project is discontinued — its successor is [**reden**](https://github.com/vricosti/reden)
->
-> ruzu achieved what it set out to prove: a large, deeply stateful C++ codebase
-> *can* be ported faithfully to Rust with the help of a large language model, and
-> the result boots and runs commercial titles. The experiment succeeded, and it
-> stops here.
->
-> Active development continues in **[reden](https://github.com/vricosti/reden)**,
-> which carries the lessons of this port forward. New issues, contributions and
-> builds belong there. This repository stays online, unmaintained, as the record
-> of the experiment.
-
 **ruzu is not a new emulator. It is a port.**
 
 Every design decision, file layout, class boundary, constant and control flow in
@@ -71,8 +59,7 @@ backend for each, so guest ARM code is JIT-compiled natively on either
 architecture rather than interpreted.
 
 A **RISC-V** host was planned — compiling the workspace on riscv64 first, then
-adding a RISC-V backend to rdynarmic. That work was never done here, and is left
-to [reden](https://github.com/vricosti/reden).
+adding a RISC-V backend to rdynarmic. That work is not implemented yet.
 
 ### Compilation tested on
 
@@ -103,10 +90,11 @@ firmware, see the [ruzu quickstart guide](docs/quickstart.md).
 
 ### Requirements
 
-- Rust **1.75** or newer (the workspace `rust-version`; the platforms above were
+- Rust **1.85** or newer (the workspace `rust-version`; the platforms above were
   validated with 1.97.1).
-- **GTK 4.6** or newer, plus SDL2, Vulkan headers, OpenSSL, FFmpeg, glslang and
-  a C/C++ toolchain. `setup.sh` installs the right package names per platform.
+- **GTK 4.6** or newer, plus Vulkan headers, OpenSSL, FFmpeg, glslang, CMake and
+  a C/C++ toolchain. SDL3 is compiled statically from source by Cargo;
+  `setup.sh` installs the remaining platform packages.
 
 ### Clone
 

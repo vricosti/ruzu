@@ -1,7 +1,7 @@
 #!/bin/sh
 # Shared dependency checks used by the platform-specific setup scripts.
 
-RUST_MINIMUM=1.75.0
+RUST_MINIMUM=1.85.0
 SETUP_COMPLETE=true
 
 confirm_install() {
@@ -78,12 +78,7 @@ verify_native_libraries() {
         return 1
     fi
 
-    if ! pkg-config --exists sdl2; then
-        echo "[ERROR] SDL2 development metadata was not found by pkg-config." >&2
-        return 1
-    fi
-
-    echo "[OK] GTK $(pkg-config --modversion gtk4) and SDL2 $(pkg-config --modversion sdl2) are available."
+    echo "[OK] GTK $(pkg-config --modversion gtk4) is available; Cargo builds SDL3 from source."
 }
 
 run_setup() {

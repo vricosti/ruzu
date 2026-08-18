@@ -1,7 +1,7 @@
 pub mod cubeb_sink;
 pub mod null_sink;
 pub mod oboe_sink;
-pub mod sdl2_sink;
+pub mod sdl3_sink;
 pub mod sink;
 pub mod sink_details;
 pub mod sink_stream;

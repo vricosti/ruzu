@@ -28,7 +28,6 @@ pub mod renderer_opengl;
 pub mod util_shaders;
 
 pub use gl_device::Device;
-pub use gl_rasterizer::{dump_gl_draw_stall_profile, RasterizerOpenGL};
-pub use gl_shader_cache::dump_shader_pipeline_stall_profile;
+pub use gl_rasterizer::RasterizerOpenGL;
 pub use gl_state_tracker::StateTracker;
-pub use renderer_opengl::{dump_present_profile, OpenGLError, RendererOpenGL};
+pub use renderer_opengl::{OpenGLError, RendererOpenGL};

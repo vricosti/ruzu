@@ -13,6 +13,7 @@ use crate::file_sys::vfs::vfs_types::VirtualDir;
 const _SUFFICIENT_SAVE_DATA_SIZE: u64 = 0xF000_0000;
 
 /// Port of Service::FileSystem::SaveDataController
+#[derive(Clone)]
 pub struct SaveDataController {
     factory: Option<Arc<Mutex<SaveDataFactory>>>,
 }

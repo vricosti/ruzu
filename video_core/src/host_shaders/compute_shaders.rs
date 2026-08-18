@@ -2,7 +2,11 @@
 // Maps to: /home/vricosti/shared/zuyu/src/video_core/host_shaders/
 
 /// Upstream: `host_shaders/astc_decoder.comp`
-pub const ASTC_DECODER_COMP: &str = r#"// SPDX-FileCopyrightText: Copyright 2021 yuzu Emulator Project
+pub const ASTC_DECODER_COMP: &str = r#"
+// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+// SPDX-FileCopyrightText: Copyright 2021 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #version 450
@@ -44,7 +48,11 @@ layout(binding = BINDING_INPUT_BUFFER, std430) readonly restrict buffer InputBuf
     uvec4 astc_data[];
 };
 
+#ifdef VULKAN
+layout(binding = BINDING_OUTPUT_IMAGE) uniform writeonly restrict image2DArray dest_image;
+#else
 layout(binding = BINDING_OUTPUT_IMAGE, rgba8) uniform writeonly restrict image2DArray dest_image;
+#endif
 
 const uint GOB_SIZE_X_SHIFT = 6;
 const uint GOB_SIZE_Y_SHIFT = 3;
@@ -74,14 +82,8 @@ uvec4 local_buff;
 uvec4 color_endpoint_data;
 int color_bitsread = 0;
 
-// Global "vector" to be pushed into when decoding
-// At most will require BLOCK_WIDTH x BLOCK_HEIGHT in single plane mode
-// At most will require BLOCK_WIDTH x BLOCK_HEIGHT x 2 in dual plane mode
-// So the maximum would be 144 (12 x 12) elements, x 2 for two planes
-#define DIVCEIL(number, divisor) (number + divisor - 1) / divisor
-#define ARRAY_NUM_ELEMENTS 144
-#define VECTOR_ARRAY_SIZE DIVCEIL(ARRAY_NUM_ELEMENTS * 2, 4)
-uint result_vector[ARRAY_NUM_ELEMENTS * 2];
+#define MAX_WEIGHT_VALUES 64
+uint result_vector[MAX_WEIGHT_VALUES];
 
 int result_index = 0;
 uint result_vector_max_index;
@@ -467,7 +469,7 @@ void DecodeColorValues(uvec4 modes, uint num_partitions, uint color_data_bits, o
         num_values += ((modes[i] >> 2) + 1) << 1;
     }
     // Find the largest encoding that's within color_data_bits
-    // Upstream TODO(ameerj): profile with binary search
+    // TODO(ameerj): profile with binary search
     int range = 0;
     while (++range < encoding_values.length()) {
         const uint bit_length = GetBitLength(num_values, range);
@@ -489,7 +491,7 @@ void DecodeColorValues(uvec4 modes, uint num_partitions, uint color_data_bits, o
         A = ReplicateBitTo9((bitval & 1));
         switch (encoding) {
         case JUST_BITS:
-            color_values[++out_index] = FastReplicateTo8(bitval, bitlen);
+            color_values[out_index++] = FastReplicateTo8(bitval, bitlen);
             break;
         case TRIT: {
             D = QuintTritValue(val);
@@ -568,7 +570,7 @@ void DecodeColorValues(uvec4 modes, uint num_partitions, uint color_data_bits, o
             uint T = (D * C) + B;
             T ^= A;
             T = (A & 0x80) | (T >> 2);
-            color_values[++out_index] = T;
+            color_values[out_index++] = T;
         }
     }
 }
@@ -593,17 +595,169 @@ ivec4 BlueContract(int a, int r, int g, int b) {
     return ivec4(a, (r + b) >> 1, (g + b) >> 1, b);
 }
 
+bool IsHDRColorEndpointMode(uint cem) {
+    return cem == 2u || cem == 3u || cem == 7u || cem == 11u || cem == 14u || cem == 15u;
+}
+
+int SignExtend(int value, uint nbits) {
+    int sign_bit = 1 << (nbits - 1u);
+    return (value ^ sign_bit) - sign_bit;
+}
+
+void DecodeHDREndpointMode7(uint v0, uint v1, uint v2, uint v3, out ivec3 e0, out ivec3 e1) {
+    uint modeval = ((v0 & 0xC0u) >> 6u) | ((v1 & 0x80u) >> 5u) | ((v2 & 0x80u) >> 4u);
+
+    uint majcomp;
+    uint mode;
+    if ((modeval & 0xCu) != 0xCu) {
+        majcomp = modeval >> 2u;
+        mode = modeval & 3u;
+    } else if (modeval != 0xFu) {
+        majcomp = modeval & 3u;
+        mode = 4u;
+    } else {
+        majcomp = 0u;
+        mode = 5u;
+    }
+
+    int red = int(v0 & 0x3Fu);
+    int green = int(v1 & 0x1Fu);
+    int blue = int(v2 & 0x1Fu);
+    int scale = int(v3 & 0x1Fu);
+
+    uint x0 = (v1 >> 6u) & 1u;
+    uint x1 = (v1 >> 5u) & 1u;
+    uint x2 = (v2 >> 6u) & 1u;
+    uint x3 = (v2 >> 5u) & 1u;
+    uint x4 = (v3 >> 7u) & 1u;
+    uint x5 = (v3 >> 6u) & 1u;
+    uint x6 = (v3 >> 5u) & 1u;
+
+    uint ohm = 1u << mode;
+    if ((ohm & 0x30u) != 0u) green |= int(x0 << 6u);
+    if ((ohm & 0x3Au) != 0u) green |= int(x1 << 5u);
+    if ((ohm & 0x30u) != 0u) blue |= int(x2 << 6u);
+    if ((ohm & 0x3Au) != 0u) blue |= int(x3 << 5u);
+    if ((ohm & 0x3Du) != 0u) scale |= int(x6 << 5u);
+    if ((ohm & 0x2Du) != 0u) scale |= int(x5 << 6u);
+    if ((ohm & 0x04u) != 0u) scale |= int(x4 << 7u);
+    if ((ohm & 0x3Bu) != 0u) red |= int(x4 << 6u);
+    if ((ohm & 0x04u) != 0u) red |= int(x3 << 6u);
+    if ((ohm & 0x10u) != 0u) red |= int(x5 << 7u);
+    if ((ohm & 0x0Fu) != 0u) red |= int(x2 << 7u);
+    if ((ohm & 0x05u) != 0u) red |= int(x1 << 8u);
+    if ((ohm & 0x0Au) != 0u) red |= int(x0 << 8u);
+    if ((ohm & 0x05u) != 0u) red |= int(x0 << 9u);
+    if ((ohm & 0x02u) != 0u) red |= int(x6 << 9u);
+    if ((ohm & 0x01u) != 0u) red |= int(x3 << 10u);
+    if ((ohm & 0x02u) != 0u) red |= int(x5 << 10u);
+
+    int shamts[6] = int[](1, 1, 2, 3, 4, 5);
+    int shamt = shamts[mode];
+    red <<= shamt;
+    green <<= shamt;
+    blue <<= shamt;
+    scale <<= shamt;
+
+    if (mode != 5u) {
+        green = red - green;
+        blue = red - blue;
+    }
+
+    if (majcomp == 1u) {
+        int t = red; red = green; green = t;
+    }
+    if (majcomp == 2u) {
+        int t = red; red = blue; blue = t;
+    }
+
+    e1 = ivec3(clamp(red, 0, 0xFFF), clamp(green, 0, 0xFFF), clamp(blue, 0, 0xFFF));
+    e0 = ivec3(clamp(red - scale, 0, 0xFFF), clamp(green - scale, 0, 0xFFF),
+              clamp(blue - scale, 0, 0xFFF));
+}
+
+void DecodeHDREndpointMode11(uint v0, uint v1, uint v2, uint v3, uint v4, uint v5, out ivec3 e0,
+                             out ivec3 e1) {
+    uint majcomp = ((v4 & 0x80u) >> 7u) | ((v5 & 0x80u) >> 6u);
+    if (majcomp == 3u) {
+        e0 = ivec3(int(v0 << 4u), int(v2 << 4u), int((v4 & 0x7Fu) << 5u));
+        e1 = ivec3(int(v1 << 4u), int(v3 << 4u), int((v5 & 0x7Fu) << 5u));
+        return;
+    }
+
+    uint mode = ((v1 & 0x80u) >> 7u) | ((v2 & 0x80u) >> 6u) | ((v3 & 0x80u) >> 5u);
+    int va = int(v0 | ((v1 & 0x40u) << 2u));
+    int vb0 = int(v2 & 0x3Fu);
+    int vb1 = int(v3 & 0x3Fu);
+    int vc = int(v1 & 0x3Fu);
+    int vd0 = int(v4 & 0x7Fu);
+    int vd1 = int(v5 & 0x7Fu);
+
+    int dbitstab[8] = int[](7, 6, 7, 6, 5, 6, 5, 6);
+    vd0 = SignExtend(vd0, uint(dbitstab[mode]));
+    vd1 = SignExtend(vd1, uint(dbitstab[mode]));
+
+    uint x0 = (v2 >> 6u) & 1u;
+    uint x1 = (v3 >> 6u) & 1u;
+    uint x2 = (v4 >> 6u) & 1u;
+    uint x3 = (v5 >> 6u) & 1u;
+    uint x4 = (v4 >> 5u) & 1u;
+    uint x5 = (v5 >> 5u) & 1u;
+
+    uint ohm = 1u << mode;
+    if ((ohm & 0xA4u) != 0u) va |= int(x0 << 9u);
+    if ((ohm & 0x08u) != 0u) va |= int(x2 << 9u);
+    if ((ohm & 0x50u) != 0u) va |= int(x4 << 9u);
+    if ((ohm & 0x50u) != 0u) va |= int(x5 << 10u);
+    if ((ohm & 0xA0u) != 0u) va |= int(x1 << 10u);
+    if ((ohm & 0xC0u) != 0u) va |= int(x2 << 11u);
+    if ((ohm & 0x04u) != 0u) vc |= int(x1 << 6u);
+    if ((ohm & 0xE8u) != 0u) vc |= int(x3 << 6u);
+    if ((ohm & 0x20u) != 0u) vc |= int(x2 << 7u);
+    if ((ohm & 0x5Bu) != 0u) vb0 |= int(x0 << 6u);
+    if ((ohm & 0x5Bu) != 0u) vb1 |= int(x1 << 6u);
+    if ((ohm & 0x12u) != 0u) vb0 |= int(x2 << 7u);
+    if ((ohm & 0x12u) != 0u) vb1 |= int(x3 << 7u);
+
+    int shamt = (int(mode) >> 1) ^ 3;
+    va <<= shamt;
+    vb0 <<= shamt;
+    vb1 <<= shamt;
+    vc <<= shamt;
+    vd0 <<= shamt;
+    vd1 <<= shamt;
+
+    int r1 = clamp(va, 0, 0xFFF);
+    int g1 = clamp(va - vb0, 0, 0xFFF);
+    int b1 = clamp(va - vb1, 0, 0xFFF);
+    int r0 = clamp(va - vc, 0, 0xFFF);
+    int g0 = clamp(va - vb0 - vc - vd0, 0, 0xFFF);
+    int b0 = clamp(va - vb1 - vc - vd1, 0, 0xFFF);
+
+    if (majcomp == 1u) {
+        int t;
+        t = r0; r0 = g0; g0 = t;
+        t = r1; r1 = g1; g1 = t;
+    } else if (majcomp == 2u) {
+        int t;
+        t = r0; r0 = b0; b0 = t;
+        t = r1; r1 = b1; b1 = t;
+    }
+    e0 = ivec3(r0, g0, b0);
+    e1 = ivec3(r1, g1, b1);
+}
+
 void ComputeEndpoints(out uvec4 ep1, out uvec4 ep2, uint color_endpoint_mode, uint color_values[32],
                       inout uint colvals_index) {
 #define READ_UINT_VALUES(N)                                                                        \
     uvec4 V[2];                                                                                    \
     for (uint i = 0; i < N; i++) {                                                                 \
-        V[i / 4][i % 4] = color_values[++colvals_index];                      \
+        V[i / 4][i % 4] = color_values[colvals_index++];                      \
     }
 #define READ_INT_VALUES(N)                                                                         \
     ivec4 V[2];                                                                                    \
     for (uint i = 0; i < N; i++) {                                                                 \
-        V[i / 4][i % 4] = int(color_values[++colvals_index]);                      \
+        V[i / 4][i % 4] = int(color_values[colvals_index++]);                      \
     }
 
     switch (color_endpoint_mode) {
@@ -719,8 +873,86 @@ void ComputeEndpoints(out uvec4 ep1, out uvec4 ep2, uint color_endpoint_mode, ui
         }
         break;
     }
+    case 2: {
+        READ_UINT_VALUES(2)
+        uint y0, y1;
+        if (V[0].y >= V[0].x) {
+            y0 = V[0].x << 4u;
+            y1 = V[0].y << 4u;
+        } else {
+            y0 = (V[0].y << 4u) + 8u;
+            y1 = (V[0].x << 4u) - 8u;
+        }
+        ep1 = uvec4(0x780u, y0, y0, y0);
+        ep2 = uvec4(0x780u, y1, y1, y1);
+        break;
+    }
+    case 3: {
+        READ_UINT_VALUES(2)
+        uint y0, d;
+        if ((V[0].x & 0x80u) != 0u) {
+            y0 = ((V[0].y & 0xE0u) << 4u) | ((V[0].x & 0x7Fu) << 2u);
+            d = (V[0].y & 0x1Fu) << 2u;
+        } else {
+            y0 = ((V[0].y & 0xF0u) << 4u) | ((V[0].x & 0x7Fu) << 1u);
+            d = (V[0].y & 0x0Fu) << 1u;
+        }
+        const uint y1 = min(y0 + d, 0xFFFu);
+        ep1 = uvec4(0x780u, y0, y0, y0);
+        ep2 = uvec4(0x780u, y1, y1, y1);
+        break;
+    }
+    case 7: {
+        READ_UINT_VALUES(4)
+        ivec3 e0, e1;
+        DecodeHDREndpointMode7(V[0].x, V[0].y, V[0].z, V[0].w, e0, e1);
+        ep1 = uvec4(0x780u, uint(e0.x), uint(e0.y), uint(e0.z));
+        ep2 = uvec4(0x780u, uint(e1.x), uint(e1.y), uint(e1.z));
+        break;
+    }
+    case 11: {
+        READ_UINT_VALUES(6)
+        ivec3 e0, e1;
+        DecodeHDREndpointMode11(V[0].x, V[0].y, V[0].z, V[0].w, V[1].x, V[1].y, e0, e1);
+        ep1 = uvec4(0x780u, uint(e0.x), uint(e0.y), uint(e0.z));
+        ep2 = uvec4(0x780u, uint(e1.x), uint(e1.y), uint(e1.z));
+        break;
+    }
+    case 14: {
+        READ_UINT_VALUES(8)
+        ivec3 e0, e1;
+        DecodeHDREndpointMode11(V[0].x, V[0].y, V[0].z, V[0].w, V[1].x, V[1].y, e0, e1);
+        ep1 = uvec4(V[1].z, uint(e0.x), uint(e0.y), uint(e0.z));
+        ep2 = uvec4(V[1].w, uint(e1.x), uint(e1.y), uint(e1.z));
+        break;
+    }
+    case 15: {
+        READ_UINT_VALUES(8)
+        ivec3 e0, e1;
+        DecodeHDREndpointMode11(V[0].x, V[0].y, V[0].z, V[0].w, V[1].x, V[1].y, e0, e1);
+        const uint mode = ((V[1].z >> 7u) & 1u) | ((V[1].w >> 6u) & 2u);
+        int a6 = int(V[1].z & 0x7Fu);
+        int a7 = int(V[1].w & 0x7Fu);
+        int alpha0, alpha1;
+        if (mode == 3u) {
+            alpha0 = a6 << 5;
+            alpha1 = a7 << 5;
+        } else {
+            a6 |= (a7 << int(mode + 1u)) & 0x780;
+            a7 &= int(0x3Fu >> mode);
+            a7 ^= int(0x20u >> mode);
+            a7 -= int(0x20u >> mode);
+            a6 <<= int(4u - mode);
+            a7 <<= int(4u - mode);
+            a7 += a6;
+            alpha0 = a6;
+            alpha1 = clamp(a7, 0, 0xFFF);
+        }
+        ep1 = uvec4(uint(alpha0), uint(e0.x), uint(e0.y), uint(e0.z));
+        ep2 = uvec4(uint(alpha1), uint(e1.x), uint(e1.y), uint(e1.z));
+        break;
+    }
     default: {
-        // HDR mode, or more likely a bug computing the color_endpoint_mode
         ep1 = uvec4(0xFF, 0xFF, 0, 0);
         ep2 = uvec4(0xFF, 0xFF, 0, 0);
         break;
@@ -731,70 +963,35 @@ void ComputeEndpoints(out uvec4 ep1, out uvec4 ep2, uint color_endpoint_mode, ui
 }
 
 uint UnquantizeTexelWeight(EncodingData val) {
-    const uint encoding = Encoding(val);
-    const uint bitlen = NumBits(val);
-    const uint bitval = BitValue(val);
-    const uint A = ReplicateBitTo7((bitval & 1));
-    uint B = 0, C = 0, D = 0;
-    uint result = 0;
-    const uint bitlen_0_results[5] = {0, 16, 32, 48, 64};
-    switch (encoding) {
-    case JUST_BITS:
-        return FastReplicateTo6(bitval, bitlen);
-    case TRIT: {
+    uint encoding = Encoding(val), bitlen = NumBits(val), bitval = BitValue(val);
+    if (encoding == JUST_BITS) {
+        return (bitlen >= 1 && bitlen <= 5)
+            ? uint(floor(0.5f + float(bitval) * 64.0f / float((1 << bitlen) - 1)))
+            : FastReplicateTo6(bitval, bitlen);
+    } else if (encoding == TRIT || encoding == QUINT) {
+        uint B = 0, C = 0, D = 0;
+        uint b_mask = (0x3100 >> (bitlen * 4)) & 0xf;
+        uint b = (bitval >> 1) & b_mask;
         D = QuintTritValue(val);
-        switch (bitlen) {
-        case 0:
-            return bitlen_0_results[D * 2];
-        case 1: {
-            C = 50;
-            break;
+        if (encoding == TRIT) {
+            switch (bitlen) {
+            case 0: return D * 32; //0,32,64
+            case 1: C = 50; break;
+            case 2: C = 23; B = (b << 6) | (b << 2) | b; break;
+            case 3: C = 11; B = (b << 5) | b; break;
+            }
+        } else if (encoding == QUINT) {
+            switch (bitlen) {
+            case 0: return D * 16; //0, 16, 32, 48, 64
+            case 1: C = 28; break;
+            case 2: C = 13; B = (b << 6) | (b << 1); break;
+            }
         }
-        case 2: {
-            C = 23;
-            const uint b = (bitval >> 1) & 1;
-            B = (b << 6) | (b << 2) | b;
-            break;
-        }
-        case 3: {
-            C = 11;
-            const uint cb = (bitval >> 1) & 3;
-            B = (cb << 5) | cb;
-            break;
-        }
-        default:
-            break;
-        }
-        break;
+        uint A = ReplicateBitTo7(bitval & 1);
+        uint res = (A & 0x20) | (((D * C + B) ^ A) >> 2);
+        return res + (res > 32 ? 1 : 0);
     }
-    case QUINT: {
-        D = QuintTritValue(val);
-        switch (bitlen) {
-        case 0:
-            return bitlen_0_results[D];
-        case 1: {
-            C = 28;
-            break;
-        }
-        case 2: {
-            C = 13;
-            const uint b = (bitval >> 1) & 1;
-            B = (b << 6) | (b << 1);
-            break;
-        }
-        }
-        break;
-    }
-    }
-    if (encoding != JUST_BITS && bitlen > 0) {
-        result = D * C + B;
-        result ^= A;
-        result = (A & 0x20) | (result >> 2);
-    }
-    if (result > 32) {
-        result += 1;
-    }
-    return result;
+    return 0;
 }
 
 void UnquantizeTexelWeights(uvec2 size, bool is_dual_plane) {
@@ -1027,6 +1224,10 @@ void DecompressBlock(ivec3 coord) {
         FillError(coord);
         return;
     }
+    if (GetNumWeightValues(size_params, dual_plane) > MAX_WEIGHT_VALUES) {
+        FillError(coord);
+        return;
+    }
     uint partition_index = 1;
     uvec4 color_endpoint_mode = uvec4(0);
     uint ced_pointer = 0;
@@ -1041,6 +1242,10 @@ void DecompressBlock(ivec3 coord) {
     const uint base_mode = base_cem & 3;
     const uint max_weight = DecodeMaxWeight(mode);
     const uint weight_bits = GetPackedBitSize(size_params, dual_plane, max_weight);
+    if (weight_bits < 24 || weight_bits > 96) {
+        FillError(coord);
+        return;
+    }
     uint remaining_bits = 128 - weight_bits - total_bitsread;
     uint extra_cem_bits = 0;
     if (base_mode > 0) {
@@ -1055,6 +1260,7 @@ void DecompressBlock(ivec3 coord) {
             extra_cem_bits += 8;
             break;
         default:
+            FillError(coord);
             return;
         }
     }
@@ -1064,6 +1270,7 @@ void DecompressBlock(ivec3 coord) {
     if (remaining_bits > 128) {
         // Bad data, more remaining bits than 4 bytes
         // return early
+        FillError(coord);
         return;
     }
     // Read color data...
@@ -1151,22 +1358,52 @@ void DecompressBlock(ivec3 coord) {
             if (num_partitions > 1) {
                 local_partition = Select2DPartition(partition_index, i, j, num_partitions);
             }
-            const uvec4 C0 = ReplicateByteTo16(endpoints0[local_partition]);
-            const uvec4 C1 = ReplicateByteTo16(endpoints1[local_partition]);
+            const uint local_cem = color_endpoint_mode[local_partition];
             const uvec4 weight_vec = GetUnquantizedWeightVector(j, i, size_params, plane_index, dual_plane);
-            const vec4 Cf =
-                vec4((C0 * (uvec4(64) - weight_vec) + C1 * weight_vec + uvec4(32)) / 64);
-            const vec4 p = (Cf / 65535.0f);
-            imageStore(dest_image, coord + ivec3(i, j, 0), p.gbar);
+
+            vec4 p;
+            if (IsHDRColorEndpointMode(local_cem)) {
+                const uvec4 C0 = endpoints0[local_partition] << 4u;
+                const uvec4 C1 = endpoints1[local_partition] << 4u;
+                const uvec4 C = (C0 * (uvec4(64) - weight_vec) + C1 * weight_vec + uvec4(32)) / 64u;
+                const uvec4 E = (C & uvec4(0xF800u)) >> 11u;
+                const uvec4 M = C & uvec4(0x7FFu);
+                const uvec4 Mt_lo = 3u * M;
+                const uvec4 Mt_mid = 4u * M - 512u;
+                const uvec4 Mt_hi = 5u * M - 2048u;
+                const uvec4 Mt =
+                    mix(Mt_lo, mix(Mt_mid, Mt_hi, greaterThanEqual(M, uvec4(1536u))),
+                        greaterThanEqual(M, uvec4(512u)));
+                const uvec4 Cf = (E << 10u) + (Mt >> 3u);
+                const uvec4 half_bits = mix(Cf, uvec4(0x7BFFu), greaterThanEqual(Cf, uvec4(0x7C00u)));
+                p = vec4(unpackHalf2x16(half_bits.x).x, unpackHalf2x16(half_bits.y).x,
+                        unpackHalf2x16(half_bits.z).x, unpackHalf2x16(half_bits.w).x);
+
+                if (local_cem == 14u) {
+                    const uint a0 = ReplicateByteTo16(uvec4(endpoints0[local_partition].x)).x;
+                    const uint a1 = ReplicateByteTo16(uvec4(endpoints1[local_partition].x)).x;
+                    const uint Ca = (a0 * (64u - weight_vec.x) + a1 * weight_vec.x + 32u) / 64u;
+                    p.x = float(Ca) / 65535.0f;
+                }
+            } else {
+                const uvec4 C0 = ReplicateByteTo16(endpoints0[local_partition]);
+                const uvec4 C1 = ReplicateByteTo16(endpoints1[local_partition]);
+                const vec4 Cf =
+                    vec4((C0 * (uvec4(64) - weight_vec) + C1 * weight_vec + uvec4(32)) / 64);
+                p = Cf / 65535.0f;
+            }
+
+            imageStore(dest_image, coord + ivec3(i, j, 0), clamp(p, 0.0f, 1.0f).gbar);
         }
     }
 }
 
 uint SwizzleOffset(uvec2 pos) {
-    const uint x = pos.x;
-    const uint y = pos.y;
-    return ((x % 64) / 32) * 256 + ((y % 8) / 2) * 64 +
-            ((x % 32) / 16) * 32 + (y % 2) * 16 + (x % 16);
+    return ((pos.x & 32u) << 3u) |
+           ((pos.y & 6u)  << 5u) |
+           ((pos.x & 16u) << 1u) |
+           ((pos.y & 1u)  << 4u) |
+           (pos.x & 15u);
 }
 
 void main() {
@@ -1205,9 +1442,8 @@ pub const BLOCK_LINEAR_UNSWIZZLE_2D_COMP: &str = r#"// SPDX-FileCopyrightText: C
 #define BEGIN_PUSH_CONSTANTS layout(push_constant) uniform PushConstants {
 #define END_PUSH_CONSTANTS };
 #define UNIFORM(n)
-#define BINDING_SWIZZLE_BUFFER 0
-#define BINDING_INPUT_BUFFER 1
-#define BINDING_OUTPUT_IMAGE 2
+#define BINDING_INPUT_BUFFER 0
+#define BINDING_OUTPUT_IMAGE 1
 
 #else // ^^^ Vulkan ^^^ // vvv OpenGL vvv
 
@@ -1220,8 +1456,7 @@ pub const BLOCK_LINEAR_UNSWIZZLE_2D_COMP: &str = r#"// SPDX-FileCopyrightText: C
 #define BEGIN_PUSH_CONSTANTS
 #define END_PUSH_CONSTANTS
 #define UNIFORM(n) layout (location = n) uniform
-#define BINDING_SWIZZLE_BUFFER 0
-#define BINDING_INPUT_BUFFER 1
+#define BINDING_INPUT_BUFFER 0
 #define BINDING_OUTPUT_IMAGE 0
 
 #endif
@@ -1236,10 +1471,6 @@ UNIFORM(5) uint x_shift;
 UNIFORM(6) uint block_height;
 UNIFORM(7) uint block_height_mask;
 END_PUSH_CONSTANTS
-
-layout(binding = BINDING_SWIZZLE_BUFFER, std430) readonly buffer SwizzleTable {
-    uint swizzle_table[];
-};
 
 #if HAS_EXTENDED_TYPES
 layout(binding = BINDING_INPUT_BUFFER, std430) buffer InputBufferU8 { uint8_t u8data[]; };
@@ -1265,9 +1496,19 @@ const uint GOB_SIZE_SHIFT = GOB_SIZE_X_SHIFT + GOB_SIZE_Y_SHIFT + GOB_SIZE_Z_SHI
 
 const uvec2 SWIZZLE_MASK = uvec2(GOB_SIZE_X - 1, GOB_SIZE_Y - 1);
 
+uint SwizzleTable(uint pos) {
+    const uint t[8] = uint[](
+        0x12100200, 0x13110301, 0x16140604, 0x17150705,
+        0x1a180a08, 0x1b190b09, 0x1e1c0e0c, 0x1f1d0f0d
+    );
+    const uint i = pos >> 4;
+    const uint h = (t[i / 4] >> ((i % 4) * 8)) & 0xff;
+    return (h << 4) | (pos & 0xf);
+}
+
 uint SwizzleOffset(uvec2 pos) {
     pos = pos & SWIZZLE_MASK;
-    return swizzle_table[pos.y * 64 + pos.x];
+    return SwizzleTable(pos.y * 64 + pos.x);
 }
 
 uvec4 ReadTexel(uint offset) {
@@ -1329,9 +1570,8 @@ pub const BLOCK_LINEAR_UNSWIZZLE_3D_COMP: &str = r#"// SPDX-FileCopyrightText: C
 #define BEGIN_PUSH_CONSTANTS layout(push_constant) uniform PushConstants {
 #define END_PUSH_CONSTANTS };
 #define UNIFORM(n)
-#define BINDING_SWIZZLE_BUFFER 0
-#define BINDING_INPUT_BUFFER 1
-#define BINDING_OUTPUT_IMAGE 2
+#define BINDING_INPUT_BUFFER 0
+#define BINDING_OUTPUT_IMAGE 1
 
 #else // ^^^ Vulkan ^^^ // vvv OpenGL vvv
 
@@ -1344,8 +1584,7 @@ pub const BLOCK_LINEAR_UNSWIZZLE_3D_COMP: &str = r#"// SPDX-FileCopyrightText: C
 #define BEGIN_PUSH_CONSTANTS
 #define END_PUSH_CONSTANTS
 #define UNIFORM(n) layout (location = n) uniform
-#define BINDING_SWIZZLE_BUFFER 0
-#define BINDING_INPUT_BUFFER 1
+#define BINDING_INPUT_BUFFER 0
 #define BINDING_OUTPUT_IMAGE 0
 
 #endif
@@ -1362,10 +1601,6 @@ UNIFORM(7) uint block_height_mask;
 UNIFORM(8) uint block_depth;
 UNIFORM(9) uint block_depth_mask;
 END_PUSH_CONSTANTS
-
-layout(binding = BINDING_SWIZZLE_BUFFER, std430) readonly buffer SwizzleTable {
-    uint swizzle_table[];
-};
 
 #if HAS_EXTENDED_TYPES
 layout(binding = BINDING_INPUT_BUFFER, std430) buffer InputBufferU8 { uint8_t u8data[]; };
@@ -1391,9 +1626,19 @@ const uint GOB_SIZE_SHIFT = GOB_SIZE_X_SHIFT + GOB_SIZE_Y_SHIFT + GOB_SIZE_Z_SHI
 
 const uvec2 SWIZZLE_MASK = uvec2(GOB_SIZE_X - 1, GOB_SIZE_Y - 1);
 
+uint SwizzleTable(uint pos) {
+    const uint t[8] = uint[](
+        0x12100200, 0x13110301, 0x16140604, 0x17150705,
+        0x1a180a08, 0x1b190b09, 0x1e1c0e0c, 0x1f1d0f0d
+    );
+    const uint i = pos >> 4;
+    const uint h = (t[i / 4] >> ((i % 4) * 8)) & 0xff;
+    return (h << 4) | (pos & 0xf);
+}
+
 uint SwizzleOffset(uvec2 pos) {
     pos = pos & SWIZZLE_MASK;
-    return swizzle_table[pos.y * 64 + pos.x];
+    return SwizzleTable(pos.y * 64 + pos.x);
 }
 
 uvec4 ReadTexel(uint offset) {
@@ -2190,3 +2435,54 @@ void main() {
     }
 }
 "#;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `astc_decoder.comp` exists twice: this GLSL constant feeds the OpenGL
+    /// backend, and the `.comp` file next to it is compiled to SPIR-V for
+    /// Vulkan. They are edited independently, so they can silently drift.
+    ///
+    /// The write sites in `DecodeColorValues` are the ones that matter most:
+    /// `ComputeEndpoints` reads `color_values` sequentially and hands slot `i`
+    /// to a specific colour channel, so writing at `++out_index` instead of
+    /// `out_index++` shifts every endpoint by one slot — a channel rotation,
+    /// with slot 0 left holding the previous block's value. Reden's own CPU
+    /// decoder (`textures::astc::decode_color_values`) writes `out[out_idx]`
+    /// and then increments, so pre-increment here also puts the GPU and CPU
+    /// ASTC paths in disagreement for identical input.
+    #[test]
+    fn astc_decoder_writes_color_values_at_the_post_increment_index() {
+        let glsl = ASTC_DECODER_COMP;
+        assert!(
+            glsl.contains("color_values[out_index++] = FastReplicateTo8(bitval, bitlen);"),
+            "JUST_BITS write site must use post-increment"
+        );
+        assert!(
+            glsl.contains("color_values[out_index++] = T;"),
+            "trit/quint write site must use post-increment"
+        );
+        assert!(
+            !glsl.contains("color_values[++out_index]"),
+            "pre-increment shifts every colour endpoint by one slot"
+        );
+    }
+
+    /// `ASTC_DECODER_COMP` is the GLSL the OpenGL backend compiles at runtime;
+    /// `astc_decoder.comp` next to it is compiled to SPIR-V for Vulkan. They are
+    /// two copies of one upstream file and are edited independently, so they can
+    /// drift silently — which is how the `color_values[++out_index]` shift
+    /// survived in both at once. The constant is generated from the file, so the
+    /// two must stay byte-identical.
+    #[test]
+    fn the_inlined_astc_decoder_matches_the_spirv_source() {
+        let comp = include_str!("astc_decoder.comp");
+        // The constant opens with a newline after `r#"`; compare the bodies.
+        assert_eq!(
+            ASTC_DECODER_COMP.trim(),
+            comp.trim(),
+            "the OpenGL and Vulkan copies of astc_decoder have drifted"
+        );
+    }
+}

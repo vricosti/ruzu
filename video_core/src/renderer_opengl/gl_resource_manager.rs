@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2025 ruzu contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! Port of zuyu/src/video_core/renderer_opengl/gl_resource_manager.{h,cpp}.
+//! Port of Eden's `video_core/renderer_opengl/gl_resource_manager.{h,cpp}`.
 
 macro_rules! ogl_resource {
     ($name:ident, $create:ident, $delete:ident) => {
@@ -204,7 +204,11 @@ impl OGLSync {
 
     pub fn is_signaled(&self) -> bool {
         let sync_status = unsafe { gl::ClientWaitSync(self.handle, 0, 0) };
-        assert_ne!(sync_status, gl::WAIT_FAILED);
+        if sync_status == gl::WAIT_FAILED {
+            // Eden's `ASSERT` is fail-soft unless debug assertions are enabled,
+            // then returns the same `WAIT_FAILED != TIMEOUT_EXPIRED` result.
+            log::error!("OGLSync::IsSignaled: glClientWaitSync returned GL_WAIT_FAILED");
+        }
         sync_status != gl::TIMEOUT_EXPIRED
     }
 }

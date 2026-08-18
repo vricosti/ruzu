@@ -1,5 +1,8 @@
-use std::ffi::c_void;
 use std::ptr::NonNull;
+
+use crate::renderer::behavior::BehaviorInfo;
+use crate::renderer::memory::MemoryPoolInfo;
+use crate::renderer::upsampler::UpsamplerManager;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -29,13 +32,15 @@ pub struct AudioRendererParameterInternal {
     pub revision: u32,
 }
 
+const _: () = assert!(std::mem::size_of::<AudioRendererParameterInternal>() == 0x34);
+
 #[derive(Debug, Clone, Copy)]
 pub struct AudioRendererSystemContext {
     pub session_id: i32,
     pub channels: i8,
     pub mix_buffer_count: i16,
-    pub behavior: Option<NonNull<c_void>>,
-    pub depop_buffer: Option<NonNull<i32>>,
-    pub upsampler_manager: Option<NonNull<c_void>>,
-    pub memory_pool_info: Option<NonNull<c_void>>,
+    pub behavior: Option<NonNull<BehaviorInfo>>,
+    pub depop_buffer: Option<NonNull<[i32]>>,
+    pub upsampler_manager: Option<NonNull<UpsamplerManager>>,
+    pub memory_pool_info: Option<NonNull<MemoryPoolInfo>>,
 }

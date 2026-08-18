@@ -40,9 +40,7 @@ const GL_AMBIENT: GLenum = 0x1200;
 static GL_MATERIALFV: OnceLock<Option<GlMaterialfv>> = OnceLock::new();
 
 fn set_table(table: &mut [u8], offset: u32, dirty_index: u8) {
-    if let Some(entry) = table.get_mut(offset as usize) {
-        *entry = dirty_index;
-    }
+    table[offset as usize] = dirty_index;
 }
 
 fn setup_dirty_color_masks(tables: &mut DirtyTables) {
@@ -185,26 +183,24 @@ fn setup_dirty_depth_test(tables: &mut DirtyTables) {
 }
 
 fn setup_dirty_stencil_test(tables: &mut DirtyTables) {
-    const STENCIL_OP_WORDS: usize = 4;
     let offsets = [
         STENCIL_ENABLE,
         STENCIL_FRONT_OP_BASE,
+        STENCIL_FRONT_REF,
+        STENCIL_FRONT_FUNC_MASK,
         STENCIL_FRONT_OP_BASE + 1,
         STENCIL_FRONT_OP_BASE + 2,
         STENCIL_FRONT_OP_BASE + 3,
-        STENCIL_FRONT_REF,
-        STENCIL_FRONT_FUNC_MASK,
         STENCIL_FRONT_MASK,
         STENCIL_TWO_SIDE_ENABLE,
         STENCIL_BACK_OP_BASE,
+        STENCIL_BACK_REF,
+        STENCIL_BACK_FUNC_MASK,
         STENCIL_BACK_OP_BASE + 1,
         STENCIL_BACK_OP_BASE + 2,
         STENCIL_BACK_OP_BASE + 3,
-        STENCIL_BACK_REF,
-        STENCIL_BACK_FUNC_MASK,
         STENCIL_BACK_MASK,
     ];
-    debug_assert_eq!(STENCIL_OP_WORDS, 4);
     for offset in offsets {
         set_table(&mut tables[0], offset, dirty::STENCIL_TEST);
     }
@@ -219,7 +215,9 @@ fn setup_dirty_alpha_test(tables: &mut DirtyTables) {
 fn setup_dirty_blend(tables: &mut DirtyTables) {
     const NUM_RENDER_TARGETS: usize = 8;
     const BLEND_COLOR_WORDS: usize = 4;
-    const BLEND_WORDS: usize = 16;
+    // Upstream `Regs::Blend` contains the nine scalar fields followed by
+    // `enable[NumRenderTargets]`: 9 + 8 = 17 register words.
+    const BLEND_WORDS: usize = 17;
     fill_block(
         &mut tables[0],
         BLEND_COLOR_BASE as usize,
@@ -494,14 +492,11 @@ impl StateTracker {
 
     /// Port of `StateTracker::SetupTables`.
     pub fn setup_tables(&mut self, channel_state: &mut ChannelState) {
-        self.bound_channel_id = Some(channel_state.bind_id);
-        let Some(maxwell_3d) = channel_state.maxwell_3d.as_mut() else {
-            return;
-        };
+        let maxwell_3d = channel_state
+            .maxwell_3d
+            .as_mut()
+            .expect("initialized channels must own Maxwell3D before SetupTables");
         let tables = maxwell_3d.dirty_tables_mut();
-        for table in tables.iter_mut() {
-            table.fill(crate::dirty_flags::flags::NULL_ENTRY);
-        }
         setup_dirty_flags(tables);
         setup_dirty_color_masks(tables);
         setup_dirty_viewports(tables);
@@ -579,7 +574,7 @@ impl StateTracker {
         }
     }
 
-    /// Returns the current Y-negate state.
+    #[cfg(test)]
     pub fn y_negate(&self) -> bool {
         self.y_negate
     }
@@ -719,11 +714,12 @@ impl StateTracker {
 
     /// Port of `StateTracker::ChangeChannel`.
     pub fn change_channel(&mut self, channel_state: &mut ChannelState) {
-        self.bound_channel_id = Some(channel_state.bind_id);
-        self.channel_flags = channel_state
+        let maxwell_3d = channel_state
             .maxwell_3d
             .as_mut()
-            .map(|maxwell| NonNull::from(maxwell.dirty_flags_mut()));
+            .expect("initialized channels must own Maxwell3D before ChangeChannel");
+        self.bound_channel_id = Some(channel_state.bind_id);
+        self.channel_flags = Some(NonNull::from(maxwell_3d.dirty_flags_mut()));
     }
 
     /// Clear the borrowed dirty-flag pointer before its channel is released.
@@ -742,23 +738,13 @@ impl StateTracker {
         }
     }
 
-    /// Access the dirty flags array directly.
-    pub fn flags_mut(&mut self) -> &mut DirtyFlags {
-        self.active_flags_mut()
-    }
-
-    /// Read-only access to dirty flags.
-    pub fn flags(&self) -> &DirtyFlags {
-        self.active_flags()
-    }
-
-    /// Check if a flag is dirty.
-    pub fn is_dirty(&self, flag: u8) -> bool {
+    #[cfg(test)]
+    fn is_dirty(&self, flag: u8) -> bool {
         self.active_flags()[flag as usize]
     }
 
     /// Check if a flag is dirty, and clear it. Returns true if it was dirty.
-    pub fn exchange(&mut self, flag: u8) -> bool {
+    pub(crate) fn exchange(&mut self, flag: u8) -> bool {
         let flags = self.active_flags_mut();
         let is_dirty = flags[flag as usize];
         flags[flag as usize] = false;
@@ -889,6 +875,7 @@ mod tests {
             tables[1][BLEND_PER_TARGET_BASE as usize],
             dirty::BLEND_STATES
         );
+        assert_eq!(tables[1][(BLEND_BASE + 16) as usize], dirty::BLEND_STATES);
         assert_eq!(
             tables[0][PRIMITIVE_RESTART_BASE as usize],
             dirty::PRIMITIVE_RESTART
@@ -959,5 +946,13 @@ mod tests {
 
         tracker.release_channel(11);
         assert!(tracker.is_dirty(dirty::VIEWPORTS));
+    }
+
+    #[test]
+    #[should_panic(expected = "initialized channels must own Maxwell3D before ChangeChannel")]
+    fn change_channel_requires_the_upstream_initialized_channel_invariant() {
+        let mut tracker = StateTracker::new();
+        let mut channel = ChannelState::new(12);
+        tracker.change_channel(&mut channel);
     }
 }

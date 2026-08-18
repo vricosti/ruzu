@@ -8,6 +8,8 @@
 
 use std::hash::{Hash, Hasher};
 
+use common::cityhash::city_hash64;
+
 // ── Texture Format ───────────────────────────────────────────────────────────
 
 /// Tegra texture format encoded in bits [6:0] of TIC word 0.
@@ -695,9 +697,16 @@ impl Eq for TicEntry {}
 
 impl Hash for TicEntry {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        // Port of `std::hash<TICEntry>` — upstream uses CityHash64 over raw bytes.
-        // For now, hash the raw u64 words directly.
-        self.raw.hash(state);
+        // Port of `std::hash<TICEntry>` in texture.cpp.
+        // SAFETY: `TicEntry` is a `repr(C)` wrapper over one fully initialized
+        // `[u64; 4]` field, with its 0x20-byte size asserted above.
+        let bytes = unsafe {
+            std::slice::from_raw_parts(
+                self as *const Self as *const u8,
+                std::mem::size_of::<Self>(),
+            )
+        };
+        state.write_u64(city_hash64(bytes));
     }
 }
 
@@ -971,13 +980,22 @@ impl TscEntry {
         }
         let settings = common::settings::values();
         let anisotropy_mode = *settings.max_anisotropy.get_value();
-        let added_anisotropy =
-            if anisotropy_mode == common::settings_enums::AnisotropyMode::Automatic {
+        let added_anisotropy = match anisotropy_mode {
+            common::settings_enums::AnisotropyMode::Automatic => {
                 (settings.resolution_info.up_scale >> settings.resolution_info.down_shift)
-                    .saturating_sub(1)
-            } else {
+                    .wrapping_sub(1)
+            }
+            common::settings_enums::AnisotropyMode::Default
+            | common::settings_enums::AnisotropyMode::X2
+            | common::settings_enums::AnisotropyMode::X4
+            | common::settings_enums::AnisotropyMode::X8
+            | common::settings_enums::AnisotropyMode::X16
+            | common::settings_enums::AnisotropyMode::X32
+            | common::settings_enums::AnisotropyMode::X64 => {
                 (anisotropy_mode as u32).wrapping_sub(1)
-            };
+            }
+            common::settings_enums::AnisotropyMode::None => return 1.0,
+        };
         (1u32 << (max_anisotropy + added_anisotropy)) as f32
     }
 
@@ -1011,8 +1029,16 @@ impl Eq for TscEntry {}
 
 impl Hash for TscEntry {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        // Port of `std::hash<TSCEntry>` — upstream uses CityHash64 over raw bytes.
-        self.raw.hash(state);
+        // Port of `std::hash<TSCEntry>` in texture.cpp.
+        // SAFETY: `TscEntry` is a `repr(C)` wrapper over one fully initialized
+        // `[u64; 4]` field, with its 0x20-byte size asserted above.
+        let bytes = unsafe {
+            std::slice::from_raw_parts(
+                self as *const Self as *const u8,
+                std::mem::size_of::<Self>(),
+            )
+        };
+        state.write_u64(city_hash64(bytes));
     }
 }
 
@@ -1057,6 +1083,14 @@ pub const SRGB_CONVERSION_LUT: [f32; 256] = [
 #[cfg(test)]
 mod tests {
     use super::*;
+    use common::hash::BuildIdentityHasher;
+    use std::hash::BuildHasher;
+
+    fn descriptor_hash<T: Hash>(value: &T) -> u64 {
+        let mut hasher = BuildIdentityHasher.build_hasher();
+        value.hash(&mut hasher);
+        hasher.finish()
+    }
 
     #[test]
     fn texture_handle_layout() {
@@ -1088,6 +1122,34 @@ mod tests {
     #[test]
     fn tsc_entry_size() {
         assert_eq!(std::mem::size_of::<TscEntry>(), 0x20);
+    }
+
+    #[test]
+    fn tic_and_tsc_hashes_match_upstream_cityhash64() {
+        let zero = [0; 4];
+        let patterned = [
+            0x0123_4567_89ab_cdef,
+            0xfedc_ba98_7654_3210,
+            0x0f1e_2d3c_4b5a_6978,
+            0x8877_6655_4433_2211,
+        ];
+
+        assert_eq!(
+            descriptor_hash(&TicEntry { raw: zero }),
+            0x7087_0616_03e5_3293
+        );
+        assert_eq!(
+            descriptor_hash(&TicEntry { raw: patterned }),
+            0x0b30_55df_79c6_67b2
+        );
+        assert_eq!(
+            descriptor_hash(&TscEntry { raw: zero }),
+            0x7087_0616_03e5_3293
+        );
+        assert_eq!(
+            descriptor_hash(&TscEntry { raw: patterned }),
+            0x0b30_55df_79c6_67b2
+        );
     }
 
     #[test]

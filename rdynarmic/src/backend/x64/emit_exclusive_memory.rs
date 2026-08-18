@@ -17,18 +17,9 @@ use rxbyak::{
 use crate::backend::x64::abi;
 use crate::backend::x64::emit_context::DeferredEmitCtx;
 use crate::backend::x64::exception_handler::{supports_fastmem, FastmemPatchInfo};
+use crate::backend::x64::host_feature::HostFeature;
 use crate::backend::x64::hostloc::HostLoc;
 use crate::backend::x64::jit_state::A64JitState;
-
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-fn host_supports_sse41() -> bool {
-    std::is_x86_feature_detected!("sse4.1")
-}
-
-#[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
-fn host_supports_sse41() -> bool {
-    false
-}
 
 // ---------------------------------------------------------------------------
 // EmitExclusiveLock / EmitExclusiveUnlock — inline acquire/release of the
@@ -387,7 +378,7 @@ fn emit_exclusive_write(
         // SystemV: RDI=context (filled by ArgCallback), RSI=vaddr,
         // RDX=value_lo, RCX=value_hi.
         ra.asm.movq(RDX, Reg::xmm(1)).unwrap();
-        if host_supports_sse41() {
+        if ctx.has_host_feature(HostFeature::SSE41) {
             ra.asm.pextrq(RCX, Reg::xmm(1), 1).unwrap();
         } else {
             ra.asm.movaps(XMM0, Reg::xmm(1)).unwrap();
@@ -608,7 +599,7 @@ fn emit_a64_exclusive_write_inline(
         128 => {
             ra.asm.mov(rax, qword_ptr(RegExp::from(tmp))).unwrap();
             ra.asm.mov(RDX, qword_ptr(RegExp::from(tmp) + 8)).unwrap();
-            if host_supports_sse41() {
+            if ctx.has_host_feature(HostFeature::SSE41) {
                 ra.asm.movq(RBX, value).unwrap();
                 ra.asm.pextrq(RCX, value, 1).unwrap();
             } else {

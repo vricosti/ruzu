@@ -33,6 +33,7 @@ use rxbyak::{
 };
 
 use crate::backend::x64::emit_context::{DeferredEmit, DeferredEmitCtx, EmitContext};
+use crate::backend::x64::host_feature::HostFeature;
 use crate::backend::x64::reg_alloc::RegAlloc;
 use crate::ir::acc_type::AccType;
 
@@ -256,7 +257,7 @@ pub fn emit_write_memory_mov<const BITSIZE: usize>(
 /// Mirrors upstream `EmitDetectMisalignedVAddr<EmitContext>` in
 /// `emit_x64_memory.h:27-69`. A64-specialised: only callable when
 /// `ctx.arch == ArchConfig::A64`.
-pub fn emit_detect_misaligned_vaddr_a64(
+pub fn emit_detect_misaligned_vaddr(
     asm: &mut CodeAssembler,
     ctx: &EmitContext,
     bitsize: usize,
@@ -410,21 +411,26 @@ pub fn emit_vaddr_lookup_a64(
         ra.scratch_gpr()
     };
 
-    emit_detect_misaligned_vaddr_a64(ra.asm, ctx, bitsize, abort, vaddr, tmp);
+    emit_detect_misaligned_vaddr(ra.asm, ctx, bitsize, abort, vaddr, tmp);
 
     if unused_top_bits == 0 {
         ra.asm.mov(tmp, vaddr).unwrap();
         ra.asm.shr(tmp, PAGE_BITS as u8).unwrap();
     } else if mem_conf.silently_mirror_page_table {
         if valid_page_index_bits >= 32 {
-            // Upstream tries the BMI2 `bzhi` form first if the host has
-            // BMI2; otherwise falls back to a shl/shr pair. We always
-            // emit the shl/shr form for simplicity; equivalent semantics.
-            ra.asm.mov(tmp, vaddr).unwrap();
-            ra.asm.shl(tmp, unused_top_bits as u8).unwrap();
-            ra.asm
-                .shr(tmp, (unused_top_bits + PAGE_BITS) as u8)
-                .unwrap();
+            if ctx.has_host_feature(HostFeature::BMI2) {
+                let bit_count = ra.scratch_gpr();
+                ra.asm.mov(bit_count, unused_top_bits as i32).unwrap();
+                ra.asm.bzhi(tmp, vaddr, bit_count).unwrap();
+                ra.asm.shr(tmp, PAGE_BITS as u8).unwrap();
+                ra.release(bit_count);
+            } else {
+                ra.asm.mov(tmp, vaddr).unwrap();
+                ra.asm.shl(tmp, unused_top_bits as u8).unwrap();
+                ra.asm
+                    .shr(tmp, (unused_top_bits + PAGE_BITS) as u8)
+                    .unwrap();
+            }
         } else {
             ra.asm.mov(tmp, vaddr).unwrap();
             ra.asm.shr(tmp, PAGE_BITS as u8).unwrap();
@@ -459,6 +465,55 @@ pub fn emit_vaddr_lookup_a64(
 
     ra.asm.mov(tmp, vaddr).unwrap();
     ra.asm.and_(tmp, PAGE_MASK as i32).unwrap();
+    RegExp::from(page) + tmp
+}
+
+/// Emit the A32 page-table lookup from upstream
+/// `EmitVAddrLookup<A32EmitContext>`. Reden's host-pointer table stores
+/// eight-byte entries directly, so `tmp * 8` is the Rust counterpart of
+/// upstream's configurable `page_table_log2_stride`.
+pub fn emit_vaddr_lookup_a32(
+    ra: &mut RegAlloc,
+    ctx: &EmitContext,
+    bitsize: usize,
+    abort: Label,
+    vaddr: Reg,
+) -> RegExp {
+    let mem_conf = &ctx.config.memory;
+    let page = ra.scratch_gpr();
+    let tmp = if mem_conf.absolute_offset_page_table {
+        page
+    } else {
+        ra.scratch_gpr()
+    };
+
+    emit_detect_misaligned_vaddr(ra.asm, ctx, bitsize, abort, vaddr, tmp);
+
+    // Upstream A32 assumes the virtual address was zero-extended from 32 bits.
+    ra.asm
+        .mov(tmp.cvt32().unwrap(), vaddr.cvt32().unwrap())
+        .unwrap();
+    ra.asm.shr(tmp.cvt32().unwrap(), PAGE_BITS as u8).unwrap();
+    ra.asm
+        .mov(page, qword_ptr(RegExp::from(rxbyak::R14) + tmp * 8u8))
+        .unwrap();
+
+    if mem_conf.page_table_pointer_mask_bits == 0 {
+        ra.asm.test(page, page).unwrap();
+    } else {
+        let mask = (!0u32 << mem_conf.page_table_pointer_mask_bits) as i32;
+        ra.asm.and_(page, mask).unwrap();
+    }
+    ra.asm.je(&abort, rxbyak::JmpType::Near).unwrap();
+
+    if mem_conf.absolute_offset_page_table {
+        return RegExp::from(page) + vaddr;
+    }
+
+    ra.asm
+        .mov(tmp.cvt32().unwrap(), vaddr.cvt32().unwrap())
+        .unwrap();
+    ra.asm.and_(tmp.cvt32().unwrap(), PAGE_MASK as i32).unwrap();
     RegExp::from(page) + tmp
 }
 

@@ -117,6 +117,10 @@ fn is_connection_based(ty: Type) -> bool {
     }
 }
 
+fn socket_blocked_by_airplane_mode(airplane_mode: bool, connection_based: bool) -> bool {
+    airplane_mode && connection_based
+}
+
 /// Per-file-descriptor state.
 ///
 /// Corresponds to `BSD::FileDescriptor` in upstream bsd.h.
@@ -279,6 +283,16 @@ impl Bsd {
             flags: 0,
             is_connection_based: is_connection_based(ty),
         });
+
+        if socket_blocked_by_airplane_mode(
+            *common::settings::values().airplane_mode.get_value(),
+            self.file_descriptors[fd as usize]
+                .as_ref()
+                .is_some_and(|descriptor| descriptor.is_connection_based),
+        ) {
+            log::error!("Airplane mode is enabled, cannot create socket");
+            return (-1, Errno::NOTCONN);
+        }
 
         (fd, Errno::SUCCESS)
     }
@@ -1407,6 +1421,13 @@ impl ServiceFramework for BsdCfg {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn airplane_mode_blocks_only_connection_based_sockets() {
+        assert!(socket_blocked_by_airplane_mode(true, true));
+        assert!(!socket_blocked_by_airplane_mode(true, false));
+        assert!(!socket_blocked_by_airplane_mode(false, true));
+    }
     use crate::hle::service::hle_ipc::SessionRequestHandlerPtr;
     use std::sync::{Arc, Mutex};
 

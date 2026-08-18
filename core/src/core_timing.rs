@@ -18,6 +18,41 @@ use std::time::Duration;
 /// Maximum slice length for single-core timing.
 const MAX_SLICE_LENGTH: i64 = 10000;
 
+const CPU_CLOCK_BASE_MHZ: u32 = 1020;
+const CPU_CLOCK_BOOST_MHZ: u32 = 1734;
+const CPU_CLOCK_OVERCLOCK_MHZ: u32 = 2040;
+
+fn cpu_clock_target_mhz(clock: common::settings_enums::CpuClock) -> u32 {
+    use common::settings_enums::CpuClock;
+    match clock {
+        CpuClock::Boost => CPU_CLOCK_BOOST_MHZ,
+        CpuClock::Overclock => CPU_CLOCK_OVERCLOCK_MHZ,
+        CpuClock::Normal => CPU_CLOCK_BASE_MHZ,
+    }
+}
+
+fn scale_clock_ticks(raw_ticks: u64, target_mhz: u32, sync_core_speed: bool, speed: u16) -> u64 {
+    let mut ticks = if target_mhz != CPU_CLOCK_BASE_MHZ {
+        raw_ticks.wrapping_mul(target_mhz as u64) / CPU_CLOCK_BASE_MHZ as u64
+    } else {
+        raw_ticks
+    };
+    if sync_core_speed {
+        ticks = (ticks as f64 / (speed as f64 * 0.01)) as u64;
+    }
+    ticks
+}
+
+/// Eden `GetNextTickCount`: replace the JIT-reported slice with the configured
+/// fixed tick count only while the paired custom-ticks setting is enabled.
+fn get_next_tick_count(use_custom_ticks: bool, configured_ticks: u32, next_ticks: u64) -> u64 {
+    if use_custom_ticks {
+        configured_ticks as u64
+    } else {
+        next_ticks
+    }
+}
+
 /// A callback that may be scheduled for a particular core timing event.
 /// Returns an optional reschedule time in nanoseconds.
 pub type TimedCallback = Box<dyn Fn(i64, Duration) -> Option<Duration> + Send + Sync>;
@@ -403,9 +438,17 @@ impl CoreTiming {
 
     /// Adds ticks to the CPU tick counter and decrements downcount.
     pub fn add_ticks(&self, ticks_to_add: u64) {
+        let (use_custom_ticks, configured_ticks) = {
+            let values = common::settings::values();
+            (
+                *values.use_custom_cpu_ticks.get_value(),
+                *values.cpu_ticks.get_value(),
+            )
+        };
+        let ticks = get_next_tick_count(use_custom_ticks, configured_ticks, ticks_to_add);
         let mut state = self.state.lock();
-        state.cpu_ticks += ticks_to_add;
-        state.downcount -= ticks_to_add as i64;
+        state.cpu_ticks += ticks;
+        state.downcount -= ticks as i64;
     }
 
     /// Resets the tick downcount to the max slice length.
@@ -415,7 +458,7 @@ impl CoreTiming {
 
     /// Adds idle ticks.
     pub fn idle(&self) {
-        self.state.lock().cpu_ticks += 1000;
+        self.add_ticks(1000);
     }
 
     /// Returns the current downcount.
@@ -425,11 +468,24 @@ impl CoreTiming {
 
     /// Returns the current CNTPCT tick value.
     pub fn get_clock_ticks(&self) -> u64 {
-        if self.is_multicore.load(Ordering::SeqCst) {
+        let raw_ticks = if self.is_multicore.load(Ordering::SeqCst) {
             self.clock.get_cntpct() as u64
         } else {
             wall_clock::cpu_tick_to_cntpct(self.state.lock().cpu_ticks)
-        }
+        };
+        let (target_mhz, sync_core_speed) = {
+            let values = common::settings::values();
+            (
+                cpu_clock_target_mhz(*values.cpu_clock.get_value()),
+                *values.sync_core_speed.get_value(),
+            )
+        };
+        let speed = if sync_core_speed {
+            common::settings::speed_limit()
+        } else {
+            100
+        };
+        scale_clock_ticks(raw_ticks, target_mhz, sync_core_speed, speed)
     }
 
     /// Returns the current GPU tick value.
@@ -594,6 +650,24 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Arc;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn custom_cpu_ticks_replace_each_reported_slice() {
+        assert_eq!(get_next_tick_count(false, 16_000, 731), 731);
+        assert_eq!(get_next_tick_count(true, 16_000, 731), 16_000);
+    }
+
+    #[test]
+    fn cpu_clock_and_speed_scaling_match_eden_targets() {
+        use common::settings_enums::CpuClock;
+
+        assert_eq!(cpu_clock_target_mhz(CpuClock::Normal), 1020);
+        assert_eq!(cpu_clock_target_mhz(CpuClock::Boost), 1734);
+        assert_eq!(cpu_clock_target_mhz(CpuClock::Overclock), 2040);
+        assert_eq!(scale_clock_ticks(1020, 1734, false, 100), 1734);
+        assert_eq!(scale_clock_ticks(1020, 1020, true, 50), 2040);
+        assert_eq!(scale_clock_ticks(1020, 1020, true, 200), 510);
+    }
 
     #[test]
     fn advance_looping_event_reschedules_from_event_time() {

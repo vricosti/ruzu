@@ -13,7 +13,8 @@
 //! so the rest of the port can use names similar to the C++ `vk::` namespace.
 
 use ash::vk;
-use std::ffi::CStr;
+use ash::vk::Handle;
+use std::ffi::{CStr, CString};
 
 // ---------------------------------------------------------------------------
 // Exception / error type — port of `vk::Exception`
@@ -50,6 +51,30 @@ pub fn check(result: vk::Result) -> Result<(), VulkanError> {
     }
 }
 
+/// Port of `vk::Framebuffer::SetObjectNameEXT`.
+pub fn set_framebuffer_name(
+    instance: &ash::Instance,
+    device: &ash::Device,
+    framebuffer: vk::Framebuffer,
+    name: &str,
+) -> Result<(), VulkanError> {
+    let Ok(name) = CString::new(name) else {
+        return Ok(());
+    };
+    let functions = vk::ExtDebugUtilsFn::load(|function_name| unsafe {
+        instance
+            .get_device_proc_addr(device.handle(), function_name.as_ptr())
+            .map_or(std::ptr::null(), |function| {
+                function as *const std::ffi::c_void
+            })
+    });
+    let name_info = vk::DebugUtilsObjectNameInfoEXT::builder()
+        .object_type(vk::ObjectType::FRAMEBUFFER)
+        .object_handle(framebuffer.as_raw())
+        .object_name(&name);
+    check(unsafe { (functions.set_debug_utils_object_name_ext)(device.handle(), &*name_info) })
+}
+
 /// Port of `vk::Filter` — returns `Err` only on error results (negative).
 pub fn filter(result: vk::Result) -> Result<vk::Result, VulkanError> {
     if result.as_raw() < 0 {
@@ -58,6 +83,22 @@ pub fn filter(result: vk::Result) -> Result<vk::Result, VulkanError> {
         Ok(result)
     }
 }
+
+/// Pipeline-stage groups from upstream's `vk` namespace.
+pub const PIPELINE_STAGE_GRAPHICS_COMPUTE: vk::PipelineStageFlags =
+    vk::PipelineStageFlags::from_raw(
+        vk::PipelineStageFlags::ALL_GRAPHICS.as_raw()
+            | vk::PipelineStageFlags::COMPUTE_SHADER.as_raw(),
+    );
+pub const PIPELINE_STAGE_GRAPHICS_COMPUTE_TRANSFER: vk::PipelineStageFlags =
+    vk::PipelineStageFlags::from_raw(
+        PIPELINE_STAGE_GRAPHICS_COMPUTE.as_raw() | vk::PipelineStageFlags::TRANSFER.as_raw(),
+    );
+pub const PIPELINE_STAGE_GRAPHICS_COMPUTE_TRANSFER_HOST: vk::PipelineStageFlags =
+    vk::PipelineStageFlags::from_raw(
+        PIPELINE_STAGE_GRAPHICS_COMPUTE_TRANSFER.as_raw() | vk::PipelineStageFlags::HOST.as_raw(),
+    );
+pub const PIPELINE_STAGE_HOST: vk::PipelineStageFlags = vk::PipelineStageFlags::HOST;
 
 // ---------------------------------------------------------------------------
 // Vendor IDs — used in physical device sorting
@@ -413,6 +454,23 @@ mod tests {
     #[test]
     fn test_filter_error() {
         assert!(filter(vk::Result::ERROR_DEVICE_LOST).is_err());
+    }
+
+    #[test]
+    fn pipeline_stage_groups_match_upstream() {
+        assert_eq!(
+            PIPELINE_STAGE_GRAPHICS_COMPUTE,
+            vk::PipelineStageFlags::ALL_GRAPHICS | vk::PipelineStageFlags::COMPUTE_SHADER
+        );
+        assert_eq!(
+            PIPELINE_STAGE_GRAPHICS_COMPUTE_TRANSFER,
+            PIPELINE_STAGE_GRAPHICS_COMPUTE | vk::PipelineStageFlags::TRANSFER
+        );
+        assert_eq!(
+            PIPELINE_STAGE_GRAPHICS_COMPUTE_TRANSFER_HOST,
+            PIPELINE_STAGE_GRAPHICS_COMPUTE_TRANSFER | vk::PipelineStageFlags::HOST
+        );
+        assert_eq!(PIPELINE_STAGE_HOST, vk::PipelineStageFlags::HOST);
     }
 
     #[test]

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //
 // GTK-backed `EmuWindow` — the launcher counterpart of `ruzu_cmd`'s
-// `EmuWindowSdl2Vk`, and conceptually of upstream yuzu's `GRenderWindow`
+// `EmuWindowSdl3Vk`, and conceptually of upstream yuzu's `GRenderWindow`
 // (`bootmanager.cpp`). It exposes exactly the native window-system data the
 // Vulkan (MoltenVK) renderer needs, sourced from the `CAMetalLayer` embedded in
 // the GTK window by `render_window::attach_metal_layer`:
@@ -40,7 +40,7 @@ pub struct GtkEmuWindow {
 
 impl GtkEmuWindow {
     /// Build from an embedded `CAMetalLayer` (macOS). Mirrors the tail of
-    /// `EmuWindowSdl2Vk::new`, which fills `window_info` for `Cocoa` and seeds
+    /// `EmuWindowSdl3Vk::new`, which fills `window_info` for `Cocoa` and seeds
     /// the framebuffer layout from the drawable size.
     #[cfg(target_os = "macos")]
     pub fn from_metal_layer(layer: EmbeddedMetalLayer) -> Self {

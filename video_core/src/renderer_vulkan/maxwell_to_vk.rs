@@ -19,6 +19,8 @@ use crate::textures::texture::{
 };
 use shader_recompiler::stage::Stage;
 
+use crate::vulkan_common::vulkan_device::{Device, FormatType};
+
 // ---------------------------------------------------------------------------
 // FormatInfo
 // ---------------------------------------------------------------------------
@@ -426,6 +428,46 @@ const TEX_FORMAT_TUPLES: &[FormatTuple] = &[
         format: vk::Format::E5B9G9R9_UFLOAT_PACK32,
         usage: 0,
     }, // E5B9G9R9_FLOAT
+    FormatTuple {
+        format: vk::Format::ETC2_R8G8B8_UNORM_BLOCK,
+        usage: 0,
+    }, // ETC2_RGB_UNORM
+    FormatTuple {
+        format: vk::Format::ETC2_R8G8B8A8_UNORM_BLOCK,
+        usage: 0,
+    }, // ETC2_RGBA_UNORM
+    FormatTuple {
+        format: vk::Format::ETC2_R8G8B8A1_UNORM_BLOCK,
+        usage: 0,
+    }, // ETC2_RGB_PTA_UNORM
+    FormatTuple {
+        format: vk::Format::ETC2_R8G8B8_SRGB_BLOCK,
+        usage: 0,
+    }, // ETC2_RGB_SRGB
+    FormatTuple {
+        format: vk::Format::ETC2_R8G8B8A8_SRGB_BLOCK,
+        usage: 0,
+    }, // ETC2_RGBA_SRGB
+    FormatTuple {
+        format: vk::Format::ETC2_R8G8B8A1_SRGB_BLOCK,
+        usage: 0,
+    }, // ETC2_RGB_PTA_SRGB
+    FormatTuple {
+        format: vk::Format::EAC_R11_UNORM_BLOCK,
+        usage: 0,
+    }, // EAC_R11_UNORM
+    FormatTuple {
+        format: vk::Format::EAC_R11_SNORM_BLOCK,
+        usage: 0,
+    }, // EAC_R11_SNORM
+    FormatTuple {
+        format: vk::Format::EAC_R11G11_UNORM_BLOCK,
+        usage: 0,
+    }, // EAC_R11G11_UNORM
+    FormatTuple {
+        format: vk::Format::EAC_R11G11_SNORM_BLOCK,
+        usage: 0,
+    }, // EAC_R11G11_SNORM
     // Depth formats
     FormatTuple {
         format: vk::Format::D32_SFLOAT,
@@ -461,9 +503,8 @@ const TEX_FORMAT_TUPLES: &[FormatTuple] = &[
 
 /// Returns true if the pixel format is a depth or stencil format.
 fn is_zeta_format(pixel_format: PixelFormat) -> bool {
-    // MaxColorFormat starts at E5B9G9R9Float+1 = D32Float
     let val = pixel_format as u32;
-    val >= PixelFormat::D32Float as u32 && val < PixelFormat::MaxDepthStencilFormat as u32
+    val >= crate::surface::MAX_COLOR_FORMAT && val < crate::surface::MAX_DEPTH_STENCIL_FORMAT
 }
 
 // ---------------------------------------------------------------------------
@@ -549,17 +590,13 @@ pub mod sampler {
 // Top-level conversion functions
 // ---------------------------------------------------------------------------
 
-/// Returns the static format-table entry used by `MaxwellToVK::SurfaceFormat`.
-pub fn surface_format(pixel_format: PixelFormat) -> FormatInfo {
+/// Returns the static format-table entry used internally by
+/// `MaxwellToVK::SurfaceFormat`.
+pub(crate) fn surface_format_table(pixel_format: PixelFormat) -> FormatInfo {
     let idx = pixel_format as usize;
-    if idx >= TEX_FORMAT_TUPLES.len() {
-        return FormatInfo {
-            format: vk::Format::UNDEFINED,
-            attachable: false,
-            storage: false,
-        };
-    }
-    let tuple = &TEX_FORMAT_TUPLES[idx];
+    let tuple = TEX_FORMAT_TUPLES
+        .get(idx)
+        .unwrap_or_else(|| panic!("unknown pixel format {pixel_format:?}"));
     FormatInfo {
         format: tuple.format,
         attachable: (tuple.usage & ATTACHABLE) != 0,
@@ -567,23 +604,21 @@ pub fn surface_format(pixel_format: PixelFormat) -> FormatInfo {
     }
 }
 
-/// Port of the ASTC/BCn conversion portion of `MaxwellToVK::SurfaceFormat`.
+/// Returns the surface format supported by the host device.
 ///
-/// Device format-feature resolution remains with the Vulkan runtime, which
-/// owns the physical-device handle. Format selection itself stays in this
-/// matching upstream module.
-pub fn surface_format_with_recompression(
-    pixel_format: PixelFormat,
+/// Port of `MaxwellToVK::SurfaceFormat(const Device&, FormatType, bool,
+/// PixelFormat)`.
+pub fn surface_format(
+    device: &Device,
+    format_type: FormatType,
     with_srgb: bool,
-    optimal_astc_supported: bool,
-    optimal_bcn_supported: bool,
-    astc_recompression: common::settings_enums::AstcRecompression,
+    pixel_format: PixelFormat,
 ) -> FormatInfo {
-    let mut info = surface_format(pixel_format);
     let is_srgb = with_srgb && crate::surface::is_pixel_format_srgb(pixel_format);
+    let mut info = surface_format_table(pixel_format);
 
-    if !optimal_astc_supported && crate::surface::is_pixel_format_astc(pixel_format) {
-        match astc_recompression {
+    if !device.is_optimal_astc_supported() && crate::surface::is_pixel_format_astc(pixel_format) {
+        match *common::settings::values().astc_recompression.get_value() {
             common::settings_enums::AstcRecompression::Uncompressed => {
                 if is_srgb {
                     info.format = vk::Format::A8B8G8R8_SRGB_PACK32;
@@ -609,7 +644,7 @@ pub fn surface_format_with_recompression(
         }
     }
 
-    if !optimal_bcn_supported && crate::surface::is_pixel_format_bcn(pixel_format) {
+    if !device.is_optimal_bcn_supported() && crate::surface::is_pixel_format_bcn(pixel_format) {
         info.format = match pixel_format {
             PixelFormat::Bc4Snorm => vk::Format::R8_SNORM,
             PixelFormat::Bc4Unorm => vk::Format::R8_UNORM,
@@ -619,8 +654,42 @@ pub fn surface_format_with_recompression(
             _ if is_srgb => vk::Format::A8B8G8R8_SRGB_PACK32,
             _ => vk::Format::A8B8G8R8_UNORM_PACK32,
         };
+    } else if !device.is_optimal_etc2_supported()
+        && crate::surface::is_pixel_format_etc2(pixel_format)
+    {
+        info.format = match pixel_format {
+            PixelFormat::EacR11Snorm => vk::Format::R8_SNORM,
+            PixelFormat::EacR11Unorm => vk::Format::R8_UNORM,
+            PixelFormat::EacR11G11Snorm => vk::Format::R8G8_SNORM,
+            PixelFormat::EacR11G11Unorm => vk::Format::R8G8_UNORM,
+            _ if is_srgb => vk::Format::A8B8G8R8_SRGB_PACK32,
+            _ => vk::Format::A8B8G8R8_UNORM_PACK32,
+        };
     }
 
+    let usage = match format_type {
+        FormatType::Buffer => {
+            vk::FormatFeatureFlags::STORAGE_TEXEL_BUFFER
+                | vk::FormatFeatureFlags::UNIFORM_TEXEL_BUFFER
+        }
+        FormatType::Linear | FormatType::Optimal => {
+            let mut usage = vk::FormatFeatureFlags::SAMPLED_IMAGE
+                | vk::FormatFeatureFlags::TRANSFER_DST
+                | vk::FormatFeatureFlags::TRANSFER_SRC;
+            if info.attachable {
+                usage |= if is_zeta_format(pixel_format) {
+                    vk::FormatFeatureFlags::DEPTH_STENCIL_ATTACHMENT
+                } else {
+                    vk::FormatFeatureFlags::COLOR_ATTACHMENT
+                };
+            }
+            if info.storage {
+                usage |= vk::FormatFeatureFlags::STORAGE_IMAGE;
+            }
+            usage
+        }
+    };
+    info.format = device.get_supported_format(info.format, usage, format_type);
     info
 }
 
@@ -1104,7 +1173,7 @@ mod tests {
 
     #[test]
     fn test_surface_format_a8b8g8r8_unorm() {
-        let info = surface_format(PixelFormat::A8B8G8R8Unorm);
+        let info = surface_format_table(PixelFormat::A8B8G8R8Unorm);
         assert_eq!(info.format, vk::Format::A8B8G8R8_UNORM_PACK32);
         assert!(info.attachable);
         assert!(info.storage);
@@ -1112,93 +1181,80 @@ mod tests {
 
     #[test]
     fn test_surface_format_bc1() {
-        let info = surface_format(PixelFormat::Bc1RgbaUnorm);
+        let info = surface_format_table(PixelFormat::Bc1RgbaUnorm);
         assert_eq!(info.format, vk::Format::BC1_RGBA_UNORM_BLOCK);
         assert!(!info.attachable);
         assert!(!info.storage);
     }
 
     #[test]
-    fn surface_format_recompresses_astc_like_upstream() {
-        use common::settings_enums::AstcRecompression;
-
-        let base = surface_format_with_recompression(
-            PixelFormat::Astc2d4x4Srgb,
-            false,
-            false,
-            true,
-            AstcRecompression::Uncompressed,
-        );
-        assert_eq!(base.format, vk::Format::A8B8G8R8_UNORM_PACK32);
-        assert!(base.storage);
-
-        let view = surface_format_with_recompression(
-            PixelFormat::Astc2d4x4Srgb,
-            true,
-            false,
-            true,
-            AstcRecompression::Uncompressed,
-        );
-        assert_eq!(view.format, vk::Format::A8B8G8R8_SRGB_PACK32);
-        assert!(!view.storage);
-
-        for (recompression, unorm, srgb) in [
+    fn surface_format_table_keeps_etc2_eac_and_depth_entries_aligned() {
+        let expected = [
             (
-                AstcRecompression::Bc1,
-                vk::Format::BC1_RGBA_UNORM_BLOCK,
-                vk::Format::BC1_RGBA_SRGB_BLOCK,
+                PixelFormat::Etc2RgbUnorm,
+                vk::Format::ETC2_R8G8B8_UNORM_BLOCK,
             ),
             (
-                AstcRecompression::Bc3,
-                vk::Format::BC3_UNORM_BLOCK,
-                vk::Format::BC3_SRGB_BLOCK,
+                PixelFormat::Etc2RgbaUnorm,
+                vk::Format::ETC2_R8G8B8A8_UNORM_BLOCK,
             ),
-        ] {
+            (
+                PixelFormat::Etc2RgbPtaUnorm,
+                vk::Format::ETC2_R8G8B8A1_UNORM_BLOCK,
+            ),
+            (PixelFormat::Etc2RgbSrgb, vk::Format::ETC2_R8G8B8_SRGB_BLOCK),
+            (
+                PixelFormat::Etc2RgbaSrgb,
+                vk::Format::ETC2_R8G8B8A8_SRGB_BLOCK,
+            ),
+            (
+                PixelFormat::Etc2RgbPtaSrgb,
+                vk::Format::ETC2_R8G8B8A1_SRGB_BLOCK,
+            ),
+            (PixelFormat::EacR11Unorm, vk::Format::EAC_R11_UNORM_BLOCK),
+            (PixelFormat::EacR11Snorm, vk::Format::EAC_R11_SNORM_BLOCK),
+            (
+                PixelFormat::EacR11G11Unorm,
+                vk::Format::EAC_R11G11_UNORM_BLOCK,
+            ),
+            (
+                PixelFormat::EacR11G11Snorm,
+                vk::Format::EAC_R11G11_SNORM_BLOCK,
+            ),
+            (PixelFormat::D32Float, vk::Format::D32_SFLOAT),
+            (PixelFormat::D16Unorm, vk::Format::D16_UNORM),
+            (PixelFormat::X8D24Unorm, vk::Format::X8_D24_UNORM_PACK32),
+            (PixelFormat::S8Uint, vk::Format::S8_UINT),
+            (PixelFormat::D24UnormS8Uint, vk::Format::D24_UNORM_S8_UINT),
+            (PixelFormat::S8UintD24Unorm, vk::Format::D24_UNORM_S8_UINT),
+            (PixelFormat::D32FloatS8Uint, vk::Format::D32_SFLOAT_S8_UINT),
+        ];
+
+        for (pixel_format, vk_format) in expected {
             assert_eq!(
-                surface_format_with_recompression(
-                    PixelFormat::Astc2d4x4Srgb,
-                    false,
-                    false,
-                    true,
-                    recompression,
-                )
-                .format,
-                unorm,
-            );
-            assert_eq!(
-                surface_format_with_recompression(
-                    PixelFormat::Astc2d4x4Srgb,
-                    true,
-                    false,
-                    true,
-                    recompression,
-                )
-                .format,
-                srgb,
+                surface_format_table(pixel_format).format,
+                vk_format,
+                "{pixel_format:?}"
             );
         }
+        assert_eq!(
+            TEX_FORMAT_TUPLES.len(),
+            PixelFormat::MaxDepthStencilFormat as usize
+        );
     }
 
     #[test]
-    fn surface_format_bcn_transcode_honors_with_srgb() {
-        use common::settings_enums::AstcRecompression;
+    fn is_zeta_format_matches_upstream_range() {
+        assert!(!is_zeta_format(PixelFormat::A8B8G8R8Unorm));
+        assert!(is_zeta_format(PixelFormat::D32Float));
+        assert!(is_zeta_format(PixelFormat::D32FloatS8Uint));
+        assert!(!is_zeta_format(PixelFormat::MaxDepthStencilFormat));
+    }
 
-        let base = surface_format_with_recompression(
-            PixelFormat::Bc3Srgb,
-            false,
-            true,
-            false,
-            AstcRecompression::Uncompressed,
-        );
-        let view = surface_format_with_recompression(
-            PixelFormat::Bc3Srgb,
-            true,
-            true,
-            false,
-            AstcRecompression::Uncompressed,
-        );
-        assert_eq!(base.format, vk::Format::A8B8G8R8_UNORM_PACK32);
-        assert_eq!(view.format, vk::Format::A8B8G8R8_SRGB_PACK32);
+    #[test]
+    #[should_panic(expected = "unknown pixel format")]
+    fn surface_format_table_rejects_upstream_sentinel() {
+        let _ = surface_format_table(PixelFormat::MaxDepthStencilFormat);
     }
 
     #[test]

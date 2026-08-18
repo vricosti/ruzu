@@ -15,20 +15,20 @@ use gtk::{gdk, glib};
 
 use super::configure_dialog::Page;
 use super::{
-    configure_audio, configure_cpu, configure_graphics, configure_graphics_advanced,
-    configure_input_per_game, configure_linux_tab, configure_per_game_addons, configure_system,
-    qt_config,
+    configure_applets, configure_audio, configure_cpu, configure_graphics,
+    configure_graphics_advanced, configure_graphics_extensions, configure_input_per_game,
+    configure_network, configure_per_game_addons, configure_system, qt_config,
 };
 
-// The reference Properties capture is 1010x661 including the Linux window
-// frame. Mutter adds 28x66 pixels around this GTK client on the reference
-// desktop, so these client dimensions reproduce the upstream capture.
-const DEFAULT_WIDTH: i32 = 982;
-const DEFAULT_HEIGHT: i32 = 595;
+// The Eden Properties captures are 928x790 including the Linux window frame.
+// Mutter adds 28x66 pixels around this GTK client on the same reference
+// desktop, so these client dimensions reproduce the upstream geometry.
+const DEFAULT_WIDTH: i32 = 900;
+const DEFAULT_HEIGHT: i32 = 724;
 const INFO_PANEL_WIDTH: i32 = 280;
 const ICON_SIZE: i32 = 256;
 
-const PER_GAME_CATEGORIES: [common::settings_enums::Category; 12] = [
+const PER_GAME_CATEGORIES: [common::settings_enums::Category; 16] = [
     common::settings_enums::Category::Controls,
     common::settings_enums::Category::Core,
     common::settings_enums::Category::Cpu,
@@ -37,10 +37,14 @@ const PER_GAME_CATEGORIES: [common::settings_enums::Category; 12] = [
     common::settings_enums::Category::Linux,
     common::settings_enums::Category::Renderer,
     common::settings_enums::Category::RendererAdvanced,
+    common::settings_enums::Category::RendererHacks,
+    common::settings_enums::Category::RendererExtensions,
     common::settings_enums::Category::RendererDebug,
     common::settings_enums::Category::Audio,
     common::settings_enums::Category::System,
     common::settings_enums::Category::SystemAudio,
+    common::settings_enums::Category::Network,
+    common::settings_enums::Category::LibraryApplet,
 ];
 
 /// Metadata displayed by the permanent left-side Info panel.
@@ -73,6 +77,7 @@ impl ConfigurePerGame {
         parent: Option<&gtk::Window>,
         properties: GameProperties,
         hid_core: Arc<parking_lot::Mutex<hid_core::hid_core::HIDCore>>,
+        runtime_lock: bool,
     ) -> Rc<Self> {
         install_properties_css();
         common::settings::set_configuring_global(false);
@@ -80,24 +85,23 @@ impl ConfigurePerGame {
         let config_path = custom_config_path(properties.title_id, &properties.path);
         let mut config = BaseConfig::new(ConfigType::PerGameConfig);
         config.initialize(&config_path);
-        config.read_values();
         qt_config::load_per_game_control_values(&config_path);
 
-        let patches =
-            configure_per_game_addons::load_from_file(properties.title_id, &properties.path);
         let advanced_graphics = configure_graphics_advanced::page();
-        let graphics = configure_graphics::page(advanced_graphics.expose_compute_option);
-        let mut pages = vec![
-            configure_per_game_addons::page(properties.title_id, &patches),
+        let graphics =
+            configure_graphics::page(advanced_graphics.expose_compute_option, runtime_lock);
+        let pages = vec![
+            configure_per_game_addons::page(properties.title_id, &properties.path),
             configure_system::page(),
             configure_cpu::page(),
             graphics,
             advanced_graphics.page,
+            configure_graphics_extensions::page(),
             configure_audio::page(),
             configure_input_per_game::page(hid_core),
+            configure_network::page(),
+            configure_applets::page(),
         ];
-        #[cfg(unix)]
-        pages.push(configure_linux_tab::page());
 
         let window = gtk::Window::builder()
             .title("Properties")

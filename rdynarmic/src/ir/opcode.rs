@@ -290,6 +290,7 @@ pub enum Opcode {
     VectorEqual128,
     VectorExtract,
     VectorExtractLower,
+    VectorRotateWholeVectorRight,
     VectorGreaterEqualSigned8,
     VectorGreaterEqualSigned16,
     VectorGreaterEqualSigned32,
@@ -1275,7 +1276,7 @@ impl Opcode {
                 => OpcodeInfo { ret: U128, args: &[U128] },
 
             // SHA
-            SM4AccessSubstitutionBox => OpcodeInfo { ret: U128, args: &[U128, U128] },
+            SM4AccessSubstitutionBox => OpcodeInfo { ret: U8, args: &[U8] },
             SHA256Hash => OpcodeInfo { ret: U128, args: &[U128, U128, U128, U1] },
             SHA256MessageSchedule0 => OpcodeInfo { ret: U128, args: &[U128, U128] },
             SHA256MessageSchedule1 => OpcodeInfo { ret: U128, args: &[U128, U128, U128] },
@@ -1406,6 +1407,7 @@ impl Opcode {
             // Vector extract
             VectorExtract => OpcodeInfo { ret: U128, args: &[U128, U128, U8] },
             VectorExtractLower => OpcodeInfo { ret: U128, args: &[U128, U128, U8] },
+            VectorRotateWholeVectorRight => OpcodeInfo { ret: U128, args: &[U128, U8] },
 
             // Vector shuffle (imm8 control)
             VectorShuffleHighHalfwords | VectorShuffleLowHalfwords | VectorShuffleWords

@@ -1,6 +1,7 @@
 use super::performance_entry::PerformanceEntryType;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
 pub enum PerformanceDetailType {
     Invalid = 0,
     Unk1 = 1,
@@ -65,3 +66,6 @@ impl Default for PerformanceDetailVersion2 {
         }
     }
 }
+
+const _: () = assert!(std::mem::size_of::<PerformanceDetailVersion1>() == 0x10);
+const _: () = assert!(std::mem::size_of::<PerformanceDetailVersion2>() == 0x18);

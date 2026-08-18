@@ -323,7 +323,16 @@ impl Swapchain {
         if let Some(tick) = self.resource_ticks.get_mut(self.image_index as usize) {
             match scheduler {
                 Some(scheduler) => {
-                    scheduler.wait(*tick);
+                    use common::settings_enums::FramePacingMode;
+                    let target_fps = match *common::settings::values().frame_pacing_mode.get_value()
+                    {
+                        FramePacingMode::Target_Auto => 0.0,
+                        FramePacingMode::Target_30 => 30.0,
+                        FramePacingMode::Target_60 => 60.0,
+                        FramePacingMode::Target_90 => 90.0,
+                        FramePacingMode::Target_120 => 120.0,
+                    };
+                    scheduler.wait_with_frame_pacing(*tick, target_fps);
                     *tick = scheduler.current_tick();
                 }
                 // Present-thread path: the scheduler belongs to the GPU thread

@@ -10,18 +10,20 @@
 use crate::control::channel_state::ChannelState;
 use crate::dirty_flags::{fill_block, setup_dirty_flags, DirtyTables};
 use crate::engines::maxwell_3d::{
-    PrimitiveTopology, BLEND_BASE, BLEND_COLOR_BASE, BLEND_PER_TARGET_BASE,
-    BLEND_PER_TARGET_ENABLED, BLEND_PER_TARGET_STRIDE, COLOR_MASK_BASE, COLOR_MASK_COMMON,
-    CULL_FACE, CULL_TEST_ENABLE, DEPTH_BIAS, DEPTH_BIAS_CLAMP, DEPTH_BOUNDS_BASE,
-    DEPTH_BOUNDS_ENABLE, DEPTH_TEST_ENABLE, DEPTH_TEST_FUNC, DEPTH_WRITE_ENABLE, FRONT_FACE,
-    LINE_WIDTH_ALIASED, LINE_WIDTH_SMOOTH, LOGIC_OP, POLYGON_OFFSET_FILL_ENABLE,
-    POLYGON_OFFSET_LINE_ENABLE, POLYGON_OFFSET_POINT_ENABLE, PRIMITIVE_RESTART_BASE,
-    RASTERIZE_ENABLE, SCISSOR_BASE, SCISSOR_STRIDE, SLOPE_SCALE_DEPTH_BIAS, STENCIL_BACK_FUNC_MASK,
-    STENCIL_BACK_MASK, STENCIL_BACK_OP_BASE, STENCIL_BACK_REF, STENCIL_ENABLE,
-    STENCIL_FRONT_FUNC_MASK, STENCIL_FRONT_MASK, STENCIL_FRONT_OP_BASE, STENCIL_FRONT_REF,
-    STENCIL_TWO_SIDE_ENABLE, VERTEX_ATTRIB_BASE, VERTEX_STREAM_BASE, VERTEX_STREAM_INSTANCE_BASE,
-    VERTEX_STREAM_STRIDE, VIEWPORT_BASE, VIEWPORT_CLIP_CONTROL, VIEWPORT_SCALE_OFFSET_ENABLED,
-    VIEWPORT_STRIDE, VP_TRANSFORM_BASE, VP_TRANSFORM_STRIDE, WINDOW_ORIGIN,
+    PrimitiveTopology, ANTI_ALIAS_ALPHA_CONTROL, BLEND_BASE, BLEND_COLOR_BASE,
+    BLEND_PER_TARGET_BASE, BLEND_PER_TARGET_ENABLED, BLEND_PER_TARGET_STRIDE, COLOR_MASK_BASE,
+    COLOR_MASK_COMMON, CONSERVATIVE_RASTER_ENABLE, CULL_FACE, CULL_TEST_ENABLE, DEPTH_BIAS,
+    DEPTH_BIAS_CLAMP, DEPTH_BOUNDS_BASE, DEPTH_BOUNDS_ENABLE, DEPTH_TEST_ENABLE, DEPTH_TEST_FUNC,
+    DEPTH_WRITE_ENABLE, FRONT_FACE, LINE_ANTI_ALIAS_ENABLE, LINE_STIPPLE_ENABLE,
+    LINE_STIPPLE_PARAMS, LINE_WIDTH_ALIASED, LINE_WIDTH_SMOOTH, LOGIC_OP,
+    POLYGON_OFFSET_FILL_ENABLE, POLYGON_OFFSET_LINE_ENABLE, POLYGON_OFFSET_POINT_ENABLE,
+    PRIMITIVE_RESTART_BASE, RASTERIZE_ENABLE, SCISSOR_BASE, SCISSOR_STRIDE, SLOPE_SCALE_DEPTH_BIAS,
+    STENCIL_BACK_FUNC_MASK, STENCIL_BACK_MASK, STENCIL_BACK_OP_BASE, STENCIL_BACK_REF,
+    STENCIL_ENABLE, STENCIL_FRONT_FUNC_MASK, STENCIL_FRONT_MASK, STENCIL_FRONT_OP_BASE,
+    STENCIL_FRONT_REF, STENCIL_TWO_SIDE_ENABLE, VERTEX_ATTRIB_BASE, VERTEX_STREAM_BASE,
+    VERTEX_STREAM_INSTANCE_BASE, VERTEX_STREAM_STRIDE, VIEWPORT_BASE, VIEWPORT_CLIP_CONTROL,
+    VIEWPORT_SCALE_OFFSET_ENABLED, VIEWPORT_STRIDE, VP_TRANSFORM_BASE, VP_TRANSFORM_STRIDE,
+    WINDOW_ORIGIN,
 };
 use std::ptr::NonNull;
 
@@ -78,13 +80,19 @@ pub mod dirty {
     pub const STENCIL_TEST_ENABLE: u8 = STENCIL_OP + 1;
     pub const PRIMITIVE_RESTART_ENABLE: u8 = STENCIL_TEST_ENABLE + 1;
     pub const RASTERIZER_DISCARD_ENABLE: u8 = PRIMITIVE_RESTART_ENABLE + 1;
-    pub const DEPTH_BIAS_ENABLE: u8 = RASTERIZER_DISCARD_ENABLE + 1;
+    pub const CONSERVATIVE_RASTERIZATION_MODE: u8 = RASTERIZER_DISCARD_ENABLE + 1;
+    pub const LINE_RASTERIZATION_MODE: u8 = CONSERVATIVE_RASTERIZATION_MODE + 1;
+    pub const LINE_STIPPLE_ENABLE: u8 = LINE_RASTERIZATION_MODE + 1;
+    pub const LINE_STIPPLE_PARAMS: u8 = LINE_STIPPLE_ENABLE + 1;
+    pub const DEPTH_BIAS_ENABLE: u8 = LINE_STIPPLE_PARAMS + 1;
     pub const STATE_ENABLE: u8 = DEPTH_BIAS_ENABLE + 1;
     pub const LOGIC_OP: u8 = STATE_ENABLE + 1;
     pub const LOGIC_OP_ENABLE: u8 = LOGIC_OP + 1;
     pub const DEPTH_CLAMP_ENABLE: u8 = LOGIC_OP_ENABLE + 1;
+    pub const ALPHA_TO_COVERAGE_ENABLE: u8 = DEPTH_CLAMP_ENABLE + 1;
+    pub const ALPHA_TO_ONE_ENABLE: u8 = ALPHA_TO_COVERAGE_ENABLE + 1;
 
-    pub const BLENDING: u8 = DEPTH_CLAMP_ENABLE + 1;
+    pub const BLENDING: u8 = ALPHA_TO_ONE_ENABLE + 1;
     pub const BLEND_ENABLE: u8 = BLENDING + 1;
     pub const BLEND_EQUATIONS: u8 = BLEND_ENABLE + 1;
     pub const COLOR_MASK: u8 = BLEND_EQUATIONS + 1;
@@ -193,10 +201,29 @@ fn setup_dirty_state_enable(tables: &mut DirtyTables) {
         (POLYGON_OFFSET_FILL_ENABLE, dirty::DEPTH_BIAS_ENABLE),
         (LOGIC_OP, dirty::LOGIC_OP_ENABLE),
         (VIEWPORT_CLIP_CONTROL, dirty::DEPTH_CLAMP_ENABLE),
+        (LINE_STIPPLE_ENABLE, dirty::LINE_STIPPLE_ENABLE),
+        (ANTI_ALIAS_ALPHA_CONTROL, dirty::ALPHA_TO_COVERAGE_ENABLE),
+        (ANTI_ALIAS_ALPHA_CONTROL, dirty::ALPHA_TO_ONE_ENABLE),
     ] {
         set(tables, 0, offset, flag);
         set(tables, 1, offset, dirty::STATE_ENABLE);
     }
+}
+
+fn setup_raster_modes(tables: &mut DirtyTables) {
+    set(tables, 0, LINE_STIPPLE_PARAMS, dirty::LINE_STIPPLE_PARAMS);
+    set(
+        tables,
+        0,
+        CONSERVATIVE_RASTER_ENABLE,
+        dirty::CONSERVATIVE_RASTERIZATION_MODE,
+    );
+    set(
+        tables,
+        0,
+        LINE_ANTI_ALIAS_ENABLE,
+        dirty::LINE_RASTERIZATION_MODE,
+    );
 }
 
 fn setup_dirty_stencil_op(tables: &mut DirtyTables) {
@@ -414,6 +441,7 @@ impl StateTracker {
         setup_dirty_vertex_attributes(tables);
         setup_dirty_vertex_bindings(tables);
         set(tables, 0, LOGIC_OP + 1, dirty::LOGIC_OP);
+        setup_raster_modes(tables);
     }
 
     /// Port of `StateTracker::ChangeChannel`.
@@ -615,6 +643,22 @@ impl StateTracker {
         self.exchange(dirty::RASTERIZER_DISCARD_ENABLE)
     }
 
+    pub fn touch_conservative_rasterization_mode(&mut self) -> bool {
+        self.exchange(dirty::CONSERVATIVE_RASTERIZATION_MODE)
+    }
+
+    pub fn touch_line_rasterization_mode(&mut self) -> bool {
+        self.exchange(dirty::LINE_RASTERIZATION_MODE)
+    }
+
+    pub fn touch_line_stipple_enable(&mut self) -> bool {
+        self.exchange(dirty::LINE_STIPPLE_ENABLE)
+    }
+
+    pub fn touch_line_stipple(&mut self) -> bool {
+        self.exchange(dirty::LINE_STIPPLE_PARAMS)
+    }
+
     /// Port of `StateTracker::TouchDepthBiasEnable`.
     pub fn touch_depth_bias_enable(&mut self) -> bool {
         self.exchange(dirty::DEPTH_BIAS_ENABLE)
@@ -628,6 +672,14 @@ impl StateTracker {
     /// Port of `StateTracker::TouchDepthClampEnable`.
     pub fn touch_depth_clamp_enable(&mut self) -> bool {
         self.exchange(dirty::DEPTH_CLAMP_ENABLE)
+    }
+
+    pub fn touch_alpha_to_coverage_enable(&mut self) -> bool {
+        self.exchange(dirty::ALPHA_TO_COVERAGE_ENABLE)
+    }
+
+    pub fn touch_alpha_to_one_enable(&mut self) -> bool {
+        self.exchange(dirty::ALPHA_TO_ONE_ENABLE)
     }
 
     /// Port of `StateTracker::TouchDepthCompareOp`.

@@ -18,7 +18,7 @@ use crate::ir::value::InstRef;
 // FPVectorAdd/Sub/Mul/Div — native SSE with upstream default-NaN handling
 // ---------------------------------------------------------------------------
 
-fn force_to_default_nan_vector(ra: &mut RegAlloc, result: rxbyak::Reg, esize: usize) {
+pub(crate) fn force_to_default_nan_vector(ra: &mut RegAlloc, result: rxbyak::Reg, esize: usize) {
     let nan_mask = ra.scratch_xmm();
     ra.asm.movaps(nan_mask, result).unwrap();
     match esize {

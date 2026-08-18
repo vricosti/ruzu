@@ -1,13 +1,34 @@
-use crate::adsp::apps::opus::opus_decode_object::{
-    DecodeObjectHeader, FLAG_INITIALIZED, FLAG_MAPPED, FLAG_MULTI_STREAM,
-};
-use crate::adsp::apps::opus::shared_memory::SharedMemory;
-use crate::errors::RESULT_LIB_OPUS_INVALID_STATE;
-use crate::opus::hardware_opus::HardwareOpus;
-use crate::Result;
-use common::ResultCode;
+use crate::adsp::apps::opus::opus_decode_object::{OPUS_INVALID_STATE, OPUS_OK};
+use std::ffi::{c_int, c_void};
+use std::mem::size_of;
 
 pub const DECODE_MULTI_STREAM_OBJECT_MAGIC: u32 = 0xDEAD_BEEF;
+
+const OPUS_RESET_STATE: c_int = 4028;
+const OPUS_GET_FINAL_RANGE_REQUEST: c_int = 4031;
+const OPUS_MULTI_STREAM_DECODE_OBJECT_SIZE: u32 = 0x20;
+
+#[link(name = "opus")]
+unsafe extern "C" {
+    fn opus_multistream_decoder_get_size(streams: c_int, coupled_streams: c_int) -> c_int;
+    fn opus_multistream_decoder_init(
+        st: *mut c_void,
+        sample_rate: c_int,
+        channels: c_int,
+        streams: c_int,
+        coupled_streams: c_int,
+        mapping: *const u8,
+    ) -> c_int;
+    fn opus_multistream_decode(
+        st: *mut c_void,
+        data: *const u8,
+        len: c_int,
+        pcm: *mut i16,
+        frame_size: c_int,
+        decode_fec: c_int,
+    ) -> c_int;
+    fn opus_multistream_decoder_ctl(st: *mut c_void, request: c_int, ...) -> c_int;
+}
 
 pub struct OpusMultiStreamDecodeObject {
     magic: u32,
@@ -15,13 +36,7 @@ pub struct OpusMultiStreamDecodeObject {
     state_valid: bool,
     self_buffer: u64,
     final_range: u32,
-    hardware_opus: HardwareOpus,
-    sample_rate: u32,
-    channel_count: u32,
-    total_stream_count: u32,
-    stereo_stream_count: u32,
-    buffer_size: u64,
-    mappings: Vec<u8>,
+    decoder_storage: Vec<usize>,
 }
 
 impl OpusMultiStreamDecodeObject {
@@ -39,8 +54,16 @@ impl OpusMultiStreamDecodeObject {
         if !Self::is_valid_stream_counts(total_stream_count, stereo_stream_count) {
             return 0;
         }
-        HardwareOpus::new()
-            .get_work_buffer_size_for_multi_stream(total_stream_count, stereo_stream_count)
+        let decoder_size = unsafe {
+            opus_multistream_decoder_get_size(
+                total_stream_count as c_int,
+                stereo_stream_count as c_int,
+            )
+        };
+        if decoder_size <= 0 {
+            return 0;
+        }
+        OPUS_MULTI_STREAM_DECODE_OBJECT_SIZE + decoder_size as u32
     }
 
     pub fn initialize(buffer: u64, comparison_buffer: u64, existing: Option<Self>) -> Self {
@@ -69,13 +92,7 @@ impl OpusMultiStreamDecodeObject {
                 state_valid: true,
                 self_buffer: buffer,
                 final_range: 0,
-                hardware_opus: HardwareOpus::new(),
-                sample_rate: 0,
-                channel_count: 0,
-                total_stream_count: 0,
-                stereo_stream_count: 0,
-                buffer_size: 0,
-                mappings: Vec::new(),
+                decoder_storage: Vec::new(),
             },
         }
     }
@@ -87,251 +104,132 @@ impl OpusMultiStreamDecodeObject {
         channel_count: u32,
         stereo_stream_count: u32,
         mappings: &[u8],
-        buffer_size: u64,
-    ) -> Result {
+    ) -> c_int {
         if !self.state_valid {
-            return RESULT_LIB_OPUS_INVALID_STATE;
+            return OPUS_INVALID_STATE;
         }
         if self.initialized {
-            return ResultCode::SUCCESS;
+            return OPUS_OK;
         }
-        let result = self.hardware_opus.initialize_multi_stream_decode_object(
-            sample_rate,
-            channel_count,
-            total_stream_count,
-            stereo_stream_count,
-            mappings,
-            buffer_size,
-        );
-        if result.is_success() {
+        let decoder_size = unsafe {
+            opus_multistream_decoder_get_size(
+                total_stream_count as c_int,
+                stereo_stream_count as c_int,
+            )
+        };
+        if decoder_size <= 0 || mappings.len() < channel_count as usize {
+            return -1;
+        }
+        let word_size = size_of::<usize>();
+        self.decoder_storage = vec![0; (decoder_size as usize).div_ceil(word_size)];
+        let result = unsafe {
+            opus_multistream_decoder_init(
+                self.decoder_storage.as_mut_ptr().cast(),
+                sample_rate as c_int,
+                channel_count as c_int,
+                total_stream_count as c_int,
+                stereo_stream_count as c_int,
+                mappings.as_ptr(),
+            )
+        };
+        if result == OPUS_OK {
             self.magic = DECODE_MULTI_STREAM_OBJECT_MAGIC;
             self.initialized = true;
             self.state_valid = true;
             self.final_range = 0;
-            self.sample_rate = sample_rate;
-            self.channel_count = channel_count;
-            self.total_stream_count = total_stream_count;
-            self.stereo_stream_count = stereo_stream_count;
-            self.buffer_size = buffer_size;
-            self.mappings = mappings.to_vec();
         }
         result
     }
 
-    pub fn shutdown(&mut self) -> Result {
+    pub fn shutdown(&mut self) -> c_int {
         if !self.state_valid {
-            return RESULT_LIB_OPUS_INVALID_STATE;
+            return OPUS_INVALID_STATE;
         }
         if self.initialized {
-            let result = self
-                .hardware_opus
-                .shutdown_multi_stream_decode_object(self.buffer_size);
-            if result.is_error() {
-                return result;
-            }
             self.magic = 0;
             self.initialized = false;
             self.state_valid = false;
             self.self_buffer = 0;
             self.final_range = 0;
-            self.sample_rate = 0;
-            self.channel_count = 0;
-            self.total_stream_count = 0;
-            self.stereo_stream_count = 0;
-            self.buffer_size = 0;
-            self.mappings.clear();
+            self.decoder_storage.clear();
         }
-        ResultCode::SUCCESS
+        OPUS_OK
     }
 
-    pub fn reset_decoder(&mut self) -> Result {
+    pub fn reset_decoder(&mut self) -> c_int {
         if !self.state_valid || !self.initialized {
-            return RESULT_LIB_OPUS_INVALID_STATE;
+            return OPUS_INVALID_STATE;
         }
-        self.hardware_opus.reset_multi_stream_decode_object()
+        let result = unsafe {
+            opus_multistream_decoder_ctl(self.decoder_storage.as_mut_ptr().cast(), OPUS_RESET_STATE)
+        };
+        result
     }
 
     pub fn decode(
         &mut self,
         out_sample_count: &mut u32,
         output_data: &mut [u8],
-        channel_count: u32,
         input_data: &[u8],
-        out_time_taken: &mut u64,
-    ) -> Result {
+    ) -> c_int {
         if !self.state_valid || !self.initialized {
-            return RESULT_LIB_OPUS_INVALID_STATE;
+            return OPUS_INVALID_STATE;
         }
-        self.hardware_opus.decode_interleaved_for_multi_stream(
-            out_sample_count,
-            output_data,
-            channel_count,
-            input_data,
-            out_time_taken,
-            false,
-        )
+        *out_sample_count = 0;
+        if self.decoder_storage.is_empty() {
+            return OPUS_INVALID_STATE;
+        }
+
+        let decoded = unsafe {
+            opus_multistream_decode(
+                self.decoder_storage.as_mut_ptr().cast(),
+                input_data.as_ptr(),
+                input_data.len() as c_int,
+                output_data.as_mut_ptr().cast(),
+                output_data.len() as c_int,
+                0,
+            )
+        };
+        if decoded < OPUS_OK {
+            return decoded;
+        }
+
+        *out_sample_count = decoded as u32;
+        let mut final_range = 0u32;
+        let result = unsafe {
+            opus_multistream_decoder_ctl(
+                self.decoder_storage.as_mut_ptr().cast(),
+                OPUS_GET_FINAL_RANGE_REQUEST,
+                &mut final_range as *mut u32,
+            )
+        };
+        self.final_range = final_range;
+        result
     }
 
     pub fn get_final_range(&self) -> u32 {
         self.final_range
     }
+}
 
-    pub fn set_final_range(&mut self, final_range: u32) {
-        self.final_range = final_range;
-    }
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-    pub fn matches_config(
-        shared: &SharedMemory,
-        buffer: u64,
-        sample_rate: u32,
-        channel_count: u32,
-        total_stream_count: u32,
-        stereo_stream_count: u32,
-        buffer_size: u64,
-    ) -> bool {
-        let Some(header) = DecodeObjectHeader::read(shared, buffer) else {
-            return false;
-        };
-        header.matches_multi_stream_config(
-            sample_rate,
-            channel_count,
-            total_stream_count,
-            stereo_stream_count,
-            buffer_size,
-        )
-    }
+    #[test]
+    fn decodes_non_silent_pcm_with_libopus() {
+        let mut object = OpusMultiStreamDecodeObject::initialize(0x1000, 0x1000, None);
+        assert_eq!(object.initialize_decoder(48_000, 1, 2, 1, &[0, 1]), OPUS_OK);
 
-    pub fn write_successful_header(
-        shared: &mut SharedMemory,
-        buffer: u64,
-        sample_rate: u32,
-        channel_count: u32,
-        total_stream_count: u32,
-        stereo_stream_count: u32,
-        buffer_size: u64,
-    ) -> bool {
-        DecodeObjectHeader {
-            magic: DECODE_MULTI_STREAM_OBJECT_MAGIC,
-            sample_rate,
-            channel_count,
-            total_stream_count,
-            stereo_stream_count,
-            _reserved0: 0,
-            buffer_size,
-            final_range: 0,
-            flags: FLAG_INITIALIZED | FLAG_MULTI_STREAM | FLAG_MAPPED,
-        }
-        .write(shared, buffer)
-    }
-
-    pub fn shutdown_with_header(
-        &mut self,
-        shared: &mut SharedMemory,
-        buffer: u64,
-        buffer_size: u64,
-    ) -> Result {
-        let Some(header) = DecodeObjectHeader::read(shared, buffer) else {
-            return RESULT_LIB_OPUS_INVALID_STATE;
-        };
-        if !header.is_initialized()
-            || !header.is_multi_stream()
-            || !header.matches_buffer_size(buffer_size)
-        {
-            return RESULT_LIB_OPUS_INVALID_STATE;
-        }
-        let result = self.shutdown();
-        if result.is_success() {
-            let _ = DecodeObjectHeader::clear(shared, buffer);
-        }
-        result
-    }
-
-    pub fn map_memory(
-        shared: &mut SharedMemory,
-        buffer: u64,
-        buffer_size: u64,
-        mapped: bool,
-    ) -> Result {
-        let Some(mut header) = DecodeObjectHeader::read(shared, buffer) else {
-            return RESULT_LIB_OPUS_INVALID_STATE;
-        };
-        if !header.is_initialized()
-            || !header.is_multi_stream()
-            || !header.matches_buffer_size(buffer_size)
-        {
-            return RESULT_LIB_OPUS_INVALID_STATE;
-        }
-        header.set_mapped(mapped);
-        if header.write(shared, buffer) {
-            ResultCode::SUCCESS
-        } else {
-            RESULT_LIB_OPUS_INVALID_STATE
-        }
-    }
-
-    pub fn decode_packet(
-        &mut self,
-        object_header: &DecodeObjectHeader,
-        payload: &[u8],
-        output: &mut [u8],
-        decoded_samples: &mut u32,
-        time_taken: &mut u64,
-        packet_final_range: u32,
-        expected_final_range: u32,
-        decoded_final_range: &mut Option<u32>,
-    ) -> Result {
-        if !object_header.can_decode_multi_stream() {
-            return RESULT_LIB_OPUS_INVALID_STATE;
-        }
-        let result = self.decode(
-            decoded_samples,
-            output,
-            object_header.channel_count,
-            payload,
-            time_taken,
+        let packet = super::super::opus_decode_object::tests::encoded_stereo_packet();
+        let mut output = vec![0u8; 960 * 2 * size_of::<i16>()];
+        let mut sample_count = 0;
+        assert_eq!(
+            object.decode(&mut sample_count, &mut output, &packet),
+            OPUS_OK
         );
-        if result.is_error() {
-            return result;
-        }
-        if expected_final_range != 0 && packet_final_range != expected_final_range {
-            return RESULT_LIB_OPUS_INVALID_STATE;
-        }
-        self.set_final_range(packet_final_range);
-        *decoded_final_range = Some(self.get_final_range());
-        ResultCode::SUCCESS
-    }
-
-    pub fn decode_interleaved_message(
-        &mut self,
-        shared: &SharedMemory,
-        buffer: u64,
-        payload: &[u8],
-        output: &mut [u8],
-        decoded_samples: &mut u32,
-        time_taken: &mut u64,
-        packet_final_range: u32,
-        expected_final_range: u32,
-        reset_requested: bool,
-        decoded_final_range: &mut Option<u32>,
-    ) -> Result {
-        let Some(object_header) = DecodeObjectHeader::read(shared, buffer) else {
-            return RESULT_LIB_OPUS_INVALID_STATE;
-        };
-        if reset_requested {
-            let result = self.reset_decoder();
-            if result.is_error() {
-                return result;
-            }
-        }
-        self.decode_packet(
-            &object_header,
-            payload,
-            output,
-            decoded_samples,
-            time_taken,
-            packet_final_range,
-            expected_final_range,
-            decoded_final_range,
-        )
+        assert_eq!(sample_count, 960);
+        assert!(output.chunks_exact(2).any(|bytes| bytes != [0, 0]));
+        assert_ne!(object.get_final_range(), 0);
     }
 }

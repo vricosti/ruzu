@@ -10,116 +10,41 @@
 //! of `TextureCacheChannelInfo` and `ChannelSetupCaches`).  The real code
 //! lives in the .h because it is template code in C++.
 //!
-//! In Rust the template is replaced by concrete methods on
-//! `TextureCacheBase` (defined in texture_cache_base.rs).  Method
-//! signatures are ported; bodies that depend on backend-specific types
-//! (Runtime, Image slot vectors, Maxwell3D registers, etc.) log a warning
-//! and return safe defaults until those types are ported.
+//! In Rust the template is replaced by generic methods on
+//! `TextureCacheBase<P>` (defined in texture_cache_base.rs). Backend-specific
+//! construction and runtime operations are supplied by `TextureCacheParams`,
+//! while the common control flow remains in this upstream-owned module.
 
+use crate::cache_types::CacheType;
 use crate::engines::draw_manager::Maxwell3DRenderTargets;
 use crate::engines::maxwell_3d::RenderTargetInfo;
 use crate::engines::maxwell_dma::dma;
+use crate::framebuffer_config::{BlendMode, FramebufferConfig};
 use crate::memory_manager::MemoryManager;
+use crate::rasterizer_interface::RasterizerDownloadArea;
 use crate::surface;
+use common::hash::BuildUnorderedDenseHasher;
 use parking_lot::Mutex as ParkingMutex;
+use smallvec::SmallVec;
+use std::collections::{HashMap, HashSet};
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use std::sync::OnceLock;
 
-use super::descriptor_table::DescriptorTable;
+use super::format_lookup_table::PixelFormat;
 use super::image_base::{
     add_image_alias, GPUVAddr, ImageAllocBase, ImageBase, ImageFlagBits, ImageMapView,
 };
-use super::image_info::{ImageInfo, TilingMode};
+use super::image_info::ImageInfo;
+#[cfg(test)]
+use super::image_info::TilingMode;
 use super::image_view_base::{ImageViewBase, ImageViewFlagBits};
-use super::image_view_info::ImageViewInfo;
+use super::image_view_info::{ImageViewInfo, SwizzleSource};
+use super::render_targets::RenderTargets;
 use super::texture_cache_base::*;
 use super::types::*;
+use super::util::{convert_image, full_upload_swizzles, map_size_bytes, unswizzle_image};
 
 // All method implementations live on TextureCacheBase.
-
-macro_rules! trace_texture_fill_stall {
-    ($($arg:tt)*) => {
-        if trace_texture_fill_stall_enabled() {
-            log::warn!($($arg)*);
-        }
-    };
-}
-
-fn cached_env_flag(cache: &'static OnceLock<bool>, name: &'static str) -> bool {
-    *cache.get_or_init(|| std::env::var_os(name).is_some())
-}
-
-fn trace_texture_fill_stall_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    cached_env_flag(&ENABLED, "RUZU_TRACE_TEXTURE_FILL_STALL")
-}
-
-fn trace_visit_result_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    cached_env_flag(&ENABLED, "RUZU_TRACE_VISIT_RESULT")
-}
-
-fn trace_descriptor_sync_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    cached_env_flag(&ENABLED, "RUZU_TRACE_DESCRIPTOR_SYNC")
-}
-
-fn trace_render_target_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    cached_env_flag(&ENABLED, "RUZU_TRACE_RT")
-}
-
-fn trace_visit_tic_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    cached_env_flag(&ENABLED, "RUZU_TRACE_VISIT_TIC")
-}
-
-fn parse_u64_env_list(name: &str) -> Option<Vec<u64>> {
-    let spec = std::env::var(name).ok()?;
-    let spec = spec.trim();
-    if spec.is_empty() {
-        return None;
-    }
-    if spec == "*" {
-        return Some(Vec::new());
-    }
-    let values = spec
-        .split(',')
-        .filter_map(|raw| {
-            let value = raw.trim();
-            if value.is_empty() {
-                return None;
-            }
-            if let Some(hex) = value
-                .strip_prefix("0x")
-                .or_else(|| value.strip_prefix("0X"))
-            {
-                u64::from_str_radix(hex, 16).ok()
-            } else {
-                value.parse::<u64>().ok()
-            }
-        })
-        .collect::<Vec<_>>();
-    (!values.is_empty()).then_some(values)
-}
-
-fn should_trace_texture_cache_addr(gpu_addr: GPUVAddr) -> bool {
-    static TARGETS: OnceLock<Option<Vec<u64>>> = OnceLock::new();
-    let Some(targets) = TARGETS
-        .get_or_init(|| parse_u64_env_list("RUZU_TRACE_TEXTURE_CACHE_ADDRS"))
-        .as_deref()
-    else {
-        return false;
-    };
-    targets.is_empty() || targets.contains(&gpu_addr)
-}
-
-pub(crate) struct FindOrInsertImageResult {
-    pub image_id: ImageId,
-    pub inserted: bool,
-    pub needs_backend_completion: bool,
-    pub queued_join_tail: bool,
-}
 
 #[derive(Debug, Clone, Copy)]
 pub struct DmaBufferImageCopyResult {
@@ -127,15 +52,609 @@ pub struct DmaBufferImageCopyResult {
     pub copy: BufferImageCopy,
 }
 
-impl TextureCacheBase {
-    pub(crate) fn set_backend_completes_join_images(&mut self, enabled: bool) {
-        self.backend_completes_join_images = enabled;
+/// Rust access adapter for the persistent Maxwell3D dirty flags consumed by
+/// upstream `TextureCache<P>::RescaleRenderTargets` and
+/// `TextureCache<P>::UpdateRenderTargets`.
+///
+/// The renderer passes a draw-time register snapshot, but dirty-flag writes
+/// still target the channel-owned Maxwell3D state just like upstream.
+pub trait RenderTargetDirtyFlagAccess {
+    fn render_target_dirty_flag(&self, flag: u8) -> bool;
+    fn clear_render_target_dirty_flag(&mut self, flag: u8);
+    fn set_render_target_dirty_flag(&mut self, flag: u8);
+}
+
+impl RenderTargetDirtyFlagAccess for [bool; 256] {
+    fn render_target_dirty_flag(&self, flag: u8) -> bool {
+        self[flag as usize]
     }
 
-    fn queue_backend_completion_for_inserted_result(&mut self, result: &FindOrInsertImageResult) {
-        if result.needs_backend_completion && result.inserted && !result.queued_join_tail {
-            self.pending_backend_insertions.push(result.image_id);
+    fn clear_render_target_dirty_flag(&mut self, flag: u8) {
+        self[flag as usize] = false;
+    }
+
+    fn set_render_target_dirty_flag(&mut self, flag: u8) {
+        self[flag as usize] = true;
+    }
+}
+
+impl<P: TextureCacheParams> TextureCacheBase<P> {
+    /// Port of upstream `TextureCache<P>::RefreshContents`.
+    pub fn refresh_contents(&mut self, image_id: ImageId) {
+        if !self.slot_images[image_id]
+            .flags
+            .contains(ImageFlagBits::CPU_MODIFIED)
+        {
+            return;
         }
+
+        self.slot_images[image_id]
+            .flags
+            .remove(ImageFlagBits::CPU_MODIFIED);
+        self.track_image(image_id);
+
+        if self.slot_images[image_id].info.num_samples > 1 && !P::can_upload_msaa(self) {
+            log::warn!("MSAA image uploads are not implemented");
+            P::transition_image_layout(self, image_id);
+            return;
+        }
+        if self.slot_images[image_id]
+            .flags
+            .contains(ImageFlagBits::ASYNCHRONOUS_DECODE)
+        {
+            self.queue_async_decode(image_id);
+            return;
+        }
+        let image = &self.slot_images[image_id];
+        if *common::settings::values().gpu_unswizzle_enabled.get_value()
+            && surface::is_pixel_format_bcn(image.info.format)
+            && image.info.image_type == ImageType::E3D
+            && image.info.resources.levels == 1
+            && image.info.resources.layers == 1
+            && map_size_bytes(image) as usize >= self.gpu_unswizzle_maxsize
+            && !image.flags.contains(ImageFlagBits::GPU_MODIFIED)
+        {
+            self.queue_async_unswizzle(image_id);
+            return;
+        }
+
+        let mut staging = P::upload_staging_buffer(
+            self,
+            map_size_bytes(&self.slot_images[image_id]) as usize,
+            false,
+        );
+        self.upload_image_contents(image_id, &mut staging);
+        P::insert_upload_memory_barrier(self);
+    }
+
+    /// Port of upstream `TextureCache<P>::UploadImageContents`.
+    fn upload_image_contents(&mut self, image_id: ImageId, staging: &mut P::AsyncBuffer) {
+        let (gpu_addr, guest_size_bytes, unswizzled_size_bytes, info, flags) = {
+            let image = &self.slot_images[image_id];
+            (
+                image.gpu_addr,
+                image.guest_size_bytes as usize,
+                image.unswizzled_size_bytes as usize,
+                image.info.clone(),
+                image.flags,
+            )
+        };
+
+        if flags.contains(ImageFlagBits::ACCELERATED_UPLOAD) {
+            let gpu_memory = self
+                .channel_gpu_memory
+                .as_ref()
+                .cloned()
+                .expect("TextureCache::UploadImageContents requires bound channel GPU memory");
+            gpu_memory.lock().read_block_with_cache_type(
+                gpu_addr,
+                P::staging_mapped_span(staging),
+                CacheType::NO_TEXTURE_CACHE,
+            );
+            let uploads = full_upload_swizzles(&info);
+            P::accelerate_image_upload(self, image_id, staging, &uploads, 0, 0);
+            return;
+        }
+
+        let gpu_memory = self
+            .channel_gpu_memory
+            .as_ref()
+            .cloned()
+            .expect("TextureCache::UploadImageContents requires bound channel GPU memory");
+        self.swizzle_data_buffer.resize(guest_size_bytes, 0);
+        gpu_memory
+            .lock()
+            .read_block_unsafe(gpu_addr, &mut self.swizzle_data_buffer);
+
+        let copies = if flags.contains(ImageFlagBits::CONVERTED) {
+            self.unswizzle_data_buffer.resize(unswizzled_size_bytes, 0);
+            let mut copies = unswizzle_image(
+                &(),
+                gpu_addr,
+                &info,
+                &self.swizzle_data_buffer,
+                &mut self.unswizzle_data_buffer,
+            );
+            convert_image(
+                &self.unswizzle_data_buffer,
+                &info,
+                P::staging_mapped_span(staging),
+                &mut copies,
+            );
+            copies
+        } else {
+            unswizzle_image(
+                &(),
+                gpu_addr,
+                &info,
+                &self.swizzle_data_buffer,
+                P::staging_mapped_span(staging),
+            )
+        };
+        P::upload_image(self, image_id, staging, &copies);
+    }
+
+    /// Port of upstream `TextureCache<P>::QueueAsyncDecode`.
+    fn queue_async_decode(&mut self, image_id: ImageId) {
+        let image = &self.slot_images[image_id];
+        if !image.flags.contains(ImageFlagBits::CONVERTED) {
+            log::error!("QueueAsyncDecode called for a non-converted image");
+        }
+        log::info!("Queuing async texture decode");
+
+        let (gpu_addr, guest_size_bytes, unswizzled_size_bytes, info) = (
+            image.gpu_addr,
+            image.guest_size_bytes as usize,
+            image.unswizzled_size_bytes as usize,
+            image.info.clone(),
+        );
+        self.slot_images[image_id]
+            .flags
+            .insert(ImageFlagBits::IS_DECODING);
+        let decode = Arc::new(AsyncDecodeContext::new(image_id));
+        self.async_decodes.push(Arc::clone(&decode));
+
+        let gpu_memory = self
+            .channel_gpu_memory
+            .as_ref()
+            .cloned()
+            .expect("TextureCache::QueueAsyncDecode requires bound channel GPU memory");
+        self.swizzle_data_buffer.resize(guest_size_bytes, 0);
+        gpu_memory
+            .lock()
+            .read_block_unsafe(gpu_addr, &mut self.swizzle_data_buffer);
+        let mut local_unswizzle_data_buffer = vec![0; unswizzled_size_bytes];
+        let mut copies = unswizzle_image(
+            &(),
+            gpu_addr,
+            &info,
+            &self.swizzle_data_buffer,
+            &mut local_unswizzle_data_buffer,
+        );
+        let out_size = map_size_bytes(&self.slot_images[image_id]) as usize;
+        self.texture_decode_worker.queue_work(move || {
+            let mut decoded_data = vec![0; out_size];
+            convert_image(
+                &local_unswizzle_data_buffer,
+                &info,
+                &mut decoded_data,
+                &mut copies,
+            );
+            let mut output = decode.output.lock().unwrap();
+            output.decoded_data = decoded_data;
+            output.copies = copies;
+            decode.complete.store(true, Ordering::Release);
+        });
+    }
+
+    /// Port of upstream `TextureCache<P>::QueueAsyncUnswizzle`.
+    fn queue_async_unswizzle(&mut self, image_id: ImageId) {
+        if self.slot_images[image_id]
+            .flags
+            .contains(ImageFlagBits::IS_DECODING)
+        {
+            return;
+        }
+
+        self.slot_images[image_id]
+            .flags
+            .insert(ImageFlagBits::IS_DECODING);
+        let info = self.slot_images[image_id].info.clone();
+        self.unswizzle_queue
+            .push_back(PendingUnswizzle::new(image_id, info));
+    }
+
+    /// Port of upstream `TextureCache<P>::TickAsyncDecode`.
+    pub fn tick_async_decode(&mut self) {
+        let mut has_uploads = false;
+        let mut index = 0;
+        while index < self.async_decodes.len() {
+            let decode = Arc::clone(&self.async_decodes[index]);
+            if !decode.complete.load(Ordering::Acquire) {
+                index += 1;
+                continue;
+            }
+            let mut output = decode.output.lock().unwrap();
+            let decoded_data = std::mem::take(&mut output.decoded_data);
+            let copies = std::mem::take(&mut output.copies);
+            drop(output);
+
+            let mut staging = P::upload_staging_buffer(
+                self,
+                map_size_bytes(&self.slot_images[decode.image_id]) as usize,
+                false,
+            );
+            P::staging_mapped_span(&mut staging).copy_from_slice(&decoded_data);
+            P::upload_image(self, decode.image_id, &staging, &copies);
+            self.slot_images[decode.image_id]
+                .flags
+                .remove(ImageFlagBits::IS_DECODING);
+            has_uploads = true;
+            self.async_decodes.remove(index);
+        }
+        if has_uploads {
+            P::insert_upload_memory_barrier(self);
+        }
+    }
+
+    /// Port of upstream `TextureCache<P>::TickAsyncUnswizzle`.
+    pub fn tick_async_unswizzle(&mut self) {
+        if self.unswizzle_queue.is_empty() {
+            return;
+        }
+        if self.current_unswizzle_frame > 0 {
+            self.current_unswizzle_frame -= 1;
+            return;
+        }
+
+        let image_id = self.unswizzle_queue.front().unwrap().image_id;
+        if !self.unswizzle_queue.front().unwrap().initialized {
+            let (total_size, info) = {
+                let image = &self.slot_images[image_id];
+                (map_size_bytes(image) as usize, image.info.clone())
+            };
+            let staging = P::upload_staging_buffer(self, total_size, true);
+            let bytes_per_block = crate::surface::bytes_per_block(info.format) as usize;
+            let width_blocks = info.size.width.div_ceil(4) as usize;
+            let height_blocks = info.size.height.div_ceil(4) as usize;
+            let task = self.unswizzle_queue.front_mut().unwrap();
+            task.total_size = total_size;
+            task.staging_buffer = Some(staging);
+            task.bytes_per_slice = width_blocks * bytes_per_block * height_blocks;
+            task.last_submitted_offset = 0;
+            task.initialized = true;
+        }
+
+        let (gpu_addr, current_offset, copy_amount) = {
+            let task = self.unswizzle_queue.front().unwrap();
+            let image = &self.slot_images[image_id];
+            if task.current_offset < task.total_size {
+                let remaining = task.total_size - task.current_offset;
+                let mut copy_amount = self.swizzle_chunk_size.min(remaining);
+                if remaining > self.swizzle_chunk_size {
+                    copy_amount = (copy_amount / task.bytes_per_slice) * task.bytes_per_slice;
+                    if copy_amount == 0 {
+                        copy_amount = task.bytes_per_slice;
+                    }
+                }
+                (image.gpu_addr, task.current_offset, copy_amount)
+            } else {
+                (image.gpu_addr, task.current_offset, 0)
+            }
+        };
+        if copy_amount != 0 {
+            let gpu_memory = self
+                .channel_gpu_memory
+                .as_ref()
+                .cloned()
+                .expect("TextureCache::TickAsyncUnswizzle requires bound channel GPU memory");
+            let task = self.unswizzle_queue.front_mut().unwrap();
+            let staging = task.staging_buffer.as_mut().unwrap();
+            let end = current_offset + copy_amount;
+            gpu_memory.lock().read_block(
+                gpu_addr.wrapping_add(current_offset as u64),
+                &mut P::staging_mapped_span(staging)[current_offset..end],
+            );
+            task.current_offset = end;
+        }
+
+        let (is_final_batch, complete_slices, bytes_per_slice, last_submitted_offset, info) = {
+            let task = self.unswizzle_queue.front().unwrap();
+            let bytes_ready = task.current_offset - task.last_submitted_offset;
+            (
+                task.current_offset >= task.total_size,
+                (bytes_ready / task.bytes_per_slice) as u32,
+                task.bytes_per_slice,
+                task.last_submitted_offset,
+                task.info.clone(),
+            )
+        };
+        if complete_slices >= self.swizzle_slices_per_batch
+            || (is_final_batch && complete_slices > 0)
+        {
+            let z_start = (last_submitted_offset / bytes_per_slice) as u32;
+            let slices_to_process = complete_slices.min(self.swizzle_slices_per_batch);
+            let z_count = slices_to_process.min(
+                self.slot_images[image_id]
+                    .info
+                    .size
+                    .depth
+                    .wrapping_sub(z_start),
+            );
+            if z_count > 0 {
+                let uploads = full_upload_swizzles(&info);
+                let staging = self
+                    .unswizzle_queue
+                    .front_mut()
+                    .unwrap()
+                    .staging_buffer
+                    .take()
+                    .unwrap();
+                P::accelerate_image_upload(self, image_id, &staging, &uploads, z_start, z_count);
+                let task = self.unswizzle_queue.front_mut().unwrap();
+                task.staging_buffer = Some(staging);
+                task.last_submitted_offset += z_count as usize * bytes_per_slice;
+            }
+        }
+
+        let complete = {
+            let task = self.unswizzle_queue.front().unwrap();
+            let slices_submitted = (task.last_submitted_offset / task.bytes_per_slice) as u32;
+            is_final_batch && slices_submitted >= self.slot_images[image_id].info.size.depth
+        };
+        if complete {
+            let mut staging = self
+                .unswizzle_queue
+                .front_mut()
+                .unwrap()
+                .staging_buffer
+                .take()
+                .unwrap();
+            P::free_deferred_staging_buffer(self, &mut staging);
+            self.slot_images[image_id]
+                .flags
+                .remove(ImageFlagBits::IS_DECODING);
+            self.unswizzle_queue.pop_front();
+            self.current_unswizzle_frame = 4;
+        }
+    }
+
+    /// Port of upstream `TextureCache<P>::VisitImageView`.
+    pub(crate) fn visit_image_view(&mut self, index: u32, compute: bool) -> ImageViewId {
+        let (descriptor, is_new) = {
+            let channel_state = self
+                .channel_caches
+                .current_channel_state_mut()
+                .unwrap_or(&mut self.channel_state);
+            let table = if compute {
+                &mut channel_state.compute_image_table
+            } else {
+                &mut channel_state.graphics_image_table
+            };
+            if index > table.limit() {
+                log::debug!("Invalid image view index={}", index);
+                return NULL_IMAGE_VIEW_ID;
+            }
+            if let Some(gpu_memory) = self.channel_gpu_memory.as_ref() {
+                table.read_with(index, |gpu_addr, out| {
+                    gpu_memory.lock().read_block_unsafe(gpu_addr, out)
+                })
+            } else {
+                table.read(self.device_memory.as_ref(), index)
+            }
+        };
+        let map_index = index
+            | if compute {
+                common::slot_vector::SlotId::TAGGED_VALUE
+            } else {
+                0
+            };
+        let image_view_id = if is_new {
+            let image_view_id = self.find_image_view(&descriptor);
+            if image_view_id != NULL_IMAGE_VIEW_ID {
+                P::prepare_image_view(self, image_view_id, false, false);
+            }
+            self.current_channel_state_mut()
+                .image_view_ids
+                .insert(map_index, image_view_id);
+            image_view_id
+        } else {
+            let image_view_id = *self
+                .current_channel_state()
+                .image_view_ids
+                .get(&map_index)
+                .expect("an unchanged descriptor must have a cached image-view id");
+            if image_view_id != NULL_IMAGE_VIEW_ID {
+                P::prepare_image_view(self, image_view_id, false, false);
+            }
+            image_view_id
+        };
+        image_view_id
+    }
+
+    /// Port of upstream `TextureCache<P>::FillImageViews`.
+    pub(crate) fn fill_image_views(
+        &mut self,
+        views: &mut [ImageViewInOut],
+        compute: bool,
+        blacklist: bool,
+    ) {
+        loop {
+            self.has_deleted_images = false;
+            let mut has_blacklisted = false;
+            for view in views.iter_mut() {
+                view.id = self.visit_image_view(view.index, compute);
+                if blacklist && view.blacklist && view.id != NULL_IMAGE_VIEW_ID {
+                    let image_id = self.slot_image_views[view.id].image_id;
+                    has_blacklisted |= self.scale_down(image_id);
+                    self.slot_images[image_id].scale_rating = 0;
+                }
+            }
+            if !self.has_deleted_images && !(blacklist && has_blacklisted) {
+                break;
+            }
+        }
+    }
+
+    fn insert_typed_image(&mut self, base: ImageBase) -> ImageId {
+        let image_id = self.slot_images.insert(ImageSlot::pending(base));
+        let base = std::ptr::NonNull::from(self.slot_images[image_id].base.as_mut());
+        let runtime = self.runtime.as_deref_mut();
+        let backend = P::create_image(runtime, image_id, base);
+        self.slot_images[image_id].backend = Some(backend);
+        P::set_image_allocation_tick(
+            self.slot_images[image_id]
+                .backend
+                .as_mut()
+                .expect("typed image payload was just constructed"),
+            self.frame_tick,
+        );
+        image_id
+    }
+
+    fn insert_typed_image_view(
+        &mut self,
+        base: ImageViewBase,
+        image_id: Option<ImageId>,
+    ) -> ImageViewId {
+        let view_id = self.slot_image_views.insert(ImageViewSlot::pending(base));
+        let base = std::ptr::NonNull::from(self.slot_image_views[view_id].base.as_mut());
+        let image = image_id.and_then(|id| {
+            self.slot_images[id]
+                .backend
+                .as_ref()
+                .map(|image| image as *const P::Image)
+        });
+        let runtime = self.runtime.as_deref_mut();
+        let image = image.map(|image| {
+            // SAFETY: the parent image slot remains alive while its view is
+            // constructed and registered.
+            unsafe { &*image }
+        });
+        let backend = P::create_image_view(runtime, view_id, base, image);
+        self.slot_image_views[view_id].backend = Some(backend);
+        view_id
+    }
+
+    fn insert_typed_sampler(&mut self, config: crate::textures::texture::TscEntry) -> SamplerId {
+        let runtime = self.runtime.as_deref_mut();
+        let backend = P::create_sampler(runtime, &config);
+        self.slot_samplers.insert(SamplerSlot {
+            config,
+            backend: Some(backend),
+        })
+    }
+
+    /// Port of upstream `TextureCache<P>::ForEachImageInRegion`.
+    ///
+    /// The callback returns true to stop traversal, matching the upstream
+    /// `BOOL_BREAK` specialization used by `FindImage` and `FindDMAImage`.
+    pub(crate) fn for_each_image_in_region(
+        &mut self,
+        cpu_addr: u64,
+        size: usize,
+        mut func: impl FnMut(ImageId, &mut ImageBase) -> bool,
+    ) -> bool {
+        Self::for_each_image_in_region_parts(
+            &self.page_table,
+            &mut self.slot_map_views,
+            &mut self.slot_images,
+            cpu_addr,
+            size,
+            |image_id, image, _| func(image_id, image),
+        )
+    }
+
+    /// Borrow-split body of upstream `TextureCache<P>::ForEachImageInRegion`.
+    ///
+    /// C++ can invoke the member callback while it mutates other members of
+    /// `TextureCache`. Rust passes the three fields owned by the traversal
+    /// explicitly so callers such as `JoinImages` can borrow their unrelated
+    /// join state at the same time; traversal and callback ordering are
+    /// unchanged.
+    fn for_each_image_in_region_parts(
+        page_table: &HashMap<u64, Vec<ImageMapId>, BuildUnorderedDenseHasher>,
+        slot_map_views: &mut common::slot_vector::SlotVector<ImageMapView>,
+        slot_images: &mut common::slot_vector::SlotVector<ImageSlot<P::Image>>,
+        cpu_addr: u64,
+        size: usize,
+        mut func: impl FnMut(
+            ImageId,
+            &mut ImageBase,
+            &common::slot_vector::SlotVector<ImageMapView>,
+        ) -> bool,
+    ) -> bool {
+        let mut images = SmallVec::<[ImageId; 32]>::new();
+        let mut maps = SmallVec::<[ImageMapId; 32]>::new();
+        let stop = Self::for_each_cpu_page_until(cpu_addr, size, |page| {
+            if let Some(page_map_ids) = page_table.get(&page) {
+                for &map_id in page_map_ids {
+                    let image_id = {
+                        let map = &mut slot_map_views[map_id];
+                        if map.picked || !map.overlaps(cpu_addr, size) {
+                            continue;
+                        }
+                        map.picked = true;
+                        maps.push(map_id);
+                        map.image_id
+                    };
+
+                    let image = &mut slot_images[image_id];
+                    if image.flags.contains(ImageFlagBits::PICKED) {
+                        continue;
+                    }
+                    image.flags.insert(ImageFlagBits::PICKED);
+                    images.push(image_id);
+                    if func(image_id, image, slot_map_views) {
+                        return true;
+                    }
+                }
+            }
+            false
+        });
+
+        for image_id in images {
+            slot_images[image_id].flags.remove(ImageFlagBits::PICKED);
+        }
+        for map_id in maps {
+            slot_map_views[map_id].picked = false;
+        }
+        stop
+    }
+
+    /// Borrow-split body shared by upstream `ForEachImageInRegionGPU` and
+    /// `ForEachSparseImageInRegion`.
+    fn for_each_image_in_gpu_region_parts(
+        page_table: &TextureCacheGPUMap,
+        slot_images: &mut common::slot_vector::SlotVector<ImageSlot<P::Image>>,
+        gpu_addr: GPUVAddr,
+        size: usize,
+        mut func: impl FnMut(ImageId, &mut ImageBase) -> bool,
+    ) -> bool {
+        let mut images = SmallVec::<[ImageId; 8]>::new();
+        let stop = Self::for_each_gpu_page_until(gpu_addr, size, |page| {
+            if let Some(page_image_ids) = page_table.get(&page) {
+                for &image_id in page_image_ids {
+                    let image = &mut slot_images[image_id];
+                    if image.flags.contains(ImageFlagBits::PICKED)
+                        || !image.overlaps_gpu(gpu_addr, size)
+                    {
+                        continue;
+                    }
+                    image.flags.insert(ImageFlagBits::PICKED);
+                    images.push(image_id);
+                    if func(image_id, image) {
+                        return true;
+                    }
+                }
+            }
+            false
+        });
+
+        for image_id in images {
+            slot_images[image_id].flags.remove(ImageFlagBits::PICKED);
+        }
+        stop
     }
 
     pub fn set_channel_gpu_memory(&mut self, gpu_memory: Arc<ParkingMutex<MemoryManager>>) {
@@ -255,23 +774,12 @@ impl TextureCacheBase {
         }
     }
 
-    fn can_add_image_alias(lhs: &ImageBase, rhs: &ImageBase) -> bool {
-        if lhs.info.image_type != rhs.info.image_type {
-            return false;
-        }
-        if lhs.info.image_type == ImageType::Linear {
-            return true;
-        }
-        let options = RelaxedOptions::SIZE | RelaxedOptions::FORMAT;
-        super::util::find_subresource(&rhs.info, lhs, rhs.gpu_addr, options, false, true).is_some()
-    }
-
     // ── Garbage collection ─────────────────────────────────────────────
 
     /// Port of `TextureCache<P>::RunGarbageCollector`.
     pub fn run_garbage_collector(&mut self) {
         let downloader = self.image_downloader.as_ref().cloned();
-        self.run_garbage_collector_with_downloader(|_image_id, image, staging| {
+        self.run_garbage_collector_with_downloader(|_image_id, image, _backend, staging| {
             let Some(downloader) = downloader.as_ref() else {
                 return false;
             };
@@ -284,7 +792,12 @@ impl TextureCacheBase {
     /// supplied by the concrete renderer wrapper.
     pub fn run_garbage_collector_with_downloader(
         &mut self,
-        mut download_image: impl FnMut(ImageId, &ImageBase, &mut [u8]) -> bool,
+        mut download_image: impl FnMut(
+            ImageId,
+            &mut ImageBase,
+            &mut Option<P::Image>,
+            &mut [u8],
+        ) -> bool,
     ) {
         let mut high_priority_mode = false;
         let mut aggressive_mode = false;
@@ -324,7 +837,7 @@ impl TextureCacheBase {
             &mut num_iterations,
         );
         self.cleanup_lru_images(
-            self.frame_tick.saturating_sub(ticks_to_destroy),
+            self.frame_tick.wrapping_sub(ticks_to_destroy),
             &mut num_iterations,
             &mut high_priority_mode,
             &mut aggressive_mode,
@@ -341,7 +854,7 @@ impl TextureCacheBase {
                 &mut num_iterations,
             );
             self.cleanup_lru_images(
-                self.frame_tick.saturating_sub(ticks_to_destroy),
+                self.frame_tick.wrapping_sub(ticks_to_destroy),
                 &mut num_iterations,
                 &mut high_priority_mode,
                 &mut aggressive_mode,
@@ -356,11 +869,16 @@ impl TextureCacheBase {
         num_iterations: &mut usize,
         high_priority_mode: &mut bool,
         aggressive_mode: &mut bool,
-        download_image: &mut impl FnMut(ImageId, &ImageBase, &mut [u8]) -> bool,
+        download_image: &mut impl FnMut(
+            ImageId,
+            &mut ImageBase,
+            &mut Option<P::Image>,
+            &mut [u8],
+        ) -> bool,
     ) {
         let mut candidates = Vec::new();
         self.lru_cache
-            .for_each_item_below(tick_threshold as i64, |image_id| {
+            .for_each_item_below(tick_threshold, |image_id| {
                 candidates.push(image_id);
                 false
             });
@@ -416,13 +934,25 @@ impl TextureCacheBase {
     fn download_image_for_gc(
         &mut self,
         image_id: ImageId,
-        download_image: &mut impl FnMut(ImageId, &ImageBase, &mut [u8]) -> bool,
+        download_image: &mut impl FnMut(
+            ImageId,
+            &mut ImageBase,
+            &mut Option<P::Image>,
+            &mut [u8],
+        ) -> bool,
     ) -> bool {
-        let image = self.slot_images[image_id].clone();
-        let mut staging = vec![0u8; image.unswizzled_size_bytes as usize];
-        if !download_image(image_id, &image, &mut staging) {
+        let mut staging = vec![0u8; self.slot_images[image_id].unswizzled_size_bytes as usize];
+        let downloaded = {
+            let slot = &mut self.slot_images[image_id];
+            let mut backend = slot.backend.take();
+            let downloaded = download_image(image_id, &mut slot.base, &mut backend, &mut staging);
+            slot.backend = backend;
+            downloaded
+        };
+        if !downloaded {
             return false;
         }
+        let image = self.slot_images[image_id].base.clone();
         let copies = super::util::full_download_copies(&image.info);
         if !self.write_downloaded_image(&image, &copies, &staging) {
             return false;
@@ -443,6 +973,9 @@ impl TextureCacheBase {
         if let Some(gpu_memory) = self.channel_gpu_memory.as_ref().cloned() {
             if let Some(gpu_memory) = gpu_memory.try_lock() {
                 super::util::swizzle_image(
+                    &|gpu_addr, output| {
+                        let _ = gpu_memory.read_block_unsafe(gpu_addr, output);
+                    },
                     &|gpu_addr, data| {
                         let _ = gpu_memory.write_block_unsafe(gpu_addr, data);
                     },
@@ -459,7 +992,11 @@ impl TextureCacheBase {
         let Some(writer) = self.guest_memory_writer.as_ref().cloned() else {
             return false;
         };
+        let device_memory = Arc::clone(&self.device_memory);
         super::util::swizzle_image(
+            &move |device_addr, output| {
+                let _ = device_memory.smmu_read_block_unsafe(device_addr, output);
+            },
             writer.as_ref(),
             image.cpu_addr,
             &image.info,
@@ -482,6 +1019,198 @@ impl TextureCacheBase {
             .smmu_write_block_unsafe(gpu_addr, staging)
     }
 
+    /// Port of `TextureCache<P>::WriteMemory`.
+    pub fn write_memory(&mut self, cpu_addr: u64, size: usize) {
+        let device_memory = &self.device_memory;
+        let sparse_views = &self.sparse_views;
+        Self::for_each_image_in_region_parts(
+            &self.page_table,
+            &mut self.slot_map_views,
+            &mut self.slot_images,
+            cpu_addr,
+            size,
+            |image_id, image, slot_map_views| {
+                if image.flags.contains(ImageFlagBits::CPU_MODIFIED) {
+                    return false;
+                }
+                image.flags.insert(ImageFlagBits::CPU_MODIFIED);
+                if image.flags.contains(ImageFlagBits::TRACKED) {
+                    Self::untrack_image_parts(
+                        device_memory,
+                        sparse_views,
+                        slot_map_views,
+                        image_id,
+                        image,
+                    );
+                }
+                false
+            },
+        );
+    }
+
+    /// Port of `TextureCache<P>::DownloadMemory` for the common Rust fallback.
+    pub fn download_memory(&mut self, cpu_addr: u64, size: usize) {
+        let Some(downloader) = self.image_downloader.as_ref().cloned() else {
+            return;
+        };
+        let Some(writer) = self.guest_memory_writer.as_ref().cloned() else {
+            return;
+        };
+
+        let mut images = SmallVec::<[ImageId; 16]>::new();
+        self.for_each_image_in_region(cpu_addr, size, |image_id, image| {
+            if !image.is_safe_download() {
+                return false;
+            }
+            image.flags.remove(ImageFlagBits::GPU_MODIFIED);
+            images.push(image_id);
+            false
+        });
+        if images.is_empty() {
+            return;
+        }
+        images.sort_by_key(|&image_id| self.slot_images[image_id].modification_tick);
+
+        for image_id in images {
+            let image = self.slot_images[image_id].base.as_ref().clone();
+            let mut staging = vec![0u8; image.unswizzled_size_bytes as usize];
+            if !downloader(image_id, &image, &mut staging) {
+                continue;
+            }
+            let copies = super::util::full_download_copies(&image.info);
+            let device_memory = std::sync::Arc::clone(&self.device_memory);
+            super::util::swizzle_image(
+                &move |device_addr, output| {
+                    let _ = device_memory.smmu_read_block_unsafe(device_addr, output);
+                },
+                writer.as_ref(),
+                image.cpu_addr,
+                &image.info,
+                &copies,
+                &staging,
+                &mut self.swizzle_data_buffer,
+            );
+        }
+    }
+
+    /// Port of `TextureCache<P>::GetFlushArea`.
+    pub fn get_flush_area(&mut self, cpu_addr: u64, size: usize) -> Option<RasterizerDownloadArea> {
+        let mut area: Option<RasterizerDownloadArea> = None;
+        let slot_image_views = &mut self.slot_image_views;
+        Self::for_each_image_in_region_parts(
+            &self.page_table,
+            &mut self.slot_map_views,
+            &mut self.slot_images,
+            cpu_addr,
+            size,
+            |_, image, _| {
+                if !image.flags.contains(ImageFlagBits::GPU_MODIFIED) {
+                    return false;
+                }
+                let current = area.get_or_insert(RasterizerDownloadArea {
+                    start_address: cpu_addr,
+                    end_address: cpu_addr.wrapping_add(size as u64),
+                    preemptive: true,
+                });
+                current.start_address = current.start_address.min(image.cpu_addr);
+                current.end_address = current.end_address.max(image.cpu_addr_end);
+                for &image_view_id in &image.image_view_ids {
+                    slot_image_views[image_view_id]
+                        .flags
+                        .insert(ImageViewFlagBits::PREEMTIVE_DOWNLOAD);
+                }
+                current.preemptive &= image.info.forced_flushed;
+                image.info.forced_flushed = true;
+                false
+            },
+        );
+        area
+    }
+
+    /// Port of `TextureCache<P>::UnmapMemory`.
+    pub fn unmap_memory(&mut self, cpu_addr: u64, size: usize) {
+        let mut deleted_images = SmallVec::<[ImageId; 16]>::new();
+        self.for_each_image_in_region(cpu_addr, size, |image_id, _| {
+            deleted_images.push(image_id);
+            false
+        });
+        for image_id in deleted_images {
+            if self.slot_images[image_id]
+                .flags
+                .contains(ImageFlagBits::TRACKED)
+            {
+                self.untrack_image(image_id);
+            }
+            self.unregister_image(image_id);
+            self.delete_image(image_id, false);
+        }
+    }
+
+    /// Port of `TextureCache<P>::TryFindFramebufferImageView`.
+    pub fn try_find_framebuffer_image_view(
+        &mut self,
+        config: &FramebufferConfig,
+        cpu_addr: u64,
+    ) -> Option<FramebufferImageView> {
+        let image_map_ids = self.page_table.get(&(cpu_addr >> YUZU_PAGEBITS))?;
+        let mut valid_image_ids = SmallVec::<[ImageId; 4]>::new();
+        for &map_id in image_map_ids {
+            let map = &self.slot_map_views[map_id];
+            let image = &self.slot_images[map.image_id];
+            if image.cpu_addr != cpu_addr || image.image_view_ids.is_empty() {
+                continue;
+            }
+            valid_image_ids.push(map.image_id);
+        }
+
+        let Some(&first_id) = valid_image_ids.first() else {
+            return None;
+        };
+        let mut image_id = first_id;
+        for &candidate_id in &valid_image_ids[1..] {
+            if self.slot_images[image_id].modification_tick
+                < self.slot_images[candidate_id].modification_tick
+            {
+                image_id = candidate_id;
+            }
+        }
+
+        let view_format = match config.pixel_format.0 {
+            4 => PixelFormat::R5G6B5Unorm,
+            5 => PixelFormat::B8G8R8A8Unorm,
+            _ => PixelFormat::A8B8G8R8Unorm,
+        };
+        let mut info = ImageViewInfo::for_render_target(
+            ImageViewType::E2D,
+            view_format,
+            SubresourceRange::default(),
+        );
+        if config.blending == BlendMode::Opaque {
+            info.x_source = SwizzleSource::R as u8;
+            info.y_source = SwizzleSource::G as u8;
+            info.z_source = SwizzleSource::B as u8;
+            info.w_source = SwizzleSource::OneFloat as u8;
+        }
+
+        let existing_view_id = self.slot_images[image_id].find_view(&info);
+        let view_id = if existing_view_id.is_valid() {
+            existing_view_id
+        } else {
+            let image = &self.slot_images[image_id];
+            let view = ImageViewBase::new(&info, &image.info, image_id, image.gpu_addr);
+            let view_id = self.insert_typed_image_view(view, Some(image_id));
+            self.slot_images[image_id].insert_view(info, view_id);
+            view_id
+        };
+        let image = &self.slot_images[image_id];
+        let view = (**self.slot_image_views.get(view_id)).clone();
+        Some(FramebufferImageView {
+            view_id,
+            view,
+            scaled: image.flags.contains(ImageFlagBits::RESCALED),
+        })
+    }
+
     fn registered_image_memory_size(image: &ImageBase) -> u64 {
         let mut tentative_size = u64::from(image.guest_size_bytes.max(image.unswizzled_size_bytes));
         if (surface::is_pixel_format_astc(image.info.format)
@@ -502,253 +1231,77 @@ impl TextureCacheBase {
         common::alignment::align_up(tentative_size, 1024)
     }
 
-    /// Memory accounting tail of upstream `TextureCache<P>::ScaleUp`.
-    pub(crate) fn account_scale_up_memory(&mut self, image_id: ImageId, had_scaled_copy: bool) {
-        if !had_scaled_copy {
+    /// Port of `TextureCache<P>::ImageCanRescale`.
+    pub(crate) fn image_can_rescale(&mut self, image_id: ImageId) -> bool {
+        if !self.slot_images[image_id].info.rescaleable {
+            return false;
+        }
+        let resolution = common::settings::values().resolution_info.clone();
+        if resolution.downscale && !self.slot_images[image_id].info.downscaleable {
+            return false;
+        }
+        if self.slot_images[image_id]
+            .flags
+            .intersects(ImageFlagBits::RESCALED | ImageFlagBits::CHECKING_RESCALABLE)
+        {
+            return true;
+        }
+        if self.slot_images[image_id]
+            .flags
+            .contains(ImageFlagBits::IS_RESCALABLE)
+        {
+            return true;
+        }
+        self.slot_images[image_id]
+            .flags
+            .insert(ImageFlagBits::CHECKING_RESCALABLE);
+        let aliases = self.slot_images[image_id]
+            .aliased_images
+            .iter()
+            .map(|alias| alias.id)
+            .collect::<SmallVec<[ImageId; 8]>>();
+        for alias_id in aliases {
+            if !self.image_can_rescale(alias_id) {
+                self.slot_images[image_id]
+                    .flags
+                    .remove(ImageFlagBits::CHECKING_RESCALABLE);
+                return false;
+            }
+        }
+        self.slot_images[image_id]
+            .flags
+            .remove(ImageFlagBits::CHECKING_RESCALABLE);
+        self.slot_images[image_id]
+            .flags
+            .insert(ImageFlagBits::IS_RESCALABLE);
+        true
+    }
+
+    /// Port of `TextureCache<P>::ScaleUp`.
+    pub(crate) fn scale_up(&mut self, image_id: ImageId) -> bool {
+        let has_copy = self.slot_images[image_id].has_scaled;
+        if !P::scale_up_image(self, image_id, false) {
+            return false;
+        }
+        if !has_copy {
             self.total_used_memory = self
                 .total_used_memory
-                .saturating_add(Self::scaled_image_memory_size(&self.slot_images[image_id]));
+                .wrapping_add(Self::scaled_image_memory_size(&self.slot_images[image_id]));
         }
+        self.invalidate_scale(image_id);
+        true
+    }
+
+    /// Port of `TextureCache<P>::ScaleDown`.
+    pub(crate) fn scale_down(&mut self, image_id: ImageId) -> bool {
+        if !P::scale_down_image(self, image_id, false) {
+            return false;
+        }
+        self.invalidate_scale(image_id);
+        true
     }
 
     // ── Image view resolution ──────────────────────────────────────────
-
-    /// Port of `TextureCache<P>::FillGraphicsImageViews`
-    /// (texture_cache.h:192-197). Method wrapper around `fill_image_views`
-    /// targeting the channel's graphics descriptor table + caches.
-    pub fn fill_graphics_image_views(
-        &mut self,
-        views: &mut [ImageViewInOut],
-        has_blacklists: bool,
-    ) {
-        self.fill_image_views(true, views, has_blacklists);
-    }
-
-    /// Port of `TextureCache<P>::FillComputeImageViews`
-    /// (texture_cache.h:199-203). Upstream passes `has_blacklists=true`
-    /// unconditionally to the underlying `FillImageViews` template.
-    pub fn fill_compute_image_views(&mut self, views: &mut [ImageViewInOut]) {
-        self.fill_image_views(false, views, true);
-    }
-
-    /// Port of `TextureCache<P>::FillImageViews` (texture_cache.h:472-495).
-    ///
-    /// Retry loop: for each view, resolves its TIC descriptor and looks up
-    /// (or creates) an `ImageViewId`. Reruns the batch if any visit cleared
-    /// `has_deleted_images` (an image got evicted mid-visit). The
-    /// `has_blacklists`/`ScaleDown` branch still needs backend access and is
-    /// noted as TODO.
-    fn fill_image_views(
-        &mut self,
-        graphics: bool,
-        views: &mut [ImageViewInOut],
-        has_blacklists: bool,
-    ) {
-        let mut has_blacklisted;
-        let mut iteration = 0u64;
-        loop {
-            iteration = iteration.wrapping_add(1);
-            trace_texture_fill_stall!(
-                "[TEXTURE_FILL_STALL] fill_image_views iter={} graphics={} views={} has_blacklists={}",
-                iteration,
-                graphics,
-                views.len(),
-                has_blacklists
-            );
-            self.has_deleted_images = false;
-            has_blacklisted = false;
-            for (slot, view) in views.iter_mut().enumerate() {
-                trace_texture_fill_stall!(
-                    "[TEXTURE_FILL_STALL] before_visit iter={} slot={} index={} blacklist={}",
-                    iteration,
-                    slot,
-                    view.index,
-                    view.blacklist
-                );
-                view.id = self.visit_image_view(graphics, view.index);
-                trace_texture_fill_stall!(
-                    "[TEXTURE_FILL_STALL] after_visit iter={} slot={} index={} id={} has_deleted={}",
-                    iteration,
-                    slot,
-                    view.index,
-                    view.id.index,
-                    self.has_deleted_images
-                );
-                if has_blacklists && view.blacklist && view.id != NULL_IMAGE_VIEW_ID {
-                    // Upstream `ScaleDown(slot_images[image_view.image_id])`
-                    // is backend-owned. Concrete texture-cache wrappers apply
-                    // it after this base descriptor pass.
-                }
-            }
-            trace_texture_fill_stall!(
-                "[TEXTURE_FILL_STALL] iter_done iter={} has_deleted={} has_blacklisted={}",
-                iteration,
-                self.has_deleted_images,
-                has_blacklisted
-            );
-            if !self.has_deleted_images && !(has_blacklists && has_blacklisted) {
-                break;
-            }
-        }
-    }
-
-    /// Port of `TextureCache<P>::VisitImageView` (texture_cache.h:497-514).
-    ///
-    /// Reads the TIC descriptor at `index` from the channel's graphics or
-    /// compute table; on a fresh read, looks up (or creates) an `ImageView`
-    /// via `find_image_view`. Splits the borrow across `channel_state`
-    /// fields + the appropriate GPU-memory owner so `find_image_view` can
-    /// take `&mut self`.
-    fn visit_image_view(&mut self, graphics: bool, index: u32) -> ImageViewId {
-        if trace_visit_tic_enabled() {
-            let table = if graphics {
-                &self.current_channel_state().graphics_image_table
-            } else {
-                &self.current_channel_state().compute_image_table
-            };
-            // Use cached descriptor without reading guest memory
-            let desc = table.cached(index);
-            if let Some(d) = desc {
-                log::warn!(
-                    "[VISIT_TIC] graphics={} index={} cached_addr=0x{:X}",
-                    graphics,
-                    index,
-                    d.address()
-                );
-            } else {
-                log::warn!(
-                    "[VISIT_TIC] graphics={} index={} cached=None",
-                    graphics,
-                    index
-                );
-            }
-        }
-        // Step 1: read the TIC descriptor with a local borrow on the table only.
-        let (descriptor, is_new) = {
-            let channel_gpu_memory = self.channel_gpu_memory.as_ref().cloned();
-            let device_memory = self.device_memory.clone();
-            let table = if graphics {
-                &mut self.current_channel_state_mut().graphics_image_table
-            } else {
-                &mut self.current_channel_state_mut().compute_image_table
-            };
-            if index > table.limit() {
-                if trace_visit_result_enabled() {
-                    log::warn!(
-                        "[VISIT_RESULT] graphics={} index={} rejected limit={}",
-                        graphics,
-                        index,
-                        table.limit(),
-                    );
-                }
-                return NULL_IMAGE_VIEW_ID;
-            }
-            trace_texture_fill_stall!(
-                "[TEXTURE_FILL_STALL] before_table_read graphics={} index={} limit={}",
-                graphics,
-                index,
-                table.limit()
-            );
-            if let Some(gpu_memory) = channel_gpu_memory {
-                table.read_with(index, |gpu_addr, out| {
-                    trace_texture_fill_stall!(
-                        "[TEXTURE_FILL_STALL] before_tic_read_block graphics={} index={} gpu=0x{:X} len={}",
-                        graphics,
-                        index,
-                        gpu_addr,
-                        out.len()
-                    );
-                    gpu_memory.lock().read_block(gpu_addr, out)
-                })
-            } else {
-                table.read(&*device_memory, index)
-            }
-        };
-        trace_texture_fill_stall!(
-            "[TEXTURE_FILL_STALL] after_table_read graphics={} index={} desc_addr=0x{:X} fmt=0x{:X} is_new={}",
-            graphics,
-            index,
-            descriptor.address(),
-            descriptor.format(),
-            is_new
-        );
-        if trace_visit_result_enabled() {
-            log::warn!(
-                "[VISIT_RESULT] graphics={} index={} desc_addr=0x{:X} desc_fmt=0x{:X} is_new={}",
-                graphics,
-                index,
-                descriptor.address(),
-                descriptor.format(),
-                is_new,
-            );
-        }
-        // Step 2: resolve on first descriptor read, and also recover if a
-        // shader-environment descriptor probe read the TIC before the image
-        // view id cache was populated.
-        let cached = {
-            let cached_ids = if graphics {
-                &self.current_channel_state().graphics_image_view_ids
-            } else {
-                &self.current_channel_state().compute_image_view_ids
-            };
-            cached_ids[index as usize]
-        };
-        if is_new || !cached.is_valid() || cached == CORRUPT_ID {
-            trace_texture_fill_stall!(
-                "[TEXTURE_FILL_STALL] before_find_image_view graphics={} index={} cached={}",
-                graphics,
-                index,
-                cached.index
-            );
-            let new_id = self.find_image_view(&descriptor);
-            trace_texture_fill_stall!(
-                "[TEXTURE_FILL_STALL] after_find_image_view graphics={} index={} new_id={}",
-                graphics,
-                index,
-                new_id.index
-            );
-            if trace_visit_result_enabled() {
-                log::warn!(
-                    "[VISIT_RESULT] graphics={} index={} cached={} new_id={}",
-                    graphics,
-                    index,
-                    cached.index,
-                    new_id.index,
-                );
-            }
-            let cached_ids = if graphics {
-                &mut self.current_channel_state_mut().graphics_image_view_ids
-            } else {
-                &mut self.current_channel_state_mut().compute_image_view_ids
-            };
-            cached_ids[index as usize] = new_id;
-            return new_id;
-        }
-        if trace_visit_result_enabled() {
-            log::warn!(
-                "[VISIT_RESULT] graphics={} index={} cached={} reused",
-                graphics,
-                index,
-                cached.index,
-            );
-        }
-        // Step 3: return the (now stable) cached id.
-        cached
-    }
-
-    /// Diagnostic helper for [TIC_LOOKUP]: resolve the PixelFormat of the
-    /// image backing `view_id` (or a marker when null/imageless).
-    fn tic_lookup_image_format(&self, view_id: ImageViewId) -> String {
-        if !view_id.is_valid() {
-            return "null_view".to_string();
-        }
-        let view = self.slot_image_views.get(view_id);
-        let image_id = view.image_id;
-        if !image_id.is_valid() {
-            return "no_image".to_string();
-        }
-        format!("{:?}", self.slot_images.get(image_id).info.format)
-    }
 
     /// Port of `TextureCache<P>::FindImageView` (texture_cache.h:1103-1113).
     /// Guards on `IsValidEntry`, then does a HashMap try_emplace against the
@@ -767,34 +1320,9 @@ impl TextureCacheBase {
             return NULL_IMAGE_VIEW_ID;
         }
         if let Some(&id) = self.current_channel_state_mut().image_views.get(descriptor) {
-            if {
-                static TIC_TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-                *TIC_TRACE.get_or_init(|| std::env::var_os("RUZU_TRACE_TIC_LOOKUP").is_some())
-            } {
-                log::warn!(
-                    "[TIC_LOOKUP] cached gpu=0x{:X} tic_format=0x{:X} view_id={} img_fmt={} (cached)",
-                    descriptor.address(),
-                    descriptor.format(),
-                    id.index,
-                    self.tic_lookup_image_format(id)
-                );
-            }
             return id;
         }
-        let addr = descriptor.address();
         let new_id = self.create_image_view(descriptor);
-        if {
-            static TIC_TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-            *TIC_TRACE.get_or_init(|| std::env::var_os("RUZU_TRACE_TIC_LOOKUP").is_some())
-        } {
-            log::warn!(
-                "[TIC_LOOKUP] new gpu=0x{:X} tic_format=0x{:X} view_id={} img_fmt={} (created)",
-                addr,
-                descriptor.format(),
-                new_id.index,
-                self.tic_lookup_image_format(new_id)
-            );
-        }
         self.current_channel_state_mut()
             .image_views
             .insert(*descriptor, new_id);
@@ -812,33 +1340,9 @@ impl TextureCacheBase {
             return NULL_IMAGE_VIEW_ID;
         }
         if let Some(&id) = self.current_channel_state_mut().image_views.get(descriptor) {
-            if {
-                static TIC_TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-                *TIC_TRACE.get_or_init(|| std::env::var_os("RUZU_TRACE_TIC_LOOKUP").is_some())
-            } {
-                log::warn!(
-                    "[TIC_LOOKUP] cached gpu=0x{:X} tic_format=0x{:X} view_id={} img_fmt={} (cached/addr_valid)",
-                    descriptor.address(),
-                    descriptor.format(),
-                    id.index,
-                    self.tic_lookup_image_format(id)
-                );
-            }
             return id;
         }
         let new_id = self.create_image_view_with_gpu_to_cpu(descriptor, gpu_to_cpu);
-        if {
-            static TIC_TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-            *TIC_TRACE.get_or_init(|| std::env::var_os("RUZU_TRACE_TIC_LOOKUP").is_some())
-        } {
-            log::warn!(
-                "[TIC_LOOKUP] new gpu=0x{:X} tic_format=0x{:X} view_id={} img_fmt={} (created/addr_valid)",
-                descriptor.address(),
-                descriptor.format(),
-                new_id.index,
-                self.tic_lookup_image_format(new_id)
-            );
-        }
         self.current_channel_state_mut()
             .image_views
             .insert(*descriptor, new_id);
@@ -854,7 +1358,7 @@ impl TextureCacheBase {
         if info.image_type == ImageType::Buffer {
             let view_info = super::image_view_info::ImageViewInfo::from_tic_entry(descriptor, 0);
             let view = ImageViewBase::new_buffer(&info, &view_info, descriptor.address());
-            return self.slot_image_views.insert(view);
+            return self.insert_typed_image_view(view, None);
         }
         let layer_offset = descriptor.base_layer() as u64 * info.layer_stride as u64;
         let image_gpu_addr = descriptor.address().wrapping_sub(layer_offset);
@@ -862,14 +1366,12 @@ impl TextureCacheBase {
         let cpu_addr = gpu_to_cpu(image_gpu_addr, image_size as u64).unwrap_or_else(|| {
             self.resolve_or_allocate_cpu_addr(image_gpu_addr, image_size as u64)
         });
-        let result = self.find_or_insert_image_from_info_with_options_result(
+        let image_id = self.find_or_insert_image_from_info_with_options(
             &info,
             image_gpu_addr,
             cpu_addr,
             RelaxedOptions::empty(),
         );
-        self.queue_backend_completion_for_inserted_result(&result);
-        let image_id = result.image_id;
         if image_id == NULL_IMAGE_ID {
             return NULL_IMAGE_VIEW_ID;
         }
@@ -888,9 +1390,8 @@ impl TextureCacheBase {
     /// `ImageViewId` (not a NULL stub). The created `ImageViewBase` carries
     /// the format, dimensions, range and parent `ImageId`, with the
     /// `Strong` flag set on both the view and its backing image. The backend
-    /// GL texture handle is still 0 — that's the next slice's problem; the
-    /// renderer needs to walk `slot_image_views[id]` and lazy-create the GL
-    /// texture from there.
+    /// concrete backend view is constructed in the same slot before the ID is
+    /// returned, matching upstream's typed `SlotVector<ImageView>`.
     fn create_image_view(
         &mut self,
         descriptor: &crate::textures::texture::TicEntry,
@@ -899,29 +1400,18 @@ impl TextureCacheBase {
         if info.image_type == ImageType::Buffer {
             let view_info = super::image_view_info::ImageViewInfo::from_tic_entry(descriptor, 0);
             let view = ImageViewBase::new_buffer(&info, &view_info, descriptor.address());
-            return self.slot_image_views.insert(view);
+            return self.insert_typed_image_view(view, None);
         }
         let layer_offset = descriptor.base_layer() as u64 * info.layer_stride as u64;
         let image_gpu_addr = descriptor.address().wrapping_sub(layer_offset);
-        let result = if self.backend_completes_join_images {
-            let image_size = super::util::calculate_guest_size_in_bytes(&info) as u64;
-            let cpu_addr = self.resolve_or_allocate_cpu_addr(image_gpu_addr, image_size);
-            self.find_or_insert_image_from_info_with_options_result(
-                &info,
-                image_gpu_addr,
-                cpu_addr,
-                RelaxedOptions::empty(),
-            )
-        } else {
-            FindOrInsertImageResult {
-                image_id: self.find_or_insert_image(&info, image_gpu_addr),
-                inserted: false,
-                needs_backend_completion: false,
-                queued_join_tail: false,
-            }
-        };
-        self.queue_backend_completion_for_inserted_result(&result);
-        let image_id = result.image_id;
+        let image_size = super::util::calculate_guest_size_in_bytes(&info) as u64;
+        let cpu_addr = self.resolve_or_allocate_cpu_addr(image_gpu_addr, image_size);
+        let image_id = self.find_or_insert_image_from_info_with_options(
+            &info,
+            image_gpu_addr,
+            cpu_addr,
+            RelaxedOptions::empty(),
+        );
         if image_id == NULL_IMAGE_ID {
             return NULL_IMAGE_VIEW_ID;
         }
@@ -959,10 +1449,6 @@ impl TextureCacheBase {
         info: &super::image_info::ImageInfo,
         gpu_addr: GPUVAddr,
     ) -> ImageId {
-        assert!(
-            !self.backend_completes_join_images,
-            "TextureCacheBase::find_or_insert_image cannot return a fully-completed ImageId when backend completion is required"
-        );
         if let Some(id) = self.find_image(info, gpu_addr) {
             return id;
         }
@@ -1031,12 +1517,11 @@ impl TextureCacheBase {
         let flexible_formats = options.contains(RelaxedOptions::FORMAT);
         let size_bytes = super::util::calculate_guest_size_in_bytes(info) as usize;
         let mut image_id = None;
-        let mut image_ids = Vec::new();
+        let mut image_ids = SmallVec::<[ImageId; 8]>::new();
 
-        for existing_image_id in self.collect_images_in_region(cpu_addr, size_bytes) {
-            let existing_image = &self.slot_images[existing_image_id];
+        self.for_each_image_in_region(cpu_addr, size_bytes, |existing_image_id, existing_image| {
             if existing_image.flags.contains(ImageFlagBits::REMAPPED) {
-                continue;
+                return false;
             }
 
             let matched = if info.image_type == ImageType::Linear
@@ -1067,14 +1552,12 @@ impl TextureCacheBase {
             };
 
             if !matched {
-                continue;
+                return false;
             }
             image_id = Some(existing_image_id);
             image_ids.push(existing_image_id);
-            if !flexible_formats && existing_image.info.format == info.format {
-                break;
-            }
-        }
+            !flexible_formats && existing_image.info.format == info.format
+        });
 
         if image_ids.len() <= 1 {
             return image_id;
@@ -1094,10 +1577,6 @@ impl TextureCacheBase {
         gpu_addr: GPUVAddr,
     ) -> ImageId {
         assert!(
-            !self.backend_completes_join_images,
-            "TextureCacheBase::insert_image cannot complete JoinImages without the backend owner"
-        );
-        assert!(
             !info.is_sparse || self.channel_gpu_memory.is_some(),
             "TextureCache::insert_image sparse image requires channel GPU memory"
         );
@@ -1110,41 +1589,63 @@ impl TextureCacheBase {
 
     /// Port of `TextureCache<P>::CheckFeedbackLoop`.
     ///
-    /// Checks whether any sampled image view matches a current render target;
-    /// if so, emits a barrier via `Runtime::BarrierFeedbackLoop`.
-    pub fn check_feedback_loop(&self, views: &[ImageViewInOut]) -> bool {
+    /// Exact colour-target views and aliases are skipped; only a distinct view
+    /// aliasing the active depth image requires the feedback-loop barrier.
+    pub fn check_feedback_loop(
+        &mut self,
+        views: &[ImageViewInOut],
+        mut barrier_feedback_loop: impl FnMut(),
+    ) {
         if !*common::settings::values()
             .barrier_feedback_loops
             .get_value()
         {
-            return false;
+            return;
         }
 
-        for view in views {
+        if self.render_targets_serial == self.last_feedback_loop_serial
+            && self.texture_bindings_serial == self.last_feedback_texture_serial
+        {
+            if self.last_feedback_loop_result {
+                barrier_feedback_loop();
+            }
+            return;
+        }
+        if self.rt_active_mask == 0 {
+            self.last_feedback_loop_serial = self.render_targets_serial;
+            self.last_feedback_texture_serial = self.texture_bindings_serial;
+            self.last_feedback_loop_result = false;
+            return;
+        }
+        let depth_active = (self.rt_active_mask & (1 << NUM_RT)) != 0;
+        let requires_barrier = views.iter().any(|view| {
             if !view.id.is_valid() || view.id == NULL_IMAGE_VIEW_ID {
-                continue;
+                return false;
             }
-            let image_view = &self.slot_image_views[view.id];
-            for &ct_view_id in &self.render_targets.color_buffer_ids {
-                if !ct_view_id.is_valid() || ct_view_id == NULL_IMAGE_VIEW_ID {
-                    continue;
-                }
-                let ct_view = &self.slot_image_views[ct_view_id];
-                if image_view.image_id == ct_view.image_id {
-                    return true;
-                }
+            if (0..NUM_RT).any(|index| {
+                (self.rt_active_mask & (1 << index)) != 0
+                    && view.id == self.render_targets.color_buffer_ids[index]
+            }) {
+                return false;
             }
-
-            let depth_buffer_id = self.render_targets.depth_buffer_id;
-            if depth_buffer_id.is_valid() && depth_buffer_id != NULL_IMAGE_VIEW_ID {
-                let zt_view = &self.slot_image_views[depth_buffer_id];
-                if image_view.image_id == zt_view.image_id {
-                    return true;
-                }
+            if depth_active && view.id == self.render_targets.depth_buffer_id {
+                return false;
             }
+            let view_image_id = self.slot_image_views[view.id].image_id;
+            if (0..NUM_RT).any(|index| {
+                (self.rt_active_mask & (1 << index)) != 0
+                    && view_image_id == self.rt_image_id[index]
+            }) {
+                return false;
+            }
+            depth_active && view_image_id == self.rt_depth_image_id
+        });
+        self.last_feedback_loop_serial = self.render_targets_serial;
+        self.last_feedback_texture_serial = self.texture_bindings_serial;
+        self.last_feedback_loop_result = requires_barrier;
+        if requires_barrier {
+            barrier_feedback_loop();
         }
-
-        false
     }
 
     // ── Descriptor synchronisation ─────────────────────────────────────
@@ -1156,9 +1657,8 @@ impl TextureCacheBase {
     /// from the texture cache so the caller hands in a `DescriptorSyncRegs`
     /// snapshot captured at draw-time. The body otherwise mirrors upstream
     /// step-for-step: pick TIC/TSC table limits (collapsing TSC limit onto
-    /// TIC's when `sampler_binding == ViaHeaderBinding`), call
-    /// `DescriptorTable::synchronize` on each, and grow the cached
-    /// `*_ids` arrays when a table's limit changed.
+    /// TIC's when `sampler_binding == ViaHeaderBinding`) and call
+    /// `DescriptorTable::synchronize` on each.
     pub fn synchronize_graphics_descriptors(&mut self, regs: DescriptorSyncRegs) {
         let tic_limit = regs.tex_header_limit;
         let tsc_limit = if regs.sampler_binding_via_header {
@@ -1166,33 +1666,22 @@ impl TextureCacheBase {
         } else {
             regs.tex_sampler_limit
         };
-        if trace_descriptor_sync_enabled() {
-            log::warn!(
-                "[DESC_SYNC] graphics tic_addr=0x{:X} tic_limit={} tsc_addr=0x{:X} tsc_limit={} via_header={}",
-                regs.tex_header_addr,
-                tic_limit,
-                regs.tex_sampler_addr,
-                tsc_limit,
-                regs.sampler_binding_via_header,
-            );
-        }
-
         let channel = self.current_channel_state_mut();
+        let mut bindings_changed = false;
         if channel
             .graphics_sampler_table
             .synchronize(regs.tex_sampler_addr, tsc_limit)
         {
-            channel
-                .graphics_sampler_ids
-                .resize(tsc_limit as usize + 1, CORRUPT_ID);
+            bindings_changed = true;
         }
         if channel
             .graphics_image_table
             .synchronize(regs.tex_header_addr, tic_limit)
         {
-            channel
-                .graphics_image_view_ids
-                .resize(tic_limit as usize + 1, CORRUPT_ID);
+            bindings_changed = true;
+        }
+        if bindings_changed {
+            self.texture_bindings_serial = self.texture_bindings_serial.wrapping_add(1);
         }
     }
 
@@ -1215,118 +1704,122 @@ impl TextureCacheBase {
         };
 
         let channel = self.current_channel_state_mut();
+        let mut bindings_changed = false;
         if channel
             .compute_sampler_table
             .synchronize(regs.tsc_addr, tsc_limit)
         {
-            channel
-                .compute_sampler_ids
-                .resize(tsc_limit as usize + 1, CORRUPT_ID);
+            bindings_changed = true;
         }
         if channel
             .compute_image_table
             .synchronize(regs.tic_addr, tic_limit)
         {
-            channel
-                .compute_image_view_ids
-                .resize(tic_limit as usize + 1, CORRUPT_ID);
+            bindings_changed = true;
+        }
+        if bindings_changed {
+            self.texture_bindings_serial = self.texture_bindings_serial.wrapping_add(1);
         }
     }
 
     // ── Sampler resolution ─────────────────────────────────────────────
 
-    /// Resolve a graphics-stage sampler index to a `SamplerId`.
+    /// Resolve a stage sampler index to a `SamplerId`.
     ///
-    /// Port of `TextureCache<P>::GetGraphicsSamplerId` (texture_cache.h:256-267).
+    /// Port of `TextureCache<P>::GetSamplerId`.
     /// Reads the TSC table at `index`, dedupes via `channel_state.samplers`,
-    /// and caches the result in `channel_state.graphics_sampler_ids[index]`
+    /// and caches the result in `channel_state.sampler_ids[index]`
     /// so subsequent draws skip the lookup when the descriptor hasn't
     /// changed.
     ///
     /// Returns `NULL_SAMPLER_ID` for out-of-range indices — upstream logs
     /// `LOG_DEBUG("Invalid sampler index={}")` and does the same.
-    pub fn get_graphics_sampler_id(&mut self, index: u32) -> SamplerId {
-        use crate::texture_cache::types::NULL_SAMPLER_ID;
-        if index
-            > self
-                .current_channel_state_mut()
-                .graphics_sampler_table
-                .limit()
-        {
-            log::debug!(
-                "TextureCacheBase::get_graphics_sampler_id: invalid index={}",
-                index
-            );
-            return NULL_SAMPLER_ID;
-        }
-        let (descriptor, is_new) =
-            if let Some(gpu_memory) = self.channel_gpu_memory.as_ref().cloned() {
-                self.current_channel_state_mut()
-                    .graphics_sampler_table
-                    .read_with(index, |gpu_addr, out| {
-                        gpu_memory.lock().read_block(gpu_addr, out)
-                    })
-            } else {
-                let gpu_memory_arc = self.device_memory.clone();
-                self.current_channel_state_mut()
-                    .graphics_sampler_table
-                    .read(gpu_memory_arc.as_ref(), index)
-            };
-        let cached = self.current_channel_state_mut().graphics_sampler_ids[index as usize];
-        if !is_new && cached.is_valid() && cached != CORRUPT_ID {
-            return cached;
-        }
-        let id = self.find_sampler(&descriptor);
-        self.current_channel_state_mut().graphics_sampler_ids[index as usize] = id;
-        id
+    pub fn get_sampler_id(&mut self, index: u32, compute: bool) -> SamplerId {
+        self.get_sampler_id_impl(index, compute, None)
     }
 
-    /// Resolve a compute-stage sampler index to a `SamplerId`.
-    ///
-    /// Port of `TextureCache<P>::GetComputeSamplerId` (texture_cache.h:270-281).
-    pub fn get_compute_sampler_id(&mut self, index: u32) -> SamplerId {
+    /// Rust ownership adapter for an upstream caller that already borrows the
+    /// channel `MemoryManager*`. This is still `GetSamplerId`; passing the
+    /// existing borrow prevents recursively locking Reden's mutex wrapper.
+    pub(crate) fn get_sampler_id_with_memory(
+        &mut self,
+        index: u32,
+        compute: bool,
+        gpu_memory: &MemoryManager,
+    ) -> SamplerId {
+        self.get_sampler_id_impl(index, compute, Some(gpu_memory))
+    }
+
+    fn get_sampler_id_impl(
+        &mut self,
+        index: u32,
+        compute: bool,
+        borrowed_gpu_memory: Option<&MemoryManager>,
+    ) -> SamplerId {
         use crate::texture_cache::types::NULL_SAMPLER_ID;
-        if index
-            > self
+        let (descriptor, is_new) = {
+            let Self {
+                channel_gpu_memory,
+                device_memory,
+                channel_caches,
+                channel_state,
+                ..
+            } = self;
+            let channel_state = channel_caches
                 .current_channel_state_mut()
-                .compute_sampler_table
-                .limit()
-        {
-            log::debug!(
-                "TextureCacheBase::get_compute_sampler_id: invalid index={}",
-                index
-            );
-            return NULL_SAMPLER_ID;
-        }
-        let (descriptor, is_new) =
-            if let Some(gpu_memory) = self.channel_gpu_memory.as_ref().cloned() {
-                self.current_channel_state_mut()
-                    .compute_sampler_table
-                    .read_with(index, |gpu_addr, out| {
-                        gpu_memory.lock().read_block(gpu_addr, out)
-                    })
+                .unwrap_or(channel_state);
+            let table = if compute {
+                &mut channel_state.compute_sampler_table
             } else {
-                let gpu_memory_arc = self.device_memory.clone();
-                self.current_channel_state_mut()
-                    .compute_sampler_table
-                    .read(gpu_memory_arc.as_ref(), index)
+                &mut channel_state.graphics_sampler_table
             };
-        let cached = self.current_channel_state_mut().compute_sampler_ids[index as usize];
-        if !is_new && cached.is_valid() && cached != CORRUPT_ID {
-            return cached;
+            if index > table.limit() {
+                log::debug!("Invalid sampler index={}", index);
+                return NULL_SAMPLER_ID;
+            }
+            if let Some(gpu_memory) = borrowed_gpu_memory {
+                table.read_with(index, |gpu_addr, out| {
+                    gpu_memory.read_block_unsafe(gpu_addr, out)
+                })
+            } else if let Some(gpu_memory) = channel_gpu_memory.as_ref() {
+                table.read_with(index, |gpu_addr, out| {
+                    gpu_memory.lock().read_block_unsafe(gpu_addr, out)
+                })
+            } else {
+                table.read(device_memory.as_ref(), index)
+            }
+        };
+        let map_index = index
+            | if compute {
+                common::slot_vector::SlotId::TAGGED_VALUE
+            } else {
+                0
+            };
+        if is_new {
+            let id = self.find_sampler(&descriptor, compute);
+            self.current_channel_state_mut()
+                .sampler_ids
+                .insert(map_index, id);
+            return id;
         }
-        let id = self.find_sampler(&descriptor);
-        self.current_channel_state_mut().compute_sampler_ids[index as usize] = id;
-        id
+        *self
+            .current_channel_state()
+            .sampler_ids
+            .get(&map_index)
+            .expect("an unchanged descriptor must have a cached sampler id")
     }
 
     /// Look up or insert a sampler by its TSC descriptor.
     ///
-    /// Port of `TextureCache<P>::FindSampler` (texture_cache.h:1735-1744):
+    /// Port of `TextureCache<P>::FindSampler` (texture_cache.h:1873-1883):
     /// all-zero TSC → `NULL_SAMPLER_ID`; otherwise `try_emplace` into the
     /// `channel_state.samplers` HashMap and on first occurrence allocate
     /// a fresh slot in `slot_samplers`.
-    pub fn find_sampler(&mut self, config: &crate::textures::texture::TscEntry) -> SamplerId {
+    pub fn find_sampler(
+        &mut self,
+        config: &crate::textures::texture::TscEntry,
+        _compute: bool,
+    ) -> SamplerId {
         use crate::texture_cache::types::NULL_SAMPLER_ID;
         // Upstream `std::ranges::all_of(config.raw, [](u64 v){ return v == 0; })`.
         if config.raw.iter().all(|&w| w == 0) {
@@ -1335,34 +1828,416 @@ impl TextureCacheBase {
         if let Some(&id) = self.current_channel_state_mut().samplers.get(config) {
             return id;
         }
-        let id = self.slot_samplers.insert(*config);
+        let id = self.insert_typed_sampler(*config);
         self.current_channel_state_mut()
             .samplers
             .insert(*config, id);
+        self.enforce_sampler_budget();
         id
+    }
+
+    /// Port of `TextureCache<P>::EnforceSamplerBudget`.
+    fn enforce_sampler_budget(&mut self) {
+        let Some(budget) = self.sampler_heap_budget else {
+            return;
+        };
+        if self.slot_samplers.size() < budget
+            || !self.channel_caches.has_current_channel_state()
+            || self.last_sampler_gc_frame == self.frame_tick
+        {
+            return;
+        }
+        self.last_sampler_gc_frame = self.frame_tick;
+        self.trim_inactive_samplers(budget);
+    }
+
+    /// Port of `TextureCache<P>::TrimInactiveSamplers`.
+    fn trim_inactive_samplers(&mut self, budget: usize) {
+        const SAMPLER_GC_SLACK: usize = 1024;
+        let active_sampler_ids: HashSet<SamplerId, BuildUnorderedDenseHasher> = {
+            let channel = self.current_channel_state();
+            channel.sampler_ids.values().copied().collect()
+        };
+        let cached_samplers: Vec<_> = self
+            .current_channel_state()
+            .samplers
+            .iter()
+            .map(|(config, id)| (*config, *id))
+            .collect();
+        let mut removed_configs = Vec::new();
+        let mut removed = 0usize;
+        for (config, sampler_id) in cached_samplers {
+            if !sampler_id.is_valid() || sampler_id == CORRUPT_ID {
+                removed_configs.push(config);
+                continue;
+            }
+            if active_sampler_ids.contains(&sampler_id) {
+                continue;
+            }
+            self.slot_samplers.erase(sampler_id);
+            removed_configs.push(config);
+            removed += 1;
+            if self.slot_samplers.size().wrapping_add(SAMPLER_GC_SLACK) <= budget {
+                break;
+            }
+        }
+        if !removed_configs.is_empty() {
+            let channel = self.current_channel_state_mut();
+            for config in removed_configs {
+                channel.samplers.remove(&config);
+            }
+        }
+        if removed != 0 {
+            log::warn!(
+                "Sampler cache exceeded {} entries on this driver; reclaimed {} inactive samplers",
+                budget,
+                removed,
+            );
+        }
     }
 
     // ── Render targets ─────────────────────────────────────────────────
 
     /// Port of `TextureCache<P>::RescaleRenderTargets`.
     ///
-    /// Iterates dirty render target slots, resolves images, and decides
-    /// whether to scale up or down based on scale ratings.  Returns whether
-    /// the final render targets are rescaled.
-    pub fn rescale_render_targets(&mut self) -> bool {
-        panic!(
-            "TextureCacheBase::rescale_render_targets cannot preserve upstream ScaleUp/ScaleDown ordering without a backend runtime; use the backend texture-cache wrapper"
-        );
+    /// The register values are carried by the draw-time snapshot because the
+    /// Rust command path cannot retain a borrow of Maxwell3D across the
+    /// rasterizer call. Backend operations remain policy callbacks, matching
+    /// the upstream `TextureCache<P>` specialization boundary.
+    fn rescale_render_targets(
+        &mut self,
+        regs: &Maxwell3DRenderTargets,
+        dirty_access: &mut impl RenderTargetDirtyFlagAccess,
+        gpu_to_cpu: &mut impl FnMut(GPUVAddr, u64) -> Option<u64>,
+    ) -> bool {
+        let mut scale_rating = 0u32;
+        let mut rescaled;
+        let mut color_images = [None; NUM_RT];
+        let mut depth_image = None;
+
+        loop {
+            dirty_access.clear_render_target_dirty_flag(crate::dirty_flags::flags::RENDER_TARGETS);
+            self.has_deleted_images = false;
+            let force = dirty_access
+                .render_target_dirty_flag(crate::dirty_flags::flags::RENDER_TARGET_CONTROL);
+            dirty_access
+                .clear_render_target_dirty_flag(crate::dirty_flags::flags::RENDER_TARGET_CONTROL);
+
+            for index in 0..NUM_RT {
+                let color_flag = crate::dirty_flags::flags::COLOR_BUFFER0 + index as u8;
+                if !force && !dirty_access.render_target_dirty_flag(color_flag) {
+                    continue;
+                }
+                dirty_access.clear_render_target_dirty_flag(color_flag);
+                let view_id = self.find_color_buffer_from_snapshot(index, regs, gpu_to_cpu);
+                self.bind_color_render_target(index, view_id);
+            }
+            if force
+                || dirty_access.render_target_dirty_flag(crate::dirty_flags::flags::ZETA_BUFFER)
+            {
+                dirty_access.clear_render_target_dirty_flag(crate::dirty_flags::flags::ZETA_BUFFER);
+                let view_id = self.find_depth_buffer_from_snapshot(regs, gpu_to_cpu);
+                self.bind_depth_render_target(view_id);
+            }
+
+            scale_rating = 0;
+            let mut any_rescaled = false;
+            let mut can_rescale = true;
+            for (index, saved) in color_images.iter_mut().enumerate() {
+                self.check_render_target_rescale(
+                    self.render_targets.color_buffer_ids[index],
+                    saved,
+                    &mut can_rescale,
+                    &mut any_rescaled,
+                    &mut scale_rating,
+                );
+            }
+            self.check_render_target_rescale(
+                self.render_targets.depth_buffer_id,
+                &mut depth_image,
+                &mut can_rescale,
+                &mut any_rescaled,
+                &mut scale_rating,
+            );
+
+            if can_rescale {
+                rescaled = any_rescaled || scale_rating >= 2;
+                if rescaled {
+                    for image_id in color_images.iter().flatten().copied().chain(depth_image) {
+                        self.scale_up(image_id);
+                    }
+                    scale_rating = 2;
+                }
+            } else {
+                rescaled = false;
+                for image_id in color_images.iter().flatten().copied().chain(depth_image) {
+                    self.scale_down(image_id);
+                }
+                scale_rating = 1;
+            }
+
+            // Upstream `InvalidateScale` writes the same live Maxwell dirty
+            // array consumed by this loop. Rust can receive a draw snapshot
+            // adapter instead, so mirror those writes into the adapter before
+            // repeating the loop after image-view deletion.
+            if self.has_deleted_images {
+                dirty_access
+                    .set_render_target_dirty_flag(crate::dirty_flags::flags::RENDER_TARGETS);
+                dirty_access.set_render_target_dirty_flag(crate::dirty_flags::flags::ZETA_BUFFER);
+                for index in 0..NUM_RT {
+                    dirty_access.set_render_target_dirty_flag(
+                        crate::dirty_flags::flags::COLOR_BUFFER0 + index as u8,
+                    );
+                }
+            }
+
+            if !self.has_deleted_images {
+                break;
+            }
+        }
+
+        for image_id in color_images.iter().flatten().copied().chain(depth_image) {
+            let image = &mut self.slot_images[image_id];
+            image.scale_rating = scale_rating;
+            if image.scale_tick <= self.frame_tick {
+                image.scale_tick = self.frame_tick.wrapping_add(1);
+            }
+        }
+        rescaled
+    }
+
+    fn check_render_target_rescale(
+        &mut self,
+        view_id: ImageViewId,
+        saved: &mut Option<ImageId>,
+        can_rescale: &mut bool,
+        any_rescaled: &mut bool,
+        scale_rating: &mut u32,
+    ) {
+        if !view_id.is_valid() || view_id == NULL_IMAGE_VIEW_ID {
+            *saved = None;
+            return;
+        }
+        let image_id = self.slot_image_views[view_id].image_id;
+        *saved = Some(image_id);
+        *can_rescale &= self.image_can_rescale(image_id);
+        let image = &self.slot_images[image_id];
+        *any_rescaled |= image.flags.contains(ImageFlagBits::RESCALED)
+            || crate::surface::get_format_type(image.info.format)
+                != crate::surface::SurfaceType::ColorTexture;
+        *scale_rating = (*scale_rating).max(if image.scale_tick <= self.frame_tick {
+            image.scale_rating.wrapping_add(1)
+        } else {
+            image.scale_rating
+        });
+    }
+
+    fn find_color_buffer_from_snapshot(
+        &mut self,
+        index: usize,
+        regs: &Maxwell3DRenderTargets,
+        gpu_to_cpu: &mut impl FnMut(GPUVAddr, u64) -> Option<u64>,
+    ) -> ImageViewId {
+        if index >= regs.rt_control.count as usize {
+            return ImageViewId::default();
+        }
+        let rt = regs.render_targets[index];
+        if rt.address == 0 || rt.format == 0 {
+            return ImageViewId::default();
+        }
+        let info = ImageInfo::from_render_target_info(&rt, regs.anti_alias_samples_mode);
+        self.find_render_target_view_from_snapshot(&info, rt.address, gpu_to_cpu)
+    }
+
+    fn find_depth_buffer_from_snapshot(
+        &mut self,
+        regs: &Maxwell3DRenderTargets,
+        gpu_to_cpu: &mut impl FnMut(GPUVAddr, u64) -> Option<u64>,
+    ) -> ImageViewId {
+        let zeta = regs.zeta;
+        if !zeta.enabled || zeta.address == 0 {
+            return ImageViewId::default();
+        }
+        let info = ImageInfo::from_zeta_info(&zeta, regs.anti_alias_samples_mode);
+        self.find_render_target_view_from_snapshot(&info, zeta.address, gpu_to_cpu)
+    }
+
+    fn find_render_target_view_from_snapshot(
+        &mut self,
+        info: &ImageInfo,
+        gpu_addr: GPUVAddr,
+        gpu_to_cpu: &mut impl FnMut(GPUVAddr, u64) -> Option<u64>,
+    ) -> ImageViewId {
+        let guest_size = super::util::calculate_guest_size_in_bytes(info) as u64;
+        let cpu_addr = gpu_to_cpu(gpu_addr, guest_size)
+            .unwrap_or_else(|| self.resolve_or_allocate_cpu_addr(gpu_addr, guest_size));
+        let mut delete_state = self.has_deleted_images;
+        let image_id = loop {
+            self.has_deleted_images = false;
+            let image_id = self.find_or_insert_image_from_info_with_options(
+                info,
+                gpu_addr,
+                cpu_addr,
+                RelaxedOptions::empty(),
+            );
+            delete_state |= self.has_deleted_images;
+            if !self.has_deleted_images {
+                break image_id;
+            }
+        };
+        self.has_deleted_images = delete_state;
+        if !image_id.is_valid() || image_id == NULL_IMAGE_ID {
+            return NULL_IMAGE_VIEW_ID;
+        }
+        self.find_image_view_from_image_info(image_id, info, gpu_addr)
+    }
+
+    fn is_full_clear_from_snapshot(
+        &self,
+        view_id: ImageViewId,
+        clear_scissor: Option<(u32, u32, u32, u32)>,
+    ) -> bool {
+        if !view_id.is_valid() || view_id == NULL_IMAGE_VIEW_ID {
+            return true;
+        }
+        let view = &self.slot_image_views[view_id];
+        let image = &self.slot_images[view.image_id];
+        if image.info.resources.levels > 1 || image.info.resources.layers > 1 {
+            return false;
+        }
+        let Some((min_x, min_y, max_x, max_y)) = clear_scissor else {
+            return true;
+        };
+        min_x == 0 && min_y == 0 && max_x >= view.size.width && max_y >= view.size.height
     }
 
     /// Port of `TextureCache<P>::UpdateRenderTargets`.
-    ///
-    /// Calls `RescaleRenderTargets` when dirty, prepares all color and depth
-    /// image views, and updates `render_targets.size`.
-    pub fn update_render_targets(&mut self, _is_clear: bool) {
-        panic!(
-            "TextureCacheBase::update_render_targets cannot prepare render-target image views without a backend runtime; use the backend texture-cache wrapper"
-        );
+    pub fn update_render_targets_with_snapshot(
+        &mut self,
+        regs: &Maxwell3DRenderTargets,
+        dirty_access: &mut impl RenderTargetDirtyFlagAccess,
+        mut gpu_to_cpu: impl FnMut(GPUVAddr, u64) -> Option<u64>,
+        is_clear: bool,
+        clear_scissor: Option<(u32, u32, u32, u32)>,
+    ) {
+        if !dirty_access.render_target_dirty_flag(crate::dirty_flags::flags::RENDER_TARGETS) {
+            for view_id in self.render_targets.color_buffer_ids {
+                let invalidate =
+                    is_clear && self.is_full_clear_from_snapshot(view_id, clear_scissor);
+                P::prepare_image_view(self, view_id, true, invalidate);
+            }
+            let depth_id = self.render_targets.depth_buffer_id;
+            let invalidate = is_clear && self.is_full_clear_from_snapshot(depth_id, clear_scissor);
+            P::prepare_image_view(self, depth_id, true, invalidate);
+            return;
+        }
+
+        let previous_render_targets = self.render_targets;
+        let rescaled = self.rescale_render_targets(regs, dirty_access, &mut gpu_to_cpu);
+        if self.is_rescaling != rescaled {
+            dirty_access.set_render_target_dirty_flag(crate::dirty_flags::flags::RESCALE_VIEWPORTS);
+            dirty_access.set_render_target_dirty_flag(crate::dirty_flags::flags::RESCALE_SCISSORS);
+            self.is_rescaling = rescaled;
+        }
+
+        for view_id in self.render_targets.color_buffer_ids {
+            let invalidate = is_clear && self.is_full_clear_from_snapshot(view_id, clear_scissor);
+            P::prepare_image_view(self, view_id, true, invalidate);
+        }
+        let depth_id = self.render_targets.depth_buffer_id;
+        let invalidate = is_clear && self.is_full_clear_from_snapshot(depth_id, clear_scissor);
+        P::prepare_image_view(self, depth_id, true, invalidate);
+
+        self.rt_active_mask = 0;
+        self.rt_image_id = [ImageId::default(); NUM_RT];
+        for index in 0..NUM_RT {
+            let view_id = self.render_targets.color_buffer_ids[index];
+            if view_id.is_valid() && view_id != NULL_IMAGE_VIEW_ID {
+                self.rt_active_mask |= 1 << index;
+                self.rt_image_id[index] = self.slot_image_views[view_id].image_id;
+            }
+        }
+        if depth_id.is_valid() && depth_id != NULL_IMAGE_VIEW_ID {
+            self.rt_active_mask |= 1 << NUM_RT;
+            self.rt_depth_image_id = self.slot_image_views[depth_id].image_id;
+        } else {
+            self.rt_depth_image_id = ImageId::default();
+        }
+
+        for index in 0..NUM_RT {
+            self.render_targets.draw_buffers[index] = regs.rt_control.map[index] as u8;
+        }
+        let resolution = common::settings::values().resolution_info.clone();
+        let (up_scale, down_shift) = if self.is_rescaling {
+            (resolution.up_scale, resolution.down_shift)
+        } else {
+            (1, 0)
+        };
+        self.render_targets.size = Extent2D {
+            width: regs.surface_clip.width.wrapping_mul(up_scale) >> down_shift,
+            height: regs.surface_clip.height.wrapping_mul(up_scale) >> down_shift,
+        };
+        self.render_targets.is_rescaled = self.is_rescaling;
+        if self.render_targets != previous_render_targets {
+            self.render_targets_serial = self.render_targets_serial.wrapping_add(1);
+        }
+        dirty_access.set_render_target_dirty_flag(crate::dirty_flags::flags::DEPTH_BIAS_GLOBAL);
+    }
+
+    /// Port of `TextureCache<P>::GetFramebuffer`.
+    pub fn get_framebuffer(&mut self) -> Result<&mut P::Framebuffer, P::FramebufferError> {
+        if self.last_framebuffer_id.is_valid()
+            && self.last_framebuffer_serial == self.render_targets_serial
+        {
+            return Ok(&mut self.slot_framebuffers[self.last_framebuffer_id]);
+        }
+        let key = self.render_targets;
+        let framebuffer_id = self.get_framebuffer_id(&key)?;
+        self.last_framebuffer_id = framebuffer_id;
+        self.last_framebuffer_serial = self.render_targets_serial;
+        Ok(&mut self.slot_framebuffers[framebuffer_id])
+    }
+
+    /// Port of `TextureCache<P>::GetFramebufferId`.
+    pub(crate) fn get_framebuffer_id(
+        &mut self,
+        key: &RenderTargets,
+    ) -> Result<FramebufferId, P::FramebufferError> {
+        if let Some(&framebuffer_id) = self.framebuffers.get(key) {
+            return Ok(framebuffer_id);
+        }
+
+        let mut color_buffers = [None; NUM_RT];
+        for (index, &view_id) in key.color_buffer_ids.iter().enumerate() {
+            if !view_id.is_valid() || view_id == NULL_IMAGE_VIEW_ID {
+                continue;
+            }
+            let backend_view = self.slot_image_views[view_id]
+                .backend
+                .as_ref()
+                .expect("render-target image view must be prepared before GetFramebuffer");
+            color_buffers[index] = Some(std::ptr::NonNull::from(backend_view));
+        }
+        let depth_buffer =
+            if key.depth_buffer_id.is_valid() && key.depth_buffer_id != NULL_IMAGE_VIEW_ID {
+                let backend_view = self.slot_image_views[key.depth_buffer_id]
+                    .backend
+                    .as_ref()
+                    .expect("depth image view must be prepared before GetFramebuffer");
+                Some(std::ptr::NonNull::from(backend_view))
+            } else {
+                None
+            };
+
+        let framebuffer = P::create_framebuffer(
+            self.runtime.as_deref_mut(),
+            color_buffers,
+            depth_buffer,
+            key,
+        )?;
+        let framebuffer_id = self.slot_framebuffers.insert(framebuffer);
+        self.framebuffers.insert(*key, framebuffer_id);
+        Ok(framebuffer_id)
     }
 
     /// Rust bridge for `TextureCache<P>::UpdateRenderTargets` while the cache
@@ -1374,15 +2249,18 @@ impl TextureCacheBase {
     pub fn update_render_targets_from_snapshot(
         &mut self,
         render_targets: &Maxwell3DRenderTargets,
-        mut gpu_to_cpu: impl FnMut(GPUVAddr, u64) -> Option<u64>,
+        gpu_to_cpu: impl FnMut(GPUVAddr, u64) -> Option<u64>,
     ) {
         let mut dirty_flags = [false; 256];
         dirty_flags[crate::dirty_flags::flags::RENDER_TARGETS as usize] = true;
         dirty_flags[crate::dirty_flags::flags::RENDER_TARGET_CONTROL as usize] = true;
-        self.update_render_targets_from_snapshot_with_dirty_flags(
+        let mut dirty_access = dirty_flags;
+        self.update_render_targets_with_snapshot(
             render_targets,
-            &dirty_flags,
+            &mut dirty_access,
             gpu_to_cpu,
+            false,
+            None,
         );
     }
 
@@ -1390,126 +2268,16 @@ impl TextureCacheBase {
         &mut self,
         render_targets: &Maxwell3DRenderTargets,
         dirty_flags: &[bool; 256],
-        mut gpu_to_cpu: impl FnMut(GPUVAddr, u64) -> Option<u64>,
+        gpu_to_cpu: impl FnMut(GPUVAddr, u64) -> Option<u64>,
     ) {
-        if !dirty_flags[crate::dirty_flags::flags::RENDER_TARGETS as usize] {
-            return;
-        }
-        let force_rt_lookup =
-            dirty_flags[crate::dirty_flags::flags::RENDER_TARGET_CONTROL as usize];
-        for index in 0..NUM_RT {
-            self.render_targets.draw_buffers[index] = render_targets.rt_control.map[index] as u8;
-        }
-
-        let resolution = common::settings::values().resolution_info.clone();
-        let (up_scale, down_shift) = if self.is_rescaling {
-            (resolution.up_scale, resolution.down_shift)
-        } else {
-            (1, 0)
-        };
-        self.render_targets.is_rescaled = self.is_rescaling;
-        self.render_targets.size = Extent2D {
-            width: (render_targets.surface_clip.width.wrapping_mul(up_scale)) >> down_shift,
-            height: (render_targets.surface_clip.height.wrapping_mul(up_scale)) >> down_shift,
-        };
-
-        for index in 0..NUM_RT {
-            let color_flag = crate::dirty_flags::flags::COLOR_BUFFER0 + index as u8;
-            if !force_rt_lookup && !dirty_flags[color_flag as usize] {
-                continue;
-            }
-            if index >= render_targets.rt_control.count as usize {
-                self.bind_color_render_target(index, ImageViewId::default());
-                continue;
-            }
-            let rt = render_targets.render_targets[index];
-            if rt.address == 0 || rt.width == 0 || rt.height == 0 || rt.format == 0 {
-                self.bind_color_render_target(index, ImageViewId::default());
-                continue;
-            }
-            let info =
-                ImageInfo::from_render_target_info(&rt, render_targets.anti_alias_samples_mode);
-            let guest_size = super::util::calculate_guest_size_in_bytes(&info) as u64;
-            let cpu_addr = gpu_to_cpu(rt.address, guest_size).unwrap_or_else(|| {
-                if trace_render_target_enabled() {
-                    log::info!(
-                        "[RT] miss translate color={} target={} gpu=0x{:X} {}x{} fmt=0x{:X}; using virtual-invalid fallback",
-                        index,
-                        index,
-                        rt.address,
-                        rt.width,
-                        rt.height,
-                        rt.format
-                    );
-                }
-                self.resolve_or_allocate_cpu_addr(rt.address, guest_size)
-            });
-
-            let image_id = self.find_or_insert_render_target_image(
-                &rt,
-                render_targets.anti_alias_samples_mode,
-                cpu_addr,
-            );
-            let view_id = self.find_render_target_view_from_image(
-                image_id,
-                &rt,
-                render_targets.anti_alias_samples_mode,
-                rt.address,
-            );
-            self.bind_color_render_target(index, view_id);
-
-            if trace_render_target_enabled() {
-                let image = &self.slot_images[image_id];
-                log::info!(
-                    "[RT] color={} target={} gpu=0x{:X} cpu=0x{:X} {}x{} fmt=0x{:X} image={} views={}",
-                    index,
-                    index,
-                    rt.address,
-                    cpu_addr,
-                    rt.width,
-                    rt.height,
-                    rt.format,
-                    image_id.index,
-                    image.image_view_ids.len()
-                );
-            }
-        }
-
-        if force_rt_lookup || dirty_flags[crate::dirty_flags::flags::ZETA_BUFFER as usize] {
-            let zeta = render_targets.zeta;
-            if zeta.enabled && zeta.address != 0 && zeta.width != 0 && zeta.height != 0 {
-                let info = ImageInfo::from_zeta_info(&zeta, render_targets.anti_alias_samples_mode);
-                let guest_size = super::util::calculate_guest_size_in_bytes(&info) as u64;
-                let cpu_addr = gpu_to_cpu(zeta.address, guest_size).unwrap_or_else(|| {
-                    if trace_render_target_enabled() {
-                        log::info!(
-                            "[RT] miss translate zeta gpu=0x{:X} {}x{} fmt=0x{:X}; using virtual-invalid fallback",
-                            zeta.address,
-                            zeta.width,
-                            zeta.height,
-                            zeta.format
-                        );
-                    }
-                    self.resolve_or_allocate_cpu_addr(zeta.address, guest_size)
-                });
-                let image_id = if self.backend_completes_join_images {
-                    let result = self.find_or_insert_image_from_info_with_options_result(
-                        &info,
-                        zeta.address,
-                        cpu_addr,
-                        RelaxedOptions::empty(),
-                    );
-                    self.queue_backend_completion_for_inserted_result(&result);
-                    result.image_id
-                } else {
-                    self.find_or_insert_image_from_info(&info, zeta.address, cpu_addr)
-                };
-                let view_id = self.find_image_view_from_image_info(image_id, &info, zeta.address);
-                self.bind_depth_render_target(view_id);
-            } else {
-                self.bind_depth_render_target(ImageViewId::default());
-            }
-        }
+        let mut dirty_access = *dirty_flags;
+        self.update_render_targets_with_snapshot(
+            render_targets,
+            &mut dirty_access,
+            gpu_to_cpu,
+            false,
+            None,
+        );
     }
 
     fn queue_preemptive_render_target_download(&mut self, new_id: ImageViewId) {
@@ -1545,44 +2313,18 @@ impl TextureCacheBase {
         self.render_targets.depth_buffer_id = new_id;
     }
 
-    fn find_or_insert_render_target_image(
-        &mut self,
-        rt: &RenderTargetInfo,
-        anti_alias_samples_mode: u32,
-        cpu_addr: u64,
-    ) -> ImageId {
-        let info = ImageInfo::from_render_target_info(rt, anti_alias_samples_mode);
-        if self.backend_completes_join_images {
-            let result = self.find_or_insert_image_from_info_with_options_result(
-                &info,
-                rt.address,
-                cpu_addr,
-                RelaxedOptions::empty(),
-            );
-            self.queue_backend_completion_for_inserted_result(&result);
-            result.image_id
-        } else {
-            self.find_or_insert_image_from_info(&info, rt.address, cpu_addr)
-        }
-    }
-
     pub fn find_or_insert_image_from_info(
         &mut self,
         info: &ImageInfo,
         gpu_addr: GPUVAddr,
         cpu_addr: u64,
     ) -> ImageId {
-        assert!(
-            !self.backend_completes_join_images,
-            "TextureCacheBase::find_or_insert_image_from_info cannot return a fully-completed ImageId when backend completion is required"
-        );
-        self.find_or_insert_image_from_info_with_options_result(
+        self.find_or_insert_image_from_info_with_options(
             info,
             gpu_addr,
             cpu_addr,
             RelaxedOptions::empty(),
         )
-        .image_id
     }
 
     /// CPU-address-aware counterpart of upstream
@@ -1594,22 +2336,6 @@ impl TextureCacheBase {
         cpu_addr: u64,
         options: RelaxedOptions,
     ) -> ImageId {
-        assert!(
-            !self.backend_completes_join_images,
-            "TextureCacheBase::find_or_insert_image_from_info_with_options cannot return a fully-completed ImageId when backend completion is required"
-        );
-        self.find_or_insert_image_from_info_with_options_result(info, gpu_addr, cpu_addr, options)
-            .image_id
-    }
-
-    pub(crate) fn find_or_insert_image_from_info_with_options_result(
-        &mut self,
-        info: &ImageInfo,
-        gpu_addr: GPUVAddr,
-        cpu_addr: u64,
-        options: RelaxedOptions,
-    ) -> FindOrInsertImageResult {
-        let trace_addr = should_trace_texture_cache_addr(gpu_addr);
         if let Some(image_id) = self.find_image_in_cpu_region_with_caps(
             info,
             gpu_addr,
@@ -1618,62 +2344,15 @@ impl TextureCacheBase {
             self.has_broken_texture_view_formats,
             self.has_native_bgr,
         ) {
-            if trace_addr {
-                use std::sync::atomic::{AtomicU64, Ordering};
-                static REGION_HITS: AtomicU64 = AtomicU64::new(0);
-                let hit = REGION_HITS.fetch_add(1, Ordering::Relaxed);
-                if hit < 32 || hit.is_power_of_two() {
-                    let image = &self.slot_images[image_id];
-                    log::warn!(
-                        "[TEX_CACHE] region_hit #{} id={} gpu=0x{:X} cpu=0x{:X} req_fmt={:?} img_fmt={:?} req={}x{} img={}x{} guest=0x{:X} flags=0x{:X} tick={}",
-                        hit,
-                        image_id.index,
-                        gpu_addr,
-                        cpu_addr,
-                        info.format,
-                        image.info.format,
-                        info.size.width,
-                        info.size.height,
-                        image.info.size.width,
-                        image.info.size.height,
-                        image.guest_size_bytes,
-                        image.flags.bits(),
-                        image.modification_tick,
-                    );
-                }
-            }
-            return FindOrInsertImageResult {
-                image_id,
-                inserted: false,
-                needs_backend_completion: false,
-                queued_join_tail: false,
-            };
+            return image_id;
         }
-        if trace_addr {
-            log::warn!(
-                "[TEX_CACHE] miss_join gpu=0x{:X} cpu=0x{:X} fmt={:?} {}x{}",
-                gpu_addr,
-                cpu_addr,
-                info.format,
-                info.size.width,
-                info.size.height
-            );
-        }
-        let pending_join_count = self.pending_join_copies.len();
         let image_id = self.join_images(info, gpu_addr, cpu_addr);
-        let queued_join_tail = self.pending_join_copies.len() != pending_join_count;
         // Upstream `InsertImage` registers the new ImageId in image_allocs_table
-        // immediately after `JoinImages`, independently from when the Vulkan
-        // backend materializes/uploads the VkImage. Keeping this registration
-        // behind backend completion makes a second lookup in the same region
-        // miss the image and create duplicate ImageIds for the same surface.
+        // immediately after the synchronous `JoinImages` lifecycle. Delaying
+        // this allocation-table update makes a second lookup in the same
+        // region create a duplicate ImageId for the same surface.
         self.register_image_alloc(image_id);
-        FindOrInsertImageResult {
-            image_id,
-            inserted: true,
-            needs_backend_completion: self.backend_completes_join_images,
-            queued_join_tail,
-        }
+        image_id
     }
 
     pub(crate) fn register_image_alloc(&mut self, image_id: ImageId) {
@@ -1684,7 +2363,9 @@ impl TextureCacheBase {
         let alloc_id = if let Some(&alloc_id) = self.image_allocs_table.get(&gpu_addr) {
             alloc_id
         } else {
-            let alloc_id = self.slot_image_allocs.insert(ImageAllocBase::default());
+            let alloc_id = self
+                .slot_image_allocs
+                .insert(ImageAllocBase::default().into());
             self.image_allocs_table.insert(gpu_addr, alloc_id);
             alloc_id
         };
@@ -1752,7 +2433,7 @@ impl TextureCacheBase {
 
         let image_info = self.slot_images[image_id].info.clone();
         let view = ImageViewBase::new(&info, &image_info, image_id, gpu_addr);
-        let view_id = self.slot_image_views.insert(view);
+        let view_id = self.insert_typed_image_view(view, Some(image_id));
         self.slot_images[image_id].insert_view(info, view_id);
         view_id
     }
@@ -1766,7 +2447,6 @@ impl TextureCacheBase {
         mut gpu_addr: GPUVAddr,
         mut cpu_addr: u64,
     ) -> ImageId {
-        let trace_addr = should_trace_texture_cache_addr(gpu_addr);
         let mut new_info = info.clone();
         let size_bytes = super::util::calculate_guest_size_in_bytes(&new_info) as usize;
         let broken_views = self.has_broken_texture_view_formats;
@@ -1782,137 +2462,144 @@ impl TextureCacheBase {
         self.join_alias_indices.clear();
 
         let this_is_linear = info.image_type == ImageType::Linear;
-        let overlaps = self.collect_images_in_region(cpu_addr, size_bytes);
-        if trace_addr {
-            log::warn!(
-                "[TEX_CACHE] join_begin gpu=0x{:X} cpu=0x{:X} size=0x{:X} fmt={:?} {}x{} overlaps={:?}",
+        let page_table = &self.page_table;
+        let slot_map_views = &mut self.slot_map_views;
+        let slot_images = &mut self.slot_images;
+        let join_ignore_textures = &mut self.join_ignore_textures;
+        let join_left_aliased_ids = &mut self.join_left_aliased_ids;
+        let join_overlaps_found = &mut self.join_overlaps_found;
+        let join_overlap_ids = &mut self.join_overlap_ids;
+        let join_copies_to_do = &mut self.join_copies_to_do;
+        let join_right_aliased_ids = &mut self.join_right_aliased_ids;
+        let join_bad_overlap_ids = &mut self.join_bad_overlap_ids;
+        Self::for_each_image_in_region_parts(
+            page_table,
+            slot_map_views,
+            slot_images,
+            cpu_addr,
+            size_bytes,
+            |overlap_id, overlap, _| {
+                if overlap.flags.contains(ImageFlagBits::REMAPPED) {
+                    join_ignore_textures.insert(overlap_id);
+                    return false;
+                }
+                let overlap_is_linear = overlap.info.image_type == ImageType::Linear;
+                if this_is_linear != overlap_is_linear {
+                    return false;
+                }
+                if this_is_linear && overlap_is_linear {
+                    if info.pitch() == overlap.info.pitch() && gpu_addr == overlap.gpu_addr {
+                        join_left_aliased_ids.push(overlap_id);
+                    }
+                    return false;
+                }
+
+                join_overlaps_found.insert(overlap_id);
+                if let Some(solution) = super::util::resolve_overlap(
+                    &new_info,
+                    gpu_addr,
+                    cpu_addr,
+                    overlap,
+                    true,
+                    broken_views,
+                    native_bgr,
+                ) {
+                    gpu_addr = solution.gpu_addr;
+                    cpu_addr = solution.cpu_addr;
+                    new_info.resources = solution.resources;
+                    join_overlap_ids.push(overlap_id);
+                    join_copies_to_do.push(JoinCopy {
+                        is_alias: false,
+                        id: overlap_id,
+                    });
+                    return false;
+                }
+
+                let options = RelaxedOptions::SIZE | RelaxedOptions::FORMAT;
+                let new_image_base = ImageBase::new(new_info.clone(), gpu_addr, cpu_addr);
+                if super::util::is_subresource(
+                    &new_info,
+                    overlap,
+                    gpu_addr,
+                    options,
+                    broken_views,
+                    native_bgr,
+                ) {
+                    join_left_aliased_ids.push(overlap_id);
+                    overlap.flags.insert(ImageFlagBits::ALIAS);
+                    join_copies_to_do.push(JoinCopy {
+                        is_alias: true,
+                        id: overlap_id,
+                    });
+                } else if super::util::is_subresource(
+                    &overlap.info,
+                    &new_image_base,
+                    overlap.gpu_addr,
+                    options,
+                    broken_views,
+                    native_bgr,
+                ) {
+                    join_right_aliased_ids.push(overlap_id);
+                    overlap.flags.insert(ImageFlagBits::ALIAS);
+                    join_copies_to_do.push(JoinCopy {
+                        is_alias: true,
+                        id: overlap_id,
+                    });
+                } else {
+                    join_bad_overlap_ids.push(overlap_id);
+                }
+                false
+            },
+        );
+        if let Some(table_index) = self.current_gpu_page_table_index(true) {
+            let sparse_page_table = &self.gpu_page_table_storage[table_index];
+            let slot_images = &mut self.slot_images;
+            let join_overlaps_found = &self.join_overlaps_found;
+            let join_ignore_textures = &mut self.join_ignore_textures;
+            Self::for_each_image_in_gpu_region_parts(
+                sparse_page_table,
+                slot_images,
                 gpu_addr,
-                cpu_addr,
                 size_bytes,
-                info.format,
-                info.size.width,
-                info.size.height,
-                overlaps.iter().map(|id| id.index).collect::<Vec<_>>()
+                |overlap_id, overlap| {
+                    if join_overlaps_found.contains(&overlap_id) {
+                        return false;
+                    }
+                    if overlap.flags.contains(ImageFlagBits::REMAPPED)
+                        || (overlap.gpu_addr == gpu_addr
+                            && overlap.guest_size_bytes as usize == size_bytes)
+                    {
+                        join_ignore_textures.insert(overlap_id);
+                    }
+                    false
+                },
             );
         }
-        for overlap_id in overlaps {
-            if !overlap_id.is_valid() {
-                continue;
-            }
-            let overlap_snapshot = self.slot_images[overlap_id].clone();
-            if trace_addr || should_trace_texture_cache_addr(overlap_snapshot.gpu_addr) {
-                log::warn!(
-                    "[TEX_CACHE] join_overlap new_gpu=0x{:X} overlap={} gpu=0x{:X} cpu=0x{:X} fmt={:?} {}x{} flags=0x{:X}",
-                    gpu_addr,
-                    overlap_id.index,
-                    overlap_snapshot.gpu_addr,
-                    overlap_snapshot.cpu_addr,
-                    overlap_snapshot.info.format,
-                    overlap_snapshot.info.size.width,
-                    overlap_snapshot.info.size.height,
-                    overlap_snapshot.flags.bits()
-                );
-            }
-            if overlap_snapshot.flags.contains(ImageFlagBits::REMAPPED) {
-                self.join_ignore_textures.insert(overlap_id);
-                continue;
-            }
-            let overlap_is_linear = overlap_snapshot.info.image_type == ImageType::Linear;
-            if this_is_linear != overlap_is_linear {
-                continue;
-            }
-            if this_is_linear && overlap_is_linear {
-                if info.pitch() == overlap_snapshot.info.pitch()
-                    && gpu_addr == overlap_snapshot.gpu_addr
-                {
-                    self.join_left_aliased_ids.push(overlap_id);
-                }
-                continue;
-            }
 
-            self.join_overlaps_found.insert(overlap_id);
-            if let Some(solution) = super::util::resolve_overlap(
-                &new_info,
-                gpu_addr,
-                cpu_addr,
-                &overlap_snapshot,
-                true,
-                broken_views,
-                native_bgr,
-            ) {
-                gpu_addr = solution.gpu_addr;
-                cpu_addr = solution.cpu_addr;
-                new_info.resources = solution.resources;
-                self.join_overlap_ids.push(overlap_id);
-                self.join_copies_to_do.push(JoinCopy {
-                    is_alias: false,
-                    id: overlap_id,
-                    gpu_modified_at_join: overlap_snapshot
-                        .flags
-                        .contains(ImageFlagBits::GPU_MODIFIED),
-                });
-                continue;
+        let join_copies = self.join_copies_to_do.clone();
+        let mut can_rescale = info.rescaleable;
+        let mut any_rescaled = false;
+        for copy in &join_copies {
+            if !can_rescale {
+                break;
             }
-
-            let options = RelaxedOptions::SIZE | RelaxedOptions::FORMAT;
-            let new_image_base = ImageBase::new(new_info.clone(), gpu_addr, cpu_addr);
-            if super::util::is_subresource(
-                &new_info,
-                &overlap_snapshot,
-                gpu_addr,
-                options,
-                broken_views,
-                native_bgr,
-            ) {
-                self.join_left_aliased_ids.push(overlap_id);
-                self.slot_images[overlap_id]
-                    .flags
-                    .insert(ImageFlagBits::ALIAS);
-                self.join_copies_to_do.push(JoinCopy {
-                    is_alias: true,
-                    id: overlap_id,
-                    gpu_modified_at_join: overlap_snapshot
-                        .flags
-                        .contains(ImageFlagBits::GPU_MODIFIED),
-                });
-            } else if super::util::is_subresource(
-                &overlap_snapshot.info,
-                &new_image_base,
-                overlap_snapshot.gpu_addr,
-                options,
-                broken_views,
-                native_bgr,
-            ) {
-                self.join_right_aliased_ids.push(overlap_id);
-                self.slot_images[overlap_id]
-                    .flags
-                    .insert(ImageFlagBits::ALIAS);
-                self.join_copies_to_do.push(JoinCopy {
-                    is_alias: true,
-                    id: overlap_id,
-                    gpu_modified_at_join: overlap_snapshot
-                        .flags
-                        .contains(ImageFlagBits::GPU_MODIFIED),
-                });
-            } else {
-                self.join_bad_overlap_ids.push(overlap_id);
-            }
+            can_rescale &= self.image_can_rescale(copy.id);
+            any_rescaled |= self.slot_images[copy.id]
+                .flags
+                .contains(ImageFlagBits::RESCALED);
         }
-        for overlap_id in self.collect_images_in_gpu_region(gpu_addr, size_bytes, true) {
-            if self.join_overlaps_found.contains(&overlap_id) {
-                continue;
-            }
-            let overlap = &self.slot_images[overlap_id];
-            if overlap.flags.contains(ImageFlagBits::REMAPPED)
-                || (overlap.gpu_addr == gpu_addr && overlap.guest_size_bytes as usize == size_bytes)
-            {
-                self.join_ignore_textures.insert(overlap_id);
+        can_rescale &= any_rescaled;
+
+        for copy in &join_copies {
+            if can_rescale {
+                self.scale_up(copy.id);
+            } else {
+                self.scale_down(copy.id);
             }
         }
 
         let new_image_id =
-            self.slot_images
-                .insert(ImageBase::new(new_info.clone(), gpu_addr, cpu_addr));
+            self.insert_typed_image(ImageBase::new(new_info.clone(), gpu_addr, cpu_addr));
         if new_info.is_sparse {
             let gpu_memory = self
                 .channel_gpu_memory
@@ -1934,16 +2621,10 @@ impl TextureCacheBase {
                 .flags
                 .contains(ImageFlagBits::GPU_MODIFIED)
             {
-                self.record_unimplemented_join_images_path(
-                    "ignored overlap is GPU_MODIFIED",
-                    info,
-                    gpu_addr,
-                    cpu_addr,
-                    overlap_id,
-                );
-                panic!(
-                    "TextureCache::JoinImages ignored GPU-modified overlap is unimplemented: overlap_id={} gpu=0x{:X}",
-                    overlap_id.index, self.slot_images[overlap_id].gpu_addr
+                log::error!(
+                    "TextureCache::JoinImages ignored GPU-modified overlap id={} gpu=0x{:X}",
+                    overlap_id.index,
+                    self.slot_images[overlap_id].gpu_addr,
                 );
             }
             if self.slot_images[overlap_id]
@@ -1952,128 +2633,92 @@ impl TextureCacheBase {
             {
                 self.untrack_image(overlap_id);
             }
-            if self.slot_images[overlap_id]
-                .flags
-                .contains(ImageFlagBits::REGISTERED)
-            {
-                self.unregister_image(overlap_id);
-            }
+            self.unregister_image(overlap_id);
             self.delete_image(overlap_id, false);
         }
 
-        let has_join_relations = !self.join_left_aliased_ids.is_empty()
-            || !self.join_right_aliased_ids.is_empty()
-            || !self.join_bad_overlap_ids.is_empty();
-        let has_pending_join_tail = if self.backend_completes_join_images {
-            !self.join_copies_to_do.is_empty() || has_join_relations
+        self.refresh_contents(new_image_id);
+        if can_rescale {
+            self.scale_up(new_image_id);
         } else {
-            !self.join_copies_to_do.is_empty()
-        };
-        if has_pending_join_tail {
-            self.join_copies_to_do
-                .sort_by_key(|copy| self.slot_images[copy.id].modification_tick);
-            self.pending_join_copies.push(PendingJoinCopies {
-                new_image_id,
-                copies: self.join_copies_to_do.clone(),
-                left_aliased_ids: self.join_left_aliased_ids.clone(),
-                right_aliased_ids: self.join_right_aliased_ids.clone(),
-                bad_overlap_ids: self.join_bad_overlap_ids.clone(),
-                alias_indices: std::collections::HashMap::new(),
-                alias_relations_applied: false,
-            });
-        } else {
-            self.join_alias_indices = self.apply_join_relations(
-                new_image_id,
-                &self.join_right_aliased_ids.clone(),
-                &self.join_left_aliased_ids.clone(),
-                &self.join_bad_overlap_ids.clone(),
-            );
+            self.scale_down(new_image_id);
         }
 
-        // Upstream registers the new image after RefreshContents, rescale,
-        // alias/bad-overlap relation application, copy/delete tail, and all
-        // backend-owned image work. In the split Vulkan backend, any queued
-        // tail must delay common registration until the backend completes that
-        // upstream-owned ordering.
-        if !has_pending_join_tail {
-            self.register_image(new_image_id);
-        }
-        if trace_addr {
-            log::warn!(
-                "[TEX_CACHE] join_end id={} gpu=0x{:X} cpu=0x{:X} fmt={:?} {}x{} copies={} left_alias={} right_alias={} bad={}",
-                new_image_id.index,
-                self.slot_images[new_image_id].gpu_addr,
-                self.slot_images[new_image_id].cpu_addr,
-                self.slot_images[new_image_id].info.format,
-                self.slot_images[new_image_id].info.size.width,
-                self.slot_images[new_image_id].info.size.height,
-                self.join_copies_to_do.len(),
-                self.join_left_aliased_ids.len(),
-                self.join_right_aliased_ids.len(),
-                self.join_bad_overlap_ids.len()
-            );
-        }
-        new_image_id
-    }
+        self.join_copies_to_do
+            .sort_by_key(|copy| self.slot_images[copy.id].modification_tick);
+        self.join_alias_indices = self.apply_join_relations(
+            new_image_id,
+            &self.join_right_aliased_ids.clone(),
+            &self.join_left_aliased_ids.clone(),
+            &self.join_bad_overlap_ids.clone(),
+        );
 
-    fn record_unimplemented_join_images_path(
-        &self,
-        reason: &str,
-        info: &ImageInfo,
-        new_gpu_addr: GPUVAddr,
-        new_cpu_addr: u64,
-        overlap_id: ImageId,
-    ) {
-        #[cfg(not(test))]
-        {
-            let overlap = &self.slot_images[overlap_id];
-            let path = std::path::Path::new(".agents/texture_cache_unimplemented_state.md");
-            if let Some(parent) = path.parent() {
-                let _ = std::fs::create_dir_all(parent);
+        for copy_object in self.join_copies_to_do.clone() {
+            if copy_object.is_alias {
+                if !self.slot_images[copy_object.id].is_safe_download() {
+                    continue;
+                }
+                let Some(&alias_index) = self.join_alias_indices.get(&copy_object.id) else {
+                    continue;
+                };
+                let Some(alias) = self.slot_images[new_image_id]
+                    .aliased_images
+                    .get(alias_index)
+                    .cloned()
+                else {
+                    continue;
+                };
+                P::copy_image(self, new_image_id, alias.id, &alias.copies);
+                self.slot_images[new_image_id].modification_tick =
+                    self.slot_images[copy_object.id].modification_tick;
+                continue;
             }
-            let entry = format!(
-                "\n## TextureCache::JoinImages unsupported path\n\
-                 - reason: {}\n\
-                 - upstream: video_core/texture_cache/texture_cache.h TextureCache<P>::JoinImages ignored-overlap loop calls UNIMPLEMENTED() when ImageFlagBits::GpuModified is set\n\
-                 - new_gpu_addr: 0x{:X}\n\
-                 - new_cpu_addr: 0x{:X}\n\
-                 - new_format: {:?}\n\
-                 - new_size: {}x{}x{}\n\
-                 - new_guest_size: {}\n\
-                 - overlap_id: {}\n\
-                 - overlap_gpu_addr: 0x{:X}\n\
-                 - overlap_cpu_addr: 0x{:X}\n\
-                 - overlap_format: {:?}\n\
-                 - overlap_size: {}x{}x{}\n\
-                 - overlap_guest_size: {}\n\
-                 - overlap_flags: 0x{:X}\n",
-                reason,
-                new_gpu_addr,
-                new_cpu_addr,
-                info.format,
-                info.size.width,
-                info.size.height,
-                info.size.depth,
-                super::util::calculate_guest_size_in_bytes(info),
-                overlap_id.index,
-                overlap.gpu_addr,
-                overlap.cpu_addr,
-                overlap.info.format,
-                overlap.info.size.width,
-                overlap.info.size.height,
-                overlap.info.size.depth,
-                overlap.guest_size_bytes,
-                overlap.flags.bits(),
-            );
-            let _ = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(path)
-                .and_then(|mut file| {
-                    use std::io::Write;
-                    file.write_all(entry.as_bytes())
-                });
+
+            let overlap_gpu_modified = self.slot_images[copy_object.id]
+                .flags
+                .contains(ImageFlagBits::GPU_MODIFIED);
+            if overlap_gpu_modified {
+                self.slot_images[new_image_id]
+                    .flags
+                    .insert(ImageFlagBits::GPU_MODIFIED);
+                let overlap_gpu_addr = self.slot_images[copy_object.id].gpu_addr;
+                let base = self.slot_images[new_image_id]
+                    .try_find_base(overlap_gpu_addr)
+                    .expect("TextureCache::JoinImages overlap base must exist");
+                let resolution = common::settings::values().resolution_info.clone();
+                let up_scale = if can_rescale { resolution.up_scale } else { 1 };
+                let down_shift = if can_rescale {
+                    resolution.down_shift
+                } else {
+                    0
+                };
+                let overlap_info = self.slot_images[copy_object.id].info.clone();
+                let copies = super::util::make_shrink_image_copies(
+                    &new_info,
+                    &overlap_info,
+                    base,
+                    up_scale,
+                    down_shift,
+                );
+                if overlap_info.num_samples != new_info.num_samples {
+                    P::copy_image_msaa(self, new_image_id, copy_object.id, &copies);
+                } else {
+                    P::copy_image(self, new_image_id, copy_object.id, &copies);
+                }
+                self.slot_images[new_image_id].modification_tick =
+                    self.slot_images[copy_object.id].modification_tick;
+            }
+            if self.slot_images[copy_object.id]
+                .flags
+                .contains(ImageFlagBits::TRACKED)
+            {
+                self.untrack_image(copy_object.id);
+            }
+            self.unregister_image(copy_object.id);
+            self.delete_image(copy_object.id, false);
         }
+        self.register_image(new_image_id);
+        new_image_id
     }
 
     pub(crate) fn apply_join_relations(
@@ -2082,45 +2727,37 @@ impl TextureCacheBase {
         right_aliased_ids: &[ImageId],
         left_aliased_ids: &[ImageId],
         bad_overlap_ids: &[ImageId],
-    ) -> std::collections::HashMap<ImageId, usize> {
-        let mut alias_indices = std::collections::HashMap::new();
-        let mut bad_overlap_ids = bad_overlap_ids.to_vec();
-        let mut new_image = self.slot_images[new_image_id].clone();
+    ) -> std::collections::HashMap<ImageId, usize, BuildUnorderedDenseHasher> {
+        let mut alias_indices = std::collections::HashMap::default();
+        let new_image = self.slot_images[new_image_id].base.as_mut() as *mut ImageBase;
         for &aliased_id in right_aliased_ids {
+            assert_ne!(aliased_id, new_image_id);
+            let aliased = self.slot_images[aliased_id].base.as_mut() as *mut ImageBase;
+            // SAFETY: `new_image_id` and `aliased_id` identify distinct boxed
+            // bases. Neither allocation moves or is replaced while backend
+            // payloads retain their inheritance pointers.
+            let (new_image, aliased) = unsafe { (&mut *new_image, &mut *aliased) };
             let alias_index = new_image.aliased_images.len();
-            let mut aliased = self.slot_images[aliased_id].clone();
-            if !Self::can_add_image_alias(&new_image, &aliased) {
-                if !bad_overlap_ids.contains(&aliased_id) {
-                    bad_overlap_ids.push(aliased_id);
-                }
-                continue;
-            }
-            if !add_image_alias(&mut new_image, &mut aliased, new_image_id, aliased_id) {
+            if !add_image_alias(new_image, aliased, new_image_id, aliased_id) {
                 continue;
             }
             alias_indices.insert(aliased_id, alias_index);
             new_image.flags.insert(ImageFlagBits::ALIAS);
-            self.slot_images[aliased_id] = aliased;
         }
         for &aliased_id in left_aliased_ids {
+            assert_ne!(aliased_id, new_image_id);
+            let aliased = self.slot_images[aliased_id].base.as_mut() as *mut ImageBase;
+            // SAFETY: same distinct stable allocations as above.
+            let (new_image, aliased) = unsafe { (&mut *new_image, &mut *aliased) };
             let alias_index = new_image.aliased_images.len();
-            let mut aliased = self.slot_images[aliased_id].clone();
-            if !Self::can_add_image_alias(&aliased, &new_image) {
-                if !bad_overlap_ids.contains(&aliased_id) {
-                    bad_overlap_ids.push(aliased_id);
-                }
-                continue;
-            }
-            if !add_image_alias(&mut aliased, &mut new_image, aliased_id, new_image_id) {
+            if !add_image_alias(aliased, new_image, aliased_id, new_image_id) {
                 continue;
             }
             alias_indices.insert(aliased_id, alias_index);
             new_image.flags.insert(ImageFlagBits::ALIAS);
-            self.slot_images[aliased_id] = aliased;
         }
-        self.slot_images[new_image_id] = new_image;
 
-        for aliased_id in bad_overlap_ids {
+        for &aliased_id in bad_overlap_ids {
             self.slot_images[aliased_id]
                 .overlapping_images
                 .push(new_image_id);
@@ -2167,10 +2804,8 @@ impl TextureCacheBase {
             "TextureCache::register_image: image already registered"
         );
         let memory_size = Self::registered_image_memory_size(&self.slot_images[image_id]);
-        self.total_used_memory = self.total_used_memory.saturating_add(memory_size);
-        let lru_index = self
-            .lru_cache
-            .insert(image_id, self.frame_tick.min(i64::MAX as u64) as i64);
+        self.total_used_memory = self.total_used_memory.wrapping_add(memory_size);
+        let lru_index = self.lru_cache.insert(image_id, self.frame_tick);
         self.slot_images[image_id].lru_index = lru_index;
 
         let (gpu_addr, guest_size_bytes, is_sparse) = {
@@ -2258,8 +2893,7 @@ impl TextureCacheBase {
         }
         let lru_index = self.slot_images[image_id].lru_index;
         if lru_index != usize::MAX {
-            self.lru_cache
-                .touch(lru_index, self.frame_tick.min(i64::MAX as u64) as i64);
+            self.lru_cache.touch(lru_index, self.frame_tick);
         }
     }
 
@@ -2406,7 +3040,23 @@ impl TextureCacheBase {
     /// Inverse of `track_image`: clears the `Tracked` flag and decrements
     /// the per-page cached count for the image's backing pages.
     pub fn untrack_image(&mut self, image_id: ImageId) {
-        let image = &mut self.slot_images[image_id];
+        Self::untrack_image_parts(
+            &self.device_memory,
+            &self.sparse_views,
+            &self.slot_map_views,
+            image_id,
+            &mut self.slot_images[image_id],
+        );
+    }
+
+    /// Field-split body of upstream `TextureCache<P>::UntrackImage`.
+    fn untrack_image_parts(
+        device_memory: &crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager,
+        sparse_views: &HashMap<ImageId, Vec<ImageMapId>, BuildUnorderedDenseHasher>,
+        slot_map_views: &common::slot_vector::SlotVector<ImageMapView>,
+        image_id: ImageId,
+        image: &mut ImageBase,
+    ) {
         debug_assert!(
             image.flags.contains(ImageFlagBits::TRACKED),
             "TextureCache::untrack_image: image not tracked"
@@ -2418,11 +3068,7 @@ impl TextureCacheBase {
         let guest_size_bytes = image.guest_size_bytes;
         if !is_sparse {
             if cpu_addr < !(1u64 << 40) {
-                self.device_memory.update_pages_cached_count(
-                    cpu_addr,
-                    guest_size_bytes as usize,
-                    -1,
-                );
+                device_memory.update_pages_cached_count(cpu_addr, guest_size_bytes as usize, -1);
             }
             return;
         }
@@ -2430,15 +3076,12 @@ impl TextureCacheBase {
             registered,
             "TextureCache::untrack_image: sparse image must be registered first"
         );
-        let sparse_maps = self
-            .sparse_views
+        let sparse_maps = sparse_views
             .get(&image_id)
-            .expect("sparse image missing from sparse_views")
-            .clone();
-        for map_view_id in sparse_maps {
-            let map = &self.slot_map_views[map_view_id];
-            self.device_memory
-                .update_pages_cached_count(map.cpu_addr, map.size, -1);
+            .expect("sparse image missing from sparse_views");
+        for &map_view_id in sparse_maps {
+            let map = &slot_map_views[map_view_id];
+            device_memory.update_pages_cached_count(map.cpu_addr, map.size, -1);
         }
     }
 
@@ -2449,23 +3092,10 @@ impl TextureCacheBase {
     /// that determines whether the image is placed in the delayed-destruction
     /// ring or freed immediately.
     pub fn delete_image(&mut self, image_id: ImageId, immediate_delete: bool) {
-        self.delete_image_impl(image_id, immediate_delete, true);
+        self.delete_image_impl(image_id, immediate_delete);
     }
 
-    pub(crate) fn delete_image_after_backend_cleanup(
-        &mut self,
-        image_id: ImageId,
-        immediate_delete: bool,
-    ) {
-        self.delete_image_impl(image_id, immediate_delete, false);
-    }
-
-    fn delete_image_impl(
-        &mut self,
-        image_id: ImageId,
-        immediate_delete: bool,
-        queue_backend_deletion: bool,
-    ) {
+    fn delete_image_impl(&mut self, image_id: ImageId, immediate_delete: bool) {
         let image_view_ids = self.slot_images[image_id].image_view_ids.clone();
         let aliased_images = self.slot_images[image_id].aliased_images.clone();
         let overlapping_images = self.slot_images[image_id].overlapping_images.clone();
@@ -2489,13 +3119,6 @@ impl TextureCacheBase {
                 .contains(ImageFlagBits::REGISTERED),
             "TextureCache::delete_image: image was not unregistered"
         );
-
-        if queue_backend_deletion && self.backend_completes_join_images {
-            self.pending_backend_deletions.push(PendingBackendDeletion {
-                image_id,
-                image_view_ids: image_view_ids.clone(),
-            });
-        }
 
         self.mark_render_targets_dirty();
         for view_id in &image_view_ids {
@@ -2551,7 +3174,7 @@ impl TextureCacheBase {
         }
         self.total_used_memory = self
             .total_used_memory
-            .saturating_sub(registered_size.saturating_add(scaled_size));
+            .wrapping_sub(registered_size.wrapping_add(scaled_size));
 
         if let Some(alloc_id) = self.image_allocs_table.get(&gpu_addr).copied() {
             let alloc_images = &mut self.slot_image_allocs[alloc_id].images;
@@ -2570,20 +3193,19 @@ impl TextureCacheBase {
         self.for_each_active_channel_state_mut(|channel| {
             channel.graphics_image_table.invalidate();
             channel.compute_image_table.invalidate();
-            channel.graphics_image_view_ids.fill(CORRUPT_ID);
-            channel.compute_image_view_ids.fill(CORRUPT_ID);
+            for image_view_id in channel.image_view_ids.values_mut() {
+                *image_view_id = CORRUPT_ID;
+            }
         });
     }
 
     /// Port of `TextureCache<P>::InvalidateScale`.
     ///
     /// Invalidates image views and framebuffers that were created against the
-    /// image's previous scale state. The backend wrapper must use the returned
-    /// view IDs to retire renderer-owned image views/framebuffers, but must not
-    /// destroy the image itself.
-    pub(crate) fn invalidate_scale(&mut self, image_id: ImageId) -> Vec<ImageViewId> {
+    /// image's previous scale state.
+    pub(crate) fn invalidate_scale(&mut self, image_id: ImageId) {
         if self.slot_images[image_id].scale_tick <= self.frame_tick {
-            self.slot_images[image_id].scale_tick = self.frame_tick + 1;
+            self.slot_images[image_id].scale_tick = self.frame_tick.wrapping_add(1);
         }
 
         let image_view_ids = self.slot_images[image_id].image_view_ids.clone();
@@ -2610,7 +3232,6 @@ impl TextureCacheBase {
         self.slot_images[image_id].image_view_infos.clear();
         self.invalidate_channel_image_views();
         self.has_deleted_images = true;
-        image_view_ids
     }
 
     /// Port of `TextureCache<P>::RemoveImageViewReferences`.
@@ -2624,8 +3245,27 @@ impl TextureCacheBase {
 
     /// Port of `TextureCache<P>::RemoveFramebuffers`.
     fn remove_framebuffers(&mut self, removed_views: &[ImageViewId]) {
-        self.framebuffers
-            .retain(|key, _| !key.contains(removed_views));
+        let last_framebuffer_id = self.last_framebuffer_id;
+        let mut removed_framebuffers = Vec::new();
+        self.framebuffers.retain(|key, framebuffer_id| {
+            if !key.contains(removed_views) {
+                return true;
+            }
+            if framebuffer_id.is_valid() {
+                removed_framebuffers.push(*framebuffer_id);
+            }
+            false
+        });
+        if removed_framebuffers.contains(&last_framebuffer_id) {
+            self.last_framebuffer_id = FramebufferId::default();
+            self.last_framebuffer_serial = 0;
+        }
+        for framebuffer_id in removed_framebuffers {
+            if self.slot_framebuffers.contains(framebuffer_id) {
+                let framebuffer = self.slot_framebuffers.take(framebuffer_id);
+                self.sentenced_framebuffers.push(framebuffer);
+            }
+        }
     }
 
     // ── Blit ───────────────────────────────────────────────────────────
@@ -2676,32 +3316,37 @@ impl TextureCacheBase {
         };
 
         let mut image_id = NULL_IMAGE_ID;
-        let mut image_ids = Vec::new();
-        for existing_image_id in self.collect_images_in_region(cpu_addr, size as usize) {
-            let existing_image = &self.slot_images[existing_image_id];
-            if existing_image.flags.contains(ImageFlagBits::REMAPPED) {
-                continue;
-            }
+        let mut image_ids = SmallVec::<[ImageId; 8]>::new();
+        self.for_each_image_in_region(
+            cpu_addr,
+            size as usize,
+            |existing_image_id, existing_image| {
+                if existing_image.flags.contains(ImageFlagBits::REMAPPED) {
+                    return false;
+                }
 
-            let matched = if info.image_type == ImageType::Linear
-                || existing_image.info.image_type == ImageType::Linear
-            {
-                let strict_size = existing_image.flags.contains(ImageFlagBits::STRONG);
-                let existing = &existing_image.info;
-                existing_image.gpu_addr == gpu_addr
-                    && existing.image_type == info.image_type
-                    && existing.pitch() == info.pitch()
-                    && super::util::is_pitch_linear_same_size(existing, info, strict_size)
-                    && surface::is_view_compatible(existing.format, info.format, false, true)
-            } else {
-                super::util::is_sub_copy(info, existing_image, gpu_addr)
-            };
+                let matched = if info.image_type == ImageType::Linear
+                    || existing_image.info.image_type == ImageType::Linear
+                {
+                    let strict_size = existing_image.flags.contains(ImageFlagBits::STRONG);
+                    let existing = &existing_image.info;
+                    existing_image.gpu_addr == gpu_addr
+                        && existing.image_type == info.image_type
+                        && existing.pitch() == info.pitch()
+                        && super::util::is_pitch_linear_same_size(existing, info, strict_size)
+                        && surface::is_view_compatible(existing.format, info.format, false, true)
+                } else {
+                    super::util::is_sub_copy(info, existing_image, gpu_addr)
+                };
 
-            if matched {
-                image_id = existing_image_id;
-                image_ids.push(existing_image_id);
-            }
-        }
+                if matched {
+                    image_id = existing_image_id;
+                    image_ids.push(existing_image_id);
+                    return true;
+                }
+                false
+            },
+        );
 
         if image_ids.len() <= 1 {
             return image_id;
@@ -2730,9 +3375,9 @@ impl TextureCacheBase {
         }
         let image = &self.slot_images[image_id];
         let base = image.try_find_base(image_operand.address)?;
-        let buffer_size = buffer_operand.pitch.saturating_mul(buffer_operand.height);
+        let buffer_size = buffer_operand.pitch.wrapping_mul(buffer_operand.height);
         let bpp = surface::bytes_per_block(image.info.format);
-        let convert = |value: u32| (image_operand.bytes_per_pixel.saturating_mul(value)) / bpp;
+        let convert = |value: u32| (image_operand.bytes_per_pixel.wrapping_mul(value)) / bpp;
         let copy = BufferImageCopy {
             buffer_offset: 0,
             buffer_size: buffer_size as usize,
@@ -2782,24 +3427,79 @@ impl TextureCacheBase {
 
     // ── Prepare / refresh ──────────────────────────────────────────────
 
-    /// Port of `TextureCache<P>::PrepareImage`.
-    ///
-    /// Ensures an image is resident and up-to-date before GPU use.  If the
-    /// image is CPU-modified it is re-uploaded; if it is a modification then
-    /// the GPU-modified flag is set.
-    pub fn prepare_image(&mut self, _image_id: ImageId, _is_modification: bool, _invalidate: bool) {
-        panic!(
-            "TextureCacheBase::prepare_image cannot preserve upstream RefreshContents/SynchronizeAliases ordering without a backend runtime; use the backend texture-cache wrapper"
-        );
+    /// Port of `TextureCache<P>::SynchronizeAliases`.
+    fn synchronize_aliases(&mut self, image_id: ImageId) {
+        let image_tick = self.slot_images[image_id].modification_tick;
+        let image_flags = self.slot_images[image_id].flags;
+        let mut aliases = SmallVec::<[(ImageId, Vec<ImageCopy>); 8]>::new();
+        let mut most_recent_tick = image_tick;
+        let mut any_rescaled = image_flags.contains(ImageFlagBits::RESCALED);
+        let mut any_modified = image_flags.contains(ImageFlagBits::GPU_MODIFIED);
+
+        for alias in &self.slot_images[image_id].aliased_images {
+            let alias_image = &self.slot_images[alias.id];
+            if image_tick < alias_image.modification_tick {
+                most_recent_tick = most_recent_tick.max(alias_image.modification_tick);
+                any_rescaled |= alias_image.flags.contains(ImageFlagBits::RESCALED);
+                any_modified |= alias_image.flags.contains(ImageFlagBits::GPU_MODIFIED);
+                aliases.push((alias.id, alias.copies.clone()));
+            }
+        }
+        if aliases.is_empty() {
+            return;
+        }
+
+        let can_rescale = self.image_can_rescale(image_id);
+        if any_rescaled {
+            if can_rescale {
+                self.scale_up(image_id);
+            } else {
+                self.scale_down(image_id);
+            }
+        }
+        let image = &mut self.slot_images[image_id];
+        image.modification_tick = most_recent_tick;
+        if any_modified {
+            image.flags.insert(ImageFlagBits::GPU_MODIFIED);
+        }
+
+        aliases.sort_unstable_by_key(|(alias_id, _)| self.slot_images[*alias_id].modification_tick);
+        let resolution_active = common::settings::values().resolution_info.active;
+        for (alias_id, copies) in aliases {
+            if resolution_active && any_rescaled {
+                if can_rescale {
+                    self.scale_up(alias_id);
+                } else {
+                    self.scale_down(alias_id);
+                }
+            }
+            P::copy_image(self, image_id, alias_id, &copies);
+        }
     }
 
-    /// Port of `TextureCache<P>::RefreshContents`.
-    ///
-    /// Re-uploads guest texture data for a CPU-modified image.
-    fn refresh_contents(&mut self, _image_id: ImageId) {
-        panic!(
-            "TextureCacheBase::refresh_contents cannot upload guest texture data without a backend runtime; use the backend texture-cache wrapper"
-        );
+    /// Port of `TextureCache<P>::PrepareImage`.
+    pub fn prepare_image(&mut self, image_id: ImageId, is_modification: bool, invalidate: bool) {
+        if invalidate {
+            self.slot_images[image_id]
+                .flags
+                .remove(ImageFlagBits::CPU_MODIFIED | ImageFlagBits::GPU_MODIFIED);
+            if !self.slot_images[image_id]
+                .flags
+                .contains(ImageFlagBits::TRACKED)
+            {
+                self.track_image(image_id);
+            }
+        } else {
+            self.refresh_contents(image_id);
+            if !self.slot_images[image_id].aliased_images.is_empty() {
+                self.synchronize_aliases(image_id);
+            }
+        }
+        if is_modification {
+            self.mark_modification_by_id(image_id);
+        }
+        let lru_index = self.slot_images[image_id].lru_index;
+        self.lru_cache.touch(lru_index, self.frame_tick);
     }
 
     // ── Modification marks ─────────────────────────────────────────────
@@ -2809,10 +3509,7 @@ impl TextureCacheBase {
     /// Sets the `GpuModified` flag on the image and updates
     /// `modification_tick`.
     pub fn mark_modification_by_id(&mut self, id: ImageId) {
-        if !id.is_valid() {
-            return;
-        }
-        self.modification_tick = self.modification_tick.saturating_add(1);
+        self.modification_tick = self.modification_tick.wrapping_add(1);
         let image = &mut self.slot_images[id];
         image.flags.insert(ImageFlagBits::GPU_MODIFIED);
         image.modification_tick = self.modification_tick;
@@ -2907,7 +3604,23 @@ mod tests {
     use super::*;
     use crate::engines::maxwell_3d::{RenderTargetInfo, RtControlInfo};
     use crate::framebuffer_config::{AndroidPixelFormat, FramebufferConfig};
+    use crate::texture_cache::render_targets::RenderTargets;
     use crate::textures::texture::{ComponentType, TextureFormat, TextureType, TicEntry, TscEntry};
+
+    static RESOLUTION_SETTINGS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn collect_images_in_region_for_test(
+        cache: &mut TextureCacheBase,
+        cpu_addr: u64,
+        size: usize,
+    ) -> SmallVec<[ImageId; 32]> {
+        let mut image_ids = SmallVec::new();
+        cache.for_each_image_in_region(cpu_addr, size, |image_id, _| {
+            image_ids.push(image_id);
+            false
+        });
+        image_ids
+    }
 
     fn color_2d_tic(address: u64, base_layer: u32) -> TicEntry {
         let word0 = (TextureFormat::A8B8G8R8 as u32)
@@ -2937,10 +3650,336 @@ mod tests {
             .collect::<Vec<_>>()
     }
 
-    fn test_cache() -> TextureCacheBase {
+    #[test]
+    fn remove_framebuffers_invalidates_last_and_sentences_backend_object() {
+        let mut cache = test_cache();
+        let removed_view = ImageViewId { index: 7 };
+        let kept_view = ImageViewId { index: 8 };
+        let removed_framebuffer = cache.slot_framebuffers.insert(());
+        let kept_framebuffer = cache.slot_framebuffers.insert(());
+        let mut removed_key = RenderTargets::default();
+        removed_key.color_buffer_ids[0] = removed_view;
+        let mut kept_key = RenderTargets::default();
+        kept_key.depth_buffer_id = kept_view;
+        cache.framebuffers.insert(removed_key, removed_framebuffer);
+        cache.framebuffers.insert(kept_key, kept_framebuffer);
+        cache.last_framebuffer_id = removed_framebuffer;
+        cache.last_framebuffer_serial = 19;
+
+        cache.remove_framebuffers(&[removed_view]);
+
+        assert!(!cache.framebuffers.contains_key(&removed_key));
+        assert_eq!(cache.framebuffers.get(&kept_key), Some(&kept_framebuffer));
+        assert_eq!(cache.last_framebuffer_id, FramebufferId::default());
+        assert_eq!(cache.last_framebuffer_serial, 0);
+        assert!(!cache.slot_framebuffers.contains(removed_framebuffer));
+        assert!(cache.slot_framebuffers.contains(kept_framebuffer));
+    }
+
+    fn unbound_test_cache() -> TextureCacheBase {
         use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
         use std::sync::Arc;
         TextureCacheBase::new(Arc::new(MaxwellDeviceMemoryManager::default()))
+    }
+
+    fn test_cache() -> TextureCacheBase {
+        use crate::memory_manager::MemoryManager;
+        use parking_lot::Mutex;
+        use std::sync::Arc;
+
+        let mut cache = unbound_test_cache();
+        cache.set_channel_gpu_memory(Arc::new(Mutex::new(MemoryManager::new(17))));
+        cache
+    }
+
+    struct TestImageViewBackend {
+        base: TextureCacheBase<TestImageViewParams>,
+    }
+
+    struct TestImageViewParams;
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct TestFramebuffer {
+        key: RenderTargets,
+        generation: u32,
+    }
+
+    thread_local! {
+        static IMAGE_VIEW_PREPARE_PUBLICATION: std::cell::RefCell<Vec<bool>> = const {
+            std::cell::RefCell::new(Vec::new())
+        };
+        static RENDER_TARGET_PREPARE_CALLS: std::cell::RefCell<Vec<(ImageViewId, bool, bool)>> = const {
+            std::cell::RefCell::new(Vec::new())
+        };
+        static JOIN_COPY_DISPATCH: std::cell::Cell<(u32, u32)> = const {
+            std::cell::Cell::new((0, 0))
+        };
+        static FRAMEBUFFER_CONSTRUCTIONS: std::cell::Cell<u32> = const {
+            std::cell::Cell::new(0)
+        };
+        static TEST_IMAGE_SCALE_SUCCEEDS: std::cell::Cell<bool> = const {
+            std::cell::Cell::new(false)
+        };
+        static PREPARE_REFRESH_CALLS: std::cell::Cell<u32> = const {
+            std::cell::Cell::new(0)
+        };
+        static UPLOAD_BARRIER_CALLS: std::cell::Cell<u32> = const {
+            std::cell::Cell::new(0)
+        };
+    }
+
+    impl TextureCacheParams for TestImageViewParams {
+        type Runtime = ();
+        type Image = ();
+        type ImageAlloc = ();
+        type ImageView = ();
+        type Sampler = ();
+        type Framebuffer = TestFramebuffer;
+        type FramebufferError = std::convert::Infallible;
+        type AsyncBuffer = Vec<u8>;
+        type BufferType = ();
+
+        const ENABLE_VALIDATION: bool = true;
+        const FRAMEBUFFER_BLITS: bool = false;
+        const HAS_EMULATED_COPIES: bool = false;
+        const HAS_DEVICE_MEMORY_INFO: bool = false;
+        const IMPLEMENTS_ASYNC_DOWNLOADS: bool = false;
+
+        fn create_image(_: Option<&mut ()>, _: ImageId, _: std::ptr::NonNull<ImageBase>) {}
+
+        fn set_image_allocation_tick(_: &mut (), _: u64) {}
+
+        fn create_image_view(
+            _: Option<&mut ()>,
+            _: ImageViewId,
+            _: std::ptr::NonNull<ImageViewBase>,
+            _: Option<&()>,
+        ) {
+        }
+
+        fn create_sampler(_: Option<&mut ()>, _: &crate::textures::texture::TscEntry) {}
+
+        fn create_framebuffer(
+            _: Option<&mut ()>,
+            _: [Option<std::ptr::NonNull<()>>; NUM_RT],
+            _: Option<std::ptr::NonNull<()>>,
+            key: &RenderTargets,
+        ) -> Result<TestFramebuffer, std::convert::Infallible> {
+            let generation = FRAMEBUFFER_CONSTRUCTIONS.with(|constructions| {
+                let generation = constructions.get().wrapping_add(1);
+                constructions.set(generation);
+                generation
+            });
+            Ok(TestFramebuffer {
+                key: *key,
+                generation,
+            })
+        }
+
+        fn prepare_image_view(
+            cache: &mut TextureCacheBase<Self>,
+            image_view_id: ImageViewId,
+            is_modification: bool,
+            invalidate: bool,
+        ) {
+            let already_published = cache
+                .current_channel_state()
+                .image_view_ids
+                .values()
+                .any(|&cached_id| cached_id == image_view_id);
+            IMAGE_VIEW_PREPARE_PUBLICATION
+                .with(|observations| observations.borrow_mut().push(already_published));
+            RENDER_TARGET_PREPARE_CALLS.with(|calls| {
+                calls
+                    .borrow_mut()
+                    .push((image_view_id, is_modification, invalidate));
+            });
+        }
+
+        fn scale_up_image(cache: &mut TextureCacheBase<Self>, image_id: ImageId, _: bool) -> bool {
+            if !TEST_IMAGE_SCALE_SUCCEEDS.with(std::cell::Cell::get) {
+                return false;
+            }
+            if cache.slot_images[image_id]
+                .flags
+                .contains(ImageFlagBits::RESCALED)
+            {
+                return false;
+            }
+            cache.slot_images[image_id]
+                .flags
+                .insert(ImageFlagBits::RESCALED);
+            cache.slot_images[image_id].has_scaled = true;
+            true
+        }
+
+        fn scale_down_image(
+            cache: &mut TextureCacheBase<Self>,
+            image_id: ImageId,
+            _: bool,
+        ) -> bool {
+            if !TEST_IMAGE_SCALE_SUCCEEDS.with(std::cell::Cell::get) {
+                return false;
+            }
+            if !cache.slot_images[image_id]
+                .flags
+                .contains(ImageFlagBits::RESCALED)
+            {
+                return false;
+            }
+            cache.slot_images[image_id]
+                .flags
+                .remove(ImageFlagBits::RESCALED);
+            true
+        }
+
+        fn upload_staging_buffer(_: &mut TextureCacheBase<Self>, size: usize, _: bool) -> Vec<u8> {
+            PREPARE_REFRESH_CALLS.with(|calls| calls.set(calls.get().wrapping_add(1)));
+            vec![0; size]
+        }
+
+        fn staging_mapped_span(buffer: &mut Vec<u8>) -> &mut [u8] {
+            buffer
+        }
+
+        fn free_deferred_staging_buffer(_: &mut TextureCacheBase<Self>, _: &mut Vec<u8>) {}
+
+        fn can_upload_msaa(_: &TextureCacheBase<Self>) -> bool {
+            true
+        }
+
+        fn transition_image_layout(_: &mut TextureCacheBase<Self>, _: ImageId) {}
+
+        fn upload_image(
+            _: &mut TextureCacheBase<Self>,
+            _: ImageId,
+            _: &Vec<u8>,
+            _: &[BufferImageCopy],
+        ) {
+        }
+
+        fn accelerate_image_upload(
+            _: &mut TextureCacheBase<Self>,
+            _: ImageId,
+            _: &Vec<u8>,
+            _: &[SwizzleParameters],
+            _: u32,
+            _: u32,
+        ) {
+        }
+
+        fn insert_upload_memory_barrier(_: &mut TextureCacheBase<Self>) {
+            UPLOAD_BARRIER_CALLS.with(|calls| calls.set(calls.get().wrapping_add(1)));
+        }
+
+        fn copy_image(_: &mut TextureCacheBase<Self>, _: ImageId, _: ImageId, _: &[ImageCopy]) {
+            JOIN_COPY_DISPATCH.with(|dispatch| {
+                let (copy, msaa) = dispatch.get();
+                dispatch.set((copy + 1, msaa));
+            });
+        }
+
+        fn copy_image_msaa(
+            _: &mut TextureCacheBase<Self>,
+            _: ImageId,
+            _: ImageId,
+            _: &[ImageCopy],
+        ) {
+            JOIN_COPY_DISPATCH.with(|dispatch| {
+                let (copy, msaa) = dispatch.get();
+                dispatch.set((copy, msaa + 1));
+            });
+        }
+    }
+
+    impl TestImageViewBackend {
+        fn new(base: TextureCacheBase<TestImageViewParams>) -> Self {
+            IMAGE_VIEW_PREPARE_PUBLICATION.with(|observations| observations.borrow_mut().clear());
+            RENDER_TARGET_PREPARE_CALLS.with(|calls| calls.borrow_mut().clear());
+            TEST_IMAGE_SCALE_SUCCEEDS.with(|enabled| enabled.set(false));
+            Self { base }
+        }
+
+        fn fill_compute_image_views(&mut self, views: &mut [ImageViewInOut]) {
+            self.base.fill_image_views(views, true, true);
+        }
+    }
+
+    #[test]
+    fn get_framebuffer_reuses_complete_key_and_tracks_render_target_serial() {
+        use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
+        use std::sync::Arc;
+
+        FRAMEBUFFER_CONSTRUCTIONS.with(|constructions| constructions.set(0));
+        let mut cache = TextureCacheBase::<TestImageViewParams>::new_for_backend(Arc::new(
+            MaxwellDeviceMemoryManager::default(),
+        ));
+        let image_info = test_color_info(1280, 720);
+        let image_id = cache.slot_images.insert(ImageSlot {
+            backend: Some(()),
+            base: Box::new(ImageBase::new(image_info.clone(), 0x5000_0000, 0x9000_0000)),
+        });
+        let view_info = ImageViewInfo {
+            view_type: ImageViewType::E2D,
+            format: image_info.format,
+            range: SubresourceRange {
+                base: SubresourceBase { level: 0, layer: 0 },
+                extent: SubresourceExtent {
+                    levels: 1,
+                    layers: 1,
+                },
+            },
+            ..ImageViewInfo::default()
+        };
+        let view_id = cache.slot_image_views.insert(ImageViewSlot {
+            backend: Some(()),
+            base: Box::new(ImageViewBase::new(
+                &view_info,
+                &image_info,
+                image_id,
+                0x5000_0000,
+            )),
+        });
+        cache.render_targets = RenderTargets {
+            color_buffer_ids: std::array::from_fn(|index| {
+                if index == 0 {
+                    view_id
+                } else {
+                    NULL_IMAGE_VIEW_ID
+                }
+            }),
+            draw_buffers: [0, 1, 2, 3, 4, 5, 6, 7],
+            size: Extent2D {
+                width: 1280,
+                height: 720,
+            },
+            ..RenderTargets::default()
+        };
+        cache.render_targets_serial = 1;
+
+        let first = *cache.get_framebuffer().unwrap();
+        let first_id = cache.last_framebuffer_id;
+        assert_eq!(first.generation, 1);
+        assert_eq!(first.key, cache.render_targets);
+
+        let cached = *cache.get_framebuffer().unwrap();
+        assert_eq!(cached, first);
+        assert_eq!(cache.last_framebuffer_id, first_id);
+        assert_eq!(FRAMEBUFFER_CONSTRUCTIONS.with(std::cell::Cell::get), 1);
+
+        cache.render_targets_serial = 2;
+        let same_key = *cache.get_framebuffer().unwrap();
+        assert_eq!(same_key, first);
+        assert_eq!(cache.last_framebuffer_id, first_id);
+        assert_eq!(cache.last_framebuffer_serial, 2);
+        assert_eq!(FRAMEBUFFER_CONSTRUCTIONS.with(std::cell::Cell::get), 1);
+
+        cache.render_targets.draw_buffers[0] = 3;
+        cache.render_targets_serial = 3;
+        let changed = *cache.get_framebuffer().unwrap();
+        assert_eq!(changed.generation, 2);
+        assert_ne!(cache.last_framebuffer_id, first_id);
+        assert_eq!(FRAMEBUFFER_CONSTRUCTIONS.with(std::cell::Cell::get), 2);
     }
 
     fn test_color_info(width: u32, height: u32) -> ImageInfo {
@@ -2953,6 +3992,102 @@ mod tests {
             },
             ..ImageInfo::default()
         }
+    }
+
+    #[test]
+    fn update_render_targets_clean_path_prepares_every_slot_with_upstream_arguments() {
+        use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
+        use std::sync::Arc;
+
+        RENDER_TARGET_PREPARE_CALLS.with(|calls| calls.borrow_mut().clear());
+        let mut cache = TextureCacheBase::<TestImageViewParams>::new_for_backend(Arc::new(
+            MaxwellDeviceMemoryManager::default(),
+        ));
+        let image_info = test_color_info(64, 32);
+        let image_id = cache.slot_images.insert(ImageSlot {
+            backend: Some(()),
+            base: Box::new(ImageBase::new(image_info.clone(), 0x1000, 0x2000)),
+        });
+        let view_info = ImageViewInfo {
+            view_type: ImageViewType::E2D,
+            format: image_info.format,
+            range: SubresourceRange {
+                base: SubresourceBase { level: 0, layer: 0 },
+                extent: SubresourceExtent {
+                    levels: 1,
+                    layers: 1,
+                },
+            },
+            ..ImageViewInfo::default()
+        };
+        let view_id = cache.slot_image_views.insert(ImageViewSlot {
+            backend: Some(()),
+            base: Box::new(ImageViewBase::new(
+                &view_info,
+                &image_info,
+                image_id,
+                0x1000,
+            )),
+        });
+        cache.render_targets.color_buffer_ids[0] = view_id;
+
+        let dirty_flags = [false; 256];
+        let mut dirty_access = dirty_flags;
+        cache.update_render_targets_with_snapshot(
+            &Maxwell3DRenderTargets::default(),
+            &mut dirty_access,
+            |_, _| None,
+            true,
+            Some((1, 0, 64, 32)),
+        );
+
+        RENDER_TARGET_PREPARE_CALLS.with(|calls| {
+            let calls = calls.borrow();
+            assert_eq!(calls.len(), NUM_RT + 1);
+            assert_eq!(calls[0], (view_id, true, false));
+            assert!(calls[1..]
+                .iter()
+                .all(|&(_, is_modification, invalidate)| is_modification && invalidate));
+        });
+        assert_eq!(dirty_access, dirty_flags);
+    }
+
+    #[test]
+    fn update_render_targets_force_lookup_consumes_flags_and_sets_depth_bias_dirty() {
+        use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
+        use std::sync::Arc;
+
+        RENDER_TARGET_PREPARE_CALLS.with(|calls| calls.borrow_mut().clear());
+        let mut cache = TextureCacheBase::<TestImageViewParams>::new_for_backend(Arc::new(
+            MaxwellDeviceMemoryManager::default(),
+        ));
+        let mut dirty_flags = [false; 256];
+        dirty_flags[crate::dirty_flags::flags::RENDER_TARGETS as usize] = true;
+        dirty_flags[crate::dirty_flags::flags::RENDER_TARGET_CONTROL as usize] = true;
+        let mut dirty_access = dirty_flags;
+
+        cache.update_render_targets_with_snapshot(
+            &Maxwell3DRenderTargets::default(),
+            &mut dirty_access,
+            |_, _| None,
+            false,
+            None,
+        );
+
+        assert!(!dirty_access[crate::dirty_flags::flags::RENDER_TARGETS as usize]);
+        assert!(!dirty_access[crate::dirty_flags::flags::RENDER_TARGET_CONTROL as usize]);
+        for index in 0..NUM_RT {
+            assert!(
+                !dirty_access[(crate::dirty_flags::flags::COLOR_BUFFER0 + index as u8) as usize]
+            );
+        }
+        assert!(!dirty_access[crate::dirty_flags::flags::ZETA_BUFFER as usize]);
+        assert!(dirty_access[crate::dirty_flags::flags::DEPTH_BIAS_GLOBAL as usize]);
+        assert!(!dirty_access[crate::dirty_flags::flags::RESCALE_VIEWPORTS as usize]);
+        assert!(!dirty_access[crate::dirty_flags::flags::RESCALE_SCISSORS as usize]);
+        RENDER_TARGET_PREPARE_CALLS.with(|calls| {
+            assert_eq!(calls.borrow().len(), NUM_RT + 1);
+        });
     }
 
     fn dma_operand(
@@ -3018,13 +4153,9 @@ mod tests {
     fn dma_buffer_image_copy_descriptor_matches_upstream_fields() {
         let mut cache = test_cache();
         let info = test_color_info(64, 64);
-        let image_id = cache
-            .slot_images
-            .insert(crate::texture_cache::image_base::ImageBase::new(
-                info,
-                0x5300_0000,
-                0x9300_0000,
-            ));
+        let image_id = cache.slot_images.insert(
+            crate::texture_cache::image_base::ImageBase::new(info, 0x5300_0000, 0x9300_0000).into(),
+        );
         let image_operand = dma::ImageOperand {
             bytes_per_pixel: 8,
             params: dma::Parameters {
@@ -3071,7 +4202,7 @@ mod tests {
     fn texture_cache_reserves_zero_for_null_resources() {
         use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
         use std::sync::Arc;
-        let mut cache = TextureCacheBase::new(Arc::new(MaxwellDeviceMemoryManager::default()));
+        let mut cache = test_cache();
         let mut descriptor = crate::textures::texture::TscEntry::default();
         descriptor.raw[0] = 0x0000_03A2_0002_6080;
 
@@ -3086,16 +4217,47 @@ mod tests {
         };
         let image_id = cache
             .slot_images
-            .insert(crate::texture_cache::image_base::ImageBase::new(
-                info, 0x1000, 0x2000,
-            ));
+            .insert(crate::texture_cache::image_base::ImageBase::new(info, 0x1000, 0x2000).into());
 
-        let sampler_id = cache.find_sampler(&descriptor);
+        let sampler_id = cache.find_sampler(&descriptor, false);
 
         assert_ne!(image_id, crate::texture_cache::types::NULL_IMAGE_ID);
         assert_eq!(image_id.index, 1);
         assert_ne!(sampler_id, crate::texture_cache::types::NULL_SAMPLER_ID);
         assert_eq!(sampler_id.index, 1);
+    }
+
+    #[test]
+    fn sampler_budget_reclaims_only_inactive_sampler_slots_once_per_frame() {
+        use crate::control::channel_state::ChannelState;
+        use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
+        use std::sync::Arc;
+
+        let mut cache = test_cache();
+        let channel = ChannelState::new(10);
+        cache.create_channel(&channel);
+        cache.bind_to_channel(10);
+        let mut first = crate::textures::texture::TscEntry::default();
+        first.raw[0] = 1;
+        let mut second = crate::textures::texture::TscEntry::default();
+        second.raw[0] = 2;
+        let first_id = cache.find_sampler(&first, false);
+        let second_id = cache.find_sampler(&second, false);
+        cache
+            .current_channel_state_mut()
+            .sampler_ids
+            .insert(0, first_id);
+        cache.set_sampler_heap_budget(Some(cache.slot_samplers.size()));
+
+        cache.enforce_sampler_budget();
+
+        assert!(cache.slot_samplers.contains(first_id));
+        assert!(!cache.slot_samplers.contains(second_id));
+        assert!(cache.current_channel_state().samplers.contains_key(&first));
+        assert!(!cache.current_channel_state().samplers.contains_key(&second));
+
+        cache.enforce_sampler_budget();
+        assert!(!cache.slot_samplers.contains(second_id));
     }
 
     #[test]
@@ -3105,7 +4267,10 @@ mod tests {
         use parking_lot::Mutex as ParkingMutex;
         use std::sync::Arc;
 
-        let mut cache = TextureCacheBase::new(Arc::new(MaxwellDeviceMemoryManager::default()));
+        let mut cache =
+            TestImageViewBackend::new(TextureCacheBase::<TestImageViewParams>::new_for_backend(
+                Arc::new(MaxwellDeviceMemoryManager::default()),
+            ));
         let device_memory = Arc::new(MaxwellDeviceMemoryManager::default());
         let mut backing = vec![0u8; 0x6000];
         device_memory.smmu_set_physical_base_for_test(backing.as_ptr() as usize);
@@ -3134,15 +4299,12 @@ mod tests {
             let tic = color_2d_tic(0x8000, 0);
             assert!(gpu_memory.write_block(0x1000, &descriptor_bytes(tic.raw)));
         }
-        cache.set_channel_gpu_memory(Arc::clone(&gpu_memory));
+        cache.base.set_channel_gpu_memory(Arc::clone(&gpu_memory));
         assert!(cache
+            .base
             .channel_state
             .compute_image_table
             .synchronize(0x1000, 0));
-        cache
-            .channel_state
-            .compute_image_view_ids
-            .resize(1, CORRUPT_ID);
 
         let mut views = [ImageViewInOut {
             index: 0,
@@ -3153,18 +4315,21 @@ mod tests {
 
         assert!(views[0].id.is_valid());
         assert_ne!(views[0].id, NULL_IMAGE_VIEW_ID);
-        let view = &cache.slot_image_views[views[0].id];
+        let view = &cache.base.slot_image_views[views[0].id];
         assert_eq!(view.gpu_addr, 0x8000);
     }
 
     #[test]
-    fn fill_image_views_resolves_corrupt_cached_id_after_descriptor_probe() {
+    fn visit_image_view_prepares_before_publication_and_on_cached_reads() {
         use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
         use crate::memory_manager::MemoryManager;
         use parking_lot::Mutex as ParkingMutex;
         use std::sync::Arc;
 
-        let mut cache = TextureCacheBase::new(Arc::new(MaxwellDeviceMemoryManager::default()));
+        let mut cache =
+            TestImageViewBackend::new(TextureCacheBase::<TestImageViewParams>::new_for_backend(
+                Arc::new(MaxwellDeviceMemoryManager::default()),
+            ));
         let device_memory = Arc::new(MaxwellDeviceMemoryManager::default());
         let mut backing = vec![0u8; 0x6000];
         device_memory.smmu_set_physical_base_for_test(backing.as_ptr() as usize);
@@ -3193,25 +4358,12 @@ mod tests {
             let tic = color_2d_tic(0x8000, 0);
             assert!(gpu_memory.write_block(0x1000, &descriptor_bytes(tic.raw)));
         }
-        cache.set_channel_gpu_memory(Arc::clone(&gpu_memory));
+        cache.base.set_channel_gpu_memory(Arc::clone(&gpu_memory));
         assert!(cache
+            .base
             .channel_state
             .compute_image_table
             .synchronize(0x1000, 0));
-        cache
-            .channel_state
-            .compute_image_view_ids
-            .resize(1, CORRUPT_ID);
-
-        let (_, is_new) = cache
-            .channel_state
-            .compute_image_table
-            .read_with(0, |gpu_addr, out| {
-                gpu_memory.lock().read_block(gpu_addr, out)
-            });
-        assert!(is_new);
-        assert_eq!(cache.channel_state.compute_image_view_ids[0], CORRUPT_ID);
-
         let mut views = [ImageViewInOut {
             index: 0,
             blacklist: false,
@@ -3222,19 +4374,37 @@ mod tests {
         assert!(views[0].id.is_valid());
         assert_ne!(views[0].id, NULL_IMAGE_VIEW_ID);
         assert_ne!(views[0].id, CORRUPT_ID);
-        assert_eq!(cache.channel_state.compute_image_view_ids[0], views[0].id);
-        assert_eq!(cache.slot_image_views[views[0].id].gpu_addr, 0x8000);
+        let first_id = views[0].id;
+        assert_eq!(
+            cache
+                .base
+                .channel_state
+                .image_view_ids
+                .get(&(common::slot_vector::SlotId::TAGGED_VALUE)),
+            Some(&first_id)
+        );
+        IMAGE_VIEW_PREPARE_PUBLICATION.with(|observations| {
+            assert_eq!(*observations.borrow(), vec![false]);
+        });
+        cache.fill_compute_image_views(&mut views);
+        assert_eq!(views[0].id, first_id);
+        assert_eq!(cache.base.slot_image_views[views[0].id].gpu_addr, 0x8000);
+        IMAGE_VIEW_PREPARE_PUBLICATION.with(|observations| {
+            assert_eq!(*observations.borrow(), vec![false, true]);
+        });
     }
 
     #[test]
-    fn fill_image_views_registers_common_image_and_defers_backend_materialization() {
+    fn fill_image_views_constructs_typed_payload_before_publishing_view() {
         use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
         use crate::memory_manager::MemoryManager;
         use parking_lot::Mutex as ParkingMutex;
         use std::sync::Arc;
 
-        let mut cache = TextureCacheBase::new(Arc::new(MaxwellDeviceMemoryManager::default()));
-        cache.set_backend_completes_join_images(true);
+        let mut cache =
+            TestImageViewBackend::new(TextureCacheBase::<TestImageViewParams>::new_for_backend(
+                Arc::new(MaxwellDeviceMemoryManager::default()),
+            ));
 
         let device_memory = Arc::new(MaxwellDeviceMemoryManager::default());
         let mut backing = vec![0u8; 0x6000];
@@ -3264,15 +4434,12 @@ mod tests {
             let tic = color_2d_tic(0x8000, 0);
             assert!(gpu_memory.write_block(0x1000, &descriptor_bytes(tic.raw)));
         }
-        cache.set_channel_gpu_memory(Arc::clone(&gpu_memory));
+        cache.base.set_channel_gpu_memory(Arc::clone(&gpu_memory));
         assert!(cache
+            .base
             .channel_state
             .compute_image_table
             .synchronize(0x1000, 0));
-        cache
-            .channel_state
-            .compute_image_view_ids
-            .resize(1, CORRUPT_ID);
 
         let mut views = [ImageViewInOut {
             index: 0,
@@ -3281,21 +4448,22 @@ mod tests {
         }];
         cache.fill_compute_image_views(&mut views);
 
-        let image_id = cache.slot_image_views[views[0].id].image_id;
-        assert_eq!(cache.pending_backend_insertions, vec![image_id]);
-        assert!(cache.slot_images[image_id]
+        let image_id = cache.base.slot_image_views[views[0].id].image_id;
+        assert!(cache.base.slot_images[image_id].backend.is_some());
+        assert!(cache.base.slot_image_views[views[0].id].backend.is_some());
+        assert!(cache.base.slot_images[image_id]
             .flags
             .contains(ImageFlagBits::REGISTERED));
     }
 
     #[test]
-    fn get_compute_sampler_id_uses_channel_gpu_memory_for_tsc_reads() {
+    fn get_sampler_id_accepts_existing_channel_memory_borrow_for_compute_tsc_reads() {
         use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
         use crate::memory_manager::MemoryManager;
         use parking_lot::Mutex as ParkingMutex;
         use std::sync::Arc;
 
-        let mut cache = TextureCacheBase::new(Arc::new(MaxwellDeviceMemoryManager::default()));
+        let mut cache = test_cache();
         let device_memory = Arc::new(MaxwellDeviceMemoryManager::default());
         let mut backing = vec![0u8; 0x1000];
         device_memory.smmu_set_physical_base_for_test(backing.as_ptr() as usize);
@@ -3329,20 +4497,20 @@ mod tests {
             .channel_state
             .compute_sampler_table
             .synchronize(0x2000, 0));
-        cache
-            .channel_state
-            .compute_sampler_ids
-            .resize(1, CORRUPT_ID);
 
-        let sampler_id = cache.get_compute_sampler_id(0);
+        let sampler_id = {
+            let gpu_memory = gpu_memory.lock();
+            cache.get_sampler_id_with_memory(0, true, &gpu_memory)
+        };
 
         assert!(sampler_id.is_valid());
         assert_ne!(sampler_id, NULL_SAMPLER_ID);
         assert_eq!(cache.slot_samplers[sampler_id].raw, tsc.raw);
+        assert!(cache.slot_samplers[sampler_id].backend.is_some());
     }
 
     #[test]
-    fn synchronize_compute_descriptors_resizes_compute_tables() {
+    fn synchronize_compute_descriptors_updates_tables_without_eager_id_entries() {
         let mut cache = test_cache();
 
         cache.synchronize_compute_descriptors(
@@ -3357,18 +4525,8 @@ mod tests {
 
         assert_eq!(cache.channel_state.compute_image_table.limit(), 4);
         assert_eq!(cache.channel_state.compute_sampler_table.limit(), 2);
-        assert_eq!(cache.channel_state.compute_image_view_ids.len(), 5);
-        assert_eq!(cache.channel_state.compute_sampler_ids.len(), 3);
-        assert!(cache
-            .channel_state
-            .compute_image_view_ids
-            .iter()
-            .all(|&id| id == CORRUPT_ID));
-        assert!(cache
-            .channel_state
-            .compute_sampler_ids
-            .iter()
-            .all(|&id| id == CORRUPT_ID));
+        assert!(cache.channel_state.image_view_ids.is_empty());
+        assert!(cache.channel_state.sampler_ids.is_empty());
     }
 
     #[test]
@@ -3387,8 +4545,8 @@ mod tests {
 
         assert_eq!(cache.channel_state.compute_image_table.limit(), 6);
         assert_eq!(cache.channel_state.compute_sampler_table.limit(), 6);
-        assert_eq!(cache.channel_state.compute_image_view_ids.len(), 7);
-        assert_eq!(cache.channel_state.compute_sampler_ids.len(), 7);
+        assert!(cache.channel_state.image_view_ids.is_empty());
+        assert!(cache.channel_state.sampler_ids.is_empty());
     }
 
     #[test]
@@ -3415,8 +4573,8 @@ mod tests {
             .expect("bound texture-cache channel exists");
         assert_eq!(bound.graphics_image_table.limit(), 808);
         assert_eq!(bound.graphics_sampler_table.limit(), 64);
-        assert_eq!(bound.graphics_image_view_ids.len(), 809);
-        assert_eq!(bound.graphics_sampler_ids.len(), 65);
+        assert!(bound.image_view_ids.is_empty());
+        assert!(bound.sampler_ids.is_empty());
         assert_eq!(cache.channel_state.graphics_image_table.limit(), 0);
         assert_eq!(cache.channel_state.graphics_sampler_table.limit(), 0);
     }
@@ -3445,8 +4603,8 @@ mod tests {
             .expect("bound texture-cache channel exists");
         assert_eq!(bound.compute_image_table.limit(), 12);
         assert_eq!(bound.compute_sampler_table.limit(), 12);
-        assert_eq!(bound.compute_image_view_ids.len(), 13);
-        assert_eq!(bound.compute_sampler_ids.len(), 13);
+        assert!(bound.image_view_ids.is_empty());
+        assert!(bound.sampler_ids.is_empty());
         assert_eq!(cache.channel_state.compute_image_table.limit(), 0);
         assert_eq!(cache.channel_state.compute_sampler_table.limit(), 0);
     }
@@ -3455,7 +4613,7 @@ mod tests {
     fn update_render_targets_from_snapshot_registers_presentable_view() {
         use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
         use std::sync::Arc;
-        let mut cache = TextureCacheBase::new(Arc::new(MaxwellDeviceMemoryManager::default()));
+        let mut cache = test_cache();
         let mut render_targets = Maxwell3DRenderTargets::default();
         render_targets.surface_clip.width = 1280;
         render_targets.surface_clip.height = 720;
@@ -3515,7 +4673,7 @@ mod tests {
         use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
         use std::sync::Arc;
 
-        let mut cache = TextureCacheBase::new(Arc::new(MaxwellDeviceMemoryManager::default()));
+        let mut cache = test_cache();
         let mut render_targets = Maxwell3DRenderTargets::default();
         render_targets.rt_control = RtControlInfo {
             count: 1,
@@ -3554,7 +4712,7 @@ mod tests {
         use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
         use std::sync::Arc;
 
-        let mut cache = TextureCacheBase::new(Arc::new(MaxwellDeviceMemoryManager::default()));
+        let mut cache = test_cache();
         let mut render_targets = Maxwell3DRenderTargets::default();
         render_targets.anti_alias_samples_mode = 3;
         render_targets.rt_control = RtControlInfo {
@@ -3597,12 +4755,58 @@ mod tests {
         assert_eq!(cache.slot_images[zeta_id].info.num_samples, 8);
     }
 
-    #[test]
-    fn update_render_targets_from_snapshot_scales_render_target_size_when_rescaling() {
+    fn rescaled_render_target_size(surface_width: u32, surface_height: u32) -> Extent2D {
         use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
-        use common::settings;
         use std::sync::Arc;
 
+        TEST_IMAGE_SCALE_SUCCEEDS.with(|enabled| enabled.set(true));
+        let mut cache = TextureCacheBase::<TestImageViewParams>::new_for_backend(Arc::new(
+            MaxwellDeviceMemoryManager::default(),
+        ));
+        cache.set_channel_gpu_memory(Arc::new(ParkingMutex::new(MemoryManager::new(17))));
+        let mut render_targets = Maxwell3DRenderTargets::default();
+        render_targets.surface_clip.width = surface_width;
+        render_targets.surface_clip.height = surface_height;
+        render_targets.rt_control = RtControlInfo {
+            count: 1,
+            map: [0; NUM_RT],
+        };
+        render_targets.render_targets[0] = RenderTargetInfo {
+            address: 0x4000_0000,
+            width: 64,
+            height: 512,
+            format: 0xD5,
+            tile_mode: 2 | (1 << 4),
+            array_pitch: 32 * 4,
+            depth: 1,
+            base_layer: 0,
+        };
+
+        cache.update_render_targets_from_snapshot(&render_targets, |_, _| Some(0x535B_5000));
+        let image_id = cache.slot_image_views[cache.render_targets.color_buffer_ids[0]].image_id;
+        assert!(cache.slot_images[image_id].info.rescaleable);
+        assert_eq!(cache.slot_images[image_id].scale_rating, 1);
+        cache.frame_tick = cache.frame_tick.wrapping_add(1);
+        cache.update_render_targets_from_snapshot(&render_targets, |_, _| Some(0x535B_5000));
+        assert!(cache.slot_images[image_id]
+            .flags
+            .contains(ImageFlagBits::RESCALED));
+        let rebound_image_id =
+            cache.slot_image_views[cache.render_targets.color_buffer_ids[0]].image_id;
+        assert_eq!(rebound_image_id, image_id);
+        assert!(cache.slot_images[rebound_image_id]
+            .flags
+            .contains(ImageFlagBits::RESCALED));
+        TEST_IMAGE_SCALE_SUCCEEDS.with(|enabled| enabled.set(false));
+        assert!(cache.render_targets.is_rescaled);
+        cache.render_targets.size
+    }
+
+    #[test]
+    fn update_render_targets_from_snapshot_scales_render_target_size_when_rescaling() {
+        use common::settings;
+
+        let _settings_guard = RESOLUTION_SETTINGS_LOCK.lock().unwrap();
         let previous_resolution = settings::values().resolution_info.clone();
         {
             let mut values = settings::values_mut();
@@ -3611,27 +4815,19 @@ mod tests {
             values.resolution_info.active = true;
         }
 
-        let mut cache = TextureCacheBase::new(Arc::new(MaxwellDeviceMemoryManager::default()));
-        cache.is_rescaling = true;
-        let mut render_targets = Maxwell3DRenderTargets::default();
-        render_targets.surface_clip.width = 1280;
-        render_targets.surface_clip.height = 720;
-
-        cache.update_render_targets_from_snapshot(&render_targets, |_gpu_addr, _guest_size| None);
+        let size = rescaled_render_target_size(1280, 720);
 
         settings::values_mut().resolution_info = previous_resolution;
 
-        assert_eq!(cache.render_targets.size.width, 1920);
-        assert_eq!(cache.render_targets.size.height, 1080);
-        assert!(cache.render_targets.is_rescaled);
+        assert_eq!(size.width, 1920);
+        assert_eq!(size.height, 1080);
     }
 
     #[test]
     fn update_render_targets_size_uses_wrapping_scale_multiply_like_upstream() {
-        use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
         use common::settings;
-        use std::sync::Arc;
 
+        let _settings_guard = RESOLUTION_SETTINGS_LOCK.lock().unwrap();
         let previous_resolution = settings::values().resolution_info.clone();
         {
             let mut values = settings::values_mut();
@@ -3640,24 +4836,12 @@ mod tests {
             values.resolution_info.active = true;
         }
 
-        let mut cache = TextureCacheBase::new(Arc::new(MaxwellDeviceMemoryManager::default()));
-        cache.is_rescaling = true;
-        let mut render_targets = Maxwell3DRenderTargets::default();
-        render_targets.surface_clip.width = u32::MAX;
-        render_targets.surface_clip.height = u32::MAX - 1;
-
-        cache.update_render_targets_from_snapshot(&render_targets, |_gpu_addr, _guest_size| None);
+        let size = rescaled_render_target_size(u32::MAX, u32::MAX - 1);
 
         settings::values_mut().resolution_info = previous_resolution;
 
-        assert_eq!(
-            cache.render_targets.size.width,
-            u32::MAX.wrapping_mul(3) >> 1
-        );
-        assert_eq!(
-            cache.render_targets.size.height,
-            (u32::MAX - 1).wrapping_mul(3) >> 1
-        );
+        assert_eq!(size.width, u32::MAX.wrapping_mul(3) >> 1);
+        assert_eq!(size.height, (u32::MAX - 1).wrapping_mul(3) >> 1);
     }
 
     #[test]
@@ -3666,7 +4850,7 @@ mod tests {
         use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
         use std::sync::Arc;
 
-        let mut cache = TextureCacheBase::new(Arc::new(MaxwellDeviceMemoryManager::default()));
+        let mut cache = test_cache();
         cache.render_targets.draw_buffers = [7, 6, 5, 4, 3, 2, 1, 0];
         cache.render_targets.size = Extent2D {
             width: 320,
@@ -3717,7 +4901,7 @@ mod tests {
         use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
         use std::sync::Arc;
 
-        let mut cache = TextureCacheBase::new(Arc::new(MaxwellDeviceMemoryManager::default()));
+        let mut cache = test_cache();
         let mut render_targets = Maxwell3DRenderTargets::default();
         render_targets.surface_clip.width = 1280;
         render_targets.surface_clip.height = 720;
@@ -3751,7 +4935,7 @@ mod tests {
         use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
         use std::sync::Arc;
 
-        let mut cache = TextureCacheBase::new(Arc::new(MaxwellDeviceMemoryManager::default()));
+        let mut cache = test_cache();
         let mut render_targets = Maxwell3DRenderTargets::default();
         render_targets.surface_clip.width = 1280;
         render_targets.surface_clip.height = 720;
@@ -3793,6 +4977,7 @@ mod tests {
 
         render_targets.zeta.address = 0x5100_0000;
         let mut dirty_flags = [false; 256];
+        dirty_flags[crate::dirty_flags::flags::RENDER_TARGETS as usize] = true;
         dirty_flags[crate::dirty_flags::flags::ZETA_BUFFER as usize] = true;
         cache.update_render_targets_from_snapshot_with_dirty_flags(
             &render_targets,
@@ -3812,7 +4997,7 @@ mod tests {
         use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
         use std::sync::Arc;
 
-        let mut cache = TextureCacheBase::new(Arc::new(MaxwellDeviceMemoryManager::default()));
+        let mut cache = test_cache();
         let mut render_targets = Maxwell3DRenderTargets::default();
         render_targets.surface_clip.width = 1280;
         render_targets.surface_clip.height = 720;
@@ -3863,7 +5048,7 @@ mod tests {
         use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
         use std::sync::Arc;
 
-        let mut cache = TextureCacheBase::new(Arc::new(MaxwellDeviceMemoryManager::default()));
+        let mut cache = test_cache();
         let mut render_targets = Maxwell3DRenderTargets::default();
         render_targets.surface_clip.width = 1280;
         render_targets.surface_clip.height = 720;
@@ -3916,7 +5101,7 @@ mod tests {
         use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
         use std::sync::Arc;
 
-        let mut cache = TextureCacheBase::new(Arc::new(MaxwellDeviceMemoryManager::default()));
+        let mut cache = test_cache();
         let mut render_targets = Maxwell3DRenderTargets::default();
         render_targets.rt_control = RtControlInfo {
             count: 1,
@@ -3954,7 +5139,7 @@ mod tests {
         use crate::texture_cache::image_view_info::SwizzleSource;
         use std::sync::Arc;
 
-        let mut cache = TextureCacheBase::new(Arc::new(MaxwellDeviceMemoryManager::default()));
+        let mut cache = test_cache();
         let mut render_targets = Maxwell3DRenderTargets::default();
         render_targets.rt_control = RtControlInfo {
             count: 1,
@@ -4009,7 +5194,7 @@ mod tests {
         use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
         use std::sync::Arc;
 
-        let mut cache = TextureCacheBase::new(Arc::new(MaxwellDeviceMemoryManager::default()));
+        let mut cache = test_cache();
         let mut render_targets = Maxwell3DRenderTargets::default();
         render_targets.rt_control = RtControlInfo {
             count: 1,
@@ -4049,12 +5234,37 @@ mod tests {
     }
 
     #[test]
+    fn try_find_framebuffer_image_view_keeps_first_candidate_on_equal_tick() {
+        let mut cache = test_cache();
+        let info = test_color_info(64, 32);
+        let first_id = cache
+            .slot_images
+            .insert(ImageBase::new(info.clone(), 0x4000_0000, 0x535B_5000).into());
+        let second_id = cache
+            .slot_images
+            .insert(ImageBase::new(info, 0x5000_0000, 0x535B_5000).into());
+        for image_id in [first_id, second_id] {
+            cache.register_image(image_id);
+            cache.slot_images[image_id]
+                .image_view_ids
+                .push(ImageViewId { index: 99 });
+            cache.slot_images[image_id].modification_tick = 7;
+        }
+
+        let view = cache
+            .try_find_framebuffer_image_view(&FramebufferConfig::default(), 0x535B_5000)
+            .expect("framebuffer view");
+
+        assert_eq!(view.view.image_id, first_id);
+    }
+
+    #[test]
     fn get_flush_area_marks_gpu_modified_image_views_preemptive() {
         use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
         use crate::texture_cache::image_view_base::ImageViewFlagBits;
         use std::sync::Arc;
 
-        let mut cache = TextureCacheBase::new(Arc::new(MaxwellDeviceMemoryManager::default()));
+        let mut cache = test_cache();
         let mut render_targets = Maxwell3DRenderTargets::default();
         render_targets.rt_control = RtControlInfo {
             count: 1,
@@ -4110,7 +5320,7 @@ mod tests {
         use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
         use std::sync::Arc;
 
-        let mut cache = TextureCacheBase::new(Arc::new(MaxwellDeviceMemoryManager::default()));
+        let mut cache = test_cache();
         let info = ImageInfo {
             format: surface::PixelFormat::A8B8G8R8Unorm,
             size: crate::texture_cache::types::Extent3D {
@@ -4138,7 +5348,7 @@ mod tests {
         use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
         use std::sync::Arc;
 
-        let mut cache = TextureCacheBase::new(Arc::new(MaxwellDeviceMemoryManager::default()));
+        let mut cache = test_cache();
         let info = ImageInfo {
             format: surface::PixelFormat::A8B8G8R8Unorm,
             size: crate::texture_cache::types::Extent3D {
@@ -4149,9 +5359,9 @@ mod tests {
             ..ImageInfo::default()
         };
         let image_id = cache.insert_image(&info, 0x4000);
-        assert!(cache.slot_images[image_id]
+        cache.slot_images[image_id]
             .flags
-            .contains(ImageFlagBits::CPU_MODIFIED));
+            .insert(ImageFlagBits::CPU_MODIFIED);
 
         cache.mark_modification_by_id(image_id);
 
@@ -4166,7 +5376,7 @@ mod tests {
         use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
         use std::sync::Arc;
 
-        let mut cache = TextureCacheBase::new(Arc::new(MaxwellDeviceMemoryManager::default()));
+        let mut cache = test_cache();
         let info = ImageInfo {
             format: surface::PixelFormat::A8B8G8R8Unorm,
             size: crate::texture_cache::types::Extent3D {
@@ -4178,10 +5388,9 @@ mod tests {
         };
         let image_id = cache.insert_image(&info, 0x4000);
         let cpu_addr = cache.slot_images[image_id].cpu_addr;
-        cache.slot_images[image_id]
+        assert!(cache.slot_images[image_id]
             .flags
-            .remove(ImageFlagBits::CPU_MODIFIED);
-        cache.track_image(image_id);
+            .contains(ImageFlagBits::TRACKED));
 
         cache.write_memory(cpu_addr, 4);
 
@@ -4191,11 +5400,55 @@ mod tests {
     }
 
     #[test]
+    fn download_memory_selects_only_upstream_safe_images_and_clears_gpu_modified() {
+        use std::sync::{Arc, Mutex};
+
+        let mut cache = test_cache();
+        let info = test_color_info(1, 1);
+        let safe_id = cache
+            .slot_images
+            .insert(ImageBase::new(info.clone(), 0x8000, 0x8000).into());
+        let cpu_modified_id = cache
+            .slot_images
+            .insert(ImageBase::new(info, 0x9000, 0x9000).into());
+        cache.register_image(safe_id);
+        cache.register_image(cpu_modified_id);
+        cache.slot_images[safe_id]
+            .flags
+            .remove(ImageFlagBits::CPU_MODIFIED);
+        cache.slot_images[safe_id]
+            .flags
+            .insert(ImageFlagBits::GPU_MODIFIED);
+        cache.slot_images[cpu_modified_id]
+            .flags
+            .insert(ImageFlagBits::GPU_MODIFIED | ImageFlagBits::CPU_MODIFIED);
+
+        let downloaded = Arc::new(Mutex::new(Vec::new()));
+        let downloaded_for_callback = Arc::clone(&downloaded);
+        cache.set_image_downloader(Arc::new(move |image_id, _, staging| {
+            downloaded_for_callback.lock().unwrap().push(image_id);
+            staging.fill(0);
+            true
+        }));
+        cache.set_guest_memory_writer(Arc::new(|_, _| {}));
+
+        cache.download_memory(0x8000, 0x2000);
+
+        assert_eq!(*downloaded.lock().unwrap(), vec![safe_id]);
+        assert!(!cache.slot_images[safe_id]
+            .flags
+            .contains(ImageFlagBits::GPU_MODIFIED));
+        assert!(cache.slot_images[cpu_modified_id]
+            .flags
+            .contains(ImageFlagBits::GPU_MODIFIED));
+    }
+
+    #[test]
     fn insert_image_uses_virtual_invalid_cpu_space_when_untranslated() {
         use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
         use std::sync::Arc;
 
-        let mut cache = TextureCacheBase::new(Arc::new(MaxwellDeviceMemoryManager::default()));
+        let mut cache = test_cache();
         let info = ImageInfo {
             format: surface::PixelFormat::A8B8G8R8Unorm,
             size: crate::texture_cache::types::Extent3D {
@@ -4219,9 +5472,9 @@ mod tests {
             second_cpu_addr,
             !(1u64 << 40) + common::alignment::align_up(first_guest_size_bytes as u64, 32)
         );
-        assert!(cache.collect_images_in_region(0x4000, 4).is_empty());
+        assert!(collect_images_in_region_for_test(&mut cache, 0x4000, 4).is_empty());
         assert_eq!(
-            cache.collect_images_in_region(first_cpu_addr, 4).as_slice(),
+            collect_images_in_region_for_test(&mut cache, first_cpu_addr, 4).as_slice(),
             &[first_id]
         );
     }
@@ -4234,7 +5487,18 @@ mod tests {
         use std::sync::Arc;
 
         let device_memory = Arc::new(MaxwellDeviceMemoryManager::default());
+        let gpu_memory = Arc::new(ParkingMutex::new(
+            MemoryManager::new_with_geometry_and_device_memory(
+                7,
+                Arc::clone(&device_memory),
+                32,
+                0x1_0000_0000,
+                16,
+                12,
+            ),
+        ));
         let mut cache = TextureCacheBase::new(Arc::clone(&device_memory));
+        cache.set_channel_gpu_memory(Arc::clone(&gpu_memory));
         let info = ImageInfo {
             format: surface::PixelFormat::A8B8G8R8Unorm,
             size: crate::texture_cache::types::Extent3D {
@@ -4248,26 +5512,16 @@ mod tests {
         let image_id = cache.insert_image(&info, 0x4000);
         assert_eq!(cache.slot_images[image_id].cpu_addr, !(1u64 << 40));
 
-        let gpu_memory = Arc::new(ParkingMutex::new(
-            MemoryManager::new_with_geometry_and_device_memory(
-                7,
-                Arc::clone(&device_memory),
-                32,
-                0x1_0000_0000,
-                16,
-                12,
-            ),
-        ));
         gpu_memory.lock().map(0x4000, 0x9000_0000, 0x1000, 0, false);
 
         cache.set_channel_gpu_memory(gpu_memory);
 
         assert_eq!(cache.slot_images[image_id].cpu_addr, 0x9000_0000);
         assert_eq!(
-            cache.collect_images_in_region(0x9000_0000, 4).as_slice(),
+            collect_images_in_region_for_test(&mut cache, 0x9000_0000, 4).as_slice(),
             &[image_id]
         );
-        assert!(cache.collect_images_in_region(!(1u64 << 40), 4).is_empty());
+        assert!(collect_images_in_region_for_test(&mut cache, !(1u64 << 40), 4).is_empty());
     }
 
     #[test]
@@ -4384,11 +5638,11 @@ mod tests {
     }
 
     #[test]
-    fn find_or_insert_reuses_stable_virtual_invalid_range_without_channel_memory() {
+    fn find_or_insert_reuses_stable_virtual_invalid_range_for_unmapped_gpu_address() {
         use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
         use std::sync::Arc;
 
-        let mut cache = TextureCacheBase::new(Arc::new(MaxwellDeviceMemoryManager::default()));
+        let mut cache = test_cache();
         let info = ImageInfo {
             format: surface::PixelFormat::A8B8G8R8Unorm,
             size: crate::texture_cache::types::Extent3D {
@@ -4414,7 +5668,7 @@ mod tests {
         use std::panic::{catch_unwind, AssertUnwindSafe};
         use std::sync::Arc;
 
-        let mut cache = TextureCacheBase::new(Arc::new(MaxwellDeviceMemoryManager::default()));
+        let mut cache = unbound_test_cache();
         let mut info = ImageInfo {
             format: surface::PixelFormat::A8B8G8R8Unorm,
             size: Extent3D {
@@ -4447,7 +5701,7 @@ mod tests {
         use parking_lot::Mutex as ParkingMutex;
         use std::sync::Arc;
 
-        let mut cache = TextureCacheBase::new(Arc::new(MaxwellDeviceMemoryManager::default()));
+        let mut cache = test_cache();
         let gpu_memory = Arc::new(ParkingMutex::new(MemoryManager::new_with_geometry(
             11,
             22,
@@ -4474,7 +5728,7 @@ mod tests {
         info.is_sparse = true;
         let image_id = cache
             .slot_images
-            .insert(ImageBase::new(info, 0x8000, 0xA000));
+            .insert(ImageBase::new(info, 0x8000, 0xA000).into());
         cache.slot_images[image_id]
             .flags
             .insert(ImageFlagBits::SPARSE);
@@ -4520,6 +5774,9 @@ mod tests {
         let mut cache = test_cache();
         let info = test_color_info(16, 16);
         let image_id = cache.insert_image(&info, 0x4000);
+        cache.slot_images[image_id]
+            .flags
+            .remove(ImageFlagBits::CPU_MODIFIED);
         cache.mark_modification_by_id(image_id);
         cache.frame_tick = 100;
         cache.expected_memory = 0;
@@ -4539,6 +5796,35 @@ mod tests {
     }
 
     #[test]
+    fn gc_backend_download_mutates_the_owned_image_base() {
+        let mut cache = test_cache();
+        let info = test_color_info(16, 16);
+        let image_id = cache.insert_image(&info, 0x4000);
+        cache.slot_images[image_id]
+            .flags
+            .remove(ImageFlagBits::CPU_MODIFIED);
+        cache.slot_images[image_id]
+            .flags
+            .insert(ImageFlagBits::GPU_MODIFIED);
+        cache.set_guest_memory_writer(std::sync::Arc::new(|_, _| {}));
+
+        let downloaded =
+            cache.download_image_for_gc(image_id, &mut |_image_id, image, _backend, staging| {
+                image.flags.insert(ImageFlagBits::REMAPPED);
+                staging.fill(0);
+                true
+            });
+
+        assert!(downloaded);
+        assert!(cache.slot_images[image_id]
+            .flags
+            .contains(ImageFlagBits::REMAPPED));
+        assert!(!cache.slot_images[image_id]
+            .flags
+            .contains(ImageFlagBits::GPU_MODIFIED));
+    }
+
+    #[test]
     fn unmap_gpu_memory_marks_overlapping_images_cpu_modified_and_remapped() {
         use crate::control::channel_state::ChannelState;
         use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
@@ -4546,7 +5832,7 @@ mod tests {
         use parking_lot::Mutex as ParkingMutex;
         use std::sync::Arc;
 
-        let mut cache = TextureCacheBase::new(Arc::new(MaxwellDeviceMemoryManager::default()));
+        let mut cache = test_cache();
         let gpu_memory = Arc::new(ParkingMutex::new(MemoryManager::new(17)));
         let other_gpu_memory = Arc::new(ParkingMutex::new(MemoryManager::new(23)));
         let mut channel = ChannelState::new(10);
@@ -4559,10 +5845,6 @@ mod tests {
 
         let info = test_color_info(16, 16);
         let image_id = cache.insert_image(&info, 0x4000);
-        cache.slot_images[image_id]
-            .flags
-            .remove(ImageFlagBits::CPU_MODIFIED);
-        cache.track_image(image_id);
         assert!(cache.slot_images[image_id]
             .flags
             .contains(ImageFlagBits::TRACKED));
@@ -4587,7 +5869,7 @@ mod tests {
         use parking_lot::Mutex as ParkingMutex;
         use std::sync::Arc;
 
-        let mut cache = TextureCacheBase::new(Arc::new(MaxwellDeviceMemoryManager::default()));
+        let mut cache = test_cache();
         let gpu_memory = Arc::new(ParkingMutex::new(MemoryManager::new_with_geometry(
             7,
             22,
@@ -4646,7 +5928,7 @@ mod tests {
         use parking_lot::Mutex as ParkingMutex;
         use std::sync::{Arc, Mutex};
 
-        let mut cache = TextureCacheBase::new(Arc::new(MaxwellDeviceMemoryManager::default()));
+        let mut cache = test_cache();
         let gpu_memory = Arc::new(ParkingMutex::new(MemoryManager::new_with_geometry(
             7,
             22,
@@ -4705,7 +5987,7 @@ mod tests {
         use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
         use std::sync::Arc;
 
-        let mut cache = TextureCacheBase::new(Arc::new(MaxwellDeviceMemoryManager::default()));
+        let mut cache = test_cache();
         let info = ImageInfo {
             format: surface::PixelFormat::A8B8G8R8Unorm,
             size: crate::texture_cache::types::Extent3D {
@@ -4738,7 +6020,7 @@ mod tests {
         let info = test_color_info(1024, 512);
         let image_id = cache
             .slot_images
-            .insert(ImageBase::new(info, 0x80000, 0x80000));
+            .insert(ImageBase::new(info, 0x80000, 0x80000).into());
         cache.register_image(image_id);
         let map_id = cache.slot_images[image_id].map_view_id;
 
@@ -4751,9 +6033,7 @@ mod tests {
                 > 1
         );
         assert_eq!(
-            cache
-                .collect_images_in_region(0x80000, 0x20_0000)
-                .as_slice(),
+            collect_images_in_region_for_test(&mut cache, 0x80000, 0x20_0000).as_slice(),
             &[image_id]
         );
         assert!(!cache.slot_map_views[map_id].picked);
@@ -4773,6 +6053,42 @@ mod tests {
     }
 
     #[test]
+    fn region_callback_stops_early_and_clears_temporary_picked_state() {
+        let mut cache = test_cache();
+        let info = test_color_info(1024, 512);
+        let first_id = cache
+            .slot_images
+            .insert(ImageBase::new(info.clone(), 0x80000, 0x80000).into());
+        cache.register_image(first_id);
+        let second_id = cache
+            .slot_images
+            .insert(ImageBase::new(info, 0x90000, 0x90000).into());
+        cache.register_image(second_id);
+
+        let mut stopped_visits = 0;
+        assert!(cache.for_each_image_in_region(0x80000, 0x20_0000, |_, _| {
+            stopped_visits += 1;
+            true
+        }));
+        assert_eq!(stopped_visits, 1);
+
+        for image_id in [first_id, second_id] {
+            let map_id = cache.slot_images[image_id].map_view_id;
+            assert!(!cache.slot_map_views[map_id].picked);
+            assert!(!cache.slot_images[image_id]
+                .flags
+                .contains(ImageFlagBits::PICKED));
+        }
+
+        let mut complete_visits = 0;
+        assert!(!cache.for_each_image_in_region(0x80000, 0x20_0000, |_, _| {
+            complete_visits += 1;
+            false
+        }));
+        assert_eq!(complete_visits, 2);
+    }
+
+    #[test]
     fn delete_image_marks_maxwell_render_targets_dirty() {
         use crate::control::channel_state::ChannelState;
         use crate::dirty_flags;
@@ -4781,9 +6097,10 @@ mod tests {
         use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
         use std::sync::Arc;
 
-        let mut cache = TextureCacheBase::new(Arc::new(MaxwellDeviceMemoryManager::default()));
+        let mut cache = test_cache();
         let mut channel = ChannelState::new(10);
         channel.maxwell_3d = Some(Box::new(Maxwell3D::new()));
+        channel.memory_manager = cache.channel_gpu_memory.clone();
         cache.create_channel(&channel);
         cache.bind_to_channel(10);
 
@@ -4805,6 +6122,7 @@ mod tests {
         };
 
         let image_id = cache.insert_image(&info, 0x4000);
+        cache.untrack_image(image_id);
         cache.unregister_image(image_id);
         cache.delete_image(image_id, false);
 
@@ -4824,7 +6142,7 @@ mod tests {
         use parking_lot::Mutex as ParkingMutex;
         use std::sync::Arc;
 
-        let mut cache = TextureCacheBase::new(Arc::new(MaxwellDeviceMemoryManager::default()));
+        let mut cache = test_cache();
         let shared_gpu_memory = Arc::new(ParkingMutex::new(MemoryManager::new(17)));
         let separate_gpu_memory = Arc::new(ParkingMutex::new(MemoryManager::new(23)));
 
@@ -4873,7 +6191,7 @@ mod tests {
         use parking_lot::Mutex as ParkingMutex;
         use std::sync::Arc;
 
-        let mut cache = TextureCacheBase::new(Arc::new(MaxwellDeviceMemoryManager::default()));
+        let mut cache = test_cache();
         let gpu_memory = Arc::new(ParkingMutex::new(MemoryManager::new_with_geometry(
             7,
             22,
@@ -4929,7 +6247,7 @@ mod tests {
         use parking_lot::Mutex as ParkingMutex;
         use std::sync::Arc;
 
-        let mut cache = TextureCacheBase::new(Arc::new(MaxwellDeviceMemoryManager::default()));
+        let mut cache = test_cache();
         let gpu_memory = Arc::new(ParkingMutex::new(MemoryManager::new_with_geometry(
             7,
             22,
@@ -4965,14 +6283,13 @@ mod tests {
     }
 
     #[test]
-    fn join_images_queues_backend_deletion_for_ignored_overlap() {
+    fn join_images_deletes_ignored_overlap_from_typed_slot() {
         use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
         use crate::memory_manager::MemoryManager;
         use parking_lot::Mutex as ParkingMutex;
         use std::sync::Arc;
 
-        let mut cache = TextureCacheBase::new(Arc::new(MaxwellDeviceMemoryManager::default()));
-        cache.set_backend_completes_join_images(true);
+        let mut cache = test_cache();
         let gpu_memory = Arc::new(ParkingMutex::new(MemoryManager::new_with_geometry(
             7,
             22,
@@ -5001,21 +6318,17 @@ mod tests {
         let new_id = cache.join_images(&info, 0x8000, 0xD000);
 
         assert_ne!(new_id, old_id);
-        assert_eq!(cache.pending_backend_deletions.len(), 1);
-        assert_eq!(cache.pending_backend_deletions[0].image_id, old_id);
+        assert!(!cache.slot_images.contains(old_id));
     }
 
     #[test]
-    #[should_panic(
-        expected = "TextureCache::JoinImages ignored GPU-modified overlap is unimplemented"
-    )]
-    fn join_images_panics_on_gpu_modified_ignored_overlap_like_upstream() {
+    fn join_images_continues_after_gpu_modified_ignored_overlap_fail_soft() {
         use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
         use crate::memory_manager::MemoryManager;
         use parking_lot::Mutex as ParkingMutex;
         use std::sync::Arc;
 
-        let mut cache = TextureCacheBase::new(Arc::new(MaxwellDeviceMemoryManager::default()));
+        let mut cache = test_cache();
         let gpu_memory = Arc::new(ParkingMutex::new(MemoryManager::new_with_geometry(
             7,
             22,
@@ -5044,21 +6357,21 @@ mod tests {
             .flags
             .insert(ImageFlagBits::GPU_MODIFIED);
 
-        let _ = cache.join_images(&info, 0x8000, 0xD000);
+        let new_id = cache.join_images(&info, 0x8000, 0xD000);
+
+        assert_ne!(new_id, old_id);
+        assert!(cache.slot_images.contains(new_id));
+        assert!(!cache.slot_images.contains(old_id));
     }
 
     #[test]
-    #[should_panic(
-        expected = "TextureCache::JoinImages ignored GPU-modified overlap is unimplemented"
-    )]
-    fn backend_join_panics_on_gpu_modified_ignored_overlap_like_upstream() {
+    fn backend_join_continues_after_gpu_modified_ignored_overlap_fail_soft() {
         use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
         use crate::memory_manager::MemoryManager;
         use parking_lot::Mutex as ParkingMutex;
         use std::sync::Arc;
 
-        let mut cache = TextureCacheBase::new(Arc::new(MaxwellDeviceMemoryManager::default()));
-        cache.set_backend_completes_join_images(true);
+        let mut cache = test_cache();
         let gpu_memory = Arc::new(ParkingMutex::new(MemoryManager::new_with_geometry(
             7,
             22,
@@ -5087,7 +6400,10 @@ mod tests {
             .flags
             .insert(ImageFlagBits::GPU_MODIFIED);
 
-        let _ = cache.join_images(&info, 0x8000, 0xD000);
+        let new_id = cache.join_images(&info, 0x8000, 0xD000);
+
+        assert_ne!(new_id, old_id);
+        assert!(!cache.slot_images.contains(old_id));
     }
 
     #[test]
@@ -5095,7 +6411,7 @@ mod tests {
         use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
         use std::sync::Arc;
 
-        let mut cache = TextureCacheBase::new(Arc::new(MaxwellDeviceMemoryManager::default()));
+        let mut cache = test_cache();
         let info = ImageInfo {
             format: surface::PixelFormat::A8B8G8R8Unorm,
             size: crate::texture_cache::types::Extent3D {
@@ -5110,14 +6426,13 @@ mod tests {
         let map_id = cache.slot_images[image_id].map_view_id;
         assert!(map_id.is_valid());
         assert_eq!(
-            cache.collect_images_in_region(cpu_addr, 4).as_slice(),
+            collect_images_in_region_for_test(&mut cache, cpu_addr, 4).as_slice(),
             &[image_id]
         );
 
-        cache.track_image(image_id);
         cache.unmap_memory(cpu_addr, 4);
 
-        assert!(cache.collect_images_in_region(cpu_addr, 4).is_empty());
+        assert!(collect_images_in_region_for_test(&mut cache, cpu_addr, 4).is_empty());
         assert_eq!(cache.slot_images.size(), 1);
         assert_eq!(cache.slot_map_views.size(), 0);
         assert!(cache.page_table.is_empty());
@@ -5129,7 +6444,7 @@ mod tests {
         use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
         use std::sync::Arc;
 
-        let mut cache = TextureCacheBase::new(Arc::new(MaxwellDeviceMemoryManager::default()));
+        let mut cache = test_cache();
         let first = ImageInfo {
             format: surface::PixelFormat::A2B10G10R10Unorm,
             image_type: ImageType::E2D,
@@ -5154,18 +6469,18 @@ mod tests {
         let second_id = cache.find_or_insert_image_from_info(&second, 0x51FC_90000, 0x2AE9_E000);
 
         assert_eq!(first_id, second_id);
-        assert!(cache.pending_join_copies.is_empty());
     }
 
     #[test]
-    fn find_or_insert_result_reports_inserted_only_for_new_image() {
+    fn find_or_insert_reuses_existing_image_like_upstream() {
         use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
         use std::sync::Arc;
 
-        let mut cache = TextureCacheBase::new(Arc::new(MaxwellDeviceMemoryManager::default()));
+        let mut cache = test_cache();
         let info = ImageInfo {
             format: surface::PixelFormat::A8B8G8R8Unorm,
             image_type: ImageType::E2D,
+            rescaleable: true,
             resources: SubresourceExtent {
                 levels: 1,
                 layers: 1,
@@ -5178,38 +6493,31 @@ mod tests {
             ..ImageInfo::default()
         };
 
-        let first = cache.find_or_insert_image_from_info_with_options_result(
+        let first = cache.find_or_insert_image_from_info_with_options(
             &info,
             0x8000,
             0x1000,
             RelaxedOptions::empty(),
         );
-        assert!(first.inserted);
-        assert!(!first.needs_backend_completion);
-        assert!(!first.queued_join_tail);
-
-        let second = cache.find_or_insert_image_from_info_with_options_result(
+        let second = cache.find_or_insert_image_from_info_with_options(
             &info,
             0x8000,
             0x1000,
             RelaxedOptions::empty(),
         );
-        assert_eq!(second.image_id, first.image_id);
-        assert!(!second.inserted);
-        assert!(!second.needs_backend_completion);
-        assert!(!second.queued_join_tail);
+        assert_eq!(second, first);
     }
 
     #[test]
-    fn backend_completed_join_registers_common_cache_immediately_like_upstream() {
+    fn join_images_registers_common_cache_immediately_like_upstream() {
         use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
         use std::sync::Arc;
 
-        let mut cache = TextureCacheBase::new(Arc::new(MaxwellDeviceMemoryManager::default()));
-        cache.set_backend_completes_join_images(true);
+        let mut cache = test_cache();
         let info = ImageInfo {
             format: surface::PixelFormat::A8B8G8R8Unorm,
             image_type: ImageType::E2D,
+            rescaleable: true,
             resources: SubresourceExtent {
                 levels: 1,
                 layers: 1,
@@ -5222,44 +6530,36 @@ mod tests {
             ..ImageInfo::default()
         };
 
-        let inserted = cache.find_or_insert_image_from_info_with_options_result(
+        let inserted = cache.find_or_insert_image_from_info_with_options(
             &info,
             0x9000,
             0x2000,
             RelaxedOptions::empty(),
         );
-        assert!(inserted.inserted);
-        assert!(inserted.needs_backend_completion);
-        assert!(!inserted.queued_join_tail);
-        assert!(cache.slot_images[inserted.image_id]
+        assert!(cache.slot_images[inserted]
             .flags
             .contains(ImageFlagBits::REGISTERED));
         assert_eq!(
-            cache.collect_images_in_region(0x2000, 4).as_slice(),
-            &[inserted.image_id]
+            collect_images_in_region_for_test(&mut cache, 0x2000, 4).as_slice(),
+            &[inserted]
         );
         assert!(!cache.image_allocs_table.is_empty());
 
-        let reused = cache.find_or_insert_image_from_info_with_options_result(
+        let reused = cache.find_or_insert_image_from_info_with_options(
             &info,
             0x9000,
             0x2000,
             RelaxedOptions::empty(),
         );
-        assert_eq!(reused.image_id, inserted.image_id);
-        assert!(!reused.inserted);
-        assert!(!reused.needs_backend_completion);
-        assert!(!reused.queued_join_tail);
+        assert_eq!(reused, inserted);
     }
 
     #[test]
-    #[should_panic(expected = "backend completion is required")]
-    fn backend_completed_join_rejects_direct_find_or_insert_helper() {
+    fn direct_find_or_insert_returns_fully_registered_image() {
         use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
         use std::sync::Arc;
 
-        let mut cache = TextureCacheBase::new(Arc::new(MaxwellDeviceMemoryManager::default()));
-        cache.set_backend_completes_join_images(true);
+        let mut cache = test_cache();
         let info = ImageInfo {
             format: surface::PixelFormat::A8B8G8R8Unorm,
             image_type: ImageType::E2D,
@@ -5275,74 +6575,175 @@ mod tests {
             ..ImageInfo::default()
         };
 
-        let _ = cache.find_or_insert_image_from_info(&info, 0x9000, 0x2000);
-    }
-
-    #[test]
-    fn backend_completed_join_keeps_explicit_result_path_available() {
-        use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
-        use std::sync::Arc;
-
-        let mut cache = TextureCacheBase::new(Arc::new(MaxwellDeviceMemoryManager::default()));
-        cache.set_backend_completes_join_images(true);
-        let info = ImageInfo {
-            format: surface::PixelFormat::A8B8G8R8Unorm,
-            image_type: ImageType::E2D,
-            resources: SubresourceExtent {
-                levels: 1,
-                layers: 1,
-            },
-            size: Extent3D {
-                width: 64,
-                height: 64,
-                depth: 1,
-            },
-            ..ImageInfo::default()
-        };
-
-        let result = cache.find_or_insert_image_from_info_with_options_result(
-            &info,
-            0x9000,
-            0x2000,
-            RelaxedOptions::empty(),
-        );
-
-        assert!(result.inserted);
-        assert!(result.needs_backend_completion);
-        assert!(!result.queued_join_tail);
-        assert!(cache.slot_images[result.image_id]
+        let image_id = cache.find_or_insert_image_from_info(&info, 0x9000, 0x2000);
+        assert!(cache.slot_images[image_id]
             .flags
             .contains(ImageFlagBits::REGISTERED));
     }
 
     #[test]
-    #[should_panic(expected = "cannot preserve upstream RefreshContents/SynchronizeAliases")]
-    fn common_prepare_image_rejects_backendless_refresh_path() {
+    fn explicit_find_or_insert_result_path_returns_registered_image() {
         use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
         use std::sync::Arc;
 
-        let mut cache = TextureCacheBase::new(Arc::new(MaxwellDeviceMemoryManager::default()));
-        cache.prepare_image(NULL_IMAGE_ID, false, false);
+        let mut cache = test_cache();
+        let info = ImageInfo {
+            format: surface::PixelFormat::A8B8G8R8Unorm,
+            image_type: ImageType::E2D,
+            resources: SubresourceExtent {
+                levels: 1,
+                layers: 1,
+            },
+            size: Extent3D {
+                width: 64,
+                height: 64,
+                depth: 1,
+            },
+            ..ImageInfo::default()
+        };
+
+        let image_id = cache.find_or_insert_image_from_info_with_options(
+            &info,
+            0x9000,
+            0x2000,
+            RelaxedOptions::empty(),
+        );
+
+        assert!(cache.slot_images[image_id]
+            .flags
+            .contains(ImageFlagBits::REGISTERED));
     }
 
     #[test]
-    #[should_panic(expected = "cannot preserve upstream ScaleUp/ScaleDown ordering")]
-    fn common_rescale_render_targets_rejects_backendless_path() {
+    fn prepare_image_runs_common_refresh_and_mark_ordering() {
         use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
         use std::sync::Arc;
 
-        let mut cache = TextureCacheBase::new(Arc::new(MaxwellDeviceMemoryManager::default()));
-        let _ = cache.rescale_render_targets();
+        PREPARE_REFRESH_CALLS.with(|calls| calls.set(0));
+        UPLOAD_BARRIER_CALLS.with(|calls| calls.set(0));
+        let mut cache = TextureCacheBase::<TestImageViewParams>::new_for_backend(Arc::new(
+            MaxwellDeviceMemoryManager::default(),
+        ));
+        cache.bind_runtime(Box::new(()));
+        cache.channel_gpu_memory = Some(Arc::new(ParkingMutex::new(MemoryManager::new(17))));
+        let image_id = cache.insert_typed_image(ImageBase::new(
+            ImageInfo {
+                format: surface::PixelFormat::A8B8G8R8Unorm,
+                image_type: ImageType::E2D,
+                resources: SubresourceExtent {
+                    levels: 1,
+                    layers: 1,
+                },
+                size: Extent3D {
+                    width: 16,
+                    height: 16,
+                    depth: 1,
+                },
+                ..ImageInfo::default()
+            },
+            0x1000,
+            0x2000,
+        ));
+        cache.slot_images[image_id].lru_index = cache.lru_cache.insert(image_id, 0);
+        cache.prepare_image(image_id, true, false);
+
+        PREPARE_REFRESH_CALLS.with(|calls| assert_eq!(calls.get(), 1));
+        UPLOAD_BARRIER_CALLS.with(|calls| assert_eq!(calls.get(), 1));
+        assert!(cache.slot_images[image_id]
+            .flags
+            .contains(ImageFlagBits::GPU_MODIFIED));
+        assert_eq!(cache.slot_images[image_id].modification_tick, 1);
     }
 
     #[test]
-    #[should_panic(expected = "cannot prepare render-target image views")]
-    fn common_update_render_targets_rejects_backendless_path() {
+    fn refresh_contents_uploads_cpu_modified_image_once_and_tracks_it() {
         use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
         use std::sync::Arc;
 
-        let mut cache = TextureCacheBase::new(Arc::new(MaxwellDeviceMemoryManager::default()));
-        cache.update_render_targets(false);
+        PREPARE_REFRESH_CALLS.with(|calls| calls.set(0));
+        UPLOAD_BARRIER_CALLS.with(|calls| calls.set(0));
+        let mut cache = TextureCacheBase::<TestImageViewParams>::new_for_backend(Arc::new(
+            MaxwellDeviceMemoryManager::default(),
+        ));
+        cache.set_channel_gpu_memory(Arc::new(ParkingMutex::new(MemoryManager::new(17))));
+        let image_id = cache.insert_typed_image(ImageBase::new(
+            ImageInfo {
+                format: surface::PixelFormat::A8B8G8R8Unorm,
+                image_type: ImageType::E2D,
+                size: Extent3D {
+                    width: 16,
+                    height: 16,
+                    depth: 1,
+                },
+                ..ImageInfo::default()
+            },
+            0x1000,
+            0x2000,
+        ));
+
+        cache.refresh_contents(image_id);
+
+        assert!(!cache.slot_images[image_id]
+            .flags
+            .contains(ImageFlagBits::CPU_MODIFIED));
+        assert!(cache.slot_images[image_id]
+            .flags
+            .contains(ImageFlagBits::TRACKED));
+        PREPARE_REFRESH_CALLS.with(|calls| assert_eq!(calls.get(), 1));
+        UPLOAD_BARRIER_CALLS.with(|calls| assert_eq!(calls.get(), 1));
+
+        cache.refresh_contents(image_id);
+
+        PREPARE_REFRESH_CALLS.with(|calls| assert_eq!(calls.get(), 1));
+        UPLOAD_BARRIER_CALLS.with(|calls| assert_eq!(calls.get(), 1));
+    }
+
+    #[test]
+    fn synchronize_aliases_uses_common_tick_scale_and_copy_ordering() {
+        use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
+        use crate::texture_cache::image_base::AliasedImage;
+        use std::sync::Arc;
+
+        JOIN_COPY_DISPATCH.with(|dispatch| dispatch.set((0, 0)));
+        TEST_IMAGE_SCALE_SUCCEEDS.with(|enabled| enabled.set(true));
+        let mut cache = TextureCacheBase::<TestImageViewParams>::new_for_backend(Arc::new(
+            MaxwellDeviceMemoryManager::default(),
+        ));
+        cache.bind_runtime(Box::new(()));
+        let info = ImageInfo {
+            format: surface::PixelFormat::A8B8G8R8Unorm,
+            image_type: ImageType::E2D,
+            rescaleable: true,
+            resources: SubresourceExtent {
+                levels: 1,
+                layers: 1,
+            },
+            size: Extent3D {
+                width: 16,
+                height: 16,
+                depth: 1,
+            },
+            ..ImageInfo::default()
+        };
+        let dst_id = cache.insert_typed_image(ImageBase::new(info.clone(), 0x1000, 0x2000));
+        let src_id = cache.insert_typed_image(ImageBase::new(info, 0x2000, 0x3000));
+        cache.slot_images[dst_id].modification_tick = 1;
+        cache.slot_images[src_id].modification_tick = 2;
+        cache.slot_images[src_id]
+            .flags
+            .insert(ImageFlagBits::GPU_MODIFIED | ImageFlagBits::RESCALED);
+        cache.slot_images[dst_id].aliased_images.push(AliasedImage {
+            id: src_id,
+            copies: vec![ImageCopy::default()],
+        });
+
+        cache.synchronize_aliases(dst_id);
+
+        assert_eq!(cache.slot_images[dst_id].modification_tick, 2);
+        assert!(cache.slot_images[dst_id]
+            .flags
+            .contains(ImageFlagBits::GPU_MODIFIED | ImageFlagBits::RESCALED));
+        JOIN_COPY_DISPATCH.with(|dispatch| assert_eq!(dispatch.get(), (1, 0)));
     }
 
     #[test]
@@ -5351,19 +6752,18 @@ mod tests {
         use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
         use std::sync::Arc;
 
-        let mut cache = TextureCacheBase::new(Arc::new(MaxwellDeviceMemoryManager::default()));
+        let mut cache = test_cache();
         let _ = cache.blit_image(&(), &(), &());
     }
 
     #[test]
-    fn find_or_insert_result_panics_on_gpu_modified_ignored_overlap_like_upstream() {
+    fn find_or_insert_continues_after_gpu_modified_ignored_overlap_fail_soft() {
         use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
         use crate::memory_manager::MemoryManager;
         use parking_lot::Mutex as ParkingMutex;
         use std::sync::Arc;
 
-        let mut cache = TextureCacheBase::new(Arc::new(MaxwellDeviceMemoryManager::default()));
-        cache.set_backend_completes_join_images(true);
+        let mut cache = test_cache();
         let gpu_memory = Arc::new(ParkingMutex::new(MemoryManager::new_with_geometry(
             7,
             22,
@@ -5388,34 +6788,25 @@ mod tests {
         };
         info.is_sparse = true;
 
-        let old = cache.find_or_insert_image_from_info_with_options_result(
+        let old = cache.find_or_insert_image_from_info_with_options(
             &info,
             0x8000,
             0xA000,
             RelaxedOptions::empty(),
         );
-        assert!(old.inserted);
-        assert!(old.needs_backend_completion);
-        assert!(!old.queued_join_tail);
-        cache.register_image(old.image_id);
-        cache.register_image_alloc(old.image_id);
-        cache.slot_images[old.image_id]
+        cache.slot_images[old]
             .flags
             .insert(ImageFlagBits::GPU_MODIFIED);
 
-        let panic_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            cache.find_or_insert_image_from_info_with_options_result(
-                &info,
-                0x8000,
-                0xD000,
-                RelaxedOptions::empty(),
-            )
-        }));
-
-        assert!(
-            panic_result.is_err(),
-            "FindOrInsertImage must stop on the upstream UNIMPLEMENTED ignored GPU-modified overlap path"
+        let replacement = cache.find_or_insert_image_from_info_with_options(
+            &info,
+            0x8000,
+            0xD000,
+            RelaxedOptions::empty(),
         );
+
+        assert!(cache.slot_images.contains(replacement));
+        assert!(!cache.slot_images.contains(old));
     }
 
     #[test]
@@ -5423,7 +6814,7 @@ mod tests {
         use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
         use std::sync::Arc;
 
-        let mut cache = TextureCacheBase::new(Arc::new(MaxwellDeviceMemoryManager::default()));
+        let mut cache = test_cache();
         let existing = ImageInfo {
             format: surface::PixelFormat::B10G11R11Float,
             image_type: ImageType::E2D,
@@ -5445,6 +6836,8 @@ mod tests {
                 levels: 1,
                 layers: 6,
             },
+            layer_stride: 32 * 32 * 4,
+            maybe_unaligned_layer_stride: 32 * 32 * 4,
             ..existing.clone()
         };
 
@@ -5453,8 +6846,7 @@ mod tests {
             cache.find_or_insert_image_from_info(&requested_cube, 0x55C_BB0000, 0x5065_6000);
 
         assert_ne!(first_id, second_id);
-        assert_eq!(cache.slot_images[first_id].info.num_samples, 4);
-        assert_eq!(cache.slot_images[first_id].info.resources.layers, 1);
+        assert!(!cache.slot_images.contains(first_id));
         assert_eq!(cache.slot_images[second_id].info.num_samples, 1);
         assert_eq!(cache.slot_images[second_id].info.resources.layers, 6);
     }
@@ -5466,7 +6858,7 @@ mod tests {
         use common::slot_vector::SlotId;
         use std::sync::Arc;
 
-        let mut cache = TextureCacheBase::new(Arc::new(MaxwellDeviceMemoryManager::default()));
+        let mut cache = test_cache();
         let descriptor = color_2d_tic(0x5000_0000, 0);
         let view_id = cache.create_image_view(&descriptor);
         assert!(view_id.is_valid());
@@ -5474,27 +6866,26 @@ mod tests {
         assert!(image_id.is_valid());
 
         cache.channel_state.image_views.insert(descriptor, view_id);
-        cache.channel_state.graphics_image_view_ids = vec![view_id, view_id];
-        cache.channel_state.compute_image_view_ids = vec![view_id];
+        cache.channel_state.image_view_ids.insert(0, view_id);
+        cache
+            .channel_state
+            .image_view_ids
+            .insert(common::slot_vector::SlotId::TAGGED_VALUE, view_id);
         let mut framebuffer_key = RenderTargets::default();
         framebuffer_key.color_buffer_ids[0] = view_id;
         cache
             .framebuffers
             .insert(framebuffer_key, SlotId { index: 0x1234 });
 
+        cache.untrack_image(image_id);
         cache.unregister_image(image_id);
         cache.delete_image(image_id, false);
 
         assert!(!cache.channel_state.image_views.contains_key(&descriptor));
         assert!(cache
             .channel_state
-            .graphics_image_view_ids
-            .iter()
-            .all(|&id| id == CORRUPT_ID));
-        assert!(cache
-            .channel_state
-            .compute_image_view_ids
-            .iter()
+            .image_view_ids
+            .values()
             .all(|&id| id == CORRUPT_ID));
         assert!(cache.framebuffers.is_empty());
         assert!(cache.has_deleted_images);
@@ -5515,11 +6906,13 @@ mod tests {
         use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
         use std::sync::Arc;
 
-        let mut cache = TextureCacheBase::new(Arc::new(MaxwellDeviceMemoryManager::default()));
+        let mut cache = test_cache();
         let mut channel_a = ChannelState::new(10);
         let mut channel_b = ChannelState::new(11);
         channel_a.bind_id = 10;
         channel_b.bind_id = 11;
+        channel_a.memory_manager = cache.channel_gpu_memory.clone();
+        channel_b.memory_manager = cache.channel_gpu_memory.clone();
         cache.create_channel(&channel_a);
         cache.create_channel(&channel_b);
         cache.bind_to_channel(10);
@@ -5534,8 +6927,10 @@ mod tests {
                 .channel_state_by_bind_id_mut(10)
                 .expect("channel 10 exists");
             channel.image_views.insert(descriptor, view_id);
-            channel.graphics_image_view_ids = vec![view_id];
-            channel.compute_image_view_ids = vec![view_id];
+            channel.image_view_ids.insert(0, view_id);
+            channel
+                .image_view_ids
+                .insert(common::slot_vector::SlotId::TAGGED_VALUE, view_id);
         }
         {
             let channel = cache
@@ -5543,10 +6938,13 @@ mod tests {
                 .channel_state_by_bind_id_mut(11)
                 .expect("channel 11 exists");
             channel.image_views.insert(descriptor, view_id);
-            channel.graphics_image_view_ids = vec![view_id];
-            channel.compute_image_view_ids = vec![view_id];
+            channel.image_view_ids.insert(0, view_id);
+            channel
+                .image_view_ids
+                .insert(common::slot_vector::SlotId::TAGGED_VALUE, view_id);
         }
 
+        cache.untrack_image(image_id);
         cache.unregister_image(image_id);
         cache.delete_image(image_id, false);
 
@@ -5556,14 +6954,7 @@ mod tests {
                 .channel_state_by_bind_id(bind_id)
                 .expect("channel exists after delete");
             assert!(!channel.image_views.contains_key(&descriptor));
-            assert!(channel
-                .graphics_image_view_ids
-                .iter()
-                .all(|&id| id == CORRUPT_ID));
-            assert!(channel
-                .compute_image_view_ids
-                .iter()
-                .all(|&id| id == CORRUPT_ID));
+            assert!(channel.image_view_ids.values().all(|&id| id == CORRUPT_ID));
         }
     }
 
@@ -5573,11 +6964,13 @@ mod tests {
         use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
         use std::sync::Arc;
 
-        let mut cache = TextureCacheBase::new(Arc::new(MaxwellDeviceMemoryManager::default()));
+        let mut cache = test_cache();
         let mut channel_a = ChannelState::new(10);
         let mut channel_b = ChannelState::new(11);
         channel_a.bind_id = 10;
         channel_b.bind_id = 11;
+        channel_a.memory_manager = cache.channel_gpu_memory.clone();
+        channel_b.memory_manager = cache.channel_gpu_memory.clone();
         cache.create_channel(&channel_a);
         cache.create_channel(&channel_b);
         cache.bind_to_channel(10);
@@ -5591,8 +6984,10 @@ mod tests {
                 .channel_state_by_bind_id_mut(bind_id)
                 .expect("channel exists");
             channel.image_views.insert(descriptor, view_id);
-            channel.graphics_image_view_ids = vec![view_id];
-            channel.compute_image_view_ids = vec![view_id];
+            channel.image_view_ids.insert(0, view_id);
+            channel
+                .image_view_ids
+                .insert(common::slot_vector::SlotId::TAGGED_VALUE, view_id);
         }
 
         cache.remove_image_view_references(&[view_id]);
@@ -5604,14 +6999,7 @@ mod tests {
                 .channel_state_by_bind_id(bind_id)
                 .expect("channel exists after invalidate");
             assert!(!channel.image_views.contains_key(&descriptor));
-            assert!(channel
-                .graphics_image_view_ids
-                .iter()
-                .all(|&id| id == CORRUPT_ID));
-            assert!(channel
-                .compute_image_view_ids
-                .iter()
-                .all(|&id| id == CORRUPT_ID));
+            assert!(channel.image_view_ids.values().all(|&id| id == CORRUPT_ID));
         }
     }
 
@@ -5622,15 +7010,18 @@ mod tests {
         use common::slot_vector::SlotId;
         use std::sync::Arc;
 
-        let mut cache = TextureCacheBase::new(Arc::new(MaxwellDeviceMemoryManager::default()));
+        let mut cache = test_cache();
         cache.frame_tick = 7;
         let descriptor = color_2d_tic(0x5300_0000, 0);
         let view_id = cache.create_image_view(&descriptor);
         let image_id = cache.slot_image_views[view_id].image_id;
 
         cache.channel_state.image_views.insert(descriptor, view_id);
-        cache.channel_state.graphics_image_view_ids = vec![view_id];
-        cache.channel_state.compute_image_view_ids = vec![view_id];
+        cache.channel_state.image_view_ids.insert(0, view_id);
+        cache
+            .channel_state
+            .image_view_ids
+            .insert(common::slot_vector::SlotId::TAGGED_VALUE, view_id);
         cache.render_targets.color_buffer_ids[0] = view_id;
         cache.render_targets.depth_buffer_id = view_id;
         let mut framebuffer_key = RenderTargets::default();
@@ -5639,9 +7030,8 @@ mod tests {
             .framebuffers
             .insert(framebuffer_key, SlotId { index: 0x4321 });
 
-        let removed = cache.invalidate_scale(image_id);
+        cache.invalidate_scale(image_id);
 
-        assert_eq!(removed, vec![view_id]);
         assert_eq!(cache.slot_images[image_id].scale_tick, 8);
         assert!(cache.slot_images[image_id].image_view_ids.is_empty());
         assert!(cache.slot_images[image_id].image_view_infos.is_empty());
@@ -5654,13 +7044,8 @@ mod tests {
         assert!(!cache.channel_state.image_views.contains_key(&descriptor));
         assert!(cache
             .channel_state
-            .graphics_image_view_ids
-            .iter()
-            .all(|&id| id == CORRUPT_ID));
-        assert!(cache
-            .channel_state
-            .compute_image_view_ids
-            .iter()
+            .image_view_ids
+            .values()
             .all(|&id| id == CORRUPT_ID));
         assert!(cache.has_deleted_images);
         assert_eq!(cache.sentenced_image_view.retained_len(), 1);
@@ -5668,26 +7053,44 @@ mod tests {
     }
 
     #[test]
-    fn account_scale_up_memory_adds_scaled_size_once() {
+    fn scale_up_accounts_scaled_memory_once() {
         use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
         use std::sync::Arc;
 
-        let mut cache = TextureCacheBase::new(Arc::new(MaxwellDeviceMemoryManager::default()));
-        let descriptor = color_2d_tic(0x5400_0000, 0);
-        let view_id = cache.create_image_view(&descriptor);
-        let image_id = cache.slot_image_views[view_id].image_id;
+        TEST_IMAGE_SCALE_SUCCEEDS.with(|enabled| enabled.set(true));
+        let mut cache = TextureCacheBase::<TestImageViewParams>::new_for_backend(Arc::new(
+            MaxwellDeviceMemoryManager::default(),
+        ));
+        cache.bind_runtime(Box::new(()));
+        let image_id = cache.insert_typed_image(ImageBase::new(
+            ImageInfo {
+                format: surface::PixelFormat::A8B8G8R8Unorm,
+                image_type: ImageType::E2D,
+                rescaleable: true,
+                size: Extent3D {
+                    width: 16,
+                    height: 16,
+                    depth: 1,
+                },
+                ..ImageInfo::default()
+            },
+            0x5400_0000,
+            0x6400_0000,
+        ));
         let initial_memory = cache.total_used_memory;
         let expected_scaled_size =
-            TextureCacheBase::scaled_image_memory_size(&cache.slot_images[image_id]);
+            TextureCacheBase::<TestImageViewParams>::scaled_image_memory_size(
+                &cache.slot_images[image_id],
+            );
 
-        cache.account_scale_up_memory(image_id, false);
+        assert!(cache.scale_up(image_id));
 
         assert_eq!(
             cache.total_used_memory,
             initial_memory + expected_scaled_size
         );
 
-        cache.account_scale_up_memory(image_id, true);
+        assert!(!cache.scale_up(image_id));
 
         assert_eq!(
             cache.total_used_memory,
@@ -5700,7 +7103,7 @@ mod tests {
         use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
         use std::sync::Arc;
 
-        let mut cache = TextureCacheBase::new(Arc::new(MaxwellDeviceMemoryManager::default()));
+        let mut cache = test_cache();
         let info = ImageInfo {
             format: surface::PixelFormat::A8B8G8R8Unorm,
             image_type: ImageType::E2D,
@@ -5717,6 +7120,7 @@ mod tests {
 
         assert_eq!(cache.slot_image_allocs[alloc_id].images, vec![image_id]);
 
+        cache.untrack_image(image_id);
         cache.unregister_image(image_id);
         cache.delete_image(image_id, false);
 
@@ -5728,7 +7132,7 @@ mod tests {
         use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
         use std::sync::Arc;
 
-        let mut cache = TextureCacheBase::new(Arc::new(MaxwellDeviceMemoryManager::default()));
+        let mut cache = test_cache();
         let first = ImageInfo {
             format: surface::PixelFormat::B10G11R11Float,
             image_type: ImageType::E2D,
@@ -5763,12 +7167,11 @@ mod tests {
     }
 
     #[test]
-    fn backend_completed_join_defers_bad_overlap_relations_until_backend_tail() {
+    fn join_images_applies_bad_overlap_relations_before_return() {
         use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
         use std::sync::Arc;
 
-        let mut cache = TextureCacheBase::new(Arc::new(MaxwellDeviceMemoryManager::default()));
-        cache.set_backend_completes_join_images(true);
+        let mut cache = test_cache();
         let first = ImageInfo {
             format: surface::PixelFormat::B10G11R11Float,
             image_type: ImageType::E2D,
@@ -5794,24 +7197,23 @@ mod tests {
         let second_id = cache.join_images(&second, 0x5219_F0000, 0x2CBF_E000);
 
         assert_ne!(first_id, second_id);
-        assert_eq!(cache.pending_join_copies.len(), 1);
-        let pending = &cache.pending_join_copies[0];
-        assert_eq!(pending.new_image_id, second_id);
-        assert!(pending.copies.is_empty());
-        assert_eq!(pending.bad_overlap_ids, vec![first_id]);
-        assert!(cache.slot_images[first_id].overlapping_images.is_empty());
-        assert!(cache.slot_images[second_id].overlapping_images.is_empty());
-        assert!(!cache.slot_images[second_id]
+        assert!(cache.slot_images[first_id]
+            .overlapping_images
+            .contains(&second_id));
+        assert!(cache.slot_images[second_id]
+            .overlapping_images
+            .contains(&first_id));
+        assert!(cache.slot_images[second_id]
             .flags
             .contains(ImageFlagBits::REGISTERED));
     }
 
     #[test]
-    fn join_images_defers_pending_alias_relations_until_backend_tail() {
+    fn join_images_applies_alias_relations_before_return() {
         use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
         use std::sync::Arc;
 
-        let mut cache = TextureCacheBase::new(Arc::new(MaxwellDeviceMemoryManager::default()));
+        let mut cache = test_cache();
         let mut full = ImageInfo {
             format: surface::PixelFormat::A8B8G8R8Unorm,
             image_type: ImageType::E2D,
@@ -5844,33 +7246,25 @@ mod tests {
         let full_base = ImageBase::new(full.clone(), 0x5000, 0x9000);
         let mip_offset = full_base.mip_level_offsets[1] as u64;
         let full_id = cache.join_images(&full, 0x5000, 0x9000);
-        cache.set_backend_completes_join_images(true);
 
         let sub_id = cache.join_images(&sub, 0x5000 + mip_offset, 0x9000 + mip_offset);
 
-        assert_eq!(cache.pending_join_copies.len(), 1);
-        let pending = &cache.pending_join_copies[0];
-        assert!(!pending.alias_relations_applied);
-        assert!(pending.alias_indices.is_empty());
-        assert_eq!(pending.left_aliased_ids, vec![full_id]);
-        assert!(pending
-            .copies
-            .iter()
-            .any(|copy| copy.is_alias && copy.id == full_id));
-
-        assert!(cache.slot_images[sub_id].aliased_images.is_empty());
-        assert!(cache.slot_images[full_id].aliased_images.is_empty());
-        assert!(!cache.slot_images[sub_id]
+        assert!(!cache.slot_images[sub_id].aliased_images.is_empty());
+        assert!(!cache.slot_images[full_id].aliased_images.is_empty());
+        assert!(cache.slot_images[sub_id]
             .flags
             .contains(ImageFlagBits::ALIAS));
+        assert!(cache.slot_images[sub_id]
+            .flags
+            .contains(ImageFlagBits::REGISTERED));
     }
 
     #[test]
-    fn backend_completed_join_preserves_gpu_modified_alias_copy_until_backend_tail() {
+    fn join_images_preserves_gpu_modified_alias_source_and_registers_result() {
         use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
         use std::sync::Arc;
 
-        let mut cache = TextureCacheBase::new(Arc::new(MaxwellDeviceMemoryManager::default()));
+        let mut cache = test_cache();
         let mut full = ImageInfo {
             format: surface::PixelFormat::A8B8G8R8Unorm,
             image_type: ImageType::E2D,
@@ -5904,32 +7298,63 @@ mod tests {
         let mip_offset = full_base.mip_level_offsets[1] as u64;
         let full_id = cache.join_images(&full, 0x5000, 0x9000);
         cache.mark_modification_by_id(full_id);
-        cache.set_backend_completes_join_images(true);
 
         let sub_id = cache.join_images(&sub, 0x5000 + mip_offset, 0x9000 + mip_offset);
 
-        assert_eq!(cache.pending_join_copies.len(), 1);
-        let pending = &cache.pending_join_copies[0];
-        assert_eq!(pending.new_image_id, sub_id);
-        assert_eq!(pending.copies.len(), 1);
-        assert_eq!(pending.copies[0].id, full_id);
-        assert!(pending.copies[0].is_alias);
-        assert!(pending.copies[0].gpu_modified_at_join);
-        assert_eq!(pending.left_aliased_ids, vec![full_id]);
-        assert!(!cache.slot_images[sub_id]
+        assert!(cache.slot_images[sub_id]
             .flags
             .contains(ImageFlagBits::REGISTERED));
+        assert!(cache.slot_images[sub_id]
+            .flags
+            .contains(ImageFlagBits::ALIAS));
         assert!(cache.slot_images[full_id]
             .flags
             .contains(ImageFlagBits::GPU_MODIFIED));
     }
 
     #[test]
-    fn backend_completed_join_defers_gpu_modified_shrink_copy_until_backend_tail() {
+    fn join_images_uses_runtime_msaa_copy_when_sample_counts_differ() {
         use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
         use std::sync::Arc;
 
-        let mut cache = TextureCacheBase::new(Arc::new(MaxwellDeviceMemoryManager::default()));
+        JOIN_COPY_DISPATCH.with(|dispatch| dispatch.set((0, 0)));
+        let mut cache = TextureCacheBase::<TestImageViewParams>::new_for_backend(Arc::new(
+            MaxwellDeviceMemoryManager::default(),
+        ));
+        cache.set_channel_gpu_memory(Arc::new(ParkingMutex::new(MemoryManager::new(17))));
+        let multisampled = ImageInfo {
+            format: surface::PixelFormat::A8B8G8R8Unorm,
+            image_type: ImageType::E2D,
+            num_samples: 4,
+            size: Extent3D {
+                width: 64,
+                height: 64,
+                depth: 1,
+            },
+            ..ImageInfo::default()
+        };
+        let single_sampled = ImageInfo {
+            num_samples: 1,
+            ..multisampled.clone()
+        };
+
+        let source_id = cache.join_images(&multisampled, 0x6000, 0xA000);
+        cache.mark_modification_by_id(source_id);
+        let _destination_id = cache.join_images(&single_sampled, 0x6000, 0xA000);
+
+        assert_eq!(
+            JOIN_COPY_DISPATCH.with(std::cell::Cell::get),
+            (0, 1),
+            "upstream JoinImages dispatches sample-count mismatches to CopyImageMSAA"
+        );
+    }
+
+    #[test]
+    fn join_images_registers_result_after_gpu_modified_overlap_classification() {
+        use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
+        use std::sync::Arc;
+
+        let mut cache = test_cache();
         let mut full = ImageInfo {
             format: surface::PixelFormat::A8B8G8R8Unorm,
             image_type: ImageType::E2D,
@@ -5963,26 +7388,16 @@ mod tests {
         let mip_offset = full_base.mip_level_offsets[1] as u64;
         let sub_id = cache.join_images(&sub, 0x5000 + mip_offset, 0x9000 + mip_offset);
         cache.mark_modification_by_id(sub_id);
-        cache.set_backend_completes_join_images(true);
 
         let full_id = cache.join_images(&full, 0x5000, 0x9000);
 
-        assert_eq!(cache.pending_join_copies.len(), 1);
-        let pending = &cache.pending_join_copies[0];
-        assert_eq!(pending.new_image_id, full_id);
-        assert_eq!(pending.copies.len(), 1);
-        assert_eq!(pending.copies[0].id, sub_id);
-        assert!(!pending.copies[0].is_alias);
-        assert!(pending.copies[0].gpu_modified_at_join);
-        assert!(pending.left_aliased_ids.is_empty());
-        assert!(pending.right_aliased_ids.is_empty());
-        assert!(pending.bad_overlap_ids.is_empty());
-        assert!(!cache.slot_images[full_id]
+        assert!(cache.slot_images[full_id]
             .flags
             .contains(ImageFlagBits::REGISTERED));
-        assert!(cache.slot_images[sub_id]
+        assert!(cache.slot_images[full_id]
             .flags
             .contains(ImageFlagBits::GPU_MODIFIED));
+        assert!(!cache.slot_images.contains(sub_id));
     }
 
     #[test]
@@ -5990,7 +7405,7 @@ mod tests {
         use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
         use std::sync::Arc;
 
-        let mut cache = TextureCacheBase::new(Arc::new(MaxwellDeviceMemoryManager::default()));
+        let mut cache = test_cache();
         let mut descriptor = color_2d_tic(0, 2);
         let layer_stride = ImageInfo::from_tic_entry(&descriptor).layer_stride as u64;
         descriptor = color_2d_tic(0x5000_0000 + 2 * layer_stride, 2);
@@ -6008,7 +7423,7 @@ mod tests {
         use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
         use std::sync::Arc;
 
-        let mut cache = TextureCacheBase::new(Arc::new(MaxwellDeviceMemoryManager::default()));
+        let mut cache = test_cache();
         let mut descriptor = color_2d_tic(0, 2);
         let layer_stride = ImageInfo::from_tic_entry(&descriptor).layer_stride as u64;
         descriptor = color_2d_tic(0x5000_0000 + 2 * layer_stride, 2);
@@ -6022,12 +7437,11 @@ mod tests {
     }
 
     #[test]
-    fn backend_completed_create_image_view_uses_virtual_invalid_fallback_like_upstream_insert() {
+    fn typed_create_image_view_uses_virtual_invalid_fallback_like_upstream_insert() {
         use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
         use std::sync::Arc;
 
-        let mut cache = TextureCacheBase::new(Arc::new(MaxwellDeviceMemoryManager::default()));
-        cache.set_backend_completes_join_images(true);
+        let mut cache = test_cache();
         let mut descriptor = color_2d_tic(0, 2);
         let layer_stride = ImageInfo::from_tic_entry(&descriptor).layer_stride as u64;
         descriptor = color_2d_tic(0x5100_0000 + 2 * layer_stride, 2);
@@ -6038,7 +7452,8 @@ mod tests {
         let image_id = cache.slot_image_views[view_id].image_id;
         assert_eq!(cache.slot_images[image_id].gpu_addr, 0x5100_0000);
         assert!(cache.slot_images[image_id].cpu_addr >= !(1u64 << 40));
-        assert_eq!(cache.pending_backend_insertions, vec![image_id]);
+        assert!(cache.slot_images[image_id].backend.is_some());
+        assert!(cache.slot_image_views[view_id].backend.is_some());
     }
 
     #[test]
@@ -6047,7 +7462,10 @@ mod tests {
         let descriptor = color_2d_tic(0x5001, 0);
         let image = ImageBase::new(ImageInfo::from_tic_entry(&descriptor), 0x5000, 0x9000);
 
-        let _ = TextureCacheBase::create_image_view_base(&image, &descriptor);
+        let _ = TextureCacheBase::<CommonTextureCacheParams>::create_image_view_base(
+            &image,
+            &descriptor,
+        );
     }
 
     #[test]
@@ -6087,7 +7505,10 @@ mod tests {
         image.mip_level_offsets[1] = 0x100;
         let mip_descriptor = color_2d_tic(0x5100, 0);
 
-        let _ = TextureCacheBase::create_image_view_base(&image, &mip_descriptor);
+        let _ = TextureCacheBase::<CommonTextureCacheParams>::create_image_view_base(
+            &image,
+            &mip_descriptor,
+        );
     }
 
     #[test]
@@ -6096,7 +7517,7 @@ mod tests {
         use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
         use std::sync::Arc;
 
-        let mut cache = TextureCacheBase::new(Arc::new(MaxwellDeviceMemoryManager::default()));
+        let mut cache = test_cache();
         let info = ImageInfo {
             format: surface::PixelFormat::A8B8G8R8Unorm,
             image_type: ImageType::E2D,
@@ -6113,7 +7534,7 @@ mod tests {
         };
         let image_id = cache
             .slot_images
-            .insert(ImageBase::new(info.clone(), 0x5000, 0x9000));
+            .insert(ImageBase::new(info.clone(), 0x5000, 0x9000).into());
 
         let _ = cache.find_image_view_from_image_info(image_id, &info, 0x5001);
     }
@@ -6129,35 +7550,41 @@ mod tests {
             },
             ..ImageInfo::default()
         };
-        cache
-            .slot_images
-            .insert(crate::texture_cache::image_base::ImageBase::new(
-                info, gpu_addr, gpu_addr,
-            ))
+        cache.slot_images.insert(
+            crate::texture_cache::image_base::ImageBase::new(info, gpu_addr, gpu_addr).into(),
+        )
     }
 
     fn insert_test_view(cache: &mut TextureCacheBase, image_id: ImageId) -> ImageViewId {
         let mut view =
             ImageViewBase::null(crate::texture_cache::image_view_base::NullImageViewParams);
         view.image_id = image_id;
-        cache.slot_image_views.insert(view)
+        cache.slot_image_views.insert(view.into())
     }
 
     #[test]
-    fn check_feedback_loop_detects_color_target_alias() {
+    fn check_feedback_loop_skips_color_target_alias_like_upstream() {
         use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
         use std::sync::Arc;
 
-        let mut cache = TextureCacheBase::new(Arc::new(MaxwellDeviceMemoryManager::default()));
+        let mut cache = test_cache();
         let image_id = insert_test_image(&mut cache, 0x6000_0000);
         let sampled_view_id = insert_test_view(&mut cache, image_id);
         let color_view_id = insert_test_view(&mut cache, image_id);
         cache.render_targets.color_buffer_ids[0] = color_view_id;
+        cache.rt_active_mask = 1;
+        cache.rt_image_id[0] = image_id;
+        cache.render_targets_serial = 1;
 
-        assert!(cache.check_feedback_loop(&[ImageViewInOut {
-            id: sampled_view_id,
-            ..ImageViewInOut::default()
-        }]));
+        let mut barriers = 0;
+        cache.check_feedback_loop(
+            &[ImageViewInOut {
+                id: sampled_view_id,
+                ..ImageViewInOut::default()
+            }],
+            || barriers += 1,
+        );
+        assert_eq!(barriers, 0);
     }
 
     #[test]
@@ -6165,15 +7592,23 @@ mod tests {
         use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
         use std::sync::Arc;
 
-        let mut cache = TextureCacheBase::new(Arc::new(MaxwellDeviceMemoryManager::default()));
+        let mut cache = test_cache();
         let image_id = insert_test_image(&mut cache, 0x6100_0000);
         let sampled_view_id = insert_test_view(&mut cache, image_id);
         cache.render_targets.depth_buffer_id = insert_test_view(&mut cache, image_id);
+        cache.rt_active_mask = 1 << NUM_RT;
+        cache.rt_depth_image_id = image_id;
+        cache.render_targets_serial = 1;
 
-        assert!(cache.check_feedback_loop(&[ImageViewInOut {
-            id: sampled_view_id,
-            ..ImageViewInOut::default()
-        }]));
+        let mut barriers = 0;
+        cache.check_feedback_loop(
+            &[ImageViewInOut {
+                id: sampled_view_id,
+                ..ImageViewInOut::default()
+            }],
+            || barriers += 1,
+        );
+        assert_eq!(barriers, 1);
     }
 
     #[test]
@@ -6181,21 +7616,79 @@ mod tests {
         use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
         use std::sync::Arc;
 
-        let mut cache = TextureCacheBase::new(Arc::new(MaxwellDeviceMemoryManager::default()));
+        let mut cache = test_cache();
         let sampled_image_id = insert_test_image(&mut cache, 0x6200_0000);
         let target_image_id = insert_test_image(&mut cache, 0x6300_0000);
         let sampled_view_id = insert_test_view(&mut cache, sampled_image_id);
         cache.render_targets.color_buffer_ids[0] = insert_test_view(&mut cache, target_image_id);
+        cache.rt_active_mask = 1;
+        cache.rt_image_id[0] = target_image_id;
+        cache.render_targets_serial = 1;
 
-        assert!(!cache.check_feedback_loop(&[
-            ImageViewInOut {
-                id: NULL_IMAGE_VIEW_ID,
+        let mut barriers = 0;
+        cache.check_feedback_loop(
+            &[
+                ImageViewInOut {
+                    id: NULL_IMAGE_VIEW_ID,
+                    ..ImageViewInOut::default()
+                },
+                ImageViewInOut {
+                    id: sampled_view_id,
+                    ..ImageViewInOut::default()
+                },
+            ],
+            || barriers += 1,
+        );
+        assert_eq!(barriers, 0);
+    }
+
+    #[test]
+    fn check_feedback_loop_cache_is_invalidated_by_texture_binding_serial() {
+        use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
+        use std::sync::Arc;
+
+        let mut cache = test_cache();
+        let depth_image_id = insert_test_image(&mut cache, 0x6400_0000);
+        let unrelated_image_id = insert_test_image(&mut cache, 0x6500_0000);
+        let depth_alias = insert_test_view(&mut cache, depth_image_id);
+        let unrelated = insert_test_view(&mut cache, unrelated_image_id);
+        cache.render_targets.depth_buffer_id = insert_test_view(&mut cache, depth_image_id);
+        cache.rt_active_mask = 1 << NUM_RT;
+        cache.rt_depth_image_id = depth_image_id;
+        cache.render_targets_serial = 1;
+
+        let mut barriers = 0;
+        cache.check_feedback_loop(
+            &[ImageViewInOut {
+                id: unrelated,
                 ..ImageViewInOut::default()
-            },
-            ImageViewInOut {
-                id: sampled_view_id,
+            }],
+            || barriers += 1,
+        );
+        cache.check_feedback_loop(
+            &[ImageViewInOut {
+                id: depth_alias,
                 ..ImageViewInOut::default()
-            },
-        ]));
+            }],
+            || barriers += 1,
+        );
+        assert_eq!(barriers, 0);
+
+        cache.texture_bindings_serial = 1;
+        cache.check_feedback_loop(
+            &[ImageViewInOut {
+                id: depth_alias,
+                ..ImageViewInOut::default()
+            }],
+            || barriers += 1,
+        );
+        cache.check_feedback_loop(
+            &[ImageViewInOut {
+                id: depth_alias,
+                ..ImageViewInOut::default()
+            }],
+            || barriers += 1,
+        );
+        assert_eq!(barriers, 2);
     }
 }

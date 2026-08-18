@@ -14,6 +14,9 @@ pub const TEX_COORD_LOCATION: i32 = 1;
 /// Uniform location for the model-view matrix.
 pub const MODEL_VIEW_MATRIX_LOCATION: i32 = 0;
 
+/// Uniform location for the screen size.
+pub const SCREEN_SIZE_LOCATION: i32 = 1;
+
 /// Screen rectangle vertex for the presentation quad.
 ///
 /// Corresponds to `OpenGL::ScreenRectVertex`.
@@ -46,6 +49,7 @@ mod tests {
 
     #[test]
     fn screen_rect_vertex_matches_upstream_glfloat_layout() {
+        assert_eq!(SCREEN_SIZE_LOCATION, 1);
         assert_eq!(
             std::mem::size_of::<ScreenRectVertex>(),
             4 * std::mem::size_of::<f32>()

@@ -1,12 +1,12 @@
 // SPDX-FileCopyrightText: 2014 Citra Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-//! ruzu-cmd: SDL2 command-line emulator frontend.
+//! ruzu-cmd: SDL3 command-line emulator frontend.
 //!
 //! Port of upstream `yuzu_cmd/yuzu.cpp`.
 //!
-//! This binary is the SDL2-based command-line frontend for the ruzu Nintendo
-//! Switch emulator. It parses command-line arguments, loads an SDL2
+//! This binary is the SDL3-based command-line frontend for the ruzu Nintendo
+//! Switch emulator. It parses command-line arguments, loads an SDL3
 //! configuration, picks the correct renderer backend (OpenGL, Vulkan, or
 //! Null), initialises the emulator core, and runs the main event loop.
 //!
@@ -24,15 +24,15 @@
 
 use clap::Parser;
 use common::settings_enums::RendererBackend;
-use sdl2::libc;
+use libc;
 use std::ffi::OsStr;
 
 pub mod emu_window;
 pub mod sdl_config;
 
 use emu_window::{
-    emu_window_sdl2_gl::EmuWindowSdl2Gl, emu_window_sdl2_null::EmuWindowSdl2Null,
-    emu_window_sdl2_vk::EmuWindowSdl2Vk,
+    emu_window_sdl3_gl::EmuWindowSdl3Gl, emu_window_sdl3_null::EmuWindowSdl3Null,
+    emu_window_sdl3_vk::EmuWindowSdl3Vk,
 };
 use sdl_config::SdlConfig;
 
@@ -41,7 +41,9 @@ fn resolve_renderer_backend(
     configured_backend: RendererBackend,
 ) -> &'static str {
     let configured_name = match configured_backend {
-        RendererBackend::OpenGL => "opengl",
+        RendererBackend::OpenGlGlsl
+        | RendererBackend::OpenGlGlasm
+        | RendererBackend::OpenGlSpirV => "opengl",
         RendererBackend::Vulkan => "vulkan",
         RendererBackend::Null => "null",
     };
@@ -72,7 +74,7 @@ mod tests {
     #[test]
     fn configured_renderer_is_used_without_cli_override() {
         assert_eq!(
-            resolve_renderer_backend(None, RendererBackend::OpenGL),
+            resolve_renderer_backend(None, RendererBackend::OpenGlGlsl),
             "opengl"
         );
         assert_eq!(
@@ -88,7 +90,7 @@ mod tests {
     #[test]
     fn cli_renderer_overrides_configured_renderer() {
         assert_eq!(
-            resolve_renderer_backend(Some("vulkan"), RendererBackend::OpenGL),
+            resolve_renderer_backend(Some("vulkan"), RendererBackend::OpenGlGlsl),
             "vulkan"
         );
         assert_eq!(
@@ -102,13 +104,13 @@ mod tests {
 // CLI argument definitions
 // ---------------------------------------------------------------------------
 
-/// ruzu-cmd — SDL2 command-line Nintendo Switch emulator frontend.
+/// ruzu-cmd — SDL3 command-line Nintendo Switch emulator frontend.
 ///
 /// Maps to the `getopt_long` option table in C++ `main()`.
 #[derive(Parser, Debug)]
 #[command(name = "ruzu-cmd")]
 #[command(version)]
-#[command(about = "ruzu Nintendo Switch emulator (SDL2 CLI frontend)")]
+#[command(about = "ruzu Nintendo Switch emulator (SDL3 CLI frontend)")]
 struct Args {
     /// Load the specified configuration file.
     ///
@@ -332,7 +334,7 @@ fn detect_fastmem_base_for_sigill() {
 /// SIGILL handler — installed when RUZU_SIGILL_TRACE=1. Linux x86_64 only.
 #[cfg(target_os = "linux")]
 extern "C" fn ruzu_sigill_handler(
-    _sig: sdl2::libc::c_int,
+    _sig: libc::c_int,
     _info: *mut libc::siginfo_t,
     ucontext: *mut libc::c_void,
 ) {
@@ -380,7 +382,7 @@ extern "C" fn ruzu_sigill_handler(
             rip, rax, r11, r15, bytes_around, recovered_vaddr, recovered_aux
         );
         let bytes = s.as_bytes();
-        sdl2::libc::write(2, bytes.as_ptr() as *const libc::c_void, bytes.len());
+        libc::write(2, bytes.as_ptr() as *const libc::c_void, bytes.len());
 
         // R15 == JitState pointer when in JIT code. A64JitState layout:
         //   offset 0..248:  reg[0..31] (X0..X30)
@@ -398,12 +400,12 @@ extern "C" fn ruzu_sigill_handler(
                 "[SIGILL]   trapping reg index = X{}, guest PC = 0x{:016X}, guest SP = 0x{:016X}\n",
                 rax, pc, sp
             );
-            sdl2::libc::write(2, s2.as_bytes().as_ptr() as *const libc::c_void, s2.len());
+            libc::write(2, s2.as_bytes().as_ptr() as *const libc::c_void, s2.len());
             // Dump X0..X30
             for i in 0..31 {
                 let x = std::ptr::read_unaligned((r15 + (i * 8) as u64) as *const u64);
                 let s3 = format!("[SIGILL]   X{:<2} = 0x{:016X}\n", i, x);
-                sdl2::libc::write(2, s3.as_bytes().as_ptr() as *const libc::c_void, s3.len());
+                libc::write(2, s3.as_bytes().as_ptr() as *const libc::c_void, s3.len());
             }
 
             // A32 traps share the same host R15 convention but the JitState
@@ -420,10 +422,10 @@ extern "C" fn ruzu_sigill_handler(
                 "[SIGILL]   A32 R15/PC=0x{:08X} SP=0x{:08X} LR=0x{:08X} upper=0x{:08X} cpsr_nzcv=0x{:08X}\n",
                 a32_regs[15], a32_regs[13], a32_regs[14], a32_upper, a32_cpsr_nzcv
             );
-            sdl2::libc::write(2, s4.as_bytes().as_ptr() as *const libc::c_void, s4.len());
+            libc::write(2, s4.as_bytes().as_ptr() as *const libc::c_void, s4.len());
             for i in 0..16 {
                 let s5 = format!("[SIGILL]   R{:<2} = 0x{:08X}\n", i, a32_regs[i]);
-                sdl2::libc::write(2, s5.as_bytes().as_ptr() as *const libc::c_void, s5.len());
+                libc::write(2, s5.as_bytes().as_ptr() as *const libc::c_void, s5.len());
             }
         }
 
@@ -441,7 +443,7 @@ extern "C" fn ruzu_sigill_handler(
                 "[SIGILL]   stored_value@vaddr=0x{:016X} = 0x{:016X}\n",
                 recovered_vaddr, stored,
             );
-            sdl2::libc::write(2, s.as_bytes().as_ptr() as *const libc::c_void, s.len());
+            libc::write(2, s.as_bytes().as_ptr() as *const libc::c_void, s.len());
         }
 
         // RUZU_DUMP_FASTMEM_VAS=0xVADDR[,0xVADDR,...] — at SIGILL time, also
@@ -461,7 +463,7 @@ extern "C" fn ruzu_sigill_handler(
                     "[SIGILL]   *[host=0x{:016X}, guest=0x{:016X}] = 0x{:016X} 0x{:016X}\n",
                     host_addr, vaddr, lo, hi,
                 );
-                sdl2::libc::write(2, s.as_bytes().as_ptr() as *const libc::c_void, s.len());
+                libc::write(2, s.as_bytes().as_ptr() as *const libc::c_void, s.len());
             }
         }
 
@@ -479,7 +481,7 @@ extern "C" fn ruzu_sigill_handler(
             (*uc).uc_mcontext.gregs[libc::REG_RIP as usize] = (rip + 2) as i64;
             return;
         }
-        sdl2::libc::_exit(132);
+        libc::_exit(132);
     }
 }
 
@@ -508,12 +510,9 @@ fn main() {
     let want_nvnflinger_history = std::env::var_os("RUZU_DUMP_NVNFLINGER_HISTORY").is_some();
     let want_hwc_cache_profile = std::env::var_os("RUZU_PROFILE_HWC_CACHE").is_some();
     let want_vsync_profile = std::env::var_os("RUZU_PROFILE_VSYNC").is_some();
-    let want_present_profile = std::env::var_os("RUZU_PROFILE_PRESENT").is_some();
     let want_submit_gpfifo_profile = std::env::var_os("RUZU_PROFILE_SUBMIT_GPFIFO").is_some();
     let want_gpu_thread_profile = std::env::var_os("RUZU_PROFILE_GPU_THREAD").is_some();
     let want_gl_draw_stall_profile = std::env::var_os("RUZU_PROFILE_GL_DRAW_STALL").is_some();
-    let want_shader_pipeline_stall_profile =
-        std::env::var_os("RUZU_PROFILE_SHADER_PIPELINE_STALL").is_some();
     let want_refresh_stages_stall_profile =
         std::env::var_os("RUZU_PROFILE_REFRESH_STAGES_STALL").is_some();
     let want_make_shader_info_stall_profile =
@@ -539,11 +538,9 @@ fn main() {
         || want_nvnflinger_history
         || want_hwc_cache_profile
         || want_vsync_profile
-        || want_present_profile
         || want_submit_gpfifo_profile
         || want_gpu_thread_profile
         || want_gl_draw_stall_profile
-        || want_shader_pipeline_stall_profile
         || want_refresh_stages_stall_profile
         || want_make_shader_info_stall_profile
         || want_shader_register_stall_profile
@@ -571,9 +568,6 @@ fn main() {
             ruzu_core::hle::service::nvnflinger::diagnostics::dump("sigusr2");
             ruzu_core::hle::service::nvnflinger::hardware_composer::dump_hwc_cache_profile();
             ruzu_core::hle::service::vi::conductor::dump_vsync_profile();
-            video_core::renderer_opengl::dump_present_profile();
-            video_core::renderer_opengl::dump_gl_draw_stall_profile();
-            video_core::renderer_opengl::dump_shader_pipeline_stall_profile();
             video_core::shader_cache::dump_refresh_stages_stall_profile();
             video_core::shader_cache::dump_make_shader_info_stall_profile();
             video_core::shader_cache::dump_shader_register_stall_profile();
@@ -581,10 +575,10 @@ fn main() {
         }
         #[cfg(unix)]
         unsafe {
-            let mut sa: sdl2::libc::sigaction = std::mem::zeroed();
+            let mut sa: libc::sigaction = std::mem::zeroed();
             sa.sa_sigaction = profile_signal as usize;
-            sdl2::libc::sigemptyset(&mut sa.sa_mask);
-            sdl2::libc::sigaction(libc::SIGUSR2, &sa, std::ptr::null_mut());
+            libc::sigemptyset(&mut sa.sa_mask);
+            libc::sigaction(libc::SIGUSR2, &sa, std::ptr::null_mut());
         }
         extern "C" fn profile_atexit() {
             ruzu_core::hle::kernel::svc::svc_ipc::dump_ipc_profile();
@@ -607,9 +601,6 @@ fn main() {
             ruzu_core::hle::service::nvnflinger::diagnostics::dump("atexit");
             ruzu_core::hle::service::nvnflinger::hardware_composer::dump_hwc_cache_profile();
             ruzu_core::hle::service::vi::conductor::dump_vsync_profile();
-            video_core::renderer_opengl::dump_present_profile();
-            video_core::renderer_opengl::dump_gl_draw_stall_profile();
-            video_core::renderer_opengl::dump_shader_pipeline_stall_profile();
             video_core::shader_cache::dump_refresh_stages_stall_profile();
             video_core::shader_cache::dump_make_shader_info_stall_profile();
             video_core::shader_cache::dump_shader_register_stall_profile();
@@ -623,11 +614,11 @@ fn main() {
     #[cfg(target_os = "linux")]
     if std::env::var_os("RUZU_SIGILL_TRACE").is_some() {
         unsafe {
-            let mut sa: sdl2::libc::sigaction = std::mem::zeroed();
+            let mut sa: libc::sigaction = std::mem::zeroed();
             sa.sa_sigaction = ruzu_sigill_handler as usize;
             sa.sa_flags = libc::SA_SIGINFO;
-            sdl2::libc::sigemptyset(&mut sa.sa_mask);
-            sdl2::libc::sigaction(libc::SIGILL, &sa, std::ptr::null_mut());
+            libc::sigemptyset(&mut sa.sa_mask);
+            libc::sigaction(libc::SIGILL, &sa, std::ptr::null_mut());
         }
         // Spawn background detector for fastmem base (populates global
         // FASTMEM_BASE_FOR_SIGILL atomic that the handler reads to dump
@@ -817,22 +808,22 @@ fn main() {
     // Step 3 (upstream): Create emu_window BEFORE loading.
     // Maps to C++:
     //   switch (Settings::values.renderer_backend.GetValue()) {
-    //     case OpenGL:  emu_window = make_unique<EmuWindow_SDL2_GL>(...);
-    //     case Vulkan:  emu_window = make_unique<EmuWindow_SDL2_VK>(...);
-    //     case Null:    emu_window = make_unique<EmuWindow_SDL2_Null>(...);
+    //     case OpenGL:  emu_window = make_unique<EmuWindow_SDL3_GL>(...);
+    //     case Vulkan:  emu_window = make_unique<EmuWindow_SDL3_VK>(...);
+    //     case Null:    emu_window = make_unique<EmuWindow_SDL3_Null>(...);
     //   }
     // -----------------------------------------------------------------------
     enum EmuWindow {
-        Gl(EmuWindowSdl2Gl),
-        Vk(EmuWindowSdl2Vk),
-        Null(EmuWindowSdl2Null),
+        Gl(EmuWindowSdl3Gl),
+        Vk(EmuWindowSdl3Vk),
+        Null(EmuWindowSdl3Null),
     }
 
     let emu_window_system_ref = ruzu_core::core::SystemRef::from_ref(&system);
     let mut emu_window = match renderer_backend {
-        "opengl" => EmuWindow::Gl(EmuWindowSdl2Gl::new(emu_window_system_ref, args.fullscreen)),
-        "vulkan" => EmuWindow::Vk(EmuWindowSdl2Vk::new(emu_window_system_ref, args.fullscreen)),
-        _ => EmuWindow::Null(EmuWindowSdl2Null::new(
+        "opengl" => EmuWindow::Gl(EmuWindowSdl3Gl::new(emu_window_system_ref, args.fullscreen)),
+        "vulkan" => EmuWindow::Vk(EmuWindowSdl3Vk::new(emu_window_system_ref, args.fullscreen)),
+        _ => EmuWindow::Null(EmuWindowSdl3Null::new(
             emu_window_system_ref,
             args.fullscreen,
         )),
@@ -882,6 +873,10 @@ fn main() {
         EmuWindow::Gl(w) => w.strict_context_required(),
         _ => false,
     };
+    let opengl_framebuffer_layout = match &emu_window {
+        EmuWindow::Gl(w) => Some(w.framebuffer_layout()),
+        _ => None,
+    };
     let vulkan_window_info = match &emu_window {
         EmuWindow::Vk(w) => Some((
             w.window_info().clone(),
@@ -914,6 +909,13 @@ fn main() {
         //   auto scope = context->Acquire();
         //   auto renderer = CreateRenderer(system, emu_window, *gpu, context);
         //   gpu->BindRenderer(renderer);
+        // `VideoCore::CreateGPU` updates the derived resolution state first.
+        // This frontend-owned factory has to retain that ordering because the
+        // renderer needs the GPU while it is being constructed.
+        {
+            let mut values = common::settings::values_mut();
+            common::settings::update_rescaling_info(&mut values);
+        }
         let system_ref = ruzu_core::core::SystemRef::from_ref(&system);
         let use_async_gpu =
             *common::settings::values().use_asynchronous_gpu_emulation.get_value()
@@ -947,15 +949,15 @@ fn main() {
         let renderer: Box<dyn video_core::renderer_base::RendererBase> =
             match renderer_backend_str.as_str() {
                 "opengl" => {
-                    let window_ptr = sdl_window_ptr_usize as *mut sdl2::sys::SDL_Window;
-                    let context = Box::new(emu_window::emu_window_sdl2_gl::SdlGlContext::new(
+                    let window_ptr = sdl_window_ptr_usize as *mut sdl3::sys::everything::SDL_Window;
+                    let context = Box::new(emu_window::emu_window_sdl3_gl::SdlGlContext::new(
                         window_ptr,
                     ));
                     let shared_context_factory: video_core::renderer_opengl::gl_shader_context::SharedContextFactory =
                         Arc::new(move || {
                             Box::new(
-                                emu_window::emu_window_sdl2_gl::SdlGlContext::new(
-                                    sdl_window_ptr_usize as *mut sdl2::sys::SDL_Window,
+                                emu_window::emu_window_sdl3_gl::SdlGlContext::new(
+                                    sdl_window_ptr_usize as *mut sdl3::sys::everything::SDL_Window,
                                 ),
                             )
                         });
@@ -964,13 +966,17 @@ fn main() {
                         gpu_ref.renderer_frame_end_notify();
                     });
                     let frame_displayed_notify = Arc::new(|| {});
+                    let framebuffer_layout = opengl_framebuffer_layout.as_ref().ok_or_else(|| {
+                        "OpenGL renderer selected without framebuffer layout".to_owned()
+                    })?;
                     let mut renderer = video_core::renderer_opengl::RendererOpenGL::new(
-                        system.telemetry_session_mut(),
                         |s| {
                             let cs = std::ffi::CString::new(s).unwrap();
                             unsafe {
-                                sdl2::sys::SDL_GL_GetProcAddress(cs.as_ptr())
-                                    as *const std::os::raw::c_void
+                                sdl3::sys::everything::SDL_GL_GetProcAddress(cs.as_ptr()).map_or(
+                                    std::ptr::null(),
+                                    |proc| proc as *const () as *const std::os::raw::c_void,
+                                )
                             }
                         },
                         syncpoints.clone(),
@@ -981,13 +987,11 @@ fn main() {
                         strict_gl_context_required,
                         context,
                         Some(shared_context_factory),
+                        Arc::clone(framebuffer_layout),
                         frame_end_notify,
                         frame_displayed_notify,
                     )
-                    .unwrap_or_else(|e| {
-                        log::error!("Failed to create OpenGL renderer: {}", e);
-                        std::process::exit(1);
-                    });
+                    .map_err(|error| format!("Failed to create OpenGL renderer: {error}"))?;
                     renderer
                         .rasterizer_mut()
                         .set_invalidate_gpu_cache_callback(Arc::new(move || unsafe {
@@ -1042,19 +1046,22 @@ fn main() {
                     let Some((window_info, drawable_size, shown_state, framebuffer_layout)) =
                         vulkan_window_info.as_ref()
                     else {
-                        log::error!("Vulkan renderer selected without Vulkan window info");
-                        std::process::exit(1);
+                        return Err(
+                            "Vulkan renderer selected without Vulkan window info".to_owned(),
+                        );
                     };
                     let Some(host1x_core) = system.host1x_core() else {
-                        log::error!("Vulkan renderer selected before Host1x initialization");
-                        std::process::exit(1);
+                        return Err(
+                            "Vulkan renderer selected before Host1x initialization".to_owned(),
+                        );
                     };
                     let Some(host1x) = host1x_core
                         .as_any()
                         .downcast_ref::<video_core::host1x::host1x::Host1x>()
                     else {
-                        log::error!("Vulkan renderer could not resolve Host1x memory manager");
-                        std::process::exit(1);
+                        return Err(
+                            "Vulkan renderer could not resolve Host1x memory manager".to_owned(),
+                        );
                     };
                     let device_memory = std::sync::Arc::clone(host1x.memory_manager());
                     // Upstream calls render_window.OnFrameDisplayed() from RendererVulkan::Composite
@@ -1068,7 +1075,6 @@ fn main() {
                     });
                     Box::new(
                         video_core::renderer_vulkan::renderer_vulkan::RendererVulkan::new(
-                            system.telemetry_session_mut(),
                             // SAFETY: this renderer is immediately bound to `gpu` below;
                             // `Gpu` drops the renderer before its shader notifier.
                             unsafe { gpu.shader_notify_handle() },
@@ -1081,10 +1087,7 @@ fn main() {
                             syncpoints.clone(),
                             device_memory,
                         )
-                        .unwrap_or_else(|e| {
-                            log::error!("Failed to create Vulkan renderer: {}", e);
-                            std::process::exit(1);
-                        }),
+                        .map_err(|error| format!("Failed to create Vulkan renderer: {error}"))?,
                     )
                 }
                 _ => Box::new(video_core::renderer_null::renderer_null::RendererNull::new(
@@ -1258,6 +1261,7 @@ fn main() {
         // AudioCore (upstream core.cpp:283): audio_core = make_unique<AudioCore>(system)
         let ac = audio_core::AudioCore::new(ruzu_core::core::SystemRef::from_ref(system));
         system.set_audio_core(Box::new(ac));
+        Ok(())
     }));
 
     // -----------------------------------------------------------------------
@@ -1364,9 +1368,9 @@ fn main() {
         signal(15, 0);
     }
 
-    // emu_window::emu_window_sdl2::schedule_auto_lr_if_requested();
-    // emu_window::emu_window_sdl2::schedule_auto_a_if_requested();
-    emu_window::emu_window_sdl2::schedule_perf_log_if_requested(emu_window_system_ref);
+    // emu_window::emu_window_sdl3::schedule_auto_lr_if_requested();
+    // emu_window::emu_window_sdl3::schedule_auto_a_if_requested();
+    emu_window::emu_window_sdl3::schedule_perf_log_if_requested(emu_window_system_ref);
     log::info!("Entering main event loop");
     let poll_events_loop = std::env::var_os("RUZU_POLL_EVENTS_LOOP").is_some();
     match &mut emu_window {

@@ -17,21 +17,29 @@ use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::rc::{Rc, Weak};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex, OnceLock};
 
 use gtk::prelude::*;
 use gtk::subclass::prelude::*;
 use gtk::{gdk, gio, glib};
 
+use ruzu_core::file_sys::content_archive::NCA;
 use ruzu_core::file_sys::control_metadata::NACP;
 use ruzu_core::file_sys::fs_filesystem::OpenMode;
+use ruzu_core::file_sys::nca_metadata::TitleType;
+use ruzu_core::file_sys::partition_filesystem::ResultStatus as FsResultStatus;
 use ruzu_core::file_sys::patch_manager::{Patch, PatchManager};
 use ruzu_core::file_sys::registered_cache::{
-    ContentProviderUnion, ContentProviderUnionSlot, ManualContentProvider,
+    get_cr_type_from_nca_type, ContentProvider, ContentProviderEntry, ContentProviderUnion,
+    ContentProviderUnionSlot, ExternalUpdateEntry, ManualContentProvider,
 };
 use ruzu_core::file_sys::vfs::vfs_real::RealVfsFilesystem;
+use ruzu_core::file_sys::vfs::vfs_types::VirtualFile;
 use ruzu_core::hle::service::filesystem::filesystem::FileSystemController;
-use ruzu_core::loader::loader::{get_loader, FileType, ResultStatus, System as LoaderSystem};
+use ruzu_core::loader::loader::{
+    get_loader, identify_file, is_bootable_game_container, FileType, ResultStatus,
+    System as LoaderSystem,
+};
 
 use crate::configuration::qt_config;
 use crate::main_window::StartGameType;
@@ -44,10 +52,26 @@ const ICON_SIZE: i32 = 64;
 /// Pixel size of the folder icon on a directory row.
 const FOLDER_ICON_SIZE: i32 = 48;
 
-/// Upstream's colorful-theme `folder` and `star` icons. Keep local copies so
-/// the game list does not depend on the host icon theme or the zuyu tree.
+/// Upstream's colorful-theme `folder`, `bad_folder` and `star` icons. Keep
+/// local copies so the game list does not depend on the host icon theme or the
+/// zuyu tree.
 const FOLDER_ICON_PNG: &[u8] = include_bytes!("../assets/game-list-folder.png");
+const BAD_FOLDER_ICON_PNG: &[u8] = include_bytes!("../assets/game-list-bad-folder.png");
 const FAVORITES_ICON_PNG: &[u8] = include_bytes!("../assets/game-list-star.png");
+
+/// Icon shown on a filesystem directory row.
+///
+/// Port of the `CustomDir` branch of upstream `GameListDir`
+/// (`qt_common/game_list/game_list_p.h`), which selects the icon from the
+/// directory's presence on disk:
+/// `icon_name = QFileInfo::exists(path) ? "folder" : "bad_folder";`
+fn folder_icon_png(path: &str) -> &'static [u8] {
+    if Path::new(path).exists() {
+        FOLDER_ICON_PNG
+    } else {
+        BAD_FOLDER_ICON_PNG
+    }
+}
 
 /// Ruzu-specific default requested for newly added filesystem directories.
 const NEW_DIRECTORY_DEEP_SCAN: bool = true;
@@ -55,6 +79,116 @@ const NEW_DIRECTORY_DEEP_SCAN: bool = true;
 /// Switch executable extensions listed in the game view. Mirrors
 /// `GameList::supported_file_extensions`.
 const SUPPORTED_EXTENSIONS: &[&str] = &["nsp", "xci", "nca", "nro", "nso", "kip"];
+
+/// Process-wide frontend provider. The mutex adapter keeps the provider stable
+/// for the non-owning union slot while allowing the game-list worker to refill
+/// it safely.
+struct SharedManualContentProvider {
+    inner: Mutex<ManualContentProvider>,
+}
+
+impl ContentProvider for SharedManualContentProvider {
+    fn refresh(&mut self) {
+        self.inner.get_mut().unwrap().refresh();
+    }
+
+    fn has_entry(
+        &self,
+        title_id: u64,
+        record_type: ruzu_core::file_sys::nca_metadata::ContentRecordType,
+    ) -> bool {
+        self.inner.lock().unwrap().has_entry(title_id, record_type)
+    }
+
+    fn get_entry_version(&self, title_id: u64) -> Option<u32> {
+        self.inner.lock().unwrap().get_entry_version(title_id)
+    }
+
+    fn get_entry_unparsed(
+        &self,
+        title_id: u64,
+        record_type: ruzu_core::file_sys::nca_metadata::ContentRecordType,
+    ) -> Option<VirtualFile> {
+        self.inner
+            .lock()
+            .unwrap()
+            .get_entry_unparsed(title_id, record_type)
+    }
+
+    fn get_entry_raw(
+        &self,
+        title_id: u64,
+        record_type: ruzu_core::file_sys::nca_metadata::ContentRecordType,
+    ) -> Option<VirtualFile> {
+        self.inner
+            .lock()
+            .unwrap()
+            .get_entry_raw(title_id, record_type)
+    }
+
+    fn list_entries_filter(
+        &self,
+        title_type: Option<TitleType>,
+        record_type: Option<ruzu_core::file_sys::nca_metadata::ContentRecordType>,
+        title_id: Option<u64>,
+    ) -> Vec<ContentProviderEntry> {
+        self.inner
+            .lock()
+            .unwrap()
+            .list_entries_filter(title_type, record_type, title_id)
+    }
+
+    fn list_update_versions(&self, title_id: u64) -> Vec<ExternalUpdateEntry> {
+        self.inner.lock().unwrap().list_update_versions(title_id)
+    }
+
+    fn get_entry_for_version(
+        &self,
+        title_id: u64,
+        content_type: ruzu_core::file_sys::nca_metadata::ContentRecordType,
+        version: u32,
+    ) -> Option<VirtualFile> {
+        self.inner
+            .lock()
+            .unwrap()
+            .get_entry_for_version(title_id, content_type, version)
+    }
+}
+
+struct FrontendContentProviders {
+    vfs: Arc<RealVfsFilesystem>,
+    manual: Box<SharedManualContentProvider>,
+    union: Arc<Mutex<ContentProviderUnion>>,
+}
+
+fn frontend_content_providers() -> &'static FrontendContentProviders {
+    static PROVIDERS: OnceLock<FrontendContentProviders> = OnceLock::new();
+    PROVIDERS.get_or_init(|| {
+        let mut manual = Box::new(SharedManualContentProvider {
+            inner: Mutex::new(ManualContentProvider::default()),
+        });
+        let union = Arc::new(Mutex::new(ContentProviderUnion::new()));
+        unsafe {
+            union.lock().unwrap().set_slot(
+                ContentProviderUnionSlot::FrontendManual,
+                (&mut *manual as *mut SharedManualContentProvider) as *mut dyn ContentProvider,
+            );
+        }
+        FrontendContentProviders {
+            vfs: RealVfsFilesystem::new(),
+            manual,
+            union,
+        }
+    })
+}
+
+pub(crate) fn frontend_content_provider_union() -> Arc<Mutex<ContentProviderUnion>> {
+    Arc::clone(&frontend_content_providers().union)
+}
+
+pub(crate) fn frontend_vfs() -> Arc<RealVfsFilesystem> {
+    Arc::clone(&frontend_content_providers().vfs)
+}
 
 // ---------------------------------------------------------------------------
 // GameEntry — a GObject row model for the ColumnView.
@@ -139,7 +273,7 @@ impl GameEntry {
         let imp = obj.imp();
         *imp.name.borrow_mut() = path.to_owned();
         *imp.path.borrow_mut() = path.to_owned();
-        *imp.icon.borrow_mut() = embedded_icon(FOLDER_ICON_PNG);
+        *imp.icon.borrow_mut() = embedded_icon(folder_icon_png(path));
         imp.is_folder.set(true);
         imp.is_favorites.set(false);
         imp.deep_scan.set(deep_scan);
@@ -252,6 +386,7 @@ struct GameListView {
     hid_core: Arc<parking_lot::Mutex<hid_core::hid_core::HIDCore>>,
     play_time_manager: Arc<frontend_common::play_time_manager::PlayTimeManager>,
     on_activate: Rc<dyn Fn(String, StartGameType)>,
+    runtime_lock: Rc<dyn Fn() -> bool>,
     property_dialog:
         RefCell<Option<Rc<crate::configuration::configure_per_game::ConfigurePerGame>>>,
     /// Eden runs `GameListWorker` outside the UI thread. The generation makes
@@ -302,14 +437,27 @@ impl GameListHandle {
     pub fn set_filter_visible(&self, visible: bool) {
         self.0.set_filter_visible(visible);
     }
+
+    /// Snapshot the program-id and icon roles exposed by Eden's game-list
+    /// model. The lobby remains responsible for lookup/filter semantics.
+    pub fn program_ids_and_icons(&self) -> Vec<(u64, Option<gdk::Texture>)> {
+        self.0
+            .all_games
+            .borrow()
+            .iter()
+            .flatten()
+            .map(|game| (game.program_id(), game.icon()))
+            .collect()
+    }
 }
 
 /// Build the game list widget. `on_activate` is invoked with the game's path
 /// when a game row is activated (double-click / Enter).
-pub fn build<F: Fn(String, StartGameType) + 'static>(
+pub fn build<F: Fn(String, StartGameType) + 'static, R: Fn() -> bool + 'static>(
     hid_core: &Arc<parking_lot::Mutex<hid_core::hid_core::HIDCore>>,
     play_time_manager: &Arc<frontend_common::play_time_manager::PlayTimeManager>,
     on_activate: F,
+    runtime_lock: R,
 ) -> (gtk::Widget, GameListHandle) {
     install_list_css();
 
@@ -472,6 +620,7 @@ pub fn build<F: Fn(String, StartGameType) + 'static>(
         hid_core: Arc::clone(hid_core),
         play_time_manager: Arc::clone(play_time_manager),
         on_activate,
+        runtime_lock: Rc::new(runtime_lock),
         property_dialog: RefCell::new(None),
         scan_generation: Arc::new(AtomicU64::new(0)),
         scan_result_sender,
@@ -1239,6 +1388,7 @@ impl GameListView {
             self.parent_window().as_ref(),
             properties,
             Arc::clone(&self.hid_core),
+            (self.runtime_lock)(),
         );
         dialog.connect_closed({
             let view = Rc::downgrade(self);
@@ -1471,11 +1621,7 @@ impl GameListView {
             .name("GameListWorker".to_string())
             .spawn(move || {
                 let mut metadata_reader = MetadataReader::new();
-                populate_manual_content_provider(
-                    &metadata_reader.vfs,
-                    &mut metadata_reader.manual_content_provider,
-                    &scannable,
-                );
+                clear_frontend_manual_content_provider();
                 if current_generation.load(Ordering::Acquire) != generation {
                     return;
                 }
@@ -1485,6 +1631,7 @@ impl GameListView {
                     if current_generation.load(Ordering::Acquire) != generation {
                         return;
                     }
+                    populate_frontend_manual_content_provider(std::slice::from_ref(&directory));
                     let games = scan_dir_games(
                         Path::new(&directory.path),
                         directory.deep_scan,
@@ -2085,11 +2232,9 @@ fn take_current_scan_result(
 /// Scan one directory and return the games it holds, sorted by title.
 ///
 /// Mirrors upstream `GameListWorker::ScanFileSystem`: a candidate file is only
-/// listed once a `Loader` accepts it *and* reports a real file type. That check
-/// is what keeps update/DLC packages out of the list — an update-only NSP's
-/// program NCA carries `ErrorMissingBKTRBaseRomFS` (it is a patch with no base
-/// RomFS of its own), so `NSP::GetStatus()` is not `Success`, the loader
-/// identifies the file as `FileType::Error`, and upstream skips it:
+/// listed once a `Loader` accepts it *and* reports a real file type. Container
+/// formats must additionally carry Application/Program content, which keeps
+/// update/DLC-only packages out of the list.
 ///
 /// ```cpp
 /// const auto file_type = loader->GetFileType();
@@ -2128,35 +2273,71 @@ fn scan_dir_games(dir: &Path, deep_scan: bool, reader: &mut MetadataReader) -> V
     games
 }
 
-/// Eden `ScanTarget::FillManualContentProvider` pass over every configured
+/// Upstream `ScanTarget::FillManualContentProvider` pass over every configured
 /// filesystem game directory.
 pub(crate) fn populate_manual_content_provider(
     vfs: &Arc<RealVfsFilesystem>,
     provider: &mut ManualContentProvider,
     directories: &[GameDir],
 ) {
-    if !*common::settings::values()
+    let add_container_content = *common::settings::values()
         .ext_content_from_game_dirs
-        .get_value()
-    {
-        return;
-    }
+        .get_value();
 
+    let mut candidates = Vec::new();
     for directory in directories {
-        let mut candidates = Vec::new();
         collect_candidates(
             Path::new(&directory.path),
             directory.deep_scan,
             &mut candidates,
         );
-        for candidate in candidates {
-            let Some(file) = vfs.arc_open_file(&candidate.path.to_string_lossy(), OpenMode::READ)
-            else {
-                continue;
-            };
-            provider.add_entries_from_container(file, false, None);
+    }
+
+    for candidate in candidates {
+        let Some(file) = vfs.arc_open_file(&candidate.path.to_string_lossy(), OpenMode::READ)
+        else {
+            continue;
+        };
+        match identify_file(&file) {
+            FileType::NCA => {
+                let nca = NCA::new(file.clone(), None);
+                if nca.get_status() == FsResultStatus::Success {
+                    provider.add_entry(
+                        TitleType::Application,
+                        get_cr_type_from_nca_type(nca.get_type() as u8),
+                        nca.get_title_id(),
+                        file,
+                    );
+                }
+            }
+            FileType::NSP | FileType::XCI => {
+                if add_container_content {
+                    let _ = provider.add_entries_from_container(file, false, None);
+                }
+            }
+            _ => {}
         }
     }
+}
+
+fn clear_frontend_manual_content_provider() {
+    let providers = frontend_content_providers();
+    let mut manual = providers
+        .manual
+        .inner
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    manual.clear_all_entries();
+}
+
+fn populate_frontend_manual_content_provider(directories: &[GameDir]) {
+    let providers = frontend_content_providers();
+    let mut manual = providers
+        .manual
+        .inner
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    populate_manual_content_provider(&providers.vfs, &mut manual, directories);
 }
 
 /// Collect candidate game files under `dir`, recursively when `deep_scan` is set.
@@ -2176,23 +2357,35 @@ fn collect_candidates(dir: &Path, deep_scan: bool, games: &mut Vec<GameFile>) {
             }
             continue;
         }
-        let Some(ext) = path.extension().and_then(|e| e.to_str()) else {
-            continue;
-        };
-        let ext_lower = ext.to_lowercase();
-        if !SUPPORTED_EXTENSIONS.contains(&ext_lower.as_str()) {
+        let is_extracted_nca_main = path.file_name().and_then(|name| name.to_str()) == Some("main");
+        let ext_lower = path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .map(str::to_lowercase);
+        if !is_extracted_nca_main
+            && !ext_lower
+                .as_deref()
+                .is_some_and(|ext| SUPPORTED_EXTENSIONS.contains(&ext))
+        {
             continue;
         }
-        let name = path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("")
-            .to_owned();
+        let name = if is_extracted_nca_main {
+            path.parent()
+                .and_then(Path::file_name)
+                .and_then(|name| name.to_str())
+                .unwrap_or("main")
+                .to_owned()
+        } else {
+            path.file_stem()
+                .and_then(|stem| stem.to_str())
+                .unwrap_or("")
+                .to_owned()
+        };
         games.push(GameFile {
             name,
             developer: String::new(),
             version: "1.0.0".to_string(),
-            kind: ext_lower.to_uppercase(),
+            kind: ext_lower.as_deref().unwrap_or("NCA").to_uppercase(),
             size: metadata.len(),
             path,
             program_id: 0,
@@ -2212,30 +2405,17 @@ struct MetadataReader {
     vfs: Arc<RealVfsFilesystem>,
     content_provider: Arc<Mutex<ContentProviderUnion>>,
     controller: Arc<Mutex<FileSystemController>>,
-    manual_content_provider: Box<ManualContentProvider>,
     loader_system: LoaderSystem,
 }
 
 impl MetadataReader {
     fn new() -> Self {
-        let vfs = RealVfsFilesystem::new();
-        let content_provider = Arc::new(Mutex::new(ContentProviderUnion::new()));
+        let providers = frontend_content_providers();
+        let vfs = Arc::clone(&providers.vfs);
+        let content_provider = Arc::clone(&providers.union);
         let mut controller = FileSystemController::new();
         controller.set_content_provider(content_provider.clone());
         controller.create_factories(vfs.clone(), false);
-        let mut manual_content_provider = Box::new(ManualContentProvider::new());
-        {
-            let mut provider = content_provider
-                .lock()
-                .unwrap_or_else(|error| error.into_inner());
-            unsafe {
-                provider.set_slot(
-                    ContentProviderUnionSlot::FrontendManual,
-                    (&mut *manual_content_provider as *mut ManualContentProvider)
-                        as *mut dyn ruzu_core::file_sys::registered_cache::ContentProvider,
-                );
-            }
-        }
         let controller = Arc::new(Mutex::new(controller));
         let loader_system = LoaderSystem {
             content_provider: Some(Arc::clone(&content_provider)),
@@ -2245,7 +2425,6 @@ impl MetadataReader {
             vfs,
             content_provider,
             controller,
-            manual_content_provider,
             loader_system,
         }
     }
@@ -2254,12 +2433,15 @@ impl MetadataReader {
     /// bootable title (no loader, or `FileType::Unknown` / `FileType::Error`).
     fn read(&mut self, path: &str) -> Option<GameMetadata> {
         let file = self.vfs.arc_open_file(path, OpenMode::READ)?;
-        let loader = get_loader(&mut self.loader_system, file, 0, 0)?;
+        let loader = get_loader(&mut self.loader_system, file.clone(), 0, 0)?;
 
-        // Upstream's skip condition, verbatim: an update-only NSP lands here as
-        // `Error` because its program NCA has no base RomFS to patch.
         let file_type = loader.get_file_type();
         if matches!(file_type, FileType::Unknown | FileType::Error) {
+            return None;
+        }
+        if matches!(file_type, FileType::NSP | FileType::XCI)
+            && !is_bootable_game_container(file, file_type, 0, 0)
+        {
             return None;
         }
 
@@ -2439,6 +2621,29 @@ mod tests {
             std::env::temp_dir().join(format!("ruzu-game-list-{}-{counter}", std::process::id()));
         std::fs::create_dir_all(&path).unwrap();
         path
+    }
+
+    #[test]
+    fn missing_game_directory_uses_the_bad_folder_icon() {
+        // The two embedded assets must stay distinguishable for this test.
+        assert_ne!(FOLDER_ICON_PNG, BAD_FOLDER_ICON_PNG);
+
+        let existing = make_temp_dir();
+        assert_eq!(folder_icon_png(existing.to_str().unwrap()), FOLDER_ICON_PNG);
+
+        let missing = existing.join("gone");
+        assert!(!missing.exists());
+        assert_eq!(
+            folder_icon_png(missing.to_str().unwrap()),
+            BAD_FOLDER_ICON_PNG
+        );
+
+        // A directory that disappears after being registered switches icons.
+        std::fs::remove_dir_all(&existing).unwrap();
+        assert_eq!(
+            folder_icon_png(existing.to_str().unwrap()),
+            BAD_FOLDER_ICON_PNG
+        );
     }
 
     #[test]
@@ -2629,6 +2834,24 @@ mod tests {
     }
 
     #[test]
+    fn collect_candidates_accepts_extracted_nca_main() {
+        let root = make_temp_dir();
+        let extracted = root.join("extracted_program");
+        std::fs::create_dir_all(&extracted).unwrap();
+        std::fs::write(extracted.join("main"), []).unwrap();
+
+        let mut games = Vec::new();
+        collect_candidates(&root, true, &mut games);
+
+        assert_eq!(games.len(), 1);
+        assert_eq!(games[0].path, extracted.join("main"));
+        assert_eq!(games[0].name, "extracted_program");
+        assert_eq!(games[0].kind, "NCA");
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn sole_directory_is_selected_after_reload() {
         let directory = GameDir {
             path: String::from(r"D:\Games\Switch"),
@@ -2699,6 +2922,9 @@ mod tests {
                 patch_type: ruzu_core::file_sys::patch_manager::PatchType::Update,
                 program_id: 1,
                 title_id: 1,
+                source: ruzu_core::file_sys::patch_manager::PatchSource::Unknown,
+                location: String::new(),
+                numeric_version: 0,
             },
             Patch {
                 enabled: false,
@@ -2707,6 +2933,9 @@ mod tests {
                 patch_type: ruzu_core::file_sys::patch_manager::PatchType::Mod,
                 program_id: 1,
                 title_id: 1,
+                source: ruzu_core::file_sys::patch_manager::PatchSource::Unknown,
+                location: String::new(),
+                numeric_version: 0,
             },
         ];
         assert_eq!(

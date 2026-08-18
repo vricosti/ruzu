@@ -18,6 +18,7 @@ pub mod fs_i_storage;
 pub mod fs_types;
 pub mod hierarchical_integrity_verification_storage;
 pub mod hierarchical_sha256_storage;
+pub mod hierarchical_sha3_storage;
 pub mod indirect_storage;
 pub mod integrity_romfs_storage;
 pub mod integrity_verification_storage;

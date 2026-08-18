@@ -1,6 +1,6 @@
-//! Port of zuyu/src/core/guest_memory.h
+//! Port of eden/src/core/guest_memory.h
 //! Status: COMPLET
-//! Derniere synchro: 2026-03-11
+//! Derniere synchro: 2026-08-17
 //!
 //! GuestMemory and GuestMemoryScoped types for safe access to guest (emulated)
 //! memory. The C++ version uses templates parameterized on a memory interface M,
@@ -8,6 +8,8 @@
 //! for the memory interface.
 
 use bitflags::bitflags;
+use common::scratch_buffer::ScratchBuffer;
+use std::marker::PhantomData;
 
 bitflags! {
     /// Flags controlling guest memory access behavior.
@@ -73,8 +75,8 @@ pub trait GuestMemoryInterface {
 ///
 /// The FLAGS parameter is a runtime value here (since Rust doesn't have const
 /// generics for bitflags). The caller is responsible for passing consistent flags.
-pub struct GuestMemory<'a, M: GuestMemoryInterface, T: Copy + Default> {
-    memory: &'a M,
+pub struct GuestMemory<'memory, 'backup, M: GuestMemoryInterface, T: Copy + Default + Clone> {
+    memory: &'memory M,
     addr: u64,
     size: usize,
     flags: GuestMemoryFlags,
@@ -85,14 +87,43 @@ pub struct GuestMemory<'a, M: GuestMemoryInterface, T: Copy + Default> {
     span_valid: bool,
     is_data_copy: bool,
     addr_changed: bool,
+    _backup: PhantomData<&'backup mut ScratchBuffer<T>>,
 }
 
-impl<'a, M: GuestMemoryInterface, T: Copy + Default> GuestMemory<'a, M, T> {
+impl<'memory, M: GuestMemoryInterface, T: Copy + Default + Clone>
+    GuestMemory<'memory, 'static, M, T>
+{
     /// Create a new GuestMemory accessor.
     ///
     /// If FLAGS includes READ, the data is immediately read from guest memory.
     /// If FLAGS is write-only, a buffer is allocated for the caller to fill.
-    pub fn new(memory: &'a M, addr: u64, size: usize, flags: GuestMemoryFlags) -> Self {
+    pub fn new(memory: &'memory M, addr: u64, size: usize, flags: GuestMemoryFlags) -> Self {
+        Self::new_impl(memory, addr, size, flags, None)
+    }
+}
+
+impl<'memory, 'backup, M: GuestMemoryInterface, T: Copy + Default + Clone>
+    GuestMemory<'memory, 'backup, M, T>
+{
+    /// Create an accessor using the caller-owned upstream scratch buffer when
+    /// the guest range cannot be exposed as one contiguous host span.
+    pub fn new_with_backup(
+        memory: &'memory M,
+        addr: u64,
+        size: usize,
+        flags: GuestMemoryFlags,
+        backup: &'backup mut ScratchBuffer<T>,
+    ) -> Self {
+        Self::new_impl(memory, addr, size, flags, Some(backup))
+    }
+
+    fn new_impl(
+        memory: &'memory M,
+        addr: u64,
+        size: usize,
+        flags: GuestMemoryFlags,
+        backup: Option<&'backup mut ScratchBuffer<T>>,
+    ) -> Self {
         assert!(
             flags.contains(GuestMemoryFlags::READ) || flags.contains(GuestMemoryFlags::WRITE),
             "GuestMemory must have at least READ or WRITE flag"
@@ -108,19 +139,19 @@ impl<'a, M: GuestMemoryInterface, T: Copy + Default> GuestMemory<'a, M, T> {
             span_valid: false,
             is_data_copy: false,
             addr_changed: false,
+            _backup: PhantomData,
         };
 
         if !flags.contains(GuestMemoryFlags::READ) {
             // Write-only path: allocate a buffer
             if !gm.try_set_span() {
-                gm.data_copy.resize(size, T::default());
-                gm.data_ptr = gm.data_copy.as_mut_ptr();
+                gm.set_copy_storage(size, backup);
                 gm.span_valid = true;
                 gm.is_data_copy = true;
             }
         } else {
             // Read path
-            gm.read_impl(addr, size);
+            gm.read_impl(addr, size, backup);
         }
 
         gm
@@ -173,10 +204,20 @@ impl<'a, M: GuestMemoryInterface, T: Copy + Default> GuestMemory<'a, M, T> {
 
     /// Read data from the given guest address into this accessor.
     pub fn read(&mut self, addr: u64, size: usize) {
-        self.read_impl(addr, size);
+        self.read_impl(addr, size, None);
     }
 
-    fn read_impl(&mut self, addr: u64, size: usize) {
+    /// Read using a caller-owned scratch buffer for the non-contiguous fallback.
+    pub fn read_with_backup(
+        &mut self,
+        addr: u64,
+        size: usize,
+        backup: &'backup mut ScratchBuffer<T>,
+    ) {
+        self.read_impl(addr, size, Some(backup));
+    }
+
+    fn read_impl(&mut self, addr: u64, size: usize, backup: Option<&'backup mut ScratchBuffer<T>>) {
         self.addr = addr;
         self.size = size;
 
@@ -190,8 +231,7 @@ impl<'a, M: GuestMemoryInterface, T: Copy + Default> GuestMemory<'a, M, T> {
                 self.memory.flush_region(self.addr, self.size_bytes());
             }
         } else {
-            self.data_copy.resize(self.size, T::default());
-            self.data_ptr = self.data_copy.as_mut_ptr();
+            self.set_copy_storage(self.size, backup);
             self.is_data_copy = true;
             self.span_valid = true;
 
@@ -205,6 +245,16 @@ impl<'a, M: GuestMemoryInterface, T: Copy + Default> GuestMemory<'a, M, T> {
                     self.size_bytes(),
                 );
             }
+        }
+    }
+
+    fn set_copy_storage(&mut self, size: usize, backup: Option<&'backup mut ScratchBuffer<T>>) {
+        if let Some(backup) = backup {
+            backup.resize_destructive(size);
+            self.data_ptr = backup.data_mut().as_mut_ptr();
+        } else {
+            self.data_copy.resize(size, T::default());
+            self.data_ptr = self.data_copy.as_mut_ptr();
         }
     }
 
@@ -250,15 +300,33 @@ impl<'a, M: GuestMemoryInterface, T: Copy + Default> GuestMemory<'a, M, T> {
 /// Corresponds to the C++ `GuestMemoryScoped<M, T, FLAGS>` template.
 /// When the FLAGS include WRITE, the destructor writes the data back to guest
 /// memory if the data was copied or the address was changed.
-pub struct GuestMemoryScoped<'a, M: GuestMemoryInterface, T: Copy + Default> {
-    inner: GuestMemory<'a, M, T>,
+pub struct GuestMemoryScoped<'memory, 'backup, M: GuestMemoryInterface, T: Copy + Default + Clone> {
+    inner: GuestMemory<'memory, 'backup, M, T>,
 }
 
-impl<'a, M: GuestMemoryInterface, T: Copy + Default> GuestMemoryScoped<'a, M, T> {
+impl<'memory, M: GuestMemoryInterface, T: Copy + Default + Clone>
+    GuestMemoryScoped<'memory, 'static, M, T>
+{
     /// Create a new scoped guest memory accessor.
-    pub fn new(memory: &'a M, addr: u64, size: usize, flags: GuestMemoryFlags) -> Self {
+    pub fn new(memory: &'memory M, addr: u64, size: usize, flags: GuestMemoryFlags) -> Self {
         Self {
             inner: GuestMemory::new(memory, addr, size, flags),
+        }
+    }
+}
+
+impl<'memory, 'backup, M: GuestMemoryInterface, T: Copy + Default + Clone>
+    GuestMemoryScoped<'memory, 'backup, M, T>
+{
+    pub fn new_with_backup(
+        memory: &'memory M,
+        addr: u64,
+        size: usize,
+        flags: GuestMemoryFlags,
+        backup: &'backup mut ScratchBuffer<T>,
+    ) -> Self {
+        Self {
+            inner: GuestMemory::new_with_backup(memory, addr, size, flags, backup),
         }
     }
 
@@ -291,7 +359,9 @@ impl<'a, M: GuestMemoryInterface, T: Copy + Default> GuestMemoryScoped<'a, M, T>
     }
 }
 
-impl<'a, M: GuestMemoryInterface, T: Copy + Default> Drop for GuestMemoryScoped<'a, M, T> {
+impl<'memory, 'backup, M: GuestMemoryInterface, T: Copy + Default + Clone> Drop
+    for GuestMemoryScoped<'memory, 'backup, M, T>
+{
     fn drop(&mut self) {
         if !self.inner.flags.contains(GuestMemoryFlags::WRITE) {
             return;
@@ -323,5 +393,98 @@ impl<'a, M: GuestMemoryInterface, T: Copy + Default> Drop for GuestMemoryScoped<
                 .memory
                 .invalidate_region(self.inner.addr, self.inner.size_bytes());
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::{Cell, UnsafeCell};
+
+    struct TestMemory {
+        bytes: UnsafeCell<Vec<u8>>,
+        direct: bool,
+        read_calls: Cell<usize>,
+        flush_calls: Cell<usize>,
+    }
+
+    impl TestMemory {
+        fn new(words: &[u32], direct: bool) -> Self {
+            let bytes = words.iter().flat_map(|word| word.to_ne_bytes()).collect();
+            Self {
+                bytes: UnsafeCell::new(bytes),
+                direct,
+                read_calls: Cell::new(0),
+                flush_calls: Cell::new(0),
+            }
+        }
+    }
+
+    impl GuestMemoryInterface for TestMemory {
+        const HAS_FLUSH_INVALIDATION: bool = true;
+
+        fn get_span(&self, addr: u64, size: usize) -> Option<*mut u8> {
+            if !self.direct {
+                return None;
+            }
+            let bytes = unsafe { &mut *self.bytes.get() };
+            (addr as usize + size <= bytes.len())
+                .then(|| unsafe { bytes.as_mut_ptr().add(addr as usize) })
+        }
+
+        fn read_block(&self, addr: u64, dest: *mut u8, size: usize) {
+            self.read_calls.set(self.read_calls.get() + 1);
+            let bytes = unsafe { &*self.bytes.get() };
+            unsafe {
+                std::ptr::copy_nonoverlapping(bytes.as_ptr().add(addr as usize), dest, size);
+            }
+        }
+
+        fn read_block_unsafe(&self, addr: u64, dest: *mut u8, size: usize) {
+            self.read_block(addr, dest, size);
+        }
+
+        fn write_block(&self, _addr: u64, _src: *const u8, _size: usize) {}
+
+        fn write_block_unsafe(&self, _addr: u64, _src: *const u8, _size: usize) {}
+
+        fn write_block_cached(&self, _addr: u64, _src: *const u8, _size: usize) {}
+
+        fn flush_region(&self, _addr: u64, _size: usize) {
+            self.flush_calls.set(self.flush_calls.get() + 1);
+        }
+
+        fn invalidate_region(&self, _addr: u64, _size: usize) {}
+    }
+
+    #[test]
+    fn contiguous_safe_read_uses_span_and_flushes_without_touching_backup() {
+        let memory = TestMemory::new(&[0x1234_5678, 0x90ab_cdef], true);
+        let mut backup = ScratchBuffer::<u32>::new();
+        let guest =
+            GuestMemory::new_with_backup(&memory, 0, 2, GuestMemoryFlags::SAFE_READ, &mut backup);
+
+        assert!(!guest.is_data_copy());
+        assert_eq!(unsafe { guest.as_slice() }, &[0x1234_5678, 0x90ab_cdef]);
+        assert_eq!(memory.read_calls.get(), 0);
+        assert_eq!(memory.flush_calls.get(), 1);
+        drop(guest);
+        assert_eq!(backup.size(), 0);
+    }
+
+    #[test]
+    fn non_contiguous_read_uses_and_reuses_caller_backup() {
+        let memory = TestMemory::new(&[0x1234_5678, 0x90ab_cdef], false);
+        let mut backup = ScratchBuffer::<u32>::with_capacity(4);
+        let capacity = backup.capacity();
+        let guest =
+            GuestMemory::new_with_backup(&memory, 0, 2, GuestMemoryFlags::UNSAFE_READ, &mut backup);
+
+        assert!(guest.is_data_copy());
+        assert_eq!(unsafe { guest.as_slice() }, &[0x1234_5678, 0x90ab_cdef]);
+        assert_eq!(memory.read_calls.get(), 1);
+        drop(guest);
+        assert_eq!(backup.size(), 2);
+        assert_eq!(backup.capacity(), capacity);
     }
 }

@@ -1,18 +1,19 @@
 // SPDX-FileCopyrightText: Copyright 2024 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-//! Port of zuyu/src/video_core/renderer_opengl/gl_blit_screen.h and gl_blit_screen.cpp
+//! Port of Eden `video_core/renderer_opengl/gl_blit_screen.{h,cpp}`.
 //!
 //! Handles compositing framebuffers to the screen using Layer + WindowAdaptPass.
 //! This is the final stage of the OpenGL rendering pipeline.
 
 use crate::framebuffer_config::FramebufferConfig;
-use crate::present::PresentFilters;
+use crate::present::{PresentFilters, ScalingFilter};
 use ruzu_core::frontend::framebuffer_layout::FramebufferLayout;
+use std::collections::LinkedList;
 
 use super::gl_shader_manager::ProgramManagerHandle;
 use super::gl_state_tracker::StateTracker;
-use super::present::filters::{self, ScalingFilter};
+use super::present::filters;
 use super::present::layer::Layer;
 use super::present::window_adapt_pass::WindowAdaptPass;
 use super::{Device, RasterizerOpenGL};
@@ -20,21 +21,27 @@ use crate::renderer_base::DeviceMemoryReader;
 
 const GL_ALPHA_TEST: u32 = 0x0BC0;
 
-fn to_opengl_scaling_filter(filter: crate::present::ScalingFilter) -> ScalingFilter {
-    match filter {
-        crate::present::ScalingFilter::NearestNeighbor => ScalingFilter::NearestNeighbor,
-        crate::present::ScalingFilter::Bilinear => ScalingFilter::Bilinear,
-        crate::present::ScalingFilter::Bicubic => ScalingFilter::Bicubic,
-        crate::present::ScalingFilter::Gaussian => ScalingFilter::Gaussian,
-        crate::present::ScalingFilter::ScaleForce => ScalingFilter::ScaleForce,
-        crate::present::ScalingFilter::Fsr => ScalingFilter::Fsr,
-    }
+/// Structure used for storing information about the display target for the
+/// Switch screen.
+///
+/// Port of `OpenGL::FramebufferTextureInfo` from `gl_blit_screen.h`.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct FramebufferTextureInfo {
+    pub display_texture: u32,
+    pub width: u32,
+    pub height: u32,
+    pub scaled_width: u32,
+    pub scaled_height: u32,
 }
 
 /// BlitScreen handles the final frame composition to the window.
 ///
-/// Corresponds to zuyu's `BlitScreen` class.
+/// Corresponds to Eden's `BlitScreen` class.
 pub struct BlitScreen {
+    // Rust drops fields in declaration order. Eden destroys layers before the
+    // window-adapt pass (reverse C++ member order).
+    layers: LinkedList<Layer>,
+    window_adapt: Option<WindowAdaptPass>,
     filters: &'static PresentFilters,
     program_manager: ProgramManagerHandle,
     /// Upstream stores `RasterizerOpenGL& rasterizer` on `BlitScreen`.
@@ -45,8 +52,6 @@ pub struct BlitScreen {
     device: *const Device,
     device_memory: DeviceMemoryReader,
     current_window_adapt: Option<ScalingFilter>,
-    window_adapt: Option<WindowAdaptPass>,
-    layers: Vec<Layer>,
 }
 
 // Safety: `BlitScreen` is owned by `RendererOpenGL`. The raw rasterizer pointer
@@ -65,9 +70,10 @@ impl BlitScreen {
         device: *const Device,
         device_memory: DeviceMemoryReader,
         filters: &'static PresentFilters,
-    ) -> Result<Self, String> {
-        log::info!("BlitScreen: OpenGL blit pipeline created");
-        Ok(Self {
+    ) -> Self {
+        Self {
+            layers: LinkedList::new(),
+            window_adapt: None,
             filters,
             program_manager,
             rasterizer,
@@ -75,9 +81,7 @@ impl BlitScreen {
             device,
             device_memory,
             current_window_adapt: None,
-            window_adapt: None,
-            layers: Vec::new(),
-        })
+        }
     }
 
     /// Draw emulated screens to the emulator window.
@@ -136,7 +140,7 @@ impl BlitScreen {
 
         // Ensure we have enough Layer instances.
         while self.layers.len() < framebuffers.len() {
-            self.layers.push(Layer::new(
+            self.layers.push_back(Layer::new(
                 self.rasterizer,
                 self.device_memory.clone(),
                 self.filters,
@@ -144,29 +148,46 @@ impl BlitScreen {
         }
 
         self.create_window_adapt();
-        if let Some(ref window_adapt) = self.window_adapt {
-            window_adapt.draw_to_framebuffer(
+        self.window_adapt
+            .as_ref()
+            .expect("CreateWindowAdapt must always construct a presentation pass")
+            .draw_to_framebuffer(
                 &mut self.layers,
                 framebuffers,
                 layout,
                 invert_y,
                 &self.program_manager,
             );
-        }
     }
 
     /// Create or recreate the window adapt pass if the scaling filter changed.
     ///
     /// Port of `BlitScreen::CreateWindowAdapt()`.
     fn create_window_adapt(&mut self) {
-        let desired = to_opengl_scaling_filter((self.filters.get_scaling_filter)());
+        let desired = (self.filters.get_scaling_filter)();
 
         if self.window_adapt.is_some() && self.current_window_adapt == Some(desired) {
             return;
         }
 
         self.current_window_adapt = Some(desired);
-        self.window_adapt = Some(filters::make_filter(desired, self.device));
+        self.window_adapt = Some(match desired {
+            ScalingFilter::NearestNeighbor => filters::make_nearest_neighbor(self.device),
+            ScalingFilter::Bicubic => filters::make_bicubic(self.device),
+            ScalingFilter::ZeroTangent => filters::make_zero_tangent(self.device),
+            ScalingFilter::BSpline => filters::make_b_spline(self.device),
+            ScalingFilter::Mitchell => filters::make_mitchell(self.device),
+            ScalingFilter::Gaussian => filters::make_gaussian(self.device),
+            ScalingFilter::Spline1 => filters::make_spline1(self.device),
+            ScalingFilter::Lanczos => filters::make_lanczos(self.device),
+            ScalingFilter::ScaleForce => filters::make_scale_force(self.device),
+            ScalingFilter::Area => filters::make_area(self.device),
+            ScalingFilter::Mmpx => filters::make_mmpx(self.device),
+            ScalingFilter::Fsr
+            | ScalingFilter::Sgsr
+            | ScalingFilter::SgsrEdge
+            | ScalingFilter::Bilinear => filters::make_bilinear(self.device),
+        });
     }
 }
 
@@ -175,31 +196,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn opengl_scaling_filter_maps_present_filters() {
-        assert_eq!(
-            to_opengl_scaling_filter(crate::present::ScalingFilter::NearestNeighbor),
-            ScalingFilter::NearestNeighbor
-        );
-        assert_eq!(
-            to_opengl_scaling_filter(crate::present::ScalingFilter::Bilinear),
-            ScalingFilter::Bilinear
-        );
-        assert_eq!(
-            to_opengl_scaling_filter(crate::present::ScalingFilter::Bicubic),
-            ScalingFilter::Bicubic
-        );
-        assert_eq!(
-            to_opengl_scaling_filter(crate::present::ScalingFilter::Gaussian),
-            ScalingFilter::Gaussian
-        );
-        assert_eq!(
-            to_opengl_scaling_filter(crate::present::ScalingFilter::ScaleForce),
-            ScalingFilter::ScaleForce
-        );
-        assert_eq!(
-            to_opengl_scaling_filter(crate::present::ScalingFilter::Fsr),
-            ScalingFilter::Fsr
-        );
+    fn scaling_filter_discriminants_match_settings() {
+        assert_eq!(ScalingFilter::NearestNeighbor as u32, 0);
+        assert_eq!(ScalingFilter::Lanczos as u32, 4);
+        assert_eq!(ScalingFilter::SgsrEdge as u32, 14);
     }
 
     #[test]

@@ -114,16 +114,25 @@ impl SharedTickState {
         let compose_speed_scale =
             f32::from_bits(self.compose_speed_scale_bits.load(Ordering::Relaxed));
         let swap_interval = self.swap_interval.load(Ordering::Relaxed);
+        let (use_multi_core, use_speed_limit) = speed_settings();
         compute_next_ticks(
             swap_interval,
             compose_speed_scale,
-            *settings::values().use_multi_core.get_value(),
-            *settings::values().use_speed_limit.get_value(),
-            *settings::values().speed_limit.get_value(),
+            use_multi_core,
+            use_speed_limit,
+            settings::speed_limit(),
             system.get().get_nvdec_active(),
             *settings::values().use_video_framerate.get_value(),
         )
     }
+}
+
+fn speed_settings() -> (bool, bool) {
+    let values = settings::values();
+    (
+        *values.use_multi_core.get_value(),
+        *values.use_speed_limit.get_value(),
+    )
 }
 
 fn compute_next_ticks(
@@ -405,12 +414,13 @@ impl Conductor {
     /// Calculate the next tick interval in nanoseconds.
     /// Port of upstream `Conductor::GetNextTicks`.
     pub fn get_next_ticks(&self) -> i64 {
+        let (use_multi_core, use_speed_limit) = speed_settings();
         compute_next_ticks(
             self.swap_interval,
             self.compose_speed_scale,
-            *settings::values().use_multi_core.get_value(),
-            *settings::values().use_speed_limit.get_value(),
-            *settings::values().speed_limit.get_value(),
+            use_multi_core,
+            use_speed_limit,
+            settings::speed_limit(),
             self.system.get().get_nvdec_active(),
             *settings::values().use_video_framerate.get_value(),
         )

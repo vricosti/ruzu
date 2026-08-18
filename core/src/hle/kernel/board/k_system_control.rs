@@ -40,6 +40,8 @@ fn get_memory_size_for_init() -> MemorySize {
         MemoryLayout::Memory4Gb => MemorySize::MemorySize4GB,
         MemoryLayout::Memory6Gb => MemorySize::MemorySize6GB,
         MemoryLayout::Memory8Gb => MemorySize::MemorySize8GB,
+        MemoryLayout::Memory10Gb => MemorySize::MemorySize10GB,
+        MemoryLayout::Memory12Gb => MemorySize::MemorySize12GB,
     }
 }
 
@@ -49,6 +51,8 @@ fn get_memory_arrange_for_init() -> MemoryArrangement {
         MemorySize::MemorySize4GB => MemoryArrangement::MemoryArrangement4GB,
         MemorySize::MemorySize6GB => MemoryArrangement::MemoryArrangement6GB,
         MemorySize::MemorySize8GB => MemoryArrangement::MemoryArrangement8GB,
+        MemorySize::MemorySize10GB => MemoryArrangement::MemoryArrangement10GB,
+        MemorySize::MemorySize12GB => MemoryArrangement::MemoryArrangement12GB,
     }
 }
 
@@ -67,6 +71,8 @@ pub mod init {
             MemorySize::MemorySize4GB => 4 * GIB,
             MemorySize::MemorySize6GB => 6 * GIB,
             MemorySize::MemorySize8GB => 8 * GIB,
+            MemorySize::MemorySize10GB => 10 * GIB,
+            MemorySize::MemorySize12GB => 12 * GIB,
         }
     }
 
@@ -95,6 +101,8 @@ pub mod init {
             MemoryArrangement::MemoryArrangement6GB => 4916 * MIB,
             MemoryArrangement::MemoryArrangement6GBForAppletDev => 3285 * MIB,
             MemoryArrangement::MemoryArrangement8GB => 6547 * MIB,
+            MemoryArrangement::MemoryArrangement10GB => 8178 * MIB,
+            MemoryArrangement::MemoryArrangement12GB => 9809 * MIB,
         }
     }
 
@@ -107,6 +115,8 @@ pub mod init {
             MemoryArrangement::MemoryArrangement6GB => 562 * MIB,
             MemoryArrangement::MemoryArrangement6GBForAppletDev => 2193 * MIB,
             MemoryArrangement::MemoryArrangement8GB => 562 * MIB,
+            MemoryArrangement::MemoryArrangement10GB => 562 * MIB,
+            MemoryArrangement::MemoryArrangement12GB => 562 * MIB,
         };
 
         let extra_system_memory_for_atmosphere: usize = 33 * MIB;

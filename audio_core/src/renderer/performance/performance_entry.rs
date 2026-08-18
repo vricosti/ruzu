@@ -49,3 +49,6 @@ impl Default for PerformanceEntryVersion2 {
         }
     }
 }
+
+const _: () = assert!(std::mem::size_of::<PerformanceEntryVersion1>() == 0x10);
+const _: () = assert!(std::mem::size_of::<PerformanceEntryVersion2>() == 0x18);

@@ -3,12 +3,14 @@ use rxbyak::{JmpType, Reg, RegExp};
 use rxbyak::{CL, R15};
 
 use crate::backend::x64::emit_context::EmitContext;
+use crate::backend::x64::host_feature::HostFeature;
 use crate::backend::x64::hostloc::*;
 use crate::backend::x64::nzcv_util;
 use crate::backend::x64::reg_alloc::Argument;
 use crate::backend::x64::reg_alloc::RegAlloc;
 use crate::backend::x64::value_classify::{ir_value_is_vector_backed, ir_value_resolves_to_xmm};
 use crate::ir::inst::Inst;
+use crate::ir::types::Type;
 use crate::ir::value::InstRef;
 
 // ---------------------------------------------------------------------------
@@ -151,7 +153,7 @@ pub fn emit_add64(ctx: &EmitContext, ra: &mut RegAlloc, inst_ref: InstRef, inst:
 /// Pre-allocates a register for carry_out BEFORE the arithmetic instruction.
 /// Returns None if no carry pseudo-op exists.
 fn do_carry(ra: &mut RegAlloc, carry_in: &mut Argument, carry_out: Option<InstRef>) -> Option<Reg> {
-    let carry_out = carry_out?;
+    let _carry_out = carry_out?;
     let reg = if carry_in.is_immediate() {
         ra.scratch_gpr()
     } else {
@@ -189,6 +191,24 @@ fn emit_add(ctx: &EmitContext, ra: &mut RegAlloc, inst_ref: InstRef, inst: &Inst
     let mut args = ra.get_argument_info(inst_ref, &inst.args, inst.num_args());
     let carry_in_is_zero = args[2].is_immediate() && !args[2].get_immediate_u1();
 
+    if carry_inst.is_none() && overflow_inst.is_none() && nzcv_inst.is_none() && carry_in_is_zero {
+        let result = ra.use_scratch_gpr(&mut args[0]);
+        let result_sized = if bitsize == 32 {
+            result.cvt32().unwrap()
+        } else {
+            result
+        };
+        let address = if args[1].is_immediate() && args[1].fits_in_immediate_s32() {
+            rxbyak::ptr(RegExp::from(result) + args[1].get_immediate_s32() as i32)
+        } else {
+            let op2 = ra.use_gpr(&mut args[1]);
+            rxbyak::ptr(RegExp::from(result) + op2)
+        };
+        ra.asm.lea(result_sized, address).unwrap();
+        ra.define_value(inst_ref, result);
+        return;
+    }
+
     // Pre-allocate registers for pseudo-ops BEFORE the main instruction.
     // This is upstream's DoNZCV/DoCarry pattern.
     let nzcv_reg = do_nzcv(ra, nzcv_inst);
@@ -206,17 +226,32 @@ fn emit_add(ctx: &EmitContext, ra: &mut RegAlloc, inst_ref: InstRef, inst: &Inst
         result
     };
 
-    if args[1].is_immediate() && args[1].fits_in_immediate_s32() {
-        let imm = args[1].get_immediate_s32() as i32;
-        if carry_in_is_zero {
-            ra.asm.add(result_sized, imm).unwrap();
-        } else if args[2].is_immediate() && args[2].get_immediate_u1() {
-            ra.asm.stc().unwrap();
-            ra.asm.adc(result_sized, imm).unwrap();
+    if args[1].is_immediate() && args[1].get_type() == Type::U32 {
+        let op_arg = args[1].get_immediate_u32();
+        if args[2].is_immediate() {
+            if args[2].get_immediate_u1() {
+                let signed = op_arg as i32 as i64;
+                let in_range = (-0x7fff_fffe..=0x7fff_fffe).contains(&signed);
+                if in_range
+                    && (carry_inst.is_some() || nzcv_inst.is_some() || overflow_inst.is_some())
+                {
+                    ra.asm.stc().unwrap();
+                    ra.asm.adc(result_sized, op_arg).unwrap();
+                } else {
+                    ra.asm
+                        .lea(
+                            result_sized,
+                            rxbyak::ptr(RegExp::from(result) + op_arg.wrapping_add(1) as i32),
+                        )
+                        .unwrap();
+                }
+            } else {
+                ra.asm.add(result_sized, op_arg).unwrap();
+            }
         } else {
             let carry = ra.use_gpr(&mut args[2]);
             ra.asm.bt_imm(carry.cvt32().unwrap(), 0).unwrap();
-            ra.asm.adc(result_sized, imm).unwrap();
+            ra.asm.adc(result_sized, op_arg).unwrap();
         }
     } else {
         let op2 = ra.use_gpr(&mut args[1]);
@@ -290,6 +325,34 @@ fn emit_sub(ctx: &EmitContext, ra: &mut RegAlloc, inst_ref: InstRef, inst: &Inst
 
     let mut args = ra.get_argument_info(inst_ref, &inst.args, inst.num_args());
     let carry_in_is_one = args[2].is_immediate() && args[2].get_immediate_u1();
+    let pseudo_use_count =
+        carry_inst.is_some() as u32 + overflow_inst.is_some() as u32 + nzcv_inst.is_some() as u32;
+    let is_cmp = inst.use_count == pseudo_use_count && carry_in_is_one;
+
+    if carry_inst.is_none()
+        && overflow_inst.is_none()
+        && nzcv_inst.is_none()
+        && carry_in_is_one
+        && args[1].is_immediate()
+        && args[1].fits_in_immediate_s32()
+        && args[1].get_immediate_s32() != 0xffff_ffff_8000_0000
+    {
+        let op1 = ra.use_gpr(&mut args[0]);
+        let result = ra.scratch_gpr();
+        let result_sized = if bitsize == 32 {
+            result.cvt32().unwrap()
+        } else {
+            result
+        };
+        ra.asm
+            .lea(
+                result_sized,
+                rxbyak::ptr(RegExp::from(op1) - args[1].get_immediate_s32() as i32),
+            )
+            .unwrap();
+        ra.define_value(inst_ref, result);
+        return;
+    }
 
     // Pre-allocate registers for pseudo-ops BEFORE the main instruction (DoNZCV/DoCarry).
     let nzcv_reg = do_nzcv(ra, nzcv_inst);
@@ -300,7 +363,11 @@ fn emit_sub(ctx: &EmitContext, ra: &mut RegAlloc, inst_ref: InstRef, inst: &Inst
         None
     };
 
-    let result = ra.use_scratch_gpr(&mut args[0]);
+    let result = if is_cmp {
+        ra.use_gpr(&mut args[0])
+    } else {
+        ra.use_scratch_gpr(&mut args[0])
+    };
     let result_sized = if bitsize == 32 {
         result.cvt32().unwrap()
     } else {
@@ -309,18 +376,37 @@ fn emit_sub(ctx: &EmitContext, ra: &mut RegAlloc, inst_ref: InstRef, inst: &Inst
 
     let mut invert_output_carry = true;
 
-    if args[1].is_immediate() && args[1].fits_in_immediate_s32() {
-        let imm = args[1].get_immediate_s32() as i32;
-        if carry_in_is_one {
-            ra.asm.sub(result_sized, imm).unwrap();
-        } else if args[2].is_immediate() {
-            ra.asm.stc().unwrap();
-            ra.asm.sbb(result_sized, imm).unwrap();
+    if is_cmp {
+        if args[1].is_immediate() && args[1].get_type() == Type::U32 {
+            ra.asm
+                .cmp(result_sized, args[1].get_immediate_u32())
+                .unwrap();
+        } else {
+            let op2 = ra.use_gpr(&mut args[1]);
+            let op2_sized = if bitsize == 32 {
+                op2.cvt32().unwrap()
+            } else {
+                op2
+            };
+            ra.asm.cmp(result_sized, op2_sized).unwrap();
+        }
+    } else if args[1].is_immediate() && args[1].get_type() == Type::U32 {
+        let op_arg = args[1].get_immediate_u32();
+        if args[2].is_immediate() {
+            if carry_in_is_one {
+                ra.asm.sub(result_sized, op_arg).unwrap();
+            } else {
+                // Upstream deliberately expresses SBC-with-zero-carry as
+                // ADD(~op_arg). Besides saving STC, this makes x64 CF already
+                // use ARM's no-borrow convention.
+                ra.asm.add(result_sized, !op_arg).unwrap();
+                invert_output_carry = false;
+            }
         } else {
             let carry = ra.use_gpr(&mut args[2]);
             ra.asm.bt_imm(carry.cvt32().unwrap(), 0).unwrap();
-            ra.asm.cmc().unwrap();
-            ra.asm.sbb(result_sized, imm).unwrap();
+            ra.asm.adc(result_sized, !op_arg).unwrap();
+            invert_output_carry = false;
         }
     } else {
         let op2 = ra.use_gpr(&mut args[1]);
@@ -378,14 +464,9 @@ fn emit_sub(ctx: &EmitContext, ra: &mut RegAlloc, inst_ref: InstRef, inst: &Inst
         ra.define_value(overflow_ref, overflow);
     }
 
-    // If NO pseudo-ops captured the flags, still invert CF for the standalone
-    // fallback handlers.
-    if nzcv_inst.is_none() && carry_inst.is_none() && overflow_inst.is_none() && invert_output_carry
-    {
-        ra.asm.cmc().unwrap();
+    if !is_cmp {
+        ra.define_value(inst_ref, result);
     }
-
-    ra.define_value(inst_ref, result);
 }
 
 // ---------------------------------------------------------------------------
@@ -650,8 +731,18 @@ pub fn emit_not64(_ctx: &EmitContext, ra: &mut RegAlloc, inst_ref: InstRef, inst
 }
 
 /// AndNot32: result = a & ~b
-pub fn emit_and_not32(_ctx: &EmitContext, ra: &mut RegAlloc, inst_ref: InstRef, inst: &Inst) {
+pub fn emit_and_not32(ctx: &EmitContext, ra: &mut RegAlloc, inst_ref: InstRef, inst: &Inst) {
     let mut args = ra.get_argument_info(inst_ref, &inst.args, inst.num_args());
+    if !args[0].is_immediate() && !args[1].is_immediate() && ctx.has_host_feature(HostFeature::BMI1)
+    {
+        let op1 = ra.use_gpr(&mut args[0]).cvt32().unwrap();
+        let op2 = ra.use_gpr(&mut args[1]).cvt32().unwrap();
+        let result = ra.scratch_gpr();
+        ra.asm.andn(result.cvt32().unwrap(), op2, op1).unwrap();
+        ra.define_value(inst_ref, result);
+        return;
+    }
+
     let op2 = ra.use_scratch_gpr(&mut args[1]);
     ra.asm.not_(op2.cvt32().unwrap()).unwrap();
     let op1 = ra.use_gpr(&mut args[0]);
@@ -662,8 +753,18 @@ pub fn emit_and_not32(_ctx: &EmitContext, ra: &mut RegAlloc, inst_ref: InstRef, 
 }
 
 /// AndNot64: result = a & ~b
-pub fn emit_and_not64(_ctx: &EmitContext, ra: &mut RegAlloc, inst_ref: InstRef, inst: &Inst) {
+pub fn emit_and_not64(ctx: &EmitContext, ra: &mut RegAlloc, inst_ref: InstRef, inst: &Inst) {
     let mut args = ra.get_argument_info(inst_ref, &inst.args, inst.num_args());
+    if !args[0].is_immediate() && !args[1].is_immediate() && ctx.has_host_feature(HostFeature::BMI1)
+    {
+        let op1 = ra.use_gpr(&mut args[0]);
+        let op2 = ra.use_gpr(&mut args[1]);
+        let result = ra.scratch_gpr();
+        ra.asm.andn(result, op2, op1).unwrap();
+        ra.define_value(inst_ref, result);
+        return;
+    }
+
     let op2 = ra.use_scratch_gpr(&mut args[1]);
     ra.asm.not_(op2).unwrap();
     let op1 = ra.use_gpr(&mut args[0]);
@@ -737,6 +838,7 @@ pub fn emit_rotate_right64(ctx: &EmitContext, ra: &mut RegAlloc, inst_ref: InstR
     emit_shift(ctx, ra, inst_ref, inst, 64, ShiftOp::Ror);
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum ShiftOp {
     Shl,
     Shr,
@@ -765,9 +867,36 @@ fn emit_shift(
         .block
         .and_then(|b| b.get_associated_pseudo_operation(inst_ref, Opcode::GetCarryFromOp));
 
+    if bitsize == 32 {
+        if let Some(carry_ref) = carry_inst {
+            emit_shift32_with_carry(ra, inst_ref, inst, carry_ref, op);
+            return;
+        }
+    }
+
     let mut args = ra.get_argument_info(inst_ref, &inst.args, inst.num_args());
 
     if args[1].is_immediate() {
+        if op == ShiftOp::Ror && carry_inst.is_none() && ctx.has_host_feature(HostFeature::BMI2) {
+            let operand = ra.use_gpr(&mut args[0]);
+            let result = ra.scratch_gpr();
+            let result_sized = if bitsize == 32 {
+                result.cvt32().unwrap()
+            } else {
+                result
+            };
+            let operand_sized = if bitsize == 32 {
+                operand.cvt32().unwrap()
+            } else {
+                operand
+            };
+            ra.asm
+                .rorx(result_sized, operand_sized, args[1].get_immediate_u8())
+                .unwrap();
+            ra.define_value(inst_ref, result);
+            return;
+        }
+
         let result = ra.use_scratch_gpr(&mut args[0]);
         let result_sized = if bitsize == 32 {
             result.cvt32().unwrap()
@@ -847,11 +976,97 @@ fn emit_shift(
 
         ra.define_value(inst_ref, result);
     } else {
+        if carry_inst.is_none() && op != ShiftOp::Ror && ctx.has_host_feature(HostFeature::BMI2) {
+            let shift = if op == ShiftOp::Sar {
+                ra.use_scratch_gpr(&mut args[1])
+            } else {
+                ra.use_gpr(&mut args[1])
+            };
+            let operand = ra.use_gpr(&mut args[0]);
+            let result = ra.scratch_gpr();
+            let shift_sized = if bitsize == 32 {
+                shift.cvt32().unwrap()
+            } else {
+                shift
+            };
+            let operand_sized = if bitsize == 32 {
+                operand.cvt32().unwrap()
+            } else {
+                operand
+            };
+            let result_sized = if bitsize == 32 {
+                result.cvt32().unwrap()
+            } else {
+                result
+            };
+
+            match op {
+                ShiftOp::Shl | ShiftOp::Shr => {
+                    if op == ShiftOp::Shl {
+                        ra.asm
+                            .shlx(result_sized, operand_sized, shift_sized)
+                            .unwrap();
+                    } else {
+                        ra.asm
+                            .shrx(result_sized, operand_sized, shift_sized)
+                            .unwrap();
+                    }
+                    let zero = ra.scratch_gpr();
+                    ra.asm
+                        .xor_(zero.cvt32().unwrap(), zero.cvt32().unwrap())
+                        .unwrap();
+                    // This deliberately follows Eden's exact thresholds,
+                    // including its SHR64 BMI2 comparison against 63.
+                    let limit = if op == ShiftOp::Shr && bitsize == 64 {
+                        63
+                    } else {
+                        bitsize as i32
+                    };
+                    ra.asm.cmp(shift.cvt8().unwrap(), limit).unwrap();
+                    if bitsize == 32 {
+                        ra.asm
+                            .cmovnb(result.cvt32().unwrap(), zero.cvt32().unwrap())
+                            .unwrap();
+                    } else {
+                        ra.asm.cmovnb(result, zero).unwrap();
+                    }
+                    ra.release(zero);
+                }
+                ShiftOp::Sar => {
+                    let saturated_shift = ra.scratch_gpr();
+                    let saturated_shift_sized = if bitsize == 32 {
+                        saturated_shift.cvt32().unwrap()
+                    } else {
+                        saturated_shift
+                    };
+                    ra.asm
+                        .mov(saturated_shift.cvt32().unwrap(), bitsize as i32 - 1)
+                        .unwrap();
+                    ra.asm
+                        .cmp(shift.cvt8().unwrap(), bitsize as i32 - 1)
+                        .unwrap();
+                    ra.asm.cmovnb(shift_sized, saturated_shift_sized).unwrap();
+                    ra.asm
+                        .sarx(result_sized, operand_sized, shift_sized)
+                        .unwrap();
+                    ra.release(saturated_shift);
+                }
+                ShiftOp::Ror => unreachable!(),
+            }
+
+            ra.define_value(inst_ref, result);
+            return;
+        }
+
         // Upstream non-BMI2 path takes the shift argument in RCX before
         // allocating the destination scratch register. That ordering matters:
         // otherwise the destination can consume RCX and make the shift input
         // impossible to allocate.
-        ra.use_loc(&mut args[1], HostLoc::Gpr(1)); // RCX
+        if carry_inst.is_none() && op == ShiftOp::Sar {
+            ra.use_scratch(&mut args[1], HostLoc::Gpr(1)); // RCX
+        } else {
+            ra.use_loc(&mut args[1], HostLoc::Gpr(1)); // RCX
+        }
         let result = ra.use_scratch_gpr(&mut args[0]);
         let result_sized = if bitsize == 32 {
             result.cvt32().unwrap()
@@ -862,7 +1077,11 @@ fn emit_shift(
         match op {
             ShiftOp::Shl => ra.asm.shl_cl(result_sized).unwrap(),
             ShiftOp::Shr => ra.asm.shr_cl(result_sized).unwrap(),
-            ShiftOp::Sar => ra.asm.sar_cl(result_sized).unwrap(),
+            ShiftOp::Sar => {
+                if carry_inst.is_some() {
+                    ra.asm.sar_cl(result_sized).unwrap();
+                }
+            }
             ShiftOp::Ror => ra.asm.ror_cl(result_sized).unwrap(),
         }
 
@@ -885,9 +1104,26 @@ fn emit_shift(
                 }
             }
             ShiftOp::Sar => {
-                // SAR saturates: shift by min(count, width-1)
-                // We don't need extra clamping since x86 SAR masks to 31/63
-                // which gives the right result for ARM's saturating behavior
+                if carry_inst.is_none() {
+                    // ARM saturates the count; x86 masks it. Clamp RCX before
+                    // the shift exactly as Eden does.
+                    let saturated_shift = ra.scratch_gpr();
+                    ra.asm
+                        .mov(saturated_shift.cvt32().unwrap(), bitsize as i32 - 1)
+                        .unwrap();
+                    ra.asm.cmp(CL, bitsize as i32 - 1).unwrap();
+                    if bitsize == 32 {
+                        ra.asm
+                            .cmova(rxbyak::ECX, saturated_shift.cvt32().unwrap())
+                            .unwrap();
+                    } else {
+                        ra.asm
+                            .cmovnb(rxbyak::ECX, saturated_shift.cvt32().unwrap())
+                            .unwrap();
+                    }
+                    ra.asm.sar_cl(result_sized).unwrap();
+                    ra.release(saturated_shift);
+                }
             }
             ShiftOp::Ror => {
                 // Rotate: any amount works correctly with x86 masking
@@ -908,83 +1144,223 @@ fn emit_shift(
     }
 }
 
+fn emit_shift32_with_carry(
+    ra: &mut RegAlloc,
+    inst_ref: InstRef,
+    inst: &Inst,
+    carry_ref: InstRef,
+    op: ShiftOp,
+) {
+    let mut args = ra.get_argument_info(inst_ref, &inst.args, inst.num_args());
+
+    if args[1].is_immediate() {
+        let shift = args[1].get_immediate_u8();
+        let result = ra.use_scratch_gpr(&mut args[0]).cvt32().unwrap();
+        let carry = ra.use_scratch_gpr(&mut args[2]);
+        let carry32 = carry.cvt32().unwrap();
+        let carry8 = carry.cvt8().unwrap();
+
+        match op {
+            ShiftOp::Shl => {
+                if shift == 0 {
+                    // Preserve both the operand and incoming carry.
+                } else if shift < 32 {
+                    ra.asm.bt_imm(carry32, 0).unwrap();
+                    ra.asm.shl(result, shift).unwrap();
+                    ra.asm.setc(carry8).unwrap();
+                } else if shift > 32 {
+                    ra.asm.xor_(result, result).unwrap();
+                    ra.asm.xor_(carry32, carry32).unwrap();
+                } else {
+                    ra.asm.mov(carry32, result).unwrap();
+                    ra.asm.xor_(result, result).unwrap();
+                    ra.asm.and_(carry32, 1).unwrap();
+                }
+            }
+            ShiftOp::Shr => {
+                if shift == 0 {
+                    // Preserve both the operand and incoming carry.
+                } else if shift < 32 {
+                    ra.asm.shr(result, shift).unwrap();
+                    ra.asm.setc(carry8).unwrap();
+                } else if shift == 32 {
+                    ra.asm.bt_imm(result, 31).unwrap();
+                    ra.asm.setc(carry8).unwrap();
+                    ra.asm.mov(result, 0).unwrap();
+                } else {
+                    ra.asm.xor_(result, result).unwrap();
+                    ra.asm.xor_(carry32, carry32).unwrap();
+                }
+            }
+            ShiftOp::Sar => {
+                if shift == 0 {
+                    // Preserve both the operand and incoming carry.
+                } else if shift <= 31 {
+                    ra.asm.sar(result, shift).unwrap();
+                    ra.asm.setc(carry8).unwrap();
+                } else {
+                    ra.asm.sar(result, 31).unwrap();
+                    ra.asm.bt_imm(result, 31).unwrap();
+                    ra.asm.setc(carry8).unwrap();
+                }
+            }
+            ShiftOp::Ror => {
+                if shift == 0 {
+                    // Preserve both the operand and incoming carry.
+                } else if shift & 0x1f == 0 {
+                    ra.asm.bt_imm(result, 31).unwrap();
+                    ra.asm.setc(carry8).unwrap();
+                } else {
+                    ra.asm.ror(result, shift).unwrap();
+                    ra.asm.setc(carry8).unwrap();
+                }
+            }
+        }
+
+        ra.define_value(carry_ref, carry);
+        ra.define_value(inst_ref, result);
+        return;
+    }
+
+    ra.use_scratch(&mut args[1], HostLoc::Gpr(1));
+    match op {
+        ShiftOp::Shl => {
+            let result = ra.use_scratch_gpr(&mut args[0]).cvt32().unwrap();
+            let tmp = ra.scratch_gpr().cvt32().unwrap();
+            let carry = ra.use_scratch_gpr(&mut args[2]);
+            ra.asm.mov(tmp, 63).unwrap();
+            ra.asm.cmp(CL, 63).unwrap();
+            ra.asm.cmova(rxbyak::ECX, tmp).unwrap();
+            ra.asm.shl(result.cvt64().unwrap(), 32).unwrap();
+            ra.asm.bt_imm(carry.cvt32().unwrap(), 0).unwrap();
+            ra.asm.shl_cl(result.cvt64().unwrap()).unwrap();
+            ra.asm.setc(carry.cvt8().unwrap()).unwrap();
+            ra.asm.shr(result.cvt64().unwrap(), 32).unwrap();
+            ra.define_value(carry_ref, carry);
+            ra.define_value(inst_ref, result);
+        }
+        ShiftOp::Shr => {
+            let operand = ra.use_gpr(&mut args[0]).cvt32().unwrap();
+            let result = ra.scratch_gpr().cvt32().unwrap();
+            let carry = ra.use_scratch_gpr(&mut args[2]);
+            ra.asm.mov(result, 63).unwrap();
+            ra.asm.cmp(CL, 63).unwrap();
+            ra.asm.cmovnb(rxbyak::ECX, result).unwrap();
+            ra.asm.mov(result, operand).unwrap();
+            ra.asm.bt_imm(carry.cvt32().unwrap(), 0).unwrap();
+            ra.asm.shr_cl(result.cvt64().unwrap()).unwrap();
+            ra.asm.setc(carry.cvt8().unwrap()).unwrap();
+            ra.define_value(carry_ref, carry);
+            ra.define_value(inst_ref, result);
+        }
+        ShiftOp::Sar => {
+            let operand = ra.use_gpr(&mut args[0]).cvt32().unwrap();
+            let result = ra.scratch_gpr().cvt32().unwrap();
+            let carry = ra.use_scratch_gpr(&mut args[2]);
+            ra.asm.mov(result, 63).unwrap();
+            ra.asm.cmp(CL, 63).unwrap();
+            ra.asm.cmovnb(rxbyak::ECX, result).unwrap();
+            ra.asm.movsxd(result.cvt64().unwrap(), operand).unwrap();
+            ra.asm.bt_imm(carry.cvt32().unwrap(), 0).unwrap();
+            ra.asm.sar_cl(result.cvt64().unwrap()).unwrap();
+            ra.asm.setc(carry.cvt8().unwrap()).unwrap();
+            ra.define_value(carry_ref, carry);
+            ra.define_value(inst_ref, result);
+        }
+        ShiftOp::Ror => {
+            let result = ra.use_scratch_gpr(&mut args[0]).cvt32().unwrap();
+            let carry = ra.use_scratch_gpr(&mut args[2]);
+            let end = ra.asm.create_label();
+            ra.asm.test(CL, CL).unwrap();
+            ra.asm.jz(&end, JmpType::Near).unwrap();
+            ra.asm.ror_cl(result).unwrap();
+            ra.asm.bt_imm(result, 31).unwrap();
+            ra.asm.setc(carry.cvt8().unwrap()).unwrap();
+            ra.asm.bind(&end).unwrap();
+            ra.define_value(carry_ref, carry);
+            ra.define_value(inst_ref, result);
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Masked shifts (shift amount already in valid range)
 // ---------------------------------------------------------------------------
 
 pub fn emit_logical_shift_left_masked32(
-    _ctx: &EmitContext,
+    ctx: &EmitContext,
     ra: &mut RegAlloc,
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_masked_shift(ra, inst_ref, inst, 32, ShiftOp::Shl);
+    emit_masked_shift(ctx, ra, inst_ref, inst, 32, ShiftOp::Shl);
 }
 
 pub fn emit_logical_shift_left_masked64(
-    _ctx: &EmitContext,
+    ctx: &EmitContext,
     ra: &mut RegAlloc,
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_masked_shift(ra, inst_ref, inst, 64, ShiftOp::Shl);
+    emit_masked_shift(ctx, ra, inst_ref, inst, 64, ShiftOp::Shl);
 }
 
 pub fn emit_logical_shift_right_masked32(
-    _ctx: &EmitContext,
+    ctx: &EmitContext,
     ra: &mut RegAlloc,
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_masked_shift(ra, inst_ref, inst, 32, ShiftOp::Shr);
+    emit_masked_shift(ctx, ra, inst_ref, inst, 32, ShiftOp::Shr);
 }
 
 pub fn emit_logical_shift_right_masked64(
-    _ctx: &EmitContext,
+    ctx: &EmitContext,
     ra: &mut RegAlloc,
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_masked_shift(ra, inst_ref, inst, 64, ShiftOp::Shr);
+    emit_masked_shift(ctx, ra, inst_ref, inst, 64, ShiftOp::Shr);
 }
 
 pub fn emit_arithmetic_shift_right_masked32(
-    _ctx: &EmitContext,
+    ctx: &EmitContext,
     ra: &mut RegAlloc,
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_masked_shift(ra, inst_ref, inst, 32, ShiftOp::Sar);
+    emit_masked_shift(ctx, ra, inst_ref, inst, 32, ShiftOp::Sar);
 }
 
 pub fn emit_arithmetic_shift_right_masked64(
-    _ctx: &EmitContext,
+    ctx: &EmitContext,
     ra: &mut RegAlloc,
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_masked_shift(ra, inst_ref, inst, 64, ShiftOp::Sar);
+    emit_masked_shift(ctx, ra, inst_ref, inst, 64, ShiftOp::Sar);
 }
 
 pub fn emit_rotate_right_masked32(
-    _ctx: &EmitContext,
+    ctx: &EmitContext,
     ra: &mut RegAlloc,
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_masked_shift(ra, inst_ref, inst, 32, ShiftOp::Ror);
+    emit_masked_shift(ctx, ra, inst_ref, inst, 32, ShiftOp::Ror);
 }
 
 pub fn emit_rotate_right_masked64(
-    _ctx: &EmitContext,
+    ctx: &EmitContext,
     ra: &mut RegAlloc,
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_masked_shift(ra, inst_ref, inst, 64, ShiftOp::Ror);
+    emit_masked_shift(ctx, ra, inst_ref, inst, 64, ShiftOp::Ror);
 }
 
 fn emit_masked_shift(
+    ctx: &EmitContext,
     ra: &mut RegAlloc,
     inst_ref: InstRef,
     inst: &Inst,
@@ -993,10 +1369,45 @@ fn emit_masked_shift(
 ) {
     let mut args = ra.get_argument_info(inst_ref, &inst.args, inst.num_args());
 
-    // Match the non-masked shift owner path: reserve RCX for the register
-    // shift count before allocating the destination scratch register.
-    // Otherwise the destination can take RCX and make the shift input
-    // impossible to place, which is exactly the STK allocator-panic path.
+    if !args[1].is_immediate() && op != ShiftOp::Ror && ctx.has_host_feature(HostFeature::BMI2) {
+        let operand = ra.use_gpr(&mut args[0]);
+        let shift = ra.use_gpr(&mut args[1]);
+        let result = ra.scratch_gpr();
+        let operand_sized = if bitsize == 32 {
+            operand.cvt32().unwrap()
+        } else {
+            operand
+        };
+        let shift_sized = if bitsize == 32 {
+            shift.cvt32().unwrap()
+        } else {
+            shift
+        };
+        let result_sized = if bitsize == 32 {
+            result.cvt32().unwrap()
+        } else {
+            result
+        };
+        match op {
+            ShiftOp::Shl => ra
+                .asm
+                .shlx(result_sized, operand_sized, shift_sized)
+                .unwrap(),
+            ShiftOp::Shr => ra
+                .asm
+                .shrx(result_sized, operand_sized, shift_sized)
+                .unwrap(),
+            ShiftOp::Sar => ra
+                .asm
+                .sarx(result_sized, operand_sized, shift_sized)
+                .unwrap(),
+            ShiftOp::Ror => unreachable!(),
+        }
+        ra.define_value(inst_ref, result);
+        return;
+    }
+
+    // The non-BMI2 register form requires CL as its implicit count.
     if !args[1].is_immediate() {
         ra.use_loc(&mut args[1], HostLoc::Gpr(1)); // RCX
     }
@@ -1305,33 +1716,71 @@ pub fn emit_most_significant_bit(
     ra.define_value(inst_ref, result);
 }
 
-/// CountLeadingZeros32: uses lzcnt (assume ABM/LZCNT support)
+/// CountLeadingZeros32.
 pub fn emit_count_leading_zeros32(
-    _ctx: &EmitContext,
+    ctx: &EmitContext,
     ra: &mut RegAlloc,
     inst_ref: InstRef,
     inst: &Inst,
 ) {
     let mut args = ra.get_argument_info(inst_ref, &inst.args, inst.num_args());
-    let source = ra.use_gpr(&mut args[0]);
-    let result = ra.scratch_gpr();
-    ra.asm
-        .lzcnt(result.cvt32().unwrap(), source.cvt32().unwrap())
-        .unwrap();
+    let result = if ctx.has_host_feature(HostFeature::LZCNT) {
+        let source = ra.use_gpr(&mut args[0]);
+        let result = ra.scratch_gpr();
+        ra.asm
+            .lzcnt(result.cvt32().unwrap(), source.cvt32().unwrap())
+            .unwrap();
+        result
+    } else {
+        let source = ra.use_scratch_gpr(&mut args[0]);
+        let result = ra.scratch_gpr();
+        let temp = ra.scratch_gpr();
+        ra.asm
+            .bsr(result.cvt32().unwrap(), source.cvt32().unwrap())
+            .unwrap();
+        ra.asm.mov(temp.cvt32().unwrap(), 32i32).unwrap();
+        ra.asm.xor_(result.cvt32().unwrap(), 31i32).unwrap();
+        ra.asm
+            .test(source.cvt32().unwrap(), source.cvt32().unwrap())
+            .unwrap();
+        ra.asm
+            .cmove(result.cvt32().unwrap(), temp.cvt32().unwrap())
+            .unwrap();
+        ra.release(source);
+        ra.release(temp);
+        result
+    };
     ra.define_value(inst_ref, result);
 }
 
-/// CountLeadingZeros64: uses lzcnt
+/// CountLeadingZeros64.
 pub fn emit_count_leading_zeros64(
-    _ctx: &EmitContext,
+    ctx: &EmitContext,
     ra: &mut RegAlloc,
     inst_ref: InstRef,
     inst: &Inst,
 ) {
     let mut args = ra.get_argument_info(inst_ref, &inst.args, inst.num_args());
-    let source = ra.use_gpr(&mut args[0]);
-    let result = ra.scratch_gpr();
-    ra.asm.lzcnt(result, source).unwrap();
+    let result = if ctx.has_host_feature(HostFeature::LZCNT) {
+        let source = ra.use_gpr(&mut args[0]);
+        let result = ra.scratch_gpr();
+        ra.asm.lzcnt(result, source).unwrap();
+        result
+    } else {
+        let source = ra.use_scratch_gpr(&mut args[0]);
+        let result = ra.scratch_gpr();
+        let temp = ra.scratch_gpr();
+        ra.asm.bsr(result, source).unwrap();
+        ra.asm.mov(temp.cvt32().unwrap(), 64i32).unwrap();
+        ra.asm.xor_(result.cvt32().unwrap(), 63i32).unwrap();
+        ra.asm.test(source, source).unwrap();
+        ra.asm
+            .cmove(result.cvt32().unwrap(), temp.cvt32().unwrap())
+            .unwrap();
+        ra.release(source);
+        ra.release(temp);
+        result
+    };
     ra.define_value(inst_ref, result);
 }
 

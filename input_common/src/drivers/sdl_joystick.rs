@@ -2,15 +2,15 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 //! Port of the `SDLJoystick` class from
-//! `/home/vricosti/Dev/emulators/zuyu/src/input_common/drivers/sdl_driver.cpp`.
+//! `input_common/drivers/sdl_driver.cpp`.
 //!
 //! One instance per opened device. Upstream keeps the `SDL_Joystick*` and
-//! `SDL_GameController*` in `unique_ptr`s with `SDL_JoystickClose` /
-//! `SDL_GameControllerClose` as deleters; the Rust port closes them in `Drop`.
+//! `SDL_Gamepad*` in `unique_ptr`s with `SDL_CloseJoystick` /
+//! `SDL_CloseGamepad` as deleters; the Rust port closes them in `Drop`.
 
 use std::ffi::CStr;
 
-use sdl2::sys as sdl;
+use sdl3_sys::everything as sdl;
 
 use common::input::{BatteryLevel, VibrationStatus};
 use common::uuid::UUID;
@@ -39,7 +39,7 @@ const MOTION_ERROR_LIMIT: u32 = 200;
 /// hosts. Leaving it in would give the same physical pad a different identity
 /// and silently drop every binding made against it.
 pub fn get_guid(joystick: *mut sdl::SDL_Joystick) -> UUID {
-    let guid = unsafe { sdl::SDL_JoystickGetGUID(joystick) };
+    let guid = unsafe { sdl::SDL_GetJoystickGUID(joystick) };
     let mut data = [0u8; 16];
     data.copy_from_slice(&guid.data);
     data[2] = 0;
@@ -52,10 +52,10 @@ pub struct SdlJoystick {
     guid: UUID,
     port: i32,
     sdl_joystick: *mut sdl::SDL_Joystick,
-    sdl_controller: *mut sdl::SDL_GameController,
+    sdl_controller: *mut sdl::SDL_Gamepad,
 
     motion: BasicMotion,
-    last_motion_update: u32,
+    last_motion_update: u64,
     motion_error_count: u32,
     has_gyro: bool,
     has_accel: bool,
@@ -65,18 +65,25 @@ pub struct SdlJoystick {
     has_hd_rumble: bool,
 }
 
-fn controller_has_hd_rumble(controller: *mut sdl::SDL_GameController) -> bool {
-    if controller.is_null() {
-        return false;
+fn controller_has_hd_rumble(
+    joystick: *mut sdl::SDL_Joystick,
+    controller: *mut sdl::SDL_Gamepad,
+) -> bool {
+    const VALVE_VENDOR_ID: u16 = 0x28DE;
+    if !controller.is_null() {
+        let controller_type = unsafe { sdl::SDL_GetGamepadType(controller) };
+        if matches!(
+            controller_type,
+            sdl::SDL_GAMEPAD_TYPE_NINTENDO_SWITCH_PRO
+                | sdl::SDL_GAMEPAD_TYPE_NINTENDO_SWITCH_JOYCON_LEFT
+                | sdl::SDL_GAMEPAD_TYPE_NINTENDO_SWITCH_JOYCON_RIGHT
+                | sdl::SDL_GAMEPAD_TYPE_PS5
+        ) || unsafe { sdl::SDL_GetGamepadVendor(controller) == VALVE_VENDOR_ID }
+        {
+            return true;
+        }
     }
-    let controller_type = unsafe { sdl::SDL_GameControllerGetType(controller) };
-    matches!(
-        controller_type,
-        sdl::SDL_GameControllerType::SDL_CONTROLLER_TYPE_NINTENDO_SWITCH_PRO
-            | sdl::SDL_GameControllerType::SDL_CONTROLLER_TYPE_NINTENDO_SWITCH_JOYCON_LEFT
-            | sdl::SDL_GameControllerType::SDL_CONTROLLER_TYPE_NINTENDO_SWITCH_JOYCON_RIGHT
-            | sdl::SDL_GameControllerType::SDL_CONTROLLER_TYPE_PS5
-    )
+    !joystick.is_null() && unsafe { sdl::SDL_GetJoystickVendor(joystick) == VALVE_VENDOR_ID }
 }
 
 /// Snapshot of upstream's two non-owning SDL pointers and their controller type.
@@ -90,7 +97,7 @@ fn controller_has_hd_rumble(controller: *mut sdl::SDL_GameController) -> bool {
 #[derive(Clone, Copy)]
 pub(crate) struct SdlJoystickHandles {
     joystick: *mut sdl::SDL_Joystick,
-    controller: *mut sdl::SDL_GameController,
+    controller: *mut sdl::SDL_Gamepad,
     has_hd_rumble: bool,
 }
 
@@ -116,10 +123,9 @@ impl SdlJoystickHandles {
 
         unsafe {
             if !self.controller.is_null() {
-                sdl::SDL_GameControllerRumble(self.controller, low, high, RUMBLE_MAX_DURATION_MS)
-                    != -1
+                sdl::SDL_RumbleGamepad(self.controller, low, high, RUMBLE_MAX_DURATION_MS)
             } else if !self.joystick.is_null() {
-                sdl::SDL_JoystickRumble(self.joystick, low, high, RUMBLE_MAX_DURATION_MS) != -1
+                sdl::SDL_RumbleJoystick(self.joystick, low, high, RUMBLE_MAX_DURATION_MS)
             } else {
                 false
             }
@@ -144,7 +150,7 @@ impl SdlJoystick {
         guid: UUID,
         port: i32,
         sdl_joystick: *mut sdl::SDL_Joystick,
-        sdl_controller: *mut sdl::SDL_GameController,
+        sdl_controller: *mut sdl::SDL_Gamepad,
     ) -> Self {
         let mut joystick = Self {
             guid,
@@ -158,7 +164,7 @@ impl SdlJoystick {
             has_accel: false,
             has_vibration: false,
             is_vibration_tested: false,
-            has_hd_rumble: controller_has_hd_rumble(sdl_controller),
+            has_hd_rumble: controller_has_hd_rumble(sdl_joystick, sdl_controller),
         };
         joystick.enable_motion();
         joystick
@@ -174,38 +180,28 @@ impl SdlJoystick {
         }
         unsafe {
             if self.has_motion() {
-                sdl::SDL_GameControllerSetSensorEnabled(
-                    self.sdl_controller,
-                    sdl::SDL_SensorType::SDL_SENSOR_ACCEL,
-                    sdl::SDL_bool::SDL_FALSE,
-                );
-                sdl::SDL_GameControllerSetSensorEnabled(
-                    self.sdl_controller,
-                    sdl::SDL_SensorType::SDL_SENSOR_GYRO,
-                    sdl::SDL_bool::SDL_FALSE,
-                );
+                sdl::SDL_SetGamepadSensorEnabled(self.sdl_controller, sdl::SDL_SENSOR_ACCEL, false);
+                sdl::SDL_SetGamepadSensorEnabled(self.sdl_controller, sdl::SDL_SENSOR_GYRO, false);
             }
-            self.has_accel = sdl::SDL_GameControllerHasSensor(
-                self.sdl_controller,
-                sdl::SDL_SensorType::SDL_SENSOR_ACCEL,
-            ) == sdl::SDL_bool::SDL_TRUE;
-            self.has_gyro = sdl::SDL_GameControllerHasSensor(
-                self.sdl_controller,
-                sdl::SDL_SensorType::SDL_SENSOR_GYRO,
-            ) == sdl::SDL_bool::SDL_TRUE;
+            self.has_accel = sdl::SDL_GamepadHasSensor(self.sdl_controller, sdl::SDL_SENSOR_ACCEL);
+            self.has_gyro = sdl::SDL_GamepadHasSensor(self.sdl_controller, sdl::SDL_SENSOR_GYRO);
             if self.has_accel {
-                sdl::SDL_GameControllerSetSensorEnabled(
+                if !sdl::SDL_SetGamepadSensorEnabled(
                     self.sdl_controller,
-                    sdl::SDL_SensorType::SDL_SENSOR_ACCEL,
-                    sdl::SDL_bool::SDL_TRUE,
-                );
+                    sdl::SDL_SENSOR_ACCEL,
+                    true,
+                ) {
+                    log::warn!("Failed to enable accelerometer sensor");
+                }
             }
             if self.has_gyro {
-                sdl::SDL_GameControllerSetSensorEnabled(
+                if !sdl::SDL_SetGamepadSensorEnabled(
                     self.sdl_controller,
-                    sdl::SDL_SensorType::SDL_SENSOR_GYRO,
-                    sdl::SDL_bool::SDL_TRUE,
-                );
+                    sdl::SDL_SENSOR_GYRO,
+                    true,
+                ) {
+                    log::warn!("Failed to enable gyroscope sensor");
+                }
             }
         }
     }
@@ -221,25 +217,32 @@ impl SdlJoystick {
     /// timestamps and all-zero samples are dropped; after
     /// [`MOTION_ERROR_LIMIT`] consecutive zero samples the sensors are
     /// restarted, which is upstream's recovery for a pad that stops reporting.
-    pub fn update_motion(
-        &mut self,
-        sensor: sdl::SDL_SensorType,
-        timestamp: u32,
-        data: [f32; 3],
-    ) -> bool {
-        let time_difference = timestamp.wrapping_sub(self.last_motion_update);
+    pub fn update_motion(&mut self, event: sdl::SDL_GamepadSensorEvent) -> bool {
+        let timestamp = if event.sensor_timestamp != 0 {
+            event.sensor_timestamp
+        } else {
+            event.timestamp
+        };
+        if self.last_motion_update == 0 {
+            self.last_motion_update = timestamp;
+            return false;
+        }
+        if timestamp < self.last_motion_update {
+            return false;
+        }
+        let time_difference = (timestamp - self.last_motion_update) / 1000;
         self.last_motion_update = timestamp;
 
-        match sensor {
-            sdl::SDL_SensorType::SDL_SENSOR_ACCEL => {
-                self.motion.accel_x = -data[0] / GRAVITY_CONSTANT;
-                self.motion.accel_y = data[2] / GRAVITY_CONSTANT;
-                self.motion.accel_z = -data[1] / GRAVITY_CONSTANT;
+        match sdl::SDL_SensorType::new(event.sensor) {
+            sdl::SDL_SENSOR_ACCEL => {
+                self.motion.accel_x = -event.data[0] / GRAVITY_CONSTANT;
+                self.motion.accel_y = event.data[2] / GRAVITY_CONSTANT;
+                self.motion.accel_z = -event.data[1] / GRAVITY_CONSTANT;
             }
-            sdl::SDL_SensorType::SDL_SENSOR_GYRO => {
-                self.motion.gyro_x = data[0] / (std::f32::consts::PI * 2.0);
-                self.motion.gyro_y = -data[2] / (std::f32::consts::PI * 2.0);
-                self.motion.gyro_z = data[1] / (std::f32::consts::PI * 2.0);
+            sdl::SDL_SENSOR_GYRO => {
+                self.motion.gyro_x = event.data[0] / (std::f32::consts::PI * 2.0);
+                self.motion.gyro_y = -event.data[2] / (std::f32::consts::PI * 2.0);
+                self.motion.gyro_z = event.data[1] / (std::f32::consts::PI * 2.0);
             }
             _ => {}
         }
@@ -265,7 +268,7 @@ impl SdlJoystick {
         }
 
         self.motion_error_count = 0;
-        self.motion.delta_timestamp = time_difference as u64 * 1000;
+        self.motion.delta_timestamp = time_difference;
         true
     }
 
@@ -330,7 +333,7 @@ impl SdlJoystick {
         self.sdl_joystick
     }
 
-    pub fn sdl_game_controller(&self) -> *mut sdl::SDL_GameController {
+    pub fn sdl_game_controller(&self) -> *mut sdl::SDL_Gamepad {
         self.sdl_controller
     }
 
@@ -339,25 +342,36 @@ impl SdlJoystick {
     pub fn set_sdl_joystick(
         &mut self,
         joystick: *mut sdl::SDL_Joystick,
-        controller: *mut sdl::SDL_GameController,
+        controller: *mut sdl::SDL_Gamepad,
     ) {
         self.close_handles();
         self.sdl_joystick = joystick;
         self.sdl_controller = controller;
-        self.has_hd_rumble = controller_has_hd_rumble(controller);
+        self.has_hd_rumble = controller_has_hd_rumble(joystick, controller);
     }
 
     /// Upstream `SDLJoystick::GetControllerName`.
     pub fn controller_name(&self) -> String {
         unsafe {
             if !self.sdl_controller.is_null() {
-                let name = sdl::SDL_GameControllerName(self.sdl_controller);
+                let canonical_name = match sdl::SDL_GetGamepadType(self.sdl_controller) {
+                    sdl::SDL_GAMEPAD_TYPE_XBOX360 => Some("Xbox 360 Controller"),
+                    sdl::SDL_GAMEPAD_TYPE_XBOXONE => Some("Xbox One Controller"),
+                    sdl::SDL_GAMEPAD_TYPE_PS3 => Some("DualShock 3 Controller"),
+                    sdl::SDL_GAMEPAD_TYPE_PS4 => Some("DualShock 4 Controller"),
+                    sdl::SDL_GAMEPAD_TYPE_PS5 => Some("DualSense Controller"),
+                    _ => None,
+                };
+                if let Some(name) = canonical_name {
+                    return name.to_string();
+                }
+                let name = sdl::SDL_GetGamepadName(self.sdl_controller);
                 if !name.is_null() {
                     return CStr::from_ptr(name).to_string_lossy().into_owned();
                 }
             }
             if !self.sdl_joystick.is_null() {
-                let name = sdl::SDL_JoystickName(self.sdl_joystick);
+                let name = sdl::SDL_GetJoystickName(self.sdl_joystick);
                 if !name.is_null() {
                     return CStr::from_ptr(name).to_string_lossy().into_owned();
                 }
@@ -368,34 +382,44 @@ impl SdlJoystick {
 
     /// Upstream `SDLJoystick::IsJoyconLeft` / `IsJoyconRight`.
     pub fn is_joycon_left(&self) -> bool {
-        self.controller_name().contains("Joy-Con Left")
+        let name = self.controller_name();
+        name.contains("Joy-Con Left") || name.contains("Joy-Con (L)")
     }
 
     pub fn is_joycon_right(&self) -> bool {
-        self.controller_name().contains("Joy-Con Right")
+        let name = self.controller_name();
+        name.contains("Joy-Con Right") || name.contains("Joy-Con (R)")
     }
 
     /// Upstream `SDLJoystick::GetBatteryLevel`.
-    pub fn battery_level(power_level: sdl::SDL_JoystickPowerLevel) -> BatteryLevel {
-        match power_level {
-            sdl::SDL_JoystickPowerLevel::SDL_JOYSTICK_POWER_EMPTY => BatteryLevel::Empty,
-            sdl::SDL_JoystickPowerLevel::SDL_JOYSTICK_POWER_LOW => BatteryLevel::Low,
-            sdl::SDL_JoystickPowerLevel::SDL_JOYSTICK_POWER_MEDIUM => BatteryLevel::Medium,
-            sdl::SDL_JoystickPowerLevel::SDL_JOYSTICK_POWER_FULL
-            | sdl::SDL_JoystickPowerLevel::SDL_JOYSTICK_POWER_MAX => BatteryLevel::Full,
-            sdl::SDL_JoystickPowerLevel::SDL_JOYSTICK_POWER_WIRED => BatteryLevel::Charging,
-            sdl::SDL_JoystickPowerLevel::SDL_JOYSTICK_POWER_UNKNOWN => BatteryLevel::None,
+    pub fn battery_level(power_state: sdl::SDL_PowerState, percent: i32) -> BatteryLevel {
+        if power_state == sdl::SDL_POWERSTATE_CHARGING {
+            return BatteryLevel::Charging;
+        }
+        if (0..=100).contains(&percent) {
+            return match percent {
+                0..=5 => BatteryLevel::Empty,
+                6..=20 => BatteryLevel::Critical,
+                21..=40 => BatteryLevel::Low,
+                41..=70 => BatteryLevel::Medium,
+                _ => BatteryLevel::Full,
+            };
+        }
+        match power_state {
+            sdl::SDL_POWERSTATE_ON_BATTERY => BatteryLevel::Medium,
+            sdl::SDL_POWERSTATE_CHARGED => BatteryLevel::Full,
+            _ => BatteryLevel::None,
         }
     }
 
     fn close_handles(&mut self) {
         unsafe {
             if !self.sdl_controller.is_null() {
-                sdl::SDL_GameControllerClose(self.sdl_controller);
+                sdl::SDL_CloseGamepad(self.sdl_controller);
                 self.sdl_controller = std::ptr::null_mut();
             }
             if !self.sdl_joystick.is_null() {
-                sdl::SDL_JoystickClose(self.sdl_joystick);
+                sdl::SDL_CloseJoystick(self.sdl_joystick);
                 self.sdl_joystick = std::ptr::null_mut();
             }
         }
@@ -420,7 +444,7 @@ mod tests {
         // SDL stores a CRC of the controller *name* in bytes 2..4. It changes
         // between SDL releases, so leaving it in would give the same physical
         // pad a new identity and silently drop its bindings.
-        let mut raw = sdl::SDL_JoystickGUID { data: [0u8; 16] };
+        let mut raw = sdl::SDL_GUID { data: [0u8; 16] };
         for (index, byte) in raw.data.iter_mut().enumerate() {
             *byte = index as u8 + 1;
         }
@@ -475,34 +499,33 @@ mod tests {
     }
 
     #[test]
-    fn battery_level_maps_every_sdl_power_level() {
-        use sdl::SDL_JoystickPowerLevel as P;
+    fn battery_level_maps_sdl3_power_state_and_percent() {
         assert_eq!(
-            SdlJoystick::battery_level(P::SDL_JOYSTICK_POWER_EMPTY),
+            SdlJoystick::battery_level(sdl::SDL_POWERSTATE_ON_BATTERY, 5),
             BatteryLevel::Empty
         );
         assert_eq!(
-            SdlJoystick::battery_level(P::SDL_JOYSTICK_POWER_LOW),
+            SdlJoystick::battery_level(sdl::SDL_POWERSTATE_ON_BATTERY, 40),
             BatteryLevel::Low
         );
         assert_eq!(
-            SdlJoystick::battery_level(P::SDL_JOYSTICK_POWER_MEDIUM),
+            SdlJoystick::battery_level(sdl::SDL_POWERSTATE_ON_BATTERY, 70),
             BatteryLevel::Medium
         );
         assert_eq!(
-            SdlJoystick::battery_level(P::SDL_JOYSTICK_POWER_FULL),
+            SdlJoystick::battery_level(sdl::SDL_POWERSTATE_ON_BATTERY, 100),
             BatteryLevel::Full
         );
         assert_eq!(
-            SdlJoystick::battery_level(P::SDL_JOYSTICK_POWER_MAX),
+            SdlJoystick::battery_level(sdl::SDL_POWERSTATE_CHARGED, -1),
             BatteryLevel::Full
         );
         assert_eq!(
-            SdlJoystick::battery_level(P::SDL_JOYSTICK_POWER_WIRED),
+            SdlJoystick::battery_level(sdl::SDL_POWERSTATE_CHARGING, 10),
             BatteryLevel::Charging
         );
         assert_eq!(
-            SdlJoystick::battery_level(P::SDL_JOYSTICK_POWER_UNKNOWN),
+            SdlJoystick::battery_level(sdl::SDL_POWERSTATE_UNKNOWN, -1),
             BatteryLevel::None
         );
     }

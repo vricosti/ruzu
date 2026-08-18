@@ -6,6 +6,15 @@
 
 use std::net::Ipv4Addr;
 
+/// Host adapter transport reported to the emulated NIFM service.
+///
+/// Port of upstream `Network::HostAdapterKind`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostAdapterKind {
+    Wifi,
+    Ethernet,
+}
+
 /// Network interface information.
 ///
 /// Corresponds to upstream `Network::NetworkInterface`.
@@ -15,6 +24,7 @@ pub struct NetworkInterface {
     pub ip_address: Ipv4Addr,
     pub subnet_mask: Ipv4Addr,
     pub gateway: Ipv4Addr,
+    pub kind: HostAdapterKind,
 }
 
 /// Get available network interfaces.
@@ -88,6 +98,7 @@ fn get_available_network_interfaces_linux() -> Vec<NetworkInterface> {
                 ip_address: ip_addr,
                 subnet_mask,
                 gateway: Ipv4Addr::from(gateway),
+                kind: HostAdapterKind::Ethernet,
             });
 
             ifa = iface.ifa_next;
@@ -165,13 +176,24 @@ pub fn get_selected_network_interface() -> Option<NetworkInterface> {
         log::error!("GetAvailableNetworkInterfaces returned no interfaces");
         return None;
     }
-
-    if let Some(iface) = interfaces.iter().find(|i| i.name == selected_name) {
-        return Some(iface.clone());
+    let selected = select_network_interface(&interfaces, &selected_name);
+    if selected.is_none() {
+        log::error!("Selected network interface '{}' not found", selected_name);
     }
+    selected
+}
 
-    log::error!("Selected network interface '{}' not found", selected_name);
-    None
+fn select_network_interface(
+    interfaces: &[NetworkInterface],
+    selected_name: &str,
+) -> Option<NetworkInterface> {
+    if selected_name.is_empty() {
+        return interfaces.first().cloned();
+    }
+    interfaces
+        .iter()
+        .find(|interface| interface.name == selected_name)
+        .cloned()
 }
 
 /// Select the first available network interface.
@@ -185,4 +207,42 @@ pub fn select_first_network_interface() {
     common::settings::values_mut()
         .network_interface
         .set_value(interfaces[0].name.clone());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn interface(name: &str) -> NetworkInterface {
+        NetworkInterface {
+            name: name.to_string(),
+            ip_address: Ipv4Addr::new(192, 0, 2, 1),
+            subnet_mask: Ipv4Addr::new(255, 255, 255, 0),
+            gateway: Ipv4Addr::new(192, 0, 2, 254),
+            kind: HostAdapterKind::Ethernet,
+        }
+    }
+
+    #[test]
+    fn empty_selection_uses_first_interface_like_upstream() {
+        let interfaces = [interface("eth0"), interface("wlan0")];
+        assert_eq!(
+            select_network_interface(&interfaces, "")
+                .expect("first interface")
+                .name,
+            "eth0"
+        );
+    }
+
+    #[test]
+    fn named_selection_must_exist() {
+        let interfaces = [interface("eth0"), interface("wlan0")];
+        assert_eq!(
+            select_network_interface(&interfaces, "wlan0")
+                .expect("named interface")
+                .name,
+            "wlan0"
+        );
+        assert!(select_network_interface(&interfaces, "missing").is_none());
+    }
 }

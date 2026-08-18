@@ -75,8 +75,8 @@ fn get_type(texture_type: TextureType) -> ShaderTextureType {
 }
 
 fn read_array(v: &mut TranslatorVisitor, reg: u32) -> Value {
-    let x = v.x(reg);
-    v.ir.convert_f32_from_u32(x)
+    let value = v.x(reg);
+    v.ir.convert_u_to_f(32, 16, value, crate::ir::types::FpControl::default())
 }
 
 fn make_coords(v: &mut TranslatorVisitor, reg: u32, texture_type: TextureType) -> Value {
@@ -260,4 +260,25 @@ pub fn tld4_b(tv: &mut TranslatorVisitor, insn: u64, _opcode: MaxwellOpcode) {
     let component = field(insn, 38, 2);
     let offset = OffsetType::from_bits(field(insn, 36, 2) as u64);
     impl_tld4(tv, insn, component, offset, true);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn array_layer_preserves_upstream_u16_conversion() {
+        let mut program = crate::ir::program::Program::new(crate::ir::types::ShaderStage::Fragment);
+        let block = program.add_block();
+        let mut visitor = TranslatorVisitor::new(&mut program, block);
+
+        let _ = read_array(&mut visitor, 0);
+
+        assert!(visitor
+            .ir
+            .program
+            .block(block)
+            .iter()
+            .any(|inst| { inst.opcode == crate::ir::opcodes::Opcode::ConvertF32U16 }));
+    }
 }

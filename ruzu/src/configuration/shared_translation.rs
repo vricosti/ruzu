@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //
 // Rust counterpart of the combo-box label tables in
-// `/home/vricosti/Dev/emulators/zuyu/src/yuzu/configuration/shared_translation.cpp`
+// `/home/vricosti/Dev/emulators/eden/src/qt_common/config/shared_translation.cpp`
 // (`ConfigurationShared::ComboboxEnumeration`).
 //
 // Upstream maps each `Settings::` enum onto an ordered list of
@@ -21,9 +21,10 @@
 
 use common::settings_enums::{
     AnisotropyMode, AntiAliasing, AppletMode, AspectRatio, AstcDecodeMode, AstcRecompression,
-    AudioMode, ConfirmStop, ConsoleMode, CpuAccuracy, CpuBackend, FullscreenMode, GpuAccuracy,
-    GpuFenceBehavior, Language, MemoryLayout, NvdecEmulation, Region, RendererBackend,
-    ResolutionSetup, ScalingFilter, ShaderBackend, VramUsageMode,
+    AudioMode, ConfirmStop, ConsoleMode, CpuAccuracy, CpuBackend, DmaAccuracy,
+    ExtendedDynamicState, FramePacingMode, FullscreenMode, GpuAccuracy, GpuFenceBehavior,
+    GpuUnswizzle, GpuUnswizzleChunk, GpuUnswizzleSize, Language, MemoryLayout, NvdecEmulation,
+    Region, RendererBackend, ResolutionSetup, ScalingFilter, VramUsageMode,
 };
 
 /// Split a `&[(T, &str)]` table into its label column, for feeding a combo box.
@@ -52,6 +53,37 @@ pub const APPLET_MODE: &[(AppletMode, &str)] = &[
     (AppletMode::LLE, "Real applet"),
 ];
 
+pub const GPU_UNSWIZZLE_SIZE: &[(GpuUnswizzleSize, &str)] = &[
+    (GpuUnswizzleSize::VerySmall, "Very Small (16 MB)"),
+    (GpuUnswizzleSize::Small, "Small (32 MB)"),
+    (GpuUnswizzleSize::Normal, "Normal (128 MB)"),
+    (GpuUnswizzleSize::Large, "Large (256 MB)"),
+    (GpuUnswizzleSize::VeryLarge, "Very Large (512 MB)"),
+];
+
+pub const GPU_UNSWIZZLE_STREAM: &[(GpuUnswizzle, &str)] = &[
+    (GpuUnswizzle::VeryLow, "Very Low (4 MB)"),
+    (GpuUnswizzle::Low, "Low (8 MB)"),
+    (GpuUnswizzle::Normal, "Normal (16 MB)"),
+    (GpuUnswizzle::Medium, "Medium (32 MB)"),
+    (GpuUnswizzle::High, "High (64 MB)"),
+];
+
+pub const GPU_UNSWIZZLE_CHUNK: &[(GpuUnswizzleChunk, &str)] = &[
+    (GpuUnswizzleChunk::VeryLow, "Very Low (32)"),
+    (GpuUnswizzleChunk::Low, "Low (64)"),
+    (GpuUnswizzleChunk::Normal, "Normal (128)"),
+    (GpuUnswizzleChunk::Medium, "Medium (256)"),
+    (GpuUnswizzleChunk::High, "High (512)"),
+];
+
+pub const EXTENDED_DYNAMIC_STATE: &[(ExtendedDynamicState, &str)] = &[
+    (ExtendedDynamicState::Disabled, "Disabled"),
+    (ExtendedDynamicState::EDS1, "ExtendedDynamicState 1"),
+    (ExtendedDynamicState::EDS2, "ExtendedDynamicState 2"),
+    (ExtendedDynamicState::EDS3, "ExtendedDynamicState 3"),
+];
+
 pub const ASTC_DECODE_MODE: &[(AstcDecodeMode, &str)] = &[
     (AstcDecodeMode::Cpu, "CPU"),
     (AstcDecodeMode::Gpu, "GPU"),
@@ -72,25 +104,35 @@ pub const VRAM_USAGE_MODE: &[(VramUsageMode, &str)] = &[
     (VramUsageMode::Aggressive, "Aggressive"),
 ];
 
-pub const RENDERER_BACKEND: &[(RendererBackend, &str)] = &[
-    (RendererBackend::OpenGL, "OpenGL"),
+pub const GRAPHICS_API: &[(RendererBackend, &str)] = &[
     (RendererBackend::Vulkan, "Vulkan"),
+    (RendererBackend::OpenGlGlsl, "OpenGL GLSL"),
+    (
+        RendererBackend::OpenGlGlasm,
+        "OpenGL GLASM (Assembly Shaders, NVIDIA Only)",
+    ),
+    (
+        RendererBackend::OpenGlSpirV,
+        "OpenGL SPIR-V (Experimental, AMD/Mesa Only)",
+    ),
     (RendererBackend::Null, "Null"),
 ];
 
-pub const SHADER_BACKEND: &[(ShaderBackend, &str)] = &[
-    (ShaderBackend::Glsl, "GLSL"),
-    (
-        ShaderBackend::Glasm,
-        "GLASM (Assembly Shaders, NVIDIA Only)",
-    ),
-    (ShaderBackend::SpirV, "SPIR-V (Experimental, AMD/Mesa Only)"),
+pub const GPU_ACCURACY: &[(GpuAccuracy, &str)] =
+    &[(GpuAccuracy::Low, "Fast"), (GpuAccuracy::High, "Accurate")];
+
+pub const DMA_ACCURACY: &[(DmaAccuracy, &str)] = &[
+    (DmaAccuracy::Default, "Default"),
+    (DmaAccuracy::Unsafe, "Unsafe (fast)"),
+    (DmaAccuracy::Safe, "Safe (stable)"),
 ];
 
-pub const GPU_ACCURACY: &[(GpuAccuracy, &str)] = &[
-    (GpuAccuracy::Normal, "Normal"),
-    (GpuAccuracy::High, "High"),
-    (GpuAccuracy::Extreme, "Extreme"),
+pub const FRAME_PACING_MODE: &[(FramePacingMode, &str)] = &[
+    (FramePacingMode::Target_Auto, "Auto"),
+    (FramePacingMode::Target_30, "30 FPS"),
+    (FramePacingMode::Target_60, "60 FPS"),
+    (FramePacingMode::Target_90, "90 FPS"),
+    (FramePacingMode::Target_120, "120 FPS"),
 ];
 
 pub const GPU_FENCE_BEHAVIOR: &[(GpuFenceBehavior, &str)] = &[
@@ -130,9 +172,14 @@ pub const NVDEC_EMULATION: &[(NvdecEmulation, &str)] = &[
 ];
 
 pub const RESOLUTION_SETUP: &[(ResolutionSetup, &str)] = &[
+    (ResolutionSetup::Res1_4X, "0.25X (180p/270p) [EXPERIMENTAL]"),
     (ResolutionSetup::Res1_2X, "0.5X (360p/540p) [EXPERIMENTAL]"),
     (ResolutionSetup::Res3_4X, "0.75X (540p/810p) [EXPERIMENTAL]"),
     (ResolutionSetup::Res1X, "1X (720p/1080p)"),
+    (
+        ResolutionSetup::Res5_4X,
+        "1.25X (900p/1350p) [EXPERIMENTAL]",
+    ),
     (
         ResolutionSetup::Res3_2X,
         "1.5X (1080p/1620p) [EXPERIMENTAL]",
@@ -151,8 +198,20 @@ pub const SCALING_FILTER: &[(ScalingFilter, &str)] = &[
     (ScalingFilter::Bilinear, "Bilinear"),
     (ScalingFilter::Bicubic, "Bicubic"),
     (ScalingFilter::Gaussian, "Gaussian"),
+    (ScalingFilter::Lanczos, "Lanczos"),
     (ScalingFilter::ScaleForce, "ScaleForce"),
-    (ScalingFilter::Fsr, "AMD FidelityFX™️ Super Resolution"),
+    (ScalingFilter::Fsr, "AMD FidelityFX Super Resolution"),
+    (ScalingFilter::Area, "Area"),
+    (ScalingFilter::Mmpx, "MMPX"),
+    (ScalingFilter::ZeroTangent, "Zero-Tangent"),
+    (ScalingFilter::BSpline, "B-Spline"),
+    (ScalingFilter::Mitchell, "Mitchell"),
+    (ScalingFilter::Spline1, "Spline-1"),
+    (ScalingFilter::Sgsr, "Snapdragon Game Super Resolution"),
+    (
+        ScalingFilter::SgsrEdge,
+        "Snapdragon Game Super Resolution EdgeDir",
+    ),
 ];
 
 pub const ANTI_ALIASING: &[(AntiAliasing, &str)] = &[
@@ -176,6 +235,9 @@ pub const ANISOTROPY_MODE: &[(AnisotropyMode, &str)] = &[
     (AnisotropyMode::X4, "4x"),
     (AnisotropyMode::X8, "8x"),
     (AnisotropyMode::X16, "16x"),
+    (AnisotropyMode::X32, "32x"),
+    (AnisotropyMode::X64, "64x"),
+    (AnisotropyMode::None, "None"),
 ];
 
 pub const LANGUAGE: &[(Language, &str)] = &[
@@ -224,12 +286,58 @@ pub const AUDIO_MODE: &[(AudioMode, &str)] = &[
 pub const MEMORY_LAYOUT: &[(MemoryLayout, &str)] = &[
     (MemoryLayout::Memory4Gb, "4GB DRAM (Default)"),
     (MemoryLayout::Memory6Gb, "6GB DRAM (Unsafe)"),
-    (MemoryLayout::Memory8Gb, "8GB DRAM (Unsafe)"),
+    (MemoryLayout::Memory8Gb, "8GB DRAM"),
+    (MemoryLayout::Memory10Gb, "10GB DRAM (Unsafe)"),
+    (MemoryLayout::Memory12Gb, "12GB DRAM (Unsafe)"),
 ];
 
 pub const CONSOLE_MODE: &[(ConsoleMode, &str)] = &[
     (ConsoleMode::Docked, "Docked"),
     (ConsoleMode::Handheld, "Handheld"),
+];
+
+// Exact status-bar context-menu maps from
+// `qt_common/config/shared_translation.h`. These deliberately remain separate
+// from the configuration combobox tables above: upstream uses shorter labels
+// and `std::map` iteration order for the status menus.
+pub const STATUS_ANTI_ALIASING: &[(AntiAliasing, &str)] = &[
+    (AntiAliasing::None, "None"),
+    (AntiAliasing::Fxaa, "FXAA"),
+    (AntiAliasing::Smaa, "SMAA"),
+];
+
+pub const STATUS_SCALING_FILTER: &[(ScalingFilter, &str)] = &[
+    (ScalingFilter::NearestNeighbor, "Nearest"),
+    (ScalingFilter::Bilinear, "Bilinear"),
+    (ScalingFilter::Bicubic, "Bicubic"),
+    (ScalingFilter::Gaussian, "Gaussian"),
+    (ScalingFilter::Lanczos, "Lanczos"),
+    (ScalingFilter::ScaleForce, "ScaleForce"),
+    (ScalingFilter::Fsr, "FSR"),
+    (ScalingFilter::Area, "Area"),
+    (ScalingFilter::ZeroTangent, "Zero-Tangent"),
+    (ScalingFilter::BSpline, "B-Spline"),
+    (ScalingFilter::Mitchell, "Mitchell"),
+    (ScalingFilter::Spline1, "Spline-1"),
+    (ScalingFilter::Mmpx, "MMPX"),
+    (ScalingFilter::Sgsr, "SGSR"),
+    (ScalingFilter::SgsrEdge, "SGSR EdgeDir"),
+];
+
+pub const STATUS_CONSOLE_MODE: &[(ConsoleMode, &str)] = &[
+    (ConsoleMode::Handheld, "Handheld"),
+    (ConsoleMode::Docked, "Docked"),
+];
+
+pub const STATUS_GPU_ACCURACY: &[(GpuAccuracy, &str)] =
+    &[(GpuAccuracy::Low, "Fast"), (GpuAccuracy::High, "Accurate")];
+
+pub const STATUS_RENDERER_BACKEND: &[(RendererBackend, &str)] = &[
+    (RendererBackend::OpenGlGlsl, "OpenGL GLSL"),
+    (RendererBackend::Vulkan, "Vulkan"),
+    (RendererBackend::Null, "Null"),
+    (RendererBackend::OpenGlGlasm, "OpenGL GLASM"),
+    (RendererBackend::OpenGlSpirV, "OpenGL SPIRV"),
 ];
 
 pub const CONFIRM_STOP: &[(ConfirmStop, &str)] = &[
@@ -250,8 +358,40 @@ mod tests {
         // Row order is part of the UI contract; upstream lists GPU last for
         // NVDEC and marks it "(Default)".
         assert_eq!(NVDEC_EMULATION[2].1, "GPU Video Decoding (Default)");
-        assert_eq!(RESOLUTION_SETUP[2].1, "1X (720p/1080p)");
+        assert_eq!(RESOLUTION_SETUP[3].1, "1X (720p/1080p)");
         assert_eq!(CONSOLE_MODE[0].1, "Docked");
+        assert_eq!(MEMORY_LAYOUT[2].1, "8GB DRAM");
+        assert_eq!(MEMORY_LAYOUT[3].0, MemoryLayout::Memory10Gb);
+        assert_eq!(MEMORY_LAYOUT[4].0, MemoryLayout::Memory12Gb);
+        assert_eq!(labels(GPU_ACCURACY), vec!["Fast", "Accurate"]);
+        assert_eq!(
+            labels(DMA_ACCURACY),
+            vec!["Default", "Unsafe (fast)", "Safe (stable)"]
+        );
+        assert_eq!(
+            labels(FRAME_PACING_MODE),
+            vec!["Auto", "30 FPS", "60 FPS", "90 FPS", "120 FPS"]
+        );
+        assert_eq!(
+            labels(SCALING_FILTER),
+            vec![
+                "Nearest Neighbor",
+                "Bilinear",
+                "Bicubic",
+                "Gaussian",
+                "Lanczos",
+                "ScaleForce",
+                "AMD FidelityFX Super Resolution",
+                "Area",
+                "MMPX",
+                "Zero-Tangent",
+                "B-Spline",
+                "Mitchell",
+                "Spline-1",
+                "Snapdragon Game Super Resolution",
+                "Snapdragon Game Super Resolution EdgeDir",
+            ]
+        );
     }
 
     #[test]
@@ -263,8 +403,7 @@ mod tests {
 
     #[test]
     fn index_of_falls_back_to_first_row() {
-        // `ScalingFilter::MaxEnum` is a sentinel, never a real UI row.
-        assert_eq!(index_of(SCALING_FILTER, &ScalingFilter::MaxEnum), 0);
+        assert_eq!(index_of(&[], &ScalingFilter::Bilinear), 0);
     }
 
     #[test]
@@ -279,5 +418,28 @@ mod tests {
         // Handheld first — a real ordering divergence worth pinning down.
         assert_eq!(CONSOLE_MODE[0].0, ConsoleMode::Docked);
         assert_eq!(CONSOLE_MODE[1].0, ConsoleMode::Handheld);
+    }
+
+    #[test]
+    fn status_context_maps_match_upstream_std_map_order_and_labels() {
+        assert_eq!(labels(STATUS_ANTI_ALIASING), vec!["None", "FXAA", "SMAA"]);
+        assert_eq!(labels(STATUS_CONSOLE_MODE), vec!["Handheld", "Docked"]);
+        assert_eq!(labels(STATUS_GPU_ACCURACY), vec!["Fast", "Accurate"]);
+        assert_eq!(
+            labels(STATUS_RENDERER_BACKEND),
+            vec![
+                "OpenGL GLSL",
+                "Vulkan",
+                "Null",
+                "OpenGL GLASM",
+                "OpenGL SPIRV",
+            ]
+        );
+        assert_eq!(STATUS_SCALING_FILTER.len(), 15);
+        assert_eq!(
+            STATUS_SCALING_FILTER[8],
+            (ScalingFilter::ZeroTangent, "Zero-Tangent")
+        );
+        assert_eq!(STATUS_SCALING_FILTER[12], (ScalingFilter::Mmpx, "MMPX"));
     }
 }

@@ -8,6 +8,7 @@
 //! Port of zuyu/src/core/hle/service/nvnflinger/buffer_queue_core.h
 //! Port of zuyu/src/core/hle/service/nvnflinger/buffer_queue_core.cpp
 
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
 use std::time::Instant;
@@ -32,6 +33,22 @@ use super::status::Status;
 use super::ui::fence::Fence;
 use super::window::NativeWindowApi;
 
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct BufferHistoryInfo {
+    pub frame_number: u64,
+    pub queue_time: i64,
+    pub presentation_time: i64,
+    pub state: BufferState,
+    _padding: u32,
+}
+
+#[derive(Default)]
+pub(crate) struct BufferHistoryState {
+    pub map: HashMap<u64, BufferHistoryInfo>,
+    order: VecDeque<u64>,
+}
+
 pub struct BufferQueueCore {
     pub mutex: Mutex<BufferQueueCoreInner>,
     pub dequeue_condition: Condvar,
@@ -44,6 +61,7 @@ pub struct BufferQueueCore {
     /// upstream. A direct caller must park in the kernel rather than block the
     /// OS thread shared by the core's guest fibers.
     dequeue_parked_threads: Mutex<Vec<Weak<KThreadLock>>>,
+    pub(crate) buffer_history: Mutex<BufferHistoryState>,
 }
 
 /// Safety-net timeout for a parked dequeue waiter. A missed wake merely
@@ -106,6 +124,7 @@ fn update_max(target: &AtomicU64, value: u64) {
 
 impl BufferQueueCore {
     pub const INVALID_BUFFER_SLOT: i32 = BufferItem::INVALID_BUFFER_SLOT;
+    pub const BUFFER_HISTORY_SIZE: usize = 8;
 
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
@@ -135,7 +154,45 @@ impl BufferQueueCore {
             dequeue_possible: AtomicBool::new(false),
             is_allocating_condition: Condvar::new(),
             dequeue_parked_threads: Mutex::new(Vec::new()),
+            buffer_history: Mutex::new(BufferHistoryState::default()),
         })
+    }
+
+    pub fn push_history(
+        &self,
+        frame_number: u64,
+        queue_time: i64,
+        presentation_time: i64,
+        state: BufferState,
+    ) {
+        let mut history = self.buffer_history.lock().unwrap();
+        if let Some(info) = history.map.get_mut(&frame_number) {
+            info.state = state;
+            return;
+        }
+
+        history.map.insert(
+            frame_number,
+            BufferHistoryInfo {
+                frame_number,
+                queue_time,
+                presentation_time,
+                state,
+                _padding: 0,
+            },
+        );
+        history.order.push_back(frame_number);
+        if history.order.len() > Self::BUFFER_HISTORY_SIZE {
+            let oldest_frame = history.order.pop_front().expect("non-empty history order");
+            history.map.remove(&oldest_frame);
+        }
+    }
+
+    pub fn update_history(&self, frame_number: u64, state: BufferState) {
+        let mut history = self.buffer_history.lock().unwrap();
+        if let Some(info) = history.map.get_mut(&frame_number) {
+            info.state = state;
+        }
     }
 
     pub fn signal_dequeue_condition(&self) {
@@ -471,6 +528,29 @@ mod tests {
     use super::*;
     use std::sync::mpsc;
     use std::time::Duration;
+
+    #[test]
+    fn buffer_history_updates_existing_frames_and_evicts_oldest_at_eight() {
+        let core = BufferQueueCore::new();
+        for frame in 1..=9 {
+            core.push_history(
+                frame,
+                frame as i64 * 10,
+                frame as i64 * 100,
+                BufferState::Queued,
+            );
+        }
+        core.update_history(9, BufferState::Free);
+
+        let history = core.buffer_history.lock().unwrap();
+        assert_eq!(history.map.len(), BufferQueueCore::BUFFER_HISTORY_SIZE);
+        assert!(!history.map.contains_key(&1));
+        assert_eq!(history.map[&9].state, BufferState::Free);
+        assert_eq!(history.map[&9].queue_time, 90);
+        assert_eq!(history.map[&9].presentation_time, 900);
+        assert_eq!(std::mem::size_of::<BufferHistoryInfo>(), 32);
+        assert_eq!(std::mem::align_of::<BufferHistoryInfo>(), 8);
+    }
 
     #[test]
     fn wait_for_dequeue_condition_falls_back_to_host_condvar_without_kernel() {

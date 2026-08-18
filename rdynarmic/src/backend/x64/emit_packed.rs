@@ -1,6 +1,7 @@
 use rxbyak::Reg;
 
 use crate::backend::x64::emit_context::EmitContext;
+use crate::backend::x64::host_feature::HostFeature;
 use crate::backend::x64::reg_alloc::RegAlloc;
 use crate::ir::inst::Inst;
 use crate::ir::value::InstRef;
@@ -181,32 +182,36 @@ pub fn emit_packed_abs_diff_sum_s8(
 // Args: (mask: U32, a: U32, b: U32) → (mask & a) | (~mask & b)
 // ---------------------------------------------------------------------------
 
-pub fn emit_packed_select(_ctx: &EmitContext, ra: &mut RegAlloc, inst_ref: InstRef, inst: &Inst) {
+pub fn emit_packed_select(ctx: &EmitContext, ra: &mut RegAlloc, inst_ref: InstRef, inst: &Inst) {
     let mut args = ra.get_argument_info(inst_ref, &inst.args, inst.num_args());
-    let mask_gpr = ra.use_gpr(&mut args[0]);
-    let a_gpr = ra.use_gpr(&mut args[1]);
-    let b_gpr = ra.use_gpr(&mut args[2]);
+    let xmm_count = args.iter().take(3).filter(|arg| arg.is_in_xmm(ra)).count();
 
-    let mask_xmm = ra.scratch_xmm();
-    let a_xmm = ra.scratch_xmm();
-    let b_xmm = ra.scratch_xmm();
-
-    ra.asm.movd(mask_xmm, mask_gpr.cvt32().unwrap()).unwrap();
-    ra.asm.movd(a_xmm, a_gpr.cvt32().unwrap()).unwrap();
-    ra.asm.movd(b_xmm, b_gpr.cvt32().unwrap()).unwrap();
-
-    // result = (mask & a) | (~mask & b)
-    ra.asm.pand(a_xmm, mask_xmm).unwrap();
-    ra.asm.pandn(mask_xmm, b_xmm).unwrap();
-    ra.asm.por(a_xmm, mask_xmm).unwrap();
-
-    let result = ra.scratch_gpr();
-    ra.asm.movd(result.cvt32().unwrap(), a_xmm).unwrap();
-
-    ra.release(mask_xmm);
-    ra.release(a_xmm);
-    ra.release(b_xmm);
-    ra.define_value(inst_ref, result);
+    if xmm_count >= 2 {
+        let ge = ra.use_scratch_xmm(&mut args[0]);
+        let to = ra.use_xmm(&mut args[1]);
+        let from = ra.use_scratch_xmm(&mut args[2]);
+        ra.asm.pand(from, ge).unwrap();
+        ra.asm.pandn(ge, to).unwrap();
+        ra.asm.por(from, ge).unwrap();
+        ra.define_value(inst_ref, from);
+    } else if ctx.has_host_feature(HostFeature::BMI1) {
+        let ge = ra.use_gpr(&mut args[0]).cvt32().unwrap();
+        let to = ra.use_scratch_gpr(&mut args[1]).cvt32().unwrap();
+        let from = ra.use_scratch_gpr(&mut args[2]).cvt32().unwrap();
+        ra.asm.and_(from, ge).unwrap();
+        ra.asm.andn(to, ge, to).unwrap();
+        ra.asm.or_(from, to).unwrap();
+        ra.define_value(inst_ref, Reg::gpr64(from.get_idx()));
+    } else {
+        let ge = ra.use_scratch_gpr(&mut args[0]).cvt32().unwrap();
+        let to = ra.use_gpr(&mut args[1]).cvt32().unwrap();
+        let from = ra.use_scratch_gpr(&mut args[2]).cvt32().unwrap();
+        ra.asm.and_(from, ge).unwrap();
+        ra.asm.not_(ge).unwrap();
+        ra.asm.and_(ge, to).unwrap();
+        ra.asm.or_(from, ge).unwrap();
+        ra.define_value(inst_ref, Reg::gpr64(from.get_idx()));
+    }
 }
 
 // ---------------------------------------------------------------------------

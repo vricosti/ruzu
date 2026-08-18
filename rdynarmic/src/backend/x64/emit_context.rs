@@ -2,10 +2,12 @@ use std::cell::RefCell;
 
 use crate::backend::x64::callback::Callback;
 use crate::backend::x64::exception_handler::FastmemPatchTable;
+use crate::backend::x64::host_feature::HostFeature;
 use crate::backend::x64::jit_state::{A32JitState, A64JitState};
 use crate::backend::x64::patch_info::PatchEntry;
 use crate::common::fp::fpcr::Fpcr;
 use crate::ir::location::{A32LocationDescriptor, A64LocationDescriptor, LocationDescriptor};
+use crate::jit_config::OptimizationFlag;
 
 pub use crate::backend::common::emit_context::MemoryEmitConfig;
 
@@ -291,6 +293,15 @@ pub struct EmitContext<'a> {
     pub location: LocationDescriptor,
     /// Emitter configuration and callbacks.
     pub config: &'a EmitConfig,
+    /// Copy of the immutable mask owned by `BlockOfCode`.
+    ///
+    /// Upstream emitters query `BlockOfCode::HasHostFeature` directly. Rust
+    /// splits the assembler and constant pool into independent mutable
+    /// borrows during emission, so the context carries the same mask by value.
+    pub host_features: HostFeature,
+    /// Effective optimization mask after applying `unsafe_optimizations`.
+    /// Upstream exposes this through virtual `EmitContext::HasOptimization`.
+    pub optimizations: OptimizationFlag,
     /// Architecture-specific configuration (A32 vs A64).
     /// Controls PC offset, halt_reason offset, location descriptor parsing.
     pub arch: ArchConfig,
@@ -381,6 +392,8 @@ impl<'a> EmitContext<'a> {
         Self {
             location,
             config,
+            host_features: crate::backend::x64::block_of_code::get_host_features(),
+            optimizations: OptimizationFlag::NO_OPTIMIZATIONS,
             arch: ArchConfig::A64,
             dispatcher_offsets: None,
             code_base_ptr: std::ptr::null(),
@@ -408,12 +421,16 @@ impl<'a> EmitContext<'a> {
         location: LocationDescriptor,
         config: &'a EmitConfig,
         arch: ArchConfig,
+        host_features: HostFeature,
+        optimizations: OptimizationFlag,
         dispatcher_offsets: [usize; 4],
         code_base_ptr: *const u8,
     ) -> Self {
         Self {
             location,
             config,
+            host_features,
+            optimizations,
             arch,
             dispatcher_offsets: Some(dispatcher_offsets),
             code_base_ptr,
@@ -440,6 +457,14 @@ impl<'a> EmitContext<'a> {
     /// Take collected patch entries out of the context.
     pub fn take_patch_entries(&self) -> Vec<PatchEntry> {
         self.patch_entries.borrow_mut().drain(..).collect()
+    }
+
+    pub fn has_host_feature(&self, feature: HostFeature) -> bool {
+        self.host_features.contains(feature)
+    }
+
+    pub fn has_optimization(&self, flag: OptimizationFlag) -> bool {
+        self.optimizations.contains(flag)
     }
 
     pub fn fpcr(&self, fpcr_controlled: bool) -> Fpcr {

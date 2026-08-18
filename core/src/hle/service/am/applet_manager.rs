@@ -14,6 +14,7 @@ use super::window_system::WindowSystem;
 use crate::core::SystemRef;
 use crate::hle::kernel::k_process::KProcess;
 use crate::hle::kernel::k_process::ProcessLock;
+use crate::hle::service::am::process_creation::create_process;
 use crate::hle::service::os::process::Process;
 
 // ---------------------------------------------------------------------------
@@ -426,6 +427,37 @@ impl AppletManager {
         let params = inner.pending_parameters.take().unwrap();
         let run_params = inner.pending_run_params.take();
         drop(inner);
+
+        if *common::settings::values().enable_overlay.get_value()
+            && window_system
+                .lock()
+                .unwrap()
+                .get_overlay_display_applet()
+                .is_none()
+        {
+            if let Some(overlay_process) =
+                create_process(self.system, AppletProgramId::OverlayDisplay as u64, 0, 0)
+            {
+                let mut overlay_applet = Applet::new(self.system, overlay_process, false);
+                overlay_applet.program_id = AppletProgramId::OverlayDisplay as u64;
+                overlay_applet.applet_id = AppletId::OverlayDisplay;
+                overlay_applet.applet_type = AppletType::OverlayApplet;
+                overlay_applet.library_applet_mode = LibraryAppletMode::PartialForeground;
+                overlay_applet.window_visible = true;
+                overlay_applet.home_button_short_pressed_blocked = false;
+                overlay_applet.home_button_long_pressed_blocked = false;
+                let overlay_applet = Arc::new(Mutex::new(overlay_applet));
+                window_system
+                    .lock()
+                    .unwrap()
+                    .track_applet(Arc::clone(&overlay_applet), false);
+                let started = overlay_applet.lock().unwrap().process.run();
+                overlay_applet.lock().unwrap().is_process_running = started;
+                log::info!(
+                    "Overlay applet launched before application (initially hidden, watching home button)"
+                );
+            }
+        }
 
         // Build the applet. Upstream: `auto applet = std::make_shared<Applet>(m_system, process, ...)`
         let mut applet = Applet::new(

@@ -10,6 +10,8 @@ use std::sync::Mutex;
 
 use ash::vk;
 
+use crate::vulkan_common::vulkan_device::Device;
+
 // ---------------------------------------------------------------------------
 // Stats
 // ---------------------------------------------------------------------------
@@ -51,20 +53,13 @@ fn get_uint64(statistic: &vk::PipelineExecutableStatisticKHR) -> u64 {
 /// Collects per-pipeline statistics via `VK_KHR_pipeline_executable_properties`
 /// and provides an aggregate report.
 pub struct PipelineStatistics {
-    device: ash::Device,
-    /// Extension function pointers for pipeline executable properties.
-    pipeline_executable_properties_fn: ash::extensions::khr::PipelineExecutableProperties,
     collected_stats: Mutex<Vec<Stats>>,
 }
 
 impl PipelineStatistics {
     /// Port of `PipelineStatistics::PipelineStatistics`.
-    pub fn new(instance: &ash::Instance, device: ash::Device) -> Self {
-        let pipeline_executable_properties_fn =
-            ash::extensions::khr::PipelineExecutableProperties::new(instance, &device);
+    pub fn new(_device: &Device) -> Self {
         PipelineStatistics {
-            device,
-            pipeline_executable_properties_fn,
             collected_stats: Mutex::new(Vec::new()),
         }
     }
@@ -73,13 +68,18 @@ impl PipelineStatistics {
     ///
     /// Queries pipeline executable properties and statistics for the given
     /// pipeline and accumulates them.
-    pub fn collect(&self, pipeline: vk::Pipeline) {
+    pub fn collect(&self, device: &Device, pipeline: vk::Pipeline) {
+        let pipeline_executable_properties_fn =
+            ash::extensions::khr::PipelineExecutableProperties::new(
+                device.get_instance(),
+                device.get_logical(),
+            );
         let pipeline_info = vk::PipelineInfoKHR::builder().pipeline(pipeline).build();
 
         let properties = unsafe {
-            self.pipeline_executable_properties_fn
+            pipeline_executable_properties_fn
                 .get_pipeline_executable_properties(&pipeline_info)
-                .unwrap_or_default()
+                .expect("GetPipelineExecutablePropertiesKHR failed")
         };
 
         for (executable, _prop) in properties.iter().enumerate() {
@@ -89,9 +89,9 @@ impl PipelineStatistics {
                 .build();
 
             let statistics = unsafe {
-                self.pipeline_executable_properties_fn
+                pipeline_executable_properties_fn
                     .get_pipeline_executable_statistics(&executable_info)
-                    .unwrap_or_default()
+                    .expect("GetPipelineExecutableStatisticsKHR failed")
             };
 
             if statistics.is_empty() {
@@ -139,34 +139,32 @@ impl PipelineStatistics {
     ///
     /// Logs averaged pipeline statistics across all collected pipelines.
     pub fn report(&self) {
-        let locked = self.collected_stats.lock().unwrap();
-        let num = locked.len() as f64;
-        if num == 0.0 {
-            return;
-        }
-
         let mut total = Stats::default();
-        for stats in locked.iter() {
-            total.code_size += stats.code_size;
-            total.register_count += stats.register_count;
-            total.sgpr_count += stats.sgpr_count;
-            total.vgpr_count += stats.vgpr_count;
-            total.branches_count += stats.branches_count;
-            total.basic_block_count += stats.basic_block_count;
-        }
+        let num = {
+            let locked = self.collected_stats.lock().unwrap();
+            for stats in locked.iter() {
+                total.code_size += stats.code_size;
+                total.register_count += stats.register_count;
+                total.sgpr_count += stats.sgpr_count;
+                total.vgpr_count += stats.vgpr_count;
+                total.branches_count += stats.branches_count;
+                total.basic_block_count += stats.basic_block_count;
+            }
+            locked.len() as f64
+        };
 
         let mut report = String::new();
-        let add = |report: &mut String, label: &str, value: u64| {
+        let add = |report: &mut String, prefix: &str, value: u64| {
             if value > 0 {
-                report.push_str(&format!("{}: {:9.03}\n", label, value as f64 / num));
+                report.push_str(&format!("{prefix}{:9.03}\n", value as f64 / num));
             }
         };
-        add(&mut report, "Code size     ", total.code_size);
-        add(&mut report, "Register count", total.register_count);
-        add(&mut report, "SGPRs         ", total.sgpr_count);
-        add(&mut report, "VGPRs         ", total.vgpr_count);
-        add(&mut report, "Branches count", total.branches_count);
-        add(&mut report, "Basic blocks  ", total.basic_block_count);
+        add(&mut report, "Code size:      ", total.code_size);
+        add(&mut report, "Register count: ", total.register_count);
+        add(&mut report, "SGPRs:          ", total.sgpr_count);
+        add(&mut report, "VGPRs:          ", total.vgpr_count);
+        add(&mut report, "Branches count: ", total.branches_count);
+        add(&mut report, "Basic blocks:   ", total.basic_block_count);
 
         log::info!(
             "\nAverage pipeline statistics\n\

@@ -51,6 +51,7 @@ struct WindowSystemInner {
     /// Foreground roots — upstream: Applet* m_home_menu, Applet* m_application
     home_menu_aruid: Option<u64>,
     application_aruid: Option<u64>,
+    overlay_display_aruid: Option<u64>,
 
     /// Applet map by aruid — upstream: std::map<u64, std::shared_ptr<Applet>>
     applets: BTreeMap<u64, Arc<Mutex<Applet>>>,
@@ -66,6 +67,7 @@ impl WindowSystem {
                 foreground_requested_aruid: None,
                 home_menu_aruid: None,
                 application_aruid: None,
+                overlay_display_aruid: None,
                 applets: BTreeMap::new(),
             }),
         }
@@ -126,6 +128,8 @@ impl WindowSystem {
             if a.applet_id == AppletId::QLaunch {
                 assert!(inner.home_menu_aruid.is_none(), "Home menu already tracked");
                 inner.home_menu_aruid = Some(aruid);
+            } else if a.applet_id == AppletId::OverlayDisplay {
+                inner.overlay_display_aruid = Some(aruid);
             } else if is_application {
                 assert!(
                     inner.application_aruid.is_none(),
@@ -157,6 +161,14 @@ impl WindowSystem {
         } else {
             None
         }
+    }
+
+    /// Upstream: `WindowSystem::GetOverlayDisplayApplet`.
+    pub fn get_overlay_display_applet(&self) -> Option<Arc<Mutex<Applet>>> {
+        let inner = self.lock.lock().unwrap();
+        inner
+            .overlay_display_aruid
+            .and_then(|aruid| inner.applets.get(&aruid).cloned())
     }
 
     /// Upstream: void RequestHomeMenuToGetForeground()
@@ -328,6 +340,10 @@ impl WindowSystem {
                             .push_unordered_message(AppletMessage::ApplicationExited);
                     }
                 }
+            }
+
+            if inner.overlay_display_aruid == Some(aruid) {
+                inner.overlay_display_aruid = None;
             }
 
             // Finalize applet.

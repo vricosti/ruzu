@@ -2031,4 +2031,54 @@ mod tests {
         assert!(!params.void_extent_hdr);
         assert!(!params.error);
     }
+    // Reden decodes ASTC through two independent implementations: this CPU
+    // decoder, and `host_shaders/astc_decoder.comp` on the GPU (the path
+    // OpenGL takes, since `accelerate_astc` defaults to `Gpu`). The GPU copy
+    // wrote its dequantised values at `color_values[++out_index]` while this
+    // one writes at `out[out_idx]` and then increments, so for identical input
+    // the two disagreed by one slot.
+    //
+    // `compute_endpoints` hands slot i to a fixed colour channel, so that
+    // one-slot shift is a channel rotation. This reproduces it by execution:
+    // a neutral grey texel decodes neutral under the correct layout and picks
+    // up a colour cast under the shifted one.
+    #[test]
+    fn shifting_color_values_by_one_slot_rotates_the_endpoint_channels() {
+        // Colour endpoint mode 8: LDR RGB direct, six values ordered
+        // R0, R1, G0, G1, B0, B1.
+        const NEUTRAL: [u32; 6] = [120, 140, 120, 140, 120, 140];
+
+        let mut idx = 0usize;
+        let (ep1, ep2) = compute_endpoints(&NEUTRAL, &mut idx, 8);
+        // R == G == B on both endpoints: genuinely neutral grey.
+        assert_eq!(ep1.color[1], ep1.color[2]);
+        assert_eq!(ep1.color[2], ep1.color[3]);
+        assert_eq!(ep2.color[1], ep2.color[2]);
+        assert_eq!(ep2.color[2], ep2.color[3]);
+
+        // What the GPU shader produced: slot 0 holds a leftover value from the
+        // previous block and every real value lands one slot later.
+        const STALE: u32 = 30;
+        let shifted: [u32; 6] = [
+            STALE, NEUTRAL[0], NEUTRAL[1], NEUTRAL[2], NEUTRAL[3], NEUTRAL[4],
+        ];
+        let mut idx = 0usize;
+        let (bad1, bad2) = compute_endpoints(&shifted, &mut idx, 8);
+
+        // The same neutral texel is no longer neutral.
+        assert_ne!(
+            (bad1.color[1], bad1.color[2], bad1.color[3]),
+            (ep1.color[1], ep1.color[2], ep1.color[3]),
+            "shifted endpoints must differ from the correct ones"
+        );
+        let neutral_after_shift = bad1.color[1] == bad1.color[2]
+            && bad1.color[2] == bad1.color[3]
+            && bad2.color[1] == bad2.color[2]
+            && bad2.color[2] == bad2.color[3];
+        assert!(
+            !neutral_after_shift,
+            "a one-slot shift must tint a neutral texel: ep1={:?} ep2={:?}",
+            bad1.color, bad2.color
+        );
+    }
 }

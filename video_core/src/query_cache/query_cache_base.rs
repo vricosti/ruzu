@@ -11,6 +11,7 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
 
+use common::hash::BuildUnorderedDenseHasher;
 use common::settings;
 
 use super::query_base::{QueryBase, QueryFlagBits, VAddr};
@@ -108,7 +109,8 @@ pub trait QueryCacheTraits {
 /// Outer key: page number (`address >> DEVICE_PAGEBITS`).
 /// Inner key: page offset (`address & DEVICE_PAGEMASK`), as `u32`.
 /// Value: the `QueryLocation` that wrote to that address.
-pub type ContentCache = HashMap<u64, HashMap<u32, QueryLocation>>;
+pub type QueryPageCache = HashMap<u32, QueryLocation, BuildUnorderedDenseHasher>;
+pub type ContentCache = HashMap<u64, QueryPageCache, BuildUnorderedDenseHasher>;
 
 /// Core query cache state shared across all backend implementations.
 ///
@@ -140,7 +142,7 @@ impl QueryCacheBase {
     pub fn new() -> Self {
         let mut this = Self {
             channel_caches: ChannelSetupCaches::new(),
-            cached_queries: HashMap::new(),
+            cached_queries: ContentCache::default(),
             cache_mutex: Mutex::new(()),
             impl_: QueryCacheBaseImpl::new(),
         };
@@ -230,29 +232,20 @@ impl QueryCacheBase {
     /// });
     /// ```
     ///
-    /// `InvalidateQuery` sets the `IsInvalidated` flag on the query.  Since
-    /// the streamer objects required to mutate flag bits are not yet ported,
-    /// we remove the entries from `cached_queries` (which is what
-    /// `remove_from_cache=true` does in `IterateCache`) and log a note.
+    /// `InvalidateQuery` sets the `IsInvalidated` flag before matching entries
+    /// are removed from `cached_queries` by `IterateCache<true>`.
     pub fn invalidate_region(&mut self, addr: VAddr, size: usize) {
-        // IterateCache<remove_from_cache=true> — each matched entry is removed.
-        // We also would call InvalidateQuery on each, but that requires
-        // access to the streamer slot vectors.  Log a warning for the missing
-        // flag-set step.
-        log::trace!(
-            "QueryCacheBase::invalidate_region: addr={:#x} size={} — \
-             removing cache entries; streamer flag mutation requires backend (not yet ported)",
+        let impl_ = &mut self.impl_;
+        Self::iterate_cache::<true, _>(
+            &self.cache_mutex,
+            &mut self.cached_queries,
             addr,
-            size
+            size,
+            |location| {
+                Self::invalidate_query_impl(impl_, location);
+                false
+            },
         );
-        let mut locations = Vec::new();
-        self.iterate_cache(addr, size, true, |location| {
-            locations.push(location);
-            false
-        });
-        for location in locations {
-            self.invalidate_query(location);
-        }
     }
 
     /// Flush all cached queries overlapping `[addr, addr+size)`.
@@ -266,25 +259,42 @@ impl QueryCacheBase {
     /// });
     /// if (result) RequestGuestHostSync();
     /// ```
-    ///
-    /// `SemiFlushQueryDirty` and `RequestGuestHostSync` require the streamer
-    /// and rasterizer, which are not yet ported.  We iterate the range (no
-    /// removal) and log a warning.
     pub fn flush_region(&mut self, addr: VAddr, size: usize) {
-        let mut locations = Vec::new();
-        self.iterate_cache(addr, size, false, |location| {
-            locations.push(location);
-            false
-        });
         let mut result = false;
-        for location in locations {
-            result |= self.semi_flush_query_dirty(location);
-            if result {
-                break;
-            }
-        }
+        let impl_ = &mut self.impl_;
+        Self::iterate_cache::<false, _>(
+            &self.cache_mutex,
+            &mut self.cached_queries,
+            addr,
+            size,
+            |location| {
+                result |= Self::semi_flush_query_dirty_impl(impl_, location);
+                result
+            },
+        );
         if result {
             self.request_guest_host_sync();
+        }
+    }
+
+    /// Cache the location created by a backend dispatch path.
+    ///
+    /// This is the indexing block at the end of upstream `CounterReport`,
+    /// exposed mechanically while Vulkan still supplies the fence callbacks
+    /// outside the shared owner.
+    pub fn cache_query_location(&mut self, cpu_addr: VAddr, location: QueryLocation) {
+        let page = cpu_addr >> DEVICE_PAGEBITS;
+        let offset = (cpu_addr & DEVICE_PAGEMASK) as u32;
+        let _lock = self.cache_mutex.lock().unwrap();
+        let old_location = self
+            .cached_queries
+            .entry(page)
+            .or_default()
+            .insert(offset, location);
+        if let Some(old_location) = old_location {
+            if let Some(old_query) = self.impl_.obtain_query_mut(old_location) {
+                old_query.flags |= QueryFlagBits::IS_REWRITTEN;
+            }
         }
     }
 
@@ -311,39 +321,20 @@ impl QueryCacheBase {
     /// return result;
     /// ```
     ///
-    /// `IsQueryDirty` reads streamer slot data.  Without the streamer, we
-    /// conservatively return false (safe: may cause unnecessary CPU reads but
-    /// never incorrect writes).
-    pub fn is_region_gpu_modified(&self, addr: VAddr, size: usize) -> bool {
-        // Determine whether any cached query location falls in the range.
-        // We cannot evaluate IsQueryDirty without the streamer, so we return
-        // false conservatively.
-        let addr_begin = addr;
-        let addr_end = addr_begin + size as u64;
-        let page_end = addr_end >> DEVICE_PAGEBITS;
-        let mut page = addr_begin >> DEVICE_PAGEBITS;
-        while page <= page_end {
-            let page_start = page << DEVICE_PAGEBITS;
-            if let Some(contents) = self.cached_queries.get(&page) {
-                for (&offset, _) in contents.iter() {
-                    let cache_begin = page_start + offset as u64;
-                    let cache_end = cache_begin + std::mem::size_of::<u32>() as u64;
-                    if cache_begin < addr_end && addr_begin < cache_end {
-                        // There is a cached query in range, but we cannot check
-                        // IsQueryDirty without the streamer.
-                        log::trace!(
-                            "QueryCacheBase::is_region_gpu_modified: addr={:#x} size={} — \
-                             cached query present but IsQueryDirty requires backend",
-                            addr,
-                            size
-                        );
-                        return false;
-                    }
-                }
-            }
-            page += 1;
-        }
-        false
+    pub fn is_region_gpu_modified(&mut self, addr: VAddr, size: usize) -> bool {
+        let mut result = false;
+        let impl_ = &self.impl_;
+        Self::iterate_cache::<false, _>(
+            &self.cache_mutex,
+            &mut self.cached_queries,
+            addr,
+            size,
+            |location| {
+                result |= Self::is_query_dirty_impl(impl_, location);
+                result
+            },
+        );
+        result
     }
 
     // ── Streamer-dependent operations (stub with log::warn) ────────────
@@ -449,12 +440,18 @@ impl QueryCacheBase {
         }
 
         let query_location = QueryLocation::new(streamer_id as u32, new_query_id as u32);
-        let is_synced = !settings::is_gpu_level_high(&settings::values()) && is_fence;
+        let values = settings::values();
+        let gpu_level_high = settings::is_gpu_level_high(&values);
+        let is_synced = (if settings::is_gpu_fence_behavior_default(&values) {
+            !gpu_level_high
+        } else {
+            !settings::is_gpu_fence_behavior_balanced(&values)
+                && !settings::is_gpu_fence_behavior_accurate(&values)
+                && !settings::is_gpu_fence_behavior_strict(&values)
+        }) && is_fence;
+        drop(values);
 
-        if !is_fence
-            && !settings::is_gpu_level_high(&settings::values())
-            && counter_type == QueryType::Payload
-        {
+        if !is_fence && !gpu_level_high && counter_type == QueryType::Payload {
             let timestamp = if has_timestamp {
                 self.impl_.gpu_mut().map(|gpu| gpu.get_ticks()).unwrap_or(0)
             } else {
@@ -492,10 +489,12 @@ impl QueryCacheBase {
                 return;
             }
             if !query_flags.intersects(QueryFlagBits::IS_FINAL_VALUE_SYNCED) {
-                debug_assert!(
-                    false,
-                    "QueryCacheBase::counter_report expected final value to be synced"
+                log::error!(
+                    "Query report value not synchronized. Consider increasing GPU accuracy."
                 );
+                if !is_synced {
+                    owner.impl_.pending_unregister.push(query_location);
+                }
                 return;
             }
 
@@ -710,16 +709,18 @@ impl QueryCacheBase {
     pub fn commit_async_flushes(&mut self) {
         self.refresh_owner_binding();
         self.notify_wfi();
-        let mut mask = 0u64;
-        self.impl_.for_each_streamer(|streamer| {
-            if streamer.has_unsynced_queries() {
-                mask |= 1u64 << streamer.get_id();
-            }
-            false
-        });
-        let _guard = self.impl_.flush_guard.lock().unwrap();
-        self.impl_.flushes_pending.push_back(mask);
-        drop(_guard);
+        let mask = {
+            let _guard = self.impl_.flush_guard.lock().unwrap();
+            let mut mask = 0u64;
+            self.impl_.for_each_streamer(|streamer| {
+                if streamer.has_unsynced_queries() {
+                    mask |= 1u64 << streamer.get_id();
+                }
+                false
+            });
+            self.impl_.flushes_pending.push_back(mask);
+            mask
+        };
         let owner = self.impl_.owner.map(|owner| owner as usize);
         if let Some(rasterizer) = self.impl_.rasterizer_mut() {
             rasterizer.sync_operation(Box::new(move || {
@@ -822,18 +823,14 @@ impl QueryCacheBase {
     /// Notify a GPU segment transition (pause/resume).
     ///
     /// Maps to C++ `QueryCacheBase::NotifySegment`:
-    /// on pause closes ZPassPixelCount64 and StreamingByteCount counters and
-    /// calls runtime PauseHostConditionalRendering; on resume calls
-    /// ResumeHostConditionalRendering.
-    pub fn notify_segment(&mut self, _resume: bool) {
-        if _resume {
+    /// pauses or resumes host conditional rendering.
+    pub fn notify_segment(&mut self, resume: bool) {
+        if resume {
             if let Some(runtime) = self.impl_.runtime_mut() {
                 runtime.resume_host_conditional_rendering();
             }
             return;
         }
-        self.counter_close(QueryType::ZPassPixelCount64);
-        self.counter_close(QueryType::StreamingByteCount);
         if let Some(runtime) = self.impl_.runtime_mut() {
             runtime.pause_host_conditional_rendering();
         }
@@ -849,11 +846,11 @@ impl QueryCacheBase {
     /// The callback `func` receives each matching `QueryLocation` and should
     /// return `true` to stop iteration early (matches the bool-returning
     /// variant in upstream).
-    pub fn iterate_cache<F>(
-        &mut self,
+    fn iterate_cache<const REMOVE_FROM_CACHE: bool, F>(
+        cache_mutex: &Mutex<()>,
+        cached_queries: &mut ContentCache,
         addr: VAddr,
         size: usize,
-        remove_from_cache: bool,
         mut func: F,
     ) where
         F: FnMut(QueryLocation) -> bool,
@@ -862,7 +859,7 @@ impl QueryCacheBase {
         let addr_end = addr_begin + size as u64;
         let page_end = addr_end >> DEVICE_PAGEBITS;
 
-        let _lock = self.cache_mutex.lock().unwrap();
+        let _lock = cache_mutex.lock().unwrap();
         let mut page = addr_begin >> DEVICE_PAGEBITS;
         while page <= page_end {
             let page_start = page << DEVICE_PAGEBITS;
@@ -873,7 +870,7 @@ impl QueryCacheBase {
                 cache_begin < addr_end && addr_begin < cache_end
             };
 
-            if let Some(contents) = self.cached_queries.get_mut(&page) {
+            if let Some(contents) = cached_queries.get_mut(&page) {
                 let mut early_exit = false;
                 for (&offset, &location) in contents.iter() {
                     if !in_range(offset) {
@@ -885,12 +882,11 @@ impl QueryCacheBase {
                     }
                 }
 
-                if remove_from_cache {
-                    contents.retain(|&offset, _| !in_range(offset));
-                }
-
                 if early_exit {
                     return;
+                }
+                if REMOVE_FROM_CACHE {
+                    contents.retain(|&offset, _| !in_range(offset));
                 }
             }
 
@@ -898,15 +894,18 @@ impl QueryCacheBase {
         }
     }
 
-    // ── Per-query operations (require streamer — stub with log::warn) ──
+    // ── Per-query operations ────────────────────────────────────────────
 
     /// Invalidate a single query by location.
     ///
     /// Maps to C++ `QueryCacheBase::InvalidateQuery`:
     /// sets `IsInvalidated` flag via `ObtainQuery(location)`.
-    /// Requires the streamer array to look up the `QueryBase`.
     pub fn invalidate_query(&mut self, _location: QueryLocation) {
-        let Some(query_base) = self.impl_.obtain_query_mut(_location) else {
+        Self::invalidate_query_impl(&mut self.impl_, _location);
+    }
+
+    fn invalidate_query_impl(impl_: &mut QueryCacheBaseImpl, location: QueryLocation) {
+        let Some(query_base) = impl_.obtain_query_mut(location) else {
             return;
         };
         query_base.flags |= QueryFlagBits::IS_INVALIDATED;
@@ -918,9 +917,12 @@ impl QueryCacheBase {
     /// ```cpp
     /// return IsHostManaged && !IsGuestSynced;
     /// ```
-    /// Requires streamer to obtain `QueryBase`.  Returns false conservatively.
-    pub fn is_query_dirty(&self, _location: QueryLocation) -> bool {
-        let Some(query_base) = self.impl_.obtain_query(_location) else {
+    pub fn is_query_dirty(&self, location: QueryLocation) -> bool {
+        Self::is_query_dirty_impl(&self.impl_, location)
+    }
+
+    fn is_query_dirty_impl(impl_: &QueryCacheBaseImpl, location: QueryLocation) -> bool {
+        let Some(query_base) = impl_.obtain_query(location) else {
             return false;
         };
         query_base.flags.intersects(QueryFlagBits::IS_HOST_MANAGED)
@@ -933,8 +935,14 @@ impl QueryCacheBase {
     /// if `IsFinalValueSynced && !IsGuestSynced` writes the value to guest
     /// memory via device_memory.GetPointer and returns false; otherwise
     /// returns whether the query is still host-managed-dirty.
-    /// Requires streamer + device_memory.  Returns false conservatively.
     pub fn semi_flush_query_dirty(&mut self, location: QueryLocation) -> bool {
+        Self::semi_flush_query_dirty_impl(&mut self.impl_, location)
+    }
+
+    fn semi_flush_query_dirty_impl(
+        impl_: &mut QueryCacheBaseImpl,
+        location: QueryLocation,
+    ) -> bool {
         let Some((
             guest_address,
             value,
@@ -942,7 +950,7 @@ impl QueryCacheBase {
             is_final_value_synced,
             is_guest_synced,
             is_host_managed,
-        )) = self.impl_.obtain_query(location).map(|query_base| {
+        )) = impl_.obtain_query(location).map(|query_base| {
             (
                 query_base.guest_address,
                 query_base.value,
@@ -958,7 +966,7 @@ impl QueryCacheBase {
             return false;
         };
         if is_final_value_synced && !is_guest_synced {
-            if let Some(device_memory) = self.impl_.device_memory_mut() {
+            if let Some(device_memory) = impl_.device_memory_mut() {
                 if has_timestamp {
                     device_memory.write_u64(guest_address, value);
                 } else {
@@ -999,6 +1007,7 @@ impl QueryCacheBase {
             return;
         }
         let pending = std::mem::take(&mut self.impl_.pending_unregister);
+        let _lock = self.cache_mutex.lock().unwrap();
         for location in pending {
             let Some(query_base) = self.impl_.obtain_query(location) else {
                 continue;
@@ -1008,9 +1017,6 @@ impl QueryCacheBase {
             if let Some(contents) = self.cached_queries.get_mut(&cont_addr) {
                 if contents.get(&base).copied() == Some(location) {
                     contents.remove(&base);
-                }
-                if contents.is_empty() {
-                    self.cached_queries.remove(&cont_addr);
                 }
             }
             self.impl_.free_query_location(location);
@@ -1261,11 +1267,18 @@ mod tests {
 
     #[derive(Default)]
     struct CountingRasterizer {
+        accelerate_dma: crate::rasterizer_interface::TestAccelerateDMA,
         sync_operations: u32,
         release_fences_calls: Vec<bool>,
     }
 
     impl RasterizerInterface for CountingRasterizer {
+        fn access_accelerate_dma(
+            &mut self,
+        ) -> &mut dyn crate::engines::maxwell_dma::AccelerateDMAInterface {
+            &mut self.accelerate_dma
+        }
+
         fn draw(
             &mut self,
             _draw_view: crate::engines::draw_manager::Maxwell3DDrawView<'_>,
@@ -1283,7 +1296,7 @@ mod tests {
             _layer_count: u32,
         ) {
         }
-        fn dispatch_compute(&mut self) {}
+        fn dispatch_compute(&mut self, _dispatch: &crate::engines::kepler_compute::DispatchCall) {}
         fn reset_counter(&mut self, _query_type: u32) {}
         fn query(
             &mut self,
@@ -1316,8 +1329,13 @@ mod tests {
             self.release_fences_calls.push(force);
         }
         fn flush_all(&mut self) {}
-        fn flush_region(&mut self, _addr: u64, _size: u64) {}
-        fn must_flush_region(&self, _addr: u64, _size: u64) -> bool {
+        fn flush_region(&mut self, _addr: u64, _size: u64, _which: crate::cache_types::CacheType) {}
+        fn must_flush_region(
+            &self,
+            _addr: u64,
+            _size: u64,
+            _which: crate::cache_types::CacheType,
+        ) -> bool {
             false
         }
         fn get_flush_area(&self, _addr: u64, _size: u64) -> RasterizerDownloadArea {
@@ -1327,7 +1345,13 @@ mod tests {
                 preemptive: false,
             }
         }
-        fn invalidate_region(&mut self, _addr: u64, _size: u64) {}
+        fn invalidate_region(
+            &mut self,
+            _addr: u64,
+            _size: u64,
+            _which: crate::cache_types::CacheType,
+        ) {
+        }
         fn on_cache_invalidation(&mut self, _addr: u64, _size: u64) {}
         fn on_cpu_write(&mut self, _addr: u64, _size: u64) -> bool {
             false
@@ -1335,7 +1359,13 @@ mod tests {
         fn invalidate_gpu_cache(&mut self) {}
         fn unmap_memory(&mut self, _addr: u64, _size: u64) {}
         fn modify_gpu_memory(&mut self, _as_id: usize, _addr: u64, _size: u64) {}
-        fn flush_and_invalidate_region(&mut self, _addr: u64, _size: u64) {}
+        fn flush_and_invalidate_region(
+            &mut self,
+            _addr: u64,
+            _size: u64,
+            _which: crate::cache_types::CacheType,
+        ) {
+        }
         fn wait_for_idle(&mut self) {}
         fn fragment_barrier(&mut self) {}
         fn tiled_cache_barrier(&mut self) {}
@@ -1431,6 +1461,80 @@ mod tests {
     }
 
     #[test]
+    fn backend_query_index_rewrites_old_location_and_flushes_new_value() {
+        let mut cache = QueryCacheBase::new();
+        let mut old_streamer = CountingStreamer::new(
+            QueryType::Payload as usize,
+            QueryBase::with_params(0x453c000, QueryFlagBits::IS_FINAL_VALUE_SYNCED, 0x1111),
+        );
+        let mut new_streamer = CountingStreamer::new(
+            QueryType::StreamingPrimitivesNeededMinusSucceeded as usize,
+            QueryBase::with_params(0x453c000, QueryFlagBits::IS_FINAL_VALUE_SYNCED, 0x2222),
+        );
+        let mut device_memory = CountingDeviceMemory::default();
+        cache
+            .impl_
+            .register_streamer(QueryType::Payload as usize, &mut old_streamer);
+        cache.impl_.register_streamer(
+            QueryType::StreamingPrimitivesNeededMinusSucceeded as usize,
+            &mut new_streamer,
+        );
+        cache.bind_device_memory(&mut device_memory);
+
+        let old_location = QueryLocation::new(QueryType::Payload as u32, 0);
+        let new_location =
+            QueryLocation::new(QueryType::StreamingPrimitivesNeededMinusSucceeded as u32, 0);
+        cache.cache_query_location(0x453c000, old_location);
+        cache.cache_query_location(0x453c000, new_location);
+
+        assert!(old_streamer
+            .query
+            .flags
+            .contains(QueryFlagBits::IS_REWRITTEN));
+        assert_eq!(
+            cache.cached_queries[&(0x453c000 >> DEVICE_PAGEBITS)][&0],
+            new_location
+        );
+
+        cache.flush_region(0x453c000, 4);
+        assert_eq!(device_memory.writes32, vec![(0x453c000, 0x2222)]);
+    }
+
+    #[test]
+    fn flush_region_stops_at_first_dirty_query_like_upstream() {
+        let mut cache = QueryCacheBase::new();
+        let mut dirty_streamer = CountingStreamer::new(
+            QueryType::Payload as usize,
+            QueryBase::with_params(0x1000, QueryFlagBits::IS_HOST_MANAGED, 0),
+        );
+        let mut later_streamer = CountingStreamer::new(
+            QueryType::ZPassPixelCount64 as usize,
+            QueryBase::with_params(0x2000, QueryFlagBits::IS_FINAL_VALUE_SYNCED, 0x2222),
+        );
+        let mut device_memory = CountingDeviceMemory::default();
+        let mut rasterizer = CountingRasterizer::default();
+        cache
+            .impl_
+            .register_streamer(QueryType::Payload as usize, &mut dirty_streamer);
+        cache
+            .impl_
+            .register_streamer(QueryType::ZPassPixelCount64 as usize, &mut later_streamer);
+        cache.bind_device_memory(&mut device_memory);
+        cache.bind_rasterizer(&mut rasterizer);
+
+        cache.cache_query_location(0x1000, QueryLocation::new(QueryType::Payload as u32, 0));
+        cache.cache_query_location(
+            0x2000,
+            QueryLocation::new(QueryType::ZPassPixelCount64 as u32, 0),
+        );
+        cache.flush_region(0x1000, 0x1004);
+
+        assert_eq!(rasterizer.release_fences_calls, vec![true]);
+        assert!(device_memory.writes32.is_empty());
+        assert!(device_memory.writes64.is_empty());
+    }
+
+    #[test]
     fn notify_and_async_flush_paths_use_registered_streamers() {
         let mut cache = QueryCacheBase::new();
         let mut streamer = CountingStreamer::new(0, QueryBase::new());
@@ -1466,6 +1570,8 @@ mod tests {
         use parking_lot::Mutex as ParkingMutex;
         use std::sync::Arc;
 
+        let _gpu_accuracy =
+            crate::test_support::GpuAccuracyGuard::set(common::settings_enums::GpuAccuracy::High);
         let mut cache = QueryCacheBase::new();
         let mut flags = QueryFlagBits::IS_FINAL_VALUE_SYNCED;
         flags |= QueryFlagBits::HAS_TIMESTAMP;
@@ -1503,8 +1609,11 @@ mod tests {
         assert_eq!(runtime.bind_calls, 1);
         assert_eq!(runtime.pause_calls, 1);
         assert_eq!(runtime.resume_calls, 1);
-        assert_eq!(zpass_streamer.close_calls, 1);
-        assert_eq!(bytecount_streamer.close_calls, 1);
+        // Upstream `QueryCacheBase::NotifySegment` only pauses/resumes host
+        // conditional rendering. Counter enable/disable belongs to the Vulkan
+        // scheduler caller and must not close either streamer here.
+        assert_eq!(zpass_streamer.close_calls, 0);
+        assert_eq!(bytecount_streamer.close_calls, 0);
 
         let location = QueryLocation::new(QueryType::Payload as u32, 0);
         assert!(!cache.semi_flush_query_dirty(location));
@@ -1535,12 +1644,8 @@ mod tests {
 
     #[test]
     fn counter_report_payload_fast_path_matches_upstream_low_accuracy_behavior() {
-        let previous_gpu_accuracy = {
-            let mut values = settings::values_mut();
-            let previous = values.current_gpu_accuracy;
-            values.current_gpu_accuracy = common::settings_enums::GpuAccuracy::Normal;
-            previous
-        };
+        let _gpu_accuracy =
+            crate::test_support::GpuAccuracyGuard::set(common::settings_enums::GpuAccuracy::Low);
 
         let mut cache = QueryCacheBase::new();
         let mut payload_streamer =
@@ -1577,18 +1682,12 @@ mod tests {
         );
         assert_eq!(payload_streamer.free_calls, 1);
         assert!(cache.cached_queries.is_empty());
-
-        settings::values_mut().current_gpu_accuracy = previous_gpu_accuracy;
     }
 
     #[test]
     fn counter_report_marks_rewritten_and_unregisters_on_sync_operation() {
-        let previous_gpu_accuracy = {
-            let mut values = settings::values_mut();
-            let previous = values.current_gpu_accuracy;
-            values.current_gpu_accuracy = common::settings_enums::GpuAccuracy::High;
-            previous
-        };
+        let _gpu_accuracy =
+            crate::test_support::GpuAccuracyGuard::set(common::settings_enums::GpuAccuracy::High);
 
         let mut cache = QueryCacheBase::new();
         let mut payload_streamer = CountingStreamer::new(
@@ -1641,8 +1740,6 @@ mod tests {
             .cached_queries
             .get(&(0x5500 >> DEVICE_PAGEBITS))
             .is_none_or(|contents| contents.is_empty()));
-
-        settings::values_mut().current_gpu_accuracy = previous_gpu_accuracy;
     }
 
     #[test]

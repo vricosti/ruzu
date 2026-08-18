@@ -10,6 +10,8 @@ pub struct DeviceSinkInfo {
     pub base: SinkInfoBase,
 }
 
+const _: () = assert!(std::mem::size_of::<DeviceSinkInfo>() <= std::mem::size_of::<SinkInfoBase>());
+
 impl DeviceSinkInfo {
     pub fn new() -> Self {
         Self {

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //
 // Rust/GTK4 counterpart of
-// `/home/vricosti/Dev/emulators/zuyu/src/yuzu/configuration/configure_dialog.cpp`
+// `/home/vricosti/Dev/emulators/eden/src/yuzu/configuration/configure_dialog.cpp`
 // (`ConfigureDialog`), whose widget tree lives in `configure.ui`.
 //
 // Upstream layout:
@@ -16,7 +16,7 @@
 //   General  → General, Hotkeys, UI, Web, Debug
 //   System   → System, Profiles, Network, Filesystem, Applets
 //   CPU      → CPU
-//   Graphics → Graphics, Advanced
+//   Graphics → Graphics, Advanced, Extras
 //   Audio    → Audio
 //   Controls → Player 1..8, Advanced
 //
@@ -33,17 +33,16 @@ use gtk::{glib, Window};
 
 use super::{
     configure_applets, configure_audio, configure_cpu, configure_debug_tab, configure_filesystem,
-    configure_general, configure_graphics, configure_graphics_advanced, configure_hotkeys,
-    configure_input, configure_network, configure_profile_manager, configure_system, configure_ui,
-    configure_web,
+    configure_general, configure_graphics, configure_graphics_advanced,
+    configure_graphics_extensions, configure_hotkeys, configure_input, configure_network,
+    configure_profile_manager, configure_system, configure_ui, configure_web,
 };
 
 /// Default dialog geometry. Upstream calls `adjustSize()` and lets Qt derive
-/// the size from `configure.ui`'s base plus the largest page — the Controls
-/// page, whose binding grid is the widest and tallest thing in the dialog.
-/// These figures are that resolved size, measured from the Qt dialog.
-const DEFAULT_WIDTH: i32 = 1290;
-const DEFAULT_HEIGHT: i32 = 850;
+/// the size from `configure.ui` plus the visible page. The current Eden dialog
+/// resolves to 1280×720 on the same desktop/session used to validate Reden.
+const DEFAULT_WIDTH: i32 = 1280;
+const DEFAULT_HEIGHT: i32 = 720;
 
 /// Fixed width of the left selector column, matching `configure.ui`'s
 /// `selectorList` `maximumSize` of 120px.
@@ -76,6 +75,16 @@ impl Page {
 struct Section {
     name: &'static str,
     pages: Vec<Page>,
+    /// Applies the pages through their upstream owner. Most sections expose
+    /// independent pages; Controls must retain `ConfigureInput`'s global-player
+    /// storage bracket around all of its subpages.
+    apply: fn(&[Page]),
+}
+
+fn apply_pages(pages: &[Page]) {
+    for page in pages {
+        (page.apply)();
+    }
 }
 
 /// The configuration dialog — upstream `ConfigureDialog`.
@@ -87,6 +96,10 @@ pub struct ConfigureDialog {
     /// of the same row doesn't rebuild the tabs (which would reset the tab
     /// position, unlike upstream's `QSignalBlocker`-guarded rebuild).
     shown: RefCell<Option<usize>>,
+    /// Notifies the main-window owner after OK has applied every page. Upstream
+    /// obtains the same edge from `QDialog::Accepted` and then refreshes its
+    /// permanent status widgets.
+    on_applied: RefCell<Option<Box<dyn Fn()>>>,
 }
 
 impl ConfigureDialog {
@@ -96,27 +109,32 @@ impl ConfigureDialog {
         parent: Option<&impl IsA<Window>>,
         input_subsystem: Rc<RefCell<input_common::InputSubsystem>>,
         hid_core: Arc<parking_lot::Mutex<hid_core::hid_core::HIDCore>>,
+        runtime_lock: bool,
     ) -> Rc<Self> {
+        // Upstream `ConfigureDialog` sets this before constructing any page so
+        // every widget represents the global configuration even while a title
+        // is running with custom settings selected.
+        common::settings::set_configuring_global(true);
+
         let window = Window::builder()
             .title("ruzu Configuration")
             .modal(true)
             .default_width(DEFAULT_WIDTH)
             .default_height(DEFAULT_HEIGHT)
             .build();
-        // Divergence from upstream, forced by the platform: upstream passes the
-        // main window as the `QDialog` parent. Setting `transient_for` here makes
-        // GTK advertise the surface as `_NET_WM_WINDOW_TYPE_DIALOG`, and window
-        // managers drop `_NET_WM_ACTION_MAXIMIZE_*` for dialogs — the maximize
-        // button in the titlebar is drawn but does nothing. The window stays
-        // modal, which is the behaviour `QDialog::exec` gives upstream; only the
-        // transient hint is dropped, so the dialog can be maximized like the
-        // main window.
-        let _ = &parent;
+        // `ConfigureDialog dialog(this); dialog.exec()` is both window-modal
+        // and parent-owned upstream. The transient relationship is required by
+        // GTK for `modal(true)` to block and stay above the main window.
+        if let Some(parent) = parent {
+            window.set_transient_for(Some(parent));
+            window.set_destroy_with_parent(true);
+        }
 
         // Upstream constructs Advanced Graphics first and gives Graphics a
         // callback to `ExposeComputeOption` when a Vulkan device requires it.
         let advanced_graphics = configure_graphics_advanced::page();
-        let graphics = configure_graphics::page(advanced_graphics.expose_compute_option);
+        let graphics =
+            configure_graphics::page(advanced_graphics.expose_compute_option, runtime_lock);
 
         // Upstream `PopulateSelectionList`'s six rows, in order.
         let sections = vec![
@@ -129,6 +147,7 @@ impl ConfigureDialog {
                     configure_web::page(),
                     configure_debug_tab::page(),
                 ],
+                apply: apply_pages,
             },
             Section {
                 name: "System",
@@ -139,22 +158,31 @@ impl ConfigureDialog {
                     configure_filesystem::page(),
                     configure_applets::page(),
                 ],
+                apply: apply_pages,
             },
             Section {
                 name: "CPU",
                 pages: vec![configure_cpu::page()],
+                apply: apply_pages,
             },
             Section {
                 name: "Graphics",
-                pages: vec![graphics, advanced_graphics.page],
+                pages: vec![
+                    graphics,
+                    advanced_graphics.page,
+                    configure_graphics_extensions::page(),
+                ],
+                apply: apply_pages,
             },
             Section {
                 name: "Audio",
                 pages: vec![configure_audio::page()],
+                apply: apply_pages,
             },
             Section {
                 name: "Controls",
                 pages: configure_input::pages(input_subsystem, hid_core),
+                apply: configure_input::apply_configuration,
             },
         ];
 
@@ -219,6 +247,7 @@ impl ConfigureDialog {
             notebook,
             sections: Rc::new(sections),
             shown: RefCell::new(None),
+            on_applied: RefCell::new(None),
         });
 
         // Upstream connects `itemSelectionChanged` to `UpdateVisibleTabs`.
@@ -244,6 +273,9 @@ impl ConfigureDialog {
             this,
             move |_| {
                 dialog.apply_configuration();
+                if let Some(callback) = dialog.on_applied.borrow().as_ref() {
+                    callback();
+                }
                 dialog.window.close();
             }
         ));
@@ -282,9 +314,7 @@ impl ConfigureDialog {
     /// on each tab regardless of which one is currently visible.
     fn apply_configuration(&self) {
         for section in self.sections.iter() {
-            for page in &section.pages {
-                (page.apply)();
-            }
+            (section.apply)(&section.pages);
         }
         // Upstream `GMainWindow::OnConfigure` calls `config->Save()` once the
         // dialog is accepted; without it the new bindings would live only in
@@ -305,6 +335,12 @@ impl ConfigureDialog {
     pub fn present(&self) {
         crate::i18n::translate_widget_tree(&self.window);
         self.window.present();
+    }
+
+    /// Connect the main-window work performed after upstream's accepted
+    /// configuration dialog has applied its values.
+    pub fn connect_applied(&self, callback: impl Fn() + 'static) {
+        *self.on_applied.borrow_mut() = Some(Box::new(callback));
     }
 
     /// Notify the owner once the GTK window closes so its `Rc` can be dropped,

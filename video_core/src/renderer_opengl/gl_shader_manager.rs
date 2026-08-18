@@ -1,11 +1,11 @@
 // SPDX-FileCopyrightText: 2025 ruzu contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! Port of zuyu/src/video_core/renderer_opengl/gl_shader_manager.h and gl_shader_manager.cpp
+//! Port of Eden `video_core/renderer_opengl/gl_shader_manager.{h,cpp}`.
 //!
 //! OpenGL program manager — manages binding of shader programs and assembly programs.
 
-use super::gl_resource_manager::{OGLPipeline, OGLProgram};
+use super::gl_resource_manager::{OGLAssemblyProgram, OGLPipeline, OGLProgram};
 use super::gl_shader_util::{bind_assembly_program, create_program_from_source};
 use crate::host_shaders::compute_shaders::OPENGL_LMEM_WARMUP_COMP;
 use std::sync::Arc;
@@ -24,26 +24,19 @@ const ASSEMBLY_PROGRAM_ENUMS: [u32; NUM_STAGES] = [
     0x8870, // GL_FRAGMENT_PROGRAM_NV
 ];
 
-/// Stage shader bits for glUseProgramStages.
-const STAGE_ENUMS: [u32; NUM_STAGES] = [
-    gl::VERTEX_SHADER_BIT,
-    gl::TESS_CONTROL_SHADER_BIT,
-    gl::TESS_EVALUATION_SHADER_BIT,
-    gl::GEOMETRY_SHADER_BIT,
-    gl::FRAGMENT_SHADER_BIT,
-];
-
 /// OpenGL program manager.
 ///
 /// Corresponds to `OpenGL::ProgramManager`.
 pub struct ProgramManager {
+    // Rust drops fields in declaration order; Eden destroys the last member
+    // (`lmem_warmup_program`) before the first owning member (`pipeline`).
+    lmem_warmup_program: OGLProgram,
     pipeline: OGLPipeline,
     is_pipeline_bound: bool,
     is_compute_bound: bool,
     current_stage_mask: u32,
     current_programs: [u32; NUM_STAGES],
     current_assembly_compute_program: u32,
-    lmem_warmup_program: OGLProgram,
 }
 
 impl ProgramManager {
@@ -54,7 +47,7 @@ impl ProgramManager {
         Self::new_with_caps(_device.use_assembly_shaders(), _device.has_lmem_perf_bug())
     }
 
-    pub fn new_with_caps(use_assembly_shaders: bool, has_lmem_perf_bug: bool) -> Self {
+    fn new_with_caps(use_assembly_shaders: bool, has_lmem_perf_bug: bool) -> Self {
         let mut pipeline = OGLPipeline::new();
         unsafe {
             gl::CreateProgramPipelines(1, &mut pipeline.handle);
@@ -68,45 +61,35 @@ impl ProgramManager {
 
         let mut lmem_warmup_program = OGLProgram::new();
         if has_lmem_perf_bug {
-            lmem_warmup_program.handle =
+            lmem_warmup_program =
                 create_program_from_source(OPENGL_LMEM_WARMUP_COMP, gl::COMPUTE_SHADER);
         }
 
         Self {
+            lmem_warmup_program,
             pipeline,
             is_pipeline_bound: false,
             is_compute_bound: false,
             current_stage_mask: 0,
             current_programs: [0; NUM_STAGES],
             current_assembly_compute_program: 0,
-            lmem_warmup_program,
         }
     }
 
-    pub fn new_shared(device: &super::gl_device::Device) -> ProgramManagerHandle {
+    pub(crate) fn new_shared(device: &super::gl_device::Device) -> ProgramManagerHandle {
         Arc::new(parking_lot::Mutex::new(Self::new(device)))
     }
 
-    pub fn new_shared_with_caps(
-        use_assembly_shaders: bool,
-        has_lmem_perf_bug: bool,
-    ) -> ProgramManagerHandle {
-        Arc::new(parking_lot::Mutex::new(Self::new_with_caps(
-            use_assembly_shaders,
-            has_lmem_perf_bug,
-        )))
-    }
-
     #[cfg(test)]
-    pub fn new_shared_for_test() -> ProgramManagerHandle {
+    pub(crate) fn new_shared_for_test() -> ProgramManagerHandle {
         Arc::new(parking_lot::Mutex::new(Self {
+            lmem_warmup_program: OGLProgram::new(),
             pipeline: OGLPipeline::new(),
             is_pipeline_bound: false,
             is_compute_bound: false,
             current_stage_mask: 0,
             current_programs: [0; NUM_STAGES],
             current_assembly_compute_program: 0,
-            lmem_warmup_program: OGLProgram::new(),
         }))
     }
 
@@ -135,12 +118,23 @@ impl ProgramManager {
     /// Bind source programs for all stages.
     ///
     /// Corresponds to `ProgramManager::BindSourcePrograms()`.
-    pub fn bind_source_programs(&mut self, programs: &[u32; NUM_STAGES]) {
+    pub fn bind_source_programs(&mut self, programs: &[OGLProgram; NUM_STAGES]) {
+        const STAGE_ENUMS: [u32; NUM_STAGES] = [
+            gl::VERTEX_SHADER_BIT,
+            gl::TESS_CONTROL_SHADER_BIT,
+            gl::TESS_EVALUATION_SHADER_BIT,
+            gl::GEOMETRY_SHADER_BIT,
+            gl::FRAGMENT_SHADER_BIT,
+        ];
         for stage in 0..NUM_STAGES {
-            if self.current_programs[stage] != programs[stage] {
-                self.current_programs[stage] = programs[stage];
+            if self.current_programs[stage] != programs[stage].handle {
+                self.current_programs[stage] = programs[stage].handle;
                 unsafe {
-                    gl::UseProgramStages(self.pipeline.handle, STAGE_ENUMS[stage], programs[stage]);
+                    gl::UseProgramStages(
+                        self.pipeline.handle,
+                        STAGE_ENUMS[stage],
+                        programs[stage].handle,
+                    );
                 }
             }
         }
@@ -190,7 +184,11 @@ impl ProgramManager {
     /// Bind assembly programs for all stages.
     ///
     /// Corresponds to `ProgramManager::BindAssemblyPrograms()`.
-    pub fn bind_assembly_programs(&mut self, programs: &[u32; NUM_STAGES], stage_mask: u32) {
+    pub fn bind_assembly_programs(
+        &mut self,
+        programs: &[OGLAssemblyProgram; NUM_STAGES],
+        stage_mask: u32,
+    ) {
         let changed_mask = self.current_stage_mask ^ stage_mask;
         self.current_stage_mask = stage_mask;
 
@@ -208,9 +206,9 @@ impl ProgramManager {
             }
         }
         for stage in 0..NUM_STAGES {
-            if self.current_programs[stage] != programs[stage] {
-                self.current_programs[stage] = programs[stage];
-                bind_assembly_program(ASSEMBLY_PROGRAM_ENUMS[stage], programs[stage]);
+            if self.current_programs[stage] != programs[stage].handle {
+                self.current_programs[stage] = programs[stage].handle;
+                bind_assembly_program(ASSEMBLY_PROGRAM_ENUMS[stage], programs[stage].handle);
             }
         }
         self.unbind_pipeline();

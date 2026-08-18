@@ -309,18 +309,18 @@ impl FileSystemController {
         use common::fs::path_util::{get_ruzu_path_string, RuzuPath};
 
         // Upstream: auto vfs = system.GetFilesystem();
-        //           auto nand_directory = vfs->OpenDirectory(NANDDir, ReadWrite);
+        //           auto save_directory = vfs->OpenDirectory(SaveDir, ReadWrite);
         let vfs = self.vfs.as_ref()?;
-        let nand_path = get_ruzu_path_string(RuzuPath::NANDDir);
-        let nand_directory: VirtualDir =
+        let save_path = get_ruzu_path_string(RuzuPath::SaveDir);
+        let save_directory: VirtualDir =
             Arc::new(crate::file_sys::vfs::vfs_real::RealVfsDirectory::new(
                 vfs.clone(),
-                nand_path,
+                save_path,
                 OpenMode::READ_WRITE,
             ));
         Some(Arc::new(Mutex::new(SaveDataFactory::new(
             program_id,
-            nand_directory,
+            save_directory,
         ))))
     }
 

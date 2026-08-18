@@ -7,14 +7,11 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use common::common_funcs::make_magic;
+
 use super::vfs::vfs::{VfsDirectory, VfsFile};
 use super::vfs::vfs_offset::OffsetVfsFile;
 use super::vfs::vfs_types::{VirtualDir, VirtualFile};
-
-/// Helper to construct a four-character-code magic value from bytes.
-const fn make_magic(a: u8, b: u8, c: u8, d: u8) -> u32 {
-    (a as u32) | ((b as u32) << 8) | ((c as u32) << 16) | ((d as u32) << 24)
-}
 
 const PFS0_MAGIC: u32 = make_magic(b'P', b'F', b'S', b'0');
 const HFS0_MAGIC: u32 = make_magic(b'H', b'F', b'S', b'0');

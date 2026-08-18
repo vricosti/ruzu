@@ -164,8 +164,6 @@ impl<'a> EmitContext<'a> {
                 && profile.support_geometry_shader_passthrough,
         };
 
-        ctx.header.push_str("#version 460 core\n");
-
         match program.stage {
             ir::types::ShaderStage::VertexB => {
                 ctx.stage_name = "vs";
@@ -880,6 +878,7 @@ mod tests {
                 texture_type: TextureType::Color2D,
                 is_depth: false,
                 is_multisample: true,
+                is_integer: false,
                 has_secondary: false,
                 cbuf_index: 2,
                 cbuf_offset: 0x40,

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //
 // Rust/GTK4 counterpart of
-// `/home/vricosti/Dev/emulators/zuyu/src/yuzu/configuration/configure_applets.cpp`
+// Eden `src/yuzu/configuration/configure_applets.cpp`
 // (`ConfigureApplets`), whose widget tree lives in `configure_applets.ui`.
 //
 // A single "Applet mode preference" group: one combo per library applet,
@@ -24,10 +24,10 @@ use super::shared_widget as w;
 /// The applets the dialog exposes, in `configure_applets.ui` order, paired with
 /// an accessor for the matching `Settings::Values` field.
 ///
-/// Upstream lists nine of the fifteen `*_applet_mode` settings; the rest
+/// Upstream exposes nine of the fifteen `*_applet_mode` settings; the rest
 /// (`shop`, `login_share`, `wifi_web_auth`, `my_page`, `net_connect`,
 /// `data_erase`) have no UI row, so they keep their defaults.
-type Field = fn(&mut Values) -> &mut common::settings_common::Setting<AppletMode>;
+type Field = fn(&mut Values) -> &mut common::settings_common::SwitchableSetting<AppletMode>;
 
 const APPLETS: &[(&str, Field)] = &[
     ("Amiibo editor", |v| &mut v.cabinet_applet_mode),
@@ -64,6 +64,12 @@ pub fn page() -> Page {
         combos.push((*field, combo));
     }
 
+    let enable_overlay = w::check_row(
+        "Enable Overlay Applet",
+        *common::settings::values().enable_overlay.get_value(),
+    );
+    content.append(&enable_overlay);
+
     column.append(&group);
 
     Page::new("Applets", scroller, move || {
@@ -72,6 +78,7 @@ pub fn page() -> Page {
             let mode = tr::value_at(tr::APPLET_MODE, combo.selected());
             field(&mut values).set_value(mode);
         }
+        values.enable_overlay.set_value(enable_overlay.is_active());
     })
 }
 

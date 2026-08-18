@@ -147,11 +147,6 @@ impl TelemetrySession {
         );
         self.add_field(
             field_type,
-            "Renderer_ShaderBackend",
-            FieldValue::U64(*vals.shader_backend.get_value() as u64),
-        );
-        self.add_field(
-            field_type,
             "Renderer_UseAsynchronousShaders",
             FieldValue::Bool(*vals.use_asynchronous_shaders.get_value()),
         );
@@ -217,7 +212,9 @@ impl Drop for TelemetrySession {
 
 fn translate_renderer(backend: settings_enums::RendererBackend) -> &'static str {
     match backend {
-        settings_enums::RendererBackend::OpenGL => "OpenGL",
+        settings_enums::RendererBackend::OpenGlGlsl
+        | settings_enums::RendererBackend::OpenGlGlasm
+        | settings_enums::RendererBackend::OpenGlSpirV => "OpenGL",
         settings_enums::RendererBackend::Vulkan => "Vulkan",
         settings_enums::RendererBackend::Null => "Null",
     }
@@ -225,9 +222,8 @@ fn translate_renderer(backend: settings_enums::RendererBackend) -> &'static str 
 
 fn translate_gpu_accuracy_level(accuracy: settings_enums::GpuAccuracy) -> &'static str {
     match accuracy {
-        settings_enums::GpuAccuracy::Normal => "Normal",
+        settings_enums::GpuAccuracy::Low => "Low",
         settings_enums::GpuAccuracy::High => "High",
-        settings_enums::GpuAccuracy::Extreme => "Extreme",
     }
 }
 

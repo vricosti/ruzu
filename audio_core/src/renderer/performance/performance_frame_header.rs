@@ -1,4 +1,4 @@
-use crate::common::common::make_magic;
+use common::common_funcs::make_magic;
 
 #[derive(Debug, Clone, Copy, Default)]
 #[repr(C)]
@@ -14,7 +14,7 @@ pub struct PerformanceFrameHeaderVersion1 {
 impl PerformanceFrameHeaderVersion1 {
     pub fn new() -> Self {
         Self {
-            magic: make_magic('P', 'E', 'R', 'F'),
+            magic: make_magic(b'P', b'E', b'R', b'F'),
             ..Default::default()
         }
     }
@@ -38,7 +38,7 @@ pub struct PerformanceFrameHeaderVersion2 {
 impl Default for PerformanceFrameHeaderVersion2 {
     fn default() -> Self {
         Self {
-            magic: make_magic('P', 'E', 'R', 'F'),
+            magic: make_magic(b'P', b'E', b'R', b'F'),
             entry_count: 0,
             detail_count: 0,
             next_offset: 0,
@@ -51,3 +51,6 @@ impl Default for PerformanceFrameHeaderVersion2 {
         }
     }
 }
+
+const _: () = assert!(std::mem::size_of::<PerformanceFrameHeaderVersion1>() == 0x18);
+const _: () = assert!(std::mem::size_of::<PerformanceFrameHeaderVersion2>() == 0x30);

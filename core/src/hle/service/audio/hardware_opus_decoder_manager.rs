@@ -194,15 +194,8 @@ impl IHardwareOpusDecoderManager {
             .system
             .get()
             .audio_core()
-            .ok_or(ResultCode::new(0))
-            .and_then(|audio_core| {
-                audio_core.open_opus_decoder(
-                    params.sample_rate,
-                    params.channel_count,
-                    false,
-                    tmem_size,
-                )
-            });
+            .expect("AudioCore must exist while hwopus is registered")
+            .open_opus_decoder(params.sample_rate, params.channel_count, false, tmem_size);
         Self::finish_open(ctx, result);
     }
 
@@ -211,27 +204,28 @@ impl IHardwareOpusDecoderManager {
         let svc = Self::as_self(this);
         let mut request = CmifRequest::new(ctx);
         let params: OpusParameters = request.raw();
-        let size = svc
+        let result = svc
             .system
             .get()
             .audio_core()
-            .map(|audio_core| {
-                audio_core.get_opus_work_buffer_size(
+            .expect("AudioCore must exist while hwopus is registered")
+            .get_opus_work_buffer_size(params.sample_rate, params.channel_count, false);
+        match result {
+            Ok(size) => {
+                log::debug!(
+                    "IHardwareOpusDecoderManager::GetWorkBufferSize rate={} ch={} -> {:#x}",
                     params.sample_rate,
                     params.channel_count,
-                    false,
-                )
-            })
-            .unwrap_or(0);
-        log::debug!(
-            "IHardwareOpusDecoderManager::GetWorkBufferSize rate={} ch={} -> {:#x}",
-            params.sample_rate,
-            params.channel_count,
-            size
-        );
-        let mut response = CmifResponse::new(ctx, 3, 0, 0);
-        response.push_result(RESULT_SUCCESS);
-        response.push_u32(size);
+                    size
+                );
+                let mut response = CmifResponse::new(ctx, 3, 0, 0);
+                response.push_result(RESULT_SUCCESS);
+                response.push_u32(size);
+            }
+            Err(result) => {
+                CmifResponse::result_only(ctx, result);
+            }
+        }
     }
 
     /// Mirror upstream `OpenHardwareOpusDecoderForMultiStream` (cmd 2).
@@ -256,18 +250,16 @@ impl IHardwareOpusDecoderManager {
             .system
             .get()
             .audio_core()
-            .ok_or(ResultCode::new(0))
-            .and_then(|audio_core| {
-                audio_core.open_opus_decoder_for_multi_stream(
-                    params.sample_rate,
-                    params.channel_count,
-                    params.total_stream_count,
-                    params.stereo_stream_count,
-                    false,
-                    &params.mappings,
-                    tmem_size,
-                )
-            });
+            .expect("AudioCore must exist while hwopus is registered")
+            .open_opus_decoder_for_multi_stream(
+                params.sample_rate,
+                params.channel_count,
+                params.total_stream_count,
+                params.stereo_stream_count,
+                false,
+                &params.mappings,
+                tmem_size,
+            );
         Self::finish_open(ctx, result);
     }
 
@@ -278,27 +270,32 @@ impl IHardwareOpusDecoderManager {
     ) {
         let svc = Self::as_self(this);
         let params = read_multi_stream_params(ctx);
-        let size = svc
+        let result = svc
             .system
             .get()
             .audio_core()
-            .map(|audio_core| {
-                audio_core.get_opus_work_buffer_size_for_multi_stream(
-                    params.sample_rate,
-                    params.channel_count,
-                    params.total_stream_count,
-                    params.stereo_stream_count,
-                    false,
-                )
-            })
-            .unwrap_or(0);
-        log::debug!(
-            "IHardwareOpusDecoderManager::GetWorkBufferSizeForMultiStream -> {:#x}",
-            size
-        );
-        let mut response = CmifResponse::new(ctx, 3, 0, 0);
-        response.push_result(RESULT_SUCCESS);
-        response.push_u32(size);
+            .expect("AudioCore must exist while hwopus is registered")
+            .get_opus_work_buffer_size_for_multi_stream(
+                params.sample_rate,
+                params.channel_count,
+                params.total_stream_count,
+                params.stereo_stream_count,
+                false,
+            );
+        match result {
+            Ok(size) => {
+                log::debug!(
+                    "IHardwareOpusDecoderManager::GetWorkBufferSizeForMultiStream -> {:#x}",
+                    size
+                );
+                let mut response = CmifResponse::new(ctx, 3, 0, 0);
+                response.push_result(RESULT_SUCCESS);
+                response.push_u32(size);
+            }
+            Err(result) => {
+                CmifResponse::result_only(ctx, result);
+            }
+        }
     }
 
     /// Mirror upstream `OpenHardwareOpusDecoderEx` (cmd 4).
@@ -321,15 +318,13 @@ impl IHardwareOpusDecoderManager {
             .system
             .get()
             .audio_core()
-            .ok_or(ResultCode::new(0))
-            .and_then(|audio_core| {
-                audio_core.open_opus_decoder(
-                    params.sample_rate,
-                    params.channel_count,
-                    params.use_large_frame_size != 0,
-                    tmem_size,
-                )
-            });
+            .expect("AudioCore must exist while hwopus is registered")
+            .open_opus_decoder(
+                params.sample_rate,
+                params.channel_count,
+                params.use_large_frame_size != 0,
+                tmem_size,
+            );
         Self::finish_open(ctx, result);
     }
 
@@ -338,25 +333,30 @@ impl IHardwareOpusDecoderManager {
         let svc = Self::as_self(this);
         let mut request = CmifRequest::new(ctx);
         let params: OpusParametersEx = request.raw();
-        let size = svc
+        let result = svc
             .system
             .get()
             .audio_core()
-            .map(|audio_core| {
-                audio_core.get_opus_work_buffer_size(
-                    params.sample_rate,
-                    params.channel_count,
-                    params.use_large_frame_size != 0,
-                )
-            })
-            .unwrap_or(0);
-        log::debug!(
-            "IHardwareOpusDecoderManager::GetWorkBufferSizeEx -> {:#x}",
-            size
-        );
-        let mut response = CmifResponse::new(ctx, 3, 0, 0);
-        response.push_result(RESULT_SUCCESS);
-        response.push_u32(size);
+            .expect("AudioCore must exist while hwopus is registered")
+            .get_opus_work_buffer_size(
+                params.sample_rate,
+                params.channel_count,
+                params.use_large_frame_size != 0,
+            );
+        match result {
+            Ok(size) => {
+                log::debug!(
+                    "IHardwareOpusDecoderManager::GetWorkBufferSizeEx -> {:#x}",
+                    size
+                );
+                let mut response = CmifResponse::new(ctx, 3, 0, 0);
+                response.push_result(RESULT_SUCCESS);
+                response.push_u32(size);
+            }
+            Err(result) => {
+                CmifResponse::result_only(ctx, result);
+            }
+        }
     }
 
     /// Mirror upstream `OpenHardwareOpusDecoderForMultiStreamEx` (cmd 6).
@@ -381,18 +381,16 @@ impl IHardwareOpusDecoderManager {
             .system
             .get()
             .audio_core()
-            .ok_or(ResultCode::new(0))
-            .and_then(|audio_core| {
-                audio_core.open_opus_decoder_for_multi_stream(
-                    params.sample_rate,
-                    params.channel_count,
-                    params.total_stream_count,
-                    params.stereo_stream_count,
-                    params.use_large_frame_size != 0,
-                    &params.mappings,
-                    tmem_size,
-                )
-            });
+            .expect("AudioCore must exist while hwopus is registered")
+            .open_opus_decoder_for_multi_stream(
+                params.sample_rate,
+                params.channel_count,
+                params.total_stream_count,
+                params.stereo_stream_count,
+                params.use_large_frame_size != 0,
+                &params.mappings,
+                tmem_size,
+            );
         Self::finish_open(ctx, result);
     }
 
@@ -403,32 +401,36 @@ impl IHardwareOpusDecoderManager {
     ) {
         let svc = Self::as_self(this);
         let params = read_multi_stream_params_ex(ctx);
-        let size = svc
+        let result = svc
             .system
             .get()
             .audio_core()
-            .map(|audio_core| {
-                audio_core.get_opus_work_buffer_size_for_multi_stream(
-                    params.sample_rate,
-                    params.channel_count,
-                    params.total_stream_count,
-                    params.stereo_stream_count,
-                    params.use_large_frame_size != 0,
-                )
-            })
-            .unwrap_or(0);
-        log::debug!(
-            "IHardwareOpusDecoderManager::GetWorkBufferSizeForMultiStreamEx -> {:#x}",
-            size
-        );
-        let mut response = CmifResponse::new(ctx, 3, 0, 0);
-        response.push_result(RESULT_SUCCESS);
-        response.push_u32(size);
+            .expect("AudioCore must exist while hwopus is registered")
+            .get_opus_work_buffer_size_for_multi_stream(
+                params.sample_rate,
+                params.channel_count,
+                params.total_stream_count,
+                params.stereo_stream_count,
+                params.use_large_frame_size != 0,
+            );
+        match result {
+            Ok(size) => {
+                log::debug!(
+                    "IHardwareOpusDecoderManager::GetWorkBufferSizeForMultiStreamEx -> {:#x}",
+                    size
+                );
+                let mut response = CmifResponse::new(ctx, 3, 0, 0);
+                response.push_result(RESULT_SUCCESS);
+                response.push_u32(size);
+            }
+            Err(result) => {
+                CmifResponse::result_only(ctx, result);
+            }
+        }
     }
 
-    /// Mirror upstream `GetWorkBufferSizeExEx` (cmd 8). Same args/output as
-    /// `GetWorkBufferSizeEx`; upstream's `impl.GetWorkBufferSizeExEx` differs
-    /// only in selecting a slightly larger buffer for newer firmware.
+    /// Mirror upstream `GetWorkBufferSizeExEx` (cmd 8), which currently
+    /// delegates to the same size formula as `GetWorkBufferSizeEx`.
     fn get_work_buffer_size_ex_ex_handler(
         this: &dyn ServiceFramework,
         ctx: &mut HLERequestContext,

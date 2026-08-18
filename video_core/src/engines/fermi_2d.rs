@@ -1545,80 +1545,15 @@ impl Fermi2D {
         let (src_surface, dst_surface, blit_config) = self.prepare_blit();
         self.memory_manager.lock().flush_caching();
 
-        let trace_blit = std::env::var_os("RUZU_TRACE_FERMI2D_BLIT").is_some();
-        if trace_blit {
-            log::info!(
-                "[FERMI2D_BLIT] src=0x{:X} {}x{} pitch={} fmt={:?} layout={:?} dst=0x{:X} {}x{} pitch={} fmt={:?} layout={:?} rect dst=({},{})->({},{}) src=({},{})->({},{}) must_accel={}",
-                src_surface.address(),
-                src_surface.width,
-                src_surface.height,
-                src_surface.pitch,
-                src_surface.format,
-                src_surface.linear,
-                dst_surface.address(),
-                dst_surface.width,
-                dst_surface.height,
-                dst_surface.pitch,
-                dst_surface.format,
-                dst_surface.linear,
-                blit_config.dst_x0,
-                blit_config.dst_y0,
-                blit_config.dst_x1,
-                blit_config.dst_y1,
-                blit_config.src_x0,
-                blit_config.src_y0,
-                blit_config.src_x1,
-                blit_config.src_y1,
-                blit_config.must_accelerate,
-            );
-        }
-
         if let Some(rasterizer_handle) = self.rasterizer {
             let rasterizer = unsafe { rasterizer_handle.as_mut() };
             if rasterizer.accelerate_surface_copy(&src_surface, &dst_surface, &blit_config) {
-                if trace_blit {
-                    log::info!("[FERMI2D_BLIT] accelerated=true");
-                }
                 return;
             }
         }
 
         self.sw_blitter
             .blit(&src_surface, &dst_surface, &blit_config);
-
-        if trace_blit {
-            let bytes_per_pixel = surface::bytes_per_block(
-                surface::pixel_format_from_render_target_format(dst_surface.format as u32),
-            ) as usize;
-            let row_bytes = if dst_surface.pitch != 0 {
-                dst_surface.pitch as usize
-            } else {
-                dst_surface.width as usize * bytes_per_pixel
-            };
-            let sample_size = row_bytes
-                .saturating_mul(dst_surface.height.max(1) as usize)
-                .min(4096);
-            let mut sample = vec![0u8; sample_size];
-            let nonzero = if sample_size != 0 {
-                self.memory_manager
-                    .lock()
-                    .read_block(dst_surface.address(), &mut sample);
-                sample.iter().filter(|&&byte| byte != 0).count()
-            } else {
-                0
-            };
-            let first_words: Vec<u32> = sample
-                .chunks_exact(4)
-                .take(4)
-                .map(|chunk| u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
-                .collect();
-            log::info!(
-                "[FERMI2D_BLIT] accelerated=false sample_size={} nonzero={} first={:08X?}",
-                sample_size,
-                nonzero,
-                first_words,
-            );
-        }
     }
 }
 
@@ -2268,7 +2203,10 @@ mod tests {
         eng.write_reg(PIXELS_FROM_MEMORY_SRC_X0_LOW, 0);
         eng.write_reg(PIXELS_FROM_MEMORY_SRC_X0_HIGH, 2);
         eng.write_reg(PIXELS_FROM_MEMORY_SRC_Y0_LOW, 0);
-        eng.write_reg(PIXELS_FROM_MEMORY_SRC_Y0_HIGH, 3);
+        // This register is the upstream blit trigger.  The test exercises only
+        // PrepareBlit, so seed it directly instead of executing the deliberately
+        // out-of-bounds synthetic blit.
+        eng.words_mut()[PIXELS_FROM_MEMORY_SRC_Y0_HIGH as usize] = 3;
 
         let (_src, _dst, config) = eng.prepare_blit();
         assert_eq!(config.operation, Operation::SrcCopy);
@@ -2300,7 +2238,9 @@ mod tests {
         eng.write_reg(PIXELS_FROM_MEMORY_SRC_X0_LOW, 0);
         eng.write_reg(PIXELS_FROM_MEMORY_SRC_X0_HIGH, 5);
         eng.write_reg(PIXELS_FROM_MEMORY_SRC_Y0_LOW, 0);
-        eng.write_reg(PIXELS_FROM_MEMORY_SRC_Y0_HIGH, 7);
+        // This register is the upstream blit trigger; avoid executing while the
+        // test is still assembling the synthetic PrepareBlit state.
+        eng.words_mut()[PIXELS_FROM_MEMORY_SRC_Y0_HIGH as usize] = 7;
 
         let (_src, _dst, config) = eng.prepare_blit();
         assert_eq!(config.src_x0, 4);

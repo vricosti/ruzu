@@ -132,10 +132,12 @@ fn insert_before(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::environment::TexturePassCaches;
     use crate::program_header::ProgramHeader;
     use crate::shader_info::{ReplaceConstant, TexturePixelFormat, TextureType};
 
     struct MockEnvironment {
+        texture_pass_caches: TexturePassCaches,
         sph: ProgramHeader,
         stage: ShaderStage,
         viewport_transform_state: u32,
@@ -144,6 +146,7 @@ mod tests {
     impl MockEnvironment {
         fn new(stage: ShaderStage, viewport_transform_state: u32) -> Self {
             Self {
+                texture_pass_caches: TexturePassCaches::default(),
                 sph: ProgramHeader::default(),
                 stage,
                 viewport_transform_state,
@@ -152,6 +155,10 @@ mod tests {
     }
 
     impl Environment for MockEnvironment {
+        fn texture_pass_caches(&mut self) -> &mut TexturePassCaches {
+            &mut self.texture_pass_caches
+        }
+
         fn read_instruction(&mut self, _address: u32) -> u64 {
             0
         }

@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-//! Port of zuyu/src/video_core/renderer_opengl/present/layer.h and layer.cpp
+//! Port of Eden `video_core/renderer_opengl/present/layer.{h,cpp}`.
 //!
 //! Presentation layer -- manages a single framebuffer texture, applies anti-aliasing
 //! and upscaling, and prepares draw data for the window adapt pass.
@@ -11,110 +11,44 @@ use super::fxaa::FXAA;
 use super::present_uniforms::{make_orthographic_matrix, ScreenRectVertex};
 use super::smaa::SMAA;
 
-use crate::framebuffer_config::{self, FramebufferConfig, RectF};
+use crate::framebuffer_config::{self, AndroidPixelFormat, FramebufferConfig, RectF};
 use crate::present::{AntiAliasing, PresentFilters, ScalingFilter};
 use crate::renderer_base::DeviceMemoryReader;
+use crate::renderer_opengl::gl_blit_screen::FramebufferTextureInfo;
+use crate::renderer_opengl::gl_resource_manager::OGLTexture;
 use crate::renderer_opengl::gl_shader_manager::ProgramManager;
 use crate::renderer_opengl::RasterizerOpenGL;
 use ruzu_core::frontend::framebuffer_layout::FramebufferLayout;
-use std::sync::atomic::{AtomicU64, Ordering};
-
-const PRESENT_LAYER_SENTINEL: u64 = u64::MAX;
-static PRESENT_PATH_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
-
-fn parse_trace_u64_env(name: &str) -> Option<u64> {
-    let value = std::env::var(name).ok()?;
-    let value = value.trim();
-    if let Some(hex) = value
-        .strip_prefix("0x")
-        .or_else(|| value.strip_prefix("0X"))
-    {
-        u64::from_str_radix(hex, 16).ok()
-    } else {
-        value.parse::<u64>().ok()
-    }
-}
-
-fn should_trace_present_path(framebuffer_addr: u64) -> bool {
-    let Some(target) = parse_trace_u64_env("RUZU_TRACE_PRESENT_PATH_ADDR") else {
-        return false;
-    };
-    if target != framebuffer_addr {
-        return false;
-    }
-    let every = parse_trace_u64_env("RUZU_TRACE_PRESENT_PATH_EVERY")
-        .unwrap_or(1)
-        .max(1);
-    let count = PRESENT_PATH_TRACE_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
-    count % every == 0
-}
-
-fn trace_present_layer(stage: u64, framebuffer: &FramebufferConfig, gpu_addr: u64, aux: &[u64]) {
-    if !common::trace::is_enabled(common::trace::cat::PRESENT_TEXTURE) {
-        return;
-    }
-    let mut args = [
-        PRESENT_LAYER_SENTINEL,
-        stage,
-        gpu_addr,
-        framebuffer.address,
-        framebuffer.offset as u64,
-        framebuffer.width as u64,
-        framebuffer.height as u64,
-        framebuffer.stride as u64,
-        framebuffer.pixel_format.0 as u64,
-        0,
-        0,
-        0,
-        0,
-    ];
-    for (index, value) in aux.iter().take(4).enumerate() {
-        args[9 + index] = *value;
-    }
-    let _ = common::trace::emit_raw(common::trace::cat::PRESENT_TEXTURE, &args);
-}
-
-/// Information about a framebuffer texture for display.
-///
-/// Corresponds to `OpenGL::FramebufferTextureInfo` (used in gl_blit_screen).
-#[derive(Clone, Copy, Debug, Default)]
-pub struct FramebufferTextureInfo {
-    pub display_texture: u32,
-    pub width: u32,
-    pub height: u32,
-    pub scaled_width: u32,
-    pub scaled_height: u32,
-}
 
 /// Information about the Switch screen texture.
 ///
 /// Corresponds to `OpenGL::TextureInfo`.
 pub struct TextureInfo {
-    pub resource: u32,
+    pub resource: OGLTexture,
     pub width: i32,
     pub height: i32,
     pub gl_format: u32,
     pub gl_type: u32,
-    pub pixel_format: u32,
+    pub pixel_format: AndroidPixelFormat,
 }
 
-impl TextureInfo {
-    pub fn new() -> Self {
-        Self {
-            resource: 0,
-            width: 0,
-            height: 0,
-            gl_format: gl::NONE,
-            gl_type: gl::NONE,
-            pixel_format: 0,
-        }
-    }
+enum AntiAlias {
+    None,
+    Fxaa(FXAA),
+    Smaa(SMAA),
 }
 
 /// A presentation layer.
 ///
 /// Corresponds to `OpenGL::Layer`.
 pub struct Layer {
+    // Rust drops fields in declaration order. Eden destroys the C++ members in
+    // reverse declaration order: anti_alias, fsr, framebuffer_texture, then
+    // gl_framebuffer_data.
+    anti_alias: AntiAlias,
+    fsr: Option<FSR>,
+    framebuffer_texture: TextureInfo,
+    gl_framebuffer_data: Vec<u8>,
     /// Upstream stores `RasterizerOpenGL& rasterizer` on `OpenGL::Layer`.
     ///
     /// Rust keeps the non-owning reference as a raw pointer because `RendererOpenGL`
@@ -127,14 +61,6 @@ pub struct Layer {
     ///
     /// Upstream stores `const PresentFilters& filters` on `OpenGL::Layer`.
     filters: &'static PresentFilters,
-    /// Framebuffer texture data on the CPU side.
-    gl_framebuffer_data: Vec<u8>,
-    /// Display information for the framebuffer texture.
-    framebuffer_texture: TextureInfo,
-
-    fsr: Option<FSR>,
-    fxaa: Option<FXAA>,
-    smaa: Option<SMAA>,
 }
 
 // Safety: `Layer` is owned by the OpenGL renderer/present pipeline. Its raw
@@ -152,13 +78,13 @@ impl Layer {
         device_memory: DeviceMemoryReader,
         filters: &'static PresentFilters,
     ) -> Self {
-        let mut texture: u32 = 0;
+        let mut texture = OGLTexture::new();
+        texture.create(gl::TEXTURE_2D);
         unsafe {
-            gl::CreateTextures(gl::TEXTURE_2D, 1, &mut texture);
-            gl::TextureStorage2D(texture, 1, gl::RGBA8, 1, 1);
+            gl::TextureStorage2D(texture.handle, 1, gl::RGBA8, 1, 1);
             let black: [u8; 4] = [0, 0, 0, 0];
             gl::ClearTexImage(
-                texture,
+                texture.handle,
                 0,
                 gl::RGBA,
                 gl::UNSIGNED_BYTE,
@@ -167,21 +93,20 @@ impl Layer {
         }
 
         Self {
-            rasterizer,
-            device_memory,
-            filters,
-            gl_framebuffer_data: Vec::new(),
+            anti_alias: AntiAlias::None,
+            fsr: None,
             framebuffer_texture: TextureInfo {
                 resource: texture,
                 width: 1,
                 height: 1,
                 gl_format: gl::RGBA,
                 gl_type: gl::UNSIGNED_BYTE,
-                pixel_format: 0,
+                pixel_format: AndroidPixelFormat::default(),
             },
-            fsr: None,
-            fxaa: None,
-            smaa: None,
+            gl_framebuffer_data: Vec::new(),
+            rasterizer,
+            device_memory,
+            filters,
         }
     }
 
@@ -207,47 +132,31 @@ impl Layer {
         let mut crop = framebuffer_config::normalize_crop(framebuffer, info.width, info.height);
         let mut texture = info.display_texture;
 
-        match (self.filters.get_anti_aliasing)() {
-            AntiAliasing::None => {}
-            AntiAliasing::Fxaa => {
-                let resolution = common::settings::values().resolution_info.clone();
-                let viewport_width = resolution.scale_up_i32(self.framebuffer_texture.width);
-                let viewport_height = resolution.scale_up_i32(self.framebuffer_texture.height);
-                unsafe {
-                    gl::Enablei(gl::SCISSOR_TEST, 0);
-                    gl::ScissorIndexed(0, 0, 0, viewport_width, viewport_height);
-                    gl::ViewportIndexedf(
-                        0,
-                        0.0,
-                        0.0,
-                        viewport_width as f32,
-                        viewport_height as f32,
-                    );
-                }
-                self.create_fxaa();
-                if let Some(fxaa) = &self.fxaa {
-                    texture = fxaa.draw(program_manager, info.display_texture);
-                }
+        let anti_aliasing = (self.filters.get_anti_aliasing)();
+        if anti_aliasing != AntiAliasing::None {
+            let resolution = common::settings::values().resolution_info.clone();
+            let viewport_width = resolution.scale_up_i32(self.framebuffer_texture.width);
+            let viewport_height = resolution.scale_up_i32(self.framebuffer_texture.height);
+            unsafe {
+                gl::Enablei(gl::SCISSOR_TEST, 0);
+                gl::ScissorIndexed(0, 0, 0, viewport_width, viewport_height);
+                gl::ViewportIndexedf(0, 0.0, 0.0, viewport_width as f32, viewport_height as f32);
             }
-            AntiAliasing::Smaa => {
-                let resolution = common::settings::values().resolution_info.clone();
-                let viewport_width = resolution.scale_up_i32(self.framebuffer_texture.width);
-                let viewport_height = resolution.scale_up_i32(self.framebuffer_texture.height);
-                unsafe {
-                    gl::Enablei(gl::SCISSOR_TEST, 0);
-                    gl::ScissorIndexed(0, 0, 0, viewport_width, viewport_height);
-                    gl::ViewportIndexedf(
-                        0,
-                        0.0,
-                        0.0,
-                        viewport_width as f32,
-                        viewport_height as f32,
-                    );
+
+            match anti_aliasing {
+                AntiAliasing::Fxaa => {
+                    self.create_fxaa();
+                    if let AntiAlias::Fxaa(fxaa) = &self.anti_alias {
+                        texture = fxaa.draw(program_manager, info.display_texture);
+                    }
                 }
-                self.create_smaa();
-                if let Some(smaa) = &self.smaa {
-                    texture = smaa.draw(program_manager, info.display_texture);
+                AntiAliasing::Smaa => {
+                    self.create_smaa();
+                    if let AntiAlias::Smaa(smaa) = &self.anti_alias {
+                        texture = smaa.draw(program_manager, info.display_texture);
+                    }
                 }
+                AntiAliasing::None => {}
             }
         }
 
@@ -310,7 +219,7 @@ impl Layer {
     fn prepare_render_target(&mut self, framebuffer: &FramebufferConfig) -> FramebufferTextureInfo {
         if self.framebuffer_texture.width != framebuffer.width as i32
             || self.framebuffer_texture.height != framebuffer.height as i32
-            || self.framebuffer_texture.pixel_format != framebuffer.pixel_format.0
+            || self.framebuffer_texture.pixel_format != framebuffer.pixel_format
             || self.gl_framebuffer_data.is_empty()
         {
             self.configure_framebuffer_texture(framebuffer);
@@ -331,7 +240,6 @@ impl Layer {
         framebuffer: &FramebufferConfig,
     ) -> FramebufferTextureInfo {
         let framebuffer_addr = framebuffer.address + framebuffer.offset as u64;
-        trace_present_layer(1, framebuffer, framebuffer_addr, &[]);
 
         let rasterizer = unsafe {
             self.rasterizer
@@ -341,35 +249,16 @@ impl Layer {
         if let Some(info) =
             rasterizer.accelerate_display(framebuffer, framebuffer_addr, framebuffer.stride)
         {
-            if should_trace_present_path(framebuffer_addr) {
-                log::info!(
-                    "[PRESENT_PATH] addr=0x{:X} path=accelerate texture={} size={}x{} scaled={}x{} fb={}x{} stride={} fmt=0x{:X}",
-                    framebuffer_addr,
-                    info.display_texture,
-                    info.width,
-                    info.height,
-                    info.scaled_width,
-                    info.scaled_height,
-                    framebuffer.width,
-                    framebuffer.height,
-                    framebuffer.stride,
-                    framebuffer.pixel_format.0,
-                );
-            }
-            trace_present_layer(
-                2,
-                framebuffer,
-                framebuffer_addr,
-                &[
-                    info.display_texture as u64,
-                    info.width as u64,
-                    info.height as u64,
-                    ((info.scaled_width as u64) << 32) | info.scaled_height as u64,
-                ],
-            );
             return info;
         }
-        trace_present_layer(3, framebuffer, framebuffer_addr, &[]);
+
+        let info = FramebufferTextureInfo {
+            display_texture: self.framebuffer_texture.resource.handle,
+            width: framebuffer.width,
+            height: framebuffer.height,
+            scaled_width: framebuffer.width,
+            scaled_height: framebuffer.height,
+        };
 
         let pixel_format =
             crate::surface::pixel_format_from_gpu_pixel_format(framebuffer.pixel_format.0);
@@ -391,23 +280,6 @@ impl Layer {
         // Read tiled framebuffer data from GPU memory.
         let mut tiled_data = vec![0u8; size_in_bytes];
         let host_ptr_available = (self.device_memory)(framebuffer_addr, &mut tiled_data);
-        let trace_present_path = should_trace_present_path(framebuffer_addr);
-        if trace_present_path {
-            let sample = &tiled_data[..tiled_data.len().min(4096)];
-            let nonzero = sample.iter().filter(|&&byte| byte != 0).count();
-            let checksum = sample
-                .iter()
-                .fold(0u64, |acc, &byte| acc.wrapping_mul(16777619) ^ byte as u64);
-            log::info!(
-                "[PRESENT_PATH] addr=0x{:X} path=cpu_read ok={} tiled_size={} sample={} nonzero={} checksum=0x{:X}",
-                framebuffer_addr,
-                host_ptr_available,
-                size_in_bytes,
-                sample.len(),
-                nonzero,
-                checksum,
-            );
-        }
 
         if host_ptr_available {
             // Unswizzle from Tegra block-linear to linear layout.
@@ -426,78 +298,6 @@ impl Layer {
                 0, // block_depth
                 1, // stride_alignment
             );
-            if trace_present_path {
-                let sample = &self.gl_framebuffer_data[..linear_size.min(4096)];
-                let nonzero = sample.iter().filter(|&&byte| byte != 0).count();
-                let checksum = sample
-                    .iter()
-                    .fold(0u64, |acc, &byte| acc.wrapping_mul(16777619) ^ byte as u64);
-                let first_rgba = self
-                    .gl_framebuffer_data
-                    .get(0..4)
-                    .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
-                    .unwrap_or(0);
-                log::info!(
-                    "[PRESENT_PATH] addr=0x{:X} path=cpu_unswizzle linear_size={} sample={} nonzero={} checksum=0x{:X} first_rgba=0x{:08X}",
-                    framebuffer_addr,
-                    linear_size,
-                    sample.len(),
-                    nonzero,
-                    checksum,
-                    first_rgba,
-                );
-            }
-
-            if common::trace::is_enabled(common::trace::cat::PRESENT_TEXTURE) {
-                let sample = &self.gl_framebuffer_data[..linear_size.min(4096)];
-                let nonzero = sample.iter().filter(|&&byte| byte != 0).count() as u64;
-                let checksum = sample
-                    .iter()
-                    .fold(0u64, |acc, &byte| acc.wrapping_mul(16777619) ^ byte as u64);
-                let first_rgba = self
-                    .gl_framebuffer_data
-                    .get(0..4)
-                    .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()) as u64)
-                    .unwrap_or(0);
-                let last_rgba = linear_size
-                    .checked_sub(4)
-                    .and_then(|start| self.gl_framebuffer_data.get(start..start + 4))
-                    .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()) as u64)
-                    .unwrap_or(0);
-                trace_present_layer(
-                    4,
-                    framebuffer,
-                    framebuffer_addr,
-                    &[
-                        size_in_bytes as u64,
-                        nonzero,
-                        checksum,
-                        (first_rgba << 32) | last_rgba,
-                    ],
-                );
-            }
-
-            if std::env::var_os("RUZU_TRACE_PRESENT").is_some() {
-                let nonzero = self.gl_framebuffer_data[..linear_size]
-                    .iter()
-                    .filter(|&&byte| byte != 0)
-                    .take(1024)
-                    .count();
-                let checksum = self.gl_framebuffer_data[..linear_size]
-                    .iter()
-                    .take(4096)
-                    .fold(0u64, |acc, &byte| acc.wrapping_mul(16777619) ^ byte as u64);
-                log::info!(
-                    "[PRESENT] LoadFB addr=0x{:X} size={} linear_size={} first_1k_nonzero={} checksum4k=0x{:X}",
-                    framebuffer_addr,
-                    size_in_bytes,
-                    linear_size,
-                    nonzero,
-                    checksum
-                );
-            }
-        } else {
-            trace_present_layer(5, framebuffer, framebuffer_addr, &[size_in_bytes as u64]);
         }
 
         // Upload to GL texture.
@@ -505,7 +305,7 @@ impl Layer {
             gl::BindBuffer(gl::PIXEL_UNPACK_BUFFER, 0);
             gl::PixelStorei(gl::UNPACK_ROW_LENGTH, framebuffer.stride as i32);
             gl::TextureSubImage2D(
-                self.framebuffer_texture.resource,
+                self.framebuffer_texture.resource.handle,
                 0, // level
                 0,
                 0, // x, y offset
@@ -518,13 +318,7 @@ impl Layer {
             gl::PixelStorei(gl::UNPACK_ROW_LENGTH, 0);
         }
 
-        FramebufferTextureInfo {
-            display_texture: self.framebuffer_texture.resource,
-            width: framebuffer.width,
-            height: framebuffer.height,
-            scaled_width: framebuffer.width,
-            scaled_height: framebuffer.height,
-        }
+        info
     }
 
     /// Reconfigure the framebuffer texture for new dimensions/format.
@@ -533,7 +327,7 @@ impl Layer {
     fn configure_framebuffer_texture(&mut self, framebuffer: &FramebufferConfig) {
         self.framebuffer_texture.width = framebuffer.width as i32;
         self.framebuffer_texture.height = framebuffer.height as i32;
-        self.framebuffer_texture.pixel_format = framebuffer.pixel_format.0;
+        self.framebuffer_texture.pixel_format = framebuffer.pixel_format;
 
         let pixel_format =
             crate::surface::pixel_format_from_gpu_pixel_format(framebuffer.pixel_format.0);
@@ -553,18 +347,12 @@ impl Layer {
                     gl::UNSIGNED_SHORT_5_6_5,
                     bytes_per_pixel,
                 ),
-                _ => {
-                    log::warn!(
-                        "Unknown framebuffer pixel format: {}, defaulting to RGBA8",
-                        framebuffer.pixel_format.0
-                    );
-                    (
-                        gl::RGBA8,
-                        gl::RGBA,
-                        gl::UNSIGNED_INT_8_8_8_8_REV,
-                        bytes_per_pixel,
-                    )
-                }
+                _ => (
+                    gl::RGBA8,
+                    gl::RGBA,
+                    gl::UNSIGNED_INT_8_8_8_8_REV,
+                    bytes_per_pixel,
+                ),
             };
 
         self.framebuffer_texture.gl_format = gl_format;
@@ -576,36 +364,29 @@ impl Layer {
             0,
         );
 
-        // Recreate GL texture.
+        // Recreate the owned GL texture exactly as Eden's OGLTexture
+        // Release/Create sequence.
+        self.framebuffer_texture.resource.release();
+        self.framebuffer_texture.resource.create(gl::TEXTURE_2D);
         unsafe {
-            if self.framebuffer_texture.resource != 0 {
-                gl::DeleteTextures(1, &self.framebuffer_texture.resource);
-            }
-            let mut texture: u32 = 0;
-            gl::CreateTextures(gl::TEXTURE_2D, 1, &mut texture);
             gl::TextureStorage2D(
-                texture,
+                self.framebuffer_texture.resource.handle,
                 1,
                 internal_format,
                 framebuffer.width as i32,
                 framebuffer.height as i32,
             );
-            self.framebuffer_texture.resource = texture;
         }
 
         // Invalidate post-processors since dimensions changed.
-        self.fxaa = None;
-        self.smaa = None;
-        self.fsr = None;
+        self.anti_alias = AntiAlias::None;
     }
 
     /// Create or recreate the FXAA pass.
-    #[allow(dead_code)]
     fn create_fxaa(&mut self) {
-        self.smaa = None;
-        if self.fxaa.is_none() {
+        if !matches!(self.anti_alias, AntiAlias::Fxaa(_)) {
             let resolution = common::settings::values().resolution_info.clone();
-            self.fxaa = Some(FXAA::new(
+            self.anti_alias = AntiAlias::Fxaa(FXAA::new(
                 resolution.scale_up_u32(self.framebuffer_texture.width as u32),
                 resolution.scale_up_u32(self.framebuffer_texture.height as u32),
             ));
@@ -613,12 +394,10 @@ impl Layer {
     }
 
     /// Create or recreate the SMAA pass.
-    #[allow(dead_code)]
     fn create_smaa(&mut self) {
-        self.fxaa = None;
-        if self.smaa.is_none() {
+        if !matches!(self.anti_alias, AntiAlias::Smaa(_)) {
             let resolution = common::settings::values().resolution_info.clone();
-            self.smaa = Some(SMAA::new(
+            self.anti_alias = AntiAlias::Smaa(SMAA::new(
                 resolution.scale_up_u32(self.framebuffer_texture.width as u32),
                 resolution.scale_up_u32(self.framebuffer_texture.height as u32),
             ));
@@ -626,12 +405,23 @@ impl Layer {
     }
 }
 
-impl Drop for Layer {
-    fn drop(&mut self) {
-        unsafe {
-            if self.framebuffer_texture.resource != 0 {
-                gl::DeleteTextures(1, &self.framebuffer_texture.resource);
-            }
-        }
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn texture_info_owns_the_upstream_raii_texture_and_typed_format() {
+        let info = TextureInfo {
+            resource: OGLTexture::new(),
+            width: 0,
+            height: 0,
+            gl_format: gl::NONE,
+            gl_type: gl::NONE,
+            pixel_format: AndroidPixelFormat::default(),
+        };
+
+        let _: &OGLTexture = &info.resource;
+        let _: AndroidPixelFormat = info.pixel_format;
+        assert!(std::mem::needs_drop::<TextureInfo>());
     }
 }

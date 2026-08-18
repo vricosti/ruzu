@@ -79,6 +79,8 @@ use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFrame
 /// - 181: UpgradeLaunchRequiredVersion (unimplemented)
 /// - 190: SendServerMaintenanceOverlayNotification (unimplemented)
 /// - 200: GetLastApplicationExitReason (unimplemented)
+/// - 210: Unknown210
+/// - 330: Unknown330
 /// - 500: StartContinuousRecordingFlushForDebug (unimplemented)
 /// - 1000: CreateMovieMaker (unimplemented)
 /// - 1001: PrepareForJit
@@ -118,6 +120,16 @@ impl IApplicationFunctions {
                 23,
                 Some(Self::get_display_version_handler),
                 "GetDisplayVersion",
+            ),
+            (
+                27,
+                Some(Self::create_cache_storage_handler),
+                "CreateCacheStorage",
+            ),
+            (
+                28,
+                Some(Self::get_save_data_size_max_handler),
+                "GetSaveDataSizeMax",
             ),
             (40, Some(Self::notify_running_handler), "NotifyRunning"),
             (
@@ -170,6 +182,8 @@ impl IApplicationFunctions {
                 Some(Self::get_health_warning_disappeared_system_event_handler),
                 "GetHealthWarningDisappearedSystemEvent",
             ),
+            (210, Some(Self::get_unknown_event_210_handler), "Unknown210"),
+            (330, Some(Self::unknown_330_handler), "Unknown330"),
             (1001, Some(Self::prepare_for_jit_handler), "PrepareForJit"),
         ]);
         Self {
@@ -493,6 +507,42 @@ impl IApplicationFunctions {
         rb.push_u64(hi);
     }
 
+    /// CreateCacheStorage (cmd 27).
+    ///
+    /// CMIF lays the `u16` input at offset 0 and aligns the following `u64`
+    /// values to offset 8. The outputs are likewise `u32` at offset 0 and
+    /// `u64` at offset 8, including one zero padding word between them.
+    fn create_cache_storage_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let service =
+            unsafe { &*(this as *const dyn ServiceFramework as *const IApplicationFunctions) };
+        let mut rp = RequestParser::new(ctx);
+        let index = rp.pop_u16();
+        rp.align_for::<u64>();
+        let normal_size = rp.pop_u64();
+        let journal_size = rp.pop_u64();
+
+        let (target_media, required_size) =
+            service.create_cache_storage(index, normal_size, journal_size);
+
+        // Result (2 words) + 16 bytes of naturally-aligned output data.
+        let mut rb = ResponseBuilder::new(ctx, 6, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_u32(target_media);
+        rb.push_u32(0);
+        rb.push_u64(required_size);
+    }
+
+    /// GetSaveDataSizeMax (cmd 28).
+    fn get_save_data_size_max_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let service =
+            unsafe { &*(this as *const dyn ServiceFramework as *const IApplicationFunctions) };
+        let (max_normal_size, max_journal_size) = service.get_save_data_size_max();
+        let mut rb = ResponseBuilder::new(ctx, 6, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_u64(max_normal_size);
+        rb.push_u64(max_journal_size);
+    }
+
     /// GetPseudoDeviceId (cmd 50): returns a pseudo device ID (UUID).
     fn get_pseudo_device_id_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         log::warn!("(STUBBED) GetPseudoDeviceId called");
@@ -602,6 +652,29 @@ impl IApplicationFunctions {
         rb.push_result(RESULT_SUCCESS);
         rb.push_copy_object_id(object_id);
     }
+
+    /// GetUnknownEvent210 (cmd 210): returns the applet's persistent event handle.
+    fn get_unknown_event_210_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        log::debug!("Unknown210 called");
+        let service =
+            unsafe { &*(this as *const dyn ServiceFramework as *const IApplicationFunctions) };
+        let object_id = service
+            .applet
+            .lock()
+            .unwrap()
+            .ensure_unknown_event_object_id(ctx)
+            .unwrap_or(0);
+        let mut rb = ResponseBuilder::new(ctx, 2, 1, 0);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_copy_object_id(object_id);
+    }
+
+    fn unknown_330_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        log::debug!("Unknown330 called");
+        let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_u8(0);
+    }
 }
 
 impl SessionRequestHandler for IApplicationFunctions {
@@ -621,5 +694,110 @@ impl ServiceFramework for IApplicationFunctions {
 
     fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
         &self.handlers_tipc
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::hle::kernel::k_process::{KProcess, ProcessLock};
+    use crate::hle::kernel::k_thread::{KThread, KThreadLock};
+    use crate::hle::service::am::applet::Applet;
+    use crate::hle::service::hle_ipc::KAutoObjectRef;
+    use crate::hle::service::os::process::Process;
+    use std::sync::Mutex;
+
+    fn make_service() -> IApplicationFunctions {
+        let system = crate::core::SystemRef::null();
+        IApplicationFunctions::new(
+            system,
+            Arc::new(Mutex::new(Applet::new(system, Process::new(), false))),
+        )
+    }
+
+    #[test]
+    fn cache_storage_handlers_match_upstream_command_table() {
+        let service = make_service();
+        let create = service.handlers().get(&27).unwrap();
+        let max = service.handlers().get(&28).unwrap();
+
+        assert!(create.handler_callback.is_some());
+        assert_eq!(create.name, "CreateCacheStorage");
+        assert!(max.handler_callback.is_some());
+        assert_eq!(max.name, "GetSaveDataSizeMax");
+    }
+
+    #[test]
+    fn unknown_210_handler_matches_upstream_command_table() {
+        let service = make_service();
+        let unknown = service.handlers().get(&210).unwrap();
+
+        assert!(unknown.handler_callback.is_some());
+        assert_eq!(unknown.name, "Unknown210");
+    }
+
+    #[test]
+    fn unknown_330_matches_upstream_command_and_output() {
+        let service = make_service();
+        let unknown = service.handlers().get(&330).unwrap();
+        assert!(unknown.handler_callback.is_some());
+        assert_eq!(unknown.name, "Unknown330");
+
+        let thread = Arc::new(KThreadLock::new(KThread::new()));
+        let mut ctx = HLERequestContext::new_with_thread(thread, 0x2000);
+        IApplicationFunctions::unknown_330_handler(&service, &mut ctx);
+
+        assert_eq!(ctx.cmd_buf[6], RESULT_SUCCESS.get_inner_value());
+        assert_eq!(ctx.cmd_buf[8] & 0xff, 0);
+    }
+
+    #[test]
+    fn unknown_210_returns_the_applets_unsignaled_persistent_event() {
+        let service = make_service();
+        let process = Arc::new(ProcessLock::from_value(KProcess::new()));
+        let thread = Arc::new(KThreadLock::new(KThread::new()));
+        thread.lock().unwrap().parent = Some(Arc::downgrade(&process));
+        let mut ctx = HLERequestContext::new_with_thread(thread, 0x2000);
+
+        IApplicationFunctions::get_unknown_event_210_handler(&service, &mut ctx);
+
+        assert_eq!(ctx.cmd_buf[6], RESULT_SUCCESS.get_inner_value());
+        let object_id = match ctx.outgoing_copy_objects.as_slice() {
+            [KAutoObjectRef::ObjectId(object_id)] => *object_id,
+            _ => panic!("expected one object-backed copy handle"),
+        };
+        assert_ne!(object_id, 0);
+
+        let applet = service.applet.lock().unwrap();
+        let event = applet.unknown_event.as_ref().unwrap().lock().unwrap();
+        assert_eq!(event.object_id, object_id);
+        assert!(!event.is_signaled.load(std::sync::atomic::Ordering::Relaxed));
+    }
+
+    #[test]
+    fn create_cache_storage_matches_upstream_stub_outputs() {
+        let service = make_service();
+        assert_eq!(service.create_cache_storage(3, 0x1000, 0x2000), (1, 0));
+    }
+
+    #[test]
+    fn create_cache_storage_reply_preserves_cmif_output_alignment() {
+        let service = make_service();
+        let mut ctx = HLERequestContext::new();
+        // Raw inputs: u16 index at +0, six bytes padding, then two u64 values.
+        ctx.cmd_buf[2] = 3;
+        ctx.cmd_buf[4] = 0x1000;
+        ctx.cmd_buf[6] = 0x2000;
+
+        IApplicationFunctions::create_cache_storage_handler(&service, &mut ctx);
+
+        // Non-domain reply payload begins at word 6. Result occupies 6..8;
+        // output data is u32 at +0, zero padding at +4, u64 at +8.
+        assert_eq!(ctx.cmd_buf[6], RESULT_SUCCESS.get_inner_value());
+        assert_eq!(ctx.cmd_buf[7], 0);
+        assert_eq!(ctx.cmd_buf[8], 1);
+        assert_eq!(ctx.cmd_buf[9], 0);
+        assert_eq!(ctx.cmd_buf[10], 0);
+        assert_eq!(ctx.cmd_buf[11], 0);
     }
 }

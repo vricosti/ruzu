@@ -60,6 +60,7 @@ fn optimization_flags_from_mask(mask: u32) -> OptimizationFlag {
 }
 
 fn upstream_optimization_config(
+    address_space_bits: usize,
     accuracy: CpuAccuracy,
     unsafe_unfuse_fma: bool,
     unsafe_reduce_fp_error: bool,
@@ -69,7 +70,7 @@ fn upstream_optimization_config(
 ) -> (OptimizationFlag, bool, usize) {
     let mut flags = OptimizationFlag::ALL_SAFE_OPTIMIZATIONS;
     let mut unsafe_optimizations = false;
-    let mut fastmem_address_space_bits = 39;
+    let mut fastmem_address_space_bits = address_space_bits;
 
     match accuracy {
         CpuAccuracy::Unsafe => {
@@ -94,7 +95,6 @@ fn upstream_optimization_config(
             unsafe_optimizations = true;
             flags |= OptimizationFlag::UNSAFE_UNFUSE_FMA;
             fastmem_address_space_bits = 64;
-            flags |= OptimizationFlag::UNSAFE_IGNORE_GLOBAL_MONITOR;
         }
         CpuAccuracy::Paranoid => {
             flags = OptimizationFlag::NO_OPTIMIZATIONS;
@@ -2257,6 +2257,7 @@ impl ArmDynarmic64 {
         shared_memory: SharedProcessMemory,
         core_timing: Arc<crate::core_timing::CoreTiming>,
         core_memory: Option<Arc<std::sync::Mutex<Memory>>>,
+        debugger_enabled: bool,
     ) -> Self {
         // Fetch fastmem pointer from core_memory BEFORE it gets moved
         // into the callbacks. Mirrors A32's pattern
@@ -2269,12 +2270,12 @@ impl ArmDynarmic64 {
         // the slow callback path for all memory accesses) — useful for
         // debugging fastmem-related issues without rebuilding.
         let no_fastmem = std::env::var_os("RUZU_NO_FASTMEM").is_some();
+        let kernel_process =
+            unsafe { &*(process as *const _ as *const crate::hle::kernel::k_process::KProcess) };
+        let address_space_bits = kernel_process.page_table.get_address_space_width() as usize;
         let mut page_table_pointer: Option<*const u8> = if no_fastmem {
             None
         } else {
-            let kernel_process = unsafe {
-                &*(process as *const _ as *const crate::hle::kernel::k_process::KProcess)
-            };
             kernel_process
                 .page_table
                 .get_base()
@@ -2366,9 +2367,14 @@ impl ArmDynarmic64 {
         let settings = common::settings::values();
         let (mut optimizations, mut unsafe_optimizations, mut fastmem_address_space_bits) =
             if *settings.cpu_debug_mode.get_value() {
-                (OptimizationFlag::ALL_SAFE_OPTIMIZATIONS, false, 39)
+                (
+                    OptimizationFlag::ALL_SAFE_OPTIMIZATIONS,
+                    false,
+                    address_space_bits,
+                )
             } else {
                 upstream_optimization_config(
+                    address_space_bits,
                     *settings.cpu_accuracy.get_value(),
                     *settings.cpuopt_unsafe_unfuse_fma.get_value(),
                     *settings.cpuopt_unsafe_reduce_fp_error.get_value(),
@@ -2382,7 +2388,7 @@ impl ArmDynarmic64 {
             fastmem_pointer.is_some() && !exclusive_monitor.is_null();
         let mut recompile_on_exclusive_fastmem_failure = true;
         let mut only_detect_misalignment_via_page_table_on_page_boundary = true;
-        let mut check_halt_on_memory_access = false;
+        let mut check_halt_on_memory_access = debugger_enabled;
 
         if *settings.cpu_debug_mode.get_value() {
             if !*settings.cpuopt_page_tables.get_value() {
@@ -2422,6 +2428,11 @@ impl ArmDynarmic64 {
             if !*settings.cpuopt_ignore_memory_aborts.get_value() {
                 check_halt_on_memory_access = true;
             }
+        }
+
+        if !common::settings::is_fastmem_enabled(&settings) {
+            fastmem_pointer = None;
+            fastmem_exclusive_access = false;
         }
 
         if let Some(mask) = parse_optimization_mask_env("RUZU_A64_OPTIMIZATION_MASK") {
@@ -2468,11 +2479,10 @@ impl ArmDynarmic64 {
             // Memory emit options matching upstream zuyu's
             // `ArmDynarmic64::MakeJit` setup
             // (zuyu/src/core/arm/dynarmic/arm_dynarmic_64.cpp:225-248).
-            // We default to 39-bit guest AS (Switch's extended user space
-            // and the size of ruzu's `VIRTUAL_RESERVE_SIZE = 1<<39` host
-            // fastmem region) with `silently_mirror_fastmem=false` so
-            // out-of-range accesses fall through to the callback path
-            // rather than aliasing into the fastmem region.
+            // Both widths come from the process page table, as in Eden's
+            // `MakeJit(page_table, page_table.GetAddressSpaceWidth())`.
+            // Auto/unsafe-fastmem-check may widen only the fastmem side to
+            // 64 bits below, matching the upstream accuracy switch.
             memory: rdynarmic::backend::x64::emit_context::MemoryEmitConfig {
                 fastmem_address_space_bits,
                 silently_mirror_fastmem: false,
@@ -2480,7 +2490,7 @@ impl ArmDynarmic64 {
                 recompile_on_exclusive_fastmem_failure,
                 recompile_on_fastmem_failure: true,
                 page_table_present: page_table_pointer.is_some(),
-                page_table_address_space_bits: 39,
+                page_table_address_space_bits: address_space_bits,
                 silently_mirror_page_table: false,
                 absolute_offset_page_table: true,
                 page_table_pointer_mask_bits: PageInfo::ATTRIBUTE_BITS as u32,
@@ -2866,19 +2876,31 @@ mod tests {
     #[test]
     fn auto_and_paranoid_optimization_configs_match_upstream_a64() {
         let (auto_flags, auto_unsafe, auto_fastmem_bits) =
-            upstream_optimization_config(CpuAccuracy::Auto, false, false, false, false, false);
+            upstream_optimization_config(39, CpuAccuracy::Auto, false, false, false, false, false);
         assert!(auto_unsafe);
         assert_eq!(auto_fastmem_bits, 64);
         assert!(auto_flags.contains(OptimizationFlag::UNSAFE_UNFUSE_FMA));
-        assert!(auto_flags.contains(OptimizationFlag::UNSAFE_IGNORE_GLOBAL_MONITOR));
+        assert!(!auto_flags.contains(OptimizationFlag::UNSAFE_IGNORE_GLOBAL_MONITOR));
         assert!(!auto_flags.contains(OptimizationFlag::UNSAFE_REDUCED_ERROR_FP));
         assert!(!auto_flags.contains(OptimizationFlag::UNSAFE_INACCURATE_NAN));
 
         let (paranoid_flags, paranoid_unsafe, paranoid_fastmem_bits) =
-            upstream_optimization_config(CpuAccuracy::Paranoid, true, true, true, true, true);
+            upstream_optimization_config(39, CpuAccuracy::Paranoid, true, true, true, true, true);
         assert_eq!(paranoid_flags, OptimizationFlag::NO_OPTIMIZATIONS);
         assert!(!paranoid_unsafe);
         assert_eq!(paranoid_fastmem_bits, 39);
+
+        let (_, accurate_unsafe, accurate_fastmem_bits) = upstream_optimization_config(
+            36,
+            CpuAccuracy::Accurate,
+            false,
+            false,
+            false,
+            false,
+            false,
+        );
+        assert!(!accurate_unsafe);
+        assert_eq!(accurate_fastmem_bits, 36);
     }
 
     #[test]

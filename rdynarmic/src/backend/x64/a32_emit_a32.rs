@@ -3,88 +3,25 @@
 //! These emit x86-64 code for the ~60 A32-prefixed IR opcodes.
 //! They access `A32JitState` via R15 + offset (same convention as A64 emitters).
 
-use rxbyak::{byte_ptr, dword_ptr, qword_ptr, word_ptr, xmmword_ptr, JmpType, Label};
+use rxbyak::{byte_ptr, dword_ptr, qword_ptr, word_ptr, xmmword_ptr, JmpType};
 use rxbyak::{Reg, RegExp, R10, R11, R15, R8, R9, RAX, RCX, RDI, RDX, RSI, RSP};
 
+use crate::backend::x64::a64_emit_x64_memory::{emit_call_to_offset, FastmemFallbacksTable};
 use crate::backend::x64::abi;
 use crate::backend::x64::block_of_code::{
     emit_switch_mxcsr_on_entry, emit_switch_mxcsr_on_exit, STACK_LAYOUT_RSP_OFFSET,
 };
 use crate::backend::x64::emit_context::EmitContext;
 use crate::backend::x64::emit_x64_memory::{
-    emit_read_memory_mov, is_ordered, PAGE_BITS, PAGE_MASK,
+    emit_read_memory_mov, emit_vaddr_lookup_a32, emit_write_memory_mov, is_ordered,
 };
+use crate::backend::x64::host_feature::HostFeature;
 use crate::backend::x64::jit_state::A32JitState;
 use crate::backend::x64::nzcv_util;
-use crate::backend::x64::patch_info::{PatchEntry, PatchType};
 use crate::backend::x64::reg_alloc::{Argument, RegAlloc};
 use crate::backend::x64::stack_layout::StackLayout;
 use crate::ir::inst::Inst;
-use crate::ir::location::LocationDescriptor;
 use crate::ir::value::InstRef;
-
-fn emit_a32_vaddr_lookup(
-    ra: &mut RegAlloc,
-    ctx: &EmitContext,
-    abort: &Label,
-    vaddr: Reg,
-    page: Reg,
-) -> RegExp {
-    let mem_conf = &ctx.config.memory;
-    let valid_page_index_bits = mem_conf.page_table_address_space_bits - PAGE_BITS;
-    let unused_top_bits = 64 - mem_conf.page_table_address_space_bits;
-
-    let tmp = if mem_conf.absolute_offset_page_table {
-        page
-    } else {
-        ra.scratch_gpr()
-    };
-
-    if unused_top_bits == 0 {
-        ra.asm.mov(tmp, vaddr).unwrap();
-        ra.asm.shr(tmp, PAGE_BITS as u8).unwrap();
-    } else if mem_conf.silently_mirror_page_table {
-        if valid_page_index_bits >= 32 {
-            ra.asm.mov(tmp, vaddr).unwrap();
-            ra.asm.shl(tmp, unused_top_bits as u8).unwrap();
-            ra.asm
-                .shr(tmp, (unused_top_bits + PAGE_BITS) as u8)
-                .unwrap();
-        } else {
-            ra.asm.mov(tmp, vaddr).unwrap();
-            ra.asm.shr(tmp, PAGE_BITS as u8).unwrap();
-            let mask = ((1u32 << valid_page_index_bits) - 1) as i32;
-            ra.asm.and_(tmp, mask).unwrap();
-        }
-    } else {
-        debug_assert!(valid_page_index_bits < 32);
-        ra.asm.mov(tmp, vaddr).unwrap();
-        ra.asm.shr(tmp, PAGE_BITS as u8).unwrap();
-        let mask = -(1i64 << valid_page_index_bits) as i32;
-        ra.asm.test(tmp, mask).unwrap();
-        ra.asm.jne(abort, JmpType::Near).unwrap();
-    }
-
-    ra.asm
-        .mov(page, qword_ptr(RegExp::from(rxbyak::R14) + tmp * 8u8))
-        .unwrap();
-
-    if mem_conf.page_table_pointer_mask_bits == 0 {
-        ra.asm.test(page, page).unwrap();
-    } else {
-        let mask = (!0u32 << mem_conf.page_table_pointer_mask_bits) as i32;
-        ra.asm.and_(page, mask).unwrap();
-    }
-    ra.asm.je(abort, JmpType::Near).unwrap();
-
-    if mem_conf.absolute_offset_page_table {
-        return RegExp::from(page) + vaddr;
-    }
-
-    ra.asm.mov(tmp, vaddr).unwrap();
-    ra.asm.and_(tmp, PAGE_MASK as i32).unwrap();
-    RegExp::from(page) + tmp
-}
 
 fn emit_bitsize_read_mov(
     ra: &mut RegAlloc,
@@ -98,6 +35,22 @@ fn emit_bitsize_read_mov(
         16 => emit_read_memory_mov::<16>(ra.asm, value_idx, addr, ordered),
         32 => emit_read_memory_mov::<32>(ra.asm, value_idx, addr, ordered),
         64 => emit_read_memory_mov::<64>(ra.asm, value_idx, addr, ordered),
+        _ => unreachable!(),
+    }
+}
+
+fn emit_bitsize_write_mov(
+    ra: &mut RegAlloc,
+    bitsize: usize,
+    addr: RegExp,
+    value_idx: u8,
+    ordered: bool,
+) -> usize {
+    match bitsize {
+        8 => emit_write_memory_mov::<8>(ra.asm, addr, value_idx, ordered),
+        16 => emit_write_memory_mov::<16>(ra.asm, addr, value_idx, ordered),
+        32 => emit_write_memory_mov::<32>(ra.asm, addr, value_idx, ordered),
+        64 => emit_write_memory_mov::<64>(ra.asm, addr, value_idx, ordered),
         _ => unreachable!(),
     }
 }
@@ -505,21 +458,84 @@ pub fn emit_a32_set_vector(_ctx: &EmitContext, ra: &mut RegAlloc, _inst_ref: Ins
 // CPSR / NZCV flags
 // ---------------------------------------------------------------------------
 
-/// A32GetCpsr: result = cpsr_nzcv (in x86 format — same as A64 NZCV raw)
-pub fn emit_a32_get_cpsr(_ctx: &EmitContext, ra: &mut RegAlloc, inst_ref: InstRef, _inst: &Inst) {
-    let offset = A32JitState::offset_of_cpsr_nzcv();
+/// A32GetCpsr: compose the architectural CPSR from the split JIT-state fields.
+pub fn emit_a32_get_cpsr(ctx: &EmitContext, ra: &mut RegAlloc, inst_ref: InstRef, _inst: &Inst) {
     let result = ra.scratch_gpr();
+    let result32 = result.cvt32().unwrap();
+    let tmp = ra.scratch_gpr();
+    let tmp32 = tmp.cvt32().unwrap();
+    let tmp2 = ra.scratch_gpr();
+    let tmp232 = tmp2.cvt32().unwrap();
+    let upper_offset = A32JitState::offset_of_upper_location_descriptor();
+    let ge_offset = A32JitState::offset_of_cpsr_ge();
+
+    if ctx.has_host_feature(HostFeature::FAST_BMI2) {
+        debug_assert_eq!(upper_offset + 4, ge_offset);
+        ra.asm
+            .mov(result, qword_ptr(RegExp::from(R15) + upper_offset as i32))
+            .unwrap();
+        ra.asm.mov(tmp, 0x8080_8080_0000_0003u64 as i64).unwrap();
+        ra.asm.pext(result, result, tmp).unwrap();
+        ra.asm.mov(tmp32, 0x000f_0220).unwrap();
+        ra.asm.pdep(result32, result32, tmp32).unwrap();
+    } else {
+        ra.asm
+            .mov(result32, dword_ptr(RegExp::from(R15) + upper_offset as i32))
+            .unwrap();
+        ra.asm.mov(tmp32, 0x120).unwrap();
+        ra.asm.imul(result32, tmp32).unwrap();
+        ra.asm.and_(result32, 0x0000_0220).unwrap();
+
+        ra.asm
+            .mov(tmp32, dword_ptr(RegExp::from(R15) + ge_offset as i32))
+            .unwrap();
+        ra.asm.and_(tmp32, 0x8080_8080u32).unwrap();
+        ra.asm.mov(tmp232, 0x0020_4081).unwrap();
+        ra.asm.imul(tmp32, tmp232).unwrap();
+        ra.asm.shr(tmp32, 12).unwrap();
+        ra.asm.and_(tmp32, 0x000f_0000).unwrap();
+        ra.asm.or_(result32, tmp32).unwrap();
+    }
+
     ra.asm
         .mov(
-            result.cvt32().unwrap(),
-            dword_ptr(RegExp::from(R15) + offset as i32),
+            tmp32,
+            dword_ptr(RegExp::from(R15) + A32JitState::offset_of_cpsr_q() as i32),
+        )
+        .unwrap();
+    ra.asm.shl(tmp32, 27).unwrap();
+    ra.asm.or_(result32, tmp32).unwrap();
+
+    ra.asm
+        .mov(
+            tmp232,
+            dword_ptr(RegExp::from(R15) + A32JitState::offset_of_cpsr_nzcv() as i32),
+        )
+        .unwrap();
+    if ctx.has_host_feature(HostFeature::FAST_BMI2) {
+        ra.asm.mov(tmp32, nzcv_util::X64_MASK as i32).unwrap();
+        ra.asm.pext(tmp232, tmp232, tmp32).unwrap();
+        ra.asm.shl(tmp232, 28).unwrap();
+    } else {
+        ra.asm.and_(tmp232, nzcv_util::X64_MASK as i32).unwrap();
+        ra.asm
+            .mov(tmp32, nzcv_util::FROM_X64_MULTIPLIER as i32)
+            .unwrap();
+        ra.asm.imul(tmp232, tmp32).unwrap();
+        ra.asm.and_(tmp232, nzcv_util::ARM_MASK as i32).unwrap();
+    }
+    ra.asm.or_(result32, tmp232).unwrap();
+    ra.asm
+        .or_(
+            result32,
+            dword_ptr(RegExp::from(R15) + A32JitState::offset_of_cpsr_jaifm() as i32),
         )
         .unwrap();
     ra.define_value(inst_ref, result);
 }
 
 /// A32SetCpsr: decompose full CPSR into split JIT state fields.
-pub fn emit_a32_set_cpsr(_ctx: &EmitContext, ra: &mut RegAlloc, _inst_ref: InstRef, inst: &Inst) {
+pub fn emit_a32_set_cpsr(ctx: &EmitContext, ra: &mut RegAlloc, _inst_ref: InstRef, inst: &Inst) {
     let mut args = ra.get_argument_info(_inst_ref, &inst.args, inst.num_args());
     let cpsr = ra.use_scratch_gpr(&mut args[0]);
     let cpsr32 = cpsr.cvt32().unwrap();
@@ -547,11 +563,16 @@ pub fn emit_a32_set_cpsr(_ctx: &EmitContext, ra: &mut RegAlloc, _inst_ref: InstR
     // cpsr_nzcv
     ra.asm.mov(tmp32, cpsr32).unwrap();
     ra.asm.shr(tmp32, 28).unwrap();
-    ra.asm
-        .mov(tmp232, nzcv_util::TO_X64_MULTIPLIER as i32)
-        .unwrap();
-    ra.asm.imul(tmp32, tmp232).unwrap();
-    ra.asm.and_(tmp32, nzcv_util::X64_MASK as i32).unwrap();
+    if ctx.has_host_feature(HostFeature::FAST_BMI2) {
+        ra.asm.mov(tmp232, nzcv_util::X64_MASK as i32).unwrap();
+        ra.asm.pdep(tmp32, tmp32, tmp232).unwrap();
+    } else {
+        ra.asm
+            .mov(tmp232, nzcv_util::TO_X64_MULTIPLIER as i32)
+            .unwrap();
+        ra.asm.imul(tmp32, tmp232).unwrap();
+        ra.asm.and_(tmp32, nzcv_util::X64_MASK as i32).unwrap();
+    }
     ra.asm
         .mov(
             dword_ptr(RegExp::from(R15) + cpsr_nzcv_offset as i32),
@@ -569,39 +590,60 @@ pub fn emit_a32_set_cpsr(_ctx: &EmitContext, ra: &mut RegAlloc, _inst_ref: InstR
         )
         .unwrap();
 
-    // upper_location_descriptor: keep FPSCR mode bits, replace E/T/IT bits
-    ra.asm
-        .and_(
-            dword_ptr(RegExp::from(R15) + upper_offset as i32),
-            0xFFFF_0000u32 as i32,
-        )
-        .unwrap();
-    ra.asm.mov(tmp32, cpsr32).unwrap();
-    ra.asm.and_(tmp32, 0x0000_0220u32 as i32).unwrap();
-    ra.asm.mov(tmp232, 0x0090_0000u32 as i32).unwrap();
-    ra.asm.imul(tmp32, tmp232).unwrap();
-    ra.asm.shr(tmp32, 28).unwrap();
-    ra.asm
-        .or_(dword_ptr(RegExp::from(R15) + upper_offset as i32), tmp32)
-        .unwrap();
+    if ctx.has_host_feature(HostFeature::FAST_BMI2) {
+        debug_assert_eq!(upper_offset + 4, ge_offset);
+        ra.asm
+            .and_(
+                qword_ptr(RegExp::from(R15) + upper_offset as i32),
+                0x7fff_0000u32,
+            )
+            .unwrap();
+        ra.asm.mov(tmp32, 0x000f_0220).unwrap();
+        ra.asm.pext(cpsr32, cpsr32, tmp32).unwrap();
+        ra.asm.mov(tmp, 0x0101_0101_0000_0003u64 as i64).unwrap();
+        ra.asm.pdep(cpsr, cpsr, tmp).unwrap();
+        ra.asm.mov(tmp, 0x8080_8080_0000_0003u64 as i64).unwrap();
+        ra.asm.mov(tmp2, tmp).unwrap();
+        ra.asm.sub(tmp, cpsr).unwrap();
+        ra.asm.xor_(tmp, tmp2).unwrap();
+        ra.asm
+            .or_(qword_ptr(RegExp::from(R15) + upper_offset as i32), tmp)
+            .unwrap();
+    } else {
+        // upper_location_descriptor: keep FPSCR mode bits, replace E/T/IT bits
+        ra.asm
+            .and_(
+                dword_ptr(RegExp::from(R15) + upper_offset as i32),
+                0xFFFF_0000u32,
+            )
+            .unwrap();
+        ra.asm.mov(tmp32, cpsr32).unwrap();
+        ra.asm.and_(tmp32, 0x0000_0220u32).unwrap();
+        ra.asm.mov(tmp232, 0x0090_0000u32).unwrap();
+        ra.asm.imul(tmp32, tmp232).unwrap();
+        ra.asm.shr(tmp32, 28).unwrap();
+        ra.asm
+            .or_(dword_ptr(RegExp::from(R15) + upper_offset as i32), tmp32)
+            .unwrap();
 
-    // cpsr_ge: expand CPSR GE[3:0] bits into byte lanes
-    ra.asm.and_(cpsr32, 0x000F_0000u32 as i32).unwrap();
-    ra.asm.shr(cpsr32, 16).unwrap();
-    ra.asm.mov(tmp232, 0x0020_4081u32 as i32).unwrap();
-    ra.asm.imul(cpsr32, tmp232).unwrap();
-    ra.asm.and_(cpsr32, 0x0101_0101u32 as i32).unwrap();
-    ra.asm.mov(tmp32, 0x8080_8080u32 as i32).unwrap();
-    ra.asm.sub(tmp32, cpsr32).unwrap();
-    ra.asm.xor_(tmp32, 0x8080_8080u32 as i32).unwrap();
-    ra.asm
-        .mov(dword_ptr(RegExp::from(R15) + ge_offset as i32), tmp32)
-        .unwrap();
+        // cpsr_ge: expand CPSR GE[3:0] bits into byte lanes
+        ra.asm.and_(cpsr32, 0x000F_0000u32).unwrap();
+        ra.asm.shr(cpsr32, 16).unwrap();
+        ra.asm.mov(tmp232, 0x0020_4081u32).unwrap();
+        ra.asm.imul(cpsr32, tmp232).unwrap();
+        ra.asm.and_(cpsr32, 0x0101_0101u32).unwrap();
+        ra.asm.mov(tmp32, 0x8080_8080u32).unwrap();
+        ra.asm.sub(tmp32, cpsr32).unwrap();
+        ra.asm.xor_(tmp32, 0x8080_8080u32).unwrap();
+        ra.asm
+            .mov(dword_ptr(RegExp::from(R15) + ge_offset as i32), tmp32)
+            .unwrap();
+    }
 }
 
 /// A32SetCpsrNZCVRaw: cpsr_nzcv = nzcv_to_x64(value) (ARM format input)
 pub fn emit_a32_set_cpsr_nzcv_raw(
-    _ctx: &EmitContext,
+    ctx: &EmitContext,
     ra: &mut RegAlloc,
     _inst_ref: InstRef,
     inst: &Inst,
@@ -623,11 +665,16 @@ pub fn emit_a32_set_cpsr_nzcv_raw(
     let tmp = ra.scratch_gpr();
     let tmp32 = tmp.cvt32().unwrap();
     ra.asm.shr(source32, 28).unwrap();
-    ra.asm
-        .mov(tmp32, nzcv_util::TO_X64_MULTIPLIER as i32)
-        .unwrap();
-    ra.asm.imul(source32, tmp32).unwrap();
-    ra.asm.and_(source32, nzcv_util::X64_MASK as i32).unwrap();
+    if ctx.has_host_feature(HostFeature::FAST_BMI2) {
+        ra.asm.mov(tmp32, nzcv_util::X64_MASK as i32).unwrap();
+        ra.asm.pdep(source32, source32, tmp32).unwrap();
+    } else {
+        ra.asm
+            .mov(tmp32, nzcv_util::TO_X64_MULTIPLIER as i32)
+            .unwrap();
+        ra.asm.imul(source32, tmp32).unwrap();
+        ra.asm.and_(source32, nzcv_util::X64_MASK as i32).unwrap();
+    }
     ra.asm
         .mov(dword_ptr(RegExp::from(R15) + offset as i32), source32)
         .unwrap();
@@ -653,7 +700,7 @@ pub fn emit_a32_set_cpsr_nzcv(
 
 /// A32SetCpsrNZCVQ: set NZCV and Q from a single ARM-format value
 pub fn emit_a32_set_cpsr_nzcvq(
-    _ctx: &EmitContext,
+    ctx: &EmitContext,
     ra: &mut RegAlloc,
     _inst_ref: InstRef,
     inst: &Inst,
@@ -689,11 +736,16 @@ pub fn emit_a32_set_cpsr_nzcvq(
     ra.asm
         .setc(byte_ptr(RegExp::from(R15) + q_offset as i32))
         .unwrap();
-    ra.asm
-        .mov(tmp32, nzcv_util::TO_X64_MULTIPLIER as i32)
-        .unwrap();
-    ra.asm.imul(value32, tmp32).unwrap();
-    ra.asm.and_(value32, nzcv_util::X64_MASK as i32).unwrap();
+    if ctx.has_host_feature(HostFeature::FAST_BMI2) {
+        ra.asm.mov(tmp32, nzcv_util::X64_MASK as i32).unwrap();
+        ra.asm.pdep(value32, value32, tmp32).unwrap();
+    } else {
+        ra.asm
+            .mov(tmp32, nzcv_util::TO_X64_MULTIPLIER as i32)
+            .unwrap();
+        ra.asm.imul(value32, tmp32).unwrap();
+        ra.asm.and_(value32, nzcv_util::X64_MASK as i32).unwrap();
+    }
     ra.asm
         .mov(dword_ptr(RegExp::from(R15) + nzcv_offset as i32), value32)
         .unwrap();
@@ -868,39 +920,49 @@ pub fn emit_a32_set_ge_flags(
 /// Each GE bit becomes a full byte (0x00 or 0xFF).
 /// Matches upstream EmitA32SetGEFlagsCompressed.
 pub fn emit_a32_set_ge_flags_compressed(
-    _ctx: &EmitContext,
+    ctx: &EmitContext,
     ra: &mut RegAlloc,
     _inst_ref: InstRef,
     inst: &Inst,
 ) {
     let offset = A32JitState::offset_of_cpsr_ge();
     let mut args = ra.get_argument_info(_inst_ref, &inst.args, inst.num_args());
-    let source = ra.use_scratch_gpr(&mut args[0]);
-    let s32 = source.cvt32().unwrap();
-
-    // Expand GE bits 19:16 to byte-lane format:
-    // Each bit becomes 0xFF (set) or 0x00 (clear) in corresponding byte
-    // Use multiply trick: isolate each bit, shift to MSB of its byte, then arithmetic shift
-    let tmp = ra.scratch_gpr();
-    let t32 = tmp.cvt32().unwrap();
-
-    // Simple approach: extract bits, expand to bytes, combine
-    // GE[0] = bit 16 → byte 0 (0x000000FF), GE[1] = bit 17 → byte 1, etc.
-    let result = ra.scratch_gpr();
-    let r32 = result.cvt32().unwrap();
-    ra.asm.xor_(r32, r32).unwrap();
-
-    for i in 0..4u32 {
-        ra.asm.mov(t32, s32).unwrap();
-        ra.asm.shr(t32, (16 + i) as u8).unwrap();
-        ra.asm.and_(t32, 1i32).unwrap();
-        ra.asm.neg(t32).unwrap(); // 0 → 0, 1 → 0xFFFFFFFF
-        ra.asm.and_(t32, (0xFFu32 << (i * 8)) as i32).unwrap(); // mask to one byte-lane
-        ra.asm.or_(r32, t32).unwrap();
+    if args[0].is_immediate() {
+        let imm = args[0].get_immediate_u32();
+        let mut ge = 0u32;
+        ge |= if imm & (1 << 19) != 0 { 0xff00_0000 } else { 0 };
+        ge |= if imm & (1 << 18) != 0 { 0x00ff_0000 } else { 0 };
+        ge |= if imm & (1 << 17) != 0 { 0x0000_ff00 } else { 0 };
+        ge |= if imm & (1 << 16) != 0 { 0x0000_00ff } else { 0 };
+        ra.asm
+            .mov(dword_ptr(RegExp::from(R15) + offset as i32), ge)
+            .unwrap();
+        return;
     }
 
+    let source = ra.use_scratch_gpr(&mut args[0]);
+    let s32 = source.cvt32().unwrap();
+    if ctx.has_host_feature(HostFeature::FAST_BMI2) {
+        let mask = ra.scratch_gpr();
+        let mask32 = mask.cvt32().unwrap();
+        ra.asm.mov(mask32, 0x0101_0101).unwrap();
+        ra.asm.shr(s32, 16).unwrap();
+        ra.asm.pdep(s32, s32, mask32).unwrap();
+        ra.asm.mov(mask32, 0xff).unwrap();
+        ra.asm.imul(s32, mask32).unwrap();
+    } else {
+        let tmp = ra.scratch_gpr();
+        let tmp32 = tmp.cvt32().unwrap();
+        ra.asm.shr(s32, 16).unwrap();
+        ra.asm.and_(s32, 0xf).unwrap();
+        ra.asm.mov(tmp32, 0x0020_4081).unwrap();
+        ra.asm.imul(s32, tmp32).unwrap();
+        ra.asm.and_(s32, 0x0101_0101).unwrap();
+        ra.asm.mov(tmp32, 0xff).unwrap();
+        ra.asm.imul(s32, tmp32).unwrap();
+    }
     ra.asm
-        .mov(dword_ptr(RegExp::from(R15) + offset as i32), r32)
+        .mov(dword_ptr(RegExp::from(R15) + offset as i32), s32)
         .unwrap();
 }
 
@@ -979,7 +1041,7 @@ pub fn emit_a32_get_fpscr_nzcv(
 
 /// A32SetFpscrNZCV: fpsr_nzcv = value
 pub fn emit_a32_set_fpscr_nzcv(
-    _ctx: &EmitContext,
+    ctx: &EmitContext,
     ra: &mut RegAlloc,
     _inst_ref: InstRef,
     inst: &Inst,
@@ -995,18 +1057,31 @@ pub fn emit_a32_set_fpscr_nzcv(
         return;
     }
 
-    let value = ra.use_scratch_gpr(&mut args[0]);
-    let value32 = value.cvt32().unwrap();
-    ra.asm.and_(value32, nzcv_util::X64_MASK as i32).unwrap();
-    let tmp = ra.scratch_gpr();
-    ra.asm
-        .mov(tmp.cvt32().unwrap(), nzcv_util::FROM_X64_MULTIPLIER as i32)
-        .unwrap();
-    ra.asm.imul(value32, tmp.cvt32().unwrap()).unwrap();
-    ra.asm.and_(value32, nzcv_util::ARM_MASK as i32).unwrap();
-    ra.asm
-        .mov(dword_ptr(RegExp::from(R15) + offset as i32), value32)
-        .unwrap();
+    if ctx.has_host_feature(HostFeature::FAST_BMI2) {
+        let value = ra.use_gpr(&mut args[0]);
+        let value32 = value.cvt32().unwrap();
+        let tmp = ra.scratch_gpr();
+        let tmp32 = tmp.cvt32().unwrap();
+        ra.asm.mov(tmp32, nzcv_util::X64_MASK as i32).unwrap();
+        ra.asm.pext(tmp32, value32, tmp32).unwrap();
+        ra.asm.shl(tmp32, 28).unwrap();
+        ra.asm
+            .mov(dword_ptr(RegExp::from(R15) + offset as i32), tmp32)
+            .unwrap();
+    } else {
+        let value = ra.use_scratch_gpr(&mut args[0]);
+        let value32 = value.cvt32().unwrap();
+        ra.asm.and_(value32, nzcv_util::X64_MASK as i32).unwrap();
+        let tmp = ra.scratch_gpr();
+        ra.asm
+            .mov(tmp.cvt32().unwrap(), nzcv_util::FROM_X64_MULTIPLIER as i32)
+            .unwrap();
+        ra.asm.imul(value32, tmp.cvt32().unwrap()).unwrap();
+        ra.asm.and_(value32, nzcv_util::ARM_MASK as i32).unwrap();
+        ra.asm
+            .mov(dword_ptr(RegExp::from(R15) + offset as i32), value32)
+            .unwrap();
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1373,13 +1448,10 @@ fn emit_a32_memory_read(
             })
             .is_some_and(|pc| ctx.arch.extract_pc(ctx.location) == pc));
 
-    let force_callback = force_callback || ctx.config.memory.page_table_present;
-
     if should_fastmem(ctx, inst_ref) && bitsize <= 64 && !force_callback {
-        // Fastmem/page-table path: result = [host_page + vaddr] when a
-        // page table is configured, otherwise the legacy direct [R13+vaddr]
-        // path below. Upstream A32 uses the page table so free/debug pages
-        // cannot be silently accessed through the sparse fastmem arena.
+        // Fastmem path: result = [R13+vaddr]. Upstream's ShouldFastmem result
+        // takes precedence over the configured page table; the page table is
+        // only used after a fault disables fastmem for this instruction.
         // R13 = fastmem_pointer, loaded in the dispatcher prelude.
         //
         // Upstream-faithful: for ordered loads (LDA / LDAB / LDAH /
@@ -1398,45 +1470,6 @@ fn emit_a32_memory_read(
         let result = ra.scratch_gpr();
         let vaddr_idx = vaddr.get_idx();
         let result_idx = result.get_idx();
-        if ctx.config.memory.page_table_present {
-            let abort = ra.asm.create_label();
-            let end = ra.asm.create_label();
-            let addr = emit_a32_vaddr_lookup(ra, ctx, &abort, vaddr, result);
-            let inst_offset = emit_bitsize_read_mov(ra, bitsize, result_idx, addr, ordered);
-            let resume_offset = ra.asm.size();
-            ra.asm.jmp(&end, JmpType::Near).unwrap();
-
-            ra.asm.bind(&abort).unwrap();
-            ra.host_call(Some(inst_ref), &mut [None, Some(&mut args[1]), None, None]);
-            if ordered {
-                ra.asm.mfence().unwrap();
-            }
-            let callback = match bitsize {
-                8 => &ctx.config.callbacks.memory_read_8,
-                16 => &ctx.config.callbacks.memory_read_16,
-                32 => &ctx.config.callbacks.memory_read_32,
-                64 => &ctx.config.callbacks.memory_read_64,
-                _ => unreachable!(),
-            };
-            callback.emit_call_simple(&mut *ra.asm).unwrap();
-            ra.asm.bind(&end).unwrap();
-            ctx.fastmem_entries.borrow_mut().push(
-                crate::backend::x64::emit_context::FastmemEntry {
-                    inst_offset,
-                    resume_offset,
-                    bitsize,
-                    is_write: false,
-                    is_exclusive: false,
-                    ordered,
-                    vaddr_reg: vaddr_idx,
-                    value_reg: result_idx,
-                    marker: (ctx.location, inst_ref.0),
-                    recompile: ctx.config.memory.recompile_on_fastmem_failure,
-                },
-            );
-            ra.define_value(inst_ref, result);
-            return;
-        }
         let addr = RegExp::from(rxbyak::R13) + vaddr;
         if ordered {
             // xor zero-extends the 64-bit register too (Intel SDM:
@@ -1491,20 +1524,57 @@ fn emit_a32_memory_read(
             }
         }
         let resume_offset = ra.asm.size();
-        ctx.fastmem_entries
-            .borrow_mut()
-            .push(crate::backend::x64::emit_context::FastmemEntry {
-                inst_offset,
-                resume_offset,
-                bitsize,
-                is_write: false,
-                is_exclusive: false,
-                ordered,
-                vaddr_reg: vaddr_idx,
-                value_reg: result_idx,
-                marker: (ctx.location, inst_ref.0),
-                recompile: ctx.config.memory.recompile_on_fastmem_failure,
-            });
+        let fallbacks = unsafe {
+            &*(ctx
+                .fastmem_fallbacks
+                .expect("A32 fastmem path requires fallback table")
+                as *const FastmemFallbacksTable)
+        };
+        let wrapped_fn_off = fallbacks.read_stub(ordered, bitsize, vaddr_idx, result_idx);
+        let marker = (ctx.location, inst_ref.0);
+        let recompile = ctx.config.memory.recompile_on_fastmem_failure;
+        ctx.deferred_emits.borrow_mut().push(Box::new(move |dctx| {
+            dctx.fastmem_patches.add(
+                dctx.code_base + inst_offset as u64,
+                crate::backend::x64::exception_handler::FastmemPatchInfo::new(
+                    dctx.code_base + resume_offset as u64,
+                    dctx.code_base + wrapped_fn_off as u64,
+                    Some(marker),
+                    recompile,
+                ),
+            );
+        }));
+        ra.define_value(inst_ref, result);
+        return;
+    }
+
+    if ctx.config.memory.page_table_present && !force_callback {
+        // When this instruction has been removed from `ShouldFastmem` after a
+        // fault, upstream falls through to the page-table path rather than
+        // calling the callback unconditionally.
+        let vaddr = ra.use_gpr(&mut args[1]);
+        let result = ra.scratch_gpr();
+        let vaddr_idx = vaddr.get_idx();
+        let result_idx = result.get_idx();
+        let fallbacks = unsafe {
+            &*(ctx
+                .fastmem_fallbacks
+                .expect("A32 page-table path requires fallback table")
+                as *const FastmemFallbacksTable)
+        };
+        let wrapped_fn_off = fallbacks.read_stub(ordered, bitsize, vaddr_idx, result_idx);
+        let abort = ra.asm.create_label();
+        let end = ra.asm.create_label();
+        let addr = emit_vaddr_lookup_a32(ra, ctx, bitsize, abort, vaddr);
+        emit_bitsize_read_mov(ra, bitsize, result_idx, addr, ordered);
+
+        ctx.deferred_emits.borrow_mut().push(Box::new(move |dctx| {
+            let asm = &mut *dctx.asm;
+            asm.bind(&abort).unwrap();
+            emit_call_to_offset(asm, wrapped_fn_off);
+            asm.jmp(&end, JmpType::Near).unwrap();
+        }));
+        ra.asm.bind(&end).unwrap();
         ra.define_value(inst_ref, result);
         return;
     }
@@ -1552,10 +1622,8 @@ fn emit_a32_memory_write(
     };
 
     if should_fastmem(ctx, inst_ref) && bitsize <= 64 && !force_callback {
-        // Fastmem/page-table path: [host_page + vaddr] = value when a
-        // page table is configured, otherwise the legacy direct [R13+vaddr]
-        // path below. Upstream A32 uses the page table so free/debug pages
-        // cannot be silently written through the sparse fastmem arena.
+        // Fastmem path: [R13+vaddr] = value. As on the read side, upstream
+        // gives a valid ShouldFastmem marker precedence over the page table.
         //
         // Upstream-faithful: for ordered stores (STL / STLB / STLH /
         // STLEX) emit `xchg [r13+vaddr], value` (mirrors
@@ -1790,20 +1858,57 @@ fn emit_a32_memory_write(
         }
 
         let resume_offset = ra.asm.size();
-        ctx.fastmem_entries
-            .borrow_mut()
-            .push(crate::backend::x64::emit_context::FastmemEntry {
-                inst_offset,
-                resume_offset,
-                bitsize,
-                is_write: true,
-                is_exclusive: false,
-                ordered,
-                vaddr_reg: vaddr_idx,
-                value_reg: value_idx,
-                marker: (ctx.location, inst_ref.0),
-                recompile: ctx.config.memory.recompile_on_fastmem_failure,
-            });
+        let fallbacks = unsafe {
+            &*(ctx
+                .fastmem_fallbacks
+                .expect("A32 fastmem path requires fallback table")
+                as *const FastmemFallbacksTable)
+        };
+        let wrapped_fn_off = fallbacks.write_stub(ordered, bitsize, vaddr_idx, value_idx);
+        let marker = (ctx.location, inst_ref.0);
+        let recompile = ctx.config.memory.recompile_on_fastmem_failure;
+        ctx.deferred_emits.borrow_mut().push(Box::new(move |dctx| {
+            dctx.fastmem_patches.add(
+                dctx.code_base + inst_offset as u64,
+                crate::backend::x64::exception_handler::FastmemPatchInfo::new(
+                    dctx.code_base + resume_offset as u64,
+                    dctx.code_base + wrapped_fn_off as u64,
+                    Some(marker),
+                    recompile,
+                ),
+            );
+        }));
+        return;
+    }
+
+    if ctx.config.memory.page_table_present && !force_callback {
+        let vaddr = ra.use_gpr(&mut args[1]);
+        let value = if ordered {
+            ra.use_scratch_gpr(&mut args[2])
+        } else {
+            ra.use_gpr(&mut args[2])
+        };
+        let vaddr_idx = vaddr.get_idx();
+        let value_idx = value.get_idx();
+        let fallbacks = unsafe {
+            &*(ctx
+                .fastmem_fallbacks
+                .expect("A32 page-table path requires fallback table")
+                as *const FastmemFallbacksTable)
+        };
+        let wrapped_fn_off = fallbacks.write_stub(ordered, bitsize, vaddr_idx, value_idx);
+        let abort = ra.asm.create_label();
+        let end = ra.asm.create_label();
+        let addr = emit_vaddr_lookup_a32(ra, ctx, bitsize, abort, vaddr);
+        emit_bitsize_write_mov(ra, bitsize, addr, value_idx, ordered);
+
+        ctx.deferred_emits.borrow_mut().push(Box::new(move |dctx| {
+            let asm = &mut *dctx.asm;
+            asm.bind(&abort).unwrap();
+            emit_call_to_offset(asm, wrapped_fn_off);
+            asm.jmp(&end, JmpType::Near).unwrap();
+        }));
+        ra.asm.bind(&end).unwrap();
         return;
     }
 

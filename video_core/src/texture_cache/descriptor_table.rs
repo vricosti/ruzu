@@ -7,6 +7,7 @@
 //! on demand, tracking which entries have been read and whether they changed.
 
 use super::image_base::GPUVAddr;
+use std::mem::MaybeUninit;
 
 /// Read N bytes from a GPU device address into `output`.
 ///
@@ -14,8 +15,9 @@ use super::image_base::GPUVAddr;
 /// table calls this with the table base + `index * sizeof(Descriptor)` so
 /// `Read(index)` lands on a real TICEntry / TSCEntry from GPU memory.
 /// Returns `true` if every byte was successfully read (all underlying
-/// pages mapped). Returning `false` is treated as a transient read failure
-/// — `Read` then falls back to the cached descriptor + reports `changed=false`.
+/// pages mapped). Like upstream `ReadBlockUnsafe`, implementations zero any
+/// unmapped portions; `DescriptorTable::read` consumes those bytes regardless
+/// of the mapping-status return value.
 pub trait GpuMemoryReader {
     /// Read `output.len()` bytes from a GPU device address into `output`.
     /// Returns `true` if every byte was successfully read.
@@ -51,10 +53,9 @@ pub trait GpuMemoryReader {
 /// (texture-cache visit_image_view) already has access to the channel's
 /// `MaxwellDeviceMemoryManager` via the cache's `device_memory` Arc.
 ///
-/// `T` must be `Copy + PartialEq + Default`. Reads are done via a byte
-/// buffer + `ptr::read_unaligned`, so `T` should be a plain
-/// `#[repr(C)]` POD type (TICEntry / TSCEntry both qualify — fixed-size
-/// `[u64; 4]` wrappers).
+/// `T` must be `Copy + PartialEq + Default`. Reads overwrite stack-backed
+/// `MaybeUninit<T>` storage directly, so `T` must be a plain `#[repr(C)]` POD
+/// type (TICEntry / TSCEntry both qualify — fixed-size `[u64; 4]` wrappers).
 pub struct DescriptorTable<T: Copy + PartialEq + Default> {
     current_gpu_addr: GPUVAddr,
     current_limit: u32,
@@ -104,12 +105,8 @@ impl<T: Copy + PartialEq + Default> DescriptorTable<T> {
     /// bytes from `current_gpu_addr + index * sizeof(Descriptor)` via the
     /// supplied `gpu_memory` reader. The caller (texture-cache
     /// `visit_image_view`) wires this up to the channel's
-    /// `MaxwellDeviceMemoryManager::smmu_read_block`.
+    /// `MaxwellDeviceMemoryManager::smmu_read_block_unsafe`.
     ///
-    /// If the GPU read fails (page not mapped at the table location)
-    /// falls back to the previously-cached descriptor with `changed=false`,
-    /// so a transient unmapped page does not poison the cache with a
-    /// `Default::default()` value.
     pub fn read(&mut self, gpu_memory: &dyn GpuMemoryReader, index: u32) -> (T, bool) {
         self.read_with(index, |descriptor_addr, output| {
             gpu_memory.read_block(descriptor_addr, output)
@@ -130,21 +127,17 @@ impl<T: Copy + PartialEq + Default> DescriptorTable<T> {
         let item_size = std::mem::size_of::<T>();
         let descriptor_addr = self.current_gpu_addr + (index as u64) * (item_size as u64);
 
-        let mut buf = vec![0u8; item_size];
-        let descriptor = if read_block(descriptor_addr, &mut buf) {
-            // SAFETY: `T` is bounded by `Copy + PartialEq + Default`. The
-            // descriptor table is only instantiated with `TicEntry` /
-            // `TscEntry`, both `#[repr(C)]` `[u64; 4]` wrappers with no
-            // invalid bit patterns. `read_block` writes exactly
-            // `item_size` bytes into `buf` when it returns `true`.
-            unsafe { std::ptr::read_unaligned(buf.as_ptr() as *const T) }
-        } else {
-            // Read failure (unmapped page at the descriptor location).
-            // Upstream would have UB'd through ReadBlockUnsafe; ruzu
-            // treats it as "descriptor unchanged" so the cached image
-            // view id is reused.
-            self.descriptors[index as usize]
+        // `std::pair<T, bool> result` default-constructs `result.first` in
+        // upstream before `ReadBlockUnsafe` overwrites its bytes.
+        let mut descriptor = MaybeUninit::new(T::default());
+        let descriptor_bytes = unsafe {
+            std::slice::from_raw_parts_mut(descriptor.as_mut_ptr().cast::<u8>(), item_size)
         };
+        let _all_mapped = read_block(descriptor_addr, descriptor_bytes);
+        // SAFETY: the storage started as an initialized `T::default()` and
+        // descriptor readers overwrite bytes in place. Descriptor tables are
+        // instantiated with POD types whose bit patterns are all valid.
+        let descriptor = unsafe { descriptor.assume_init() };
 
         let changed = if self.is_descriptor_read(index) {
             descriptor != self.descriptors[index as usize]
@@ -176,33 +169,18 @@ impl<T: Copy + PartialEq + Default> DescriptorTable<T> {
 
     // ── Private helpers ────────────────────────────────────────────────
 
-    /// Upstream's TIC/TSC table is bounded by Maxwell3D limits that fit in
-    /// the firmware (low thousands). When the GPU regs are uninitialized at
-    /// boot or get a garbage write, the raw u32 limit can be `0xFFFFFFFF`
-    /// — that would translate to a 32 GiB descriptor `Vec::resize`, which
-    /// SIGSEGVs the allocator. Clamp to a generous-but-finite cap; values
-    /// above it indicate a register read against uninitialized state.
-    const MAX_REASONABLE_LIMIT: u32 = 0xFFFF; // 65 536 descriptors
-
     fn refresh(&mut self, gpu_addr: GPUVAddr, limit: u32) {
-        if limit > Self::MAX_REASONABLE_LIMIT {
-            log::warn!(
-                "DescriptorTable::refresh: limit={} > {} — clamping (regs likely uninitialized)",
-                limit,
-                Self::MAX_REASONABLE_LIMIT,
-            );
-            self.current_gpu_addr = gpu_addr;
-            self.current_limit = 0;
-            self.read_descriptors.clear();
-            self.descriptors.clear();
-            return;
-        }
         self.current_gpu_addr = gpu_addr;
         self.current_limit = limit;
 
-        let num_descriptors = limit as usize + 1;
-        self.read_descriptors.clear();
+        // Some games repeatedly grow these tables. Match upstream's aggressive
+        // 0x80000-entry allocation buckets rather than reallocating at every
+        // observed limit.
+        let num_descriptors = (((limit.wrapping_add(0x80000)) & !0x7ffff).wrapping_add(1)) as usize;
+        let old_read_size = self.read_descriptors.len();
         self.read_descriptors.resize((num_descriptors + 63) / 64, 0);
+        let retained_read_size = old_read_size.min(self.read_descriptors.len());
+        self.read_descriptors[..retained_read_size].fill(0);
         self.descriptors.resize(num_descriptors, T::default());
     }
 
@@ -218,5 +196,74 @@ impl<T: Copy + PartialEq + Default> DescriptorTable<T> {
 impl<T: Copy + PartialEq + Default> Default for DescriptorTable<T> {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::DescriptorTable;
+
+    #[test]
+    fn refresh_uses_upstream_aggressive_allocation_buckets() {
+        let mut table = DescriptorTable::<u32>::new();
+
+        assert!(table.synchronize(0x1000, 0));
+        assert_eq!(table.descriptors.len(), 0x80001);
+        assert_eq!(table.read_descriptors.len(), (0x80001 + 63) / 64);
+
+        assert!(table.synchronize(0x1000, 0x80000));
+        assert_eq!(table.descriptors.len(), 0x100001);
+        assert_eq!(table.read_descriptors.len(), (0x100001 + 63) / 64);
+    }
+
+    #[test]
+    fn synchronize_invalidates_previously_read_descriptors() {
+        let mut table = DescriptorTable::<u32>::new();
+        table.synchronize(0x1000, 0);
+
+        assert_eq!(
+            table.read_with(0, |_, out| {
+                out.copy_from_slice(&7u32.to_ne_bytes());
+                true
+            }),
+            (7, true)
+        );
+        assert_eq!(
+            table.read_with(0, |_, out| {
+                out.copy_from_slice(&7u32.to_ne_bytes());
+                true
+            }),
+            (7, false)
+        );
+
+        assert!(table.synchronize(0x2000, 0));
+        assert_eq!(
+            table.read_with(0, |_, out| {
+                out.copy_from_slice(&7u32.to_ne_bytes());
+                true
+            }),
+            (7, true)
+        );
+    }
+
+    #[test]
+    fn unmapped_read_consumes_upstream_zero_fill() {
+        let mut table = DescriptorTable::<u32>::new();
+        table.synchronize(0x1000, 0);
+
+        assert_eq!(
+            table.read_with(0, |_, out| {
+                out.copy_from_slice(&7u32.to_ne_bytes());
+                true
+            }),
+            (7, true)
+        );
+        assert_eq!(
+            table.read_with(0, |_, out| {
+                out.fill(0);
+                false
+            }),
+            (0, true)
+        );
     }
 }

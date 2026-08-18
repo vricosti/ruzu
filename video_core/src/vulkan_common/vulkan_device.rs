@@ -1,17 +1,21 @@
 // SPDX-FileCopyrightText: 2025 ruzu contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! Port of `zuyu/src/video_core/vulkan_common/vulkan_device.h` and
-//! `zuyu/src/video_core/vulkan_common/vulkan_device.cpp`.
+//! Port of upstream `video_core/vulkan_common/vulkan_device.h` and
+//! `video_core/vulkan_common/vulkan_device.cpp`.
 //!
 //! Manages a Vulkan physical+logical device pair, collecting device properties,
 //! features, and extensions. Provides accessors matching the C++ `Device` class.
 
 use ash::vk;
+use ash::vk::Handle;
 use std::collections::{BTreeSet, HashMap};
 use std::ffi::{CStr, CString};
+use std::ptr::NonNull;
+use std::sync::{Arc, Mutex};
 
 use super::nsight_aftermath_tracker::NsightAftermathTracker;
+use super::vma::VmaAllocator;
 use super::vulkan_wrapper::{get_physical_device_tool_properties, LogicalDevice, VulkanError};
 
 // ---------------------------------------------------------------------------
@@ -23,6 +27,32 @@ use super::vulkan_wrapper::{get_physical_device_tool_properties, LogicalDevice, 
 /// Port of `GuestWarpSize` from `vulkan_device.h`.
 pub const GUEST_WARP_SIZE: u32 = 32;
 const ONE_GIB: u64 = 1024 * 1024 * 1024;
+
+/// Stable non-owning Rust counterpart of upstream's pervasive `const Device&`
+/// members. Renderer owners are boxed before these references are created and
+/// are destroyed after every dependent cache/pipeline worker has joined.
+#[derive(Clone, Copy)]
+pub(crate) struct DeviceReference(NonNull<Device>);
+
+impl DeviceReference {
+    pub(crate) fn new(device: &Device) -> Self {
+        Self(NonNull::from(device))
+    }
+
+    pub(crate) fn get(&self) -> &Device {
+        // SAFETY: construction/drop ordering is documented above and mirrors
+        // the lifetime of the C++ reference members this replaces.
+        unsafe { self.0.as_ref() }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn dangling_for_test() -> Self {
+        Self(NonNull::dangling())
+    }
+}
+
+unsafe impl Send for DeviceReference {}
+unsafe impl Sync for DeviceReference {}
 
 // ash 0.37 predates VK_EXT_depth_bias_control. Keep the Vulkan ABI payload
 // local to its upstream owner until the workspace binding is upgraded.
@@ -63,6 +93,26 @@ fn pnext_chain_has_unique_structure_types(mut next: *const std::ffi::c_void) -> 
     true
 }
 
+/// Port of the descriptor-indexing policy block in upstream
+/// `Device::RemoveUnsuitableExtensions`.
+fn apply_descriptor_indexing_policy(features: &mut vk::PhysicalDeviceDescriptorIndexingFeatures) {
+    features.shader_input_attachment_array_dynamic_indexing = vk::FALSE;
+    features.shader_uniform_texel_buffer_array_dynamic_indexing = vk::FALSE;
+    features.shader_storage_texel_buffer_array_dynamic_indexing = vk::FALSE;
+    features.shader_uniform_buffer_array_non_uniform_indexing = vk::FALSE;
+    features.shader_storage_buffer_array_non_uniform_indexing = vk::FALSE;
+    features.shader_input_attachment_array_non_uniform_indexing = vk::FALSE;
+    features.descriptor_binding_uniform_buffer_update_after_bind = vk::FALSE;
+    features.descriptor_binding_sampled_image_update_after_bind = vk::FALSE;
+    features.descriptor_binding_storage_image_update_after_bind = vk::FALSE;
+    features.descriptor_binding_storage_buffer_update_after_bind = vk::FALSE;
+    features.descriptor_binding_uniform_texel_buffer_update_after_bind = vk::FALSE;
+    features.descriptor_binding_storage_texel_buffer_update_after_bind = vk::FALSE;
+    features.descriptor_binding_update_unused_while_pending = vk::FALSE;
+    features.descriptor_binding_variable_descriptor_count = vk::FALSE;
+    features.runtime_descriptor_array = vk::FALSE;
+}
+
 macro_rules! clear_feature_preserving_chain {
     ($feature:expr) => {{
         let p_next = $feature.p_next;
@@ -84,6 +134,16 @@ pub enum FormatType {
     Linear,
     Optimal,
     Buffer,
+}
+
+fn is_tiler_driver(driver_id: vk::DriverId) -> bool {
+    matches!(
+        driver_id,
+        vk::DriverId::QUALCOMM_PROPRIETARY
+            | vk::DriverId::ARM_PROPRIETARY
+            | vk::DriverId::SAMSUNG_PROPRIETARY
+            | vk::DriverId::MESA_TURNIP
+    )
 }
 
 /// Snapshot of the Vulkan memory heaps tracked by `Device`.
@@ -207,18 +267,23 @@ pub struct DeviceExtensions {
     pub variable_pointer: bool,
 
     // VK features 1.2
+    pub descriptor_indexing: bool,
     pub host_query_reset: bool,
     pub bit8_storage: bool,
     pub timeline_semaphore: bool,
+    pub buffer_device_address: bool,
 
     // VK features 1.3
     pub shader_demote_to_helper_invocation: bool,
     pub subgroup_size_control: bool,
+    pub synchronization2: bool,
 
     // VK feature extensions
     pub custom_border_color: bool,
+    pub color_write_enable: bool,
     pub depth_bias_control: bool,
     pub depth_clip_control: bool,
+    pub descriptor_buffer: bool,
     pub extended_dynamic_state: bool,
     pub extended_dynamic_state2: bool,
     pub extended_dynamic_state2_extra: bool,
@@ -261,6 +326,9 @@ pub struct DeviceExtensions {
     pub geometry_shader_passthrough: bool,
     pub viewport_array2: bool,
     pub viewport_swizzle: bool,
+    pub filter_cubic: bool,
+    pub filter_cubic_img: bool,
+    pub filter_cubic_weights: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -277,8 +345,13 @@ pub struct Device {
     instance: ash::Instance,
     /// Physical device handle.
     physical: vk::PhysicalDevice,
+    /// Vulkan Memory Allocator. Declared before `logical` so VMA is destroyed
+    /// before the logical device, matching `Device::~Device` upstream.
+    allocator: VmaAllocator,
     /// Logical device wrapper.
     logical: LogicalDevice,
+    descriptor_buffer: Option<ash::extensions::ext::DescriptorBuffer>,
+    synchronization2: Option<ash::extensions::khr::Synchronization2>,
     /// Device dispatch (ash device handle).
     _dld: ash::Device,
     /// Main graphics queue.
@@ -309,6 +382,9 @@ pub struct Device {
     pub subgroup_size_control_properties: vk::PhysicalDeviceSubgroupSizeControlProperties,
     /// Transform feedback properties.
     pub transform_feedback_properties: vk::PhysicalDeviceTransformFeedbackPropertiesEXT,
+    /// `VK_EXT_descriptor_buffer` properties queried with the physical-device
+    /// property chain.
+    pub descriptor_buffer_properties: vk::PhysicalDeviceDescriptorBufferPropertiesEXT,
     /// Raw `VkPhysicalDeviceTransformFeedbackFeaturesEXT::geometryStreams` feature bit.
     pub transform_feedback_geometry_streams_supported: bool,
 
@@ -323,6 +399,15 @@ pub struct Device {
     pub host_query_reset_supported: bool,
     /// Feature bit from `VkPhysicalDeviceShaderFloat16Int8Features`.
     pub shader_int8_supported: bool,
+    /// Feature bits from `VkPhysicalDevice8BitStorageFeatures`.
+    pub uniform_and_storage_buffer_8bit_supported: bool,
+    pub storage_buffer_8bit_supported: bool,
+    /// Feature bits from `VkPhysicalDevice16BitStorageFeatures`.
+    pub uniform_and_storage_buffer_16bit_supported: bool,
+    pub storage_buffer_16bit_supported: bool,
+    /// Feature bits from `VkPhysicalDeviceWorkgroupMemoryExplicitLayoutFeaturesKHR`.
+    pub workgroup_memory_explicit_layout_8bit_access_supported: bool,
+    pub workgroup_memory_explicit_layout_16bit_access_supported: bool,
     /// Feature bit from `VkPhysicalDevicePrimitiveTopologyListRestartFeaturesEXT`.
     pub primitive_topology_list_restart_supported: bool,
     /// Feature bit from `VkPhysicalDevicePrimitiveTopologyListRestartFeaturesEXT`.
@@ -335,6 +420,17 @@ pub struct Device {
     pub shader_output_layer_supported: bool,
     /// `VK_EXT_depth_bias_control::depthBiasExact` after suitability filtering.
     pub exact_depth_bias_control_supported: bool,
+    /// Feature bit from `VkPhysicalDeviceShaderAtomicInt64Features`. Upstream
+    /// keeps this separate from the buffer-side bit so that
+    /// `IsSharedInt64AtomicsSupported` and `IsExtShaderAtomicInt64Supported`
+    /// answer different questions.
+    pub shader_shared_int64_atomics_supported: bool,
+    /// Feature bits from `VkPhysicalDeviceDescriptorIndexingFeatures`.
+    pub descriptor_binding_partially_bound_supported: bool,
+    pub sampled_image_array_non_uniform_indexing_supported: bool,
+    pub storage_image_array_non_uniform_indexing_supported: bool,
+    pub uniform_texel_buffer_array_non_uniform_indexing_supported: bool,
+    pub storage_texel_buffer_array_non_uniform_indexing_supported: bool,
 
     // Misc capability flags
     pub is_optimal_astc_supported: bool,
@@ -357,9 +453,21 @@ pub struct Device {
     pub must_emulate_bgr565: bool,
     pub dynamic_state3_blending: bool,
     pub dynamic_state3_enables: bool,
+    pub dynamic_state3_depth_clamp_enable: bool,
+    pub dynamic_state3_logic_op_enable: bool,
+    pub dynamic_state3_line_raster_mode: bool,
+    pub dynamic_state3_conservative_raster_mode: bool,
+    pub dynamic_state3_line_stipple_enable: bool,
+    pub dynamic_state3_alpha_to_coverage: bool,
+    pub dynamic_state3_alpha_to_one: bool,
+    pub provoking_vertex_last_supported: bool,
+    pub transform_feedback_preserves_provoking_vertex: bool,
+    pub smooth_lines_supported: bool,
+    pub stippled_rectangular_lines_supported: bool,
     pub supports_conditional_barriers: bool,
     pub device_access_memory: u64,
     pub sets_per_pool: u32,
+    sampler_heap_budget: usize,
     pub nvidia_arch: NvidiaArchitecture,
 
     /// Reported Vulkan extensions.
@@ -480,10 +588,14 @@ impl Device {
             supported_extensions.contains("VK_EXT_extended_dynamic_state2");
         let has_extended_dynamic_state3 =
             supported_extensions.contains("VK_EXT_extended_dynamic_state3");
+        let has_descriptor_buffer = supported_extensions.contains("VK_EXT_descriptor_buffer");
+        let has_buffer_device_address = device_properties.api_version >= vk::API_VERSION_1_2
+            || supported_extensions.contains("VK_KHR_buffer_device_address");
         let has_vertex_input_dynamic_state =
             supported_extensions.contains("VK_EXT_vertex_input_dynamic_state");
         let has_depth_clip_control = supported_extensions.contains("VK_EXT_depth_clip_control");
         let has_custom_border_color = supported_extensions.contains("VK_EXT_custom_border_color");
+        let has_color_write_enable = supported_extensions.contains("VK_EXT_color_write_enable");
         let has_depth_bias_control = supported_extensions.contains("VK_EXT_depth_bias_control");
         let has_line_rasterization = supported_extensions.contains("VK_EXT_line_rasterization");
         let has_transform_feedback = supported_extensions.contains("VK_EXT_transform_feedback");
@@ -503,6 +615,8 @@ impl Device {
             .contains("VK_EXT_shader_demote_to_helper_invocation")
             || device_properties.api_version >= vk::API_VERSION_1_3;
         let has_draw_indirect_count = supported_extensions.contains("VK_KHR_draw_indirect_count");
+        let has_synchronization2 = device_properties.api_version >= vk::API_VERSION_1_3
+            || supported_extensions.contains("VK_KHR_synchronization2");
         let has_sampler_filter_minmax =
             supported_extensions.contains("VK_EXT_sampler_filter_minmax");
         let mut storage_16bit_features = vk::PhysicalDevice16BitStorageFeatures::default();
@@ -521,11 +635,18 @@ impl Device {
             vk::PhysicalDevicePortabilitySubsetFeaturesKHR::default();
         let mut timeline_semaphore_features =
             vk::PhysicalDeviceTimelineSemaphoreFeatures::default();
+        let mut synchronization2_features = vk::PhysicalDeviceSynchronization2Features::default();
         let mut subgroup_size_control_features =
             vk::PhysicalDeviceSubgroupSizeControlFeatures::default();
         let mut vulkan12_features = vk::PhysicalDeviceVulkan12Features::default();
+        let mut buffer_device_address_features =
+            vk::PhysicalDeviceBufferDeviceAddressFeatures::default();
+        let mut descriptor_buffer_features =
+            vk::PhysicalDeviceDescriptorBufferFeaturesEXT::default();
         let mut custom_border_color_features =
             vk::PhysicalDeviceCustomBorderColorFeaturesEXT::default();
+        let mut color_write_enable_features =
+            vk::PhysicalDeviceColorWriteEnableFeaturesEXT::default();
         let mut depth_bias_control_features = PhysicalDeviceDepthBiasControlFeaturesExt::default();
         let mut line_rasterization_features =
             vk::PhysicalDeviceLineRasterizationFeaturesEXT::default();
@@ -554,6 +675,8 @@ impl Device {
         let mut device_fault_features = vk::PhysicalDeviceFaultFeaturesEXT::default();
         let mut shader_demote_features =
             vk::PhysicalDeviceShaderDemoteToHelperInvocationFeatures::default();
+        let mut descriptor_indexing_features =
+            vk::PhysicalDeviceDescriptorIndexingFeatures::default();
         let mut features2 = {
             let mut features2_builder = vk::PhysicalDeviceFeatures2::builder()
                 .push_next(&mut storage_16bit_features)
@@ -577,14 +700,28 @@ impl Device {
             {
                 features2_builder = features2_builder.push_next(&mut timeline_semaphore_features);
             }
+            if has_synchronization2 {
+                features2_builder = features2_builder.push_next(&mut synchronization2_features);
+            }
             if device_properties.api_version >= vk::API_VERSION_1_3
                 || supported_extensions.contains("VK_EXT_subgroup_size_control")
             {
                 features2_builder =
                     features2_builder.push_next(&mut subgroup_size_control_features);
             }
+            if device_properties.api_version >= vk::API_VERSION_1_2
+                || supported_extensions.contains("VK_EXT_descriptor_indexing")
+            {
+                features2_builder = features2_builder.push_next(&mut descriptor_indexing_features);
+            }
             if device_properties.api_version >= vk::API_VERSION_1_2 {
                 features2_builder = features2_builder.push_next(&mut vulkan12_features);
+            } else if has_buffer_device_address {
+                features2_builder =
+                    features2_builder.push_next(&mut buffer_device_address_features);
+            }
+            if has_descriptor_buffer {
+                features2_builder = features2_builder.push_next(&mut descriptor_buffer_features);
             }
             if has_portability_subset {
                 features2_builder = features2_builder.push_next(&mut portability_subset_features);
@@ -614,6 +751,9 @@ impl Device {
             }
             if has_custom_border_color {
                 features2_builder = features2_builder.push_next(&mut custom_border_color_features);
+            }
+            if has_color_write_enable {
+                features2_builder = features2_builder.push_next(&mut color_write_enable_features);
             }
             if has_line_rasterization {
                 features2_builder = features2_builder.push_next(&mut line_rasterization_features);
@@ -660,6 +800,7 @@ impl Device {
             instance.get_physical_device_features2(physical, &mut features2);
         }
         let device_features = features2.features;
+        apply_descriptor_indexing_policy(&mut descriptor_indexing_features);
 
         macro_rules! log_recommended_feature {
             ($feature:expr, $name:literal) => {
@@ -683,6 +824,14 @@ impl Device {
         log_recommended_feature!(
             depth_bias_control_features.depth_bias_exact,
             "depthBiasExact"
+        );
+        log_recommended_feature!(
+            descriptor_indexing_features.descriptor_binding_partially_bound,
+            "descriptorBindingPartiallyBound"
+        );
+        log_recommended_feature!(
+            descriptor_indexing_features.shader_sampled_image_array_non_uniform_indexing,
+            "shaderSampledImageArrayNonUniformIndexing"
         );
         log_recommended_feature!(
             extended_dynamic_state_features.extended_dynamic_state,
@@ -714,6 +863,10 @@ impl Device {
             "timelineSemaphore"
         );
         log_recommended_feature!(
+            synchronization2_features.synchronization2,
+            "synchronization2"
+        );
+        log_recommended_feature!(
             transform_feedback_features.transform_feedback,
             "transformFeedback"
         );
@@ -740,6 +893,8 @@ impl Device {
             vk::PhysicalDeviceSubgroupSizeControlProperties::default();
         let mut transform_feedback_properties =
             vk::PhysicalDeviceTransformFeedbackPropertiesEXT::default();
+        let mut descriptor_buffer_properties =
+            vk::PhysicalDeviceDescriptorBufferPropertiesEXT::default();
         let mut properties2_builder = vk::PhysicalDeviceProperties2::builder()
             .push_next(&mut driver_properties)
             .push_next(&mut subgroup_properties);
@@ -748,6 +903,9 @@ impl Device {
         }
         if has_push_descriptor {
             properties2_builder = properties2_builder.push_next(&mut push_descriptor_properties);
+        }
+        if has_descriptor_buffer {
+            properties2_builder = properties2_builder.push_next(&mut descriptor_buffer_properties);
         }
         if supported_extensions.contains("VK_EXT_subgroup_size_control")
             || subgroup_size_control_features.subgroup_size_control != 0
@@ -767,6 +925,28 @@ impl Device {
         let mut supports_shader_float16 = shader_float16_int8_features.shader_float16 != 0;
         let supports_shader_int8 = shader_float16_int8_features.shader_int8 != 0;
         let supports_timeline_semaphore = timeline_semaphore_features.timeline_semaphore != 0;
+        let supports_synchronization2 =
+            has_synchronization2 && synchronization2_features.synchronization2 != 0;
+        let mut supports_buffer_device_address = has_buffer_device_address
+            && if device_properties.api_version >= vk::API_VERSION_1_2 {
+                vulkan12_features.buffer_device_address != 0
+            } else {
+                buffer_device_address_features.buffer_device_address != 0
+            };
+        let supports_descriptor_buffer = has_descriptor_buffer
+            && descriptor_buffer_features.descriptor_buffer != 0
+            && supports_buffer_device_address;
+        if has_descriptor_buffer
+            && descriptor_buffer_features.descriptor_buffer != 0
+            && !supports_buffer_device_address
+        {
+            log::warn!("Descriptor buffer needs buffer device address, disabling.");
+        }
+        // Upstream only enables buffer device address as the prerequisite for
+        // VK_EXT_descriptor_buffer; do not expose or enable it on its own.
+        if !supports_descriptor_buffer {
+            supports_buffer_device_address = false;
+        }
         let supports_primitive_topology_list_restart =
             primitive_topology_list_restart_features.primitive_topology_list_restart != 0;
         let supports_primitive_topology_patch_list_restart =
@@ -777,13 +957,6 @@ impl Device {
             && extended_dynamic_state2_features.extended_dynamic_state2 != 0;
         let mut supports_extended_dynamic_state2_extra = supports_extended_dynamic_state2
             && extended_dynamic_state2_features.extended_dynamic_state2_logic_op != 0;
-        let mut dynamic_state3_blending = has_extended_dynamic_state3
-            && extended_dynamic_state3_features.extended_dynamic_state3_color_blend_enable != 0
-            && extended_dynamic_state3_features.extended_dynamic_state3_color_blend_equation != 0
-            && extended_dynamic_state3_features.extended_dynamic_state3_color_write_mask != 0;
-        let mut dynamic_state3_enables = has_extended_dynamic_state3
-            && extended_dynamic_state3_features.extended_dynamic_state3_depth_clamp_enable != 0
-            && extended_dynamic_state3_features.extended_dynamic_state3_logic_op_enable != 0;
         let mut supports_vertex_input_dynamic_state = has_vertex_input_dynamic_state
             && vertex_input_dynamic_state_features.vertex_input_dynamic_state != 0;
         let mut supports_custom_border_color = has_custom_border_color
@@ -793,8 +966,22 @@ impl Device {
             && depth_bias_control_features.depth_bias_control != 0
             && depth_bias_control_features.least_representable_value_force_unorm_representation
                 != 0;
+        let mut supports_color_write_enable =
+            has_color_write_enable && color_write_enable_features.color_write_enable != 0;
         let exact_depth_bias_control_supported =
             supports_depth_bias_control && depth_bias_control_features.depth_bias_exact != 0;
+        let descriptor_binding_partially_bound_supported =
+            descriptor_indexing_features.descriptor_binding_partially_bound != 0;
+        let sampled_image_array_non_uniform_indexing_supported =
+            descriptor_indexing_features.shader_sampled_image_array_non_uniform_indexing != 0;
+        let storage_image_array_non_uniform_indexing_supported =
+            descriptor_indexing_features.shader_storage_image_array_non_uniform_indexing != 0;
+        let uniform_texel_buffer_array_non_uniform_indexing_supported = descriptor_indexing_features
+            .shader_uniform_texel_buffer_array_non_uniform_indexing
+            != 0;
+        let storage_texel_buffer_array_non_uniform_indexing_supported = descriptor_indexing_features
+            .shader_storage_texel_buffer_array_non_uniform_indexing
+            != 0;
         let supports_transform_feedback = has_transform_feedback
             && transform_feedback_features.transform_feedback != 0
             && transform_feedback_features.geometry_streams != 0
@@ -826,6 +1013,8 @@ impl Device {
         let supports_shader_atomic_int64 = shader_atomic_int64_features.shader_buffer_int64_atomics
             != 0
             && shader_atomic_int64_features.shader_shared_int64_atomics != 0;
+        let shader_shared_int64_atomics_supported =
+            shader_atomic_int64_features.shader_shared_int64_atomics != 0;
 
         let driver_id = driver_properties.driver_id;
         let is_radv = driver_id == vk::DriverId::MESA_RADV;
@@ -888,6 +1077,9 @@ impl Device {
         }
         if is_qualcomm {
             must_emulate_scaled_formats = true;
+            log::warn!("Qualcomm drivers have broken VK_EXT_color_write_enable");
+            supports_color_write_enable = false;
+            color_write_enable_features.color_write_enable = vk::FALSE;
             log::warn!("Qualcomm drivers have broken VK_EXT_extended_dynamic_state");
             supports_extended_dynamic_state = false;
             extended_dynamic_state_features.extended_dynamic_state = vk::FALSE;
@@ -952,20 +1144,17 @@ impl Device {
         }
         if is_radv && has_extended_dynamic_state3 {
             log::warn!("RADV has broken extendedDynamicState3ColorBlendEquation");
-            dynamic_state3_blending = false;
             extended_dynamic_state3_features.extended_dynamic_state3_color_blend_enable = vk::FALSE;
             extended_dynamic_state3_features.extended_dynamic_state3_color_blend_equation =
                 vk::FALSE;
             if masked_driver_version < vk::make_api_version(0, 23, 1, 0) {
                 log::warn!("RADV versions older than 23.1.0 have broken depth clamp dynamic state");
-                dynamic_state3_enables = false;
                 extended_dynamic_state3_features.extended_dynamic_state3_depth_clamp_enable =
                     vk::FALSE;
             }
         }
         if is_amd_driver && has_extended_dynamic_state3 {
             log::warn!("AMD drivers have broken extendedDynamicState3ColorBlendEquation");
-            dynamic_state3_blending = false;
             extended_dynamic_state3_features.extended_dynamic_state3_color_blend_enable = vk::FALSE;
             extended_dynamic_state3_features.extended_dynamic_state3_color_blend_equation =
                 vk::FALSE;
@@ -1033,6 +1222,102 @@ impl Device {
             log::warn!("Turnip requires higher-than-reported vertex binding limits");
             device_properties.limits.max_vertex_input_bindings = 32;
         }
+        let sampler_heap_budget = if is_qualcomm {
+            derive_sampler_heap_budget(
+                device_properties.limits.max_sampler_allocation_count as usize,
+            )
+        } else {
+            0
+        };
+        if sampler_heap_budget != 0 {
+            let sampler_limit = device_properties.limits.max_sampler_allocation_count as usize;
+            log::warn!(
+                "Qualcomm driver reports max {} samplers; reserving {} (25%) and allowing Reden to use {} (75%) to avoid heap exhaustion",
+                sampler_limit,
+                sampler_limit / 4,
+                sampler_heap_budget,
+            );
+        }
+
+        let (dynamic_state_level, vertex_input_dynamic_state_enabled, emulate_bgr565) = {
+            let values = common::settings::values();
+            (
+                *values.dyna_state.get_value(),
+                *values.vertex_input_dynamic_state.get_value(),
+                *values.emulate_bgr565.get_value(),
+            )
+        };
+        match dynamic_state_level {
+            common::settings::ExtendedDynamicState::Disabled => {
+                supports_extended_dynamic_state = false;
+                supports_extended_dynamic_state2 = false;
+                supports_extended_dynamic_state2_extra = false;
+                extended_dynamic_state_features.extended_dynamic_state = vk::FALSE;
+                extended_dynamic_state2_features.extended_dynamic_state2 = vk::FALSE;
+                extended_dynamic_state2_features.extended_dynamic_state2_logic_op = vk::FALSE;
+                extended_dynamic_state2_features.extended_dynamic_state2_patch_control_points =
+                    vk::FALSE;
+                clear_feature_preserving_chain!(extended_dynamic_state3_features);
+            }
+            common::settings::ExtendedDynamicState::EDS1 => {
+                supports_extended_dynamic_state2 = false;
+                supports_extended_dynamic_state2_extra = false;
+                extended_dynamic_state2_features.extended_dynamic_state2 = vk::FALSE;
+                extended_dynamic_state2_features.extended_dynamic_state2_logic_op = vk::FALSE;
+                extended_dynamic_state2_features.extended_dynamic_state2_patch_control_points =
+                    vk::FALSE;
+                clear_feature_preserving_chain!(extended_dynamic_state3_features);
+            }
+            common::settings::ExtendedDynamicState::EDS2 => {
+                clear_feature_preserving_chain!(extended_dynamic_state3_features);
+            }
+            common::settings::ExtendedDynamicState::EDS3 => {}
+        }
+
+        // Port of the granular EDS3 capability policy in
+        // `Device::RemoveUnsuitableExtensions`. Keep the extension enabled
+        // when any supported EDS3 state is usable, and include the prerequisite
+        // extensions/features used by upstream for line and conservative state.
+        let mut dynamic_state3_blending = has_extended_dynamic_state3
+            && extended_dynamic_state3_features.extended_dynamic_state3_color_blend_enable != 0
+            && extended_dynamic_state3_features.extended_dynamic_state3_color_blend_equation != 0
+            && extended_dynamic_state3_features.extended_dynamic_state3_color_write_mask != 0;
+        let mut dynamic_state3_depth_clamp_enable = has_extended_dynamic_state3
+            && extended_dynamic_state3_features.extended_dynamic_state3_depth_clamp_enable != 0;
+        let mut dynamic_state3_logic_op_enable = has_extended_dynamic_state3
+            && extended_dynamic_state3_features.extended_dynamic_state3_logic_op_enable != 0;
+        let mut dynamic_state3_line_raster_mode = has_extended_dynamic_state3
+            && extended_dynamic_state3_features.extended_dynamic_state3_line_rasterization_mode
+                != 0
+            && has_line_rasterization
+            && line_rasterization_features.rectangular_lines != 0;
+        let mut dynamic_state3_conservative_raster_mode = has_extended_dynamic_state3
+            && extended_dynamic_state3_features
+                .extended_dynamic_state3_conservative_rasterization_mode
+                != 0
+            && supported_extensions.contains("VK_EXT_conservative_rasterization");
+        let mut dynamic_state3_line_stipple_enable = has_extended_dynamic_state3
+            && extended_dynamic_state3_features.extended_dynamic_state3_line_stipple_enable != 0
+            && has_line_rasterization
+            && line_rasterization_features.stippled_rectangular_lines != 0;
+        let mut dynamic_state3_alpha_to_coverage = has_extended_dynamic_state3
+            && extended_dynamic_state3_features.extended_dynamic_state3_alpha_to_coverage_enable
+                != 0;
+        let mut dynamic_state3_alpha_to_one = has_extended_dynamic_state3
+            && extended_dynamic_state3_features.extended_dynamic_state3_alpha_to_one_enable != 0
+            && device_features.alpha_to_one != 0;
+        let mut dynamic_state3_enables = dynamic_state3_depth_clamp_enable
+            || dynamic_state3_logic_op_enable
+            || dynamic_state3_line_raster_mode
+            || dynamic_state3_conservative_raster_mode
+            || dynamic_state3_line_stipple_enable
+            || dynamic_state3_alpha_to_coverage
+            || dynamic_state3_alpha_to_one;
+        if !vertex_input_dynamic_state_enabled {
+            supports_vertex_input_dynamic_state = false;
+            vertex_input_dynamic_state_features.vertex_input_dynamic_state = vk::FALSE;
+        }
+
         if !supports_extended_dynamic_state && supports_extended_dynamic_state2 {
             log::info!("Removing extendedDynamicState2 due to missing extendedDynamicState");
             supports_extended_dynamic_state2 = false;
@@ -1047,20 +1332,23 @@ impl Device {
             log::info!("Removing extendedDynamicState3 due to missing extendedDynamicState2");
             dynamic_state3_blending = false;
             dynamic_state3_enables = false;
-            extended_dynamic_state3_features.extended_dynamic_state3_color_blend_enable = vk::FALSE;
-            extended_dynamic_state3_features.extended_dynamic_state3_color_blend_equation =
-                vk::FALSE;
-            extended_dynamic_state3_features.extended_dynamic_state3_color_write_mask = vk::FALSE;
-            extended_dynamic_state3_features.extended_dynamic_state3_depth_clamp_enable = vk::FALSE;
-            extended_dynamic_state3_features.extended_dynamic_state3_logic_op_enable = vk::FALSE;
+            dynamic_state3_depth_clamp_enable = false;
+            dynamic_state3_logic_op_enable = false;
+            dynamic_state3_line_raster_mode = false;
+            dynamic_state3_conservative_raster_mode = false;
+            dynamic_state3_line_stipple_enable = false;
+            dynamic_state3_alpha_to_coverage = false;
+            dynamic_state3_alpha_to_one = false;
+            clear_feature_preserving_chain!(extended_dynamic_state3_features);
         }
         let supports_depth_clip_control =
             has_depth_clip_control && depth_clip_control_features.depth_clip_control != 0;
         let supports_4444_formats = has_4444_formats && formats_4444_features.format_a4b4g4r4 != 0;
         let supports_vertex_attribute_divisor = has_vertex_attribute_divisor;
-        // Upstream requires both features before enabling VK_EXT_provoking_vertex.
-        let supports_provoking_vertex = has_provoking_vertex
-            && provoking_vertex_features.provoking_vertex_last != 0
+        let supports_provoking_vertex = has_provoking_vertex;
+        let provoking_vertex_last_supported =
+            supports_provoking_vertex && provoking_vertex_features.provoking_vertex_last != 0;
+        let transform_feedback_preserves_provoking_vertex = supports_provoking_vertex
             && provoking_vertex_features.transform_feedback_preserves_provoking_vertex != 0;
         let supports_null_descriptor = has_robustness2 && robustness2_features.null_descriptor != 0;
         let supports_device_fault = has_device_fault && device_fault_features.device_fault != 0;
@@ -1102,6 +1390,11 @@ impl Device {
         );
         remove_extension_if_unsupported(
             &mut loaded_extensions,
+            "VK_EXT_color_write_enable",
+            supports_color_write_enable,
+        );
+        remove_extension_if_unsupported(
+            &mut loaded_extensions,
             "VK_EXT_depth_bias_control",
             supports_depth_bias_control,
         );
@@ -1110,6 +1403,18 @@ impl Device {
             "VK_EXT_depth_clip_control",
             supports_depth_clip_control,
         );
+        remove_extension_if_unsupported(
+            &mut loaded_extensions,
+            "VK_EXT_descriptor_buffer",
+            supports_descriptor_buffer,
+        );
+        if device_properties.api_version < vk::API_VERSION_1_2 {
+            remove_extension_if_unsupported(
+                &mut loaded_extensions,
+                "VK_KHR_buffer_device_address",
+                supports_buffer_device_address,
+            );
+        }
         remove_extension_if_unsupported(
             &mut loaded_extensions,
             "VK_EXT_extended_dynamic_state",
@@ -1170,14 +1475,34 @@ impl Device {
             "VK_KHR_push_descriptor",
             supports_push_descriptor,
         );
+        remove_extension_if_unsupported(
+            &mut loaded_extensions,
+            "VK_KHR_synchronization2",
+            supports_synchronization2,
+        );
         if !supports_custom_border_color {
             clear_feature_preserving_chain!(custom_border_color_features);
+        }
+        if !supports_color_write_enable {
+            clear_feature_preserving_chain!(color_write_enable_features);
         }
         if !supports_depth_bias_control {
             clear_feature_preserving_chain!(depth_bias_control_features);
         }
         if !supports_depth_clip_control {
             clear_feature_preserving_chain!(depth_clip_control_features);
+        }
+        if !supports_descriptor_buffer {
+            clear_feature_preserving_chain!(descriptor_buffer_features);
+        }
+        if !supports_buffer_device_address {
+            if device_properties.api_version >= vk::API_VERSION_1_2 {
+                vulkan12_features.buffer_device_address = vk::FALSE;
+                vulkan12_features.buffer_device_address_capture_replay = vk::FALSE;
+                vulkan12_features.buffer_device_address_multi_device = vk::FALSE;
+            } else {
+                clear_feature_preserving_chain!(buffer_device_address_features);
+            }
         }
         if !supports_extended_dynamic_state {
             clear_feature_preserving_chain!(extended_dynamic_state_features);
@@ -1205,6 +1530,9 @@ impl Device {
         }
         if !supports_subgroup_size_control {
             clear_feature_preserving_chain!(subgroup_size_control_features);
+        }
+        if !supports_synchronization2 {
+            clear_feature_preserving_chain!(synchronization2_features);
         }
         if supports_device_fault {
             log::info!("Vulkan device-fault diagnostics enabled");
@@ -1245,11 +1573,8 @@ impl Device {
             physical,
             loaded_extensions.contains("VK_EXT_tooling_info"),
         );
-        let timeline_semaphore_supported = supports_timeline_semaphore
-            && !matches!(
-                driver_id,
-                vk::DriverId::QUALCOMM_PROPRIETARY | vk::DriverId::MESA_TURNIP
-            );
+        let timeline_semaphore_supported =
+            supports_timeline_semaphore && driver_id != vk::DriverId::MESA_TURNIP;
         let enabled_extensions: Vec<CString> = loaded_extensions
             .iter()
             .map(|name| CString::new(name.as_str()).unwrap())
@@ -1287,6 +1612,29 @@ impl Device {
         let logical = LogicalDevice::create(&instance, physical, &device_create_info)?;
         let graphics_queue = logical.get_queue(graphics_family);
         let present_queue = logical.get_queue(present_family);
+        let mut allocator_flags = vk_mem::AllocatorCreateFlags::EXTERNALLY_SYNCHRONIZED;
+        if loaded_extensions.contains("VK_EXT_memory_budget") {
+            allocator_flags |= vk_mem::AllocatorCreateFlags::EXT_MEMORY_BUDGET;
+        }
+        if supports_buffer_device_address {
+            allocator_flags |= vk_mem::AllocatorCreateFlags::BUFFER_DEVICE_ADDRESS;
+        }
+        let allocator_info = vk_mem::AllocatorCreateInfo::new(&instance, &logical.device, physical)
+            .flags(allocator_flags)
+            .preferred_large_heap_block_size(if is_integrated {
+                64 * 1024 * 1024
+            } else {
+                256 * 1024 * 1024
+            })
+            .vulkan_api_version(device_properties.api_version);
+        let allocator = Arc::new(Mutex::new(
+            vk_mem::Allocator::new(allocator_info).map_err(VulkanError::new)?,
+        ));
+        let descriptor_buffer = supports_descriptor_buffer
+            .then(|| ash::extensions::ext::DescriptorBuffer::new(&instance, &logical.device));
+        let synchronization2 = (supports_synchronization2
+            && device_properties.api_version < vk::API_VERSION_1_3)
+            .then(|| ash::extensions::khr::Synchronization2::new(&instance, &logical.device));
 
         let instance_version = unsafe {
             let props = instance.get_physical_device_properties(physical);
@@ -1315,8 +1663,11 @@ impl Device {
         Ok(Self {
             instance,
             physical,
+            allocator,
             _dld: ash::Device::clone(&logical.device),
             logical,
+            descriptor_buffer,
+            synchronization2,
             graphics_queue,
             present_queue,
             instance_version,
@@ -1330,11 +1681,15 @@ impl Device {
                 uniform_buffer_standard_layout: loaded_extensions
                     .contains("VK_KHR_uniform_buffer_standard_layout"),
                 variable_pointer: loaded_extensions.contains("VK_KHR_variable_pointers"),
+                descriptor_indexing: loaded_extensions.contains("VK_EXT_descriptor_indexing"),
                 host_query_reset: loaded_extensions.contains("VK_EXT_host_query_reset"),
                 bit8_storage: loaded_extensions.contains("VK_KHR_8bit_storage"),
                 timeline_semaphore: loaded_extensions.contains("VK_KHR_timeline_semaphore"),
+                buffer_device_address: supports_buffer_device_address,
                 subgroup_size_control: supports_subgroup_size_control,
+                synchronization2: supports_synchronization2,
                 custom_border_color: supports_custom_border_color,
+                color_write_enable: supports_color_write_enable,
                 depth_bias_control: supports_depth_bias_control,
                 primitive_topology_list_restart: has_primitive_topology_list_restart,
                 extended_dynamic_state: supports_extended_dynamic_state,
@@ -1346,6 +1701,7 @@ impl Device {
                 transform_feedback: supports_transform_feedback,
                 vertex_input_dynamic_state: supports_vertex_input_dynamic_state,
                 depth_clip_control: supports_depth_clip_control,
+                descriptor_buffer: supports_descriptor_buffer,
                 index_type_uint8: has_index_type_uint8,
                 vertex_attribute_divisor: supports_vertex_attribute_divisor,
                 provoking_vertex: supports_provoking_vertex,
@@ -1383,6 +1739,9 @@ impl Device {
                     .contains("VK_NV_geometry_shader_passthrough"),
                 viewport_array2: loaded_extensions.contains("VK_NV_viewport_array2"),
                 viewport_swizzle: loaded_extensions.contains("VK_NV_viewport_swizzle"),
+                filter_cubic: loaded_extensions.contains("VK_EXT_filter_cubic"),
+                filter_cubic_img: loaded_extensions.contains("VK_IMG_filter_cubic"),
+                filter_cubic_weights: loaded_extensions.contains("VK_QCOM_filter_cubic_weights"),
                 ..DeviceExtensions::default()
             },
             device_properties,
@@ -1392,6 +1751,7 @@ impl Device {
             push_descriptor_properties,
             subgroup_size_control_properties,
             transform_feedback_properties,
+            descriptor_buffer_properties,
             transform_feedback_geometry_streams_supported: transform_feedback_features
                 .geometry_streams
                 != 0,
@@ -1400,6 +1760,22 @@ impl Device {
             timeline_semaphore_supported,
             host_query_reset_supported: host_query_reset_features.host_query_reset != 0,
             shader_int8_supported: supports_shader_int8,
+            uniform_and_storage_buffer_8bit_supported: storage_8bit_features
+                .uniform_and_storage_buffer8_bit_access
+                != 0,
+            storage_buffer_8bit_supported: storage_8bit_features.storage_buffer8_bit_access != 0,
+            uniform_and_storage_buffer_16bit_supported: storage_16bit_features
+                .uniform_and_storage_buffer16_bit_access
+                != 0,
+            storage_buffer_16bit_supported: storage_16bit_features.storage_buffer16_bit_access != 0,
+            workgroup_memory_explicit_layout_8bit_access_supported:
+                workgroup_memory_explicit_layout_features
+                    .workgroup_memory_explicit_layout8_bit_access
+                    != 0,
+            workgroup_memory_explicit_layout_16bit_access_supported:
+                workgroup_memory_explicit_layout_features
+                    .workgroup_memory_explicit_layout16_bit_access
+                    != 0,
             primitive_topology_list_restart_supported: supports_primitive_topology_list_restart,
             primitive_topology_patch_list_restart_supported:
                 supports_primitive_topology_patch_list_restart,
@@ -1407,6 +1783,12 @@ impl Device {
             null_descriptor_supported: supports_null_descriptor,
             shader_output_layer_supported: vulkan12_features.shader_output_layer != 0,
             exact_depth_bias_control_supported,
+            shader_shared_int64_atomics_supported,
+            descriptor_binding_partially_bound_supported,
+            sampled_image_array_non_uniform_indexing_supported,
+            storage_image_array_non_uniform_indexing_supported,
+            uniform_texel_buffer_array_non_uniform_indexing_supported,
+            storage_texel_buffer_array_non_uniform_indexing_supported,
             is_optimal_astc_supported,
             is_blit_depth24_stencil8_supported,
             is_blit_depth32_stencil8_supported,
@@ -1424,15 +1806,26 @@ impl Device {
             supports_d24_depth,
             cant_blit_msaa,
             must_emulate_scaled_formats,
-            must_emulate_bgr565: must_emulate_bgr565_for_driver(
-                driver_id,
-                device_properties.device_id,
-            ),
+            must_emulate_bgr565: emulate_bgr565,
             dynamic_state3_blending,
             dynamic_state3_enables,
+            dynamic_state3_depth_clamp_enable,
+            dynamic_state3_logic_op_enable,
+            dynamic_state3_line_raster_mode,
+            dynamic_state3_conservative_raster_mode,
+            dynamic_state3_line_stipple_enable,
+            dynamic_state3_alpha_to_coverage,
+            dynamic_state3_alpha_to_one,
+            provoking_vertex_last_supported,
+            transform_feedback_preserves_provoking_vertex,
+            smooth_lines_supported: line_rasterization_features.smooth_lines != 0,
+            stippled_rectangular_lines_supported: line_rasterization_features
+                .stippled_rectangular_lines
+                != 0,
             supports_conditional_barriers,
             device_access_memory,
             sets_per_pool: if is_amd_driver { 96 } else { 64 },
+            sampler_heap_budget,
             nvidia_arch,
             supported_extensions,
             loaded_extensions,
@@ -1543,6 +1936,66 @@ impl Device {
         }
     }
 
+    /// Names a shader module for an attached Vulkan debugging tool.
+    ///
+    /// This is the Rust counterpart of upstream's
+    /// `vk::ShaderModule::SetObjectNameEXT` used by `vk_pipeline_cache.cpp`.
+    pub fn set_shader_module_name(&self, module: vk::ShaderModule, name: &str) {
+        if !self.has_debugging_tool_attached() {
+            return;
+        }
+        let Ok(name) = CString::new(name) else {
+            log::warn!("Refusing Vulkan shader-module name containing NUL");
+            return;
+        };
+        let functions = vk::ExtDebugUtilsFn::load(|function_name| unsafe {
+            self.instance
+                .get_device_proc_addr(self.logical.device.handle(), function_name.as_ptr())
+                .map_or(std::ptr::null(), |function| {
+                    function as *const std::ffi::c_void
+                })
+        });
+        let name_info = vk::DebugUtilsObjectNameInfoEXT::builder()
+            .object_type(vk::ObjectType::SHADER_MODULE)
+            .object_handle(module.as_raw())
+            .object_name(&name);
+        let result = unsafe {
+            (functions.set_debug_utils_object_name_ext)(self.logical.device.handle(), &*name_info)
+        };
+        if result != vk::Result::SUCCESS {
+            log::warn!("Failed to name Vulkan shader module: {result:?}");
+        }
+    }
+
+    /// Rust counterpart of `vk::Buffer::SetObjectNameEXT` used by the
+    /// descriptor-buffer ring.
+    pub fn set_buffer_name(&self, buffer: vk::Buffer, name: &str) {
+        if !self.has_debugging_tool_attached() {
+            return;
+        }
+        let Ok(name) = CString::new(name) else {
+            log::warn!("Refusing Vulkan buffer name containing NUL");
+            return;
+        };
+        let functions = vk::ExtDebugUtilsFn::load(|function_name| unsafe {
+            self.instance
+                .get_device_proc_addr(self.logical.device.handle(), function_name.as_ptr())
+                .map_or(std::ptr::null(), |function| {
+                    function as *const std::ffi::c_void
+                })
+        });
+        let name_info = vk::DebugUtilsObjectNameInfoEXT::builder()
+            .object_type(vk::ObjectType::BUFFER)
+            .object_handle(buffer.as_raw())
+            .object_name(&name);
+        let result = unsafe {
+            (functions.set_debug_utils_object_name_ext)(self.logical.device.handle(), &*name_info)
+        };
+        if result != vk::Result::SUCCESS {
+            log::warn!("Failed to name Vulkan buffer: {result:?}");
+        }
+    }
+
     /// Returns the name of the VkDriverId reported from Vulkan.
     ///
     /// Port of `Device::GetDriverName`.
@@ -1564,6 +2017,17 @@ impl Device {
     /// Returns the logical ash device.
     pub fn get_logical(&self) -> &ash::Device {
         &self.logical.device
+    }
+
+    /// Returns the VMA allocator.
+    pub fn get_allocator(&self) -> &VmaAllocator {
+        &self.allocator
+    }
+
+    /// Ash needs the instance dispatch table to construct extension loaders.
+    /// Upstream's Vulkan wrapper carries that dispatch through `vk::Device`.
+    pub(crate) fn get_instance(&self) -> &ash::Instance {
+        &self.instance
     }
 
     /// Returns the device dispatch loader.
@@ -1622,6 +2086,13 @@ impl Device {
         self.driver_properties.driver_id
     }
 
+    /// Returns true for tile-based deferred renderers.
+    ///
+    /// Port of `Device::IsTiler`.
+    pub fn is_tiler(&self) -> bool {
+        is_tiler_driver(self.get_driver_id())
+    }
+
     /// Returns whether multiple typed views may alias one descriptor binding.
     /// Matches upstream `Device::IsDescriptorAliasingSupported`.
     pub fn is_descriptor_aliasing_supported(&self) -> bool {
@@ -1642,6 +2113,7 @@ impl Device {
                 | vk::DriverId::INTEL_OPEN_SOURCE_MESA
                 | vk::DriverId::QUALCOMM_PROPRIETARY
                 | vk::DriverId::MESA_TURNIP
+                | vk::DriverId::SAMSUNG_PROPRIETARY
         );
         let is_steam_deck = self.device_properties.vendor_id == 0x1002
             && matches!(self.device_properties.device_id, 0x163f | 0x1435);
@@ -1677,6 +2149,67 @@ impl Device {
         self.device_properties.limits.max_compute_shared_memory_size
     }
 
+    /// Port of upstream `Device::GetMaxComputeWorkGroupCount`.
+    pub fn get_max_compute_work_group_count(&self) -> [u32; 3] {
+        self.device_properties.limits.max_compute_work_group_count
+    }
+
+    pub fn get_max_per_stage_descriptor_sampled_images(&self) -> u32 {
+        self.device_properties
+            .limits
+            .max_per_stage_descriptor_sampled_images
+    }
+
+    pub fn get_max_per_stage_resources(&self) -> u32 {
+        self.device_properties.limits.max_per_stage_resources
+    }
+
+    pub fn get_max_descriptor_set_samplers(&self) -> u32 {
+        self.device_properties.limits.max_descriptor_set_samplers
+    }
+
+    pub fn get_max_descriptor_set_uniform_buffers(&self) -> u32 {
+        self.device_properties
+            .limits
+            .max_descriptor_set_uniform_buffers
+    }
+
+    pub fn get_max_descriptor_set_uniform_buffers_dynamic(&self) -> u32 {
+        self.device_properties
+            .limits
+            .max_descriptor_set_uniform_buffers_dynamic
+    }
+
+    pub fn get_max_descriptor_set_storage_buffers(&self) -> u32 {
+        self.device_properties
+            .limits
+            .max_descriptor_set_storage_buffers
+    }
+
+    pub fn get_max_descriptor_set_storage_buffers_dynamic(&self) -> u32 {
+        self.device_properties
+            .limits
+            .max_descriptor_set_storage_buffers_dynamic
+    }
+
+    pub fn get_max_descriptor_set_sampled_images(&self) -> u32 {
+        self.device_properties
+            .limits
+            .max_descriptor_set_sampled_images
+    }
+
+    pub fn get_max_descriptor_set_storage_images(&self) -> u32 {
+        self.device_properties
+            .limits
+            .max_descriptor_set_storage_images
+    }
+
+    pub fn get_max_descriptor_set_input_attachments(&self) -> u32 {
+        self.device_properties
+            .limits
+            .max_descriptor_set_input_attachments
+    }
+
     /// Returns the device's floating-point control properties.
     pub fn float_control_properties(&self) -> &vk::PhysicalDeviceFloatControlsProperties {
         &self.float_controls_properties
@@ -1690,6 +2223,11 @@ impl Device {
     /// Returns true if BCn is natively supported.
     pub fn is_optimal_bcn_supported(&self) -> bool {
         self.device_features.texture_compression_bc != 0
+    }
+
+    /// Returns true if ETC2/EAC is natively supported.
+    pub fn is_optimal_etc2_supported(&self) -> bool {
+        self.device_features.texture_compression_etc2 != 0
     }
 
     /// Returns true if the device supports float64 natively.
@@ -1708,6 +2246,42 @@ impl Device {
         self.shader_int8_supported
     }
 
+    /// Port of upstream `Device::IsUniformAndStorageBuffer8BitAccessSupported`.
+    pub fn is_uniform_and_storage_buffer_8bit_access_supported(&self) -> bool {
+        self.uniform_and_storage_buffer_8bit_supported
+    }
+
+    /// Port of upstream `Device::IsStorageBuffer8BitAccessSupported`.
+    pub fn is_storage_buffer_8bit_access_supported(&self) -> bool {
+        self.storage_buffer_8bit_supported
+    }
+
+    /// Port of upstream `Device::IsUniformAndStorageBuffer16BitAccessSupported`.
+    pub fn is_uniform_and_storage_buffer_16bit_access_supported(&self) -> bool {
+        self.uniform_and_storage_buffer_16bit_supported
+    }
+
+    /// Port of upstream `Device::IsStorageBuffer16BitAccessSupported`.
+    pub fn is_storage_buffer_16bit_access_supported(&self) -> bool {
+        self.storage_buffer_16bit_supported
+    }
+
+    /// Returns true if UINT8 index buffers can be converted through the
+    /// compute pass. Port of upstream `Device::SupportsUint8Indices`.
+    pub fn supports_uint8_indices(&self) -> bool {
+        self.storage_buffer_8bit_supported && self.storage_buffer_16bit_supported
+    }
+
+    /// Port of upstream `Device::IsWorkgroupMemoryExplicitLayout8BitAccessSupported`.
+    pub fn is_workgroup_memory_explicit_layout_8bit_access_supported(&self) -> bool {
+        self.workgroup_memory_explicit_layout_8bit_access_supported
+    }
+
+    /// Port of upstream `Device::IsWorkgroupMemoryExplicitLayout16BitAccessSupported`.
+    pub fn is_workgroup_memory_explicit_layout_16bit_access_supported(&self) -> bool {
+        self.workgroup_memory_explicit_layout_16bit_access_supported
+    }
+
     pub fn is_guest_warp_size_supported(&self, stage: vk::ShaderStageFlags) -> bool {
         self.subgroup_size_control_properties
             .required_subgroup_size_stages
@@ -1720,9 +2294,78 @@ impl Device {
             .intersects(feature)
     }
 
+    /// Port of upstream `Device::GetSubgroupSupportedStages`.
+    pub fn get_subgroup_supported_stages(&self) -> vk::ShaderStageFlags {
+        self.subgroup_properties.supported_stages
+    }
+
+    /// Port of upstream `Device::IsSampledImageArrayNonUniformIndexingSupported`.
+    pub fn is_sampled_image_array_non_uniform_indexing_supported(&self) -> bool {
+        self.sampled_image_array_non_uniform_indexing_supported
+    }
+
+    /// Port of upstream `Device::IsStorageImageArrayNonUniformIndexingSupported`.
+    pub fn is_storage_image_array_non_uniform_indexing_supported(&self) -> bool {
+        self.storage_image_array_non_uniform_indexing_supported
+    }
+
+    /// Port of upstream `Device::IsUniformTexelBufferArrayNonUniformIndexingSupported`.
+    pub fn is_uniform_texel_buffer_array_non_uniform_indexing_supported(&self) -> bool {
+        self.uniform_texel_buffer_array_non_uniform_indexing_supported
+    }
+
+    /// Port of upstream `Device::IsStorageTexelBufferArrayNonUniformIndexingSupported`.
+    pub fn is_storage_texel_buffer_array_non_uniform_indexing_supported(&self) -> bool {
+        self.storage_texel_buffer_array_non_uniform_indexing_supported
+    }
+
+    /// Port of upstream `Device::IsDescriptorBindingPartiallyBoundSupported`.
+    pub fn is_descriptor_binding_partially_bound_supported(&self) -> bool {
+        self.descriptor_binding_partially_bound_supported
+    }
+
+    /// Port of upstream `Device::IsExtDescriptorBufferSupported`.
+    pub fn is_ext_descriptor_buffer_supported(&self) -> bool {
+        self.extensions.descriptor_buffer
+    }
+
+    /// Port of upstream `Device::DescriptorBufferProperties`.
+    pub fn descriptor_buffer_properties(&self) -> &vk::PhysicalDeviceDescriptorBufferPropertiesEXT {
+        &self.descriptor_buffer_properties
+    }
+
+    /// Port of upstream `Device::IsBufferDeviceAddressSupported`.
+    pub fn is_buffer_device_address_supported(&self) -> bool {
+        self.extensions.buffer_device_address
+    }
+
+    pub fn descriptor_buffer_extension(&self) -> Option<&ash::extensions::ext::DescriptorBuffer> {
+        self.descriptor_buffer.as_ref()
+    }
+
     /// Returns true if timeline semaphores are supported and enabled.
     pub fn is_timeline_semaphore_supported(&self) -> bool {
         self.timeline_semaphore_supported
+    }
+
+    /// Port of upstream `Device::HasSynchronization2`.
+    pub fn has_synchronization2(&self) -> bool {
+        self.extensions.synchronization2
+    }
+
+    pub fn synchronization2_extension(&self) -> Option<&ash::extensions::khr::Synchronization2> {
+        self.synchronization2.as_ref()
+    }
+
+    /// Port of upstream `Device::GetSamplerHeapBudget`.
+    pub fn get_sampler_heap_budget(&self) -> Option<usize> {
+        (self.sampler_heap_budget != 0).then_some(self.sampler_heap_budget)
+    }
+
+    /// Port of upstream `Device::IsTransformFeedbackDrawSupported`.
+    pub fn is_transform_feedback_draw_supported(&self) -> bool {
+        self.extensions.transform_feedback
+            && self.transform_feedback_properties.transform_feedback_draw != 0
     }
 
     /// Returns true if host-side `vkResetQueryPool` is supported.
@@ -1781,6 +2424,11 @@ impl Device {
     /// Returns the maximum number of push descriptors.
     pub fn max_push_descriptors(&self) -> u32 {
         self.push_descriptor_properties.max_push_descriptors
+    }
+
+    /// Returns true if robust buffer access is enabled on the device.
+    pub fn is_robust_buffer_access_enabled(&self) -> bool {
+        self.device_features.robust_buffer_access != 0
     }
 
     /// Returns true when a known debugging tool is attached.
@@ -1944,6 +2592,10 @@ impl Device {
         self.extensions.custom_border_color
     }
 
+    pub fn is_ext_color_write_enable_supported(&self) -> bool {
+        self.extensions.color_write_enable
+    }
+
     pub fn is_ext_extended_dynamic_state_supported(&self) -> bool {
         self.extensions.extended_dynamic_state
     }
@@ -2005,8 +2657,27 @@ impl Device {
         self.extensions.provoking_vertex
     }
 
+    pub fn supports_provoking_vertex_first_mode(&self) -> bool {
+        self.extensions.provoking_vertex
+    }
+
+    pub fn supports_provoking_vertex_last_mode(&self) -> bool {
+        self.extensions.provoking_vertex && self.provoking_vertex_last_supported
+    }
+
+    pub fn supports_transform_feedback_provoking_vertex_preservation(&self) -> bool {
+        self.extensions.provoking_vertex && self.transform_feedback_preserves_provoking_vertex
+    }
+
     pub fn is_ext_shader_atomic_int64_supported(&self) -> bool {
         self.extensions.shader_atomic_int64
+    }
+
+    /// Port of upstream `Device::IsSharedInt64AtomicsSupported`. Distinct from
+    /// the buffer-side query above: shader-shared 64-bit atomics are a separate
+    /// feature bit.
+    pub fn is_shared_int64_atomics_supported(&self) -> bool {
+        self.extensions.shader_atomic_int64 && self.shader_shared_int64_atomics_supported
     }
 
     pub fn is_ext_conditional_rendering(&self) -> bool {
@@ -2071,6 +2742,60 @@ impl Device {
 
     pub fn is_ext_extended_dynamic_state3_enables_supported(&self) -> bool {
         self.dynamic_state3_enables
+    }
+
+    /// Port of `Device::IsExtFilterCubicSupported`.
+    pub fn is_ext_filter_cubic_supported(&self) -> bool {
+        self.extensions.filter_cubic
+    }
+
+    /// Port of `Device::IsQcomFilterCubicWeightsSupported`.
+    pub fn is_qcom_filter_cubic_weights_supported(&self) -> bool {
+        self.extensions.filter_cubic_weights
+    }
+
+    pub fn supports_dynamic_state3_depth_clamp_enable(&self) -> bool {
+        self.dynamic_state3_depth_clamp_enable
+    }
+
+    pub fn supports_dynamic_state3_logic_op_enable(&self) -> bool {
+        self.dynamic_state3_logic_op_enable
+    }
+
+    pub fn supports_dynamic_state3_line_rasterization_mode(&self) -> bool {
+        self.dynamic_state3_line_raster_mode
+    }
+
+    pub fn supports_dynamic_state3_conservative_rasterization_mode(&self) -> bool {
+        self.dynamic_state3_conservative_raster_mode
+    }
+
+    pub fn supports_dynamic_state3_line_stipple_enable(&self) -> bool {
+        self.dynamic_state3_line_stipple_enable
+    }
+
+    pub fn supports_dynamic_state3_alpha_to_coverage_enable(&self) -> bool {
+        self.dynamic_state3_alpha_to_coverage
+    }
+
+    pub fn supports_dynamic_state3_alpha_to_one_enable(&self) -> bool {
+        self.dynamic_state3_alpha_to_one
+    }
+
+    pub fn supports_smooth_lines(&self) -> bool {
+        self.smooth_lines_supported
+    }
+
+    pub fn supports_stippled_rectangular_lines(&self) -> bool {
+        self.stippled_rectangular_lines_supported
+    }
+
+    pub fn is_molten_vk(&self) -> bool {
+        self.get_driver_id() == vk::DriverId::MOLTENVK
+    }
+
+    pub fn supports_alpha_to_one(&self) -> bool {
+        self.device_features.alpha_to_one != 0
     }
 
     pub fn supports_conditional_barriers(&self) -> bool {
@@ -2211,9 +2936,18 @@ fn collect_physical_memory_info(
     }
 
     let available_memory = device_access_memory.wrapping_sub(device_initial_usage) as i64;
-    let upper = std::cmp::min(available_memory - 8 * ONE_GIB as i64, 4 * ONE_GIB as i64);
-    let lower = std::cmp::min(local_memory as i64, 4 * ONE_GIB as i64);
+    let memory_size =
+        integrated_memory_size(*common::settings::values().vram_usage_mode.get_value());
+    let upper = std::cmp::min(available_memory - 8 * ONE_GIB as i64, memory_size as i64);
+    let lower = std::cmp::min(local_memory as i64, memory_size as i64);
     (std::cmp::max(upper, lower) as u64, valid_heap_memory)
+}
+
+fn integrated_memory_size(mode: common::settings_enums::VramUsageMode) -> u64 {
+    match mode {
+        common::settings_enums::VramUsageMode::Conservative => 4 * ONE_GIB,
+        common::settings_enums::VramUsageMode::Aggressive => 6 * ONE_GIB,
+    }
 }
 
 fn device_memory_usage_from_budget(
@@ -2269,11 +3003,6 @@ fn driver_name_from_id(driver_id: vk::DriverId) -> Option<&'static str> {
     }
 }
 
-fn must_emulate_bgr565_for_driver(driver_id: vk::DriverId, device_id: u32) -> bool {
-    driver_id == vk::DriverId::INTEL_OPEN_SOURCE_MESA
-        || (driver_id == vk::DriverId::QUALCOMM_PROPRIETARY && device_id != 0x4305_0a01)
-}
-
 fn sampler_filter_minmax_supported(
     extension_available: bool,
     is_amd: bool,
@@ -2282,15 +3011,26 @@ fn sampler_filter_minmax_supported(
     extension_available && (!is_amd || shader_float16_supported)
 }
 
+fn derive_sampler_heap_budget(sampler_limit: usize) -> usize {
+    if sampler_limit == 0 {
+        return 0;
+    }
+    const MIN_SAMPLER_BUDGET: usize = 1024;
+    let reserved = sampler_limit / 4;
+    MIN_SAMPLER_BUDGET.max(sampler_limit - reserved)
+}
+
 fn initial_loaded_extensions(
     api_version: u32,
     supported_extensions: &BTreeSet<String>,
     enable_device_fault: bool,
 ) -> BTreeSet<String> {
     const FEATURE_EXTENSIONS: &[&str] = &[
+        "VK_EXT_color_write_enable",
         "VK_EXT_custom_border_color",
         "VK_EXT_depth_bias_control",
         "VK_EXT_depth_clip_control",
+        "VK_EXT_descriptor_buffer",
         "VK_EXT_extended_dynamic_state",
         "VK_EXT_extended_dynamic_state2",
         "VK_EXT_extended_dynamic_state3",
@@ -2329,18 +3069,24 @@ fn initial_loaded_extensions(
         "VK_NV_geometry_shader_passthrough",
         "VK_NV_viewport_array2",
         "VK_NV_viewport_swizzle",
+        "VK_EXT_filter_cubic",
+        "VK_IMG_filter_cubic",
+        "VK_QCOM_filter_cubic_weights",
         // Required by MoltenVK even though the upstream revision predates
         // explicit portability-subset handling.
         "VK_KHR_portability_subset",
     ];
     const FEATURES_1_2: &[&str] = &[
+        "VK_EXT_descriptor_indexing",
         "VK_EXT_host_query_reset",
         "VK_KHR_8bit_storage",
+        "VK_KHR_buffer_device_address",
         "VK_KHR_timeline_semaphore",
     ];
     const FEATURES_1_3: &[&str] = &[
         "VK_EXT_shader_demote_to_helper_invocation",
         "VK_EXT_subgroup_size_control",
+        "VK_KHR_synchronization2",
     ];
 
     let mut loaded = BTreeSet::new();
@@ -2432,6 +3178,10 @@ fn device_is_suitable(
     }
     if requires_swapchain && !extensions.contains("VK_KHR_swapchain") {
         log::error!("Missing required extension VK_KHR_swapchain");
+        suitable = false;
+    }
+    if api_version < vk::API_VERSION_1_2 && !extensions.contains("VK_EXT_descriptor_indexing") {
+        log::error!("Missing required extension VK_EXT_descriptor_indexing");
         suitable = false;
     }
 
@@ -2820,20 +3570,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn bgr565_emulation_matches_upstream_driver_exceptions() {
-        assert!(must_emulate_bgr565_for_driver(
-            vk::DriverId::INTEL_OPEN_SOURCE_MESA,
-            0,
-        ));
-        assert!(must_emulate_bgr565_for_driver(
+    fn tiler_driver_set_matches_upstream() {
+        for driver in [
             vk::DriverId::QUALCOMM_PROPRIETARY,
-            0,
-        ));
-        assert!(!must_emulate_bgr565_for_driver(
-            vk::DriverId::QUALCOMM_PROPRIETARY,
-            0x4305_0a01,
-        ));
-        assert!(!must_emulate_bgr565_for_driver(vk::DriverId::MESA_RADV, 0,));
+            vk::DriverId::ARM_PROPRIETARY,
+            vk::DriverId::SAMSUNG_PROPRIETARY,
+            vk::DriverId::MESA_TURNIP,
+        ] {
+            assert!(is_tiler_driver(driver), "{driver:?}");
+        }
+        assert!(!is_tiler_driver(vk::DriverId::NVIDIA_PROPRIETARY));
+        assert!(!is_tiler_driver(vk::DriverId::MESA_RADV));
     }
 
     #[test]
@@ -2851,12 +3598,16 @@ mod tests {
             "VK_EXT_4444_formats",
             "VK_EXT_index_type_uint8",
             "VK_EXT_primitive_topology_list_restart",
+            "VK_EXT_descriptor_indexing",
             "VK_EXT_host_query_reset",
             "VK_KHR_8bit_storage",
             "VK_KHR_timeline_semaphore",
             "VK_EXT_shader_demote_to_helper_invocation",
             "VK_EXT_subgroup_size_control",
             "VK_KHR_swapchain",
+            "VK_EXT_filter_cubic",
+            "VK_IMG_filter_cubic",
+            "VK_QCOM_filter_cubic_weights",
         ]
         .into_iter()
         .map(str::to_string)
@@ -2864,13 +3615,18 @@ mod tests {
 
         let vulkan_11 = initial_loaded_extensions(vk::API_VERSION_1_1, &supported, false);
         assert!(vulkan_11.contains("VK_EXT_host_query_reset"));
+        assert!(vulkan_11.contains("VK_EXT_descriptor_indexing"));
         assert!(vulkan_11.contains("VK_KHR_8bit_storage"));
         assert!(vulkan_11.contains("VK_KHR_timeline_semaphore"));
         assert!(vulkan_11.contains("VK_EXT_shader_demote_to_helper_invocation"));
         assert!(vulkan_11.contains("VK_EXT_subgroup_size_control"));
+        assert!(vulkan_11.contains("VK_EXT_filter_cubic"));
+        assert!(vulkan_11.contains("VK_IMG_filter_cubic"));
+        assert!(vulkan_11.contains("VK_QCOM_filter_cubic_weights"));
 
         let vulkan_13 = initial_loaded_extensions(vk::API_VERSION_1_3, &supported, false);
         assert!(!vulkan_13.contains("VK_EXT_host_query_reset"));
+        assert!(!vulkan_13.contains("VK_EXT_descriptor_indexing"));
         assert!(!vulkan_13.contains("VK_KHR_8bit_storage"));
         assert!(!vulkan_13.contains("VK_KHR_timeline_semaphore"));
         assert!(!vulkan_13.contains("VK_EXT_shader_demote_to_helper_invocation"));
@@ -3008,6 +3764,49 @@ mod tests {
     }
 
     #[test]
+    fn descriptor_indexing_extension_is_mandatory_before_vulkan_1_2() {
+        let (
+            mut extensions,
+            features,
+            storage_16bit,
+            storage_8bit,
+            host_query_reset,
+            shader_demote,
+            shader_draw_parameters,
+            variable_pointers,
+            limits,
+        ) = suitable_device_inputs();
+        extensions.insert("VK_EXT_descriptor_indexing".to_string());
+        assert!(device_is_suitable(
+            vk::API_VERSION_1_1,
+            true,
+            &extensions,
+            &features,
+            &storage_16bit,
+            &storage_8bit,
+            &host_query_reset,
+            &shader_demote,
+            &shader_draw_parameters,
+            &variable_pointers,
+            &limits,
+        ));
+        extensions.remove("VK_EXT_descriptor_indexing");
+        assert!(!device_is_suitable(
+            vk::API_VERSION_1_1,
+            true,
+            &extensions,
+            &features,
+            &storage_16bit,
+            &storage_8bit,
+            &host_query_reset,
+            &shader_demote,
+            &shader_draw_parameters,
+            &variable_pointers,
+            &limits,
+        ));
+    }
+
+    #[test]
     fn depth_bias_control_payload_matches_vulkan_abi() {
         let (expected_size, expected_alignment) = if cfg!(target_pointer_width = "64") {
             (32, 8)
@@ -3089,6 +3888,18 @@ mod tests {
     }
 
     #[test]
+    fn integrated_memory_limit_matches_vram_usage_mode() {
+        assert_eq!(
+            integrated_memory_size(common::settings_enums::VramUsageMode::Conservative),
+            4 * ONE_GIB
+        );
+        assert_eq!(
+            integrated_memory_size(common::settings_enums::VramUsageMode::Aggressive),
+            6 * ONE_GIB
+        );
+    }
+
+    #[test]
     fn device_memory_usage_from_budget_sums_valid_heaps() {
         let mut budget = vk::PhysicalDeviceMemoryBudgetPropertiesEXT::default();
         budget.heap_usage[0] = ONE_GIB;
@@ -3133,6 +3944,13 @@ mod tests {
     }
 
     #[test]
+    fn qualcomm_sampler_heap_budget_matches_upstream_reservation() {
+        assert_eq!(derive_sampler_heap_budget(0), 0);
+        assert_eq!(derive_sampler_heap_budget(4096), 3072);
+        assert_eq!(derive_sampler_heap_budget(512), 1024);
+    }
+
+    #[test]
     fn feature_chain_rejects_duplicate_structure_types() {
         let mut duplicate = vk::PhysicalDeviceTimelineSemaphoreFeatures::default();
         let mut timeline = vk::PhysicalDeviceTimelineSemaphoreFeatures::default();
@@ -3150,5 +3968,54 @@ mod tests {
         assert!(pnext_chain_has_unique_structure_types(
             (&timeline as *const vk::PhysicalDeviceTimelineSemaphoreFeatures).cast()
         ));
+    }
+
+    #[test]
+    fn descriptor_indexing_policy_matches_upstream_enabled_subset() {
+        let mut features = vk::PhysicalDeviceDescriptorIndexingFeatures {
+            shader_uniform_texel_buffer_array_dynamic_indexing: vk::TRUE,
+            shader_storage_texel_buffer_array_dynamic_indexing: vk::TRUE,
+            shader_sampled_image_array_non_uniform_indexing: vk::TRUE,
+            shader_storage_image_array_non_uniform_indexing: vk::TRUE,
+            shader_uniform_texel_buffer_array_non_uniform_indexing: vk::TRUE,
+            shader_storage_texel_buffer_array_non_uniform_indexing: vk::TRUE,
+            descriptor_binding_partially_bound: vk::TRUE,
+            runtime_descriptor_array: vk::TRUE,
+            descriptor_binding_sampled_image_update_after_bind: vk::TRUE,
+            ..Default::default()
+        };
+
+        apply_descriptor_indexing_policy(&mut features);
+
+        assert_eq!(features.runtime_descriptor_array, vk::FALSE);
+        assert_eq!(
+            features.descriptor_binding_sampled_image_update_after_bind,
+            vk::FALSE
+        );
+        assert_eq!(features.descriptor_binding_partially_bound, vk::TRUE);
+        assert_eq!(
+            features.shader_uniform_texel_buffer_array_dynamic_indexing,
+            vk::FALSE
+        );
+        assert_eq!(
+            features.shader_storage_texel_buffer_array_dynamic_indexing,
+            vk::FALSE
+        );
+        assert_eq!(
+            features.shader_sampled_image_array_non_uniform_indexing,
+            vk::TRUE
+        );
+        assert_eq!(
+            features.shader_storage_image_array_non_uniform_indexing,
+            vk::TRUE
+        );
+        assert_eq!(
+            features.shader_uniform_texel_buffer_array_non_uniform_indexing,
+            vk::TRUE
+        );
+        assert_eq!(
+            features.shader_storage_texel_buffer_array_non_uniform_indexing,
+            vk::TRUE
+        );
     }
 }

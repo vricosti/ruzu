@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //
 // Rust/GTK4 counterpart of
-// `/home/vricosti/Dev/emulators/zuyu/src/yuzu/configuration/configure_system.cpp`
+// `/home/vricosti/Dev/emulators/eden/src/yuzu/configuration/configure_system.cpp`
 // (`ConfigureSystem`), whose widget tree lives in `configure_system.ui`.
 //
 // Two groups: "System" (language, region, time zone, custom RTC, RNG seed,
@@ -19,6 +19,18 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use super::configure_dialog::Page;
 use super::shared_translation as tr;
 use super::shared_widget as w;
+
+const CPU_CLOCKS: &[(common::settings_enums::CpuClock, &str)] = &[
+    (common::settings_enums::CpuClock::Normal, "Normal"),
+    (common::settings_enums::CpuClock::Boost, "Boost"),
+    (common::settings_enums::CpuClock::Overclock, "Overclock"),
+];
+
+const GPU_CLOCKS: &[(common::settings_enums::GpuClock, &str)] = &[
+    (common::settings_enums::GpuClock::Normal, "Normal"),
+    (common::settings_enums::GpuClock::Boost, "Boost"),
+    (common::settings_enums::GpuClock::Overclock, "Overclock"),
+];
 
 /// Seconds in the Switch epoch offset used to render the custom RTC field.
 /// Upstream stores `custom_rtc` as a POSIX timestamp and shows it in a
@@ -45,6 +57,22 @@ pub fn page() -> Page {
 
     // --- "System" ---------------------------------------------------------
     let (system_group, system) = w::group("System");
+
+    let cpu_clock_value = *common::settings::values().cpu_clock.get_value();
+    let (cpu_clock_row, cpu_clock) = w::combo_row(
+        "CPU Clocks:",
+        &tr::labels(CPU_CLOCKS),
+        tr::index_of(CPU_CLOCKS, &cpu_clock_value),
+    );
+    system.append(&cpu_clock_row);
+
+    let gpu_clock_value = *common::settings::values().gpu_clock.get_value();
+    let (gpu_clock_row, gpu_clock) = w::combo_row(
+        "GPU Clocks:",
+        &tr::labels(GPU_CLOCKS),
+        tr::index_of(GPU_CLOCKS, &gpu_clock_value),
+    );
+    system.append(&gpu_clock_row);
 
     let language_index = tr::index_of(
         tr::LANGUAGE,
@@ -119,6 +147,10 @@ pub fn page() -> Page {
     console_mode_row.set_visible(!configuring_global);
     system.append(&console_mode_row);
 
+    let program_args_value = common::settings::values().program_args.get_value().clone();
+    let (program_args_row, program_args) = w::entry_row("Homebrew Args:", &program_args_value);
+    system.append(&program_args_row);
+
     let invalid_locale = gtk::Label::new(None);
     invalid_locale.set_wrap(true);
     invalid_locale.set_xalign(0.0);
@@ -162,6 +194,32 @@ pub fn page() -> Page {
     let speed_row = gated_row(&speed_check, &speed_control);
     core.append(&speed_row);
 
+    let (slow_speed_row, slow_speed) = w::spin_row(
+        "Slow Speed:",
+        *common::settings::values().slow_speed_limit.get_value() as f64,
+        0.0,
+        9999.0,
+        1.0,
+        "%",
+    );
+    core.append(&slow_speed_row);
+
+    let (turbo_speed_row, turbo_speed) = w::spin_row(
+        "Turbo Speed:",
+        *common::settings::values().turbo_speed_limit.get_value() as f64,
+        0.0,
+        9999.0,
+        1.0,
+        "%",
+    );
+    core.append(&turbo_speed_row);
+
+    let sync_core_speed = w::check_row(
+        "Synchronize Core Speed",
+        *common::settings::values().sync_core_speed.get_value(),
+    );
+    core.append(&sync_core_speed);
+
     column.append(&core_group);
 
     // Gate each dependent control on its check box, as upstream does.
@@ -174,6 +232,8 @@ pub fn page() -> Page {
     // Line the control column up across both groups. The check-box rows would
     // otherwise sit ~20px left of the combo rows above them.
     let label_columns = w::align_label_columns(&[
+        &cpu_clock_row,
+        &gpu_clock_row,
         &language_row,
         &region_row,
         &time_zone_row,
@@ -182,8 +242,11 @@ pub fn page() -> Page {
         &seed_row,
         &device_name_row,
         &console_mode_row,
+        &program_args_row,
         &memory_row,
         &speed_row,
+        &slow_speed_row,
+        &turbo_speed_row,
     ]);
 
     Page::new("System", scroller, move || {
@@ -192,6 +255,8 @@ pub fn page() -> Page {
         let _keep_alive = &label_columns;
 
         let language_value = tr::value_at(tr::LANGUAGE, language.selected());
+        let cpu_clock_value = tr::value_at(CPU_CLOCKS, cpu_clock.selected());
+        let gpu_clock_value = tr::value_at(GPU_CLOCKS, gpu_clock.selected());
         let region_value = tr::value_at(tr::REGION, region.selected());
         let time_zone_value = time_zone.selected();
         let rtc_on = custom_rtc_check.is_active();
@@ -205,6 +270,10 @@ pub fn page() -> Page {
         let memory_value = tr::value_at(tr::MEMORY_LAYOUT, memory.selected());
         let limit_on = speed_check.is_active();
         let limit_value = speed_spin.value() as u16;
+        let slow_speed_value = slow_speed.value() as u16;
+        let turbo_speed_value = turbo_speed.value() as u16;
+        let synchronize_core = sync_core_speed.is_active();
+        let args = program_args.text().to_string();
         let console_mode = if handheld.is_active() {
             common::settings_enums::ConsoleMode::Handheld
         } else {
@@ -212,6 +281,8 @@ pub fn page() -> Page {
         };
 
         let mut values = common::settings::values_mut();
+        values.cpu_clock.set_value(cpu_clock_value);
+        values.gpu_clock.set_value(gpu_clock_value);
         values.language_index.set_value(language_value);
         values.region_index.set_value(region_value);
         if let Some(zone) = common::settings_enums::TimeZone::from_u32(time_zone_value) {
@@ -229,6 +300,10 @@ pub fn page() -> Page {
         values.memory_layout_mode.set_value(memory_value);
         values.use_speed_limit.set_value(limit_on);
         values.speed_limit.set_value(limit_value);
+        values.slow_speed_limit.set_value(slow_speed_value);
+        values.turbo_speed_limit.set_value(turbo_speed_value);
+        values.sync_core_speed.set_value(synchronize_core);
+        values.program_args.set_value(args);
         if !configuring_global {
             values.use_docked_mode.set_value(console_mode);
         }
@@ -366,32 +441,35 @@ fn time_zone_labels() -> Vec<String> {
         .iter()
         .map(|(name, zone)| match zone {
             common::settings_enums::TimeZone::Auto => {
-                format!("Auto ({})", host_time_zone())
+                format!("Auto ({})", common::time_zone::find_system_time_zone())
             }
             common::settings_enums::TimeZone::Default => {
-                format!("Default ({})", host_time_zone())
+                format!("Default ({})", common::time_zone::get_default_time_zone())
             }
             _ => name.to_string(),
         })
         .collect()
 }
 
-/// The host's zone name, as upstream's `Common::TimeZone::GetDefaultTimeZone()`
-/// reports it. Falls back to "GMT" when the host offers nothing.
-fn host_time_zone() -> String {
-    std::fs::read_to_string("/etc/timezone")
-        .map(|s| s.trim().to_string())
-        .ok()
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "GMT".to_string())
-}
-
 /// Render a POSIX timestamp the way upstream's `QDateTimeEdit` displays it.
 fn format_rtc(timestamp: i64) -> String {
-    // `time`/`chrono` are not dependencies of this crate; upstream's display
-    // format is reproduced from the raw timestamp via a minimal civil-date
-    // conversion (Howard Hinnant's `civil_from_days`, the same algorithm
-    // `std::chrono` uses).
+    #[cfg(unix)]
+    unsafe {
+        let raw = timestamp as libc::time_t;
+        let mut local = std::mem::zeroed::<libc::tm>();
+        if !libc::localtime_r(&raw, &mut local).is_null() {
+            return format!(
+                "{:02}/{:02}/{:04} {:02}:{:02}",
+                local.tm_mday,
+                local.tm_mon + 1,
+                local.tm_year + 1900,
+                local.tm_hour,
+                local.tm_min
+            );
+        }
+    }
+
+    // Platform fallback when no local-time conversion is available.
     let days = timestamp.div_euclid(86_400);
     let secs_of_day = timestamp.rem_euclid(86_400);
     let (year, month, day) = civil_from_days(days);
@@ -426,6 +504,19 @@ fn parse_rtc(text: &str) -> Option<i64> {
     {
         return None;
     }
+    #[cfg(unix)]
+    unsafe {
+        let mut local = std::mem::zeroed::<libc::tm>();
+        local.tm_year = i32::try_from(year - 1900).ok()?;
+        local.tm_mon = i32::try_from(month - 1).ok()?;
+        local.tm_mday = i32::try_from(day).ok()?;
+        local.tm_hour = i32::try_from(hour).ok()?;
+        local.tm_min = i32::try_from(minute).ok()?;
+        local.tm_isdst = -1;
+        return Some(libc::mktime(&mut local) as i64);
+    }
+
+    #[cfg(not(unix))]
     Some(days_from_civil(year, month, day) * 86_400 + hour * 3600 + minute * 60)
 }
 
@@ -481,8 +572,9 @@ mod tests {
     }
 
     #[test]
-    fn epoch_renders_as_unix_day_zero() {
-        assert_eq!(format_rtc(0), "01/01/1970 00:00");
+    fn rtc_uses_the_host_local_time_like_qdatetime() {
+        let timestamp = 1_785_000_000;
+        assert_eq!(parse_rtc(&format_rtc(timestamp)), Some(timestamp));
     }
 
     #[test]
@@ -505,9 +597,15 @@ mod tests {
 
     #[test]
     fn time_zone_list_covers_every_enum_variant() {
+        let labels = time_zone_labels();
         assert_eq!(
-            time_zone_labels().len(),
+            labels.len(),
             common::settings_enums::TimeZone::canonicalizations().len()
+        );
+        assert_eq!(labels[1], "Default (GMT)");
+        assert_eq!(
+            labels[0],
+            format!("Auto ({})", common::time_zone::find_system_time_zone())
         );
     }
 

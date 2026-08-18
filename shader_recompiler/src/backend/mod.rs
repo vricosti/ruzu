@@ -237,10 +237,32 @@ mod tests {
         assert_eq!(words[0], 0x07230203);
     }
 
+    /// Upstream value-initializes every `bool` in `Profile` to false; only
+    /// `supported_spirv` and `supported_subgroup_stages` carry a non-zero
+    /// default.
     #[test]
     fn test_profile_default() {
         let profile = Profile::default();
         assert_eq!(profile.supported_spirv, 0x00010000);
-        assert!(profile.support_demote_to_helper_invocation);
+        assert_eq!(profile.supported_subgroup_stages, 0x7F);
+        assert!(!profile.support_demote_to_helper_invocation);
+    }
+
+    #[test]
+    fn default_profile_supports_every_subgroup_stage() {
+        use crate::stage::Stage;
+
+        let profile = Profile::default();
+        for stage in [
+            Stage::VertexB,
+            Stage::TessellationControl,
+            Stage::TessellationEval,
+            Stage::Geometry,
+            Stage::Fragment,
+            Stage::Compute,
+            Stage::VertexA,
+        ] {
+            assert!(profile.supports_subgroup_stage(stage), "{stage}");
+        }
     }
 }

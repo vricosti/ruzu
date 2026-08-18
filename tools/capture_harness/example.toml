@@ -1,0 +1,62 @@
+[process]
+executable = "../../target/release/ruzu-cmd"
+rom_path = "/absolute/path/to/title.nsp"
+rom_arg = "-g"
+args = [
+    "--renderer",
+    "vulkan",
+]
+working_directory = "../.."
+log_file = "output/process.log"
+stop_at = "00:01:10"
+terminate_after_timeline = true
+termination_grace_ms = 3000
+
+[cleanup]
+shader_cache_paths = [
+    "/absolute/path/to/shader-cache/title-id",
+]
+save_data_paths = [
+    "/absolute/path/to/save-data/title-id",
+]
+
+[process.environment]
+DISPLAY = ":0"
+RUST_LOG = "info"
+
+[input]
+default_hold_ms = 100
+restore_config = true
+
+[[input.events]]
+at = "00:00:12.000"
+buttons = ["l", "r"]
+label = "L+R"
+
+[[input.events]]
+at = "00:00:14.000"
+buttons = ["a"]
+label = "A"
+
+[capture]
+output_directory = "output"
+target = "window"
+match_process_pid = true
+window_title_regex = ".*reden.*"
+window_wait_timeout = "00:00:20"
+screenshot_prefix = "reference"
+times = [
+    "00:00:20.000",
+    "00:00:40.000",
+    "00:01:00.000",
+]
+
+[video]
+enabled = true
+start = "00:00:05.000"
+end = "00:01:05.000"
+output = "reference.mp4"
+fps = 60
+codec = "libx264"
+crf = 18
+include_cursor = false

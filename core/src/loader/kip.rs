@@ -9,10 +9,11 @@ use crate::file_sys::kernel_executable::KIP;
 use crate::file_sys::program_metadata::{ProgramAddressSpaceType, ProgramMetadata};
 use crate::file_sys::vfs::vfs_types::VirtualFile;
 use crate::hle::kernel::code_set::CodeSet;
+use common::common_funcs::make_magic;
 
 use super::loader::{
-    make_magic, AppLoader, FileType, FileTypeIdentifier, KProcess, LoadParameters, LoadResult,
-    ResultStatus, System,
+    AppLoader, FileType, FileTypeIdentifier, KProcess, LoadParameters, LoadResult, ResultStatus,
+    System,
 };
 use super::nso::read_object;
 

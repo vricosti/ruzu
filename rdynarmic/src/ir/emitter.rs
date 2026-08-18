@@ -523,6 +523,10 @@ impl<'a> IREmitter<'a> {
         self.emit(Opcode::SHA256MessageSchedule1, &[x, y, z])
     }
 
+    pub fn sm4_access_substitution_box(&mut self, a: Value) -> Value {
+        self.emit(Opcode::SM4AccessSubstitutionBox, &[a])
+    }
+
     // --- Vector get/set element ---
 
     pub fn vector_get_element(&mut self, esize: usize, a: Value, index: u8) -> Value {
@@ -810,6 +814,14 @@ impl<'a> IREmitter<'a> {
         self.emit(Opcode::VectorExtractLower, &[a, b, Value::ImmU8(position)])
     }
 
+    pub fn vector_rotate_whole_vector_right(&mut self, a: Value, amount: u8) -> Value {
+        assert_eq!(amount % 32, 0);
+        self.emit(
+            Opcode::VectorRotateWholeVectorRight,
+            &[a, Value::ImmU8(amount)],
+        )
+    }
+
     /// Upstream: `VectorDeinterleaveEven(esize, a, b)`.
     pub fn vector_deinterleave_even(&mut self, esize: usize, a: Value, b: Value) -> Value {
         let op = match esize {
@@ -854,6 +866,26 @@ impl<'a> IREmitter<'a> {
             _ => panic!("Invalid esize {}", esize),
         };
         self.emit(op, &[a, Value::ImmU8(shift)])
+    }
+
+    pub fn vector_rotate_right(&mut self, esize: usize, a: Value, amount: u8) -> Value {
+        assert!((amount as usize) < esize);
+        if amount == 0 {
+            return a;
+        }
+        let right = self.vector_logical_shift_right(esize, a, amount);
+        let left = self.vector_logical_shift_left(esize, a, esize as u8 - amount);
+        self.vector_or(right, left)
+    }
+
+    pub fn vector_rotate_left(&mut self, esize: usize, a: Value, amount: u8) -> Value {
+        assert!((amount as usize) < esize);
+        if amount == 0 {
+            return a;
+        }
+        let left = self.vector_logical_shift_left(esize, a, amount);
+        let right = self.vector_logical_shift_right(esize, a, esize as u8 - amount);
+        self.vector_or(left, right)
     }
 
     pub fn vector_arithmetic_shift_right(&mut self, esize: usize, a: Value, shift: u8) -> Value {
@@ -1607,6 +1639,56 @@ impl<'a> IREmitter<'a> {
             _ => panic!("Invalid esize {}", esize),
         };
         self.emit(op, &[a])
+    }
+
+    pub fn fp_recip_estimate(&mut self, esize: usize, a: Value) -> Value {
+        let op = match esize {
+            16 => Opcode::FPRecipEstimate16,
+            32 => Opcode::FPRecipEstimate32,
+            64 => Opcode::FPRecipEstimate64,
+            _ => panic!("Invalid esize {}", esize),
+        };
+        self.emit(op, &[a])
+    }
+
+    pub fn fp_recip_exponent(&mut self, esize: usize, a: Value) -> Value {
+        let op = match esize {
+            16 => Opcode::FPRecipExponent16,
+            32 => Opcode::FPRecipExponent32,
+            64 => Opcode::FPRecipExponent64,
+            _ => panic!("Invalid esize {}", esize),
+        };
+        self.emit(op, &[a])
+    }
+
+    pub fn fp_recip_step_fused(&mut self, esize: usize, a: Value, b: Value) -> Value {
+        let op = match esize {
+            16 => Opcode::FPRecipStepFused16,
+            32 => Opcode::FPRecipStepFused32,
+            64 => Opcode::FPRecipStepFused64,
+            _ => panic!("Invalid esize {}", esize),
+        };
+        self.emit(op, &[a, b])
+    }
+
+    pub fn fp_rsqrt_estimate(&mut self, esize: usize, a: Value) -> Value {
+        let op = match esize {
+            16 => Opcode::FPRSqrtEstimate16,
+            32 => Opcode::FPRSqrtEstimate32,
+            64 => Opcode::FPRSqrtEstimate64,
+            _ => panic!("Invalid esize {}", esize),
+        };
+        self.emit(op, &[a])
+    }
+
+    pub fn fp_rsqrt_step_fused(&mut self, esize: usize, a: Value, b: Value) -> Value {
+        let op = match esize {
+            16 => Opcode::FPRSqrtStepFused16,
+            32 => Opcode::FPRSqrtStepFused32,
+            64 => Opcode::FPRSqrtStepFused64,
+            _ => panic!("Invalid esize {}", esize),
+        };
+        self.emit(op, &[a, b])
     }
 
     pub fn fp_add(&mut self, esize: usize, a: Value, b: Value) -> Value {

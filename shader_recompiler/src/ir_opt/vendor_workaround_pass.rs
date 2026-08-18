@@ -4,8 +4,8 @@
 //! Port of `ir_opt/vendor_workaround_pass.cpp`
 //!
 //! Applies vendor-specific workarounds to the IR. Currently handles
-//! an NVIDIA bug in Super Mario RPG where byte swap patterns using
-//! IAdd32 need to be replaced with BitwiseOr32.
+//! a vendor-driver bug where byte-swap patterns using `IAdd32` need
+//! to be replaced with `BitwiseOr32`.
 
 use crate::ir::instruction::Inst;
 use crate::ir::opcodes::Opcode;
@@ -16,23 +16,19 @@ use crate::ir::value::Value;
 ///
 /// Upstream: `VendorWorkaroundPass` (vendor_workaround_pass.cpp:65-77).
 pub fn vendor_workaround_pass(program: &mut Program) {
-    // Collect indices of IAdd32 instructions to patch.
-    // We collect first to avoid borrow issues when mutating.
-    let mut patches: Vec<(usize, u32)> = Vec::new();
-
-    for (block_idx, block) in program.blocks.iter().enumerate() {
-        for (inst_idx, inst) in block.indexed_iter() {
-            if inst.opcode == Opcode::IAdd32 {
-                if should_replace_with_or(program, inst) {
-                    patches.push((block_idx, inst_idx));
-                }
+    for block_idx in program.post_order_blocks.clone() {
+        let instructions = program
+            .block(block_idx)
+            .indexed_iter()
+            .map(|(inst_idx, _)| inst_idx)
+            .collect::<Vec<_>>();
+        for inst_idx in instructions {
+            if program.block(block_idx).inst(inst_idx).opcode == Opcode::IAdd32 {
+                adding_byte_swaps_workaround(program, block_idx, inst_idx);
             }
         }
     }
-
-    for (block_idx, inst_idx) in patches {
-        program.blocks[block_idx].inst_mut(inst_idx).opcode = Opcode::BitwiseOr32;
-    }
+    program.recompute_use_counts();
 }
 
 /// Resolve an instruction Value through Identity chains.
@@ -58,8 +54,7 @@ fn try_inst_recursive<'a>(program: &'a Program, val: &Value) -> Option<&'a Inst>
     }
 }
 
-/// Check if an IAdd32 instruction matches the byte-swap pattern and should
-/// be replaced with BitwiseOr32.
+/// Replace an `IAdd32` matching the byte-swap pattern with `BitwiseOr32`.
 ///
 /// Upstream: `AddingByteSwapsWorkaround` (vendor_workaround_pass.cpp:12-63).
 ///
@@ -69,47 +64,48 @@ fn try_inst_recursive<'a>(program: &'a Program, val: &Value) -> Option<&'a Inst>
 ///   %lhs_shl = ShiftLeftLogical32 %lhs_mul, #16
 ///   %rhs_bfe = BitFieldUExtract %factor_a, #16, #16
 ///   %result  = IAdd32 %lhs_shl, %rhs_bfe
-fn should_replace_with_or(program: &Program, inst: &Inst) -> bool {
+fn adding_byte_swaps_workaround(program: &mut Program, block_idx: u32, inst_idx: u32) {
+    let inst = program.block(block_idx).inst(inst_idx);
     if inst.args.len() < 2 {
-        return false;
+        return;
     }
 
     let lhs_shl = match try_inst_recursive(program, &inst.args[0]) {
         Some(i) => i,
-        None => return false,
+        None => return,
     };
     let rhs_bfe = match try_inst_recursive(program, &inst.args[1]) {
         Some(i) => i,
-        None => return false,
+        None => return,
     };
 
     // Check lhs_shl: ShiftLeftLogical32 with shift amount 16.
     if lhs_shl.opcode != Opcode::ShiftLeftLogical32 {
-        return false;
+        return;
     }
     if lhs_shl.args.len() < 2 || lhs_shl.args[1] != Value::ImmU32(16) {
-        return false;
+        return;
     }
 
     // Check rhs_bfe: BitFieldUExtract with offset=16, count=16.
     if rhs_bfe.opcode != Opcode::BitFieldUExtract {
-        return false;
+        return;
     }
     if rhs_bfe.args.len() < 3
         || rhs_bfe.args[1] != Value::ImmU32(16)
         || rhs_bfe.args[2] != Value::ImmU32(16)
     {
-        return false;
+        return;
     }
 
     // Check lhs_mul: the source of the shift should be IMul32 or BitFieldUExtract.
     let lhs_mul = match try_inst_recursive(program, &lhs_shl.args[0]) {
         Some(i) => i,
-        None => return false,
+        None => return,
     };
     let lhs_mul_optional = lhs_mul.opcode == Opcode::BitFieldUExtract;
     if lhs_mul.opcode != Opcode::IMul32 && !lhs_mul_optional {
-        return false;
+        return;
     }
 
     // Check lhs_bfe: the first input to the multiply (or the BFE itself if optional).
@@ -118,27 +114,80 @@ fn should_replace_with_or(program: &Program, inst: &Inst) -> bool {
     } else {
         match try_inst_recursive(program, &lhs_mul.args[0]) {
             Some(i) => i,
-            None => return false,
+            None => return,
         }
     };
 
     if lhs_bfe.opcode != Opcode::BitFieldUExtract {
-        return false;
+        return;
     }
     if lhs_bfe.args.len() < 3
         || lhs_bfe.args[1] != Value::ImmU32(0)
         || lhs_bfe.args[2] != Value::ImmU32(16)
     {
-        return false;
+        return;
     }
 
-    // Verify both BFEs extract from the same source.
-    if lhs_bfe.args.is_empty() || rhs_bfe.args.is_empty() {
-        return false;
-    }
-    if lhs_bfe.args[0] != rhs_bfe.args[0] {
-        return false;
+    let args = program.block(block_idx).inst(inst_idx).args[..2].to_vec();
+    let replacement_idx = program
+        .block_mut(block_idx)
+        .insert_inst_before(inst_idx, Inst::new(Opcode::BitwiseOr32, args));
+    let replacement = Value::Inst(crate::ir::value::InstRef {
+        block: block_idx,
+        inst: replacement_idx,
+    });
+    let inst = program.block_mut(block_idx).inst_mut(inst_idx);
+    inst.opcode = Opcode::Identity;
+    inst.args = vec![replacement];
+    inst.phi_args.clear();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ir::basic_block::Block;
+    use crate::ir::types::ShaderStage;
+    use crate::ir::value::InstRef;
+
+    fn inst_value(inst: u32) -> Value {
+        Value::Inst(InstRef { block: 0, inst })
     }
 
-    true
+    #[test]
+    fn byte_swap_workaround_inserts_or_and_replaces_add_with_identity() {
+        let mut program = Program::new(ShaderStage::VertexB);
+        program.blocks.push(Block::new());
+        program.post_order_blocks = vec![0];
+        let source = program
+            .block_mut(0)
+            .append_inst(Inst::new(Opcode::GetRegister, vec![Value::ImmU32(1)]));
+        let lhs_bfe = program.block_mut(0).append_inst(Inst::new(
+            Opcode::BitFieldUExtract,
+            vec![inst_value(source), Value::ImmU32(0), Value::ImmU32(16)],
+        ));
+        let lhs_shl = program.block_mut(0).append_inst(Inst::new(
+            Opcode::ShiftLeftLogical32,
+            vec![inst_value(lhs_bfe), Value::ImmU32(16)],
+        ));
+        let rhs_bfe = program.block_mut(0).append_inst(Inst::new(
+            Opcode::BitFieldUExtract,
+            vec![inst_value(source), Value::ImmU32(16), Value::ImmU32(16)],
+        ));
+        let add = program.block_mut(0).append_inst(Inst::new(
+            Opcode::IAdd32,
+            vec![inst_value(lhs_shl), inst_value(rhs_bfe)],
+        ));
+
+        vendor_workaround_pass(&mut program);
+
+        let identity = program.block(0).inst(add);
+        assert_eq!(identity.opcode, Opcode::Identity);
+        let Value::Inst(or_ref) = identity.args[0] else {
+            panic!("workaround identity must refer to the inserted OR");
+        };
+        let or = program.block(or_ref.block).inst(or_ref.inst);
+        assert_eq!(or.opcode, Opcode::BitwiseOr32);
+        assert_eq!(or.args, vec![inst_value(lhs_shl), inst_value(rhs_bfe)]);
+        assert_eq!(or.use_count, 1);
+    }
 }

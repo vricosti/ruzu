@@ -9,15 +9,18 @@
 
 use crate::dirty_flags::flags as Dirty;
 use crate::engines::maxwell_3d::{
-    ConstBufferBinding, DrawCall, RenderTargetInfo, RtControlInfo, ShaderStageType, CLEAR_SURFACE,
-    DRAW_BEGIN, DRAW_END, DRAW_INLINE_INDEX, DRAW_TEXTURE_SRC_Y0, IB_BASE, IB_OFF_COUNT,
-    IB_OFF_FIRST, INDEX_BUFFER16_FIRST, INDEX_BUFFER16_SUBSEQUENT, INDEX_BUFFER32_FIRST,
-    INDEX_BUFFER32_SUBSEQUENT, INDEX_BUFFER8_FIRST, INDEX_BUFFER8_SUBSEQUENT,
+    ConstBufferBinding, DrawCall, Maxwell3D, RenderTargetInfo, RtControlInfo, ShaderStageType,
+    CLEAR_SURFACE, DRAW_BEGIN, DRAW_END, DRAW_INLINE_INDEX, DRAW_TEXTURE_SRC_Y0, IB_BASE,
+    IB_OFF_COUNT, IB_OFF_FIRST, INDEX_BUFFER16_FIRST, INDEX_BUFFER16_SUBSEQUENT,
+    INDEX_BUFFER32_FIRST, INDEX_BUFFER32_SUBSEQUENT, INDEX_BUFFER8_FIRST, INDEX_BUFFER8_SUBSEQUENT,
     INLINE_INDEX_2X16_EVEN, INLINE_INDEX_4X8_INDEX0, MAX_CB_SLOTS, NUM_SHADER_PROGRAMS,
     NUM_SHADER_STAGES, TOPOLOGY_OVERRIDE, VB_COUNT, VB_FIRST, VERTEX_ARRAY_INSTANCE_FIRST,
     VERTEX_ARRAY_INSTANCE_SUBSEQUENT,
 };
 use crate::rasterizer_interface::RasterizerInterface;
+use std::marker::PhantomData;
+use std::ops::{Deref, DerefMut};
+use std::ptr::NonNull;
 
 /// GPU virtual address type.
 pub type GPUVAddr = u64;
@@ -220,12 +223,22 @@ pub trait Maxwell3DAccess {
     /// Set a dirty flag. Upstream: `maxwell3d->dirty.flags[index] = true`.
     fn set_dirty_flag(&mut self, index: u8);
 
-    /// Read dirty flags for draw-time rasterizer state synchronization,
-    /// matching upstream rasterizer reads of `maxwell3d->dirty.flags`.
-    fn dirty_flags(&self) -> [bool; 256];
+    /// Borrow dirty flags for draw-time rasterizer state synchronization,
+    /// matching upstream rasterizer references to `maxwell3d->dirty.flags`.
+    fn dirty_flags(&self) -> &[bool; 256];
+
+    /// Read one dirty flag without materializing the complete flag array.
+    fn dirty_flag(&self, index: u8) -> bool;
 
     /// Clear one dirty flag after the backend consumes it.
     fn clear_dirty_flag(&mut self, index: u8);
+
+    /// Mutate `regs.logic_op.enable`.
+    ///
+    /// Upstream's AMD workaround writes this register from
+    /// `RasterizerVulkan::UpdateDynamicStates`, so the draw-time view must
+    /// preserve that mutation on the live Maxwell3D owner.
+    fn set_logic_op_enabled(&mut self, _enabled: bool) {}
 
     /// Return the stable channel-owned dirty flag storage for backends that
     /// mirror upstream's persistent `Maxwell3D*` ownership.
@@ -355,6 +368,11 @@ pub trait Maxwell3DAccess {
         false
     }
 
+    /// Read `regs.clear_control.use_viewport_clip0`.
+    fn clear_control_use_viewport_clip0(&self) -> bool {
+        false
+    }
+
     /// Read render-target address.
     fn rt_address(&self, index: usize) -> u64;
 
@@ -424,6 +442,11 @@ pub trait Maxwell3DAccess {
         false
     }
 
+    /// Read `regs.iterated_blend.enable`.
+    fn iterated_blend_enabled(&self) -> bool {
+        false
+    }
+
     /// Read global blend state used when per-target blending is disabled.
     fn global_blend_info(&self, rt: usize) -> crate::engines::maxwell_3d::BlendInfo {
         self.effective_blend_info(rt)
@@ -477,6 +500,10 @@ pub trait Maxwell3DAccess {
         Default::default()
     }
 
+    fn line_stipple_info(&self) -> crate::engines::maxwell_3d::LineStippleInfo {
+        Default::default()
+    }
+
     /// Read depth-clamp enable state, matching upstream `SyncDepthClamp`.
     fn depth_clamp_enabled(&self) -> bool {
         true
@@ -503,6 +530,11 @@ pub trait Maxwell3DAccess {
     /// `FixedPipelineState::DynamicState::Refresh`.
     fn depth_bounds_enable(&self) -> bool {
         false
+    }
+
+    /// Read `regs.depth_bounds`, matching `UpdateDepthBounds`.
+    fn depth_bounds(&self) -> [f32; 2] {
+        [0.0, 1.0]
     }
 
     /// Read `regs.mandated_early_z`, matching upstream `FixedPipelineState::Refresh`.
@@ -671,6 +703,7 @@ pub struct Maxwell3DDrawRegisters {
     pub blend: [crate::engines::maxwell_3d::BlendInfo; 8],
     pub blend_per_target_enabled: bool,
     pub global_blend: crate::engines::maxwell_3d::BlendInfo,
+    pub iterated_blend_enabled: bool,
     pub blend_color: crate::engines::maxwell_3d::BlendColorInfo,
     pub depth_stencil: crate::engines::maxwell_3d::DepthStencilInfo,
     pub rasterizer: crate::engines::maxwell_3d::RasterizerInfo,
@@ -681,11 +714,13 @@ pub struct Maxwell3DDrawRegisters {
     pub anti_alias_alpha_control: crate::engines::maxwell_3d::AntiAliasAlphaControlInfo,
     pub point_state: crate::engines::maxwell_3d::PointStateInfo,
     pub line_state: crate::engines::maxwell_3d::LineStateInfo,
+    pub line_stipple: crate::engines::maxwell_3d::LineStippleInfo,
     pub depth_clamp_enabled: bool,
     pub conservative_raster_enable: bool,
     pub engine_state: crate::engines::maxwell_3d::EngineHint,
     pub provoking_vertex_last: bool,
     pub depth_bounds_enable: bool,
+    pub depth_bounds: [f32; 2],
     pub mandated_early_z: bool,
     pub alpha_test_enabled: bool,
     pub alpha_test_func: crate::engines::maxwell_3d::ComparisonOp,
@@ -729,6 +764,7 @@ impl Default for Maxwell3DDrawRegisters {
             blend: Default::default(),
             blend_per_target_enabled: false,
             global_blend: Default::default(),
+            iterated_blend_enabled: false,
             blend_color: Default::default(),
             depth_stencil: Default::default(),
             rasterizer: Default::default(),
@@ -739,11 +775,13 @@ impl Default for Maxwell3DDrawRegisters {
             anti_alias_alpha_control: Default::default(),
             point_state: Default::default(),
             line_state: Default::default(),
+            line_stipple: Default::default(),
             depth_clamp_enabled: true,
             conservative_raster_enable: false,
             engine_state: crate::engines::maxwell_3d::EngineHint::None,
             provoking_vertex_last: false,
             depth_bounds_enable: false,
+            depth_bounds: [0.0, 1.0],
             mandated_early_z: false,
             alpha_test_enabled: false,
             alpha_test_func: crate::engines::maxwell_3d::ComparisonOp::Always,
@@ -798,6 +836,7 @@ impl Maxwell3DDrawRegisters {
             blend: std::array::from_fn(|i| maxwell3d.effective_blend_info(i)),
             blend_per_target_enabled: maxwell3d.blend_per_target_enabled(),
             global_blend: maxwell3d.global_blend_info(0),
+            iterated_blend_enabled: maxwell3d.iterated_blend_enabled(),
             blend_color: maxwell3d.blend_color_info(),
             depth_stencil: maxwell3d.depth_stencil_info(),
             rasterizer: maxwell3d.rasterizer_info(),
@@ -808,11 +847,13 @@ impl Maxwell3DDrawRegisters {
             anti_alias_alpha_control: maxwell3d.anti_alias_alpha_control_info(),
             point_state: maxwell3d.point_state_info(),
             line_state: maxwell3d.line_state_info(),
+            line_stipple: maxwell3d.line_stipple_info(),
             depth_clamp_enabled: maxwell3d.depth_clamp_enabled(),
             conservative_raster_enable: maxwell3d.conservative_raster_enable(),
             engine_state: maxwell3d.engine_state(),
             provoking_vertex_last: maxwell3d.provoking_vertex_last(),
             depth_bounds_enable: maxwell3d.depth_bounds_enable(),
+            depth_bounds: maxwell3d.depth_bounds(),
             mandated_early_z: maxwell3d.mandated_early_z(),
             alpha_test_enabled: maxwell3d.alpha_test_enabled(),
             alpha_test_func: maxwell3d.alpha_test_func(),
@@ -847,25 +888,140 @@ impl Maxwell3DDrawRegisters {
             surface_clip: maxwell3d.surface_clip_info(),
             framebuffer_srgb: maxwell3d.framebuffer_srgb(),
             depth_mode: maxwell3d.depth_stencil_info().depth_mode,
-            dirty_flags: maxwell3d.dirty_flags(),
+            dirty_flags: *maxwell3d.dirty_flags(),
             color_masks: std::array::from_fn(|i| maxwell3d.color_mask_info(i)),
             color_mask_common: maxwell3d.color_mask_common(),
         }
     }
+
+    /// Rebuild the register snapshot used only by Reden's legacy offscreen
+    /// `render_draw_calls` entry point. Runtime Maxwell draws use
+    /// `Maxwell3DDrawView::live` and never execute this conversion.
+    pub fn from_draw_call(draw: &DrawCall) -> Self {
+        Self {
+            shader_program_addresses: std::array::from_fn(|index| {
+                draw.program_base_address
+                    .wrapping_add(draw.shader_stages[index].offset as u64)
+            }),
+            index_buffer_gpu_addr: draw.index_buffer_addr,
+            index_buffer_gpu_addr_end: draw.index_buffer_addr_end,
+            render_targets: draw.render_targets(),
+            cb_bindings: draw.cb_bindings,
+            vertex_streams: draw.vertex_streams,
+            vertex_stream_instances: draw.vertex_stream_instances,
+            vertex_stream_limits: draw.vertex_stream_limits,
+            vertex_attribs: draw.vertex_attribs,
+            scissors: draw.scissors,
+            blend: draw.blend,
+            blend_per_target_enabled: draw.blend_per_target_enabled,
+            global_blend: draw.global_blend,
+            iterated_blend_enabled: draw.iterated_blend_enabled,
+            blend_color: draw.blend_color,
+            depth_stencil: draw.depth_stencil.clone(),
+            rasterizer: draw.rasterizer.clone(),
+            rasterize_enable: draw.rasterize_enable,
+            primitive_restart: draw.primitive_restart,
+            logic_op: draw.logic_op,
+            frag_color_clamp_any_enabled: false,
+            anti_alias_alpha_control: draw.anti_alias_alpha_control,
+            point_state: crate::engines::maxwell_3d::PointStateInfo {
+                point_size: draw.point_size,
+                ..Default::default()
+            },
+            line_state: crate::engines::maxwell_3d::LineStateInfo {
+                line_anti_alias_enable: draw.line_anti_alias_enable,
+                line_width_smooth: draw.rasterizer.line_width_smooth,
+                line_width_aliased: draw.rasterizer.line_width_aliased,
+            },
+            line_stipple: draw.line_stipple,
+            depth_clamp_enabled: draw.depth_clamp_enabled,
+            conservative_raster_enable: draw.conservative_raster_enable,
+            engine_state: draw.engine_state,
+            provoking_vertex_last: draw.provoking_vertex_last,
+            depth_bounds_enable: draw.depth_bounds_enable,
+            depth_bounds: draw.depth_bounds,
+            mandated_early_z: draw.mandated_early_z,
+            alpha_test_enabled: draw.alpha_test_enabled,
+            alpha_test_func: draw.alpha_test_func,
+            alpha_test_ref: draw.alpha_test_ref,
+            tessellation_primitive: draw.tessellation_primitive,
+            tessellation_spacing: draw.tessellation_spacing,
+            tessellation_clockwise: draw.tessellation_clockwise,
+            patch_vertices: draw.patch_vertices,
+            transform_feedback_enabled: draw.transform_feedback_enabled,
+            transform_feedback_state: draw.transform_feedback_state,
+            shader_config_enabled: draw.shader_stages.map(|stage| stage.enabled),
+            descriptor_sync_regs: crate::texture_cache::texture_cache_base::DescriptorSyncRegs {
+                sampler_binding_via_header: matches!(
+                    draw.sampler_binding,
+                    crate::engines::maxwell_3d::SamplerBinding::ViaHeaderBinding
+                ),
+                tex_header_addr: draw.tex_header_pool_addr,
+                tex_header_limit: draw.tex_header_pool_limit,
+                tex_sampler_addr: draw.tex_sampler_pool_addr,
+                tex_sampler_limit: draw.tex_sampler_pool_limit,
+            },
+            zpass_pixel_count_enabled: false,
+            window_origin_lower_left: draw.window_origin_lower_left,
+            window_origin_flip_y: draw.window_origin_flip_y,
+            viewport0_scale_y: draw.viewport_transforms[0].scale_y,
+            viewport_transforms: draw.viewport_transforms,
+            viewport_scale_offset_enabled: draw.viewport_scale_offset_enabled,
+            surface_clip: draw.surface_clip,
+            framebuffer_srgb: false,
+            depth_mode: draw.depth_stencil.depth_mode,
+            dirty_flags: draw.dirty_flags,
+            color_masks: draw.color_masks,
+            color_mask_common: false,
+        }
+    }
+}
+
+struct Maxwell3DLiveRef<'a> {
+    pointer: NonNull<Maxwell3D>,
+    _lifetime: PhantomData<&'a mut Maxwell3D>,
+}
+
+impl<'a> Maxwell3DLiveRef<'a> {
+    fn new(maxwell3d: &'a mut Maxwell3D) -> Self {
+        Self {
+            pointer: NonNull::from(maxwell3d),
+            _lifetime: PhantomData,
+        }
+    }
+}
+
+impl Deref for Maxwell3DLiveRef<'_> {
+    type Target = Maxwell3D;
+
+    fn deref(&self) -> &Self::Target {
+        // SAFETY: `_lifetime` prevents the view from outliving the engine;
+        // rasterizer callbacks are serialized on the GPU thread and each
+        // dereference is scoped to one access, matching upstream's non-owning
+        // Maxwell3D*.
+        unsafe { self.pointer.as_ref() }
+    }
+}
+
+impl DerefMut for Maxwell3DLiveRef<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        // SAFETY: mutable register accesses are serialized with the cache and
+        // state-tracker accesses that retain their own stable raw pointers.
+        unsafe { self.pointer.as_mut() }
+    }
 }
 
 enum Maxwell3DDrawSource<'a> {
-    Live(&'a mut dyn Maxwell3DAccess),
+    Live(Maxwell3DLiveRef<'a>),
     Snapshot(Maxwell3DDrawRegisters),
 }
 
 /// Draw-time Maxwell3D view passed to rasterizers.
 ///
 /// Upstream rasterizers keep a `Maxwell3D*` and read register/dirty state
-/// through it while drawing. This wrapper keeps the backend entry point on a
-/// Maxwell view instead of a raw `DrawState`; the live path reads through
-/// `Maxwell3DAccess` so Maxwell register-derived values do not live in
-/// `DrawState`.
+/// through it while drawing. This wrapper carries the same concrete engine
+/// pointer for the live path, while snapshot mode remains available for tests
+/// and reduced rasterizer fixtures.
 pub struct Maxwell3DDrawView<'a> {
     draw_state: &'a DrawState,
     draw_indexed: bool,
@@ -884,12 +1040,12 @@ impl<'a> Maxwell3DDrawView<'a> {
     pub fn live(
         draw_state: &'a DrawState,
         draw_indexed: bool,
-        maxwell3d: &'a mut dyn Maxwell3DAccess,
+        maxwell3d: &'a mut Maxwell3D,
     ) -> Self {
         Self {
             draw_state,
             draw_indexed,
-            source: Maxwell3DDrawSource::Live(maxwell3d),
+            source: Maxwell3DDrawSource::Live(Maxwell3DLiveRef::new(maxwell3d)),
         }
     }
 
@@ -913,13 +1069,23 @@ impl<'a> Maxwell3DDrawView<'a> {
         self.draw_indexed
     }
 
+    /// Expose the concrete engine pointer carried by the production draw
+    /// path. OpenGL pipelines retain this through their upstream-equivalent
+    /// `SetEngine`; snapshot-only test views intentionally return `None`.
+    pub(crate) fn live_maxwell3d_ptr(&mut self) -> Option<NonNull<Maxwell3D>> {
+        match &mut self.source {
+            Maxwell3DDrawSource::Live(maxwell3d) => Some(maxwell3d.pointer),
+            Maxwell3DDrawSource::Snapshot(_) => None,
+        }
+    }
+
     pub fn draw_call_snapshot(&self, instance_count: u32) -> DrawCall {
         match &self.source {
             Maxwell3DDrawSource::Live(maxwell3d) => build_draw_call_snapshot(
                 self.draw_state,
                 self.draw_indexed,
                 instance_count,
-                *maxwell3d,
+                &**maxwell3d,
             ),
             Maxwell3DDrawSource::Snapshot(registers) => {
                 let mut shader_stages =
@@ -954,6 +1120,9 @@ impl<'a> Maxwell3DDrawView<'a> {
                     window_origin_flip_y: registers.window_origin_flip_y,
                     surface_clip: registers.surface_clip,
                     blend: registers.blend,
+                    blend_per_target_enabled: registers.blend_per_target_enabled,
+                    global_blend: registers.global_blend,
+                    iterated_blend_enabled: registers.iterated_blend_enabled,
                     blend_color: registers.blend_color,
                     depth_stencil: registers.depth_stencil.clone(),
                     rasterizer: registers.rasterizer.clone(),
@@ -965,6 +1134,7 @@ impl<'a> Maxwell3DDrawView<'a> {
                     engine_state: registers.engine_state,
                     provoking_vertex_last: registers.provoking_vertex_last,
                     depth_bounds_enable: registers.depth_bounds_enable,
+                    depth_bounds: registers.depth_bounds,
                     mandated_early_z: registers.mandated_early_z,
                     alpha_test_enabled: registers.alpha_test_enabled,
                     alpha_test_func: registers.alpha_test_func,
@@ -977,6 +1147,7 @@ impl<'a> Maxwell3DDrawView<'a> {
                     anti_alias_samples_mode: registers.render_targets.anti_alias_samples_mode,
                     anti_alias_alpha_control: registers.anti_alias_alpha_control,
                     line_anti_alias_enable: registers.line_state.line_anti_alias_enable,
+                    line_stipple: registers.line_stipple,
                     program_base_address: 0,
                     cb_bindings: registers.cb_bindings,
                     vertex_attribs: registers.vertex_attribs,
@@ -1009,7 +1180,7 @@ impl<'a> Maxwell3DDrawView<'a> {
     pub fn registers(&self) -> Maxwell3DDrawRegisters {
         match &self.source {
             Maxwell3DDrawSource::Live(maxwell3d) => {
-                Maxwell3DDrawRegisters::from_maxwell3d(*maxwell3d)
+                Maxwell3DDrawRegisters::from_maxwell3d(&**maxwell3d)
             }
             Maxwell3DDrawSource::Snapshot(registers) => registers.clone(),
         }
@@ -1055,12 +1226,108 @@ impl<'a> Maxwell3DDrawView<'a> {
         }
     }
 
+    pub fn render_target(&self, index: usize) -> RenderTargetInfo {
+        match &self.source {
+            Maxwell3DDrawSource::Live(maxwell3d) => maxwell3d.rt_info(index),
+            Maxwell3DDrawSource::Snapshot(registers) => {
+                registers.render_targets.render_targets[index]
+            }
+        }
+    }
+
+    pub fn zeta(&self) -> crate::engines::maxwell_3d::ZetaInfo {
+        match &self.source {
+            Maxwell3DDrawSource::Live(maxwell3d) => maxwell3d.zeta_info(),
+            Maxwell3DDrawSource::Snapshot(registers) => registers.render_targets.zeta,
+        }
+    }
+
+    pub fn anti_alias_samples_mode(&self) -> u32 {
+        match &self.source {
+            Maxwell3DDrawSource::Live(maxwell3d) => maxwell3d.anti_alias_samples_mode(),
+            Maxwell3DDrawSource::Snapshot(registers) => {
+                registers.render_targets.anti_alias_samples_mode
+            }
+        }
+    }
+
     pub fn cb_bindings(&self) -> [[ConstBufferBinding; MAX_CB_SLOTS]; NUM_SHADER_STAGES] {
         match &self.source {
             Maxwell3DDrawSource::Live(maxwell3d) => std::array::from_fn(|stage| {
                 std::array::from_fn(|slot| maxwell3d.const_buffer_binding(stage, slot))
             }),
             Maxwell3DDrawSource::Snapshot(registers) => registers.cb_bindings,
+        }
+    }
+
+    pub fn const_buffer_binding(&self, stage: usize, slot: usize) -> ConstBufferBinding {
+        match &self.source {
+            Maxwell3DDrawSource::Live(maxwell3d) => maxwell3d.const_buffer_binding(stage, slot),
+            Maxwell3DDrawSource::Snapshot(registers) => registers.cb_bindings[stage][slot],
+        }
+    }
+
+    pub fn vertex_stream(&self, index: usize) -> crate::engines::maxwell_3d::VertexStreamInfo {
+        match &self.source {
+            Maxwell3DDrawSource::Live(maxwell3d) => maxwell3d.vertex_stream_info(index as u32),
+            Maxwell3DDrawSource::Snapshot(registers) => registers.vertex_streams[index],
+        }
+    }
+
+    pub fn vertex_stream_instance(&self, index: usize) -> u32 {
+        match &self.source {
+            Maxwell3DDrawSource::Live(maxwell3d) => maxwell3d.vertex_stream_instance(index as u32),
+            Maxwell3DDrawSource::Snapshot(registers) => registers.vertex_stream_instances[index],
+        }
+    }
+
+    pub fn vertex_attrib(&self, index: usize) -> crate::engines::maxwell_3d::VertexAttribInfo {
+        match &self.source {
+            Maxwell3DDrawSource::Live(maxwell3d) => maxwell3d.vertex_attrib_info(index as u32),
+            Maxwell3DDrawSource::Snapshot(registers) => registers.vertex_attribs[index],
+        }
+    }
+
+    /// Raw `Maxwell3D::Regs::vertex_attrib_format[index]` word.
+    ///
+    /// The live path preserves Eden's direct bitfield reads. Snapshot mode
+    /// mechanically reconstructs the word for reduced test fixtures.
+    pub fn vertex_attrib_raw(&self, index: usize) -> u32 {
+        match &self.source {
+            Maxwell3DDrawSource::Live(maxwell3d) => maxwell3d.vertex_attrib_raw(index as u32),
+            Maxwell3DDrawSource::Snapshot(registers) => {
+                let attrib = registers.vertex_attribs[index];
+                attrib.buffer_index
+                    | (u32::from(attrib.constant) << 6)
+                    | ((attrib.offset & 0x3fff) << 7)
+                    | ((attrib.size.to_raw() & 0x3f) << 21)
+                    | ((attrib.attrib_type.to_raw() & 0x7) << 27)
+                    | (u32::from(attrib.bgra) << 31)
+            }
+        }
+    }
+
+    pub fn viewport_transform(
+        &self,
+        index: usize,
+    ) -> crate::engines::maxwell_3d::ViewportTransformInfo {
+        match &self.source {
+            Maxwell3DDrawSource::Live(maxwell3d) => maxwell3d.viewport_transform_info(index as u32),
+            Maxwell3DDrawSource::Snapshot(registers) => registers.viewport_transforms[index],
+        }
+    }
+
+    pub fn scissor(&self, index: usize) -> crate::engines::maxwell_3d::ScissorInfo {
+        match &self.source {
+            Maxwell3DDrawSource::Live(maxwell3d) => maxwell3d.scissor_info(index as u32),
+            Maxwell3DDrawSource::Snapshot(registers) => registers.scissors[index],
+        }
+    }
+
+    pub fn blend_at(&self, index: usize) -> crate::engines::maxwell_3d::BlendInfo {
+        match &self.source {
+            Maxwell3DDrawSource::Live(maxwell3d) => maxwell3d.effective_blend_info(index),
+            Maxwell3DDrawSource::Snapshot(registers) => registers.blend[index],
         }
     }
 
@@ -1131,6 +1398,13 @@ impl<'a> Maxwell3DDrawView<'a> {
         match &self.source {
             Maxwell3DDrawSource::Live(maxwell3d) => maxwell3d.global_blend_info(0),
             Maxwell3DDrawSource::Snapshot(registers) => registers.global_blend,
+        }
+    }
+
+    pub fn iterated_blend_enabled(&self) -> bool {
+        match &self.source {
+            Maxwell3DDrawSource::Live(maxwell3d) => maxwell3d.iterated_blend_enabled(),
+            Maxwell3DDrawSource::Snapshot(registers) => registers.iterated_blend_enabled,
         }
     }
 
@@ -1238,6 +1512,20 @@ impl<'a> Maxwell3DDrawView<'a> {
         match &self.source {
             Maxwell3DDrawSource::Live(maxwell3d) => maxwell3d.depth_bounds_enable(),
             Maxwell3DDrawSource::Snapshot(registers) => registers.depth_bounds_enable,
+        }
+    }
+
+    pub fn depth_bounds(&self) -> [f32; 2] {
+        match &self.source {
+            Maxwell3DDrawSource::Live(maxwell3d) => maxwell3d.depth_bounds(),
+            Maxwell3DDrawSource::Snapshot(registers) => registers.depth_bounds,
+        }
+    }
+
+    pub fn line_stipple(&self) -> crate::engines::maxwell_3d::LineStippleInfo {
+        match &self.source {
+            Maxwell3DDrawSource::Live(maxwell3d) => maxwell3d.line_stipple_info(),
+            Maxwell3DDrawSource::Snapshot(registers) => registers.line_stipple,
         }
     }
 
@@ -1409,10 +1697,17 @@ impl<'a> Maxwell3DDrawView<'a> {
         }
     }
 
-    pub fn dirty_flags(&self) -> [bool; 256] {
+    pub fn dirty_flags(&self) -> &[bool; 256] {
         match &self.source {
             Maxwell3DDrawSource::Live(maxwell3d) => maxwell3d.dirty_flags(),
-            Maxwell3DDrawSource::Snapshot(registers) => registers.dirty_flags,
+            Maxwell3DDrawSource::Snapshot(registers) => &registers.dirty_flags,
+        }
+    }
+
+    pub fn dirty_flag(&self, index: u8) -> bool {
+        match &self.source {
+            Maxwell3DDrawSource::Live(maxwell3d) => maxwell3d.dirty_flag(index),
+            Maxwell3DDrawSource::Snapshot(registers) => registers.dirty_flags[index as usize],
         }
     }
 
@@ -1437,6 +1732,18 @@ impl<'a> Maxwell3DDrawView<'a> {
         }
     }
 
+    /// Write `regs.logic_op.enable` on the live engine, matching the register
+    /// mutation performed by upstream's AMD workaround. Snapshot mode keeps
+    /// the same state transition for tests and legacy callers.
+    pub fn set_logic_op_enabled(&mut self, enabled: bool) {
+        match &mut self.source {
+            Maxwell3DDrawSource::Live(maxwell3d) => maxwell3d.set_logic_op_enabled(enabled),
+            Maxwell3DDrawSource::Snapshot(registers) => {
+                registers.logic_op.enabled = enabled;
+            }
+        }
+    }
+
     /// Mark a Maxwell dirty flag from a backend sync helper.
     ///
     /// Upstream `SyncPolygonModes` sets `PolygonModeFront/Back` dirty again
@@ -1457,6 +1764,13 @@ impl<'a> Maxwell3DDrawView<'a> {
                 std::array::from_fn(|i| maxwell3d.color_mask_info(i))
             }
             Maxwell3DDrawSource::Snapshot(registers) => registers.color_masks,
+        }
+    }
+
+    pub fn color_mask(&self, index: usize) -> crate::engines::maxwell_3d::ColorMaskInfo {
+        match &self.source {
+            Maxwell3DDrawSource::Live(maxwell3d) => maxwell3d.color_mask_info(index),
+            Maxwell3DDrawSource::Snapshot(registers) => registers.color_masks[index],
         }
     }
 
@@ -1523,6 +1837,9 @@ fn build_draw_call_snapshot(
         window_origin_flip_y: maxwell3d.window_origin_flip_y(),
         surface_clip: maxwell3d.surface_clip_info(),
         blend,
+        blend_per_target_enabled: maxwell3d.blend_per_target_enabled(),
+        global_blend: maxwell3d.global_blend_info(0),
+        iterated_blend_enabled: maxwell3d.iterated_blend_enabled(),
         blend_color: maxwell3d.blend_color_info(),
         depth_stencil: maxwell3d.depth_stencil_info(),
         rasterizer: maxwell3d.rasterizer_info(),
@@ -1534,6 +1851,7 @@ fn build_draw_call_snapshot(
         engine_state: maxwell3d.engine_state(),
         provoking_vertex_last: maxwell3d.provoking_vertex_last(),
         depth_bounds_enable: maxwell3d.depth_bounds_enable(),
+        depth_bounds: maxwell3d.depth_bounds(),
         mandated_early_z: maxwell3d.mandated_early_z(),
         alpha_test_enabled: maxwell3d.alpha_test_enabled(),
         alpha_test_func: maxwell3d.alpha_test_func(),
@@ -1546,6 +1864,7 @@ fn build_draw_call_snapshot(
         anti_alias_samples_mode: maxwell3d.anti_alias_samples_mode(),
         anti_alias_alpha_control: maxwell3d.anti_alias_alpha_control_info(),
         line_anti_alias_enable: maxwell3d.line_state_info().line_anti_alias_enable,
+        line_stipple: maxwell3d.line_stipple_info(),
         program_base_address: maxwell3d.program_base_address(),
         cb_bindings,
         vertex_attribs,
@@ -1565,12 +1884,12 @@ fn build_draw_call_snapshot(
         zeta: maxwell3d.zeta_info(),
         transform_feedback_enabled: maxwell3d.transform_feedback_enabled(),
         transform_feedback_state: maxwell3d.transform_feedback_state(),
-        dirty_flags: maxwell3d.dirty_flags(),
+        dirty_flags: *maxwell3d.dirty_flags(),
     }
 }
 
 enum Maxwell3DClearSource<'a> {
-    Live(&'a mut dyn Maxwell3DAccess),
+    Live(Maxwell3DLiveRef<'a>),
     Snapshot {
         clear_state: ClearState,
         render_targets: Maxwell3DRenderTargets,
@@ -1608,9 +1927,9 @@ impl<'a> Maxwell3DClearView<'a> {
         }
     }
 
-    pub fn live(maxwell3d: &'a mut dyn Maxwell3DAccess) -> Self {
+    pub fn live(maxwell3d: &'a mut Maxwell3D) -> Self {
         Self {
-            source: Maxwell3DClearSource::Live(maxwell3d),
+            source: Maxwell3DClearSource::Live(Maxwell3DLiveRef::new(maxwell3d)),
         }
     }
 
@@ -1639,10 +1958,10 @@ impl<'a> Maxwell3DClearView<'a> {
         }
     }
 
-    pub fn dirty_flags(&self) -> [bool; 256] {
+    pub fn dirty_flags(&self) -> &[bool; 256] {
         match &self.source {
             Maxwell3DClearSource::Live(maxwell3d) => maxwell3d.dirty_flags(),
-            Maxwell3DClearSource::Snapshot { dirty_flags, .. } => *dirty_flags,
+            Maxwell3DClearSource::Snapshot { dirty_flags, .. } => dirty_flags,
         }
     }
 
@@ -1671,10 +1990,101 @@ impl<'a> Maxwell3DClearView<'a> {
         }
     }
 
+    pub fn use_viewport_clip0(&self) -> bool {
+        match &self.source {
+            Maxwell3DClearSource::Live(maxwell3d) => maxwell3d.clear_control_use_viewport_clip0(),
+            Maxwell3DClearSource::Snapshot { .. } => false,
+        }
+    }
+
     pub fn scissor(&self, index: u32) -> crate::engines::maxwell_3d::ScissorInfo {
         match &self.source {
             Maxwell3DClearSource::Live(maxwell3d) => maxwell3d.scissor_info(index),
             Maxwell3DClearSource::Snapshot { .. } => Default::default(),
+        }
+    }
+
+    pub fn scissors(
+        &self,
+    ) -> [crate::engines::maxwell_3d::ScissorInfo; crate::engines::maxwell_3d::NUM_VIEWPORTS] {
+        match &self.source {
+            Maxwell3DClearSource::Live(maxwell3d) => {
+                std::array::from_fn(|index| maxwell3d.scissor_info(index as u32))
+            }
+            Maxwell3DClearSource::Snapshot { .. } => Default::default(),
+        }
+    }
+
+    /// Read whether `regs.window_origin.mode != UpperLeft` for clear-time
+    /// scissor conversion. Upstream `RasterizerVulkan::Clear` passes the live
+    /// Maxwell register file to `GetScissorState`.
+    pub fn window_origin_lower_left(&self) -> bool {
+        match &self.source {
+            Maxwell3DClearSource::Live(maxwell3d) => maxwell3d.window_origin_lower_left(),
+            Maxwell3DClearSource::Snapshot { .. } => false,
+        }
+    }
+
+    pub fn window_origin_flip_y(&self) -> bool {
+        match &self.source {
+            Maxwell3DClearSource::Live(maxwell3d) => maxwell3d.window_origin_flip_y(),
+            Maxwell3DClearSource::Snapshot { .. } => false,
+        }
+    }
+
+    pub fn viewport0_scale_y(&self) -> f32 {
+        match &self.source {
+            Maxwell3DClearSource::Live(maxwell3d) => maxwell3d.viewport_transform_scale_y(0),
+            Maxwell3DClearSource::Snapshot { .. } => 0.0,
+        }
+    }
+
+    pub fn viewport_transforms(
+        &self,
+    ) -> [crate::engines::maxwell_3d::ViewportTransformInfo;
+           crate::engines::maxwell_3d::NUM_VIEWPORTS] {
+        match &self.source {
+            Maxwell3DClearSource::Live(maxwell3d) => {
+                std::array::from_fn(|index| maxwell3d.viewport_transform_info(index as u32))
+            }
+            Maxwell3DClearSource::Snapshot { .. } => Default::default(),
+        }
+    }
+
+    pub fn viewport_scale_offset_enabled(&self) -> bool {
+        match &self.source {
+            Maxwell3DClearSource::Live(maxwell3d) => maxwell3d.viewport_scale_offset_enabled(),
+            Maxwell3DClearSource::Snapshot { .. } => false,
+        }
+    }
+
+    pub fn surface_clip(&self) -> crate::engines::maxwell_3d::SurfaceClipInfo {
+        match &self.source {
+            Maxwell3DClearSource::Live(maxwell3d) => maxwell3d.surface_clip_info(),
+            Maxwell3DClearSource::Snapshot { render_targets, .. } => render_targets.surface_clip,
+        }
+    }
+
+    pub fn rasterizer(&self) -> crate::engines::maxwell_3d::RasterizerInfo {
+        match &self.source {
+            Maxwell3DClearSource::Live(maxwell3d) => maxwell3d.rasterizer_info(),
+            Maxwell3DClearSource::Snapshot { .. } => Default::default(),
+        }
+    }
+
+    pub fn depth_mode(&self) -> crate::engines::maxwell_3d::DepthMode {
+        match &self.source {
+            Maxwell3DClearSource::Live(maxwell3d) => maxwell3d.depth_stencil_info().depth_mode,
+            Maxwell3DClearSource::Snapshot { .. } => {
+                crate::engines::maxwell_3d::DepthMode::ZeroToOne
+            }
+        }
+    }
+
+    pub fn zpass_pixel_count_enabled(&self) -> bool {
+        match &self.source {
+            Maxwell3DClearSource::Live(maxwell3d) => maxwell3d.zpass_pixel_count_enabled(),
+            Maxwell3DClearSource::Snapshot { .. } => false,
         }
     }
 
@@ -1688,6 +2098,20 @@ impl<'a> Maxwell3DClearView<'a> {
     pub fn framebuffer_srgb(&self) -> bool {
         match &self.source {
             Maxwell3DClearSource::Live(maxwell3d) => maxwell3d.framebuffer_srgb(),
+            Maxwell3DClearSource::Snapshot { .. } => false,
+        }
+    }
+
+    pub fn rasterize_enable(&self) -> bool {
+        match &self.source {
+            Maxwell3DClearSource::Live(maxwell3d) => maxwell3d.rasterize_enable(),
+            Maxwell3DClearSource::Snapshot { .. } => true,
+        }
+    }
+
+    pub fn frag_color_clamp_any_enabled(&self) -> bool {
+        match &self.source {
+            Maxwell3DClearSource::Live(maxwell3d) => maxwell3d.frag_color_clamp_any_enabled(),
             Maxwell3DClearSource::Snapshot { .. } => false,
         }
     }
@@ -1719,7 +2143,7 @@ impl<'a> Maxwell3DIndirectView<'a> {
     pub fn live(
         draw_state: &'a DrawState,
         indirect_params: &'a IndirectParams,
-        maxwell3d: &'a mut dyn Maxwell3DAccess,
+        maxwell3d: &'a mut Maxwell3D,
     ) -> Self {
         Self {
             draw_view: Maxwell3DDrawView::live(draw_state, indirect_params.is_indexed, maxwell3d),
@@ -1749,6 +2173,10 @@ impl<'a> Maxwell3DIndirectView<'a> {
 
     pub fn clear_dirty_flag(&mut self, index: u8) {
         self.draw_view.clear_dirty_flag(index);
+    }
+
+    pub fn set_logic_op_enabled(&mut self, enabled: bool) {
+        self.draw_view.set_logic_op_enabled(enabled);
     }
 
     pub fn draw_view_mut(&mut self) -> &mut Maxwell3DDrawView<'a> {
@@ -1824,7 +2252,7 @@ impl<'a> Maxwell3DDrawTextureView<'a> {
     pub fn live(
         draw_state: &'a DrawState,
         draw_texture_state: DrawTextureState,
-        maxwell3d: &'a mut dyn Maxwell3DAccess,
+        maxwell3d: &'a mut Maxwell3D,
     ) -> Self {
         Self {
             draw_texture_state,
@@ -1850,7 +2278,7 @@ impl<'a> Maxwell3DDrawTextureView<'a> {
         self.draw_view.descriptor_sync_regs()
     }
 
-    pub fn dirty_flags(&self) -> [bool; 256] {
+    pub fn dirty_flags(&self) -> &[bool; 256] {
         self.draw_view.dirty_flags()
     }
 
@@ -1864,6 +2292,10 @@ impl<'a> Maxwell3DDrawTextureView<'a> {
 
     pub fn clear_dirty_flag(&mut self, index: u8) {
         self.draw_view.clear_dirty_flag(index);
+    }
+
+    pub fn set_logic_op_enabled(&mut self, enabled: bool) {
+        self.draw_view.set_logic_op_enabled(enabled);
     }
 
     pub fn zpass_pixel_count_enabled(&self) -> bool {
@@ -2018,6 +2450,9 @@ impl DrawManager {
             window_origin_flip_y: maxwell3d.window_origin_flip_y(),
             surface_clip: maxwell3d.surface_clip_info(),
             blend,
+            blend_per_target_enabled: maxwell3d.blend_per_target_enabled(),
+            global_blend: maxwell3d.global_blend_info(0),
+            iterated_blend_enabled: maxwell3d.iterated_blend_enabled(),
             blend_color: maxwell3d.blend_color_info(),
             depth_stencil: maxwell3d.depth_stencil_info(),
             rasterizer: maxwell3d.rasterizer_info(),
@@ -2029,6 +2464,7 @@ impl DrawManager {
             engine_state: maxwell3d.engine_state(),
             provoking_vertex_last: maxwell3d.provoking_vertex_last(),
             depth_bounds_enable: maxwell3d.depth_bounds_enable(),
+            depth_bounds: maxwell3d.depth_bounds(),
             mandated_early_z: maxwell3d.mandated_early_z(),
             alpha_test_enabled: maxwell3d.alpha_test_enabled(),
             alpha_test_func: maxwell3d.alpha_test_func(),
@@ -2041,6 +2477,7 @@ impl DrawManager {
             anti_alias_samples_mode: maxwell3d.anti_alias_samples_mode(),
             anti_alias_alpha_control: maxwell3d.anti_alias_alpha_control_info(),
             line_anti_alias_enable: maxwell3d.line_state_info().line_anti_alias_enable,
+            line_stipple: maxwell3d.line_stipple_info(),
             program_base_address: maxwell3d.program_base_address(),
             cb_bindings,
             vertex_attribs,
@@ -2060,7 +2497,7 @@ impl DrawManager {
             zeta: maxwell3d.zeta_info(),
             transform_feedback_enabled: maxwell3d.transform_feedback_enabled(),
             transform_feedback_state: maxwell3d.transform_feedback_state(),
-            dirty_flags: maxwell3d.dirty_flags(),
+            dirty_flags: *maxwell3d.dirty_flags(),
         }
     }
 
@@ -2463,6 +2900,14 @@ mod tests {
     use super::*;
 
     #[test]
+    fn live_maxwell_view_uses_a_thin_concrete_engine_pointer() {
+        assert_eq!(
+            std::mem::size_of::<Maxwell3DLiveRef<'static>>(),
+            std::mem::size_of::<*mut Maxwell3D>()
+        );
+    }
+
+    #[test]
     fn test_index_buffer_small_from_raw() {
         // Topology = Triangles (0x4), count = 100, first = 0
         let raw = (0x4u32 << 28) | (100u32 << 16) | 0;
@@ -2528,6 +2973,8 @@ mod tests {
         assert!(view.window_origin_lower_left());
         assert!(view.window_origin_flip_y());
         assert_eq!(view.viewport0_scale_y(), -1.0);
+        fn assert_borrowed_dirty_flags(_: &[bool; 256]) {}
+        assert_borrowed_dirty_flags(view.dirty_flags());
         assert!(
             view.dirty_flags()[crate::renderer_opengl::gl_state_tracker::dirty::VIEWPORTS as usize]
         );

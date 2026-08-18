@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //
 // Rust counterpart of
-// `/home/vricosti/Dev/emulators/zuyu/src/yuzu/configuration/qt_config.cpp`
+// `/home/vricosti/Dev/emulators/eden/src/yuzu/configuration/qt_config.cpp`
 // (`Config::ReadUIValues` / `Config::SaveUIValues` and the Qt-owned control
 // values).
 //
@@ -55,21 +55,6 @@ pub fn load_global_values() {
     let path = config_path();
     let mut config = BaseConfig::new(ConfigType::GlobalConfig);
     config.initialize(&path);
-    config.read_values();
-
-    let contents = std::fs::read_to_string(path).unwrap_or_default();
-    let storage = parse_section_values(&contents, "Data%20Storage");
-    if storage
-        .get("tas_directory\\default")
-        .is_some_and(|value| !is_true(value))
-    {
-        if let Some(path) = storage.get("tas_directory") {
-            common::fs::path_util::set_ruzu_path(
-                RuzuPath::TASDir,
-                std::path::Path::new(unquote(path)),
-            );
-        }
-    }
 }
 
 /// Persist the generic global categories through upstream's
@@ -78,7 +63,11 @@ pub fn load_global_values() {
 pub fn save_global_values() -> io::Result<()> {
     let path = config_path();
     let mut config = BaseConfig::new(ConfigType::GlobalConfig);
-    config.initialize(&path);
+    // Upstream writes through the already-loaded, long-lived `QtConfig`
+    // object. Reden reconstructs this adapter for each save, so load only the
+    // INI document here: `initialize` would reload the old on-disk values into
+    // `Settings::values` and discard the dialog changes before saving them.
+    config.set_up_ini(&path);
     config.save_values();
     config.write_to_ini()
 }
@@ -210,6 +199,115 @@ pub fn load_view_values() {
     });
 }
 
+/// Read the three Direct Connect fields owned by upstream
+/// `QtConfig::ReadMultiplayerValues`.
+pub fn load_multiplayer_values() {
+    let contents = std::fs::read_to_string(config_path()).unwrap_or_default();
+    let values = parse_section_values(&contents, UI_SECTION);
+    uisettings::with_mut(|ui| {
+        ui.multiplayer_nickname.set_value(read_ui_string_setting(
+            &contents,
+            "Multiplayer\\nickname",
+            ui.multiplayer_nickname.get_default(),
+        ));
+        ui.multiplayer_filter_text.set_value(read_ui_string_setting(
+            &contents,
+            "Multiplayer\\filter_text",
+            ui.multiplayer_filter_text.get_default(),
+        ));
+        ui.multiplayer_filter_games_owned
+            .set_value(read_ui_bool_setting(
+                &values,
+                "Multiplayer\\filter_games_owned",
+                *ui.multiplayer_filter_games_owned.get_default(),
+            ));
+        ui.multiplayer_filter_hide_empty
+            .set_value(read_ui_bool_setting(
+                &values,
+                "Multiplayer\\filter_games_hide_empty",
+                *ui.multiplayer_filter_hide_empty.get_default(),
+            ));
+        ui.multiplayer_filter_hide_full
+            .set_value(read_ui_bool_setting(
+                &values,
+                "Multiplayer\\filter_games_hide_full",
+                *ui.multiplayer_filter_hide_full.get_default(),
+            ));
+        ui.multiplayer_ip.set_value(read_ui_string_setting(
+            &contents,
+            "Multiplayer\\ip",
+            ui.multiplayer_ip.get_default(),
+        ));
+        ui.multiplayer_port.set_value(read_ui_u32_setting(
+            &values,
+            "Multiplayer\\port",
+            *ui.multiplayer_port.get_default(),
+        ));
+    });
+}
+
+/// Persist the three Direct Connect fields through upstream
+/// `QtConfig::SaveMultiplayerValues`'s `Category::Multiplayer` writer.
+pub fn save_multiplayer_values() -> io::Result<()> {
+    let path = config_path();
+    let mut contents = std::fs::read_to_string(&path).unwrap_or_default();
+    uisettings::with(|ui| {
+        contents = replace_ui_string_setting(
+            &contents,
+            "Multiplayer\\nickname",
+            ui.multiplayer_nickname.get_value(),
+            ui.multiplayer_nickname.get_default(),
+        );
+        contents = replace_ui_string_setting(
+            &contents,
+            "Multiplayer\\filter_text",
+            ui.multiplayer_filter_text.get_value(),
+            ui.multiplayer_filter_text.get_default(),
+        );
+        for (key, setting) in [
+            (
+                "Multiplayer\\filter_games_owned",
+                &ui.multiplayer_filter_games_owned,
+            ),
+            (
+                "Multiplayer\\filter_games_hide_empty",
+                &ui.multiplayer_filter_hide_empty,
+            ),
+            (
+                "Multiplayer\\filter_games_hide_full",
+                &ui.multiplayer_filter_hide_full,
+            ),
+        ] {
+            let value = *setting.get_value();
+            contents = replace_section_setting(
+                &contents,
+                "UI",
+                key,
+                if value { "true" } else { "false" },
+                value == *setting.get_default(),
+            );
+        }
+        contents = replace_ui_string_setting(
+            &contents,
+            "Multiplayer\\ip",
+            ui.multiplayer_ip.get_value(),
+            ui.multiplayer_ip.get_default(),
+        );
+        let port = *ui.multiplayer_port.get_value();
+        contents = replace_section_setting(
+            &contents,
+            "UI",
+            "Multiplayer\\port",
+            &port.to_string(),
+            port == *ui.multiplayer_port.get_default(),
+        );
+    });
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, contents)
+}
+
 /// Persist the five checkable `View` actions through upstream
 /// `QtConfig::SaveUIValues`'s generic `Category::Ui` writer.
 pub fn save_view_values() -> io::Result<()> {
@@ -269,6 +367,23 @@ fn read_ui_bool_setting(
             .map(|value| is_true(value))
             .unwrap_or(default)
     }
+}
+
+fn read_ui_u32_setting(
+    values: &std::collections::BTreeMap<String, String>,
+    key: &str,
+    default: u32,
+) -> u32 {
+    if values
+        .get(&format!("{key}\\default"))
+        .is_none_or(|value| is_true(value))
+    {
+        return default;
+    }
+    values
+        .get(key)
+        .and_then(|value| value.parse::<u32>().ok())
+        .unwrap_or(default)
 }
 
 /// Persist the selected interface locale through upstream's
@@ -1468,6 +1583,71 @@ mod tests {
         assert!(updated.contains("[Controls]"));
         assert!(updated.contains("Paths\\gamedirs\\1\\path=/new"));
         assert!(!updated.contains("/old"));
+    }
+
+    #[test]
+    fn multiplayer_fields_round_trip_with_upstream_ui_keys() {
+        let mut contents = "[UI]\nUnrelated=value\n".to_string();
+        contents = replace_ui_string_setting(&contents, "Multiplayer\\nickname", "Player One", "");
+        contents =
+            replace_ui_string_setting(&contents, "Multiplayer\\filter_text", "preferred room", "");
+        contents = replace_section_setting(
+            &contents,
+            "UI",
+            "Multiplayer\\filter_games_owned",
+            "true",
+            false,
+        );
+        contents = replace_section_setting(
+            &contents,
+            "UI",
+            "Multiplayer\\filter_games_hide_empty",
+            "true",
+            false,
+        );
+        contents = replace_section_setting(
+            &contents,
+            "UI",
+            "Multiplayer\\filter_games_hide_full",
+            "false",
+            false,
+        );
+        contents = replace_ui_string_setting(&contents, "Multiplayer\\ip", "room.example.org", "");
+        contents = replace_section_setting(&contents, "UI", "Multiplayer\\port", "24873", false);
+
+        let values = parse_section_values(&contents, UI_SECTION);
+        assert_eq!(
+            read_ui_string_setting(&contents, "Multiplayer\\nickname", ""),
+            "Player One"
+        );
+        assert_eq!(
+            read_ui_string_setting(&contents, "Multiplayer\\ip", ""),
+            "room.example.org"
+        );
+        assert_eq!(
+            read_ui_string_setting(&contents, "Multiplayer\\filter_text", ""),
+            "preferred room"
+        );
+        assert!(read_ui_bool_setting(
+            &values,
+            "Multiplayer\\filter_games_owned",
+            false
+        ));
+        assert!(read_ui_bool_setting(
+            &values,
+            "Multiplayer\\filter_games_hide_empty",
+            false
+        ));
+        assert!(!read_ui_bool_setting(
+            &values,
+            "Multiplayer\\filter_games_hide_full",
+            true
+        ));
+        assert_eq!(
+            read_ui_u32_setting(&values, "Multiplayer\\port", 24872),
+            24873
+        );
+        assert!(contents.contains("Unrelated=value"));
     }
 
     #[test]

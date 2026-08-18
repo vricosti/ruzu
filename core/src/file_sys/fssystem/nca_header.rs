@@ -485,3 +485,5 @@ pub struct NcaMetaDataHashData {
     pub layer_info_offset: i64,
     pub integrity_meta_info: IntegrityMetaInfo,
 }
+
+const _: () = assert!(std::mem::size_of::<NcaMetaDataHashData>() == 0xE8);

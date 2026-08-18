@@ -10,10 +10,11 @@ use std::collections::BTreeMap;
 use crate::file_sys::vfs::vfs::VfsFile;
 use crate::file_sys::vfs::vfs_types::VirtualFile;
 use crate::hle::kernel::code_set::CodeSet;
+use common::common_funcs::make_magic;
 
 use super::loader::{
-    make_magic, AppLoader, FileType, FileTypeIdentifier, KProcess, LoadParameters, LoadResult,
-    Modules, ResultStatus, System, NACP,
+    AppLoader, FileType, FileTypeIdentifier, KProcess, LoadParameters, LoadResult, Modules,
+    ResultStatus, System, NACP,
 };
 
 // ============================================================================

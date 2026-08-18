@@ -12,14 +12,15 @@
 // cycling through the same sequence upstream does. The colours come from
 // upstream's own stylesheet — see [`css`] below.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use gtk::prelude::*;
+use gtk::{gio, glib};
 
 use common::settings;
 use common::settings_enums::{
-    AntiAliasing, ConsoleMode, GpuAccuracy, RendererBackend, ScalingFilter, ShaderBackend,
+    AntiAliasing, ConsoleMode, GpuAccuracy, RendererBackend, ScalingFilter,
 };
 use input_common::drivers::tas_input::{TasState, PLAYER_NUMBER};
 use ruzu_core::perf_stats::PerfStatsResults;
@@ -38,10 +39,18 @@ pub struct StatusBar {
     res_scale: gtk::Label,
     game_fps: gtk::Label,
     frame_time: gtk::Label,
-    /// Invoked after any button changes a setting, so the owner can react
-    /// (upstream calls `system->ApplySettings()` from the same handlers).
-    on_changed: RefCell<Option<Box<dyn Fn()>>>,
+    /// Invoked only by upstream `OnToggleGpuAccuracy`, whose left-click path
+    /// calls `system->ApplySettings()` after changing the setting. The context
+    /// menu deliberately does not invoke it because Eden's direct menu action
+    /// only updates the value and button text.
+    on_gpu_accuracy_changed: RefCell<Option<Box<dyn Fn()>>>,
+    /// Mirrors `MainWindow::emulation_running` for the renderer button. Eden
+    /// disables that complete button (left click and context menu) while a
+    /// title is active because the graphics API cannot be changed live.
+    emulation_running: Cell<bool>,
 }
+
+type StatusMenuAction = (String, Box<dyn Fn(&StatusBar) -> bool>);
 
 impl StatusBar {
     pub fn new() -> Rc<Self> {
@@ -102,7 +111,8 @@ impl StatusBar {
             res_scale,
             game_fps,
             frame_time,
-            on_changed: RefCell::new(None),
+            on_gpu_accuracy_changed: RefCell::new(None),
+            emulation_running: Cell::new(false),
         });
 
         bar.connect_actions();
@@ -110,9 +120,9 @@ impl StatusBar {
         bar
     }
 
-    /// Register a callback fired whenever a status button changes a setting.
-    pub fn connect_changed(&self, f: impl Fn() + 'static) {
-        *self.on_changed.borrow_mut() = Some(Box::new(f));
+    /// Register upstream `OnToggleGpuAccuracy`'s live-apply callback.
+    pub fn connect_gpu_accuracy_changed(&self, f: impl Fn() + 'static) {
+        *self.on_gpu_accuracy_changed.borrow_mut() = Some(Box::new(f));
     }
 
     /// The widget to place at the bottom of the window.
@@ -128,44 +138,230 @@ impl StatusBar {
                 $button.connect_clicked(move |_| {
                     log::debug!("status bar: {} clicked", stringify!($handler));
                     bar.$handler();
-                    bar.refresh();
-                    if let Some(f) = bar.on_changed.borrow().as_ref() {
-                        f();
-                    }
+                    bar.finish_setting_change();
                 });
             }};
         }
 
         on_click!(self.renderer, on_toggle_graphics_api);
-        on_click!(self.accuracy, on_toggle_gpu_accuracy);
         on_click!(self.dock, on_toggle_docked_mode);
         on_click!(self.filter, on_toggle_adapting_filter);
         on_click!(self.aa, on_toggle_anti_aliasing);
         on_click!(self.volume, on_toggle_mute);
+
+        {
+            let bar = Rc::clone(self);
+            self.accuracy.connect_clicked(move |_| {
+                log::debug!("status bar: on_toggle_gpu_accuracy clicked");
+                bar.on_toggle_gpu_accuracy();
+                bar.finish_setting_change();
+                if let Some(callback) = bar.on_gpu_accuracy_changed.borrow().as_ref() {
+                    callback();
+                }
+            });
+        }
+
+        self.install_context_menu(&self.renderer, StatusBar::renderer_context_actions);
+        self.install_context_menu(&self.accuracy, StatusBar::accuracy_context_actions);
+        self.install_context_menu(&self.dock, StatusBar::dock_context_actions);
+        self.install_context_menu(&self.filter, StatusBar::filter_context_actions);
+        self.install_context_menu(&self.aa, StatusBar::aa_context_actions);
+        self.install_context_menu(&self.volume, StatusBar::volume_context_actions);
     }
 
-    /// Upstream `GMainWindow::OnToggleGraphicsAPI`: Vulkan ⇄ OpenGL.
+    fn finish_setting_change(&self) {
+        self.refresh();
+    }
+
+    /// Keep the renderer selector locked exactly when Eden disables
+    /// `renderer_status_button` in `BootGame`/`OnEmulationStopped`.
+    pub fn set_emulation_running(&self, running: bool) {
+        self.emulation_running.set(running);
+        self.renderer.set_sensitive(!running);
+    }
+
+    /// GTK counterpart of `Qt::CustomContextMenu` on each status button.
+    fn install_context_menu(
+        self: &Rc<Self>,
+        button: &gtk::Button,
+        actions: fn(&StatusBar) -> Vec<StatusMenuAction>,
+    ) {
+        let gesture = gtk::GestureClick::new();
+        gesture.set_button(gtk::gdk::BUTTON_SECONDARY);
+        let bar = Rc::downgrade(self);
+        let anchor = button.downgrade();
+        gesture.connect_pressed(move |gesture, _, x, y| {
+            let (Some(bar), Some(anchor)) = (bar.upgrade(), anchor.upgrade()) else {
+                return;
+            };
+            bar.show_context_menu(anchor.upcast_ref(), x, y, actions(&bar));
+            gesture.set_state(gtk::EventSequenceState::Claimed);
+        });
+        button.add_controller(gesture);
+    }
+
+    fn show_context_menu(
+        self: &Rc<Self>,
+        anchor: &gtk::Widget,
+        x: f64,
+        y: f64,
+        actions: Vec<StatusMenuAction>,
+    ) {
+        let menu = gio::Menu::new();
+        let action_group = gio::SimpleActionGroup::new();
+        for (index, (label, callback)) in actions.into_iter().enumerate() {
+            let name = format!("choice-{index}");
+            let action = gio::SimpleAction::new(&name, None);
+            let bar = Rc::downgrade(self);
+            action.connect_activate(move |_, _| {
+                let Some(bar) = bar.upgrade() else { return };
+                if callback(&bar) {
+                    bar.finish_setting_change();
+                }
+            });
+            action_group.add_action(&action);
+            menu.append(
+                Some(&crate::i18n::tr(&label)),
+                Some(&format!("status.{name}")),
+            );
+        }
+
+        let popover = gtk::PopoverMenu::from_model(Option::<&gio::Menu>::None);
+        popover.add_css_class("ruzu-context-menu");
+        popover.set_has_arrow(false);
+        // Eden's QMenu automatically flips above the status-bar button when
+        // opening below would place it under the window/screen edge. GTK's
+        // default Popover placement prefers the bottom, so select the matching
+        // status-bar direction explicitly.
+        popover.set_position(gtk::PositionType::Top);
+        popover.insert_action_group("status", Some(&action_group));
+        popover.set_parent(anchor);
+        popover.set_pointing_to(Some(&gtk::gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
+        popover.set_menu_model(Some(&menu));
+        popover.connect_closed(|popover| {
+            let popover = popover.clone();
+            glib::idle_add_local_once(move || popover.unparent());
+        });
+        popover.popup();
+    }
+
+    fn renderer_context_actions(&self) -> Vec<StatusMenuAction> {
+        renderer_context_choices(self.emulation_running.get())
+            .into_iter()
+            .map(|(backend, label)| {
+                (
+                    label.to_string(),
+                    Box::new(move |_: &StatusBar| {
+                        settings::values_mut().renderer_backend.set_value(backend);
+                        true
+                    }) as Box<dyn Fn(&StatusBar) -> bool>,
+                )
+            })
+            .collect()
+    }
+
+    fn accuracy_context_actions(&self) -> Vec<StatusMenuAction> {
+        crate::configuration::shared_translation::STATUS_GPU_ACCURACY
+            .iter()
+            .map(|(accuracy, label)| {
+                let accuracy = *accuracy;
+                (
+                    (*label).to_string(),
+                    Box::new(move |_: &StatusBar| {
+                        settings::values_mut().gpu_accuracy.set_value(accuracy);
+                        true
+                    }) as Box<dyn Fn(&StatusBar) -> bool>,
+                )
+            })
+            .collect()
+    }
+
+    fn dock_context_actions(&self) -> Vec<StatusMenuAction> {
+        crate::configuration::shared_translation::STATUS_CONSOLE_MODE
+            .iter()
+            .map(|(mode, label)| {
+                let mode = *mode;
+                (
+                    (*label).to_string(),
+                    Box::new(move |bar: &StatusBar| {
+                        if *settings::values().use_docked_mode.get_value() == mode {
+                            return false;
+                        }
+                        bar.on_toggle_docked_mode();
+                        true
+                    }) as Box<dyn Fn(&StatusBar) -> bool>,
+                )
+            })
+            .collect()
+    }
+
+    fn filter_context_actions(&self) -> Vec<StatusMenuAction> {
+        crate::configuration::shared_translation::STATUS_SCALING_FILTER
+            .iter()
+            .map(|(filter, label)| {
+                let filter = *filter;
+                (
+                    (*label).to_string(),
+                    Box::new(move |_: &StatusBar| {
+                        settings::values_mut().scaling_filter.set_value(filter);
+                        true
+                    }) as Box<dyn Fn(&StatusBar) -> bool>,
+                )
+            })
+            .collect()
+    }
+
+    fn aa_context_actions(&self) -> Vec<StatusMenuAction> {
+        crate::configuration::shared_translation::STATUS_ANTI_ALIASING
+            .iter()
+            .map(|(anti_aliasing, label)| {
+                let anti_aliasing = *anti_aliasing;
+                (
+                    (*label).to_string(),
+                    Box::new(move |_: &StatusBar| {
+                        settings::values_mut()
+                            .anti_aliasing
+                            .set_value(anti_aliasing);
+                        true
+                    }) as Box<dyn Fn(&StatusBar) -> bool>,
+                )
+            })
+            .collect()
+    }
+
+    fn volume_context_actions(&self) -> Vec<StatusMenuAction> {
+        let muted = *settings::values().audio_muted.get_value();
+        vec![
+            (
+                if muted { "Unmute" } else { "Mute" }.to_string(),
+                Box::new(|bar: &StatusBar| {
+                    bar.on_toggle_mute();
+                    true
+                }),
+            ),
+            (
+                "Reset Volume".to_string(),
+                Box::new(|_: &StatusBar| {
+                    settings::values_mut().volume.set_value(100);
+                    true
+                }),
+            ),
+        ]
+    }
+
+    /// Upstream `GMainWindow::OnToggleGraphicsAPI`.
     fn on_toggle_graphics_api(&self) {
         let mut values = settings::values_mut();
-        let api = if *values.renderer_backend.get_value() != RendererBackend::Vulkan {
-            RendererBackend::Vulkan
-        } else {
-            // Upstream falls back to `Null` where OpenGL is not compiled in;
-            // ruzu always builds both backends.
-            RendererBackend::OpenGL
-        };
+        let api = next_graphics_api(*values.renderer_backend.get_value());
         values.renderer_backend.set_value(api);
     }
 
-    /// Upstream `GMainWindow::OnToggleGpuAccuracy`: High ⇄ Normal.
-    ///
-    /// Note this is *not* a cycle through every value — upstream deliberately
-    /// bounces between High and Normal, and treats Extreme as "go to High".
+    /// Upstream `GMainWindow::OnToggleGpuAccuracy`: High ⇄ Low.
     fn on_toggle_gpu_accuracy(&self) {
         let mut values = settings::values_mut();
         let accuracy = match *values.gpu_accuracy.get_value() {
-            GpuAccuracy::High => GpuAccuracy::Normal,
-            GpuAccuracy::Normal | GpuAccuracy::Extreme => GpuAccuracy::High,
+            GpuAccuracy::High => GpuAccuracy::Low,
+            GpuAccuracy::Low => GpuAccuracy::High,
         };
         values.gpu_accuracy.set_value(accuracy);
     }
@@ -185,12 +381,12 @@ impl StatusBar {
     }
 
     /// Upstream `GMainWindow::OnToggleAdaptingFilter`: advance one step,
-    /// wrapping past `MaxEnum` back to `NearestNeighbor`.
+    /// wrapping past `EnumMetadata<ScalingFilter>::GetLast()`.
     fn on_toggle_adapting_filter(&self) {
         let mut values = settings::values_mut();
         let next = next_wrapping(
             *values.scaling_filter.get_value() as u32,
-            ScalingFilter::MaxEnum as u32,
+            ScalingFilter::SgsrEdge as u32,
         );
         if let Some(filter) = ScalingFilter::from_u32(next) {
             values.scaling_filter.set_value(filter);
@@ -198,12 +394,12 @@ impl StatusBar {
     }
 
     /// Upstream's `aa_status_button` click handler: advance one step, wrapping
-    /// past `MaxEnum` back to `None`.
+    /// past `EnumMetadata<AntiAliasing>::GetLast()`.
     fn on_toggle_anti_aliasing(&self) {
         let mut values = settings::values_mut();
         let next = next_wrapping(
             *values.anti_aliasing.get_value() as u32,
-            AntiAliasing::MaxEnum as u32,
+            AntiAliasing::Smaa as u32,
         );
         if let Some(aa) = AntiAliasing::from_u32(next) {
             values.anti_aliasing.set_value(aa);
@@ -225,17 +421,12 @@ impl StatusBar {
     pub fn refresh(&self) {
         let values = settings::values();
 
-        // `UpdateAPIText`: OpenGL additionally shows the shader backend.
+        // `UpdateAPIText`: the fused backend value names the OpenGL shader API.
         let backend = *values.renderer_backend.get_value();
         let renderer = match backend {
-            RendererBackend::OpenGL => {
-                let shader = match *values.shader_backend.get_value() {
-                    ShaderBackend::Glsl => "GLSL",
-                    ShaderBackend::Glasm => "GLASM",
-                    ShaderBackend::SpirV => "SPIRV",
-                };
-                format!("OPENGL {shader}")
-            }
+            RendererBackend::OpenGlGlsl => "OPENGL GLSL".to_string(),
+            RendererBackend::OpenGlGlasm => "OPENGL GLASM".to_string(),
+            RendererBackend::OpenGlSpirV => "OPENGL SPIRV".to_string(),
             RendererBackend::Vulkan => "VULKAN".to_string(),
             RendererBackend::Null => "NULL".to_string(),
         };
@@ -246,12 +437,13 @@ impl StatusBar {
 
         // `UpdateGPUAccuracyButton`.
         let accuracy = *values.gpu_accuracy.get_value();
-        self.accuracy.set_label(match accuracy {
-            GpuAccuracy::Normal => "NORMAL",
-            GpuAccuracy::High => "HIGH",
-            GpuAccuracy::Extreme => "EXTREME",
-        });
-        set_checked(&self.accuracy, accuracy != GpuAccuracy::Normal);
+        let accuracy_label = crate::configuration::shared_translation::GPU_ACCURACY
+            .iter()
+            .find_map(|(value, label)| (*value == accuracy).then_some(*label))
+            .unwrap_or("Unknown")
+            .to_uppercase();
+        self.accuracy.set_label(&accuracy_label);
+        set_checked(&self.accuracy, accuracy == GpuAccuracy::High);
 
         // `UpdateDockedButton`.
         let console_mode = *values.use_docked_mode.get_value();
@@ -261,16 +453,26 @@ impl StatusBar {
         });
         set_checked(&self.dock, console_mode == ConsoleMode::Docked);
 
-        // `UpdateFilterText`: FSR gets a short label of its own.
+        // `UpdateFilterText` uses the short status-bar map from
+        // `qt_common/config/shared_translation.h`, not the longer settings-row
+        // descriptions used by the configuration dialog.
         self.filter
             .set_label(match *values.scaling_filter.get_value() {
                 ScalingFilter::NearestNeighbor => "NEAREST",
                 ScalingFilter::Bilinear => "BILINEAR",
                 ScalingFilter::Bicubic => "BICUBIC",
+                ScalingFilter::ZeroTangent => "ZERO-TANGENT",
+                ScalingFilter::BSpline => "B-SPLINE",
+                ScalingFilter::Mitchell => "MITCHELL",
+                ScalingFilter::Spline1 => "SPLINE-1",
                 ScalingFilter::Gaussian => "GAUSSIAN",
+                ScalingFilter::Lanczos => "LANCZOS",
                 ScalingFilter::ScaleForce => "SCALEFORCE",
                 ScalingFilter::Fsr => "FSR",
-                ScalingFilter::MaxEnum => "BILINEAR",
+                ScalingFilter::Area => "AREA",
+                ScalingFilter::Mmpx => "MMPX",
+                ScalingFilter::Sgsr => "SGSR",
+                ScalingFilter::SgsrEdge => "SGSR EDGEDIR",
             });
         // Upstream keeps the filter button permanently checked.
         set_checked(&self.filter, true);
@@ -280,7 +482,6 @@ impl StatusBar {
             AntiAliasing::None => "NO AA",
             AntiAliasing::Fxaa => "FXAA",
             AntiAliasing::Smaa => "SMAA",
-            AntiAliasing::MaxEnum => "NO AA",
         });
         set_checked(&self.aa, true);
 
@@ -357,6 +558,28 @@ impl StatusBar {
     }
 }
 
+fn renderer_context_choices(running: bool) -> Vec<(RendererBackend, &'static str)> {
+    if running {
+        return Vec::new();
+    }
+    crate::configuration::shared_translation::STATUS_RENDERER_BACKEND
+        .iter()
+        .copied()
+        .filter(|(backend, _)| *backend != RendererBackend::Null)
+        .collect()
+}
+
+/// The exact switch in upstream `GMainWindow::OnToggleGraphicsAPI`.
+fn next_graphics_api(api: RendererBackend) -> RendererBackend {
+    match api {
+        RendererBackend::Vulkan => RendererBackend::OpenGlGlsl,
+        RendererBackend::OpenGlGlsl => RendererBackend::OpenGlGlsl,
+        RendererBackend::OpenGlSpirV => RendererBackend::OpenGlGlasm,
+        RendererBackend::OpenGlGlasm => RendererBackend::Null,
+        RendererBackend::Null => RendererBackend::Vulkan,
+    }
+}
+
 fn create_tas_frames_string(frames: [usize; PLAYER_NUMBER]) -> String {
     let Some(last_player) = frames.iter().rposition(|frames| *frames != 0) else {
         return String::new();
@@ -429,13 +652,13 @@ fn format_frame_time(frametime_seconds: f64) -> String {
     )
 }
 
-/// Next enum discriminant, wrapping back to 0 once `max` is reached.
+/// Next enum discriminant, wrapping back to 0 after `last`.
 ///
 /// Mirrors upstream's `static_cast<Enum>(static_cast<u32>(value) + 1)` followed
-/// by a `== MaxEnum` reset, used by both the filter and AA buttons.
-fn next_wrapping(current: u32, max: u32) -> u32 {
+/// by a comparison with `EnumMetadata<Enum>::GetLast()`.
+fn next_wrapping(current: u32, last: u32) -> u32 {
     let next = current + 1;
-    if next >= max {
+    if next > last {
         0
     } else {
         next
@@ -545,47 +768,69 @@ mod tests {
     use super::*;
 
     #[test]
-    fn filter_cycle_wraps_past_the_last_real_value() {
-        // ScalingFilter: NearestNeighbor..Fsr, then MaxEnum is the sentinel.
-        let fsr = ScalingFilter::Fsr as u32;
-        let max = ScalingFilter::MaxEnum as u32;
-        assert_eq!(next_wrapping(fsr, max), 0);
+    fn graphics_api_toggle_matches_upstream_switch() {
         assert_eq!(
-            ScalingFilter::from_u32(next_wrapping(fsr, max)),
+            next_graphics_api(RendererBackend::Vulkan),
+            RendererBackend::OpenGlGlsl
+        );
+        assert_eq!(
+            next_graphics_api(RendererBackend::OpenGlGlsl),
+            RendererBackend::OpenGlGlsl
+        );
+        assert_eq!(
+            next_graphics_api(RendererBackend::OpenGlSpirV),
+            RendererBackend::OpenGlGlasm
+        );
+        assert_eq!(
+            next_graphics_api(RendererBackend::OpenGlGlasm),
+            RendererBackend::Null
+        );
+        assert_eq!(
+            next_graphics_api(RendererBackend::Null),
+            RendererBackend::Vulkan
+        );
+    }
+
+    #[test]
+    fn renderer_context_menu_matches_upstream_runtime_lock() {
+        assert_eq!(
+            renderer_context_choices(false),
+            vec![
+                (RendererBackend::OpenGlGlsl, "OpenGL GLSL"),
+                (RendererBackend::Vulkan, "Vulkan"),
+                (RendererBackend::OpenGlGlasm, "OpenGL GLASM"),
+                (RendererBackend::OpenGlSpirV, "OpenGL SPIRV"),
+            ]
+        );
+        assert!(renderer_context_choices(true).is_empty());
+    }
+
+    #[test]
+    fn filter_cycle_wraps_past_the_last_real_value() {
+        let last = ScalingFilter::SgsrEdge as u32;
+        assert_eq!(next_wrapping(last, last), 0);
+        assert_eq!(
+            ScalingFilter::from_u32(next_wrapping(last, last)),
             Some(ScalingFilter::NearestNeighbor)
         );
     }
 
     #[test]
     fn filter_cycle_advances_one_step() {
-        let max = ScalingFilter::MaxEnum as u32;
+        let last = ScalingFilter::SgsrEdge as u32;
         assert_eq!(
-            ScalingFilter::from_u32(next_wrapping(ScalingFilter::NearestNeighbor as u32, max)),
+            ScalingFilter::from_u32(next_wrapping(ScalingFilter::NearestNeighbor as u32, last)),
             Some(ScalingFilter::Bilinear)
         );
     }
 
     #[test]
     fn anti_aliasing_cycle_wraps_to_none() {
-        let max = AntiAliasing::MaxEnum as u32;
+        let last = AntiAliasing::Smaa as u32;
         assert_eq!(
-            AntiAliasing::from_u32(next_wrapping(AntiAliasing::Smaa as u32, max)),
+            AntiAliasing::from_u32(next_wrapping(AntiAliasing::Smaa as u32, last)),
             Some(AntiAliasing::None)
         );
-    }
-
-    #[test]
-    fn cycles_never_land_on_the_sentinel() {
-        // Selecting MaxEnum would render "BILINEAR"/"NO AA" while storing an
-        // invalid value, so the wrap must skip it from every starting point.
-        let max = ScalingFilter::MaxEnum as u32;
-        for start in 0..max {
-            assert_ne!(next_wrapping(start, max), max);
-        }
-        let max = AntiAliasing::MaxEnum as u32;
-        for start in 0..max {
-            assert_ne!(next_wrapping(start, max), max);
-        }
     }
 
     #[test]

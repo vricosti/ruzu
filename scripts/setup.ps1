@@ -6,8 +6,8 @@ Installs and verifies the native Windows dependencies required to build Ruzu.
 
 .DESCRIPTION
 The script uses the native x64 MSVC toolchain. Rust is installed exclusively
-through rustup. GTK4, SDL2, FFmpeg, OpenSSL, Vulkan, glslang, and pkgconf are
-built and managed by vcpkg.
+through rustup. GTK4, FFmpeg, OpenSSL, Vulkan, glslang, and pkgconf are built
+and managed by vcpkg. Cargo builds SDL3 statically from source.
 #>
 
 [CmdletBinding()]
@@ -19,7 +19,7 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 $ProgressPreference = "SilentlyContinue"
 
-$RustMinimum = [version]"1.75.0"
+$RustMinimum = [version]"1.85.0"
 $RustToolchain = "stable-x86_64-pc-windows-msvc"
 $VcpkgTriplet = "x64-windows-ruzu"
 $ScriptDirectory = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -31,7 +31,6 @@ $RequestedVcpkgRoot = $env:VCPKG_ROOT
 
 $VcpkgPackages = @(
     "gtk:$VcpkgTriplet"
-    "sdl2:$VcpkgTriplet"
     "ffmpeg[avcodec]:$VcpkgTriplet"
     "openssl:$VcpkgTriplet"
     "vulkan:$VcpkgTriplet"
@@ -395,7 +394,7 @@ function Get-MissingVcpkgPackages {
         throw "Unable to query installed vcpkg packages."
     }
 
-    $requiredNames = @("gtk", "sdl2", "ffmpeg", "openssl", "vulkan", "glslang", "pkgconf")
+    $requiredNames = @("gtk", "ffmpeg", "openssl", "vulkan", "glslang", "pkgconf")
     return @($requiredNames | Where-Object {
         $pattern = "^$([regex]::Escape($_)):$([regex]::Escape($VcpkgTriplet))\s"
         -not ($installed -match $pattern)
@@ -581,7 +580,6 @@ function Configure-NativeEnvironment {
 function Verify-NativeDependencies {
     $checks = @(
         [pscustomobject]@{ Package = "gtk4"; Minimum = "4.6" }
-        [pscustomobject]@{ Package = "sdl2"; Minimum = $null }
         [pscustomobject]@{ Package = "libavcodec"; Minimum = $null }
         [pscustomobject]@{ Package = "libavutil"; Minimum = $null }
         [pscustomobject]@{ Package = "openssl"; Minimum = $null }
@@ -603,8 +601,7 @@ function Verify-NativeDependencies {
     }
 
     $gtkVersion = & $env:PKG_CONFIG --modversion gtk4
-    $sdlVersion = & $env:PKG_CONFIG --modversion sdl2
-    Write-Host "[OK] GTK $gtkVersion and SDL2 $sdlVersion are available through vcpkg."
+    Write-Host "[OK] GTK $gtkVersion is available through vcpkg; Cargo builds SDL3 from source."
 
     foreach ($command in @("cl.exe", "cmake.exe", "ninja.exe", "glslangValidator.exe")) {
         if (-not (Get-Command $command -ErrorAction SilentlyContinue)) {

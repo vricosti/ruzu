@@ -8,7 +8,8 @@
 // a preallocated buffer that can be used by callers for I/O operations.
 // The buffer ownership is tied to the storage lifetime.
 
-use crate::file_sys::vfs::vfs_types::VirtualFile;
+use crate::file_sys::vfs::vfs::VfsFile;
+use crate::file_sys::vfs::vfs_types::{VirtualDir, VirtualFile};
 
 /// A storage that wraps a VirtualFile and holds a preallocated buffer.
 ///
@@ -32,11 +33,14 @@ impl MemoryResourceBufferHoldStorage {
         }
     }
 
-    /// Check if the buffer was successfully allocated (non-empty).
+    /// Check if the buffer was successfully allocated.
+    ///
+    /// `Vec` allocation failure aborts before construction, while a zero-byte
+    /// allocation is valid just like C++ `operator new(0)`.
     ///
     /// Corresponds to upstream `MemoryResourceBufferHoldStorage::IsValid`.
     pub fn is_valid(&self) -> bool {
-        !self.buffer.is_empty()
+        true
     }
 
     /// Get a read-only reference to the held buffer.
@@ -65,6 +69,44 @@ impl MemoryResourceBufferHoldStorage {
     }
 }
 
+impl VfsFile for MemoryResourceBufferHoldStorage {
+    fn get_name(&self) -> String {
+        self.storage.get_name()
+    }
+
+    fn get_size(&self) -> usize {
+        self.storage.get_size()
+    }
+
+    fn resize(&self, new_size: usize) -> bool {
+        self.storage.resize(new_size)
+    }
+
+    fn get_containing_directory(&self) -> Option<VirtualDir> {
+        self.storage.get_containing_directory()
+    }
+
+    fn is_writable(&self) -> bool {
+        self.storage.is_writable()
+    }
+
+    fn is_readable(&self) -> bool {
+        self.storage.is_readable()
+    }
+
+    fn read(&self, data: &mut [u8], length: usize, offset: usize) -> usize {
+        self.storage.read(data, length, offset)
+    }
+
+    fn write(&self, data: &[u8], length: usize, offset: usize) -> usize {
+        self.storage.write(data, length, offset)
+    }
+
+    fn rename(&self, new_name: &str) -> bool {
+        self.storage.rename(new_name)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -82,7 +124,7 @@ mod tests {
 
         let storage_zero =
             MemoryResourceBufferHoldStorage::new(make_test_storage(vec![0u8; 10]), 0);
-        assert!(!storage_zero.is_valid());
+        assert!(storage_zero.is_valid());
     }
 
     #[test]

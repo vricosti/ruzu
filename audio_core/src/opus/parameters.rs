@@ -71,3 +71,9 @@ pub struct OpusPacketHeader {
     pub size: u32,
     pub final_range: u32,
 }
+
+const _: () = assert!(std::mem::size_of::<OpusParameters>() == 0x8);
+const _: () = assert!(std::mem::size_of::<OpusParametersEx>() == 0x10);
+const _: () = assert!(std::mem::size_of::<OpusMultiStreamParameters>() == 0x110);
+const _: () = assert!(std::mem::size_of::<OpusMultiStreamParametersEx>() == 0x118);
+const _: () = assert!(std::mem::size_of::<OpusPacketHeader>() == 0x8);

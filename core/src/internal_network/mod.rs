@@ -4,6 +4,7 @@
 //! Internal network modules.
 //! Port of zuyu/src/core/internal_network/
 
+pub mod emu_net_state;
 pub mod network;
 pub mod network_interface;
 pub mod socket_proxy;

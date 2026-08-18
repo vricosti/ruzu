@@ -56,16 +56,7 @@ impl TurboResources {
             physical_device,
             vk::SurfaceKHR::null(),
         )?;
-        let memory_properties =
-            unsafe { instance.get_physical_device_memory_properties(physical_device) };
-        let physical_properties =
-            unsafe { instance.get_physical_device_properties(physical_device) };
-        let allocator = MemoryAllocator::new(
-            device.get_logical().clone(),
-            memory_properties,
-            physical_properties.limits.buffer_image_granularity,
-            false,
-        );
+        let allocator = MemoryAllocator::new(&device);
         let mut resources = Self {
             allocator,
             device,

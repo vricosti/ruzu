@@ -14,7 +14,7 @@
 //
 // The `CAMetalLayer` is what the Vulkan/MoltenVK renderer creates its
 // `VkSurfaceKHR` from (via `VK_EXT_metal_surface`), exactly as `ruzu_cmd`'s
-// `emu_window_sdl2_vk.rs` does.
+// `emu_window_sdl3_vk.rs` does.
 
 #![cfg(target_os = "macos")]
 

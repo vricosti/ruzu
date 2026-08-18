@@ -42,6 +42,15 @@ unsafe impl Sync for VideoGpuMemoryManagerHandle {}
 
 static NEXT_MEMORY_MANAGER_ID: AtomicUsize = AtomicUsize::new(1);
 
+fn gpu_clock_multiplier(clock: common::settings_enums::GpuClock) -> u64 {
+    use common::settings_enums::GpuClock;
+    match clock {
+        GpuClock::Boost => 256,
+        GpuClock::Overclock => 512,
+        GpuClock::Normal => 1,
+    }
+}
+
 /// Device address type.
 pub type DAddr = u64;
 
@@ -245,12 +254,20 @@ impl Gpu {
             if let Some(host1x) = self.system_ref().get().host1x_core() {
                 if std::env::var_os("RUZU_DISABLE_HOST1X_INVALIDATE_BIND").is_none() {
                     host1x.bind_device_memory_invalidator(Box::new(move |addr, size| unsafe {
-                        rasterizer.as_mut().invalidate_region(addr, size as u64);
+                        rasterizer.as_mut().invalidate_region(
+                            addr,
+                            size as u64,
+                            crate::cache_types::CacheType::ALL,
+                        );
                     }));
                 }
                 if std::env::var_os("RUZU_DISABLE_HOST1X_FLUSH_BIND").is_none() {
                     host1x.bind_device_memory_flusher(Box::new(move |addr, size| unsafe {
-                        rasterizer.as_mut().flush_region(addr, size as u64);
+                        rasterizer.as_mut().flush_region(
+                            addr,
+                            size as u64,
+                            crate::cache_types::CacheType::ALL,
+                        );
                     }));
                 }
                 if let Some(host1x) = host1x
@@ -477,6 +494,17 @@ impl Gpu {
         self.renderer.lock().unwrap()
     }
 
+    /// Refresh settings shared by all renderer backends.
+    ///
+    /// Upstream owner/call chain:
+    /// `Core::System::ApplySettings()` -> `GPU::Renderer()` ->
+    /// `RendererBase::RefreshBaseSettings()`.
+    pub fn refresh_renderer_settings(&self) {
+        if let Some(renderer) = self.renderer.lock().unwrap().as_mut() {
+            renderer.refresh_base_settings();
+        }
+    }
+
     /// Port of `GPU::ShaderNotify()`.
     pub fn shader_notify(&self) -> &ShaderNotify {
         &self.shader_notify
@@ -547,7 +575,11 @@ impl Gpu {
         self.request_sync_operation(Box::new(move || {
             let gpu = unsafe { &*(gpu_addr as *const Gpu) };
             if let Some(rasterizer) = gpu.rasterizer_handle() {
-                unsafe { rasterizer.as_mut() }.flush_region(addr, size as u64);
+                unsafe { rasterizer.as_mut() }.flush_region(
+                    addr,
+                    size as u64,
+                    crate::cache_types::CacheType::ALL,
+                );
             }
         }))
     }
@@ -597,12 +629,8 @@ impl Gpu {
             return 0;
         }
 
-        let mut gpu_tick = system.get().core_timing().get_gpu_ticks();
-        if *settings::values().use_fast_gpu_time.get_value() {
-            gpu_tick /= 256;
-        }
-
-        gpu_tick
+        let gpu_tick = system.get().core_timing().get_gpu_ticks();
+        gpu_tick / gpu_clock_multiplier(*settings::values().gpu_clock.get_value())
     }
 
     /// Returns whether async GPU mode is enabled.
@@ -699,8 +727,11 @@ impl Gpu {
         let fence = self.request_sync_operation(Box::new(move || {
             let gpu = unsafe { &*(gpu_addr as *const Gpu) };
             if let Some(rasterizer) = gpu.rasterizer_handle() {
-                unsafe { rasterizer.as_mut() }
-                    .flush_region(start_address, end_address - start_address);
+                unsafe { rasterizer.as_mut() }.flush_region(
+                    start_address,
+                    end_address - start_address,
+                    crate::cache_types::CacheType::ALL,
+                );
             }
         }));
         self.gpu_thread.lock().unwrap().tick_gpu();
@@ -988,6 +1019,14 @@ impl GpuCoreInterface for Gpu {
         self
     }
 
+    fn get_device_vendor(&self) -> String {
+        self.renderer
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map_or_else(String::new, |renderer| renderer.get_device_vendor())
+    }
+
     fn allocate_channel_handle(&self) -> Arc<dyn GpuChannelHandle> {
         let channel_id = self.allocate_channel();
         let channel_state = self.create_channel(channel_id);
@@ -1133,11 +1172,18 @@ mod tests {
     use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 
     struct FakeRasterizer {
+        accelerate_dma: crate::rasterizer_interface::TestAccelerateDMA,
         initialized_channels: Arc<StdMutex<Vec<i32>>>,
         bound_channels: Arc<StdMutex<Vec<i32>>>,
     }
 
     impl RasterizerInterface for FakeRasterizer {
+        fn access_accelerate_dma(
+            &mut self,
+        ) -> &mut dyn crate::engines::maxwell_dma::AccelerateDMAInterface {
+            &mut self.accelerate_dma
+        }
+
         fn draw(
             &mut self,
             _draw_view: crate::engines::draw_manager::Maxwell3DDrawView<'_>,
@@ -1155,7 +1201,7 @@ mod tests {
             _layer_count: u32,
         ) {
         }
-        fn dispatch_compute(&mut self) {}
+        fn dispatch_compute(&mut self, _dispatch: &crate::engines::kepler_compute::DispatchCall) {}
         fn reset_counter(&mut self, _query_type: u32) {}
         fn query(
             &mut self,
@@ -1181,8 +1227,13 @@ mod tests {
         fn signal_reference(&mut self) {}
         fn release_fences(&mut self, _force: bool) {}
         fn flush_all(&mut self) {}
-        fn flush_region(&mut self, _addr: u64, _size: u64) {}
-        fn must_flush_region(&self, _addr: u64, _size: u64) -> bool {
+        fn flush_region(&mut self, _addr: u64, _size: u64, _which: crate::cache_types::CacheType) {}
+        fn must_flush_region(
+            &self,
+            _addr: u64,
+            _size: u64,
+            _which: crate::cache_types::CacheType,
+        ) -> bool {
             false
         }
         fn get_flush_area(&self, addr: u64, _size: u64) -> RasterizerDownloadArea {
@@ -1192,7 +1243,13 @@ mod tests {
                 preemptive: true,
             }
         }
-        fn invalidate_region(&mut self, _addr: u64, _size: u64) {}
+        fn invalidate_region(
+            &mut self,
+            _addr: u64,
+            _size: u64,
+            _which: crate::cache_types::CacheType,
+        ) {
+        }
         fn on_cache_invalidation(&mut self, _addr: u64, _size: u64) {}
         fn on_cpu_write(&mut self, _addr: u64, _size: u64) -> bool {
             false
@@ -1200,7 +1257,13 @@ mod tests {
         fn invalidate_gpu_cache(&mut self) {}
         fn unmap_memory(&mut self, _addr: u64, _size: u64) {}
         fn modify_gpu_memory(&mut self, _as_id: usize, _addr: u64, _size: u64) {}
-        fn flush_and_invalidate_region(&mut self, _addr: u64, _size: u64) {}
+        fn flush_and_invalidate_region(
+            &mut self,
+            _addr: u64,
+            _size: u64,
+            _which: crate::cache_types::CacheType,
+        ) {
+        }
         fn wait_for_idle(&mut self) {}
         fn fragment_barrier(&mut self) {}
         fn tiled_cache_barrier(&mut self) {}
@@ -1264,6 +1327,7 @@ mod tests {
         let initialized_channels = Arc::new(StdMutex::new(Vec::new()));
         let bound_channels = Arc::new(StdMutex::new(Vec::new()));
         let rasterizer = Box::new(FakeRasterizer {
+            accelerate_dma: Default::default(),
             initialized_channels: initialized_channels.clone(),
             bound_channels: bound_channels.clone(),
         });
@@ -1301,6 +1365,7 @@ mod tests {
 
         let bound_channels = Arc::new(StdMutex::new(Vec::new()));
         let rasterizer = Box::new(FakeRasterizer {
+            accelerate_dma: Default::default(),
             initialized_channels: Arc::new(StdMutex::new(Vec::new())),
             bound_channels: bound_channels.clone(),
         });
@@ -1343,6 +1408,7 @@ mod tests {
         let initialized_channels = Arc::new(StdMutex::new(Vec::new()));
         let bound_channels = Arc::new(StdMutex::new(Vec::new()));
         let rasterizer = Box::new(FakeRasterizer {
+            accelerate_dma: Default::default(),
             initialized_channels: initialized_channels.clone(),
             bound_channels: bound_channels.clone(),
         });
@@ -1378,7 +1444,7 @@ mod tests {
     }
 
     #[test]
-    fn get_ticks_uses_core_timing_and_fast_gpu_time_setting() {
+    fn get_ticks_uses_core_timing_and_gpu_clock_setting() {
         static SETTINGS_LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
         let _guard = SETTINGS_LOCK
             .get_or_init(|| StdMutex::new(()))
@@ -1392,20 +1458,29 @@ mod tests {
         let gpu = Gpu::new(false, false);
         gpu.set_system_ref(ruzu_core::core::SystemRef::from_ref(&system));
 
-        let previous_fast_gpu_time = {
+        let previous_gpu_clock = {
             let values = settings::values();
-            *values.use_fast_gpu_time.get_value()
+            *values.gpu_clock.get_value()
         };
 
-        settings::values_mut().use_fast_gpu_time.set_value(false);
+        settings::values_mut()
+            .gpu_clock
+            .set_value(common::settings_enums::GpuClock::Normal);
         assert_eq!(gpu.get_ticks(), base_gpu_ticks);
 
-        settings::values_mut().use_fast_gpu_time.set_value(true);
+        settings::values_mut()
+            .gpu_clock
+            .set_value(common::settings_enums::GpuClock::Boost);
         assert_eq!(gpu.get_ticks(), base_gpu_ticks / 256);
 
         settings::values_mut()
-            .use_fast_gpu_time
-            .set_value(previous_fast_gpu_time);
+            .gpu_clock
+            .set_value(common::settings_enums::GpuClock::Overclock);
+        assert_eq!(gpu.get_ticks(), base_gpu_ticks / 512);
+
+        settings::values_mut()
+            .gpu_clock
+            .set_value(previous_gpu_clock);
     }
 
     #[test]

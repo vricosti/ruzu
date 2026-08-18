@@ -227,7 +227,6 @@ impl System {
     }
 
     pub fn release_buffers(&self) {
-        self.session.tick();
         let current_time = self
             .system
             .get()

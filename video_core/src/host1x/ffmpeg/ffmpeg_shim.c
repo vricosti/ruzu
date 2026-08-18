@@ -16,11 +16,7 @@
 typedef struct RuzuFfmpegDecoder {
     const AVCodec* decoder;
     AVCodecContext* context;
-    AVFrame* temp_frame;
-    int decode_order;
-    int got_frame;
     int last_error;
-    int h264_software_packet_decode;
 } RuzuFfmpegDecoder;
 
 typedef struct RuzuFfmpegHardwareContext {
@@ -221,35 +217,15 @@ void ruzu_ffmpeg_decoder_destroy(RuzuFfmpegDecoder* decoder) {
     if (decoder == NULL) {
         return;
     }
-    av_frame_free(&decoder->temp_frame);
     avcodec_free_context(&decoder->context);
     free(decoder);
 }
 
-int ruzu_ffmpeg_decoder_send_packet(RuzuFfmpegDecoder* decoder, const uint8_t* data, uintptr_t size) {
+int ruzu_ffmpeg_decoder_send_packet(RuzuFfmpegDecoder* decoder, const uint8_t* data,
+                                    uintptr_t size, int64_t pts, int64_t dts) {
     if (decoder == NULL || decoder->context == NULL) {
         return -1;
     }
-
-    av_frame_free(&decoder->temp_frame);
-    decoder->temp_frame = av_frame_alloc();
-    decoder->got_frame = 0;
-    if (decoder->temp_frame == NULL) {
-        decoder->last_error = AVERROR(ENOMEM);
-        return decoder->last_error;
-    }
-
-#ifndef ANDROID
-    if (decoder->context->hw_device_ctx == NULL && decoder->context->codec_id == AV_CODEC_ID_H264) {
-        decoder->decode_order = 1;
-        const int ret = avcodec_send_frame(decoder->context, decoder->temp_frame);
-        if (ret != AVERROR(EINVAL)) {
-            decoder->last_error = ret;
-            return ret;
-        }
-        decoder->h264_software_packet_decode = 1;
-    }
-#endif
 
     AVPacket* packet = av_packet_alloc();
     if (packet == NULL) {
@@ -258,6 +234,8 @@ int ruzu_ffmpeg_decoder_send_packet(RuzuFfmpegDecoder* decoder, const uint8_t* d
     }
     packet->data = (uint8_t*)data;
     packet->size = (int)size;
+    packet->pts = pts;
+    packet->dts = dts;
 
     const int ret = avcodec_send_packet(decoder->context, packet);
     decoder->last_error = ret;
@@ -270,6 +248,10 @@ int ruzu_ffmpeg_decoder_last_error(const RuzuFfmpegDecoder* decoder) {
         return -1;
     }
     return decoder->last_error;
+}
+
+int ruzu_ffmpeg_error_is_eof_or_again(int error) {
+    return error == AVERROR_EOF || error == AVERROR(EAGAIN);
 }
 
 void ruzu_ffmpeg_error_string(int errnum, char* out, uintptr_t out_size) {
@@ -303,36 +285,6 @@ AVFrame* ruzu_ffmpeg_decoder_receive_frame_with_hw_transfer(RuzuFfmpegDecoder* d
     if (decoder == NULL || decoder->context == NULL) {
         return NULL;
     }
-
-#ifndef ANDROID
-    if (decoder->context->hw_device_ctx == NULL && decoder->context->codec_id == AV_CODEC_ID_H264 &&
-        !decoder->h264_software_packet_decode) {
-        decoder->decode_order = 1;
-        int ret = 0;
-
-        if (decoder->got_frame == 0) {
-            AVPacket* packet = av_packet_alloc();
-            if (packet == NULL) {
-                decoder->last_error = AVERROR(ENOMEM);
-                return NULL;
-            }
-            packet->data = NULL;
-            packet->size = 0;
-            ret = avcodec_receive_packet(decoder->context, packet);
-            av_packet_free(&packet);
-            decoder->context->has_b_frames = 0;
-        }
-
-        decoder->last_error = ret;
-        if (decoder->got_frame == 0 || ret < 0) {
-            return NULL;
-        }
-
-        AVFrame* output = decoder->temp_frame;
-        decoder->temp_frame = NULL;
-        return output;
-    }
-#endif
 
     if (decoder->context->hw_device_ctx == NULL) {
         return ruzu_ffmpeg_decoder_receive_frame(decoder);

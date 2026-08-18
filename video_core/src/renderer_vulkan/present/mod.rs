@@ -13,6 +13,7 @@ pub mod fsr;
 pub mod fxaa;
 pub mod layer;
 pub mod present_push_constants;
+pub mod sgsr;
 pub mod smaa;
 pub mod util;
 pub mod window_adapt_pass;

@@ -11,8 +11,9 @@ use crate::file_sys::content_archive::{NCAContentType, NCA};
 use crate::file_sys::nca_metadata::{ContentRecordType, TitleType};
 use crate::file_sys::partition_filesystem::ResultStatus as FsResultStatus;
 use crate::file_sys::patch_manager::PatchManager;
-use crate::file_sys::registered_cache::get_update_title_id;
+use crate::file_sys::registered_cache::{get_update_title_id, ContentProvider};
 use crate::file_sys::vfs::vfs_types::VirtualFile;
+use crate::hle::service::filesystem::filesystem::FileSystemController;
 
 use super::loader::{
     AppLoader, FileType, FileTypeIdentifier, KProcess, LoadResult, Modules, ResultStatus, System,
@@ -32,9 +33,6 @@ pub struct AppLoaderXci {
     is_loaded: bool,
     xci: XCI,
     nca_loader: AppLoaderNca,
-    // Upstream stores icon_file and nacp_file from control NCA via PatchManager.
-    // PatchManager::ParseControlNCA is not yet fully wired up with
-    // FileSystemController and ContentProvider references.
     icon_file: Option<VirtualFile>,
     nacp_file: Option<crate::file_sys::control_metadata::NACP>,
 }
@@ -44,20 +42,13 @@ impl FileTypeIdentifier for AppLoaderXci {
     ///
     /// Maps to upstream `AppLoader_XCI::IdentifyType`.
     ///
-    /// Upstream constructs `FileSys::XCI(xci_file)`, checks status == Success,
-    /// verifies a Program NCA exists, and that AppLoader_NCA::IdentifyType
-    /// returns FileType::NCA for the program NCA file.
+    /// Upstream accepts a valid container with a secure partition; whether it
+    /// contains a bootable Program NCA is checked by the loader path.
     fn identify_type(xci_file: &VirtualFile) -> FileType {
         let xci = XCI::new(xci_file.clone(), 0, 0);
 
-        if xci.get_status() == FsResultStatus::Success
-            && xci.get_nca_by_type(NCAContentType::Program).is_some()
-        {
-            if let Some(program_nca_file) = xci.get_nca_file_by_type(NCAContentType::Program) {
-                if AppLoaderNca::identify_type(&program_nca_file) == FileType::NCA {
-                    return FileType::XCI;
-                }
-            }
+        if xci.get_status() == FsResultStatus::Success && xci.get_secure_partition_nsp().is_some() {
+            return FileType::XCI;
         }
 
         FileType::Error
@@ -71,9 +62,13 @@ impl AppLoaderXci {
     ///
     /// Upstream constructs FileSys::XCI, extracts the program NCA to create
     /// AppLoader_NCA, and parses the control NCA via PatchManager for NACP/icon.
-    /// PatchManager::ParseControlNCA requires FileSystemController and
-    /// ContentProvider which are not yet fully wired into the loader path.
-    pub fn new(file: VirtualFile, program_id: u64, program_index: usize) -> Self {
+    pub fn new(
+        file: VirtualFile,
+        filesystem_controller: &FileSystemController,
+        content_provider: &dyn ContentProvider,
+        program_id: u64,
+        program_index: usize,
+    ) -> Self {
         let xci = XCI::new(file.clone(), program_id, program_index);
 
         // Upstream: nca_loader = make_unique<AppLoader_NCA>(xci->GetProgramNCAFile())
@@ -95,7 +90,11 @@ impl AppLoaderXci {
             let control_nca = xci.get_nca_by_type(NCAContentType::Control);
             if let Some(ref control) = control_nca {
                 if control.get_status() == FsResultStatus::Success {
-                    let pm = PatchManager::new_without_deps(xci.get_program_title_id());
+                    let pm = PatchManager::new(
+                        xci.get_program_title_id(),
+                        filesystem_controller,
+                        content_provider,
+                    );
                     let (parsed_nacp, parsed_icon) = pm.parse_control_nca(control);
                     nacp_file = parsed_nacp;
                     icon_file = parsed_icon;

@@ -12,8 +12,10 @@ use std::sync::Arc;
 
 use log::trace;
 
+use crate::cache_types::CacheType;
 use crate::control::channel_state::ChannelState;
 use crate::control::channel_state_cache::{ChannelInfo, ChannelSetupCaches};
+use crate::engines::maxwell_dma::{dma, AccelerateDMAInterface};
 use crate::host1x::syncpoint_manager::SyncpointManager;
 use crate::query_cache::types::QueryPropertiesFlags;
 use crate::rasterizer_interface::{RasterizerDownloadArea, RasterizerInterface};
@@ -54,6 +56,34 @@ impl AccelerateDMA {
 impl Default for AccelerateDMA {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl AccelerateDMAInterface for AccelerateDMA {
+    fn buffer_copy(&mut self, start_address: u64, end_address: u64, amount: u64) -> bool {
+        AccelerateDMA::buffer_copy(self, start_address, end_address, amount)
+    }
+
+    fn buffer_clear(&mut self, src_address: u64, amount: u64, value: u32) -> bool {
+        AccelerateDMA::buffer_clear(self, src_address, amount, value)
+    }
+
+    fn image_to_buffer(
+        &mut self,
+        _copy_info: &dma::ImageCopy,
+        _src: &dma::ImageOperand,
+        _dst: &dma::BufferOperand,
+    ) -> bool {
+        false
+    }
+
+    fn buffer_to_image(
+        &mut self,
+        _copy_info: &dma::ImageCopy,
+        _src: &dma::BufferOperand,
+        _dst: &dma::ImageOperand,
+    ) -> bool {
+        false
     }
 }
 
@@ -99,8 +129,8 @@ impl RasterizerNull {
     }
 
     /// Access the DMA accelerator.
-    pub fn access_accelerate_dma(&self) -> &AccelerateDMA {
-        &self.accelerate_dma
+    pub fn access_accelerate_dma(&mut self) -> &mut AccelerateDMA {
+        &mut self.accelerate_dma
     }
 
     pub fn set_guest_memory_writer(&mut self, writer: crate::renderer_base::GuestMemoryWriter) {
@@ -143,7 +173,7 @@ impl RasterizerInterface for RasterizerNull {
         trace!("RasterizerNull::clear (no-op)");
     }
 
-    fn dispatch_compute(&mut self) {
+    fn dispatch_compute(&mut self, _dispatch: &crate::engines::kepler_compute::DispatchCall) {
         trace!("RasterizerNull::dispatch_compute (no-op)");
     }
 
@@ -250,9 +280,9 @@ impl RasterizerInterface for RasterizerNull {
 
     fn flush_all(&mut self) {}
 
-    fn flush_region(&mut self, _addr: u64, _size: u64) {}
+    fn flush_region(&mut self, _addr: u64, _size: u64, _which: CacheType) {}
 
-    fn must_flush_region(&self, _addr: u64, _size: u64) -> bool {
+    fn must_flush_region(&self, _addr: u64, _size: u64, _which: CacheType) -> bool {
         false
     }
 
@@ -266,7 +296,7 @@ impl RasterizerInterface for RasterizerNull {
         }
     }
 
-    fn invalidate_region(&mut self, _addr: u64, _size: u64) {}
+    fn invalidate_region(&mut self, _addr: u64, _size: u64, _which: CacheType) {}
 
     fn on_cache_invalidation(&mut self, _addr: u64, _size: u64) {}
 
@@ -280,7 +310,7 @@ impl RasterizerInterface for RasterizerNull {
 
     fn modify_gpu_memory(&mut self, _as_id: usize, _addr: u64, _size: u64) {}
 
-    fn flush_and_invalidate_region(&mut self, _addr: u64, _size: u64) {}
+    fn flush_and_invalidate_region(&mut self, _addr: u64, _size: u64, _which: CacheType) {}
 
     // ── Barriers / misc (no-ops) ────────────────────────────────────────
 
@@ -308,18 +338,8 @@ impl RasterizerInterface for RasterizerNull {
 
     fn accelerate_inline_to_memory(&mut self, _address: u64, _copy_size: usize, _memory: &[u8]) {}
 
-    fn accelerate_dma_buffer_copy(
-        &mut self,
-        src_address: u64,
-        dest_address: u64,
-        amount: u64,
-    ) -> bool {
-        self.accelerate_dma
-            .buffer_copy(src_address, dest_address, amount)
-    }
-
-    fn accelerate_dma_buffer_clear(&mut self, dst_address: u64, amount: u64, value: u32) -> bool {
-        self.accelerate_dma.buffer_clear(dst_address, amount, value)
+    fn access_accelerate_dma(&mut self) -> &mut dyn AccelerateDMAInterface {
+        &mut self.accelerate_dma
     }
 
     // ── Channel management ──────────────────────────────────────────────
@@ -366,11 +386,11 @@ mod tests {
             ),
             1,
         );
-        rast.dispatch_compute();
+        rast.dispatch_compute(&crate::engines::kepler_compute::DispatchCall::default());
         rast.flush_all();
         rast.wait_for_idle();
         rast.tick_frame();
-        assert!(!rast.must_flush_region(0, 0));
+        assert!(!rast.must_flush_region(0, 0, CacheType::ALL));
         assert!(!rast.on_cpu_write(0, 0));
         assert!(rast.accelerate_surface_copy(
             &crate::engines::fermi_2d::Surface::default(),

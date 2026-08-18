@@ -106,6 +106,7 @@ pub trait Host1xCoreInterface: Any + Send + Sync {
     fn smmu_apply_op_on_host_pointer(
         &self,
         host_ptr: usize,
+        scratch: &mut common::scratch_buffer::ScratchBuffer<u32>,
         operation: &mut dyn FnMut(u64),
     ) -> usize;
 

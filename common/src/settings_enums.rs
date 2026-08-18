@@ -70,6 +70,20 @@ macro_rules! settings_enum {
             }
         }
 
+        impl crate::settings_setting::SettingType for $name {
+            fn to_config_string(&self) -> String {
+                (*self as u32).to_string()
+            }
+
+            fn canonicalize_value(&self) -> String {
+                self.canonicalize().to_string()
+            }
+
+            fn is_enum_type() -> bool {
+                true
+            }
+        }
+
         impl Default for $name {
             fn default() -> Self {
                 // First variant is the default
@@ -88,7 +102,7 @@ macro_rules! settings_enum {
 pub enum AudioEngine {
     Auto = 0,
     Cubeb = 1,
-    Sdl2 = 2,
+    Sdl3 = 2,
     Null = 3,
     Oboe = 4,
 }
@@ -98,7 +112,7 @@ impl AudioEngine {
         match self {
             Self::Auto => "auto",
             Self::Cubeb => "cubeb",
-            Self::Sdl2 => "sdl2",
+            Self::Sdl3 => "sdl3",
             Self::Null => "null",
             Self::Oboe => "oboe",
         }
@@ -108,7 +122,7 @@ impl AudioEngine {
         match s {
             "auto" => Some(Self::Auto),
             "cubeb" => Some(Self::Cubeb),
-            "sdl2" => Some(Self::Sdl2),
+            "sdl3" => Some(Self::Sdl3),
             "null" => Some(Self::Null),
             "oboe" => Some(Self::Oboe),
             _ => None,
@@ -119,7 +133,7 @@ impl AudioEngine {
         match val {
             0 => Some(Self::Auto),
             1 => Some(Self::Cubeb),
-            2 => Some(Self::Sdl2),
+            2 => Some(Self::Sdl3),
             3 => Some(Self::Null),
             4 => Some(Self::Oboe),
             _ => None,
@@ -146,6 +160,20 @@ impl std::str::FromStr for AudioEngine {
         Self::from_string(value)
             .or_else(|| value.parse::<u32>().ok().and_then(Self::from_u32))
             .ok_or(())
+    }
+}
+
+impl crate::settings_setting::SettingType for AudioEngine {
+    fn to_config_string(&self) -> String {
+        (*self as u32).to_string()
+    }
+
+    fn canonicalize_value(&self) -> String {
+        self.canonicalize().to_string()
+    }
+
+    fn is_enum_type() -> bool {
+        true
     }
 }
 
@@ -209,6 +237,9 @@ settings_enum! {
         X4,
         X8,
         X16,
+        X32,
+        X64,
+        None,
     }
 }
 
@@ -229,6 +260,24 @@ settings_enum! {
 }
 
 settings_enum! {
+    pub enum FramePacingMode {
+        Target_Auto,
+        Target_30,
+        Target_60,
+        Target_90,
+        Target_120,
+    }
+}
+
+settings_enum! {
+    pub enum DmaAccuracy {
+        Default,
+        Unsafe,
+        Safe,
+    }
+}
+
+settings_enum! {
     pub enum VSyncMode {
         Immediate,
         Mailbox,
@@ -244,39 +293,104 @@ settings_enum! {
     }
 }
 
-settings_enum! {
-    pub enum RendererBackend {
-        OpenGL,
-        Vulkan,
-        Null,
-    }
+/// Upstream `Settings::RendererBackend`.
+///
+/// The Rust identifiers follow Rust casing, while the canonical strings retain
+/// Eden's exact `OpenGL_*` spellings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[repr(u32)]
+pub enum RendererBackend {
+    OpenGlGlsl = 0,
+    Vulkan = 1,
+    Null = 2,
+    OpenGlGlasm = 3,
+    OpenGlSpirV = 4,
 }
 
 impl RendererBackend {
-    /// Compatibility helper: parse from string or numeric value used in config files.
-    pub fn from_str_or_default(s: &str) -> Self {
-        match s.trim().to_lowercase().as_str() {
-            "0" | "opengl" => Self::OpenGL,
-            "1" | "vulkan" => Self::Vulkan,
-            "2" | "null" => Self::Null,
-            _ => Self::Vulkan,
+    pub fn canonicalize(self) -> &'static str {
+        match self {
+            Self::OpenGlGlsl => "OpenGL_GLSL",
+            Self::Vulkan => "Vulkan",
+            Self::Null => "Null",
+            Self::OpenGlGlasm => "OpenGL_GLASM",
+            Self::OpenGlSpirV => "OpenGL_SPIRV",
         }
+    }
+
+    pub fn from_string(value: &str) -> Option<Self> {
+        match value {
+            "OpenGL_GLSL" => Some(Self::OpenGlGlsl),
+            "Vulkan" => Some(Self::Vulkan),
+            "Null" => Some(Self::Null),
+            "OpenGL_GLASM" => Some(Self::OpenGlGlasm),
+            "OpenGL_SPIRV" => Some(Self::OpenGlSpirV),
+            _ => None,
+        }
+    }
+
+    pub fn from_u32(value: u32) -> Option<Self> {
+        match value {
+            0 => Some(Self::OpenGlGlsl),
+            1 => Some(Self::Vulkan),
+            2 => Some(Self::Null),
+            3 => Some(Self::OpenGlGlasm),
+            4 => Some(Self::OpenGlSpirV),
+            _ => None,
+        }
+    }
+
+    pub fn canonicalizations() -> &'static [(&'static str, Self)] {
+        &[
+            ("OpenGL_GLSL", Self::OpenGlGlsl),
+            ("Vulkan", Self::Vulkan),
+            ("Null", Self::Null),
+            ("OpenGL_GLASM", Self::OpenGlGlasm),
+            ("OpenGL_SPIRV", Self::OpenGlSpirV),
+        ]
     }
 }
 
-settings_enum! {
-    pub enum ShaderBackend {
-        Glsl,
-        Glasm,
-        SpirV,
+impl std::fmt::Display for RendererBackend {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.canonicalize())
+    }
+}
+
+impl std::str::FromStr for RendererBackend {
+    type Err = ();
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::from_string(value)
+            .or_else(|| value.parse::<u32>().ok().and_then(Self::from_u32))
+            .ok_or(())
+    }
+}
+
+impl crate::settings_setting::SettingType for RendererBackend {
+    fn to_config_string(&self) -> String {
+        (*self as u32).to_string()
+    }
+
+    fn canonicalize_value(&self) -> String {
+        self.canonicalize().to_string()
+    }
+
+    fn is_enum_type() -> bool {
+        true
+    }
+}
+
+impl Default for RendererBackend {
+    fn default() -> Self {
+        Self::OpenGlGlsl
     }
 }
 
 settings_enum! {
     pub enum GpuAccuracy {
-        Normal,
+        Low,
         High,
-        Extreme,
     }
 }
 
@@ -307,10 +421,75 @@ settings_enum! {
 }
 
 settings_enum! {
+    pub enum CpuClock {
+        Normal,
+        Boost,
+        Overclock,
+    }
+}
+
+settings_enum! {
+    pub enum GpuClock {
+        Normal,
+        Boost,
+        Overclock,
+    }
+}
+
+settings_enum! {
+    pub enum GpuUnswizzleSize {
+        VerySmall,
+        Small,
+        Normal,
+        Large,
+        VeryLarge,
+    }
+}
+
+settings_enum! {
+    pub enum GpuUnswizzle {
+        VeryLow,
+        Low,
+        Normal,
+        Medium,
+        High,
+    }
+}
+
+settings_enum! {
+    pub enum GpuUnswizzleChunk {
+        VeryLow,
+        Low,
+        Normal,
+        Medium,
+        High,
+    }
+}
+
+settings_enum! {
+    pub enum ExtendedDynamicState {
+        Disabled,
+        EDS1,
+        EDS2,
+        EDS3,
+    }
+}
+
+settings_enum! {
+    pub enum SpeedMode {
+        Standard,
+        Turbo,
+        Slow,
+    }
+}
+
+settings_enum! {
     pub enum MemoryLayout {
         Memory4Gb,
         Memory6Gb,
         Memory8Gb,
+        Memory10Gb,
+        Memory12Gb,
     }
 }
 
@@ -339,9 +518,11 @@ settings_enum! {
 
 settings_enum! {
     pub enum ResolutionSetup {
+        Res1_4X,
         Res1_2X,
         Res3_4X,
         Res1X,
+        Res5_4X,
         Res3_2X,
         Res2X,
         Res3X,
@@ -359,9 +540,17 @@ settings_enum! {
         Bilinear,
         Bicubic,
         Gaussian,
+        Lanczos,
         ScaleForce,
         Fsr,
-        MaxEnum,
+        Area,
+        ZeroTangent,
+        BSpline,
+        Mitchell,
+        Spline1,
+        Mmpx,
+        Sgsr,
+        SgsrEdge,
     }
 }
 
@@ -370,7 +559,6 @@ settings_enum! {
         None,
         Fxaa,
         Smaa,
-        MaxEnum,
     }
 }
 
@@ -411,6 +599,8 @@ pub enum Category {
     Overlay,
     Renderer,
     RendererAdvanced,
+    RendererHacks,
+    RendererExtensions,
     RendererDebug,
     System,
     SystemAudio,
@@ -447,7 +637,11 @@ impl Category {
             Category::Core => "Core",
             Category::Cpu | Category::CpuDebug | Category::CpuUnsafe => "Cpu",
             Category::Overlay => "Overlay",
-            Category::Renderer | Category::RendererAdvanced | Category::RendererDebug => "Renderer",
+            Category::Renderer
+            | Category::RendererAdvanced
+            | Category::RendererHacks
+            | Category::RendererExtensions
+            | Category::RendererDebug => "Renderer",
             Category::System | Category::SystemAudio => "System",
             Category::DataStorage => "Data Storage",
             Category::Debugging | Category::DebuggingGraphics => "Debugging",
@@ -470,5 +664,71 @@ impl Category {
             Category::Linux => "Linux",
             Category::MaxEnum => "Miscellaneous",
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{GpuAccuracy, RendererBackend, ScalingFilter};
+    use std::str::FromStr;
+
+    #[test]
+    fn gpu_accuracy_has_the_two_upstream_levels_and_numeric_values() {
+        assert_eq!(GpuAccuracy::Low as u32, 0);
+        assert_eq!(GpuAccuracy::High as u32, 1);
+        assert_eq!(
+            GpuAccuracy::canonicalizations(),
+            &[("Low", GpuAccuracy::Low), ("High", GpuAccuracy::High)]
+        );
+        assert_eq!(GpuAccuracy::from_str("0"), Ok(GpuAccuracy::Low));
+        assert_eq!(GpuAccuracy::from_str("1"), Ok(GpuAccuracy::High));
+        assert!(GpuAccuracy::from_str("2").is_err());
+    }
+
+    #[test]
+    fn renderer_backend_discriminants_match_eden_fused_enum() {
+        let expected = [
+            RendererBackend::OpenGlGlsl,
+            RendererBackend::Vulkan,
+            RendererBackend::Null,
+            RendererBackend::OpenGlGlasm,
+            RendererBackend::OpenGlSpirV,
+        ];
+        for (index, backend) in expected.into_iter().enumerate() {
+            assert_eq!(backend as u32, index as u32);
+            assert_eq!(RendererBackend::from_u32(index as u32), Some(backend));
+        }
+        assert_eq!(expected[0].canonicalize(), "OpenGL_GLSL");
+        assert_eq!(expected[3].canonicalize(), "OpenGL_GLASM");
+        assert_eq!(expected[4].canonicalize(), "OpenGL_SPIRV");
+        assert_eq!(RendererBackend::from_str("OpenGL_GLSL"), Ok(expected[0]));
+        assert_eq!(RendererBackend::from_str("OpenGL_GLASM"), Ok(expected[3]));
+        assert_eq!(RendererBackend::from_str("OpenGL_SPIRV"), Ok(expected[4]));
+    }
+
+    #[test]
+    fn scaling_filter_discriminants_match_upstream_serialization() {
+        let expected = [
+            ScalingFilter::NearestNeighbor,
+            ScalingFilter::Bilinear,
+            ScalingFilter::Bicubic,
+            ScalingFilter::Gaussian,
+            ScalingFilter::Lanczos,
+            ScalingFilter::ScaleForce,
+            ScalingFilter::Fsr,
+            ScalingFilter::Area,
+            ScalingFilter::ZeroTangent,
+            ScalingFilter::BSpline,
+            ScalingFilter::Mitchell,
+            ScalingFilter::Spline1,
+            ScalingFilter::Mmpx,
+            ScalingFilter::Sgsr,
+            ScalingFilter::SgsrEdge,
+        ];
+        for (index, filter) in expected.into_iter().enumerate() {
+            assert_eq!(filter as u32, index as u32);
+            assert_eq!(ScalingFilter::from_u32(index as u32), Some(filter));
+        }
+        assert_eq!(ScalingFilter::SgsrEdge as u32, expected.len() as u32 - 1);
     }
 }

@@ -6,6 +6,8 @@
 
 use std::sync::Arc;
 
+use common::common_funcs::make_magic;
+
 use super::partition_filesystem::ResultStatus;
 use super::vfs::vfs::VfsFile;
 use super::vfs::vfs_offset::OffsetVfsFile;
@@ -14,10 +16,6 @@ use super::vfs::vfs_types::VirtualFile;
 // ============================================================================
 // Constants
 // ============================================================================
-
-const fn make_magic(a: u8, b: u8, c: u8, d: u8) -> u32 {
-    (a as u32) | ((b as u32) << 8) | ((c as u32) << 16) | ((d as u32) << 24)
-}
 
 const KIP1_MAGIC: u32 = make_magic(b'K', b'I', b'P', b'1');
 const INI1_MAGIC: u32 = make_magic(b'I', b'N', b'I', b'1');

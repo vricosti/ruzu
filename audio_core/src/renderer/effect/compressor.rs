@@ -46,6 +46,11 @@ pub struct ParameterVersion2 {
     pub makeup_gain_enabled: bool,
 }
 
+const _: () =
+    assert!(std::mem::size_of::<ParameterVersion1>() <= std::mem::size_of::<InParameterVersion1>());
+const _: () =
+    assert!(std::mem::size_of::<ParameterVersion2>() <= std::mem::size_of::<InParameterVersion2>());
+
 pub fn update_v1(
     _effect: &mut EffectInfoBase,
     error_info: &mut ErrorInfo,

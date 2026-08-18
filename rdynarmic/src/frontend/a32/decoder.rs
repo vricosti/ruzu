@@ -259,6 +259,7 @@ pub enum ArmInstId {
     VFP_VDUP,
     // ASIMD
     ASIMD_VMOV_imm,
+    ASIMD_VMOVN,
     ASIMD_VRHADD,
     ASIMD_VQRDMULH,
     ASIMD_VMUL_float,
@@ -343,6 +344,7 @@ pub enum ArmInstId {
     // ASIMD two registers and shift amount
     ASIMD_SHR,
     ASIMD_SRA,
+    ASIMD_VSHRN,
     ASIMD_VSHL_imm,
     ASIMD_VSLI,
     ASIMD_VSRI,
@@ -580,6 +582,8 @@ fn decode_arm_unconditional(instr: u32) -> ArmInstId {
         // Upstream decoder checks modified immediate first.
         // Pattern: 1111001i1D000bcdVVVVcccc0Qo1efgh
         _ if matches_arm(instr, 0xFEB8_0090, 0xF280_0010) => ArmInstId::ASIMD_VMOV_imm,
+        // VSHRN: 111100101Diiiiiidddd100000M1mmmm
+        _ if matches_arm(instr, 0xFF80_0FD0, 0xF280_0810) => ArmInstId::ASIMD_VSHRN,
         // ASIMD two registers and shift amount (bit 23=1, bit 4=1)
         // SHR:   1111001U1Diiiiiidddd0000LQM1mmmm
         _ if matches_arm(instr, 0xFE80_0F10, 0xF280_0010) => ArmInstId::ASIMD_SHR,
@@ -730,6 +734,8 @@ fn decode_arm_unconditional(instr: u32) -> ArmInstId {
         _ if matches_arm(instr, 0xFFB3_0F90, 0xF3B2_0100) => ArmInstId::ASIMD_VUZP,
         // VZIP:         111100111D11zz10dddd00011QM0mmmm
         _ if matches_arm(instr, 0xFFB3_0F90, 0xF3B2_0180) => ArmInstId::ASIMD_VZIP,
+        // VMOVN:        111100111D11zz10dddd001000M0mmmm
+        _ if matches_arm(instr, 0xFFB3_0FD0, 0xF3B2_0200) => ArmInstId::ASIMD_VMOVN,
         // VCGT (zero):  111100111D11zz01dddd0F000QM0mmmm
         _ if matches_arm(instr, 0xFFB3_0B90, 0xF3B1_0000) => ArmInstId::ASIMD_VCGT_zero,
         // VCGE (zero):  111100111D11zz01dddd0F001QM0mmmm
@@ -1979,6 +1985,12 @@ mod tests {
     fn test_decode_asimd_vzip_regression_opcodes() {
         assert_eq!(decode_arm(0xF3FA_21E0).id, ArmInstId::ASIMD_VZIP);
         assert_eq!(decode_arm(0xF3FA_41E6).id, ArmInstId::ASIMD_VZIP);
+    }
+
+    #[test]
+    fn test_decode_super_mario_party_narrowing_instructions() {
+        assert_eq!(decode_arm(0xF2E0_3830).id, ArmInstId::ASIMD_VSHRN);
+        assert_eq!(decode_arm(0xF3FA_2220).id, ArmInstId::ASIMD_VMOVN);
     }
 
     #[test]

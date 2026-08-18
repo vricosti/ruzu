@@ -1,9 +1,17 @@
 // SPDX-FileCopyrightText: 2025 ruzu contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! Port of zuyu/src/video_core/renderer_opengl/maxwell_to_gl.h
+//! Port of Eden `video_core/renderer_opengl/maxwell_to_gl.h`.
 //!
 //! Maxwell GPU register values to OpenGL enum translation tables.
+
+use std::ffi::CStr;
+use std::sync::OnceLock;
+
+use crate::engines::maxwell_3d::PrimitiveTopology;
+
+const GL_QUAD_STRIP: u32 = 0x0008;
+const GL_POLYGON: u32 = 0x0009;
 
 /// A GL format tuple (internal_format, format, type).
 ///
@@ -22,6 +30,22 @@ impl FormatTuple {
             format,
             gl_type,
         }
+    }
+
+    /// A slot with no OpenGL representation. Upstream's `GetFormatTuple` switch
+    /// simply has no `case` for these formats and hits `UNREACHABLE()`; here the
+    /// table is indexed, so the slot exists and is flagged instead.
+    pub const fn unsupported() -> Self {
+        Self {
+            internal_format: gl::NONE,
+            format: gl::NONE,
+            gl_type: gl::NONE,
+        }
+    }
+
+    /// True for a slot with no OpenGL representation.
+    pub const fn is_unsupported(&self) -> bool {
+        self.internal_format == gl::NONE
     }
 
     pub const fn compressed(internal_format: u32) -> Self {
@@ -74,7 +98,7 @@ const GL_COMPRESSED_SRGB8_ALPHA8_ASTC_12X12_KHR: u32 = 0x93DD;
 /// Format table mapping PixelFormat enum to GL format tuples.
 ///
 /// Corresponds to `OpenGL::MaxwellToGL::FORMAT_TABLE`.
-pub static FORMAT_TABLE: &[FormatTuple] = &[
+pub(crate) static FORMAT_TABLE: &[FormatTuple] = &[
     FormatTuple::new(gl::RGBA8, gl::RGBA, gl::UNSIGNED_INT_8_8_8_8_REV), // A8B8G8R8_UNORM
     FormatTuple::new(gl::RGBA8_SNORM, gl::RGBA, gl::BYTE),               // A8B8G8R8_SNORM
     FormatTuple::new(gl::RGBA8I, gl::RGBA_INTEGER, gl::BYTE),            // A8B8G8R8_SINT
@@ -178,6 +202,9 @@ pub static FORMAT_TABLE: &[FormatTuple] = &[
     FormatTuple::compressed(GL_COMPRESSED_RGBA_ASTC_6X5_KHR),            // ASTC_2D_6X5_UNORM
     FormatTuple::compressed(GL_COMPRESSED_SRGB8_ALPHA8_ASTC_6X5_KHR),    // ASTC_2D_6X5_SRGB
     FormatTuple::new(gl::RGB9_E5, gl::RGB, gl::UNSIGNED_INT_5_9_9_9_REV), // E5B9G9R9_FLOAT
+    // `SURFACE_FORMAT_LIST` omits ETC2/EAC and continues directly with the
+    // depth/stencil tuples. Keep that compact initializer order: the fixed-size
+    // upstream array zero-initializes its ten unused trailing elements.
     FormatTuple::new(gl::DEPTH_COMPONENT32F, gl::DEPTH_COMPONENT, gl::FLOAT), // D32_FLOAT
     FormatTuple::new(
         gl::DEPTH_COMPONENT16,
@@ -189,7 +216,7 @@ pub static FORMAT_TABLE: &[FormatTuple] = &[
         gl::DEPTH_COMPONENT,
         gl::UNSIGNED_INT_24_8,
     ), // X8_D24_UNORM
-    FormatTuple::new(gl::STENCIL_INDEX8, gl::STENCIL, gl::UNSIGNED_BYTE), // S8_UINT
+    FormatTuple::new(gl::STENCIL_INDEX8, gl::STENCIL, gl::UNSIGNED_BYTE),     // S8_UINT
     FormatTuple::new(
         gl::DEPTH24_STENCIL8,
         gl::DEPTH_STENCIL,
@@ -205,53 +232,104 @@ pub static FORMAT_TABLE: &[FormatTuple] = &[
         gl::DEPTH_STENCIL,
         gl::FLOAT_32_UNSIGNED_INT_24_8_REV,
     ), // D32_FLOAT_S8_UINT
+    FormatTuple::unsupported(),
+    FormatTuple::unsupported(),
+    FormatTuple::unsupported(),
+    FormatTuple::unsupported(),
+    FormatTuple::unsupported(),
+    FormatTuple::unsupported(),
+    FormatTuple::unsupported(),
+    FormatTuple::unsupported(),
+    FormatTuple::unsupported(),
+    FormatTuple::unsupported(),
 ];
 
-/// Look up the format tuple for a given pixel format index.
+/// Look up the format tuple for a pixel format.
 ///
 /// Corresponds to `OpenGL::MaxwellToGL::GetFormatTuple()`.
-pub fn get_format_tuple(pixel_format: usize) -> &'static FormatTuple {
-    assert!(pixel_format < FORMAT_TABLE.len());
-    &FORMAT_TABLE[pixel_format]
+pub fn get_format_tuple(pixel_format: crate::surface::PixelFormat) -> FormatTuple {
+    use crate::surface::PixelFormat;
+
+    match pixel_format {
+        PixelFormat::Etc2RgbUnorm
+        | PixelFormat::Etc2RgbaUnorm
+        | PixelFormat::Etc2RgbPtaUnorm
+        | PixelFormat::Etc2RgbSrgb
+        | PixelFormat::Etc2RgbaSrgb
+        | PixelFormat::Etc2RgbPtaSrgb
+        | PixelFormat::EacR11Unorm
+        | PixelFormat::EacR11Snorm
+        | PixelFormat::EacR11G11Unorm
+        | PixelFormat::EacR11G11Snorm
+        | PixelFormat::MaxDepthStencilFormat
+        | PixelFormat::Invalid => {
+            panic!("GetFormatTuple: pixel format {pixel_format:?} has no OpenGL representation")
+        }
+        // Upstream `GetFormatTuple` is a switch generated from
+        // `SURFACE_FORMAT_LIST`; it does not use the compact `FORMAT_TABLE` to
+        // translate enum ordinals. Keep these post-ETC2/EAC cases explicit so
+        // their mapping cannot depend on a magic enum/table offset.
+        PixelFormat::D32Float => {
+            FormatTuple::new(gl::DEPTH_COMPONENT32F, gl::DEPTH_COMPONENT, gl::FLOAT)
+        }
+        PixelFormat::D16Unorm => FormatTuple::new(
+            gl::DEPTH_COMPONENT16,
+            gl::DEPTH_COMPONENT,
+            gl::UNSIGNED_SHORT,
+        ),
+        PixelFormat::X8D24Unorm => FormatTuple::new(
+            gl::DEPTH_COMPONENT24,
+            gl::DEPTH_COMPONENT,
+            gl::UNSIGNED_INT_24_8,
+        ),
+        PixelFormat::S8Uint => FormatTuple::new(gl::STENCIL_INDEX8, gl::STENCIL, gl::UNSIGNED_BYTE),
+        PixelFormat::D24UnormS8Uint | PixelFormat::S8UintD24Unorm => FormatTuple::new(
+            gl::DEPTH24_STENCIL8,
+            gl::DEPTH_STENCIL,
+            gl::UNSIGNED_INT_24_8,
+        ),
+        PixelFormat::D32FloatS8Uint => FormatTuple::new(
+            gl::DEPTH32F_STENCIL8,
+            gl::DEPTH_STENCIL,
+            gl::FLOAT_32_UNSIGNED_INT_24_8_REV,
+        ),
+        _ => FORMAT_TABLE[pixel_format as usize],
+    }
 }
 
 /// Map a Maxwell index format to GL index type.
 ///
 /// Corresponds to `OpenGL::MaxwellToGL::IndexFormat()`.
-pub fn index_format(format: u32) -> u32 {
+pub fn index_format(format: crate::engines::maxwell_3d::IndexFormat) -> u32 {
+    use crate::engines::maxwell_3d::IndexFormat;
     match format {
-        0 => gl::UNSIGNED_BYTE,
-        1 => gl::UNSIGNED_SHORT,
-        2 => gl::UNSIGNED_INT,
-        _ => {
-            debug_assert!(false, "Invalid index format: {}", format);
-            gl::UNSIGNED_INT
-        }
+        IndexFormat::UnsignedByte => gl::UNSIGNED_BYTE,
+        IndexFormat::UnsignedShort => gl::UNSIGNED_SHORT,
+        IndexFormat::UnsignedInt => gl::UNSIGNED_INT,
     }
 }
 
 /// Map a Maxwell primitive topology to GL primitive mode.
 ///
 /// Corresponds to `OpenGL::MaxwellToGL::PrimitiveTopology()`.
-pub fn primitive_topology(topology: u32) -> u32 {
+pub fn primitive_topology(topology: PrimitiveTopology) -> u32 {
+    use PrimitiveTopology::*;
     match topology {
-        0x0001 => gl::POINTS,
-        0x0002 => gl::LINES,
-        0x0003 => gl::LINE_LOOP,
-        0x0004 => gl::LINE_STRIP,
-        0x0005 => gl::TRIANGLES,
-        0x0006 => gl::TRIANGLE_STRIP,
-        0x0007 => gl::TRIANGLE_FAN,
-        0x0008 => gl::QUADS,
-        0x000A => gl::LINES_ADJACENCY,
-        0x000B => gl::LINE_STRIP_ADJACENCY,
-        0x000C => gl::TRIANGLES_ADJACENCY,
-        0x000D => gl::TRIANGLE_STRIP_ADJACENCY,
-        0x000E => gl::PATCHES,
-        _ => {
-            log::warn!("Unknown primitive topology: {:#x}", topology);
-            gl::POINTS
-        }
+        Points => gl::POINTS,
+        Lines => gl::LINES,
+        LineLoop => gl::LINE_LOOP,
+        LineStrip => gl::LINE_STRIP,
+        Triangles => gl::TRIANGLES,
+        TriangleStrip => gl::TRIANGLE_STRIP,
+        TriangleFan => gl::TRIANGLE_FAN,
+        Quads => gl::QUADS,
+        QuadStrip => GL_QUAD_STRIP,
+        Polygon => GL_POLYGON,
+        LinesAdjacency => gl::LINES_ADJACENCY,
+        LineStripAdjacency => gl::LINE_STRIP_ADJACENCY,
+        TrianglesAdjacency => gl::TRIANGLES_ADJACENCY,
+        TriangleStripAdjacency => gl::TRIANGLE_STRIP_ADJACENCY,
+        Patches => gl::PATCHES,
     }
 }
 
@@ -373,14 +451,19 @@ pub fn blend_func(factor: u32) -> u32 {
         0x09 | 0x4306 => gl::DST_COLOR,
         0x0A | 0x4307 => gl::ONE_MINUS_DST_COLOR,
         0x0B | 0x4308 => gl::SRC_ALPHA_SATURATE,
-        0x0D | 0xC900 => gl::SRC1_COLOR,
-        0x0E | 0xC901 => gl::ONE_MINUS_SRC1_COLOR,
-        0x0F | 0xC902 => gl::SRC1_ALPHA,
-        0x10 | 0xC903 => gl::ONE_MINUS_SRC1_ALPHA,
-        0x11 | 0xC001 => gl::CONSTANT_COLOR,
-        0x12 | 0xC002 => gl::ONE_MINUS_CONSTANT_COLOR,
-        0x13 | 0xC003 => gl::CONSTANT_ALPHA,
-        0x14 | 0xC004 => gl::ONE_MINUS_CONSTANT_ALPHA,
+        // The D3D half of upstream's `Blend::Factor` runs
+        // BothSourceAlpha(0xC), OneMinusBothSourceAlpha(0xD),
+        // BlendFactor(0xE), OneMinusBlendFactor(0xF), then Source1*(0x10..0x13)
+        // — and each pairs with the GL-style value that maps to the same GL
+        // enum, not with the one that happens to follow it numerically.
+        0x0C | 0xC003 => gl::CONSTANT_ALPHA,
+        0x0D | 0xC004 => gl::ONE_MINUS_CONSTANT_ALPHA,
+        0x0E | 0xC001 => gl::CONSTANT_COLOR,
+        0x0F | 0xC002 => gl::ONE_MINUS_CONSTANT_COLOR,
+        0x10 | 0xC900 => gl::SRC1_COLOR,
+        0x11 | 0xC901 => gl::ONE_MINUS_SRC1_COLOR,
+        0x12 | 0xC902 => gl::SRC1_ALPHA,
+        0x13 | 0xC903 => gl::ONE_MINUS_SRC1_ALPHA,
         _ => {
             log::warn!("Unimplemented blend factor: {:#x}", factor);
             gl::ZERO
@@ -410,7 +493,8 @@ pub fn texture_filter_mode(filter: u32, mipmap_filter: u32) -> u32 {
             3 => gl::LINEAR_MIPMAP_LINEAR,
             _ => {
                 log::warn!("Invalid mipmap filter mode: {}", mipmap_filter);
-                gl::LINEAR
+                // Eden falls through the outer switch and returns GL_NEAREST.
+                gl::NEAREST
             }
         },
         _ => {
@@ -424,6 +508,13 @@ pub fn texture_filter_mode(filter: u32, mipmap_filter: u32) -> u32 {
 ///
 /// Corresponds to `OpenGL::MaxwellToGL::WrapMode()`.
 pub fn wrap_mode(mode: u32) -> u32 {
+    wrap_mode_with_texture_mirror_clamp(mode, has_texture_mirror_clamp())
+}
+
+const GL_MIRROR_CLAMP_EXT: u32 = 0x8742;
+const GL_MIRROR_CLAMP_TO_BORDER_EXT: u32 = 0x8912;
+
+fn wrap_mode_with_texture_mirror_clamp(mode: u32, has_texture_mirror_clamp: bool) -> u32 {
     match mode {
         0 => gl::REPEAT,
         1 => gl::MIRRORED_REPEAT,
@@ -431,13 +522,27 @@ pub fn wrap_mode(mode: u32) -> u32 {
         3 => gl::CLAMP_TO_BORDER,
         4 => gl::CLAMP_TO_EDGE, // GL_CLAMP (deprecated) — fallback
         5 => gl::MIRROR_CLAMP_TO_EDGE,
-        6 => gl::MIRROR_CLAMP_TO_EDGE, // MirrorOnceBorder — fallback
-        7 => gl::MIRROR_CLAMP_TO_EDGE, // MirrorOnceClampOgl — fallback
+        6 if has_texture_mirror_clamp => GL_MIRROR_CLAMP_TO_BORDER_EXT,
+        7 if has_texture_mirror_clamp => GL_MIRROR_CLAMP_EXT,
+        6 | 7 => gl::MIRROR_CLAMP_TO_EDGE,
         _ => {
             log::warn!("Unimplemented texture wrap mode: {}", mode);
             gl::REPEAT
         }
     }
+}
+
+fn has_texture_mirror_clamp() -> bool {
+    static HAS_TEXTURE_MIRROR_CLAMP: OnceLock<bool> = OnceLock::new();
+    *HAS_TEXTURE_MIRROR_CLAMP.get_or_init(|| unsafe {
+        let mut count = 0;
+        gl::GetIntegerv(gl::NUM_EXTENSIONS, &mut count);
+        (0..count as u32).any(|index| {
+            let extension = gl::GetStringi(gl::EXTENSIONS, index);
+            !extension.is_null()
+                && CStr::from_ptr(extension.cast()).to_bytes() == b"GL_EXT_texture_mirror_clamp"
+        })
+    })
 }
 
 /// Map a depth compare function to GL compare function.
@@ -464,6 +569,15 @@ pub fn depth_compare_func(func: u32) -> u32 {
 ///
 /// Corresponds to `OpenGL::MaxwellToGL::VertexFormat()`.
 /// Returns the GL type constant (e.g. GL_FLOAT, GL_UNSIGNED_BYTE).
+/// Upstream's `MaxwellToGL::VertexFormat` has a single failure path: it logs
+/// `UNIMPLEMENTED_MSG` and returns a value-initialised `GLenum`, i.e. `GL_NONE`.
+/// Substituting a plausible-looking type instead would silently reinterpret the
+/// stream rather than surfacing the unhandled combination.
+fn unimplemented_vertex_format(attrib_type: u32, size: u32) -> u32 {
+    log::warn!("Unimplemented vertex format of type={attrib_type} and size={size:#x}");
+    gl::NONE
+}
+
 pub fn vertex_format(attrib_type: u32, size: u32) -> u32 {
     match attrib_type {
         // UNorm, UScaled, UInt
@@ -472,10 +586,7 @@ pub fn vertex_format(attrib_type: u32, size: u32) -> u32 {
             0x03 | 0x05 | 0x0F | 0x1B => gl::UNSIGNED_SHORT,
             0x01 | 0x02 | 0x04 | 0x12 => gl::UNSIGNED_INT,
             0x30 => gl::UNSIGNED_INT_2_10_10_10_REV,
-            _ => {
-                log::warn!("Unknown unsigned vertex size: {:#x}", size);
-                gl::UNSIGNED_BYTE
-            }
+            _ => unimplemented_vertex_format(attrib_type, size),
         },
         // SNorm, SScaled, SInt
         1 | 6 | 3 => match size {
@@ -483,25 +594,16 @@ pub fn vertex_format(attrib_type: u32, size: u32) -> u32 {
             0x03 | 0x05 | 0x0F | 0x1B => gl::SHORT,
             0x01 | 0x02 | 0x04 | 0x12 => gl::INT,
             0x30 => gl::INT_2_10_10_10_REV,
-            _ => {
-                log::warn!("Unknown signed vertex size: {:#x}", size);
-                gl::BYTE
-            }
+            _ => unimplemented_vertex_format(attrib_type, size),
         },
         // Float
         7 => match size {
             0x0F | 0x03 | 0x1B => gl::HALF_FLOAT,
             0x01 | 0x02 | 0x04 | 0x12 => gl::FLOAT,
             0x31 => gl::UNSIGNED_INT_10F_11F_11F_REV,
-            _ => {
-                log::warn!("Unknown float vertex size: {:#x}", size);
-                gl::FLOAT
-            }
+            _ => unimplemented_vertex_format(attrib_type, size),
         },
-        _ => {
-            log::warn!("Invalid vertex attribute type: {}", attrib_type);
-            gl::FLOAT
-        }
+        _ => unimplemented_vertex_format(attrib_type, size),
     }
 }
 
@@ -571,21 +673,88 @@ mod tests {
             PixelFormat::MaxDepthStencilFormat as usize
         );
         assert_eq!(
-            get_format_tuple(PixelFormat::A8B8G8R8Unorm as usize).internal_format,
+            get_format_tuple(PixelFormat::A8B8G8R8Unorm).internal_format,
             gl::RGBA8
         );
         assert_eq!(
-            get_format_tuple(PixelFormat::B8G8R8A8Srgb as usize).internal_format,
+            get_format_tuple(PixelFormat::B8G8R8A8Srgb).internal_format,
             gl::SRGB8_ALPHA8
         );
         assert_eq!(
-            get_format_tuple(PixelFormat::A2R10G10B10Unorm as usize).format,
+            get_format_tuple(PixelFormat::A2R10G10B10Unorm).format,
             gl::BGRA
         );
         assert_eq!(
-            get_format_tuple(PixelFormat::D32FloatS8Uint as usize).gl_type,
+            get_format_tuple(PixelFormat::D32FloatS8Uint).gl_type,
             gl::FLOAT_32_UNSIGNED_INT_24_8_REV
         );
+    }
+
+    // Upstream initializes FORMAT_TABLE from SURFACE_FORMAT_LIST, which omits
+    // ETC2/EAC. Depth/stencil tuples therefore immediately follow E5B9G9R9,
+    // while the ten remaining fixed-array elements are zero-initialized.
+    #[test]
+    fn format_table_keeps_upstream_compact_initializer_order() {
+        assert_eq!(PixelFormat::Etc2RgbUnorm as usize, 95);
+        assert_eq!(PixelFormat::EacR11G11Snorm as usize, 104);
+        assert_eq!(PixelFormat::D32Float as usize, 105);
+        assert_eq!(PixelFormat::D32FloatS8Uint as usize, 111);
+
+        assert_eq!(FORMAT_TABLE[95].internal_format, gl::DEPTH_COMPONENT32F);
+        assert_eq!(FORMAT_TABLE[101].internal_format, gl::DEPTH32F_STENCIL8);
+        assert!(FORMAT_TABLE[102..].iter().all(FormatTuple::is_unsupported));
+
+        assert_eq!(
+            get_format_tuple(PixelFormat::D32Float).internal_format,
+            gl::DEPTH_COMPONENT32F
+        );
+        assert_eq!(
+            get_format_tuple(PixelFormat::D16Unorm).internal_format,
+            gl::DEPTH_COMPONENT16
+        );
+        assert_eq!(
+            get_format_tuple(PixelFormat::S8Uint).internal_format,
+            gl::STENCIL_INDEX8
+        );
+    }
+
+    // Upstream's OpenGL `SURFACE_FORMAT_LIST` has no ETC2/EAC entries, so
+    // `GetFormatTuple` reaches `UNREACHABLE()` for them.
+    #[test]
+    fn etc2_formats_have_no_opengl_tuple() {
+        assert!(FORMAT_TABLE[102..].iter().all(FormatTuple::is_unsupported));
+    }
+
+    #[test]
+    #[should_panic(expected = "no OpenGL representation")]
+    fn get_format_tuple_rejects_etc2() {
+        get_format_tuple(PixelFormat::Etc2RgbUnorm);
+    }
+
+    // Maxwell exposes every blend factor twice: a D3D-style value (0x1..0x13)
+    // and a GL-style one. The two halves are not in the same order, so pairing
+    // them by position silently produces a shifted table — which is what this
+    // function used to carry.
+    #[test]
+    fn blend_func_pairs_the_d3d_and_gl_encodings_like_upstream() {
+        for (d3d, gl_value, expected) in [
+            (0x01u32, 0x4000u32, gl::ZERO),
+            (0x02, 0x4001, gl::ONE),
+            (0x0B, 0x4308, gl::SRC_ALPHA_SATURATE),
+            (0x0C, 0xC003, gl::CONSTANT_ALPHA),
+            (0x0D, 0xC004, gl::ONE_MINUS_CONSTANT_ALPHA),
+            (0x0E, 0xC001, gl::CONSTANT_COLOR),
+            (0x0F, 0xC002, gl::ONE_MINUS_CONSTANT_COLOR),
+            (0x10, 0xC900, gl::SRC1_COLOR),
+            (0x11, 0xC901, gl::ONE_MINUS_SRC1_COLOR),
+            (0x12, 0xC902, gl::SRC1_ALPHA),
+            (0x13, 0xC903, gl::ONE_MINUS_SRC1_ALPHA),
+        ] {
+            assert_eq!(blend_func(d3d), expected, "D3D factor {d3d:#x}");
+            assert_eq!(blend_func(gl_value), expected, "GL factor {gl_value:#x}");
+        }
+        // 0x14 is not a Maxwell blend factor.
+        assert_eq!(blend_func(0x14), gl::ZERO);
     }
 
     #[test]
@@ -598,5 +767,43 @@ mod tests {
         assert_eq!(vertex_format(3, 0x0A), gl::BYTE);
         assert_eq!(vertex_format(7, 0x03), gl::HALF_FLOAT);
         assert_eq!(vertex_format(7, 0x01), gl::FLOAT);
+    }
+
+    #[test]
+    fn primitive_topology_maps_all_maxwell_values() {
+        assert_eq!(primitive_topology(PrimitiveTopology::Points), gl::POINTS);
+        assert_eq!(primitive_topology(PrimitiveTopology::Quads), gl::QUADS);
+        assert_eq!(
+            primitive_topology(PrimitiveTopology::QuadStrip),
+            GL_QUAD_STRIP
+        );
+        assert_eq!(primitive_topology(PrimitiveTopology::Polygon), GL_POLYGON);
+        assert_eq!(primitive_topology(PrimitiveTopology::Patches), gl::PATCHES);
+    }
+
+    #[test]
+    fn index_and_invalid_filter_mappings_match_upstream() {
+        use crate::engines::maxwell_3d::IndexFormat;
+
+        assert_eq!(index_format(IndexFormat::UnsignedByte), gl::UNSIGNED_BYTE);
+        assert_eq!(index_format(IndexFormat::UnsignedShort), gl::UNSIGNED_SHORT);
+        assert_eq!(index_format(IndexFormat::UnsignedInt), gl::UNSIGNED_INT);
+        assert_eq!(texture_filter_mode(2, 0), gl::NEAREST);
+    }
+
+    #[test]
+    fn mirror_once_wrap_modes_use_ext_variants_when_available() {
+        assert_eq!(
+            wrap_mode_with_texture_mirror_clamp(6, true),
+            GL_MIRROR_CLAMP_TO_BORDER_EXT
+        );
+        assert_eq!(
+            wrap_mode_with_texture_mirror_clamp(7, true),
+            GL_MIRROR_CLAMP_EXT
+        );
+        assert_eq!(
+            wrap_mode_with_texture_mirror_clamp(6, false),
+            gl::MIRROR_CLAMP_TO_EDGE
+        );
     }
 }

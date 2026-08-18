@@ -1,19 +1,19 @@
 // SPDX-FileCopyrightText: 2023 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-//! SDL2 configuration.
+//! SDL3 configuration.
 //!
 //! Port of `yuzu_cmd/sdl_config.h` and `yuzu_cmd/sdl_config.cpp`.
 //!
-//! `SdlConfig` is the concrete `Config` implementation for the SDL2
+//! `SdlConfig` is the concrete `Config` implementation for the SDL3
 //! command-line frontend. It extends the base `Config` infrastructure from
-//! `frontend_common` with SDL2-specific default key bindings.
+//! `frontend_common` with SDL3-specific default key bindings.
 //!
 //! # Default key bindings
 //!
 //! The constants below mirror the C++ static arrays declared in `sdl_config.h`
 //! and defined in `sdl_config.cpp`. They map logical controller inputs to
-//! SDL scancode integers. The SDL scancode values come from `sdl2::keyboard::Scancode`.
+//! SDL scancode integers. The SDL scancode values come from `sdl3::keyboard::Scancode`.
 //!
 //! | C++ constant                     | Rust constant                      |
 //! |----------------------------------|------------------------------------|
@@ -179,7 +179,7 @@ pub const DEFAULT_RINGCON_ANALOGS: [i32; 2] = [0, 0];
 // SdlConfig
 // ---------------------------------------------------------------------------
 
-/// SDL2 frontend configuration.
+/// SDL3 frontend configuration.
 ///
 /// Maps to C++ class `SdlConfig` in `yuzu_cmd/sdl_config.h`.
 ///
@@ -202,13 +202,16 @@ impl SdlConfig {
         let config_path = resolve_config_path(config_path);
         let mut base = BaseConfig::new(ConfigType::GlobalConfig);
         base.initialize(&config_path);
+        // Eden's path-based `Config::Initialize` always calls `Reload()`
+        // before the derived `SdlConfig` reads its frontend-specific values.
+        // Keep this explicit instead of placing it in `BaseConfig::initialize`:
+        // the name/type-based InputProfile path intentionally skips Reload.
+        base.reload();
         let mut instance = SdlConfig {
             is_global: true,
             config_path,
             base,
         };
-        instance.read_base_control_values();
-        instance.read_system_values();
         instance.read_sdl_values();
         instance.save_sdl_values();
         instance
@@ -219,7 +222,7 @@ impl SdlConfig {
     /// Maps to C++ `SdlConfig::ReloadAllValues`.
     pub fn reload_all_values(&mut self) {
         // Upstream: Reload(); ReadSdlValues(); SaveSdlValues();
-        log::warn!("SdlConfig::reload_all_values: Config::Reload not yet ported");
+        self.base.reload();
         self.read_sdl_values();
         self.save_sdl_values();
     }
@@ -229,7 +232,7 @@ impl SdlConfig {
     /// Maps to C++ `SdlConfig::SaveAllValues`.
     pub fn save_all_values(&mut self) {
         // Upstream: SaveValues(); SaveSdlValues();
-        log::warn!("SdlConfig::save_all_values: Config::SaveValues not yet ported");
+        self.base.save_values();
         self.save_sdl_values();
     }
 
@@ -237,38 +240,11 @@ impl SdlConfig {
     // Read helpers
     // -----------------------------------------------------------------------
 
-    /// Runs the `Config::ReadPlayerValues` part of base `ReadControlValues`.
-    ///
-    /// Upstream executes this from `Config::Initialize` before the derived
-    /// `ReadSdlValues` pass fills the SDL bindings.
-    fn read_base_control_values(&mut self) {
-        self.base.begin_group("Controls");
-        {
-            let mut values = common::settings::values_mut();
-            values.players.set_global(true);
-        }
-        let player_count = common::settings::values().players.get_value().len();
-        for player_index in 0..player_count {
-            self.base.read_player_values(player_index);
-        }
-        self.base.end_group();
-    }
-
     /// Reads all SDL-specific config values.
     ///
     /// Maps to C++ `SdlConfig::ReadSdlValues`.
     fn read_sdl_values(&mut self) {
         self.read_sdl_control_values();
-    }
-
-    /// Reads the subset of global System settings needed by the SDL frontend.
-    ///
-    /// Upstream `Config::ReadSystemValues` calls `ReadCategory(System)`, which
-    /// includes `rng_seed_enabled` and `rng_seed`. The full frontend_common
-    /// Config layer is not ported yet, so keep this narrow bridge in the SDL
-    /// config owner instead of applying RNG policy in `main.rs`.
-    fn read_system_values(&mut self) {
-        self.base.read_system_values();
     }
 
     /// Reads SDL control (button/analog/motion) config values.
@@ -370,8 +346,11 @@ impl SdlConfig {
     fn save_sdl_values(&mut self) {
         // Upstream: LOG_DEBUG(Config, "Saving SDL configuration values")
         //           SaveSdlControlValues(); WriteToIni()
-        log::debug!("SdlConfig::save_sdl_values: Config::WriteToIni not yet ported");
+        log::debug!("Saving SDL configuration values");
         self.save_sdl_control_values();
+        if let Err(error) = self.base.write_to_ini() {
+            log::error!("Config file could not be saved: {error}");
+        }
     }
 
     /// Saves SDL control (button/analog/motion) config values.
@@ -499,10 +478,15 @@ impl Drop for SdlConfig {
 
 #[cfg(test)]
 mod tests {
-    use super::{read_sdl_player_values_into, resolve_config_path, DEFAULT_BUTTONS, NUM_BUTTONS};
+    use super::{
+        read_sdl_player_values_into, resolve_config_path, SdlConfig, DEFAULT_BUTTONS, NUM_BUTTONS,
+    };
     use common::param_package::ParamPackage;
+    use common::settings_enums::RendererBackend;
     use common::settings_input::{native_button, PlayerInput};
     use frontend_common::config::{BaseConfig, ConfigType};
+
+    static SETTINGS_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
     fn default_button_array_matches_upstream_zero_initialization() {
@@ -537,8 +521,94 @@ mod tests {
     #[test]
     fn explicit_config_path_is_used_verbatim() {
         assert_eq!(
-            resolve_config_path(Some("/tmp/custom-sdl2-config.ini".to_string())),
-            std::path::PathBuf::from("/tmp/custom-sdl2-config.ini")
+            resolve_config_path(Some("/tmp/custom-sdl3-config.ini".to_string())),
+            std::path::PathBuf::from("/tmp/custom-sdl3-config.ini")
         );
+    }
+
+    #[test]
+    fn constructor_applies_core_and_renderer_values_from_explicit_config() {
+        let _guard = SETTINGS_TEST_LOCK.lock().unwrap();
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "ruzu-sdl-config-{}-{unique}.ini",
+            std::process::id()
+        ));
+        std::fs::write(
+            &path,
+            r#"
+            [Core]
+            use_speed_limit\default=false
+            use_speed_limit=false
+            speed_limit\default=false
+            speed_limit=321
+
+            [Controls]
+            player_0_profile_name=command-line
+            player_0_connected\default=false
+            player_0_connected=false
+            player_0_type\default=false
+            player_0_type=5
+            player_0_vibration_enabled\default=false
+            player_0_vibration_enabled=false
+            player_0_vibration_strength\default=false
+            player_0_vibration_strength=63
+
+            [Renderer]
+            backend\default=false
+            backend=0
+            "#,
+        )
+        .unwrap();
+
+        let previous = {
+            let values = common::settings::values();
+            (
+                *values.use_speed_limit.get_value(),
+                *values.speed_limit.get_value(),
+                *values.renderer_backend.get_value(),
+                values.players.clone(),
+            )
+        };
+
+        let config = SdlConfig::new(Some(path.to_string_lossy().into_owned()));
+
+        {
+            let values = common::settings::values();
+            assert!(!*values.use_speed_limit.get_value());
+            assert_eq!(*values.speed_limit.get_value(), 321);
+            assert_eq!(
+                *values.renderer_backend.get_value(),
+                RendererBackend::OpenGlGlsl
+            );
+            let player = &values.players.get_value()[0];
+            assert_eq!(player.profile_name, "command-line");
+            assert!(!player.connected);
+            assert_eq!(
+                player.controller_type,
+                common::settings_input::ControllerType::GameCube
+            );
+            assert!(!player.vibration_enabled);
+            assert_eq!(player.vibration_strength, 63);
+        }
+
+        let rewritten = std::fs::read_to_string(&path).unwrap();
+        assert!(rewritten.lines().any(|line| line == "backend=0"));
+        assert!(rewritten.lines().any(|line| line == "cpu_backend=0"));
+        assert!(!rewritten.contains("backend=OpenGL"));
+        assert!(!rewritten.contains("cpu_backend=Dynarmic"));
+
+        {
+            let mut values = common::settings::values_mut();
+            values.use_speed_limit.set_value(previous.0);
+            values.speed_limit.set_value(previous.1);
+            values.renderer_backend.set_value(previous.2);
+            values.players = previous.3;
+        }
+        drop(config);
+        std::fs::remove_file(path).unwrap();
     }
 }

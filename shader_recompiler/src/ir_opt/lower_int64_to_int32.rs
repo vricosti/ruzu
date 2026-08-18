@@ -562,6 +562,267 @@ fn lower_shift_right_arithmetic64(program: &mut Program, inst_ref: InstRef, inst
     replace_uses_with(program, inst_ref, replacement);
 }
 
+fn lower_iabs64(program: &mut Program, inst_ref: InstRef, inst: &Inst) {
+    let block = program.block_mut(inst_ref.block);
+    let (lo, hi) = unpack(block, inst_ref.block, inst_ref.inst, inst.args[0]);
+    let lo_not = insert_before(
+        block,
+        inst_ref.block,
+        inst_ref.inst,
+        Opcode::BitwiseNot32,
+        vec![lo],
+    );
+    let neg_lo = insert_before(
+        block,
+        inst_ref.block,
+        inst_ref.inst,
+        Opcode::IAdd32,
+        vec![lo_not, Value::ImmU32(1)],
+    );
+    let carry_flag = insert_pseudo_before(
+        block,
+        inst_ref.block,
+        inst_ref.inst,
+        Opcode::GetCarryFromOp,
+        neg_lo,
+    );
+    let carry = insert_before(
+        block,
+        inst_ref.block,
+        inst_ref.inst,
+        Opcode::SelectU32,
+        vec![carry_flag, Value::ImmU32(1), Value::ImmU32(0)],
+    );
+    let hi_not = insert_before(
+        block,
+        inst_ref.block,
+        inst_ref.inst,
+        Opcode::BitwiseNot32,
+        vec![hi],
+    );
+    let neg_hi = insert_before(
+        block,
+        inst_ref.block,
+        inst_ref.inst,
+        Opcode::IAdd32,
+        vec![hi_not, carry],
+    );
+    let sign = insert_before(
+        block,
+        inst_ref.block,
+        inst_ref.inst,
+        Opcode::BitwiseAnd32,
+        vec![hi, Value::ImmU32(0x8000_0000)],
+    );
+    let is_negative = insert_before(
+        block,
+        inst_ref.block,
+        inst_ref.inst,
+        Opcode::INotEqual,
+        vec![sign, Value::ImmU32(0)],
+    );
+    let ret_lo = insert_before(
+        block,
+        inst_ref.block,
+        inst_ref.inst,
+        Opcode::SelectU32,
+        vec![is_negative, neg_lo, lo],
+    );
+    let ret_hi = insert_before(
+        block,
+        inst_ref.block,
+        inst_ref.inst,
+        Opcode::SelectU32,
+        vec![is_negative, neg_hi, hi],
+    );
+    let replacement = composite_pair(block, inst_ref.block, inst_ref.inst, ret_lo, ret_hi);
+    replace_uses_with(program, inst_ref, replacement);
+}
+
+fn lower_select_u64(program: &mut Program, inst_ref: InstRef, inst: &Inst) {
+    let block = program.block_mut(inst_ref.block);
+    let condition = inst.args[0];
+    let (true_lo, true_hi) = unpack(block, inst_ref.block, inst_ref.inst, inst.args[1]);
+    let (false_lo, false_hi) = unpack(block, inst_ref.block, inst_ref.inst, inst.args[2]);
+    let ret_lo = insert_before(
+        block,
+        inst_ref.block,
+        inst_ref.inst,
+        Opcode::SelectU32,
+        vec![condition, true_lo, false_lo],
+    );
+    let ret_hi = insert_before(
+        block,
+        inst_ref.block,
+        inst_ref.inst,
+        Opcode::SelectU32,
+        vec![condition, true_hi, false_hi],
+    );
+    let replacement = composite_pair(block, inst_ref.block, inst_ref.inst, ret_lo, ret_hi);
+    replace_uses_with(program, inst_ref, replacement);
+}
+
+fn lower_undef_u64(program: &mut Program, inst_ref: InstRef) {
+    let block = program.block_mut(inst_ref.block);
+    let replacement = composite_pair(
+        block,
+        inst_ref.block,
+        inst_ref.inst,
+        Value::ImmU32(0),
+        Value::ImmU32(0),
+    );
+    replace_uses_with(program, inst_ref, replacement);
+}
+
+fn lower_convert_u64_u32(program: &mut Program, inst_ref: InstRef, inst: &Inst) {
+    let block = program.block_mut(inst_ref.block);
+    let replacement = composite_pair(
+        block,
+        inst_ref.block,
+        inst_ref.inst,
+        inst.args[0],
+        Value::ImmU32(0),
+    );
+    replace_uses_with(program, inst_ref, replacement);
+}
+
+fn lower_convert_u32_u64(program: &mut Program, inst_ref: InstRef, inst: &Inst) {
+    let block = program.block_mut(inst_ref.block);
+    let (lo, _) = unpack(block, inst_ref.block, inst_ref.inst, inst.args[0]);
+    replace_uses_with(program, inst_ref, lo);
+}
+
+fn lower_int_to_float64(
+    program: &mut Program,
+    inst_ref: InstRef,
+    inst: &Inst,
+    is_signed: bool,
+    dest_bits: u32,
+) {
+    let block = program.block_mut(inst_ref.block);
+    let (lo, hi) = unpack(block, inst_ref.block, inst_ref.inst, inst.args[0]);
+    let low = insert_before(
+        block,
+        inst_ref.block,
+        inst_ref.inst,
+        Opcode::ConvertF32U32,
+        vec![lo],
+    );
+    let high = insert_before(
+        block,
+        inst_ref.block,
+        inst_ref.inst,
+        if is_signed {
+            Opcode::ConvertF32S32
+        } else {
+            Opcode::ConvertF32U32
+        },
+        vec![hi],
+    );
+    let combined = insert_before(
+        block,
+        inst_ref.block,
+        inst_ref.inst,
+        Opcode::FPFma32,
+        vec![high, Value::ImmF32(4_294_967_296.0), low],
+    );
+    let replacement = match dest_bits {
+        16 => insert_before(
+            block,
+            inst_ref.block,
+            inst_ref.inst,
+            Opcode::ConvertF16F32,
+            vec![combined],
+        ),
+        32 => combined,
+        64 => insert_before(
+            block,
+            inst_ref.block,
+            inst_ref.inst,
+            Opcode::ConvertF64F32,
+            vec![combined],
+        ),
+        _ => unreachable!("upstream only requests 16, 32, or 64 bits"),
+    };
+    replace_uses_with(program, inst_ref, replacement);
+}
+
+fn lower_float_to_int64(
+    program: &mut Program,
+    inst_ref: InstRef,
+    inst: &Inst,
+    is_signed: bool,
+    src_bits: u32,
+) {
+    let block = program.block_mut(inst_ref.block);
+    let value = match src_bits {
+        16 => insert_before(
+            block,
+            inst_ref.block,
+            inst_ref.inst,
+            Opcode::ConvertF32F16,
+            vec![inst.args[0]],
+        ),
+        32 => inst.args[0],
+        64 => insert_before(
+            block,
+            inst_ref.block,
+            inst_ref.inst,
+            Opcode::ConvertF32F64,
+            vec![inst.args[0]],
+        ),
+        _ => unreachable!("upstream only accepts 16, 32, or 64 bits"),
+    };
+    let scaled = insert_before(
+        block,
+        inst_ref.block,
+        inst_ref.inst,
+        Opcode::FPMul32,
+        vec![value, Value::ImmF32(1.0 / 4_294_967_296.0)],
+    );
+    let high_f = insert_before(
+        block,
+        inst_ref.block,
+        inst_ref.inst,
+        Opcode::FPFloor32,
+        vec![scaled],
+    );
+    let hi = insert_before(
+        block,
+        inst_ref.block,
+        inst_ref.inst,
+        if is_signed {
+            Opcode::ConvertS32F32
+        } else {
+            Opcode::ConvertU32F32
+        },
+        vec![high_f],
+    );
+    let neg_scale = insert_before(
+        block,
+        inst_ref.block,
+        inst_ref.inst,
+        Opcode::FPNeg32,
+        vec![Value::ImmF32(4_294_967_296.0)],
+    );
+    let low_f = insert_before(
+        block,
+        inst_ref.block,
+        inst_ref.inst,
+        Opcode::FPFma32,
+        vec![high_f, neg_scale, value],
+    );
+    let lo = insert_before(
+        block,
+        inst_ref.block,
+        inst_ref.inst,
+        Opcode::ConvertU32F32,
+        vec![low_f],
+    );
+    let replacement = composite_pair(block, inst_ref.block, inst_ref.inst, lo, hi);
+    replace_uses_with(program, inst_ref, replacement);
+}
+
 fn replacement_opcode(opcode: Opcode) -> Option<Opcode> {
     Some(match opcode {
         Opcode::PackUint2x32 | Opcode::UnpackUint2x32 => Opcode::Identity,
@@ -575,6 +836,17 @@ fn replacement_opcode(opcode: Opcode) -> Option<Opcode> {
         Opcode::GlobalAtomicOr64 => Opcode::GlobalAtomicOr32x2,
         Opcode::GlobalAtomicXor64 => Opcode::GlobalAtomicXor32x2,
         Opcode::GlobalAtomicExchange64 => Opcode::GlobalAtomicExchange32x2,
+        Opcode::StorageAtomicIAdd64 => Opcode::StorageAtomicIAdd32x2,
+        Opcode::StorageAtomicSMin64 => Opcode::StorageAtomicSMin32x2,
+        Opcode::StorageAtomicUMin64 => Opcode::StorageAtomicUMin32x2,
+        Opcode::StorageAtomicSMax64 => Opcode::StorageAtomicSMax32x2,
+        Opcode::StorageAtomicUMax64 => Opcode::StorageAtomicUMax32x2,
+        Opcode::StorageAtomicAnd64 => Opcode::StorageAtomicAnd32x2,
+        Opcode::StorageAtomicOr64 => Opcode::StorageAtomicOr32x2,
+        Opcode::StorageAtomicXor64 => Opcode::StorageAtomicXor32x2,
+        Opcode::StorageAtomicExchange64 => Opcode::StorageAtomicExchange32x2,
+        Opcode::BitCastU64F64 => Opcode::UnpackDouble2x32,
+        Opcode::BitCastF64U64 => Opcode::PackDouble2x32,
         _ => return None,
     })
 }
@@ -595,6 +867,23 @@ fn lower(program: &mut Program, inst_ref: InstRef) {
         Opcode::ShiftLeftLogical64 => lower_shift_left_logical64(program, inst_ref, &inst),
         Opcode::ShiftRightLogical64 => lower_shift_right_logical64(program, inst_ref, &inst),
         Opcode::ShiftRightArithmetic64 => lower_shift_right_arithmetic64(program, inst_ref, &inst),
+        Opcode::IAbs64 => lower_iabs64(program, inst_ref, &inst),
+        Opcode::SelectU64 => lower_select_u64(program, inst_ref, &inst),
+        Opcode::UndefU64 => lower_undef_u64(program, inst_ref),
+        Opcode::ConvertU64U32 => lower_convert_u64_u32(program, inst_ref, &inst),
+        Opcode::ConvertU32U64 => lower_convert_u32_u64(program, inst_ref, &inst),
+        Opcode::ConvertS64F16 => lower_float_to_int64(program, inst_ref, &inst, true, 16),
+        Opcode::ConvertS64F32 => lower_float_to_int64(program, inst_ref, &inst, true, 32),
+        Opcode::ConvertS64F64 => lower_float_to_int64(program, inst_ref, &inst, true, 64),
+        Opcode::ConvertU64F16 => lower_float_to_int64(program, inst_ref, &inst, false, 16),
+        Opcode::ConvertU64F32 => lower_float_to_int64(program, inst_ref, &inst, false, 32),
+        Opcode::ConvertU64F64 => lower_float_to_int64(program, inst_ref, &inst, false, 64),
+        Opcode::ConvertF16S64 => lower_int_to_float64(program, inst_ref, &inst, true, 16),
+        Opcode::ConvertF32S64 => lower_int_to_float64(program, inst_ref, &inst, true, 32),
+        Opcode::ConvertF64S64 => lower_int_to_float64(program, inst_ref, &inst, true, 64),
+        Opcode::ConvertF16U64 => lower_int_to_float64(program, inst_ref, &inst, false, 16),
+        Opcode::ConvertF32U64 => lower_int_to_float64(program, inst_ref, &inst, false, 32),
+        Opcode::ConvertF64U64 => lower_int_to_float64(program, inst_ref, &inst, false, 64),
         _ => {}
     }
 }
@@ -695,6 +984,68 @@ mod tests {
             assert_eq!(
                 program.block(0).inst(replacement.inst).opcode,
                 Opcode::CompositeConstructU32x2
+            );
+        }
+    }
+
+    #[test]
+    fn storage_atomics_and_bitcasts_match_upstream_replacements() {
+        for (source, expected) in [
+            (Opcode::StorageAtomicIAdd64, Opcode::StorageAtomicIAdd32x2),
+            (Opcode::StorageAtomicSMin64, Opcode::StorageAtomicSMin32x2),
+            (Opcode::StorageAtomicUMin64, Opcode::StorageAtomicUMin32x2),
+            (Opcode::StorageAtomicSMax64, Opcode::StorageAtomicSMax32x2),
+            (Opcode::StorageAtomicUMax64, Opcode::StorageAtomicUMax32x2),
+            (Opcode::StorageAtomicAnd64, Opcode::StorageAtomicAnd32x2),
+            (Opcode::StorageAtomicOr64, Opcode::StorageAtomicOr32x2),
+            (Opcode::StorageAtomicXor64, Opcode::StorageAtomicXor32x2),
+            (
+                Opcode::StorageAtomicExchange64,
+                Opcode::StorageAtomicExchange32x2,
+            ),
+            (Opcode::BitCastU64F64, Opcode::UnpackDouble2x32),
+            (Opcode::BitCastF64U64, Opcode::PackDouble2x32),
+        ] {
+            let (mut program, inst) = program_with(source, vec![Value::ImmU64(0)]);
+            lower_int64_to_int32(&mut program);
+            assert_eq!(program.block(0).inst(inst.inst).opcode, expected);
+        }
+    }
+
+    #[test]
+    fn scalar_and_conversion_families_are_lowered() {
+        let cases = [
+            (Opcode::UndefU64, vec![]),
+            (Opcode::IAbs64, vec![Value::ImmU64(1)]),
+            (
+                Opcode::SelectU64,
+                vec![Value::ImmU1(true), Value::ImmU64(1), Value::ImmU64(2)],
+            ),
+            (Opcode::ConvertU64U32, vec![Value::ImmU32(1)]),
+            (Opcode::ConvertU32U64, vec![Value::ImmU64(1)]),
+            (Opcode::ConvertS64F16, vec![Value::ImmF16(0)]),
+            (Opcode::ConvertS64F32, vec![Value::ImmF32(1.0)]),
+            (Opcode::ConvertS64F64, vec![Value::ImmF64(1.0)]),
+            (Opcode::ConvertU64F16, vec![Value::ImmF16(0)]),
+            (Opcode::ConvertU64F32, vec![Value::ImmF32(1.0)]),
+            (Opcode::ConvertU64F64, vec![Value::ImmF64(1.0)]),
+            (Opcode::ConvertF16S64, vec![Value::ImmU64(1)]),
+            (Opcode::ConvertF32S64, vec![Value::ImmU64(1)]),
+            (Opcode::ConvertF64S64, vec![Value::ImmU64(1)]),
+            (Opcode::ConvertF16U64, vec![Value::ImmU64(1)]),
+            (Opcode::ConvertF32U64, vec![Value::ImmU64(1)]),
+            (Opcode::ConvertF64U64, vec![Value::ImmU64(1)]),
+        ];
+        for (opcode, args) in cases {
+            let (mut program, source) = program_with(opcode, args);
+            let consumer = program
+                .block_mut(0)
+                .append_inst(Inst::new(Opcode::Identity, vec![Value::Inst(source)]));
+            lower_int64_to_int32(&mut program);
+            assert_ne!(
+                program.block(0).inst(consumer).args[0],
+                Value::Inst(source),
+                "{opcode:?} was not lowered"
             );
         }
     }

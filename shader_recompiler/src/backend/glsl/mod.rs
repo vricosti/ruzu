@@ -49,6 +49,18 @@ pub fn emit_glsl(
     if matches!(ctx.stage, crate::stage::Stage::Fragment) && program.info.stores_frag_color[0] {
         emit_glsl_special::emit_fragment_alpha_test(&mut ctx);
     }
+    // Upstream chooses the version specifier after emitting the program,
+    // because only then is `uses_y_direction` known. Fixed-function material
+    // state is available only in the compatibility profile; all other
+    // shaders use the unsuffixed GLSL version directive.
+    ctx.header.insert_str(
+        0,
+        if ctx.uses_y_direction {
+            "#version 460 compatibility\n"
+        } else {
+            "#version 460\n"
+        },
+    );
     let mut header = std::mem::take(&mut ctx.header);
     if program.shared_memory_size > 0 {
         let max_size = profile.gl_max_compute_smem_size;
@@ -68,82 +80,6 @@ pub fn emit_glsl(
     }
     ctx.define_variables(&mut header);
     let code = std::mem::take(&mut ctx.code);
-    if std::env::var_os("RUZU_FORCE_FRAGMENT_RED").is_some()
-        && program.stage == ir::types::ShaderStage::Fragment
-    {
-        return format!("{}frag_color0=vec4(1.0,0.0,0.0,1.0);return;}}\n", header);
-    }
-    if let Ok(mode) = std::env::var("RUZU_FRAGMENT_DEBUG") {
-        if program.stage == ir::types::ShaderStage::Fragment {
-            match mode.as_str() {
-                "attr1" if program.info.loads.generic_any(1) => {
-                    return format!("{}frag_color0=abs(in_attr1);return;}}\n", header);
-                }
-                "attr2" if program.info.loads.generic_any(2) => {
-                    return format!("{}frag_color0=abs(in_attr2);return;}}\n", header);
-                }
-                "tex0_attr1" if !ctx.textures.is_empty() && program.info.loads.generic_any(1) => {
-                    return format!(
-                        "{}frag_color0=texture(tex{},in_attr1.xy);return;}}\n",
-                        header, ctx.textures[0].binding
-                    );
-                }
-                "tex0_attr2" if !ctx.textures.is_empty() && program.info.loads.generic_any(2) => {
-                    return format!(
-                        "{}frag_color0=texture(tex{},in_attr2.xy);return;}}\n",
-                        header, ctx.textures[0].binding
-                    );
-                }
-                "tex1_attr2" if ctx.textures.len() > 1 && program.info.loads.generic_any(2) => {
-                    return format!(
-                        "{}frag_color0=texture(tex{},in_attr2.xy);return;}}\n",
-                        header, ctx.textures[1].binding
-                    );
-                }
-                "tex0_zero" => {
-                    if let Some(texture) = ctx.textures.first() {
-                        return format!(
-                            "{}frag_color0=texture(tex{},vec2(0.0,0.0));return;}}\n",
-                            header, texture.binding
-                        );
-                    }
-                    return format!("{}frag_color0=vec4(0.0,1.0,0.0,1.0);return;}}\n", header);
-                }
-                "tex0_fetch0" => {
-                    if let Some(texture) = ctx.textures.first() {
-                        return format!(
-                            "{}frag_color0=texelFetch(tex{},ivec2(0,0),0);return;}}\n",
-                            header, texture.binding
-                        );
-                    }
-                    return format!("{}frag_color0=vec4(0.0,1.0,0.0,1.0);return;}}\n", header);
-                }
-                _ => {}
-            }
-        }
-    }
-    if std::env::var_os("RUZU_FORCE_VERTEX_TRIANGLE").is_some()
-        && matches!(
-            program.stage,
-            ir::types::ShaderStage::VertexA | ir::types::ShaderStage::VertexB
-        )
-    {
-        return format!(
-            "{}vec2 p[3]=vec2[3](vec2(-1.0,-1.0),vec2(3.0,-1.0),vec2(-1.0,3.0));gl_Position=vec4(p[gl_VertexID%3],0.0,1.0);return;}}\n",
-            header
-        );
-    }
-    if std::env::var_os("RUZU_FORCE_VERTEX_INDEXED_QUAD").is_some()
-        && matches!(
-            program.stage,
-            ir::types::ShaderStage::VertexA | ir::types::ShaderStage::VertexB
-        )
-    {
-        return format!(
-            "{}vec2 p[4]=vec2[4](vec2(-1.0,-1.0),vec2(1.0,-1.0),vec2(-1.0,1.0),vec2(1.0,1.0));gl_Position=vec4(p[gl_VertexID&3],0.0,1.0);return;}}\n",
-            header
-        );
-    }
     format!("{}{}{}", header, code, "}\n")
 }
 
@@ -172,5 +108,6 @@ mod tests {
         let source = emit_glsl(&profile, &runtime_info, &mut program, &mut bindings);
 
         assert!(source.contains("shared uint smem[8];"));
+        assert!(source.starts_with("#version 460\n"));
     }
 }

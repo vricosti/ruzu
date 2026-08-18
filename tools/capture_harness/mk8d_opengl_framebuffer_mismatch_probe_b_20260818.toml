@@ -1,0 +1,27 @@
+[process]
+executable = "../../target/release/reden"
+rom_path = "/home/vricosti/Games/Emulators/Switch/common/roms/commercial/Mario Kart 8 Deluxe [NSP]/Mario Kart 8 Deluxe [0100152000022000][v0].nsp"
+args = []
+working_directory = "../.."
+log_file = "../../screenshots/reden/mk8d-opengl-framebuffer-mismatch-probe-b-20260818/process.log"
+stop_at = "00:00:35.000"
+terminate_after_timeline = true
+termination_grace_ms = 3000
+
+[process.environment]
+DISPLAY = ":0"
+RUST_LOG = "info"
+RUZU_TRACE_GL_DRAW_OUTPUT_EVERY = "5000"
+
+[capture]
+output_directory = "../../screenshots/reden/mk8d-opengl-framebuffer-mismatch-probe-b-20260818"
+target = "window"
+match_process_pid = true
+window_wait_timeout = "00:00:10"
+screenshot_prefix = "mk8d-opengl-framebuffer-mismatch-probe-b"
+times = ["00:00:25.000", "00:00:33.000"]
+
+[video]
+enabled = false
+end = "00:00:33"
+output = "unused.mp4"

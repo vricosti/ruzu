@@ -9,7 +9,8 @@
 // outside_region_storage. For accesses that span the region boundary,
 // the read is split into multiple sub-reads.
 
-use crate::file_sys::vfs::vfs_types::VirtualFile;
+use crate::file_sys::vfs::vfs::VfsFile;
+use crate::file_sys::vfs::vfs_types::{VirtualDir, VirtualFile};
 
 /// A region defined by an offset and size.
 ///
@@ -118,6 +119,45 @@ impl RegionSwitchStorage {
             }
             false
         }
+    }
+}
+
+impl VfsFile for RegionSwitchStorage {
+    fn get_name(&self) -> String {
+        String::from("RegionSwitchStorage")
+    }
+
+    fn get_size(&self) -> usize {
+        self.get_size()
+    }
+
+    fn resize(&self, _new_size: usize) -> bool {
+        false
+    }
+
+    fn get_containing_directory(&self) -> Option<VirtualDir> {
+        None
+    }
+
+    fn is_writable(&self) -> bool {
+        false
+    }
+
+    fn is_readable(&self) -> bool {
+        true
+    }
+
+    fn read(&self, data: &mut [u8], length: usize, offset: usize) -> usize {
+        let actual = length.min(data.len());
+        self.read(&mut data[..actual], actual, offset)
+    }
+
+    fn write(&self, _data: &[u8], _length: usize, _offset: usize) -> usize {
+        0
+    }
+
+    fn rename(&self, _new_name: &str) -> bool {
+        false
     }
 }
 

@@ -15,6 +15,7 @@ pub mod core_timing;
 pub mod cpu_manager;
 pub mod device_memory;
 pub mod device_memory_manager;
+pub mod game_settings;
 pub mod gpu_core;
 pub mod gpu_dirty_memory_manager;
 pub mod guest_memory;

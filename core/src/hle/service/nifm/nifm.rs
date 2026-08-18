@@ -14,6 +14,7 @@ use crate::hle::service::hle_ipc::{
 };
 use crate::hle::service::ipc_helpers::{RequestParser, ResponseBuilder};
 use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
+use crate::internal_network::emu_net_state::{refresh_from_host, EmuNetState};
 use crate::internal_network::network::{get_host_ipv4_address, translate_ipv4};
 use crate::internal_network::network_interface::get_selected_network_interface;
 
@@ -325,11 +326,17 @@ pub mod general_service_commands {
     pub const GET_CURRENT_IP_ADDRESS: u32 = 12;
     pub const CREATE_TEMPORARY_NETWORK_PROFILE: u32 = 14;
     pub const GET_CURRENT_IP_CONFIG_INFO: u32 = 15;
+    pub const SET_WIRELESS_COMMUNICATION_ENABLED: u32 = 16;
     pub const IS_WIRELESS_COMMUNICATION_ENABLED: u32 = 17;
     pub const GET_INTERNET_CONNECTION_STATUS: u32 = 18;
+    pub const SET_ETHERNET_COMMUNICATION_ENABLED: u32 = 19;
     pub const IS_ETHERNET_COMMUNICATION_ENABLED: u32 = 20;
     pub const IS_ANY_INTERNET_REQUEST_ACCEPTED: u32 = 21;
     pub const IS_ANY_FOREGROUND_REQUEST_ACCEPTED: u32 = 22;
+}
+
+fn internet_connection_available(has_host_address: bool, airplane_mode: bool) -> bool {
+    has_host_address && !airplane_mode
 }
 
 /// IPC command IDs for IRequest
@@ -521,7 +528,10 @@ impl IRequest {
         let this = unsafe { &mut *(std::ptr::addr_of!(*this).cast::<IRequest>().cast_mut()) };
         log::debug!("(STUBBED) IRequest::GetResult called");
 
-        let has_connection = get_host_ipv4_address().is_some();
+        let has_connection = internet_connection_available(
+            get_host_ipv4_address().is_some(),
+            *common::settings::values().airplane_mode.get_value(),
+        );
         let result = match this.state {
             RequestState::NotSubmitted => {
                 if has_connection {
@@ -738,7 +748,11 @@ impl IGeneralService {
                 Some(IGeneralService::get_current_ip_config_info_handler),
                 "GetCurrentIpConfigInfo",
             ),
-            (16, None, "SetWirelessCommunicationEnabled"),
+            (
+                general_service_commands::SET_WIRELESS_COMMUNICATION_ENABLED,
+                Some(IGeneralService::set_wireless_communication_enabled_handler),
+                "SetWirelessCommunicationEnabled",
+            ),
             (
                 general_service_commands::IS_WIRELESS_COMMUNICATION_ENABLED,
                 Some(IGeneralService::is_wireless_communication_enabled_handler),
@@ -749,7 +763,11 @@ impl IGeneralService {
                 Some(IGeneralService::get_internet_connection_status_handler),
                 "GetInternetConnectionStatus",
             ),
-            (19, None, "SetEthernetCommunicationEnabled"),
+            (
+                general_service_commands::SET_ETHERNET_COMMUNICATION_ENABLED,
+                Some(IGeneralService::set_ethernet_communication_enabled_handler),
+                "SetEthernetCommunicationEnabled",
+            ),
             (
                 general_service_commands::IS_ETHERNET_COMMUNICATION_ENABLED,
                 Some(IGeneralService::is_ethernet_communication_enabled_handler),
@@ -880,21 +898,50 @@ impl IGeneralService {
         _this: &dyn ServiceFramework,
         ctx: &mut HLERequestContext,
     ) {
-        log::warn!("(STUBBED) IGeneralService::IsWirelessCommunicationEnabled called");
         let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
         rb.push_result(RESULT_SUCCESS);
-        rb.push_u8(1);
+        rb.push_u8(if *common::settings::values().airplane_mode.get_value() {
+            0
+        } else {
+            1
+        });
+    }
+
+    fn set_wireless_communication_enabled_handler(
+        _this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        let mut rp = RequestParser::new(ctx);
+        let enable = rp.pop_u8();
+        common::settings::values_mut()
+            .airplane_mode
+            .set_value(enable == 0);
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
     }
 
     fn get_internet_connection_status_handler(
         _this: &dyn ServiceFramework,
         ctx: &mut HLERequestContext,
     ) {
-        log::warn!("(STUBBED) IGeneralService::GetInternetConnectionStatus called");
-        let out = InternetConnectionStatusOutput {
-            interface_type: NetworkInterfaceType::WiFiIeee80211 as u8,
-            wifi_strength: 3,
-            state: InternetConnectionStatus::Connected as u8,
+        refresh_from_host();
+        let state = EmuNetState::get().lock();
+        let out = if state.connected {
+            InternetConnectionStatusOutput {
+                interface_type: if state.via_wifi {
+                    NetworkInterfaceType::WiFiIeee80211 as u8
+                } else {
+                    NetworkInterfaceType::Ethernet as u8
+                },
+                wifi_strength: state.bars,
+                state: InternetConnectionStatus::Connected as u8,
+            }
+        } else {
+            InternetConnectionStatusOutput {
+                interface_type: NetworkInterfaceType::WiFiIeee80211 as u8,
+                wifi_strength: 0,
+                state: InternetConnectionStatus::ConnectingUnknown1 as u8,
+            }
         };
         let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
         rb.push_result(RESULT_SUCCESS);
@@ -908,11 +955,30 @@ impl IGeneralService {
         log::warn!("(STUBBED) IGeneralService::IsEthernetCommunicationEnabled called");
         let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
         rb.push_result(RESULT_SUCCESS);
-        rb.push_u8(if get_host_ipv4_address().is_some() {
-            1
-        } else {
-            0
-        });
+        rb.push_u8(
+            if internet_connection_available(
+                get_host_ipv4_address().is_some(),
+                *common::settings::values().airplane_mode.get_value(),
+            ) {
+                1
+            } else {
+                0
+            },
+        );
+    }
+
+    fn set_ethernet_communication_enabled_handler(
+        _this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        use std::sync::atomic::Ordering;
+
+        let mut rp = RequestParser::new(ctx);
+        EmuNetState::get()
+            .ethernet_enabled
+            .store(rp.pop_u8() != 0, Ordering::Relaxed);
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
     }
 
     fn is_any_internet_request_accepted_handler(
@@ -922,11 +988,16 @@ impl IGeneralService {
         log::error!("(STUBBED) IGeneralService::IsAnyInternetRequestAccepted called");
         let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
         rb.push_result(RESULT_SUCCESS);
-        rb.push_u8(if get_host_ipv4_address().is_some() {
-            1
-        } else {
-            0
-        });
+        rb.push_u8(
+            if internet_connection_available(
+                get_host_ipv4_address().is_some(),
+                *common::settings::values().airplane_mode.get_value(),
+            ) {
+                1
+            } else {
+                0
+            },
+        );
     }
 
     fn is_any_foreground_request_accepted_handler(
@@ -1059,4 +1130,29 @@ pub fn loop_process(system: crate::core::SystemRef) {
     }
 
     ServerManager::run_server_shared(server_manager);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn airplane_mode_suppresses_host_connectivity() {
+        assert!(internet_connection_available(true, false));
+        assert!(!internet_connection_available(true, true));
+        assert!(!internet_connection_available(false, false));
+    }
+
+    #[test]
+    fn wireless_and_ethernet_commands_are_registered() {
+        let service = IGeneralService::new();
+        assert!(service
+            .handlers
+            .get(&general_service_commands::SET_WIRELESS_COMMUNICATION_ENABLED)
+            .is_some_and(|entry| entry.handler_callback.is_some()));
+        assert!(service
+            .handlers
+            .get(&general_service_commands::SET_ETHERNET_COMMUNICATION_ENABLED)
+            .is_some_and(|entry| entry.handler_callback.is_some()));
+    }
 }

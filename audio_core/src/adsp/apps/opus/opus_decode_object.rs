@@ -1,132 +1,28 @@
-use crate::adsp::apps::opus::shared_memory::SharedMemory;
-use crate::errors::RESULT_LIB_OPUS_INVALID_STATE;
-use crate::opus::hardware_opus::HardwareOpus;
-use crate::Result;
-use common::ResultCode;
+use std::ffi::{c_int, c_void};
 use std::mem::size_of;
 
 pub const DECODE_OBJECT_MAGIC: u32 = 0xDEAD_BEEF;
-pub const FLAG_INITIALIZED: u32 = 1 << 0;
-pub const FLAG_MULTI_STREAM: u32 = 1 << 1;
-pub const FLAG_MAPPED: u32 = 1 << 2;
 
-#[repr(C)]
-#[derive(Clone, Copy, Default)]
-pub struct DecodeObjectHeader {
-    pub magic: u32,
-    pub sample_rate: u32,
-    pub channel_count: u32,
-    pub total_stream_count: u32,
-    pub stereo_stream_count: u32,
-    pub _reserved0: u32,
-    pub buffer_size: u64,
-    pub final_range: u32,
-    pub flags: u32,
-}
+pub(crate) const OPUS_OK: c_int = 0;
+pub(crate) const OPUS_INVALID_PACKET: c_int = -4;
+pub(crate) const OPUS_INVALID_STATE: c_int = -6;
+const OPUS_RESET_STATE: c_int = 4028;
+const OPUS_GET_FINAL_RANGE_REQUEST: c_int = 4031;
+const OPUS_DECODE_OBJECT_SIZE: u32 = 0x20;
 
-impl DecodeObjectHeader {
-    pub fn read(shared: &SharedMemory, buffer: u64) -> Option<Self> {
-        let raw = shared.read_transfer(buffer as usize, size_of::<DecodeObjectHeader>())?;
-        Some(Self {
-            magic: u32::from_ne_bytes(raw[0..4].try_into().unwrap_or([0; 4])),
-            sample_rate: u32::from_ne_bytes(raw[4..8].try_into().unwrap_or([0; 4])),
-            channel_count: u32::from_ne_bytes(raw[8..12].try_into().unwrap_or([0; 4])),
-            total_stream_count: u32::from_ne_bytes(raw[12..16].try_into().unwrap_or([0; 4])),
-            stereo_stream_count: u32::from_ne_bytes(raw[16..20].try_into().unwrap_or([0; 4])),
-            _reserved0: u32::from_ne_bytes(raw[20..24].try_into().unwrap_or([0; 4])),
-            buffer_size: u64::from_ne_bytes(raw[24..32].try_into().unwrap_or([0; 8])),
-            final_range: u32::from_ne_bytes(raw[32..36].try_into().unwrap_or([0; 4])),
-            flags: u32::from_ne_bytes(raw[36..40].try_into().unwrap_or([0; 4])),
-        })
-    }
-
-    pub fn write(self, shared: &mut SharedMemory, buffer: u64) -> bool {
-        let mut raw = [0u8; size_of::<DecodeObjectHeader>()];
-        raw[0..4].copy_from_slice(&self.magic.to_ne_bytes());
-        raw[4..8].copy_from_slice(&self.sample_rate.to_ne_bytes());
-        raw[8..12].copy_from_slice(&self.channel_count.to_ne_bytes());
-        raw[12..16].copy_from_slice(&self.total_stream_count.to_ne_bytes());
-        raw[16..20].copy_from_slice(&self.stereo_stream_count.to_ne_bytes());
-        raw[20..24].copy_from_slice(&self._reserved0.to_ne_bytes());
-        raw[24..32].copy_from_slice(&self.buffer_size.to_ne_bytes());
-        raw[32..36].copy_from_slice(&self.final_range.to_ne_bytes());
-        raw[36..40].copy_from_slice(&self.flags.to_ne_bytes());
-        shared.write_transfer(buffer as usize, &raw)
-    }
-
-    pub fn clear(shared: &mut SharedMemory, buffer: u64) -> bool {
-        Self::default().write(shared, buffer)
-    }
-
-    pub fn write_final_range(shared: &mut SharedMemory, buffer: u64, final_range: u32) -> bool {
-        let Some(mut header) = Self::read(shared, buffer) else {
-            return false;
-        };
-        header.final_range = final_range;
-        header.write(shared, buffer)
-    }
-
-    pub fn is_initialized(&self) -> bool {
-        self.magic == DECODE_OBJECT_MAGIC && (self.flags & FLAG_INITIALIZED) != 0
-    }
-
-    pub fn is_multi_stream(&self) -> bool {
-        (self.flags & FLAG_MULTI_STREAM) != 0
-    }
-
-    pub fn is_mapped(&self) -> bool {
-        (self.flags & FLAG_MAPPED) != 0
-    }
-
-    pub fn matches_buffer_size(&self, buffer_size: u64) -> bool {
-        self.buffer_size == buffer_size
-    }
-
-    pub fn matches_single_config(
-        &self,
-        sample_rate: u32,
-        channel_count: u32,
-        buffer_size: u64,
-    ) -> bool {
-        self.is_initialized()
-            && !self.is_multi_stream()
-            && self.sample_rate == sample_rate
-            && self.channel_count == channel_count
-            && self.matches_buffer_size(buffer_size)
-    }
-
-    pub fn matches_multi_stream_config(
-        &self,
-        sample_rate: u32,
-        channel_count: u32,
-        total_stream_count: u32,
-        stereo_stream_count: u32,
-        buffer_size: u64,
-    ) -> bool {
-        self.is_initialized()
-            && self.is_multi_stream()
-            && self.sample_rate == sample_rate
-            && self.channel_count == channel_count
-            && self.total_stream_count == total_stream_count
-            && self.stereo_stream_count == stereo_stream_count
-            && self.matches_buffer_size(buffer_size)
-    }
-
-    pub fn can_decode_single(&self) -> bool {
-        self.is_initialized() && self.is_mapped() && !self.is_multi_stream()
-    }
-
-    pub fn can_decode_multi_stream(&self) -> bool {
-        self.is_initialized() && self.is_mapped() && self.is_multi_stream()
-    }
-
-    pub fn set_mapped(&mut self, mapped: bool) {
-        if mapped {
-            self.flags |= FLAG_MAPPED;
-        } else {
-            self.flags &= !FLAG_MAPPED;
-        }
-    }
+#[link(name = "opus")]
+unsafe extern "C" {
+    fn opus_decoder_get_size(channels: c_int) -> c_int;
+    fn opus_decoder_init(st: *mut c_void, sample_rate: c_int, channels: c_int) -> c_int;
+    fn opus_decode(
+        st: *mut c_void,
+        data: *const u8,
+        len: c_int,
+        pcm: *mut i16,
+        frame_size: c_int,
+        decode_fec: c_int,
+    ) -> c_int;
+    fn opus_decoder_ctl(st: *mut c_void, request: c_int, ...) -> c_int;
 }
 
 pub struct OpusDecodeObject {
@@ -135,10 +31,7 @@ pub struct OpusDecodeObject {
     state_valid: bool,
     self_buffer: u64,
     final_range: u32,
-    hardware_opus: HardwareOpus,
-    sample_rate: u32,
-    channel_count: u32,
-    buffer_size: u64,
+    decoder_storage: Vec<usize>,
 }
 
 impl OpusDecodeObject {
@@ -150,7 +43,11 @@ impl OpusDecodeObject {
         if !Self::is_valid_channel_count(channel_count) {
             return 0;
         }
-        HardwareOpus::new().get_work_buffer_size(channel_count)
+        let decoder_size = unsafe { opus_decoder_get_size(channel_count as c_int) };
+        if decoder_size <= 0 {
+            return 0;
+        }
+        OPUS_DECODE_OBJECT_SIZE + decoder_size as u32
     }
 
     pub fn initialize(buffer: u64, comparison_buffer: u64, existing: Option<Self>) -> Self {
@@ -179,248 +76,176 @@ impl OpusDecodeObject {
                 state_valid: true,
                 self_buffer: buffer,
                 final_range: 0,
-                hardware_opus: HardwareOpus::new(),
-                sample_rate: 0,
-                channel_count: 0,
-                buffer_size: 0,
+                decoder_storage: Vec::new(),
             },
         }
     }
 
-    pub fn initialize_decoder(
-        &mut self,
-        sample_rate: u32,
-        channel_count: u32,
-        buffer_size: u64,
-    ) -> Result {
+    pub fn initialize_decoder(&mut self, sample_rate: u32, channel_count: u32) -> c_int {
         if !self.state_valid {
-            return RESULT_LIB_OPUS_INVALID_STATE;
+            return OPUS_INVALID_STATE;
         }
         if self.initialized {
-            return ResultCode::SUCCESS;
+            return OPUS_OK;
         }
-        let result =
-            self.hardware_opus
-                .initialize_decode_object(sample_rate, channel_count, buffer_size);
-        if result.is_success() {
+        let decoder_size = unsafe { opus_decoder_get_size(channel_count as c_int) };
+        if decoder_size <= 0 {
+            return -1;
+        }
+        let word_size = size_of::<usize>();
+        self.decoder_storage = vec![0; (decoder_size as usize).div_ceil(word_size)];
+        let result = unsafe {
+            opus_decoder_init(
+                self.decoder_storage.as_mut_ptr().cast(),
+                sample_rate as c_int,
+                channel_count as c_int,
+            )
+        };
+        if result == OPUS_OK {
             self.magic = DECODE_OBJECT_MAGIC;
             self.initialized = true;
             self.state_valid = true;
             self.final_range = 0;
-            self.sample_rate = sample_rate;
-            self.channel_count = channel_count;
-            self.buffer_size = buffer_size;
         }
         result
     }
 
-    pub fn shutdown(&mut self) -> Result {
+    pub fn shutdown(&mut self) -> c_int {
         if !self.state_valid {
-            return RESULT_LIB_OPUS_INVALID_STATE;
+            return OPUS_INVALID_STATE;
         }
         if self.initialized {
-            let result = self.hardware_opus.shutdown_decode_object(self.buffer_size);
-            if result.is_error() {
-                return result;
-            }
             self.magic = 0;
             self.initialized = false;
             self.state_valid = false;
             self.self_buffer = 0;
             self.final_range = 0;
-            self.sample_rate = 0;
-            self.channel_count = 0;
-            self.buffer_size = 0;
+            self.decoder_storage.clear();
         }
-        ResultCode::SUCCESS
+        OPUS_OK
     }
 
-    pub fn reset_decoder(&mut self) -> Result {
+    pub fn reset_decoder(&mut self) -> c_int {
         if !self.state_valid || !self.initialized {
-            return RESULT_LIB_OPUS_INVALID_STATE;
+            return OPUS_INVALID_STATE;
         }
-        self.hardware_opus.reset_decode_object()
+        let result =
+            unsafe { opus_decoder_ctl(self.decoder_storage.as_mut_ptr().cast(), OPUS_RESET_STATE) };
+        result
     }
 
     pub fn decode(
         &mut self,
         out_sample_count: &mut u32,
         output_data: &mut [u8],
-        channel_count: u32,
         input_data: &[u8],
-        out_time_taken: &mut u64,
-    ) -> Result {
+    ) -> c_int {
         if !self.state_valid || !self.initialized {
-            return RESULT_LIB_OPUS_INVALID_STATE;
+            return OPUS_INVALID_STATE;
         }
-        self.hardware_opus.decode_interleaved(
-            out_sample_count,
-            output_data,
-            channel_count,
-            input_data,
-            out_time_taken,
-            false,
-        )
+        *out_sample_count = 0;
+        if self.decoder_storage.is_empty() {
+            return OPUS_INVALID_STATE;
+        }
+
+        let decoded = unsafe {
+            opus_decode(
+                self.decoder_storage.as_mut_ptr().cast(),
+                input_data.as_ptr(),
+                input_data.len() as c_int,
+                output_data.as_mut_ptr().cast(),
+                output_data.len() as c_int,
+                0,
+            )
+        };
+        if decoded < OPUS_OK {
+            return decoded;
+        }
+
+        *out_sample_count = decoded as u32;
+        let mut final_range = 0u32;
+        let result = unsafe {
+            opus_decoder_ctl(
+                self.decoder_storage.as_mut_ptr().cast(),
+                OPUS_GET_FINAL_RANGE_REQUEST,
+                &mut final_range as *mut u32,
+            )
+        };
+        self.final_range = final_range;
+        result
     }
 
     pub fn get_final_range(&self) -> u32 {
         self.final_range
     }
+}
 
-    pub fn set_final_range(&mut self, final_range: u32) {
-        self.final_range = final_range;
+#[cfg(test)]
+pub(crate) mod tests {
+    use super::*;
+
+    const OPUS_APPLICATION_AUDIO: c_int = 2049;
+
+    #[link(name = "opus")]
+    unsafe extern "C" {
+        fn opus_encoder_create(
+            sample_rate: c_int,
+            channels: c_int,
+            application: c_int,
+            error: *mut c_int,
+        ) -> *mut c_void;
+        fn opus_encode(
+            st: *mut c_void,
+            pcm: *const i16,
+            frame_size: c_int,
+            data: *mut u8,
+            max_data_bytes: c_int,
+        ) -> c_int;
+        fn opus_encoder_destroy(st: *mut c_void);
     }
 
-    pub fn header(&self) -> DecodeObjectHeader {
-        DecodeObjectHeader {
-            magic: DECODE_OBJECT_MAGIC,
-            sample_rate: self.sample_rate,
-            channel_count: self.channel_count,
-            total_stream_count: 0,
-            stereo_stream_count: 0,
-            _reserved0: 0,
-            buffer_size: self.buffer_size,
-            final_range: self.final_range,
-            flags: FLAG_INITIALIZED | FLAG_MAPPED,
+    pub(crate) fn encoded_stereo_packet() -> Vec<u8> {
+        let mut error = 0;
+        let encoder = unsafe { opus_encoder_create(48_000, 2, OPUS_APPLICATION_AUDIO, &mut error) };
+        assert_eq!(error, OPUS_OK);
+        assert!(!encoder.is_null());
+
+        let mut pcm = vec![0i16; 960 * 2];
+        for frame in 0..960 {
+            let sample = (((frame % 96) as i16) - 48) * 400;
+            pcm[frame * 2] = sample;
+            pcm[frame * 2 + 1] = sample;
         }
-    }
-
-    pub fn matches_config(
-        shared: &SharedMemory,
-        buffer: u64,
-        sample_rate: u32,
-        channel_count: u32,
-        buffer_size: u64,
-    ) -> bool {
-        let Some(header) = DecodeObjectHeader::read(shared, buffer) else {
-            return false;
+        let mut packet = vec![0u8; 4_000];
+        let packet_size = unsafe {
+            opus_encode(
+                encoder,
+                pcm.as_ptr(),
+                960,
+                packet.as_mut_ptr(),
+                packet.len() as c_int,
+            )
         };
-        header.matches_single_config(sample_rate, channel_count, buffer_size)
+        unsafe { opus_encoder_destroy(encoder) };
+        assert!(packet_size > 0);
+        packet.truncate(packet_size as usize);
+        packet
     }
 
-    pub fn write_successful_header(
-        shared: &mut SharedMemory,
-        buffer: u64,
-        sample_rate: u32,
-        channel_count: u32,
-        buffer_size: u64,
-    ) -> bool {
-        DecodeObjectHeader {
-            magic: DECODE_OBJECT_MAGIC,
-            sample_rate,
-            channel_count,
-            total_stream_count: 0,
-            stereo_stream_count: 0,
-            _reserved0: 0,
-            buffer_size,
-            final_range: 0,
-            flags: FLAG_INITIALIZED | FLAG_MAPPED,
-        }
-        .write(shared, buffer)
-    }
+    #[test]
+    fn decodes_non_silent_pcm_with_libopus() {
+        let mut object = OpusDecodeObject::initialize(0x1000, 0x1000, None);
+        assert_eq!(object.initialize_decoder(48_000, 2), OPUS_OK);
 
-    pub fn shutdown_with_header(
-        &mut self,
-        shared: &mut SharedMemory,
-        buffer: u64,
-        buffer_size: u64,
-    ) -> Result {
-        let Some(header) = DecodeObjectHeader::read(shared, buffer) else {
-            return RESULT_LIB_OPUS_INVALID_STATE;
-        };
-        if !header.matches_single_config(header.sample_rate, header.channel_count, buffer_size) {
-            return RESULT_LIB_OPUS_INVALID_STATE;
-        }
-        let result = self.shutdown();
-        if result.is_success() {
-            let _ = DecodeObjectHeader::clear(shared, buffer);
-        }
-        result
-    }
-
-    pub fn map_memory(
-        shared: &mut SharedMemory,
-        buffer: u64,
-        buffer_size: u64,
-        mapped: bool,
-    ) -> Result {
-        let Some(mut header) = DecodeObjectHeader::read(shared, buffer) else {
-            return RESULT_LIB_OPUS_INVALID_STATE;
-        };
-        if !header.is_initialized() || !header.matches_buffer_size(buffer_size) {
-            return RESULT_LIB_OPUS_INVALID_STATE;
-        }
-        header.set_mapped(mapped);
-        if header.write(shared, buffer) {
-            ResultCode::SUCCESS
-        } else {
-            RESULT_LIB_OPUS_INVALID_STATE
-        }
-    }
-
-    pub fn decode_packet(
-        &mut self,
-        object_header: &DecodeObjectHeader,
-        payload: &[u8],
-        output: &mut [u8],
-        decoded_samples: &mut u32,
-        time_taken: &mut u64,
-        packet_final_range: u32,
-        expected_final_range: u32,
-        decoded_final_range: &mut Option<u32>,
-    ) -> Result {
-        if !object_header.can_decode_single() {
-            return RESULT_LIB_OPUS_INVALID_STATE;
-        }
-        let result = self.decode(
-            decoded_samples,
-            output,
-            object_header.channel_count,
-            payload,
-            time_taken,
+        let packet = encoded_stereo_packet();
+        let mut output = vec![0u8; 960 * 2 * size_of::<i16>()];
+        let mut sample_count = 0;
+        assert_eq!(
+            object.decode(&mut sample_count, &mut output, &packet),
+            OPUS_OK
         );
-        if result.is_error() {
-            return result;
-        }
-        if expected_final_range != 0 && packet_final_range != expected_final_range {
-            return RESULT_LIB_OPUS_INVALID_STATE;
-        }
-        self.set_final_range(packet_final_range);
-        *decoded_final_range = Some(self.get_final_range());
-        ResultCode::SUCCESS
-    }
-
-    pub fn decode_interleaved_message(
-        &mut self,
-        shared: &SharedMemory,
-        buffer: u64,
-        payload: &[u8],
-        output: &mut [u8],
-        decoded_samples: &mut u32,
-        time_taken: &mut u64,
-        packet_final_range: u32,
-        expected_final_range: u32,
-        reset_requested: bool,
-        decoded_final_range: &mut Option<u32>,
-    ) -> Result {
-        let Some(object_header) = DecodeObjectHeader::read(shared, buffer) else {
-            return RESULT_LIB_OPUS_INVALID_STATE;
-        };
-        if reset_requested {
-            let result = self.reset_decoder();
-            if result.is_error() {
-                return result;
-            }
-        }
-        self.decode_packet(
-            &object_header,
-            payload,
-            output,
-            decoded_samples,
-            time_taken,
-            packet_final_range,
-            expected_final_range,
-            decoded_final_range,
-        )
+        assert_eq!(sample_count, 960);
+        assert!(output.chunks_exact(2).any(|bytes| bytes != [0, 0]));
+        assert_ne!(object.get_final_range(), 0);
     }
 }

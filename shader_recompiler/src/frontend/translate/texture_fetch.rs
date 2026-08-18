@@ -81,10 +81,8 @@ fn get_type(type_: TextureType) -> ShaderTextureType {
 }
 
 fn read_array(v: &mut TranslatorVisitor, reg: u32) -> Value {
-    let raw = v.x(reg);
-    let extracted =
-        v.ir.bit_field_u_extract(raw, Value::ImmU32(0), Value::ImmU32(16));
-    v.ir.convert_f32_from_u32(extracted)
+    let value = v.x(reg);
+    v.ir.convert_u_to_f(32, 16, value, crate::ir::types::FpControl::default())
 }
 
 fn make_coords(v: &mut TranslatorVisitor, reg: u32, type_: TextureType) -> Value {
@@ -271,6 +269,22 @@ pub fn tex_b(tv: &mut TranslatorVisitor, insn: u64, _opcode: MaxwellOpcode) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn array_layer_preserves_upstream_u16_conversion() {
+        let mut program = crate::ir::program::Program::new(crate::ir::types::ShaderStage::Fragment);
+        let block = program.add_block();
+        let mut visitor = TranslatorVisitor::new(&mut program, block);
+
+        let _ = read_array(&mut visitor, 0);
+
+        assert!(visitor
+            .ir
+            .program
+            .block(block)
+            .iter()
+            .any(|inst| { inst.opcode == crate::ir::opcodes::Opcode::ConvertF32U16 }));
+    }
 
     #[test]
     fn lod_clamp_uses_typed_upstream_not_implemented_exception() {

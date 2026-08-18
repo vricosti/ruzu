@@ -107,6 +107,35 @@ pub fn arm_asimd_sra(ir: &mut A32IREmitter, inst: &DecodedArm) -> bool {
     true
 }
 
+/// Port of upstream `TranslatorVisitor::asimd_VSHRN` through
+/// `ShiftRightNarrowing(..., Truncation, Unsigned)`.
+pub fn arm_asimd_vshrn(ir: &mut A32IREmitter, inst: &DecodedArm) -> bool {
+    let (_u, d, imm6, vd, _l, _q, m, vm) = decode_two_reg_shift(inst);
+    if (imm6 >> 3) == 0 {
+        return super::decode_error(ir);
+    }
+    if (vm & 1) != 0 {
+        return super::undefined_instruction(ir);
+    }
+
+    let (esize, shift_amount) = element_size_and_shift_amount(true, false, imm6);
+    let source_esize = 2 * esize;
+    let Some(d_reg) = to_vector_reg(false, d, vd) else {
+        return super::undefined_instruction(ir);
+    };
+    let Some(m_reg) = to_vector_reg(true, m, vm) else {
+        return super::undefined_instruction(ir);
+    };
+
+    let reg_m = ir.get_vector(m_reg);
+    let wide_result = ir
+        .ir()
+        .vector_logical_shift_right(source_esize, reg_m, shift_amount as u8);
+    let result = ir.ir().vector_narrow(source_esize, wide_result);
+    ir.set_vector(d_reg, result);
+    true
+}
+
 pub fn arm_asimd_vshl_imm(ir: &mut A32IREmitter, inst: &DecodedArm) -> bool {
     let (_u, d, imm6, vd, l, q, m, vm) = decode_two_reg_shift(inst);
     if !l && (imm6 >> 3) == 0 {
@@ -311,6 +340,20 @@ mod tests {
             arm_asimd_vqshl_imm,
         );
         assert!(opcodes.contains(&Opcode::VectorUnsignedSaturatedShiftLeft8));
+        assert_eq!(opcodes.last(), Some(&Opcode::A32SetVector));
+    }
+
+    #[test]
+    fn super_mario_party_vshrn_i64_emits_shift_then_narrow() {
+        let opcodes = translate_with(
+            DecodedArm {
+                raw: 0xF2E0_3830,
+                id: ArmInstId::ASIMD_VSHRN,
+            },
+            arm_asimd_vshrn,
+        );
+        assert!(opcodes.contains(&Opcode::VectorLogicalShiftRight64));
+        assert!(opcodes.contains(&Opcode::VectorNarrow64));
         assert_eq!(opcodes.last(), Some(&Opcode::A32SetVector));
     }
 }

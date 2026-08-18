@@ -14,6 +14,7 @@ use ash::vk;
 use super::renderer_vulkan::OwnedSurface;
 use super::scheduler::Scheduler;
 use super::swapchain::Swapchain;
+use crate::vulkan_common::vulkan_device::Device;
 use crate::vulkan_common::vulkan_surface;
 
 // ---------------------------------------------------------------------------
@@ -28,6 +29,14 @@ fn make_image_subresource_layers() -> vk::ImageSubresourceLayers {
         base_array_layer: 0,
         layer_count: 1,
     }
+}
+
+/// Port of the anonymous-namespace `CanBlitToSwapchain` helper.
+fn can_blit_to_swapchain(device: &Device, format: vk::Format) -> bool {
+    device
+        .format_properties(format)
+        .optimal_tiling_features
+        .contains(vk::FormatFeatureFlags::BLIT_DST)
 }
 
 /// Port of `MakeImageBlit`.
@@ -212,17 +221,21 @@ impl PresentManager {
         instance: ash::Instance,
         window_info: vulkan_surface::WindowSystemInfo,
         surface: Arc<Mutex<OwnedSurface>>,
-        device: ash::Device,
+        vulkan_device: &Device,
         memory_properties: vk::PhysicalDeviceMemoryProperties,
         frame_image_format: vk::Format,
         graphics_family: u32,
         image_count: usize,
-        blit_supported: bool,
         use_present_thread: bool,
         submit_mutex: Arc<Mutex<()>>,
         swapchain: Arc<Mutex<Swapchain>>,
         graphics_queue: vk::Queue,
     ) -> Self {
+        let device = vulkan_device.get_logical().clone();
+        let blit_supported = can_blit_to_swapchain(
+            vulkan_device,
+            swapchain.lock().unwrap().get_image_view_format(),
+        );
         let effective_count = image_count.min(MAX_IMAGES_IN_FLIGHT);
 
         // Create command pool

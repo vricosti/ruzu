@@ -16,8 +16,9 @@ use crate::ir::value::{Attribute, InstRef, Value};
 use crate::ir_opt;
 use crate::program_header::{PixelImap, ProgramHeader};
 use crate::runtime_info::{AttributeType, RuntimeInfo};
-use crate::shader_info::Interpolation;
+use crate::shader_info::{Interpolation, StorageBufferDescriptor};
 use crate::varying_state::VaryingState;
+use crate::{environment::Environment, host_translate_info::HostTranslateInfo};
 use std::collections::{BTreeMap, VecDeque};
 
 /// Translate a Maxwell shader program from instruction words to IR.
@@ -30,6 +31,221 @@ pub fn translate_program(instructions: &[u64], stage: crate::ir::types::ShaderSt
     crate::pipeline_cache::translate_program_at_offset(instructions, stage, 0)
 }
 
+/// Remove CFG blocks that upstream identifies as unreachable after structured
+/// control-flow construction.
+///
+/// Upstream stores block pointers, so erasing an owner does not renumber live
+/// references. Rust stores block indices and therefore remaps every live block
+/// reference while preserving the same keep predicate and ordering.
+pub fn remove_unreachable_blocks(program: &mut Program) {
+    if program.blocks.len() == program.post_order_blocks.len() {
+        return;
+    }
+    let keep = program
+        .blocks
+        .iter()
+        .enumerate()
+        .map(|(index, block)| index == 0 || !block.imm_predecessors.is_empty())
+        .collect::<Vec<_>>();
+    let mut remap = vec![None; keep.len()];
+    let mut next = 0u32;
+    for (index, keep_block) in keep.iter().copied().enumerate() {
+        if keep_block {
+            remap[index] = Some(next);
+            next += 1;
+        }
+    }
+    if next as usize == program.blocks.len() {
+        return;
+    }
+
+    program.blocks = std::mem::take(&mut program.blocks)
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, mut block)| {
+            keep[index].then(|| {
+                remap_block_indices(&mut block, &remap);
+                block
+            })
+        })
+        .collect();
+    program.syntax_list = std::mem::take(&mut program.syntax_list)
+        .into_iter()
+        .map(|node| remap_syntax_node_indices(node, &remap))
+        .collect();
+    program.post_order_blocks = std::mem::take(&mut program.post_order_blocks)
+        .into_iter()
+        .filter_map(|block| remap[block as usize])
+        .collect();
+    regenerate_block_order_from_syntax(program);
+}
+
+fn mapped_block(remap: &[Option<u32>], block: u32) -> u32 {
+    remap
+        .get(block as usize)
+        .and_then(|mapped| *mapped)
+        .unwrap_or_else(|| panic!("live IR references removed unreachable block {block}"))
+}
+
+fn remap_value_indices(value: Value, remap: &[Option<u32>]) -> Value {
+    match value {
+        Value::Inst(InstRef { block, inst }) => Value::Inst(InstRef {
+            block: mapped_block(remap, block),
+            inst,
+        }),
+        other => other,
+    }
+}
+
+fn remap_block_indices(block: &mut Block, remap: &[Option<u32>]) {
+    for inst in block.iter_mut() {
+        for arg in &mut inst.args {
+            *arg = remap_value_indices(*arg, remap);
+        }
+        for (predecessor, value) in &mut inst.phi_args {
+            *predecessor = mapped_block(remap, *predecessor);
+            *value = remap_value_indices(*value, remap);
+        }
+        if let Some(associated) = &mut inst.associated {
+            for reference in [
+                &mut associated.zero_inst,
+                &mut associated.sign_inst,
+                &mut associated.carry_inst,
+                &mut associated.overflow_inst,
+            ] {
+                if let Some(reference) = reference {
+                    reference.block = mapped_block(remap, reference.block);
+                }
+            }
+        }
+    }
+    for value in &mut block.ssa_reg_values {
+        *value = remap_value_indices(*value, remap);
+    }
+    for predecessor in &mut block.imm_predecessors {
+        *predecessor = mapped_block(remap, *predecessor);
+    }
+    for successor in &mut block.imm_successors {
+        *successor = mapped_block(remap, *successor);
+    }
+}
+
+fn remap_syntax_node_indices(node: SyntaxNode, remap: &[Option<u32>]) -> SyntaxNode {
+    match node {
+        SyntaxNode::Block(block) => SyntaxNode::Block(mapped_block(remap, block)),
+        SyntaxNode::If { cond, body, merge } => SyntaxNode::If {
+            cond: remap_value_indices(cond, remap),
+            body: mapped_block(remap, body),
+            merge: mapped_block(remap, merge),
+        },
+        SyntaxNode::EndIf { merge } => SyntaxNode::EndIf {
+            merge: mapped_block(remap, merge),
+        },
+        SyntaxNode::Loop {
+            body,
+            continue_block,
+            merge,
+        } => SyntaxNode::Loop {
+            body: mapped_block(remap, body),
+            continue_block: mapped_block(remap, continue_block),
+            merge: mapped_block(remap, merge),
+        },
+        SyntaxNode::Repeat {
+            cond,
+            loop_header,
+            merge,
+        } => SyntaxNode::Repeat {
+            cond: remap_value_indices(cond, remap),
+            loop_header: mapped_block(remap, loop_header),
+            merge: mapped_block(remap, merge),
+        },
+        SyntaxNode::Break { cond, merge, skip } => SyntaxNode::Break {
+            cond: remap_value_indices(cond, remap),
+            merge: mapped_block(remap, merge),
+            skip: mapped_block(remap, skip),
+        },
+        SyntaxNode::Return => SyntaxNode::Return,
+        SyntaxNode::Unreachable => SyntaxNode::Unreachable,
+    }
+}
+
+/// Run the optimization sequence owned by upstream `TranslateProgram`.
+pub fn optimize_program_with_env(
+    env: &mut dyn Environment,
+    program: &mut Program,
+    host_info: &HostTranslateInfo,
+    sph: Option<&ProgramHeader>,
+) {
+    optimize_program(program, host_info, Some(env), sph, None);
+}
+
+/// Compatibility entry point for callers that do not own an upstream
+/// `Environment`. The pass order still has a single owner here; only the
+/// environment-dependent folds and state queries are unavailable.
+pub(crate) fn optimize_program_without_env(
+    program: &mut Program,
+    host_info: &HostTranslateInfo,
+    sph: Option<&ProgramHeader>,
+    texture_bound_buffer: Option<u32>,
+) {
+    optimize_program(program, host_info, None, sph, texture_bound_buffer);
+}
+
+fn optimize_program(
+    program: &mut Program,
+    host_info: &HostTranslateInfo,
+    mut env: Option<&mut dyn Environment>,
+    sph: Option<&ProgramHeader>,
+    texture_bound_buffer: Option<u32>,
+) {
+    if !host_info.support_float64 {
+        ir_opt::lower_fp64_to_fp32::lower_fp64_to_fp32(program);
+    }
+    if !host_info.support_float16 {
+        ir_opt::lower_fp16_to_fp32::lower_fp16_to_fp32(program);
+    }
+    if !host_info.support_int64 {
+        ir_opt::lower_int64_to_int32::lower_int64_to_int32(program);
+    }
+    if !host_info.support_conditional_barrier {
+        ir_opt::conditional_barrier_pass::conditional_barrier_pass(program);
+    }
+    ir_opt::ssa_rewrite_pass::ssa_rewrite_pass(program);
+    if let Some(env) = env.as_deref_mut() {
+        ir_opt::constant_propagation_pass::constant_propagation_pass_with_env(env, program);
+        ir_opt::position_pass::position_pass(env, program);
+    } else {
+        ir_opt::constant_propagation_pass::constant_propagation_pass(program);
+    }
+    ir_opt::global_memory_to_storage_buffer_pass::global_memory_to_storage_buffer_pass(
+        program, host_info,
+    );
+    if let Some(env) = env.as_deref_mut() {
+        ir_opt::texture_pass::texture_pass(env, program, host_info);
+    } else if let Some(texture_bound_buffer) = texture_bound_buffer {
+        ir_opt::texture_pass::texture_pass_bound_textures(program, texture_bound_buffer);
+    }
+    {
+        let settings = common::settings::values();
+        if settings.resolution_info.active || *settings.rescale_hack.get_value() {
+            drop(settings);
+            ir_opt::rescaling_pass::rescaling_pass(program);
+        }
+    }
+    ir_opt::dead_code_elimination_pass::dead_code_elimination_pass(program);
+    let renderer_debug = *common::settings::values().renderer_debug.get_value();
+    if renderer_debug {
+        ir_opt::verification_pass::verification_pass(program);
+    }
+    if let Some(sph) = sph {
+        ir_opt::collect_shader_info_pass::collect_shader_info_pass_with_sph(program, sph);
+    } else {
+        ir_opt::collect_shader_info_pass::collect_shader_info_pass(program);
+    }
+    ir_opt::layer_pass::layer_pass(program, host_info);
+    ir_opt::vendor_workaround_pass::vendor_workaround_pass(program);
+}
+
 /// Merge dual vertex programs (VertexA + VertexB) into a single VertexB program.
 ///
 /// Port of upstream `MergeDualVertexPrograms` in
@@ -37,7 +253,11 @@ pub fn translate_program(instructions: &[u64], stage: crate::ir::types::ShaderSt
 /// pointers, so appending VertexB syntax after VertexA is pointer-safe. Rust
 /// syntax nodes store block indices; this port explicitly remaps every VertexB
 /// block reference and every `Value::Inst` reference by the VertexA block count.
-pub fn merge_dual_vertex_programs(vertex_a: &mut Program, vertex_b: &mut Program) -> Program {
+pub fn merge_dual_vertex_programs(
+    vertex_a: &mut Program,
+    vertex_b: &mut Program,
+    env_vertex_b: &mut dyn Environment,
+) -> Program {
     let vertex_b_block_offset = vertex_a.blocks.len() as u32;
 
     ir_opt::dual_vertex_pass::vertex_a_transform_pass(vertex_a);
@@ -102,8 +322,14 @@ pub fn merge_dual_vertex_programs(vertex_a: &mut Program, vertex_b: &mut Program
         &mut result.info,
         &mut vertex_b.info,
     );
-    ir_opt::dead_code_elimination::dead_code_elimination_pass(&mut result);
-    ir_opt::collect_info::collect_shader_info_pass(&mut result);
+    ir_opt::dead_code_elimination_pass::dead_code_elimination_pass(&mut result);
+    if *common::settings::values().renderer_debug.get_value() {
+        ir_opt::verification_pass::verification_pass(&result);
+    }
+    ir_opt::collect_shader_info_pass::collect_shader_info_pass_with_sph(
+        &mut result,
+        env_vertex_b.sph(),
+    );
 
     result
 }
@@ -220,6 +446,44 @@ pub fn collect_interpolation_info(sph: &ProgramHeader, program: &mut Program) {
             PixelImap::Constant => Interpolation::Flat,
             PixelImap::ScreenLinear => Interpolation::NoPerspective,
         };
+    }
+}
+
+/// Port of upstream `AddNVNStorageBuffers`.
+pub fn add_nvn_storage_buffers(program: &mut Program) {
+    if !program.info.uses_global_memory {
+        return;
+    }
+    const DRIVER_CBUF: u32 = 0;
+    const DESCRIPTOR_SIZE: u32 = 0x10;
+    const NUM_BUFFERS: u32 = 16;
+    let base = match program.stage {
+        ShaderStage::VertexA | ShaderStage::VertexB => 0x110,
+        ShaderStage::TessellationControl => 0x210,
+        ShaderStage::TessellationEval | ShaderStage::Compute => 0x310,
+        ShaderStage::Geometry => 0x410,
+        ShaderStage::Fragment => 0x510,
+    };
+
+    let descriptors = &mut program.info.storage_buffers_descriptors;
+    for index in 0..NUM_BUFFERS {
+        if program.info.nvn_buffer_used & (1u16 << index) == 0 {
+            continue;
+        }
+        let offset = base + index * DESCRIPTOR_SIZE;
+        if let Some(descriptor) = descriptors
+            .iter_mut()
+            .find(|descriptor| descriptor.cbuf_offset == offset)
+        {
+            descriptor.is_written |= program.info.stores_global_memory;
+            continue;
+        }
+        descriptors.push(StorageBufferDescriptor {
+            cbuf_index: DRIVER_CBUF,
+            cbuf_offset: offset,
+            count: 1,
+            is_written: program.info.stores_global_memory,
+        });
     }
 }
 
@@ -642,7 +906,7 @@ mod interpolation_tests {
     }
 }
 
-fn regenerate_block_order_from_syntax(program: &mut Program) {
+pub(crate) fn regenerate_block_order_from_syntax(program: &mut Program) {
     let mut order = 0;
     for node in &program.syntax_list {
         if let SyntaxNode::Block(block_index) = *node {
@@ -662,6 +926,121 @@ mod tests {
     use crate::ir::opcodes::Opcode;
 
     #[test]
+    fn block_order_follows_abstract_syntax_list_like_generate_blocks() {
+        let mut program = Program::new(ShaderStage::Fragment);
+        program.blocks = vec![Block::new(), Block::new(), Block::new()];
+        program.syntax_list = vec![
+            SyntaxNode::Block(2),
+            SyntaxNode::Block(0),
+            SyntaxNode::Block(1),
+        ];
+
+        regenerate_block_order_from_syntax(&mut program);
+
+        assert_eq!(program.blocks[2].order, 0);
+        assert_eq!(program.blocks[0].order, 1);
+        assert_eq!(program.blocks[1].order, 2);
+    }
+
+    struct MergeEnvironment {
+        texture_pass_caches: crate::environment::TexturePassCaches,
+        sph: ProgramHeader,
+    }
+
+    impl Default for MergeEnvironment {
+        fn default() -> Self {
+            Self {
+                texture_pass_caches: Default::default(),
+                sph: ProgramHeader::default(),
+            }
+        }
+    }
+
+    impl Environment for MergeEnvironment {
+        fn texture_pass_caches(&mut self) -> &mut crate::environment::TexturePassCaches {
+            &mut self.texture_pass_caches
+        }
+
+        fn read_instruction(&mut self, _address: u32) -> u64 {
+            0
+        }
+
+        fn read_cbuf_value(&mut self, _cbuf_index: u32, _cbuf_offset: u32) -> u32 {
+            0
+        }
+
+        fn read_texture_type(&mut self, _raw_handle: u32) -> crate::shader_info::TextureType {
+            crate::shader_info::TextureType::Color2D
+        }
+
+        fn read_texture_pixel_format(
+            &mut self,
+            _raw_handle: u32,
+        ) -> crate::shader_info::TexturePixelFormat {
+            crate::shader_info::TexturePixelFormat::A8B8G8R8Unorm
+        }
+
+        fn is_texture_pixel_format_integer(&mut self, _raw_handle: u32) -> bool {
+            false
+        }
+
+        fn read_viewport_transform_state(&mut self) -> u32 {
+            1
+        }
+
+        fn texture_bound_buffer(&self) -> u32 {
+            0
+        }
+
+        fn local_memory_size(&self) -> u32 {
+            0
+        }
+
+        fn shared_memory_size(&self) -> u32 {
+            0
+        }
+
+        fn workgroup_size(&self) -> [u32; 3] {
+            [1; 3]
+        }
+
+        fn has_hle_macro_state(&self) -> bool {
+            false
+        }
+
+        fn get_replace_const_buffer(
+            &mut self,
+            _bank: u32,
+            _offset: u32,
+        ) -> Option<crate::shader_info::ReplaceConstant> {
+            None
+        }
+
+        fn dump(&mut self, _pipeline_hash: u64, _shader_hash: u64) {}
+
+        fn sph(&self) -> &ProgramHeader {
+            &self.sph
+        }
+
+        fn gp_passthrough_mask(&self) -> &[u32; 8] {
+            static MASK: [u32; 8] = [0; 8];
+            &MASK
+        }
+
+        fn shader_stage(&self) -> ShaderStage {
+            ShaderStage::VertexB
+        }
+
+        fn start_address(&self) -> u32 {
+            0
+        }
+
+        fn is_proprietary_driver(&self) -> bool {
+            false
+        }
+    }
+
+    #[test]
     fn translate_program_uses_cfg_driver_instead_of_empty_stub() {
         let program = translate_program(&[0, 0x50B0_0000_0000_0000], ShaderStage::VertexB);
 
@@ -669,6 +1048,39 @@ mod tests {
         assert!(
             !program.blocks.is_empty(),
             "translate_program must build IR blocks instead of returning Program::new(stage)"
+        );
+    }
+
+    #[test]
+    fn remove_unreachable_blocks_preserves_and_remaps_live_indices() {
+        let mut program = Program::new(ShaderStage::VertexB);
+        let mut entry = Block::new();
+        entry.add_successor(2);
+        let unreachable = Block::new();
+        let mut exit = Block::new();
+        exit.add_predecessor(0);
+        exit.append_inst(Inst::new(
+            Opcode::Identity,
+            vec![Value::Inst(InstRef { block: 0, inst: 0 })],
+        ));
+        entry.append_inst(Inst::new(Opcode::UndefU32, vec![]));
+        program.blocks = vec![entry, unreachable, exit];
+        program.post_order_blocks = vec![2, 0];
+        program.syntax_list = vec![
+            SyntaxNode::Block(0),
+            SyntaxNode::Block(2),
+            SyntaxNode::Return,
+        ];
+
+        remove_unreachable_blocks(&mut program);
+
+        assert_eq!(program.blocks.len(), 2);
+        assert_eq!(program.post_order_blocks, vec![1, 0]);
+        assert!(matches!(program.syntax_list[1], SyntaxNode::Block(1)));
+        assert_eq!(program.block(1).imm_predecessors, vec![0]);
+        assert_eq!(
+            program.block(1).inst(0).args[0],
+            Value::Inst(InstRef { block: 0, inst: 0 })
         );
     }
 
@@ -697,7 +1109,8 @@ mod tests {
         vertex_b.local_memory_size = 0x40;
         vertex_b.info.stores.mask[0] = 0x2;
 
-        let result = merge_dual_vertex_programs(&mut vertex_a, &mut vertex_b);
+        let mut env = MergeEnvironment::default();
+        let result = merge_dual_vertex_programs(&mut vertex_a, &mut vertex_b, &mut env);
 
         assert_eq!(result.stage, ShaderStage::VertexB);
         assert_eq!(result.local_memory_size, 0x40);
@@ -708,5 +1121,33 @@ mod tests {
         assert!(matches!(result.syntax_list[2], SyntaxNode::Return));
         assert_eq!(result.post_order_blocks, vec![1, 0]);
         assert_eq!(result.blocks[1].imm_successors, vec![1]);
+    }
+
+    #[test]
+    fn add_nvn_storage_buffers_adds_and_merges_driver_descriptors() {
+        let mut program = Program::new(ShaderStage::Fragment);
+        program.info.uses_global_memory = true;
+        program.info.stores_global_memory = true;
+        program.info.nvn_buffer_used = (1 << 2) | (1 << 5);
+        program.info.storage_buffers_descriptors.push(
+            crate::shader_info::StorageBufferDescriptor {
+                cbuf_index: 0,
+                cbuf_offset: 0x530,
+                count: 1,
+                is_written: false,
+            },
+        );
+
+        add_nvn_storage_buffers(&mut program);
+
+        assert_eq!(program.info.storage_buffers_descriptors.len(), 2);
+        assert!(program.info.storage_buffers_descriptors[0].is_written);
+        assert_eq!(program.info.storage_buffers_descriptors[1].cbuf_index, 0);
+        assert_eq!(
+            program.info.storage_buffers_descriptors[1].cbuf_offset,
+            0x560
+        );
+        assert_eq!(program.info.storage_buffers_descriptors[1].count, 1);
+        assert!(program.info.storage_buffers_descriptors[1].is_written);
     }
 }

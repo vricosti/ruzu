@@ -22,6 +22,7 @@ use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFrame
 
 use super::super::filesystem::FileSystemController;
 use super::fs_i_filesystem::IFileSystem;
+use super::fs_i_save_data_info_reader::ISaveDataInfoReader;
 use super::fs_i_storage::IStorage;
 use super::fsp_types::SizeGetter;
 
@@ -234,6 +235,16 @@ impl FspSrv {
                     53,
                     Some(Self::open_read_only_save_data_file_system_handler),
                     "OpenReadOnlySaveDataFileSystem",
+                ),
+                (
+                    61,
+                    Some(Self::open_save_data_info_reader_by_save_data_space_id_handler),
+                    "OpenSaveDataInfoReaderBySaveDataSpaceId",
+                ),
+                (
+                    62,
+                    Some(Self::open_save_data_info_reader_only_cache_storage_handler),
+                    "OpenSaveDataInfoReaderOnlyCacheStorage",
                 ),
                 (
                     200,
@@ -486,6 +497,55 @@ impl FspSrv {
             "(STUBBED) OpenReadOnlySaveDataFileSystem called, delegating to OpenSaveDataFileSystem"
         );
         Self::open_save_data_file_system_handler(this, ctx);
+    }
+
+    /// Port of upstream `FSP_SRV::OpenSaveDataInfoReaderBySaveDataSpaceId`.
+    fn open_save_data_info_reader_by_save_data_space_id_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const FspSrv) };
+        let mut rp = RequestParser::new(ctx);
+        let Some(space) = Self::parse_save_data_space_id(rp.pop_u8()) else {
+            log::error!("FspSrv::OpenSaveDataInfoReaderBySaveDataSpaceId: invalid SaveDataSpaceId");
+            Self::push_error_with_null_interface(ctx, RESULT_TARGET_NOT_FOUND.raw());
+            return;
+        };
+
+        log::info!(
+            "FspSrv::OpenSaveDataInfoReaderBySaveDataSpaceId called, space={:?}",
+            space
+        );
+        let controller = service.save_data_controller.lock().unwrap().clone();
+        let Some(controller) = controller else {
+            Self::push_error_with_null_interface(ctx, RESULT_TARGET_NOT_FOUND.raw());
+            return;
+        };
+
+        Self::push_interface_response(ctx, Arc::new(ISaveDataInfoReader::new(controller, space)));
+    }
+
+    /// Port of upstream `FSP_SRV::OpenSaveDataInfoReaderOnlyCacheStorage`.
+    fn open_save_data_info_reader_only_cache_storage_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const FspSrv) };
+        log::warn!("(STUBBED) FspSrv::OpenSaveDataInfoReaderOnlyCacheStorage called");
+
+        let controller = service.save_data_controller.lock().unwrap().clone();
+        let Some(controller) = controller else {
+            Self::push_error_with_null_interface(ctx, RESULT_TARGET_NOT_FOUND.raw());
+            return;
+        };
+
+        Self::push_interface_response(
+            ctx,
+            Arc::new(ISaveDataInfoReader::new(
+                controller,
+                SaveDataSpaceId::Temporary,
+            )),
+        );
     }
 
     fn open_data_storage_by_current_process_handler(
@@ -766,5 +826,22 @@ impl ServiceFramework for FspSrv {
         );
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn save_data_info_reader_handlers_match_upstream_table() {
+        let service = FspSrv::new();
+        let by_space = service.handlers.get(&61).unwrap();
+        let cache_only = service.handlers.get(&62).unwrap();
+
+        assert_eq!(by_space.name, "OpenSaveDataInfoReaderBySaveDataSpaceId");
+        assert!(by_space.handler_callback.is_some());
+        assert_eq!(cache_only.name, "OpenSaveDataInfoReaderOnlyCacheStorage");
+        assert!(cache_only.handler_callback.is_some());
     }
 }

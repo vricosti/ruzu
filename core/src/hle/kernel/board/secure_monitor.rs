@@ -12,6 +12,8 @@ pub enum MemorySize {
     MemorySize4GB = 0,
     MemorySize6GB = 1,
     MemorySize8GB = 2,
+    MemorySize10GB = 3,
+    MemorySize12GB = 4,
 }
 
 /// Memory arrangement identifiers returned by the secure monitor.
@@ -24,4 +26,19 @@ pub enum MemoryArrangement {
     MemoryArrangement6GB = 3,
     MemoryArrangement6GBForAppletDev = 4,
     MemoryArrangement8GB = 5,
+    MemoryArrangement10GB = 6,
+    MemoryArrangement12GB = 7,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn memory_layout_discriminants_match_secure_monitor_abi() {
+        assert_eq!(MemorySize::MemorySize10GB as u32, 3);
+        assert_eq!(MemorySize::MemorySize12GB as u32, 4);
+        assert_eq!(MemoryArrangement::MemoryArrangement10GB as u32, 6);
+        assert_eq!(MemoryArrangement::MemoryArrangement12GB as u32, 7);
+    }
 }

@@ -10,8 +10,11 @@ use std::sync::{Arc, Mutex, RwLock};
 
 use ash::vk;
 use log::debug;
+use shader_recompiler::shader_info::{num_descriptors, Info as ShaderInfo};
 
 use super::resource_pool::ResourcePool;
+use super::scheduler::Scheduler;
+use crate::vulkan_common::vulkan_device::{Device, DeviceReference};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -63,7 +66,7 @@ impl DescriptorBankInfo {
             && self.texture_buffers >= subset.texture_buffers
             && self.image_buffers >= subset.image_buffers
             && self.textures >= subset.textures
-            && self.images >= subset.image_buffers
+            && self.images >= subset.images
     }
 }
 
@@ -87,10 +90,11 @@ struct DescriptorBank {
 ///
 /// Port of `AllocatePool` from `vk_descriptor_pool.cpp`.
 fn allocate_pool(
-    device: &ash::Device,
+    device: &Device,
     bank: &mut DescriptorBank,
-    sets_per_pool: u32,
 ) -> Result<vk::DescriptorPool, vk::Result> {
+    let logical = device.get_logical();
+    let sets_per_pool = device.get_sets_per_pool();
     let mut pool_sizes = Vec::with_capacity(6);
     let info = &bank.info;
 
@@ -139,7 +143,7 @@ fn allocate_pool(
         .pool_sizes(&pool_sizes)
         .build();
 
-    let pool = unsafe { device.create_descriptor_pool(&pool_ci, None)? };
+    let pool = unsafe { logical.create_descriptor_pool(&pool_ci, None)? };
     bank.pools.push(pool);
     Ok(pool)
 }
@@ -156,25 +160,22 @@ struct DescriptorAllocatorState {
 /// that references it.
 #[derive(Clone)]
 pub struct DescriptorAllocator {
-    device: ash::Device,
+    device: DeviceReference,
     bank: Arc<Mutex<DescriptorBank>>,
     layout: vk::DescriptorSetLayout,
-    sets_per_pool: u32,
     state: Arc<Mutex<DescriptorAllocatorState>>,
 }
 
 impl DescriptorAllocator {
     fn new(
-        device: ash::Device,
+        device: &Device,
         bank: Arc<Mutex<DescriptorBank>>,
         layout: vk::DescriptorSetLayout,
-        sets_per_pool: u32,
     ) -> Self {
         Self {
-            device,
+            device: DeviceReference::new(device),
             bank,
             layout,
-            sets_per_pool,
             state: Arc::new(Mutex::new(DescriptorAllocatorState {
                 resource_pool: ResourcePool::new_with_external_ticks(SETS_GROW_RATE),
                 sets: Vec::new(),
@@ -189,21 +190,19 @@ impl DescriptorAllocator {
         current_tick: u64,
     ) -> Result<vk::DescriptorSet, vk::Result> {
         let mut state = self.state.lock().unwrap();
-        let device = self.device.clone();
+        let device = self.device;
         let bank = Arc::clone(&self.bank);
         let layout = self.layout;
-        let sets_per_pool = self.sets_per_pool;
         let DescriptorAllocatorState {
             resource_pool,
             sets,
         } = &mut *state;
         let mut allocate = |begin: usize, end: usize| {
             sets.push(Self::allocate_descriptors(
-                &device,
+                device.get(),
                 &bank,
                 layout,
                 end - begin,
-                sets_per_pool,
             )?);
             Ok(())
         };
@@ -217,24 +216,24 @@ impl DescriptorAllocator {
 
     /// Port of `DescriptorAllocator::AllocateDescriptors`.
     fn allocate_descriptors(
-        device: &ash::Device,
+        device: &Device,
         bank: &Arc<Mutex<DescriptorBank>>,
         layout: vk::DescriptorSetLayout,
         count: usize,
-        sets_per_pool: u32,
     ) -> Result<Vec<vk::DescriptorSet>, vk::Result> {
+        let logical = device.get_logical();
         let layouts = vec![layout; count];
         let mut bank = bank.lock().unwrap();
         let mut allocate_info = vk::DescriptorSetAllocateInfo::builder()
             .descriptor_pool(*bank.pools.last().expect("descriptor bank has no pool"))
             .set_layouts(&layouts)
             .build();
-        match unsafe { device.allocate_descriptor_sets(&allocate_info) } {
+        match unsafe { logical.allocate_descriptor_sets(&allocate_info) } {
             Ok(sets) => Ok(sets),
             Err(vk::Result::ERROR_OUT_OF_POOL_MEMORY) => {
-                let pool = allocate_pool(device, &mut bank, sets_per_pool)?;
+                let pool = allocate_pool(device, &mut bank)?;
                 allocate_info.descriptor_pool = pool;
-                unsafe { device.allocate_descriptor_sets(&allocate_info) }
+                unsafe { logical.allocate_descriptor_sets(&allocate_info) }
             }
             Err(error) => Err(error),
         }
@@ -253,8 +252,9 @@ impl DescriptorAllocator {
 /// configured for specific descriptor type requirements. Banks are reused
 /// when their descriptor counts are close enough (within SCORE_THRESHOLD).
 pub struct DescriptorPool {
-    device: ash::Device,
-    sets_per_pool: u32,
+    // Upstream's bank pools are RAII wrappers. Reden stores raw ash handles,
+    // so their owner retains this lightweight reference for destruction.
+    device: DeviceReference,
     banks_lock: RwLock<BanksState>,
 }
 
@@ -265,10 +265,9 @@ struct BanksState {
 
 impl DescriptorPool {
     /// Port of `DescriptorPool::DescriptorPool`.
-    pub fn new(device: ash::Device, sets_per_pool: u32) -> Self {
+    pub fn new(device: &Device, _scheduler: &mut Scheduler) -> Self {
         DescriptorPool {
-            device,
-            sets_per_pool,
+            device: DeviceReference::new(device),
             banks_lock: RwLock::new(BanksState {
                 bank_infos: Vec::new(),
                 banks: Vec::new(),
@@ -283,12 +282,31 @@ impl DescriptorPool {
         info: &DescriptorBankInfo,
     ) -> Result<DescriptorAllocator, vk::Result> {
         let bank = self.bank(info)?;
-        Ok(DescriptorAllocator::new(
-            self.device.clone(),
-            bank,
-            layout,
-            self.sets_per_pool,
-        ))
+        Ok(DescriptorAllocator::new(self.device.get(), bank, layout))
+    }
+
+    /// Port of `DescriptorPool::Allocator(..., span<const Shader::Info>)`.
+    pub fn allocator_for_infos<'a>(
+        &self,
+        layout: vk::DescriptorSetLayout,
+        infos: impl IntoIterator<Item = &'a ShaderInfo>,
+    ) -> Result<DescriptorAllocator, vk::Result> {
+        let mut bank = DescriptorBankInfo::default();
+        for info in infos {
+            bank.uniform_buffers += num_descriptors(&info.constant_buffer_descriptors);
+            bank.storage_buffers += num_descriptors(&info.storage_buffers_descriptors);
+            bank.texture_buffers += num_descriptors(&info.texture_buffer_descriptors);
+            bank.image_buffers += num_descriptors(&info.image_buffer_descriptors);
+            bank.textures += num_descriptors(&info.texture_descriptors);
+            bank.images += num_descriptors(&info.image_descriptors);
+        }
+        bank.score = (bank.uniform_buffers
+            + bank.storage_buffers
+            + bank.texture_buffers
+            + bank.image_buffers
+            + bank.textures
+            + bank.images) as i32;
+        self.allocator(layout, &bank)
     }
 
     /// Port of `DescriptorPool::Bank`.
@@ -310,7 +328,7 @@ impl DescriptorPool {
             info: *reqs,
             pools: Vec::new(),
         };
-        allocate_pool(&self.device, &mut bank, self.sets_per_pool)?;
+        allocate_pool(self.device.get(), &mut bank)?;
         let bank = Arc::new(Mutex::new(bank));
         state.banks.push(Arc::clone(&bank));
 
@@ -330,7 +348,10 @@ impl Drop for DescriptorPool {
         for bank in &state.banks {
             for pool in &bank.lock().unwrap().pools {
                 unsafe {
-                    self.device.destroy_descriptor_pool(*pool, None);
+                    self.device
+                        .get()
+                        .get_logical()
+                        .destroy_descriptor_pool(*pool, None);
                 }
             }
         }
@@ -340,6 +361,16 @@ impl Drop for DescriptorPool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn allocator_keeps_an_upstream_device_reference() {
+        fn device_reference(allocator: &DescriptorAllocator) -> DeviceReference {
+            allocator.device
+        }
+        fn require_signature(_: fn(&DescriptorAllocator) -> DeviceReference) {}
+
+        require_signature(device_reference);
+    }
 
     #[test]
     fn bank_info_superset() {
@@ -366,7 +397,7 @@ mod tests {
     }
 
     #[test]
-    fn bank_info_superset_matches_upstream_image_buffer_comparison() {
+    fn bank_info_superset_checks_image_descriptors() {
         let bank = DescriptorBankInfo {
             image_buffers: 8,
             images: 1,
@@ -380,10 +411,7 @@ mod tests {
             ..DescriptorBankInfo::default()
         };
 
-        // Keep the exact comparison in local upstream
-        // `DescriptorBankInfo::IsSuperset`: `images` is compared with the
-        // requested image-buffer count.
-        assert!(bank.is_superset(&request));
+        assert!(!bank.is_superset(&request));
     }
 
     #[test]

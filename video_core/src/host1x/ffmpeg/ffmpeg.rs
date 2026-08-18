@@ -6,6 +6,7 @@
 //! Wraps FFmpeg types (AVPacket, AVFrame, AVCodec, AVCodecContext) for video
 //! decoding.
 
+use std::collections::VecDeque;
 use std::ffi::CStr;
 use std::sync::Arc;
 
@@ -39,6 +40,8 @@ mod ffi {
             decoder: *mut RuzuFfmpegDecoder,
             data: *const c_uchar,
             size: uintptr_t,
+            pts: i64,
+            dts: i64,
         ) -> c_int;
         pub fn ruzu_ffmpeg_decoder_receive_frame(decoder: *mut RuzuFfmpegDecoder) -> *mut AVFrame;
         pub fn ruzu_ffmpeg_decoder_receive_frame_with_hw_transfer(
@@ -50,6 +53,7 @@ mod ffi {
             codec: u64,
         ) -> c_int;
         pub fn ruzu_ffmpeg_decoder_last_error(decoder: *const RuzuFfmpegDecoder) -> c_int;
+        pub fn ruzu_ffmpeg_error_is_eof_or_again(error: c_int) -> c_int;
         pub fn ruzu_ffmpeg_error_string(errnum: c_int, out: *mut i8, out_size: uintptr_t);
         pub fn ruzu_ffmpeg_frame_destroy(frame: *mut AVFrame);
         pub fn ruzu_ffmpeg_frame_width(frame: *const AVFrame) -> c_int;
@@ -76,13 +80,22 @@ fn av_error(ret: i32) -> String {
 /// Port of `FFmpeg::Packet`.
 pub struct Packet {
     data: Vec<u8>,
+    pts: i64,
+    dts: i64,
 }
 
 impl Packet {
     pub fn new(data: &[u8]) -> Self {
         Self {
             data: data.to_vec(),
+            pts: i64::MIN,
+            dts: i64::MIN,
         }
+    }
+
+    fn set_timestamps(&mut self, pts: i64, dts: i64) {
+        self.pts = pts;
+        self.dts = dts;
     }
 }
 
@@ -317,7 +330,6 @@ impl DecoderContext {
             return false;
         }
         log::info!("Using FFmpeg software decoding");
-        self.decode_order = self.codec == VideoCodec::H264;
         true
     }
 
@@ -330,9 +342,11 @@ impl DecoderContext {
                 self.raw,
                 _packet.data.as_ptr(),
                 _packet.data.len(),
+                _packet.pts,
+                _packet.dts,
             )
         };
-        if ret < 0 {
+        if ret < 0 && unsafe { ffi::ruzu_ffmpeg_error_is_eof_or_again(ret) } == 0 {
             log::error!(
                 "FFmpeg::DecoderContext::send_packet: avcodec_send_packet error: {}",
                 av_error(ret)
@@ -349,7 +363,7 @@ impl DecoderContext {
         let frame = unsafe { ffi::ruzu_ffmpeg_decoder_receive_frame_with_hw_transfer(self.raw) };
         if frame.is_null() {
             let ret = unsafe { ffi::ruzu_ffmpeg_decoder_last_error(self.raw.cast_const()) };
-            if ret < 0 {
+            if ret < 0 && unsafe { ffi::ruzu_ffmpeg_error_is_eof_or_again(ret) } == 0 {
                 log::error!(
                     "FFmpeg::DecoderContext::receive_frame: avcodec_receive_frame error: {}",
                     av_error(ret)
@@ -376,6 +390,34 @@ impl Drop for DecoderContext {
     }
 }
 
+/// Guest surface offsets associated with one submitted compressed frame.
+///
+/// Port of `FFmpeg::FrameOffsets`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FrameOffsets {
+    pub interlaced: bool,
+    pub hidden: bool,
+    pub luma: u64,
+    pub luma_bottom: u64,
+}
+
+/// Dimensions supplied by NVDEC for decoders that need them before opening.
+///
+/// Port of `FFmpeg::FrameDimensions`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FrameDimensions {
+    pub width: i32,
+    pub height: i32,
+}
+
+/// A decoded frame paired with the guest offsets of the packet that produced it.
+///
+/// Port of `FFmpeg::DecodeApi::DecodedFrame`.
+pub struct DecodedFrame {
+    pub frame: Arc<Frame>,
+    pub offsets: FrameOffsets,
+}
+
 /// High-level decode API that manages codec, context, and optional hardware
 /// acceleration.
 ///
@@ -384,6 +426,11 @@ pub struct DecodeApi {
     decoder: Option<Decoder>,
     decoder_context: Option<DecoderContext>,
     hardware_context: Option<HardwareContext>,
+    opened: bool,
+    defer_android_mediacodec_open: bool,
+    needs_h264_extradata: bool,
+    next_pts: i64,
+    pending_offsets: VecDeque<FrameOffsets>,
 }
 
 impl DecodeApi {
@@ -392,6 +439,11 @@ impl DecodeApi {
             decoder: None,
             decoder_context: None,
             hardware_context: None,
+            opened: false,
+            defer_android_mediacodec_open: false,
+            needs_h264_extradata: false,
+            next_pts: 0,
+            pending_offsets: VecDeque::new(),
         }
     }
 
@@ -420,6 +472,7 @@ impl DecodeApi {
         }
         self.decoder = Some(decoder);
         self.decoder_context = Some(decoder_context);
+        self.opened = true;
         true
     }
 
@@ -427,6 +480,11 @@ impl DecodeApi {
         self.hardware_context = None;
         self.decoder_context = None;
         self.decoder = None;
+        self.opened = false;
+        self.defer_android_mediacodec_open = false;
+        self.needs_h264_extradata = false;
+        self.next_pts = 0;
+        self.pending_offsets.clear();
     }
 
     pub fn using_decode_order(&self) -> bool {
@@ -435,21 +493,36 @@ impl DecodeApi {
             .map_or(false, |ctx| ctx.using_decode_order())
     }
 
-    pub fn send_packet(&mut self, _packet_data: &[u8]) -> bool {
+    pub fn send_packet(
+        &mut self,
+        packet_data: &[u8],
+        offsets: FrameOffsets,
+        _dimensions: Option<FrameDimensions>,
+    ) -> bool {
         let _ = common::trace::emit(
             common::trace::cat::HOST1X_VIDEO,
-            &[4, 2, 0, 0, _packet_data.len() as u64],
+            &[4, 2, 0, 0, packet_data.len() as u64],
         );
+        if !self.opened {
+            return false;
+        }
         let Some(decoder_context) = self.decoder_context.as_mut() else {
             return false;
         };
-        let packet = Packet::new(_packet_data);
+        if !offsets.hidden {
+            self.pending_offsets.push_back(offsets);
+        }
+        let mut packet = Packet::new(packet_data);
+        packet.set_timestamps(self.next_pts, self.next_pts);
+        self.next_pts += 1;
         decoder_context.send_packet(&packet)
     }
 
-    pub fn receive_frame(&mut self) -> Option<Arc<Frame>> {
+    pub fn receive_frame(&mut self) -> Option<DecodedFrame> {
         let _ = common::trace::emit(common::trace::cat::HOST1X_VIDEO, &[4, 3, 0, 0, 0]);
-        self.decoder_context.as_mut()?.receive_frame()
+        let frame = self.decoder_context.as_mut()?.receive_frame()?;
+        let offsets = self.pending_offsets.pop_front().unwrap_or_default();
+        Some(DecodedFrame { frame, offsets })
     }
 }
 
@@ -475,10 +548,39 @@ mod tests {
     }
 
     #[test]
-    fn decode_api_initializes_h264_software_decoder() {
+    fn decode_api_initializes_h264_software_decoder_in_upstream_presentation_order() {
         let mut api = DecodeApi::new();
         assert!(api.initialize(VideoCodec::H264));
-        assert!(api.using_decode_order());
+        assert!(!api.using_decode_order());
+    }
+
+    #[test]
+    fn decode_api_reset_clears_packet_correlation_state() {
+        let mut api = DecodeApi::new();
+        api.next_pts = 17;
+        api.pending_offsets.push_back(FrameOffsets {
+            luma: 0x1234,
+            ..FrameOffsets::default()
+        });
+
+        api.reset();
+
+        assert_eq!(api.next_pts, 0);
+        assert!(api.pending_offsets.is_empty());
+        assert!(!api.opened);
+    }
+
+    #[test]
+    fn frame_offsets_default_matches_upstream_zero_initialization() {
+        assert_eq!(
+            FrameOffsets::default(),
+            FrameOffsets {
+                interlaced: false,
+                hidden: false,
+                luma: 0,
+                luma_bottom: 0,
+            }
+        );
     }
 
     #[test]

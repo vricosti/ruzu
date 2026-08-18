@@ -9,7 +9,7 @@
 //!
 //! Matches zuyu's `vk_pipeline_cache.cpp` concept.
 
-use std::collections::{hash_map::DefaultHasher, BTreeMap, HashMap};
+use std::collections::{hash_map::DefaultHasher, HashMap};
 use std::hash::{Hash, Hasher};
 
 use super::backend;
@@ -18,7 +18,9 @@ use super::frontend::control_flow;
 use super::frontend::structured_control_flow::{self, Expr, StructuredAction};
 use super::frontend::translate::TranslatorVisitor;
 use super::frontend::translate_program::{
-    collect_interpolation_info, convert_legacy_to_generic, merge_dual_vertex_programs,
+    add_nvn_storage_buffers, collect_interpolation_info, convert_legacy_to_generic,
+    merge_dual_vertex_programs, optimize_program_with_env, optimize_program_without_env,
+    remove_unreachable_blocks,
 };
 use super::ir::basic_block::Block;
 use super::ir::emitter::Emitter;
@@ -27,8 +29,7 @@ use super::ir::opcodes::Opcode;
 use super::ir::post_order::post_order;
 use super::ir::program::{Program, ShaderInfo, SyntaxNode};
 use super::ir::types::{OutputTopology, ShaderStage};
-use super::ir::value::{InstRef, Pred, Value};
-use super::ir_opt;
+use super::ir::value::{InstRef, Value};
 use super::profile::Profile;
 use super::program_header::ProgramHeader;
 use super::runtime_info::RuntimeInfo;
@@ -93,9 +94,9 @@ fn translate_cfg_to_program(
     materialize_entry_prologue(&mut program);
     materialize_return_epilogues(&mut program);
 
-    for idx in 0..program.blocks.len() {
-        program.block_mut(idx as u32).order = idx as u32;
-    }
+    // Upstream `GenerateBlocks` assigns `Block::order` while traversing the
+    // abstract syntax list, not from the block owner's allocation index.
+    crate::frontend::translate_program::regenerate_block_order_from_syntax(&mut program);
     materialize_structured_actions(
         &mut program,
         &structured.actions,
@@ -113,7 +114,7 @@ fn translate_cfg_to_program(
         // blocks, so assuming block 0 drops that root and any conditions it
         // defines from SSA construction.
         program.post_order_blocks = post_order_from_syntax_root(&program);
-        clear_unreachable_blocks(&mut program);
+        remove_unreachable_blocks(&mut program);
     }
 
     program
@@ -177,26 +178,7 @@ fn materialize_condition(
     block: u32,
     cond: control_flow::Condition,
 ) -> Value {
-    let pred = Pred(cond.pred);
-    if pred.is_true() {
-        return Value::ImmU1(!cond.negated);
-    }
-
-    let get_pred = append_inst(
-        program,
-        block,
-        Inst::new(Opcode::GetPred, vec![Value::Pred(pred)]),
-    );
-    let value = if cond.negated {
-        append_inst(
-            program,
-            block,
-            Inst::new(Opcode::LogicalNot, vec![get_pred]),
-        )
-    } else {
-        get_pred
-    };
-    value
+    Emitter::new(program, block).condition(cond)
 }
 
 fn materialize_structured_actions(
@@ -221,17 +203,6 @@ fn materialize_structured_actions(
                     }
                     if is_sched_control_word(i) {
                         continue;
-                    }
-                    if std::env::var_os("RUZU_TRACE_SHADER_WORDS").is_some()
-                        && maxwell_opcode_is_unknown(code[i])
-                    {
-                        eprintln!(
-                            "[SHADER_WORD_UNKNOWN] stage={:?} abs=0x{:X} index={} word=0x{:016X}",
-                            stage,
-                            base_offset + (i as u32 * 8),
-                            i,
-                            code[i]
-                        );
                     }
                     tv.translate_instruction(code[i]);
                 }
@@ -439,45 +410,6 @@ fn append_inst(program: &mut Program, block: u32, inst: Inst) -> Value {
     })
 }
 
-/// Rust adaptation of upstream `RemoveUnreachableBlocks`.
-///
-/// Upstream erases unreachable `IR::Block*` entries after computing
-/// `post_order_blocks`. Rust `Value::Inst` stores block indices rather than
-/// pointers, so erasing from `program.blocks` would shift indices and corrupt
-/// instruction references. Clearing unreachable blocks preserves indices while
-/// preventing stale instructions from reaching optimization/emission.
-fn clear_unreachable_blocks(program: &mut Program) {
-    if program.blocks.len() == program.post_order_blocks.len() {
-        return;
-    }
-    let reachable: std::collections::BTreeSet<u32> =
-        program.post_order_blocks.iter().copied().collect();
-    for node in &mut program.syntax_list {
-        match node {
-            SyntaxNode::If { cond, .. }
-            | SyntaxNode::Repeat { cond, .. }
-            | SyntaxNode::Break { cond, .. } => {
-                if let Value::Inst(inst_ref) = cond {
-                    if !reachable.contains(&inst_ref.block) {
-                        *cond = Value::ImmU1(false);
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-    for (index, block) in program.blocks.iter_mut().enumerate().skip(1) {
-        if reachable.contains(&(index as u32)) {
-            continue;
-        }
-        for inst in &mut block.instructions {
-            *inst = None;
-        }
-        block.imm_predecessors.clear();
-        block.imm_successors.clear();
-    }
-}
-
 fn is_sched_control_word(word_index: usize) -> bool {
     word_index % 4 == 0
 }
@@ -575,7 +507,12 @@ pub fn compile_shader(
     log::trace!("  Syntax nodes: {}", program.syntax_list.len());
 
     // Step 4: Run optimization passes.
-    ir_opt::optimize(&mut program);
+    optimize_program_without_env(
+        &mut program,
+        &crate::host_translate_info::HostTranslateInfo::default(),
+        None,
+        None,
+    );
 
     // Step 5: Emit SPIR-V.
     let spirv_words = backend::emit_spirv(&program, profile, runtime_info);
@@ -633,6 +570,8 @@ pub fn translate_program_from_env_with_host_info(
     env: &mut dyn Environment,
     host_info: &crate::host_translate_info::HostTranslateInfo,
 ) -> Program {
+    let mut normalized_host_info = host_info.clone();
+    normalized_host_info.apply_descriptor_limit_policy();
     let cfg_blocks = control_flow::build_cfg_from_env(env, base_offset, code.len());
     let sph = env.sph().clone();
     let mut program = translate_cfg_to_program(
@@ -642,9 +581,10 @@ pub fn translate_program_from_env_with_host_info(
         &cfg_blocks,
         Some(&sph),
     );
-    apply_environment_program_metadata(&mut program, env, host_info);
-    optimize_program_with_env(&mut program, env, host_info, Some(&sph));
+    apply_environment_program_metadata(&mut program, env, &normalized_host_info);
+    optimize_program_with_env(env, &mut program, &normalized_host_info, Some(&sph));
     collect_interpolation_info(&sph, &mut program);
+    add_nvn_storage_buffers(&mut program);
     program
 }
 
@@ -682,16 +622,17 @@ pub fn compile_shader_glsl(
     let cfg_blocks = control_flow::build_cfg(code);
     let mut program = translate_cfg_to_program(code, stage, 0, &cfg_blocks, None);
 
-    ir_opt::optimize(&mut program);
+    optimize_program_without_env(
+        &mut program,
+        &crate::host_translate_info::HostTranslateInfo::default(),
+        None,
+        None,
+    );
 
     let mut bindings = backend::bindings::Bindings::default();
     convert_legacy_to_generic(&mut program, runtime_info);
     let source = backend::glsl::emit_glsl(profile, runtime_info, &mut program, &mut bindings);
     log::debug!("  GLSL: {} bytes", source.len());
-    if std::env::var_os("RUZU_DUMP_GLSL").is_some() {
-        eprintln!("[RUZU_DUMP_GLSL {:?}]\n{}", stage, source);
-    }
-
     CompiledGlslShader {
         source,
         info: program.info,
@@ -785,15 +726,8 @@ pub fn compile_shader_glsl_from_env_with_bindings_and_host_info(
     host_info: &crate::host_translate_info::HostTranslateInfo,
 ) -> CompiledGlslShader {
     let stage = env.shader_stage();
-    let dump = ShaderIrDumpConfig::from_env(stage, base_offset, code);
     let mut program = translate_program_from_env_with_host_info(code, base_offset, env, host_info);
-    if let Some(dump) = dump.as_ref() {
-        dump.write(&program, "00_env_translated");
-    }
     convert_legacy_to_generic(&mut program, runtime_info);
-    if let Some(dump) = dump.as_ref() {
-        dump.write(&program, "01_env_legacy_to_generic");
-    }
     let source = backend::glsl::emit_glsl(profile, runtime_info, &mut program, bindings);
     CompiledGlslShader {
         source,
@@ -813,15 +747,8 @@ pub fn compile_shader_from_env_with_host_info(
     host_info: &crate::host_translate_info::HostTranslateInfo,
 ) -> CompiledShader {
     let stage = env.shader_stage();
-    let dump = ShaderIrDumpConfig::from_env(stage, base_offset, code);
     let mut program = translate_program_from_env_with_host_info(code, base_offset, env, host_info);
-    if let Some(dump) = dump.as_ref() {
-        dump.write(&program, "00_env_translated");
-    }
     convert_legacy_to_generic(&mut program, runtime_info);
-    if let Some(dump) = dump.as_ref() {
-        dump.write(&program, "01_env_legacy_to_generic");
-    }
     let spirv_words = backend::emit_spirv(&program, profile, runtime_info);
     CompiledShader {
         spirv_words,
@@ -840,15 +767,8 @@ pub fn compile_shader_from_env_with_bindings_and_host_info(
     host_info: &crate::host_translate_info::HostTranslateInfo,
 ) -> CompiledShader {
     let stage = env.shader_stage();
-    let dump = ShaderIrDumpConfig::from_env(stage, base_offset, code);
     let mut program = translate_program_from_env_with_host_info(code, base_offset, env, host_info);
-    if let Some(dump) = dump.as_ref() {
-        dump.write(&program, "00_env_translated");
-    }
     convert_legacy_to_generic(&mut program, runtime_info);
-    if let Some(dump) = dump.as_ref() {
-        dump.write(&program, "01_env_legacy_to_generic");
-    }
     let spirv_words = backend::emit_spirv_with_bindings(&program, profile, runtime_info, bindings);
     CompiledShader {
         spirv_words,
@@ -974,32 +894,17 @@ fn emit_glsl_program_at_offset(
         code.len(),
         base_offset
     );
-    if std::env::var_os("RUZU_TRACE_SHADER_WORDS").is_some() {
-        trace_shader_words(stage, base_offset, code);
-    }
-
     let cfg_blocks = control_flow::build_cfg(code);
     let mut program = translate_cfg_to_program(code, stage, base_offset, &cfg_blocks, sph);
 
-    optimize_glsl_with_optional_ir_dump(
-        &mut program,
-        stage,
-        base_offset,
-        code,
-        texture_bound_buffer,
-        sph,
-        host_info,
-    );
+    optimize_program_without_env(&mut program, host_info, sph, texture_bound_buffer);
 
     convert_legacy_to_generic(&mut program, runtime_info);
     if let Some(sph) = sph {
         collect_interpolation_info(sph, &mut program);
     }
+    add_nvn_storage_buffers(&mut program);
     let source = backend::glsl::emit_glsl(profile, runtime_info, &mut program, bindings);
-    if std::env::var_os("RUZU_DUMP_GLSL").is_some() {
-        eprintln!("[RUZU_DUMP_GLSL {:?}]\n{}", stage, source);
-    }
-
     CompiledGlslShader {
         source,
         info: program.info,
@@ -1010,101 +915,8 @@ fn emit_glsl_program_at_offset(
 fn host_info_from_profile(profile: &Profile) -> crate::host_translate_info::HostTranslateInfo {
     crate::host_translate_info::HostTranslateInfo {
         support_int64: profile.support_int64,
-        min_ssbo_alignment: profile.min_ssbo_alignment as u32,
+        min_ssbo_alignment: profile.min_ssbo_alignment,
         ..Default::default()
-    }
-}
-
-/// Compile a Maxwell VertexA + VertexB pair into one merged VertexB GLSL
-/// program, matching upstream `MergeDualVertexPrograms` ownership.
-pub fn compile_dual_vertex_shader_glsl_at_offset(
-    vertex_a_code: &[u64],
-    vertex_a_base_offset: u32,
-    vertex_b_code: &[u64],
-    vertex_b_base_offset: u32,
-    profile: &Profile,
-    runtime_info: &RuntimeInfo,
-) -> CompiledGlslShader {
-    let mut bindings = backend::bindings::Bindings::default();
-    compile_dual_vertex_shader_glsl_at_offset_with_bindings(
-        vertex_a_code,
-        vertex_a_base_offset,
-        vertex_b_code,
-        vertex_b_base_offset,
-        profile,
-        runtime_info,
-        &mut bindings,
-    )
-}
-
-pub fn compile_dual_vertex_shader_glsl_at_offset_with_bindings(
-    vertex_a_code: &[u64],
-    vertex_a_base_offset: u32,
-    vertex_b_code: &[u64],
-    vertex_b_base_offset: u32,
-    profile: &Profile,
-    runtime_info: &RuntimeInfo,
-    bindings: &mut backend::bindings::Bindings,
-) -> CompiledGlslShader {
-    let host_info = host_info_from_profile(profile);
-    compile_dual_vertex_shader_glsl_at_offset_with_bindings_and_host_info(
-        vertex_a_code,
-        vertex_a_base_offset,
-        vertex_b_code,
-        vertex_b_base_offset,
-        profile,
-        runtime_info,
-        bindings,
-        &host_info,
-    )
-}
-
-pub fn compile_dual_vertex_shader_glsl_at_offset_with_bindings_and_host_info(
-    vertex_a_code: &[u64],
-    vertex_a_base_offset: u32,
-    vertex_b_code: &[u64],
-    vertex_b_base_offset: u32,
-    profile: &Profile,
-    runtime_info: &RuntimeInfo,
-    bindings: &mut backend::bindings::Bindings,
-    host_info: &crate::host_translate_info::HostTranslateInfo,
-) -> CompiledGlslShader {
-    log::debug!(
-        "Compiling dual vertex shader to GLSL (va={} words @0x{:X}, vb={} words @0x{:X})",
-        vertex_a_code.len(),
-        vertex_a_base_offset,
-        vertex_b_code.len(),
-        vertex_b_base_offset
-    );
-    if std::env::var_os("RUZU_TRACE_SHADER_WORDS").is_some() {
-        trace_shader_words(ShaderStage::VertexA, vertex_a_base_offset, vertex_a_code);
-        trace_shader_words(ShaderStage::VertexB, vertex_b_base_offset, vertex_b_code);
-    }
-
-    let mut vertex_a = translate_and_optimize_with_host_info(
-        vertex_a_code,
-        ShaderStage::VertexA,
-        vertex_a_base_offset,
-        host_info,
-    );
-    let mut vertex_b = translate_and_optimize_with_host_info(
-        vertex_b_code,
-        ShaderStage::VertexB,
-        vertex_b_base_offset,
-        host_info,
-    );
-    let mut program = merge_dual_vertex_programs(&mut vertex_a, &mut vertex_b);
-
-    convert_legacy_to_generic(&mut program, runtime_info);
-    let source = backend::glsl::emit_glsl(profile, runtime_info, &mut program, bindings);
-    if std::env::var_os("RUZU_DUMP_GLSL").is_some() {
-        eprintln!("[RUZU_DUMP_GLSL DualVertex]\n{}", source);
-    }
-
-    CompiledGlslShader {
-        source,
-        info: program.info,
-        stage: ShaderStage::VertexB,
     }
 }
 
@@ -1136,12 +948,49 @@ pub fn compile_dual_vertex_shader_from_env_with_bindings_and_host_info(
         vertex_b_env,
         host_info,
     );
-    let mut program = merge_dual_vertex_programs(&mut vertex_a, &mut vertex_b);
+    let mut program = merge_dual_vertex_programs(&mut vertex_a, &mut vertex_b, vertex_b_env);
 
     convert_legacy_to_generic(&mut program, runtime_info);
     let spirv_words = backend::emit_spirv_with_bindings(&program, profile, runtime_info, bindings);
     CompiledShader {
         spirv_words,
+        info: program.info,
+        stage: ShaderStage::VertexB,
+    }
+}
+
+/// Compile a Maxwell VertexA + VertexB pair to GLSL through the
+/// upstream-shaped environment bridge.
+pub fn compile_dual_vertex_shader_glsl_from_env_with_bindings_and_host_info(
+    vertex_a_code: &[u64],
+    vertex_a_base_offset: u32,
+    vertex_a_env: &mut dyn Environment,
+    vertex_b_code: &[u64],
+    vertex_b_base_offset: u32,
+    vertex_b_env: &mut dyn Environment,
+    profile: &Profile,
+    runtime_info: &RuntimeInfo,
+    bindings: &mut backend::bindings::Bindings,
+    host_info: &crate::host_translate_info::HostTranslateInfo,
+) -> CompiledGlslShader {
+    let mut vertex_a = translate_program_from_env_with_host_info(
+        vertex_a_code,
+        vertex_a_base_offset,
+        vertex_a_env,
+        host_info,
+    );
+    let mut vertex_b = translate_program_from_env_with_host_info(
+        vertex_b_code,
+        vertex_b_base_offset,
+        vertex_b_env,
+        host_info,
+    );
+    let mut program = merge_dual_vertex_programs(&mut vertex_a, &mut vertex_b, vertex_b_env);
+
+    convert_legacy_to_generic(&mut program, runtime_info);
+    let source = backend::glsl::emit_glsl(profile, runtime_info, &mut program, bindings);
+    CompiledGlslShader {
+        source,
         info: program.info,
         stage: ShaderStage::VertexB,
     }
@@ -1200,9 +1049,11 @@ fn translate_and_optimize_with_host_info(
     base_offset: u32,
     host_info: &crate::host_translate_info::HostTranslateInfo,
 ) -> Program {
+    let mut normalized_host_info = host_info.clone();
+    normalized_host_info.apply_descriptor_limit_policy();
     let cfg_blocks = control_flow::build_cfg(code);
     let mut program = translate_cfg_to_program(code, stage, base_offset, &cfg_blocks, None);
-    ir_opt::optimize_with_host_info(&mut program, host_info);
+    optimize_program_without_env(&mut program, &normalized_host_info, None, None);
     program
 }
 
@@ -1260,305 +1111,6 @@ fn output_vertices_for_topology(topology: OutputTopology) -> u32 {
         OutputTopology::PointList => 1,
         OutputTopology::LineStrip => 2,
         OutputTopology::TriangleStrip => 3,
-    }
-}
-
-fn optimize_program_with_env(
-    program: &mut Program,
-    env: &mut dyn Environment,
-    host_info: &crate::host_translate_info::HostTranslateInfo,
-    sph: Option<&ProgramHeader>,
-) {
-    ir_opt::ssa_rewrite_pass::ssa_rewrite_pass(program);
-    ir_opt::identity_removal::identity_removal_pass(program);
-    ir_opt::constant_propagation::constant_propagation_pass_with_env(env, program);
-    ir_opt::identity_removal::identity_removal_pass(program);
-    ir_opt::position_pass::position_pass(env, program);
-    ir_opt::global_memory_to_storage_buffer_pass::global_memory_to_storage_buffer_pass(
-        program, host_info,
-    );
-    ir_opt::texture_pass::texture_pass(env, program, host_info);
-    ir_opt::dead_code_elimination::dead_code_elimination_pass(program);
-    if let Some(sph) = sph {
-        ir_opt::collect_info::collect_shader_info_pass_with_sph(program, sph);
-    } else {
-        ir_opt::collect_info::collect_shader_info_pass(program);
-    }
-    ir_opt::layer_pass::layer_pass(program, host_info);
-    ir_opt::vendor_workaround_pass::vendor_workaround_pass(program);
-}
-
-fn optimize_glsl_with_optional_ir_dump(
-    program: &mut Program,
-    stage: ShaderStage,
-    base_offset: u32,
-    code: &[u64],
-    texture_bound_buffer: Option<u32>,
-    sph: Option<&ProgramHeader>,
-    host_info: &crate::host_translate_info::HostTranslateInfo,
-) {
-    let dump = ShaderIrDumpConfig::from_env(stage, base_offset, code);
-    if let Some(dump) = dump.as_ref() {
-        dump.write(program, "00_translated");
-    }
-
-    ir_opt::ssa_rewrite_pass::ssa_rewrite_pass(program);
-    if let Some(dump) = dump.as_ref() {
-        dump.write(program, "01_ssa_rewrite");
-    }
-    ir_opt::identity_removal::identity_removal_pass(program);
-    if let Some(dump) = dump.as_ref() {
-        dump.write(program, "02_identity_removal_1");
-    }
-    ir_opt::constant_propagation::constant_propagation_pass(program);
-    if let Some(dump) = dump.as_ref() {
-        dump.write(program, "03_constant_propagation");
-    }
-    ir_opt::identity_removal::identity_removal_pass(program);
-    if let Some(dump) = dump.as_ref() {
-        dump.write(program, "04_identity_removal_2");
-    }
-    ir_opt::global_memory_to_storage_buffer_pass::global_memory_to_storage_buffer_pass(
-        program, host_info,
-    );
-    if let Some(dump) = dump.as_ref() {
-        dump.write(program, "05_global_memory_to_storage_buffer");
-    }
-    if let Some(texture_bound_buffer) = texture_bound_buffer {
-        ir_opt::texture_pass::texture_pass_bound_textures(program, texture_bound_buffer);
-        if let Some(dump) = dump.as_ref() {
-            dump.write(program, "06_texture_pass");
-        }
-    }
-    let code_hash = hash_code(code);
-    if shader_hash_env_matches("RUZU_SHADER_SKIP_DCE_HASH", code_hash) {
-        log::warn!(
-            "[SHADER_SKIP_DCE] stage={:?} base=0x{:X} hash=0x{:016X}",
-            stage,
-            base_offset,
-            code_hash
-        );
-        if let Some(dump) = dump.as_ref() {
-            dump.write(program, "07_dead_code_elimination_skipped");
-        }
-    } else {
-        ir_opt::dead_code_elimination::dead_code_elimination_pass(program);
-        if let Some(dump) = dump.as_ref() {
-            dump.write(program, "07_dead_code_elimination");
-        }
-    }
-    if let Some(sph) = sph {
-        ir_opt::collect_info::collect_shader_info_pass_with_sph(program, sph);
-    } else {
-        ir_opt::collect_info::collect_shader_info_pass(program);
-    }
-    if let Some(dump) = dump.as_ref() {
-        dump.write(program, "08_collect_shader_info");
-    }
-    ir_opt::layer_pass::layer_pass(program, host_info);
-    if let Some(dump) = dump.as_ref() {
-        dump.write(program, "09_layer_pass");
-    }
-    ir_opt::vendor_workaround_pass::vendor_workaround_pass(program);
-    if let Some(dump) = dump.as_ref() {
-        dump.write(program, "10_vendor_workaround_pass");
-    }
-}
-
-struct ShaderIrDumpConfig {
-    dir: std::path::PathBuf,
-    stage: ShaderStage,
-    base_offset: u32,
-    code_hash: u64,
-    words: usize,
-    decoded_words: Option<String>,
-}
-
-impl ShaderIrDumpConfig {
-    fn from_env(stage: ShaderStage, base_offset: u32, code: &[u64]) -> Option<Self> {
-        let dir = std::env::var_os("RUZU_DUMP_SHADER_IR_DIR").map(std::path::PathBuf::from)?;
-        let code_hash = hash_code(code);
-        if let Ok(spec) = std::env::var("RUZU_DUMP_SHADER_IR_STAGE") {
-            if !spec.split(',').any(|raw| {
-                let value = raw.trim();
-                value == "*" || value.eq_ignore_ascii_case(&format!("{stage:?}"))
-            }) {
-                return None;
-            }
-        }
-        if let Ok(spec) = std::env::var("RUZU_DUMP_SHADER_IR_CODE_HASH") {
-            if !spec.split(',').any(|raw| {
-                let value = raw.trim();
-                if value == "*" {
-                    return true;
-                }
-                let hex = value
-                    .strip_prefix("0x")
-                    .or_else(|| value.strip_prefix("0X"))
-                    .unwrap_or(value);
-                u64::from_str_radix(hex, 16).is_ok_and(|target| target == code_hash)
-            }) {
-                return None;
-            }
-        }
-        if let Ok(spec) = std::env::var("RUZU_DUMP_SHADER_IR_BASE") {
-            if !spec.split(',').any(|raw| {
-                let value = raw.trim();
-                if value == "*" {
-                    return true;
-                }
-                let hex = value
-                    .strip_prefix("0x")
-                    .or_else(|| value.strip_prefix("0X"))
-                    .unwrap_or(value);
-                u32::from_str_radix(hex, 16).is_ok_and(|target| target == base_offset)
-            }) {
-                return None;
-            }
-        }
-        if let Err(err) = std::fs::create_dir_all(&dir) {
-            log::warn!(
-                "Failed to create RUZU_DUMP_SHADER_IR_DIR {}: {}",
-                dir.display(),
-                err
-            );
-            return None;
-        }
-        Some(Self {
-            dir,
-            stage,
-            base_offset,
-            code_hash,
-            words: code.len(),
-            decoded_words: std::env::var_os("RUZU_DUMP_SHADER_IR_WORDS")
-                .map(|_| decoded_shader_words(stage, base_offset, code)),
-        })
-    }
-
-    fn write(&self, program: &Program, phase: &str) {
-        let path = self.dir.join(format!(
-            "{phase}_{:?}_base_{:06X}_hash_{:016X}.txt",
-            self.stage, self.base_offset, self.code_hash
-        ));
-        let mut out = String::new();
-        out.push_str(&format!(
-            "phase={phase}\nstage={:?}\nbase_offset=0x{:X}\ncode_hash=0x{:016X}\nwords={}\nblocks={}\nsyntax_nodes={}\npost_order={:?}\n\n",
-            self.stage,
-            self.base_offset,
-            self.code_hash,
-            self.words,
-            program.blocks.len(),
-            program.syntax_list.len(),
-            program.post_order_blocks,
-        ));
-        out.push_str("syntax:\n");
-        for (index, node) in program.syntax_list.iter().enumerate() {
-            out.push_str(&format!("  {index:04}: {node:?}\n"));
-        }
-        if let Some(decoded_words) = &self.decoded_words {
-            out.push_str("\nshader_words:\n");
-            out.push_str(decoded_words);
-        }
-        out.push_str("\nopcode_counts:\n");
-        for (name, count) in opcode_counts(program) {
-            out.push_str(&format!("  {name}: {count}\n"));
-        }
-        out.push_str("\nblocks:\n");
-        for (block_index, block) in program.blocks.iter().enumerate() {
-            out.push_str(&format!(
-                "block {block_index} order={} preds={:?} succs={:?} live_insts={}\n",
-                block.order,
-                block.imm_predecessors,
-                block.imm_successors,
-                block.indexed_iter().count(),
-            ));
-            for (inst_index, inst) in block.indexed_iter() {
-                out.push_str(&format!(
-                    "  {inst_index:04}: {} args={:?} phi={:?}\n",
-                    inst.opcode.name(),
-                    inst.args,
-                    inst.phi_args,
-                ));
-            }
-        }
-        if let Err(err) = std::fs::write(&path, out) {
-            log::warn!("Failed to write shader IR dump {}: {}", path.display(), err);
-        } else {
-            log::info!(
-                "[SHADER_IR_DUMP] phase={} stage={:?} hash=0x{:016X} path={}",
-                phase,
-                self.stage,
-                self.code_hash,
-                path.display()
-            );
-        }
-    }
-}
-
-fn decoded_shader_words(stage: ShaderStage, base_offset: u32, code: &[u64]) -> String {
-    let mut out = String::new();
-    for (index, &word) in code.iter().enumerate() {
-        let abs = base_offset + (index as u32 * 8);
-        let sched = is_sched_control_word(index);
-        let predicate = super::frontend::instruction::Instruction::new(word).pred();
-        let opcode = super::frontend::maxwell_opcodes::decode_opcode(word)
-            .map(|op| format!("{op:?}"))
-            .unwrap_or_else(|| "UNKNOWN".to_string());
-        out.push_str(&format!(
-            "  index={index:04} abs=0x{abs:06X} sched={sched} opcode={opcode} pred={}{} word=0x{word:016X} stage={stage:?}\n",
-            if predicate.negated { "!" } else { "" },
-            predicate.index,
-        ));
-    }
-    out
-}
-
-fn opcode_counts(program: &Program) -> BTreeMap<&'static str, usize> {
-    let mut counts = BTreeMap::new();
-    for block in &program.blocks {
-        for (_, inst) in block.indexed_iter() {
-            *counts.entry(inst.opcode.name()).or_insert(0) += 1;
-        }
-    }
-    counts
-}
-
-fn shader_hash_env_matches(env_name: &str, code_hash: u64) -> bool {
-    let Ok(spec) = std::env::var(env_name) else {
-        return false;
-    };
-    spec.split(',').any(|raw| {
-        let value = raw.trim();
-        if value.is_empty() {
-            return false;
-        }
-        if value == "*" {
-            return true;
-        }
-        let hex = value
-            .strip_prefix("0x")
-            .or_else(|| value.strip_prefix("0X"))
-            .unwrap_or(value);
-        u64::from_str_radix(hex, 16).is_ok_and(|target| target == code_hash)
-    })
-}
-
-fn trace_shader_words(stage: ShaderStage, base_offset: u32, code: &[u64]) {
-    eprintln!(
-        "[SHADER_CODE] stage={:?} base=0x{:X} words={}",
-        stage,
-        base_offset,
-        code.len()
-    );
-    for (i, &word) in code.iter().take(32).enumerate() {
-        eprintln!(
-            "[SHADER_CODE_WORD] stage={:?} abs=0x{:X} index={} sched={} word=0x{:016X}",
-            stage,
-            base_offset + (i as u32 * 8),
-            i,
-            is_sched_control_word(i),
-            word
-        );
     }
 }
 
@@ -1806,10 +1358,7 @@ mod tests {
                 end_class: EndClass::Branch,
                 branch_true: Some(2),
                 branch_false: Some(1),
-                cond: Condition {
-                    pred: 2,
-                    negated: true,
-                },
+                cond: Condition::from_pred(crate::ir::condition::IrPred::P2, true),
                 stack_depth: 0,
                 branch_reg: 0,
                 branch_offset: 0,
@@ -1882,40 +1431,6 @@ mod tests {
     }
 
     #[test]
-    fn clear_unreachable_blocks_preserves_indices_but_drops_stale_instructions() {
-        use crate::ir::basic_block::Block;
-        use crate::ir::instruction::Inst;
-        use crate::ir::opcodes::Opcode;
-        use crate::ir::value::{InstRef, Reg, Value};
-
-        let mut program = Program::new(ShaderStage::VertexB);
-        program.blocks.push(Block::new());
-        program.blocks.push(Block::new());
-        let cond = program
-            .block_mut(1)
-            .append_inst(Inst::new(Opcode::GetRegister, vec![Value::Reg(Reg(3))]));
-        program.syntax_list.push(SyntaxNode::If {
-            cond: Value::Inst(InstRef {
-                block: 1,
-                inst: cond,
-            }),
-            body: 1,
-            merge: 0,
-        });
-        program.post_order_blocks = vec![0];
-
-        clear_unreachable_blocks(&mut program);
-
-        assert_eq!(program.blocks.len(), 2);
-        assert!(program.block(1).is_empty());
-        assert_eq!(program.post_order_blocks, vec![0]);
-        let SyntaxNode::If { cond, .. } = program.syntax_list[0] else {
-            panic!("expected If syntax node");
-        };
-        assert_eq!(cond, Value::ImmU1(false));
-    }
-
-    #[test]
     fn sched_control_skip_is_anchored_at_code_start() {
         // The sched grid is anchored at the start of the code slice
         // (`code[0]` is always a sched word), regardless of the code's
@@ -1931,6 +1446,7 @@ mod tests {
     const UNCONDITIONAL_EXIT: u64 = 0xE300_0000_0007_000F;
 
     struct DummyEnvironment {
+        texture_pass_caches: crate::environment::TexturePassCaches,
         sph: ProgramHeader,
     }
 
@@ -1938,11 +1454,18 @@ mod tests {
         fn compute() -> Self {
             let mut sph = ProgramHeader::default();
             sph.raw[3] = (OutputTopology::TriangleStrip as u32) << 24;
-            Self { sph }
+            Self {
+                texture_pass_caches: Default::default(),
+                sph,
+            }
         }
     }
 
     impl Environment for DummyEnvironment {
+        fn texture_pass_caches(&mut self) -> &mut crate::environment::TexturePassCaches {
+            &mut self.texture_pass_caches
+        }
+
         fn read_instruction(&mut self, address: u32) -> u64 {
             match address {
                 // Location aligns past the sched word at byte offset zero.

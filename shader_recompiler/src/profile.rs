@@ -4,8 +4,8 @@
 //! Port of `shader_recompiler/profile.h`
 //!
 //! GPU/driver capability profile used during shader compilation.
-//! The existing `backend::Profile` is a simplified version; this module
-//! provides the full upstream-faithful `Profile` struct.
+
+use crate::stage::Stage;
 
 /// Full GPU/driver capability profile matching upstream `Profile` struct.
 #[derive(Debug, Clone)]
@@ -14,7 +14,11 @@ pub struct Profile {
     pub unified_descriptor_binding: bool,
     pub support_descriptor_aliasing: bool,
     pub support_int8: bool,
+    pub support_uniform_and_storage_buffer_8bit: bool,
+    pub support_storage_buffer_8bit: bool,
     pub support_int16: bool,
+    pub support_uniform_and_storage_buffer_16bit: bool,
+    pub support_storage_buffer_16bit: bool,
     pub support_int64: bool,
     pub support_vertex_instance_id: bool,
     pub support_float_controls: bool,
@@ -28,12 +32,16 @@ pub struct Profile {
     pub support_fp32_signed_zero_nan_preserve: bool,
     pub support_fp64_signed_zero_nan_preserve: bool,
     pub support_explicit_workgroup_layout: bool,
+    pub support_workgroup_layout_8bit_access: bool,
+    pub support_workgroup_layout_16bit_access: bool,
     pub support_vote: bool,
+    pub supported_subgroup_stages: u32,
     pub support_viewport_index_layer_non_geometry: bool,
     pub support_viewport_mask: bool,
     pub support_typeless_image_loads: bool,
     pub support_demote_to_helper_invocation: bool,
     pub support_int64_atomics: bool,
+    pub support_shared_int64_atomics: bool,
     pub support_derivative_control: bool,
     pub support_geometry_shader_passthrough: bool,
     pub support_native_ndc: bool,
@@ -47,6 +55,10 @@ pub struct Profile {
     pub support_scaled_attributes: bool,
     pub support_multi_viewport: bool,
     pub support_geometry_streams: bool,
+    pub support_sampled_image_array_nonuniform_indexing: bool,
+    pub support_storage_image_array_nonuniform_indexing: bool,
+    pub support_uniform_texel_buffer_array_nonuniform_indexing: bool,
+    pub support_storage_texel_buffer_array_nonuniform_indexing: bool,
 
     pub warp_size_potentially_larger_than_guest: bool,
 
@@ -92,6 +104,13 @@ pub struct Profile {
     pub max_user_clip_distances: u32,
 }
 
+impl Profile {
+    /// Port of upstream `Profile::SupportsSubgroupStage`.
+    pub fn supports_subgroup_stage(&self, stage: Stage) -> bool {
+        (self.supported_subgroup_stages & (1u32 << stage as u32)) != 0
+    }
+}
+
 impl Default for Profile {
     fn default() -> Self {
         Self {
@@ -99,7 +118,11 @@ impl Default for Profile {
             unified_descriptor_binding: false,
             support_descriptor_aliasing: false,
             support_int8: false,
+            support_uniform_and_storage_buffer_8bit: false,
+            support_storage_buffer_8bit: false,
             support_int16: false,
+            support_uniform_and_storage_buffer_16bit: false,
+            support_storage_buffer_16bit: false,
             support_int64: false,
             support_vertex_instance_id: false,
             support_float_controls: false,
@@ -113,12 +136,16 @@ impl Default for Profile {
             support_fp32_signed_zero_nan_preserve: false,
             support_fp64_signed_zero_nan_preserve: false,
             support_explicit_workgroup_layout: false,
+            support_workgroup_layout_8bit_access: false,
+            support_workgroup_layout_16bit_access: false,
             support_vote: false,
+            supported_subgroup_stages: 0x7F,
             support_viewport_index_layer_non_geometry: false,
             support_viewport_mask: false,
             support_typeless_image_loads: false,
-            support_demote_to_helper_invocation: true,
+            support_demote_to_helper_invocation: false,
             support_int64_atomics: false,
+            support_shared_int64_atomics: false,
             support_derivative_control: false,
             support_geometry_shader_passthrough: false,
             support_native_ndc: false,
@@ -132,6 +159,10 @@ impl Default for Profile {
             support_scaled_attributes: false,
             support_multi_viewport: false,
             support_geometry_streams: false,
+            support_sampled_image_array_nonuniform_indexing: false,
+            support_storage_image_array_nonuniform_indexing: false,
+            support_uniform_texel_buffer_array_nonuniform_indexing: false,
+            support_storage_texel_buffer_array_nonuniform_indexing: false,
             warp_size_potentially_larger_than_guest: false,
             lower_left_origin_mode: false,
             need_declared_frag_colors: false,

@@ -1,0 +1,110 @@
+// SPDX-FileCopyrightText: Copyright 2025 Eden Emulator Project
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+#version 430
+
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_8bit_storage  : require
+
+layout(push_constant) uniform PushConstants {
+    uvec3 blocks_dim;
+    uint bytes_per_block_log2;
+
+    uvec3 origin;
+    uint slice_size;
+
+    uint block_size;
+    uint x_shift;
+    uint block_height;
+    uint block_height_mask;
+
+    uint block_depth;
+    uint block_depth_mask;
+    int _pad;
+
+    ivec3 destination;
+} pc;
+
+layout(binding = 0, std430) buffer InputBufferU8   { uint8_t  u8data[];  };
+layout(binding = 0, std430) buffer InputBufferU16  { uint16_t u16data[]; };
+layout(binding = 0, std430) buffer InputBufferU32  { uint   u32data[];  };
+layout(binding = 0, std430) buffer InputBufferU64  { uvec2  u64data[];  };
+layout(binding = 0, std430) buffer InputBufferU128 { uvec4  u128data[]; };
+
+layout(binding = 1, std430) writeonly buffer OutputBuffer {
+    uint out_u32[];
+};
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 4) in;
+
+const uint GOB_SIZE_X = 64;
+const uint GOB_SIZE_Y = 8;
+const uint GOB_SIZE_Z = 1;
+const uint GOB_SIZE_X_SHIFT = 6;
+const uint GOB_SIZE_Y_SHIFT = 3;
+const uint GOB_SIZE_Z_SHIFT = 0;
+const uint GOB_SIZE_SHIFT = GOB_SIZE_X_SHIFT + GOB_SIZE_Y_SHIFT + GOB_SIZE_Z_SHIFT;
+const uvec2 SWIZZLE_MASK = uvec2(GOB_SIZE_X - 1u, GOB_SIZE_Y - 1u);
+
+uint SwizzleTable(uint pos) {
+    const uint t[8] = uint[](
+        0x12100200, 0x13110301, 0x16140604, 0x17150705,
+        0x1a180a08, 0x1b190b09, 0x1e1c0e0c, 0x1f1d0f0d
+    );
+    const uint i = pos >> 4;
+    const uint h = (t[i / 4] >> ((i % 4) * 8)) & 0xff;
+    return (h << 4) | (pos & 0xf);
+}
+
+uint SwizzleOffset(uvec2 pos) {
+    pos &= SWIZZLE_MASK;
+    return SwizzleTable(pos.y * 64u + pos.x);
+}
+
+uvec4 ReadTexel(uint offset) {
+    uint bpl2 = pc.bytes_per_block_log2;
+    switch (bpl2) {
+        case 0u: return uvec4(u8data[offset], 0u, 0u, 0u);
+        case 1u: return uvec4(u16data[offset / 2u], 0u, 0u, 0u);
+        case 2u: return uvec4(u32data[offset / 4u], 0u, 0u, 0u);
+        case 3u: return uvec4(u64data[offset / 8u], 0u, 0u);
+        case 4u: return u128data[offset / 16u];
+    }
+    return uvec4(0u);
+}
+
+void main() {
+    uvec3 block_coord = gl_GlobalInvocationID;
+    if (any(greaterThanEqual(block_coord, pc.blocks_dim))) {
+        return;
+    }
+
+    uint bytes_per_block = 1u << pc.bytes_per_block_log2;
+    uvec3 pos;
+    pos.x = (block_coord.x + (pc.origin.x >> 2u)) * bytes_per_block;
+    pos.y = block_coord.y + (pc.origin.y >> 2u);
+    pos.z = block_coord.z + pc.origin.z;
+
+    uint swizzle = SwizzleOffset(pos.xy);
+    uint block_y = pos.y >> GOB_SIZE_Y_SHIFT;
+    uint offset = 0u;
+    offset += (pos.z >> pc.block_depth) * pc.slice_size;
+    offset += (pos.z & pc.block_depth_mask) << (GOB_SIZE_SHIFT + pc.block_height);
+    offset += (block_y >> pc.block_height) * pc.block_size;
+    offset += (block_y & pc.block_height_mask) << GOB_SIZE_SHIFT;
+    offset += (pos.x >> GOB_SIZE_X_SHIFT) << pc.x_shift;
+    offset += swizzle;
+
+    uvec4 texel = ReadTexel(offset);
+    uint block_index = block_coord.x +
+                       (block_coord.y * pc.blocks_dim.x) +
+                       (block_coord.z * pc.blocks_dim.x * pc.blocks_dim.y);
+    uint out_idx = block_index * (bytes_per_block >> 2u);
+
+    out_u32[out_idx] = texel.x;
+    out_u32[out_idx + 1u] = texel.y;
+    if (pc.bytes_per_block_log2 == 4u) {
+        out_u32[out_idx + 2u] = texel.z;
+        out_u32[out_idx + 3u] = texel.w;
+    }
+}

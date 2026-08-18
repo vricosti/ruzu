@@ -115,6 +115,12 @@ const UNSET_CHANNEL: usize = usize::MAX;
 /// `ChannelSetupCaches<ChannelInfo>`.
 pub struct ChannelSetupCaches<P> {
     // -- "current" state (updated by bind_to_channel) ---------------------
+    /// Stable address of the currently bound per-channel state.
+    ///
+    /// Upstream stores `P* channel_state` pointing into a `std::deque<P>`.
+    /// Rust's `VecDeque` does not preserve element addresses when it grows, so
+    /// `channel_storage` owns boxed elements and this field stores the pointee
+    /// address rather than repeatedly resolving `current_channel_id`.
     channel_state: Option<usize>,
     current_channel_id: usize,
     current_address_space: usize,
@@ -129,7 +135,7 @@ pub struct ChannelSetupCaches<P> {
     pub program_id: u64,
 
     // -- storage ----------------------------------------------------------
-    channel_storage: VecDeque<P>,
+    channel_storage: VecDeque<Box<P>>,
     free_channel_ids: VecDeque<usize>,
     channel_map: HashMap<i32, usize>,
     active_channel_ids: Vec<usize>,
@@ -191,18 +197,19 @@ impl<P> ChannelSetupCaches<P> {
         );
 
         let new_id = if let Some(id) = self.free_channel_ids.pop_front() {
-            self.channel_storage[id] = P::from_channel_state(channel);
+            self.channel_storage[id] = Box::new(P::from_channel_state(channel));
             id
         } else {
             self.channel_storage
-                .push_back(P::from_channel_state(channel));
+                .push_back(Box::new(P::from_channel_state(channel)));
             self.channel_storage.len() - 1
         };
 
         self.channel_map.insert(channel.bind_id, new_id);
 
         if self.current_channel_id != UNSET_CHANNEL {
-            self.channel_state = Some(self.current_channel_id);
+            self.channel_state =
+                Some((&mut *self.channel_storage[self.current_channel_id] as *mut P) as usize);
         }
 
         self.active_channel_ids.push(new_id);
@@ -244,9 +251,9 @@ impl<P> ChannelSetupCaches<P> {
         assert!(id >= 0, "bind_to_channel: negative id");
 
         self.current_channel_id = storage_id;
-        self.channel_state = Some(storage_id);
+        self.channel_state = Some((&mut *self.channel_storage[storage_id] as *mut P) as usize);
 
-        let state = &self.channel_storage[storage_id];
+        let state = &*self.channel_storage[storage_id];
         self.maxwell3d = Some(state.maxwell3d_ref());
         self.kepler_compute = Some(state.kepler_compute_ref());
         self.gpu_memory = Some(state.gpu_memory_ref());
@@ -277,7 +284,8 @@ impl<P> ChannelSetupCaches<P> {
             self.gpu_memory = None;
             self.program_id = 0;
         } else if self.current_channel_id != UNSET_CHANNEL {
-            self.channel_state = Some(self.current_channel_id);
+            self.channel_state =
+                Some((&mut *self.channel_storage[self.current_channel_id] as *mut P) as usize);
         }
 
         if let Some(pos) = self
@@ -307,7 +315,9 @@ impl<P> ChannelSetupCaches<P> {
 
     pub fn current_channel_state(&self) -> Option<&P> {
         let channel_state = self.channel_state?;
-        self.channel_storage.get(channel_state)
+        // `channel_storage` owns boxed entries, so insertion or deque growth
+        // cannot move this pointee. Bind/erase keeps the address synchronized.
+        Some(unsafe { &*(channel_state as *const P) })
     }
 
     pub fn has_current_channel_state(&self) -> bool {
@@ -316,24 +326,26 @@ impl<P> ChannelSetupCaches<P> {
 
     pub fn current_channel_state_mut(&mut self) -> Option<&mut P> {
         let channel_state = self.channel_state?;
-        self.channel_storage.get_mut(channel_state)
+        // `&mut self` excludes every other cache access while the returned
+        // reference exists; the boxed pointee remains stable across growth.
+        Some(unsafe { &mut *(channel_state as *mut P) })
     }
 
     pub fn channel_state_by_bind_id(&self, id: i32) -> Option<&P> {
         let &storage_id = self.channel_map.get(&id)?;
-        self.channel_storage.get(storage_id)
+        self.channel_storage.get(storage_id).map(Box::as_ref)
     }
 
     pub fn channel_state_by_bind_id_mut(&mut self, id: i32) -> Option<&mut P> {
         let &storage_id = self.channel_map.get(&id)?;
-        self.channel_storage.get_mut(storage_id)
+        self.channel_storage.get_mut(storage_id).map(Box::as_mut)
     }
 
     pub fn for_each_active_channel_state_mut(&mut self, mut f: impl FnMut(&mut P)) {
         let active_channel_ids = self.active_channel_ids.clone();
         for id in active_channel_ids {
             if let Some(state) = self.channel_storage.get_mut(id) {
-                f(state);
+                f(state.as_mut());
             }
         }
     }
@@ -460,6 +472,32 @@ mod tests {
             .and_then(ChannelCacheAccessor::gpu_memory_arc)
             .expect("bound gpu memory");
         assert_eq!(bound.lock().get_id(), 42);
+    }
+
+    #[test]
+    fn bound_channel_state_address_survives_storage_growth() {
+        let mut caches: ChannelSetupCaches<ChannelInfo> = ChannelSetupCaches::new();
+
+        let mut bound_channel = ChannelState::new(1);
+        bound_channel.program_id = 0xCAFE;
+        caches.create_channel(&bound_channel);
+        caches.bind_to_channel(1);
+        let bound_address = caches.channel_state.expect("bound channel address");
+
+        for bind_id in 2..258 {
+            let mut channel = ChannelState::new(bind_id);
+            channel.program_id = bind_id as u64;
+            caches.create_channel(&channel);
+        }
+
+        assert_eq!(caches.channel_state, Some(bound_address));
+        assert_eq!(
+            caches
+                .current_channel_state()
+                .expect("bound channel after storage growth")
+                .program_id,
+            0xCAFE
+        );
     }
 
     #[test]

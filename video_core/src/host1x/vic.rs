@@ -6,8 +6,9 @@
 //! Video Image Composer (VIC) — reads decoded frames from the frame queue,
 //! performs color conversion / compositing, and writes output surfaces.
 //!
-//! The VIC implementation is heavily FFmpeg/SIMD-dependent in upstream; method
-//! bodies that require FFmpeg frame data or SIMD (SSE4.1) are stubbed.
+//! The scalar paths preserve the upstream FFmpeg-backed frame conversion and
+//! compositing behavior; upstream's optional SSE4.1 paths remain host-side
+//! optimizations rather than separate behavior.
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -772,6 +773,7 @@ pub struct Vic {
     luma_scratch: Vec<u8>,
     chroma_scratch: Vec<u8>,
     swizzle_scratch: Vec<u8>,
+    has_decoded_frame: bool,
 }
 
 impl Vic {
@@ -794,6 +796,7 @@ impl Vic {
             luma_scratch: Vec::new(),
             chroma_scratch: Vec::new(),
             swizzle_scratch: Vec::new(),
+            has_decoded_frame: false,
         }
     }
 
@@ -826,18 +829,9 @@ impl Vic {
                 std::mem::size_of::<ConfigStruct>(),
             )
         };
-        if !self
-            .memory_manager
+        self.memory_manager
             .lock()
-            .read_block(config_addr, config_bytes)
-        {
-            log::error!(
-                "Vic {} failed to read ConfigStruct at 0x{:X}",
-                self.id,
-                config_addr
-            );
-            return;
-        }
+            .read_block(config_addr, config_bytes);
         if let Some(config_start) = config_start {
             emit_vic_timing(
                 self.id,
@@ -864,6 +858,7 @@ impl Vic {
         {
             self.output_surface.fill(Pixel::default());
         } else {
+            let mut decoded_frame = false;
             for index in 0..config.slot_structs.len() {
                 let slot_config = config.slot_structs[index];
                 if !slot_config.config.slot_enable() {
@@ -877,7 +872,7 @@ impl Vic {
 
                 let frame_start = trace_video.then(Instant::now);
                 let Some(frame) = self.frame_queue.get_frame(self.nvdec_id, luma_offset) else {
-                    log::error!(
+                    log::trace!(
                         "Vic {} failed to get frame with offset 0x{:X}",
                         self.id,
                         luma_offset
@@ -903,10 +898,9 @@ impl Vic {
                         log::warn!(
                         "Vic {} unimplemented FFmpeg frame pixel format {} for slot format {:?}",
                         self.id,
-                        format,
-                        slot_config.surface_config.slot_pixel_format()
-                    );
-                        continue;
+                            format,
+                            slot_config.surface_config.slot_pixel_format()
+                        );
                     }
                 }
                 if let Some(read_start) = read_start {
@@ -932,6 +926,12 @@ impl Vic {
                         u64::from(slot_config.color_matrix.matrix_enable()),
                     );
                 }
+                decoded_frame = true;
+            }
+            if decoded_frame {
+                self.has_decoded_frame = true;
+            } else if !self.has_decoded_frame {
+                return;
             }
         }
 
@@ -1588,6 +1588,66 @@ impl ProcessMethodHook for Vic {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
+
+    const TEST_CONFIG_GPU_ADDR: u64 = 0x1_0000;
+    const TEST_OUTPUT_GPU_ADDR: u64 = 0x1_1000;
+    const TEST_DEVICE_ADDR: u64 = 0x8000;
+
+    fn vic_with_mapped_config(config: &ConfigStruct) -> (Vic, Vec<u8>) {
+        let mut backing = vec![0x5a; 0x2000];
+        let config_bytes = unsafe {
+            std::slice::from_raw_parts(
+                (config as *const ConfigStruct).cast::<u8>(),
+                std::mem::size_of::<ConfigStruct>(),
+            )
+        };
+        backing[..config_bytes.len()].copy_from_slice(config_bytes);
+
+        let device_memory = Arc::new(MaxwellDeviceMemoryManager::default());
+        device_memory.smmu_set_physical_base_for_test(backing.as_ptr() as usize);
+        device_memory.smmu_map_with_cpu_backing(
+            TEST_DEVICE_ADDR,
+            backing.as_ptr(),
+            0x4000_0000,
+            backing.len(),
+            1,
+            true,
+        );
+        let mut memory = MemoryManager::new_with_geometry_and_device_memory(
+            0,
+            device_memory,
+            32,
+            1u64 << 31,
+            16,
+            12,
+        );
+        memory.map(
+            TEST_CONFIG_GPU_ADDR,
+            TEST_DEVICE_ADDR,
+            backing.len() as u64,
+            0,
+            false,
+        );
+        let memory = Arc::new(parking_lot::Mutex::new(memory));
+        let queue = Arc::new(FrameQueue::new());
+        let mut vic = Vic::new(4, 0, queue, memory);
+        vic.process_method(
+            VIC_REG_CONFIG_STRUCT_OFFSET as u32,
+            (TEST_CONFIG_GPU_ADDR >> 8) as u32,
+        );
+        vic.process_method(
+            VIC_REG_OUTPUT_SURFACE_LUMA as u32,
+            (TEST_OUTPUT_GPU_ADDR >> 8) as u32,
+        );
+        (vic, backing)
+    }
+
+    fn abgr_config() -> ConfigStruct {
+        let mut config = ConfigStruct::default();
+        config.output_surface_config.format_flags = VideoPixelFormat::A8B8G8R8 as u32;
+        config
+    }
 
     #[test]
     fn vic_bitfield_accessors_match_upstream_layout() {
@@ -1650,5 +1710,64 @@ mod tests {
             Some(VicMethod::Execute)
         );
         assert_eq!(VicMethod::from_u32(0x300), None);
+    }
+
+    #[test]
+    fn execute_does_not_write_before_the_first_decoded_frame() {
+        assert_ne!(
+            *common::settings::values().nvdec_emulation.get_value(),
+            common::settings_enums::NvdecEmulation::Off
+        );
+        let mut config = abgr_config();
+        config.slot_structs[0].config.data[0] = 1;
+        let (mut vic, backing) = vic_with_mapped_config(&config);
+
+        vic.execute();
+
+        assert!(!vic.has_decoded_frame);
+        assert_eq!(&backing[0x1000..0x1010], &[0x5a; 0x10]);
+    }
+
+    #[test]
+    fn execute_counts_an_available_frame_even_when_its_format_is_unsupported() {
+        assert_ne!(
+            *common::settings::values().nvdec_emulation.get_value(),
+            common::settings_enums::NvdecEmulation::Off
+        );
+        let mut config = abgr_config();
+        config.slot_structs[0].config.data[0] = 1;
+        let (mut vic, backing) = vic_with_mapped_config(&config);
+        vic.frame_queue.open(9);
+        vic.frame_queue
+            .push_present_order(9, 0, Arc::new(Frame::new()));
+
+        vic.execute();
+
+        assert!(vic.has_decoded_frame);
+        assert_eq!(&backing[0x1000..0x1010], &[0; 0x10]);
+    }
+
+    #[test]
+    fn execute_reuses_the_last_surface_after_a_decoded_frame() {
+        assert_ne!(
+            *common::settings::values().nvdec_emulation.get_value(),
+            common::settings_enums::NvdecEmulation::Off
+        );
+        let (mut vic, backing) = vic_with_mapped_config(&abgr_config());
+        vic.has_decoded_frame = true;
+        vic.output_surface.push(Pixel {
+            r: 0x100,
+            g: 0x200,
+            b: 0x300,
+            a: 0x3fc,
+        });
+
+        vic.execute();
+
+        assert!(vic.has_decoded_frame);
+        assert_eq!(
+            &backing[0x1000..0x1010],
+            &[0x40, 0x80, 0xc0, 0xff, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+        );
     }
 }

@@ -11,9 +11,11 @@ use crate::file_sys::control_metadata::NACP as FileSysNACP;
 use crate::file_sys::nca_metadata::{ContentRecordType, TitleType};
 use crate::file_sys::partition_filesystem::ResultStatus as FsResultStatus;
 use crate::file_sys::patch_manager::PatchManager;
-use crate::file_sys::registered_cache::get_update_title_id;
+use crate::file_sys::registered_cache::{get_update_title_id, ContentProvider};
 use crate::file_sys::submission_package::NSP;
+use crate::file_sys::vfs::vfs::VfsDirectory;
 use crate::file_sys::vfs::vfs_types::VirtualFile;
+use crate::hle::service::filesystem::filesystem::FileSystemController;
 
 use super::deconstructed_rom_directory::AppLoaderDeconstructedRomDirectory;
 use super::loader::{
@@ -59,37 +61,31 @@ impl FileTypeIdentifier for AppLoaderNsp {
     fn identify_type(nsp_file: &VirtualFile) -> FileType {
         let nsp = NSP::new(nsp_file.clone(), 0, 0);
 
-        if nsp.get_status() == FsResultStatus::Success {
-            // Extracted Type case
-            if nsp.is_extracted_type() {
-                if let Some(exefs) = nsp.get_exefs() {
-                    if is_directory_exefs(&exefs) {
-                        return FileType::NSP;
-                    }
+        if nsp.get_status() != FsResultStatus::Success {
+            return FileType::Error;
+        }
+
+        // Extracted Type case.
+        if nsp.is_extracted_type() {
+            if let Some(exefs) = nsp.get_exefs() {
+                if is_directory_exefs(&exefs) {
+                    return FileType::NSP;
                 }
             }
+        }
 
-            // Non-Extracted Type case
-            let program_id = nsp.get_program_title_id();
-            if !nsp.is_extracted_type() {
-                if nsp
-                    .get_nca(
-                        program_id,
-                        ContentRecordType::Program,
-                        TitleType::Application,
-                    )
-                    .is_some()
-                {
-                    if let Some(nca_file) = nsp.get_nca_file(
-                        program_id,
-                        ContentRecordType::Program,
-                        TitleType::Application,
-                    ) {
-                        if AppLoaderNca::identify_type(&nca_file) == FileType::NCA {
-                            return FileType::NSP;
-                        }
-                    }
-                }
+        // Non-extracted NSPs can legitimately contain only update/DLC
+        // content. Identify the container format itself; `load` validates
+        // whether it contains a bootable application.
+        if !nsp.get_ncas().is_empty() {
+            return FileType::NSP;
+        }
+
+        // Preserve format detection when NCAs could not be parsed (for
+        // example because keys are missing) but the PFS still contains them.
+        for entry in nsp.get_files() {
+            if entry.get_name().ends_with(".nca") {
+                return FileType::NSP;
             }
         }
 
@@ -101,42 +97,49 @@ impl AppLoaderNsp {
     /// Create a new NSP loader.
     ///
     /// Maps to upstream `AppLoader_NSP::AppLoader_NSP`.
-    pub fn new(file: VirtualFile, program_id: u64, program_index: usize) -> Self {
+    pub fn new(
+        file: VirtualFile,
+        filesystem_controller: &FileSystemController,
+        content_provider: &dyn ContentProvider,
+        program_id: u64,
+        program_index: usize,
+    ) -> Self {
         let nsp = NSP::new(file.clone(), program_id, program_index);
 
         let mut icon_file: Option<VirtualFile> = None;
         let mut nacp_file: Option<FileSysNACP> = None;
 
-        let secondary_loader: Option<Box<dyn AppLoader>> =
-            if nsp.get_status() != FsResultStatus::Success {
-                None
-            } else if nsp.is_extracted_type() {
-                // Extracted type: use DeconstructedRomDirectory from ExeFS.
-                nsp.get_exefs().map(|exefs| {
-                    let is_hbl = file.get_name() == "hbl.nsp";
-                    Box::new(AppLoaderDeconstructedRomDirectory::new_from_directory(
-                        exefs, false, is_hbl,
-                    )) as Box<dyn AppLoader>
-                })
-            } else {
-                let title_id = nsp.get_program_title_id();
+        let secondary_loader: Option<Box<dyn AppLoader>> = if nsp.get_status()
+            != FsResultStatus::Success
+        {
+            None
+        } else if nsp.is_extracted_type() {
+            // Extracted type: use DeconstructedRomDirectory from ExeFS.
+            nsp.get_exefs().map(|exefs| {
+                let is_hbl = file.get_name() == "hbl.nsp";
+                Box::new(AppLoaderDeconstructedRomDirectory::new_from_directory(
+                    exefs, false, is_hbl,
+                )) as Box<dyn AppLoader>
+            })
+        } else {
+            let title_id = nsp.get_program_title_id();
 
-                // Parse control NCA for NACP/icon via PatchManager.
-                let control_nca =
-                    nsp.get_nca(title_id, ContentRecordType::Control, TitleType::Application);
-                if let Some(ref control) = control_nca {
-                    if control.get_status() == FsResultStatus::Success {
-                        let pm = PatchManager::new_without_deps(title_id);
-                        let (parsed_nacp, parsed_icon) = pm.parse_control_nca(control);
-                        nacp_file = parsed_nacp;
-                        icon_file = parsed_icon;
-                    }
+            // Parse control NCA for NACP/icon via PatchManager.
+            match nsp.get_nca(title_id, ContentRecordType::Control, TitleType::Application) {
+                Some(control) if control.get_status() == FsResultStatus::Success => {
+                    let pm = PatchManager::new(title_id, filesystem_controller, content_provider);
+                    let (parsed_nacp, parsed_icon) = pm.parse_control_nca(&control);
+                    nacp_file = parsed_nacp;
+                    icon_file = parsed_icon;
+
+                    // Upstream only constructs the secondary program loader
+                    // after a valid control NCA has been parsed.
+                    nsp.get_nca_file(title_id, ContentRecordType::Program, TitleType::Application)
+                        .map(|nca_file| Box::new(AppLoaderNca::new(nca_file)) as Box<dyn AppLoader>)
                 }
-
-                // Non-extracted type: use NCA loader for the program NCA file.
-                nsp.get_nca_file(title_id, ContentRecordType::Program, TitleType::Application)
-                    .map(|nca_file| Box::new(AppLoaderNca::new(nca_file)) as Box<dyn AppLoader>)
-            };
+                _ => None,
+            }
+        };
 
         Self {
             file,
@@ -376,5 +379,36 @@ impl AppLoader for AppLoaderNsp {
             Some(loader) => loader.read_nso_modules(modules),
             None => ResultStatus::ErrorNotImplemented,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use super::*;
+    use crate::file_sys::vfs::vfs_vector::VectorVfsFile;
+
+    fn single_file_pfs(name: &str) -> VirtualFile {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"PFS0");
+        bytes.extend_from_slice(&1u32.to_le_bytes());
+        bytes.extend_from_slice(&((name.len() + 1) as u32).to_le_bytes());
+        bytes.extend_from_slice(&[0; 4]);
+        bytes.extend_from_slice(&0u64.to_le_bytes());
+        bytes.extend_from_slice(&1u64.to_le_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(&[0; 4]);
+        bytes.extend_from_slice(name.as_bytes());
+        bytes.push(0);
+        bytes.push(0);
+        Arc::new(VectorVfsFile::new(bytes, "package.nsp".to_owned(), None))
+    }
+
+    #[test]
+    fn identify_type_accepts_nsp_when_ncas_cannot_be_parsed() {
+        let file = single_file_pfs("unparsed.nca");
+
+        assert_eq!(AppLoaderNsp::identify_type(&file), FileType::NSP);
     }
 }

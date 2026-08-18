@@ -1,19 +1,22 @@
 // SPDX-FileCopyrightText: Copyright 2024 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-//! Port of zuyu/src/core/hle/service/am/process_creation.h
-//! Port of zuyu/src/core/hle/service/am/process_creation.cpp
+//! Port of Eden `src/core/hle/service/am/process_creation.h` and `process_creation.cpp`.
 
 use std::sync::{Arc, Mutex};
 
+use crate::file_sys::content_archive::NCA;
 use crate::file_sys::nca_metadata::ContentRecordType;
+use crate::file_sys::partition_filesystem::ResultStatus as FileSysResultStatus;
 use crate::file_sys::patch_manager::PatchManager;
 use crate::file_sys::registered_cache::{
-    get_update_title_id, ContentProviderUnion, ContentProviderUnionSlot,
+    get_update_title_id, ContentProvider, ContentProviderUnion, ContentProviderUnionSlot,
 };
 use crate::file_sys::romfs_factory::StorageId;
 use crate::hle::service::filesystem::filesystem::FileSystemController;
 use crate::hle::service::glue::glue_manager::ApplicationLaunchProperty;
+use crate::hle::service::os::process::Process;
+use crate::loader::loader::{get_loader, ResultStatus, System as LoaderSystem};
 
 /// Port of upstream local `GetStorageIdForFrontendSlot`.
 pub fn get_storage_id_for_frontend_slot(slot: Option<ContentProviderUnionSlot>) -> StorageId {
@@ -22,6 +25,7 @@ pub fn get_storage_id_for_frontend_slot(slot: Option<ContentProviderUnionSlot>) 
         Some(ContentProviderUnionSlot::SysNAND) => StorageId::NandSystem,
         Some(ContentProviderUnionSlot::SDMC) => StorageId::SdCard,
         Some(ContentProviderUnionSlot::FrontendManual) => StorageId::Host,
+        Some(ContentProviderUnionSlot::External) => StorageId::None,
         None => StorageId::None,
     }
 }
@@ -65,10 +69,40 @@ pub fn build_application_launch_property(
 /// 4. Creates a Process and calls process->Initialize(*loader, out_load_result)
 /// 5. Returns the initialized Process
 ///
-/// Requires: ContentProviderUnion, NCA parsing, Loader infrastructure, and
-/// service-layer Process initialization -- none of which are fully wired yet.
-pub fn create_process(_program_id: u64, _min_key_gen: u8, _max_key_gen: u8) {
-    log::warn!("(STUBBED) create_process called -- requires ContentProviderUnion, NCA, and Loader infrastructure");
+pub fn create_process(
+    system: crate::core::SystemRef,
+    program_id: u64,
+    min_key_gen: u8,
+    max_key_gen: u8,
+) -> Option<Process> {
+    let system_ref = system.get();
+    let storage = system_ref.get_content_provider()?;
+    let nca_raw = storage
+        .lock()
+        .unwrap()
+        .get_entry_raw(program_id, ContentRecordType::Program)?;
+
+    if min_key_gen > 0 {
+        let nca = NCA::new(nca_raw.clone(), None);
+        let key_generation = nca.get_key_generation();
+        if nca.get_status() == FileSysResultStatus::Success
+            && (key_generation < min_key_gen || key_generation > max_key_gen)
+        {
+            log::warn!("Skipping program {program_id:016X} with generation {key_generation}");
+            return None;
+        }
+    }
+
+    let mut loader_system = LoaderSystem {
+        content_provider: Some(Arc::clone(storage)),
+        filesystem_controller: Some(system_ref.get_filesystem_controller()),
+    };
+    let mut loader = get_loader(&mut loader_system, nca_raw, program_id, 0)?;
+    let mut process = Process::new();
+    let mut load_result = ResultStatus::ErrorNotInitialized;
+    process
+        .initialize(system, loader.as_mut(), &mut load_result)
+        .then_some(process)
 }
 
 /// Port of CreateApplicationProcess

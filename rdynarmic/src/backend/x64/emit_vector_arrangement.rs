@@ -6,6 +6,7 @@
 
 use crate::backend::x64::emit_context::EmitContext;
 use crate::backend::x64::emit_vector_helpers::*;
+use crate::backend::x64::host_feature::HostFeature;
 use crate::backend::x64::reg_alloc::RegAlloc;
 use crate::ir::inst::Inst;
 use crate::ir::value::InstRef;
@@ -378,6 +379,26 @@ pub fn emit_vector_extract_lower(
         ra.asm.psrldq(result, position / 8).unwrap();
     }
     ra.asm.movq(result, result).unwrap();
+    ra.define_value(inst_ref, result);
+}
+
+fn whole_vector_rotate_shuffle_imm(shift_amount: u8) -> u8 {
+    assert_eq!(shift_amount % 32, 0);
+    0b1110_0100_u8.rotate_right(u32::from(shift_amount / 32) * 2)
+}
+
+pub fn emit_vector_rotate_whole_vector_right(
+    _ctx: &EmitContext,
+    ra: &mut RegAlloc,
+    inst_ref: InstRef,
+    inst: &Inst,
+) {
+    let mut args = ra.get_argument_info(inst_ref, &inst.args, inst.num_args());
+    let operand = ra.use_xmm(&mut args[0]);
+    let result = ra.scratch_xmm();
+    let shift_amount = args[1].get_immediate_u8();
+    let shuffle_imm = whole_vector_rotate_shuffle_imm(shift_amount);
+    ra.asm.pshufd(result, operand, shuffle_imm).unwrap();
     ra.define_value(inst_ref, result);
 }
 
@@ -917,36 +938,71 @@ extern "C" fn fallback_narrow64(result: *mut [u8; 16], a: *const [u8; 16]) {
 }
 
 // Narrow16: truncate 8×u16 from a to 8×u8 in the low half, zero upper half.
-pub fn emit_vector_narrow16(_ctx: &EmitContext, ra: &mut RegAlloc, inst_ref: InstRef, inst: &Inst) {
+pub fn emit_vector_narrow16(ctx: &EmitContext, ra: &mut RegAlloc, inst_ref: InstRef, inst: &Inst) {
     let mut args = ra.get_argument_info(inst_ref, &inst.args, inst.num_args());
+    if ctx.has_host_feature(HostFeature::AVX512_ORTHO | HostFeature::AVX512BW) {
+        let a = ra.use_xmm(&mut args[0]);
+        let result = ra.scratch_xmm();
+        ra.asm.vpmovwb(result, a).unwrap();
+        ra.define_value(inst_ref, result);
+        return;
+    }
     let result = ra.use_scratch_xmm(&mut args[0]);
-    let pool = ra.constant_pool.as_mut().expect("constant pool required");
-    let narrow_mask = pool.get_constant(0x0E_0C_0A_08_06_04_02_00u64, 0x80_80_80_80_80_80_80_80u64);
+    let zeros = ra.scratch_xmm();
+    let narrow_mask = ra
+        .constant_pool
+        .as_mut()
+        .expect("constant pool required")
+        .get_constant(0x00ff_00ff_00ff_00ff, 0x00ff_00ff_00ff_00ff);
+    ra.asm.pxor(zeros, zeros).unwrap();
     ra.asm
-        .pshufb(result, rxbyak::xmmword_ptr(narrow_mask))
+        .pand(result, rxbyak::xmmword_ptr(narrow_mask))
         .unwrap();
+    ra.asm.packuswb(result, zeros).unwrap();
+    ra.release(zeros);
     ra.define_value(inst_ref, result);
 }
 
 // Narrow32: truncate 4×u32 to 4×u16 in the low half, zero upper half.
-pub fn emit_vector_narrow32(_ctx: &EmitContext, ra: &mut RegAlloc, inst_ref: InstRef, inst: &Inst) {
+pub fn emit_vector_narrow32(ctx: &EmitContext, ra: &mut RegAlloc, inst_ref: InstRef, inst: &Inst) {
     let mut args = ra.get_argument_info(inst_ref, &inst.args, inst.num_args());
+    if ctx.has_host_feature(HostFeature::AVX512_ORTHO) {
+        let a = ra.use_xmm(&mut args[0]);
+        let result = ra.scratch_xmm();
+        ra.asm.vpmovdw(result, a).unwrap();
+        ra.define_value(inst_ref, result);
+        return;
+    }
     let result = ra.use_scratch_xmm(&mut args[0]);
-    let pool = ra.constant_pool.as_mut().expect("constant pool required");
-    let narrow_mask = pool.get_constant(0x0D_0C_09_08_05_04_01_00u64, 0x80_80_80_80_80_80_80_80u64);
-    ra.asm
-        .pshufb(result, rxbyak::xmmword_ptr(narrow_mask))
-        .unwrap();
+    let zeros = ra.scratch_xmm();
+    ra.asm.pxor(zeros, zeros).unwrap();
+    if ctx.has_host_feature(HostFeature::SSE41) {
+        ra.asm.pblendw(result, zeros, 0xaa).unwrap();
+        ra.asm.packusdw(result, zeros).unwrap();
+    } else {
+        ra.asm.pslld_imm(result, 16).unwrap();
+        ra.asm.psrad_imm(result, 16).unwrap();
+        ra.asm.packssdw(result, zeros).unwrap();
+    }
+    ra.release(zeros);
     ra.define_value(inst_ref, result);
 }
 
 // Narrow64: truncate 2×u64 to 2×u32 in the low half, zero upper half.
-pub fn emit_vector_narrow64(_ctx: &EmitContext, ra: &mut RegAlloc, inst_ref: InstRef, inst: &Inst) {
+pub fn emit_vector_narrow64(ctx: &EmitContext, ra: &mut RegAlloc, inst_ref: InstRef, inst: &Inst) {
     let mut args = ra.get_argument_info(inst_ref, &inst.args, inst.num_args());
+    if ctx.has_host_feature(HostFeature::AVX512_ORTHO) {
+        let a = ra.use_xmm(&mut args[0]);
+        let result = ra.scratch_xmm();
+        ra.asm.vpmovqd(result, a).unwrap();
+        ra.define_value(inst_ref, result);
+        return;
+    }
     let result = ra.use_scratch_xmm(&mut args[0]);
     let zeros = ra.scratch_xmm();
-    ra.asm.xorps(zeros, zeros).unwrap();
-    ra.asm.shufps(result, zeros, 0x88).unwrap();
+    ra.asm.pxor(zeros, zeros).unwrap();
+    ra.asm.shufps(result, zeros, 0x08).unwrap();
+    ra.release(zeros);
     ra.define_value(inst_ref, result);
 }
 
@@ -1064,6 +1120,8 @@ mod tests {
         let _: fn(&EmitContext, &mut RegAlloc, InstRef, &Inst) = emit_vector_broadcast_lower32;
         let _: fn(&EmitContext, &mut RegAlloc, InstRef, &Inst) = emit_vector_extract;
         let _: fn(&EmitContext, &mut RegAlloc, InstRef, &Inst) = emit_vector_extract_lower;
+        let _: fn(&EmitContext, &mut RegAlloc, InstRef, &Inst) =
+            emit_vector_rotate_whole_vector_right;
         let _: fn(&EmitContext, &mut RegAlloc, InstRef, &Inst) = emit_vector_interleave_lower8;
         let _: fn(&EmitContext, &mut RegAlloc, InstRef, &Inst) = emit_vector_interleave_upper64;
         let _: fn(&EmitContext, &mut RegAlloc, InstRef, &Inst) = emit_vector_deinterleave_even8;
@@ -1073,5 +1131,13 @@ mod tests {
         let _: fn(&EmitContext, &mut RegAlloc, InstRef, &Inst) = emit_vector_narrow16;
         let _: fn(&EmitContext, &mut RegAlloc, InstRef, &Inst) = emit_vector_sign_extend8;
         let _: fn(&EmitContext, &mut RegAlloc, InstRef, &Inst) = emit_vector_zero_extend64;
+    }
+
+    #[test]
+    fn whole_vector_rotate_uses_upstream_pshufd_controls() {
+        assert_eq!(whole_vector_rotate_shuffle_imm(0), 0b11_10_01_00);
+        assert_eq!(whole_vector_rotate_shuffle_imm(32), 0b00_11_10_01);
+        assert_eq!(whole_vector_rotate_shuffle_imm(64), 0b01_00_11_10);
+        assert_eq!(whole_vector_rotate_shuffle_imm(96), 0b10_01_00_11);
     }
 }

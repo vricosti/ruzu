@@ -15,11 +15,14 @@ use super::staging_buffer_pool::StagingBufferPool;
 use super::update_descriptor::{ComputePassDescriptorQueue, DescriptorUpdateEntry};
 use crate::engines::maxwell_3d::IndexFormat;
 use crate::host_shaders::spirv_shaders::{
-    ASTC_DECODER_COMP_SPV, CONVERT_MSAA_TO_NON_MSAA_COMP_SPV, CONVERT_NON_MSAA_TO_MSAA_COMP_SPV,
+    ASTC_DECODER_COMP_SPV, BLOCK_LINEAR_UNSWIZZLE_3D_BCN_COMP_SPV,
+    CONVERT_MSAA_TO_NON_MSAA_COMP_SPV, CONVERT_NON_MSAA_TO_MSAA_COMP_SPV,
     QUERIES_PREFIX_SCAN_SUM_COMP_SPV, QUERIES_PREFIX_SCAN_SUM_NOSUBGROUPS_COMP_SPV,
     RESOLVE_CONDITIONAL_RENDER_COMP_SPV, VULKAN_QUAD_INDEXED_COMP_SPV, VULKAN_UINT8_COMP_SPV,
 };
-use crate::texture_cache::accelerated_swizzle::make_block_linear_swizzle_2d_params;
+use crate::texture_cache::accelerated_swizzle::{
+    make_block_linear_swizzle_2d_params, make_block_linear_swizzle_3d_params,
+};
 use crate::texture_cache::image_info::ImageInfo;
 use crate::texture_cache::types::SwizzleParameters;
 
@@ -76,6 +79,25 @@ pub struct QueriesPrefixScanPushConstants {
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ConditionalRenderingResolvePushConstants {
     pub compare_to_zero: u32,
+}
+
+/// Port of `BlockLinearUnswizzle3DPushConstants`.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct BlockLinearUnswizzle3DPushConstants {
+    pub blocks_dim: [u32; 3],
+    pub bytes_per_block_log2: u32,
+    pub origin: [u32; 3],
+    pub slice_size: u32,
+    pub block_size: u32,
+    pub x_shift: u32,
+    pub block_height: u32,
+    pub block_height_mask: u32,
+    pub block_depth: u32,
+    pub block_depth_mask: u32,
+    pub _pad: i32,
+    pub destination: [i32; 3],
+    pub _pad_end: i32,
 }
 
 /// Memory barrier for shader write -> vertex attribute read.
@@ -366,15 +388,15 @@ impl Uint8Pass {
         let staging = unsafe { self.staging_buffer_pool.as_mut() }
             .request_device_local_buffer(staging_size)
             .expect("Uint8Pass device-local staging allocation failed");
+        let scheduler = unsafe { self.scheduler.as_mut() };
         let descriptor_data = unsafe {
             let queue = self.compute_pass_descriptor_queue.as_mut();
-            queue.acquire();
+            queue.acquire(scheduler, 2, false);
             queue.add_buffer(src_buffer, u64::from(src_offset), u64::from(num_vertices));
             queue.add_buffer(staging.buffer, staging.offset, staging_size);
             DescriptorData(queue.update_data())
         };
         let num_workgroups = (num_vertices + DISPATCH_SIZE - 1) / DISPATCH_SIZE;
-        let scheduler = unsafe { self.scheduler.as_mut() };
         let known_gpu_tick = scheduler.known_gpu_tick();
         let pending_tick = scheduler.pending_tick();
         let descriptor_allocator = self.base.descriptor_allocator.clone();
@@ -490,16 +512,16 @@ impl QuadIndexedPass {
         let staging = unsafe { self.staging_buffer_pool.as_mut() }
             .request_device_local_buffer(staging_size)
             .expect("QuadIndexedPass device-local staging allocation failed");
+        let scheduler = unsafe { self.scheduler.as_mut() };
         let descriptor_data = unsafe {
             let queue = self.compute_pass_descriptor_queue.as_mut();
-            queue.acquire();
+            queue.acquire(scheduler, 2, false);
             queue.add_buffer(src_buffer, u64::from(src_offset), u64::from(input_size));
             queue.add_buffer(staging.buffer, staging.offset, staging_size);
             DescriptorData(queue.update_data())
         };
         let push_constants: [u32; 3] = [base_vertex, index_shift, if is_strip { 1 } else { 0 }];
         let num_workgroups = (num_tri_vertices + DISPATCH_SIZE - 1) / DISPATCH_SIZE;
-        let scheduler = unsafe { self.scheduler.as_mut() };
         let known_gpu_tick = scheduler.known_gpu_tick();
         let pending_tick = scheduler.pending_tick();
         let descriptor_allocator = self.base.descriptor_allocator.clone();
@@ -615,14 +637,14 @@ impl ConditionalRenderingResolvePass {
         compare_to_zero: bool,
     ) {
         let compare_size = if compare_to_zero { 8 } else { 24 };
+        let scheduler = unsafe { self.scheduler.as_mut() };
         let descriptor_data = unsafe {
             let queue = self.compute_pass_descriptor_queue.as_mut();
-            queue.acquire();
+            queue.acquire(scheduler, 2, false);
             queue.add_buffer(src_buffer, u64::from(src_offset), compare_size);
             queue.add_buffer(dst_buffer, 0, std::mem::size_of::<u32>() as u64);
             DescriptorData(queue.update_data())
         };
-        let scheduler = unsafe { self.scheduler.as_mut() };
         let known_gpu_tick = scheduler.known_gpu_tick();
         let pending_tick = scheduler.pending_tick();
         let descriptor_allocator = self.base.descriptor_allocator.clone();
@@ -773,16 +795,16 @@ impl QueriesPrefixScanPass {
                 accumulation_limit: (runs_to_do - 1) as u32,
                 buffer_offset: used_offset as u32,
             };
+            let scheduler = unsafe { self.scheduler.as_mut() };
             let descriptor_data = unsafe {
                 let queue = self.compute_pass_descriptor_queue.as_mut();
-                queue.acquire();
+                queue.acquire(scheduler, 3, false);
                 let query_range = (number_of_sums * std::mem::size_of::<u64>()) as u64;
                 queue.add_buffer(src_buffer, 0, query_range);
                 queue.add_buffer(dst_buffer, 0, query_range);
                 queue.add_buffer(accumulation_buffer, 0, std::mem::size_of::<u64>() as u64);
                 DescriptorData(queue.update_data())
             };
-            let scheduler = unsafe { self.scheduler.as_mut() };
             let known_gpu_tick = scheduler.known_gpu_tick();
             let pending_tick = scheduler.pending_tick();
             let descriptor_allocator = self.base.descriptor_allocator.clone();
@@ -1064,7 +1086,9 @@ impl AstcDecoderPass {
                 image_layout: vk::ImageLayout::GENERAL,
             };
             unsafe {
-                self.compute_pass_descriptor_queue.as_mut().acquire();
+                self.compute_pass_descriptor_queue
+                    .as_mut()
+                    .acquire(scheduler, 2, false);
                 self.compute_pass_descriptor_queue.as_mut().add_buffer(
                     staging_buffer,
                     input_offset,
@@ -1148,6 +1172,308 @@ impl AstcDecoderPass {
         });
         scheduler.finish();
         true
+    }
+}
+
+// ---------------------------------------------------------------------------
+// BlockLinearUnswizzle3DPass
+// ---------------------------------------------------------------------------
+
+/// Port of `BlockLinearUnswizzle3DPass` from `vk_compute_pass.{h,cpp}`.
+pub struct BlockLinearUnswizzle3DPass {
+    base: ComputePass,
+    scheduler: NonNull<Scheduler>,
+    #[allow(dead_code)]
+    staging_buffer_pool: NonNull<StagingBufferPool>,
+    compute_pass_descriptor_queue: NonNull<ComputePassDescriptorQueue>,
+}
+
+impl BlockLinearUnswizzle3DPass {
+    pub fn new(
+        device: &ash::Device,
+        scheduler: &mut Scheduler,
+        descriptor_pool: &DescriptorPool,
+        staging_buffer_pool: &mut StagingBufferPool,
+        compute_pass_descriptor_queue: &mut ComputePassDescriptorQueue,
+    ) -> Result<Self, vk::Result> {
+        let bindings = input_output_bindings();
+        let templates = [
+            vk::DescriptorUpdateTemplateEntry {
+                dst_binding: 0,
+                dst_array_element: 0,
+                descriptor_count: 1,
+                descriptor_type: vk::DescriptorType::STORAGE_BUFFER,
+                offset: 0,
+                stride: std::mem::size_of::<DescriptorUpdateEntry>(),
+            },
+            vk::DescriptorUpdateTemplateEntry {
+                dst_binding: 1,
+                dst_array_element: 0,
+                descriptor_count: 1,
+                descriptor_type: vk::DescriptorType::STORAGE_BUFFER,
+                offset: std::mem::size_of::<DescriptorUpdateEntry>(),
+                stride: std::mem::size_of::<DescriptorUpdateEntry>(),
+            },
+        ];
+        let push_constants = [vk::PushConstantRange {
+            stage_flags: vk::ShaderStageFlags::COMPUTE,
+            offset: 0,
+            size: std::mem::size_of::<BlockLinearUnswizzle3DPushConstants>() as u32,
+        }];
+        let base = ComputePass::new(
+            device,
+            descriptor_pool,
+            &bindings,
+            &templates,
+            &INPUT_OUTPUT_BANK_INFO,
+            &push_constants,
+            BLOCK_LINEAR_UNSWIZZLE_3D_BCN_COMP_SPV,
+            None,
+        )?;
+        Ok(Self {
+            base,
+            scheduler: NonNull::from(scheduler),
+            staging_buffer_pool: NonNull::from(staging_buffer_pool),
+            compute_pass_descriptor_queue: NonNull::from(compute_pass_descriptor_queue),
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn unswizzle(
+        &mut self,
+        image: vk::Image,
+        aspect: vk::ImageAspectFlags,
+        info: &ImageInfo,
+        guest_size_bytes: usize,
+        output_buffer: vk::Buffer,
+        output_buffer_size: vk::DeviceSize,
+        swizzled_buffer: vk::Buffer,
+        swizzled_offset: vk::DeviceSize,
+        swizzles: &[SwizzleParameters],
+        z_start: u32,
+        z_count: u32,
+    ) -> bool {
+        let max_batch_slices = z_count.min(info.size.depth);
+        if max_batch_slices == 0 || swizzles.len() != 1 {
+            return false;
+        }
+        let swizzle = &swizzles[0];
+        let params = make_block_linear_swizzle_3d_params(swizzle, info);
+        let blocks_x = info.size.width.div_ceil(4);
+        let blocks_y = info.size.height.div_ceil(4);
+
+        let scheduler = unsafe { self.scheduler.as_mut() };
+        scheduler.request_outside_renderpass();
+        for z_offset in (0..z_count).step_by(max_batch_slices as usize) {
+            let current_chunk_slices = max_batch_slices.min(z_count - z_offset);
+            let current_z_start = z_start + z_offset;
+            self.unswizzle_chunk(
+                image,
+                aspect,
+                info.size.width,
+                info.size.height,
+                guest_size_bytes,
+                output_buffer,
+                output_buffer_size,
+                swizzled_buffer,
+                swizzled_offset,
+                swizzle,
+                params,
+                blocks_x,
+                blocks_y,
+                current_z_start,
+                current_chunk_slices,
+            );
+        }
+        true
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn unswizzle_chunk(
+        &mut self,
+        image: vk::Image,
+        aspect: vk::ImageAspectFlags,
+        image_width: u32,
+        image_height: u32,
+        guest_size_bytes: usize,
+        output_buffer: vk::Buffer,
+        output_buffer_size: vk::DeviceSize,
+        swizzled_buffer: vk::Buffer,
+        swizzled_offset: vk::DeviceSize,
+        swizzle: &SwizzleParameters,
+        params: crate::texture_cache::accelerated_swizzle::BlockLinearSwizzle3DParams,
+        blocks_x: u32,
+        blocks_y: u32,
+        z_start: u32,
+        z_count: u32,
+    ) {
+        let push_constants = BlockLinearUnswizzle3DPushConstants {
+            blocks_dim: [blocks_x, blocks_y, z_count],
+            bytes_per_block_log2: params.bytes_per_block_log2,
+            origin: [params.origin[0], params.origin[1], z_start],
+            slice_size: params.slice_size,
+            block_size: params.block_size,
+            x_shift: params.x_shift,
+            block_height: params.block_height,
+            block_height_mask: params.block_height_mask,
+            block_depth: params.block_depth,
+            block_depth_mask: params.block_depth_mask,
+            _pad: 0,
+            destination: [params.destination[0], params.destination[1], 0],
+            _pad_end: 0,
+        };
+        let input_offset = swizzled_offset + swizzle.buffer_offset as vk::DeviceSize;
+        let input_size = guest_size_bytes
+            .saturating_sub(swizzle.buffer_offset as usize)
+            .max(1) as vk::DeviceSize;
+        let scheduler = unsafe { self.scheduler.as_mut() };
+        let descriptor_data = unsafe {
+            let queue = self.compute_pass_descriptor_queue.as_mut();
+            queue.acquire(scheduler, 3, false);
+            queue.add_buffer(swizzled_buffer, input_offset, input_size);
+            queue.add_buffer(output_buffer, 0, output_buffer_size);
+            DescriptorData(queue.update_data())
+        };
+        let dispatch_x = blocks_x.div_ceil(8);
+        let dispatch_y = blocks_y.div_ceil(8);
+        let dispatch_z = z_count.div_ceil(4);
+        let bytes_per_block = 1u64 << push_constants.bytes_per_block_log2;
+        let barrier_size =
+            u64::from(blocks_x) * u64::from(blocks_y) * bytes_per_block * u64::from(z_count);
+        let is_first_chunk = z_start == 0;
+        let known_gpu_tick = scheduler.known_gpu_tick();
+        let pending_tick = scheduler.pending_tick();
+        let descriptor_allocator = self.base.descriptor_allocator.clone();
+        let device = self.base.device.clone();
+        let descriptor_template = self.base.descriptor_template;
+        let pipeline = self.base.pipeline;
+        let layout = self.base.layout;
+        scheduler.record(move |cmdbuf| unsafe {
+            if image == vk::Image::null() || output_buffer == vk::Buffer::null() {
+                return;
+            }
+            let descriptor_set = descriptor_allocator
+                .commit(known_gpu_tick, pending_tick)
+                .expect("BlockLinearUnswizzle3DPass descriptor allocation failed");
+            device.update_descriptor_set_with_template(
+                descriptor_set,
+                descriptor_template,
+                descriptor_data.as_raw_data(),
+            );
+            device.cmd_bind_pipeline(cmdbuf, vk::PipelineBindPoint::COMPUTE, pipeline);
+            device.cmd_bind_descriptor_sets(
+                cmdbuf,
+                vk::PipelineBindPoint::COMPUTE,
+                layout,
+                0,
+                &[descriptor_set],
+                &[],
+            );
+            device.cmd_push_constants(
+                cmdbuf,
+                layout,
+                vk::ShaderStageFlags::COMPUTE,
+                0,
+                bytemuck::bytes_of(&push_constants),
+            );
+            device.cmd_dispatch(cmdbuf, dispatch_x, dispatch_y, dispatch_z);
+
+            let buffer_barrier = vk::BufferMemoryBarrier::builder()
+                .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .buffer(output_buffer)
+                .offset(0)
+                .size(barrier_size)
+                .build();
+            let pre_barrier = vk::ImageMemoryBarrier::builder()
+                .src_access_mask(if is_first_chunk {
+                    vk::AccessFlags::empty()
+                } else {
+                    vk::AccessFlags::TRANSFER_WRITE
+                })
+                .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                .old_layout(if is_first_chunk {
+                    vk::ImageLayout::UNDEFINED
+                } else {
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL
+                })
+                .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .image(image)
+                .subresource_range(vk::ImageSubresourceRange {
+                    aspect_mask: aspect,
+                    base_mip_level: 0,
+                    level_count: 1,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                })
+                .build();
+            device.cmd_pipeline_barrier(
+                cmdbuf,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[buffer_barrier],
+                &[pre_barrier],
+            );
+            let copy = vk::BufferImageCopy {
+                buffer_offset: 0,
+                buffer_row_length: 0,
+                buffer_image_height: 0,
+                image_subresource: vk::ImageSubresourceLayers {
+                    aspect_mask: aspect,
+                    mip_level: 0,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                },
+                image_offset: vk::Offset3D {
+                    x: 0,
+                    y: 0,
+                    z: z_start as i32,
+                },
+                image_extent: vk::Extent3D {
+                    width: image_width,
+                    height: image_height,
+                    depth: z_count,
+                },
+            };
+            device.cmd_copy_buffer_to_image(
+                cmdbuf,
+                output_buffer,
+                image,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                &[copy],
+            );
+            let post_barrier = vk::ImageMemoryBarrier::builder()
+                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE)
+                .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                .new_layout(vk::ImageLayout::GENERAL)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .image(image)
+                .subresource_range(vk::ImageSubresourceRange {
+                    aspect_mask: aspect,
+                    base_mip_level: 0,
+                    level_count: 1,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                })
+                .build();
+            device.cmd_pipeline_barrier(
+                cmdbuf,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::FRAGMENT_SHADER | vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[post_barrier],
+            );
+        });
     }
 }
 
@@ -1271,7 +1597,7 @@ impl MsaaCopyPass {
     pub fn copy_image(
         &mut self,
         device: &ash::Device,
-        scheduler: &Scheduler,
+        scheduler: &mut Scheduler,
         cmdbuf: vk::CommandBuffer,
         dst_image: vk::Image,
         src_view: vk::ImageView,
@@ -1301,7 +1627,9 @@ impl MsaaCopyPass {
             },
         ];
         unsafe {
-            self.compute_pass_descriptor_queue.as_mut().acquire();
+            self.compute_pass_descriptor_queue
+                .as_mut()
+                .acquire(scheduler, 2, false);
             self.compute_pass_descriptor_queue
                 .as_mut()
                 .add_image(src_view);
@@ -1394,6 +1722,8 @@ unsafe impl bytemuck::Zeroable for QueriesPrefixScanPushConstants {}
 unsafe impl bytemuck::Pod for QueriesPrefixScanPushConstants {}
 unsafe impl bytemuck::Zeroable for ConditionalRenderingResolvePushConstants {}
 unsafe impl bytemuck::Pod for ConditionalRenderingResolvePushConstants {}
+unsafe impl bytemuck::Zeroable for BlockLinearUnswizzle3DPushConstants {}
+unsafe impl bytemuck::Pod for BlockLinearUnswizzle3DPushConstants {}
 
 #[cfg(test)]
 mod tests {
@@ -1413,6 +1743,17 @@ mod tests {
             std::mem::size_of::<QueriesPrefixScanPushConstants>(),
             4 * std::mem::size_of::<u32>()
         );
+    }
+
+    #[test]
+    fn block_linear_unswizzle_3d_push_constants_layout() {
+        assert_eq!(
+            std::mem::size_of::<BlockLinearUnswizzle3DPushConstants>(),
+            76
+        );
+        let value = BlockLinearUnswizzle3DPushConstants::default();
+        let base = std::ptr::addr_of!(value) as usize;
+        assert_eq!(std::ptr::addr_of!(value.destination) as usize - base, 60);
     }
 
     #[test]

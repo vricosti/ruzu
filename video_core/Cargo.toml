@@ -13,6 +13,7 @@ thiserror.workspace = true
 anyhow.workspace = true
 vulkano.workspace = true
 ash.workspace = true
+vk-mem.workspace = true
 raw-window-handle.workspace = true
 parking_lot.workspace = true
 rspirv.workspace = true
@@ -20,7 +21,8 @@ spirv.workspace = true
 bitflags.workspace = true
 bytemuck.workspace = true
 libc = "0.2"
-smallvec = "1"
+smallvec = { version = "1", features = ["const_generics"] }
+rxbyak = { path = "../externals/rxbyak" }
 
 [build-dependencies]
 cc = "1"

@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2025 ruzu contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! SPIR-V emission context — maps to zuyu's
+//! SPIR-V emission context — maps to upstream
 //! `backend/spirv/spirv_emit_context.h` and `spirv_emit_context.cpp`.
 //!
 //! Wraps rspirv builder with cached types, constants, and resource variables.
@@ -69,6 +69,7 @@ pub(crate) struct TextureDefinition {
     pub image_type: spirv::Word,
     pub count: u32,
     pub is_multisample: bool,
+    pub is_integer: bool,
 }
 
 /// Port of upstream `TextureBufferDefinition` in `spirv_emit_context.h`.
@@ -83,6 +84,7 @@ pub(crate) struct TextureBufferDefinition {
 pub(crate) struct ImageBufferDefinition {
     pub id: spirv::Word,
     pub image_type: spirv::Word,
+    pub pointer_type: spirv::Word,
     pub count: u32,
     pub is_integer: bool,
 }
@@ -92,6 +94,7 @@ pub(crate) struct ImageBufferDefinition {
 pub(crate) struct ImageDefinition {
     pub id: spirv::Word,
     pub image_type: spirv::Word,
+    pub pointer_type: spirv::Word,
     pub count: u32,
     pub is_integer: bool,
 }
@@ -267,8 +270,13 @@ fn texture_image_type(ctx: &mut SpirvEmitContext, desc: &TextureDescriptor) -> s
         TextureType::ColorArrayCube => (spirv::Dim::DimCube, 1, 0),
         TextureType::Buffer => panic!("SPIR-V: buffer texture in sampled texture descriptors"),
     };
+    let sampled_type = if desc.is_integer {
+        ctx.u32_type
+    } else {
+        ctx.f32_type
+    };
     ctx.builder.type_image(
-        ctx.f32_type,
+        sampled_type,
         dim,
         depth,
         arrayed,
@@ -356,6 +364,9 @@ pub struct SpirvEmitContext {
     pub f32_vec4_type: spirv::Word,
     pub u64_type: spirv::Word,
     pub f64_type: spirv::Word,
+    pub f64_vec2_type: spirv::Word,
+    pub f64_vec3_type: spirv::Word,
+    pub f64_vec4_type: spirv::Word,
     pub void_fn_type: spirv::Word,
 
     // ── Pointer types ─────────────────────────────────────────────────
@@ -454,6 +465,17 @@ pub struct SpirvEmitContext {
     pub shared_store_u16_func: spirv::Word,
     pub increment_cas_shared: spirv::Word,
     pub decrement_cas_shared: spirv::Word,
+    /// Set by `define_shared_memory`; mirrors upstream
+    /// `EmitContext::uses_explicit_workgroup_layout`.
+    pub uses_explicit_workgroup_layout: bool,
+    /// Ids already carrying `OpDecorate … NonUniform`, so the decoration is
+    /// emitted at most once per id. Mirrors upstream
+    /// `EmitContext::non_uniform_ids`.
+    pub non_uniform_ids: std::collections::HashSet<spirv::Word>,
+    pub uses_nonuniform_sampled_image: bool,
+    pub uses_nonuniform_storage_image: bool,
+    pub uses_nonuniform_uniform_texel_buffer: bool,
+    pub uses_nonuniform_storage_texel_buffer: bool,
 
     // ── Resources ─────────────────────────────────────────────────────
     /// Typed constant-buffer views indexed by CB index. The views alias the
@@ -620,6 +642,21 @@ impl SpirvEmitContext {
         } else {
             f32_type
         };
+        let f64_vec2_type = if program.info.uses_fp64 {
+            builder.type_vector(f64_type, 2)
+        } else {
+            f32_vec2_type
+        };
+        let f64_vec3_type = if program.info.uses_fp64 {
+            builder.type_vector(f64_type, 3)
+        } else {
+            f32_vec3_type
+        };
+        let f64_vec4_type = if program.info.uses_fp64 {
+            builder.type_vector(f64_type, 4)
+        } else {
+            f32_vec4_type
+        };
 
         // Function type: void(void)
         let void_fn_type = builder.type_function(void_type, vec![]);
@@ -714,6 +751,12 @@ impl SpirvEmitContext {
             shared_store_u16_func: 0,
             increment_cas_shared: 0,
             decrement_cas_shared: 0,
+            uses_explicit_workgroup_layout: false,
+            non_uniform_ids: std::collections::HashSet::new(),
+            uses_nonuniform_sampled_image: false,
+            uses_nonuniform_storage_image: false,
+            uses_nonuniform_uniform_texel_buffer: false,
+            uses_nonuniform_storage_texel_buffer: false,
             void_type,
             bool_type,
             u8_type,
@@ -736,6 +779,9 @@ impl SpirvEmitContext {
             f32_vec4_type,
             u64_type,
             f64_type,
+            f64_vec2_type,
+            f64_vec3_type,
+            f64_vec4_type,
             void_fn_type,
             input_f32_ptr,
             output_f32_ptr,
@@ -803,6 +849,40 @@ impl SpirvEmitContext {
     /// Create a u32 constant.
     pub fn constant_u32(&mut self, value: u32) -> spirv::Word {
         self.builder.constant_bit32(self.u32_type, value)
+    }
+
+    /// Port of upstream `EmitContext::BitOffset8`.
+    pub(crate) fn bit_offset_8(&mut self, offset: ir::Value) -> spirv::Word {
+        if offset.is_immediate() {
+            return self.constant_u32((offset.imm_u32() % 4) * 8);
+        }
+        let offset = self.resolve_value(&offset);
+        let three = self.constant_u32(3);
+        let shifted = self
+            .builder
+            .shift_left_logical(self.u32_type, None, offset, three)
+            .unwrap();
+        let twenty_four = self.constant_u32(24);
+        self.builder
+            .bitwise_and(self.u32_type, None, shifted, twenty_four)
+            .unwrap()
+    }
+
+    /// Port of upstream `EmitContext::BitOffset16`.
+    pub(crate) fn bit_offset_16(&mut self, offset: ir::Value) -> spirv::Word {
+        if offset.is_immediate() {
+            return self.constant_u32(((offset.imm_u32() / 2) % 2) * 16);
+        }
+        let offset = self.resolve_value(&offset);
+        let three = self.constant_u32(3);
+        let shifted = self
+            .builder
+            .shift_left_logical(self.u32_type, None, offset, three)
+            .unwrap();
+        let sixteen = self.constant_u32(16);
+        self.builder
+            .bitwise_and(self.u32_type, None, shifted, sixteen)
+            .unwrap()
     }
 
     /// Create an i32 constant.
@@ -948,36 +1028,47 @@ impl SpirvEmitContext {
         if !info.uses_cbuf_indirect {
             return;
         }
-        let types = info.used_indirect_cbuf_types;
-        if self.profile.support_descriptor_aliasing && types & Type::U8 as u32 != 0 {
-            self.load_const_func_u8 = self
-                .define_constant_buffer_indirect_function(self.u8_type, UniformDefinitionKind::U8);
+        let mut types = info.used_indirect_cbuf_types;
+        let supports_aliasing = self.profile.support_descriptor_aliasing;
+        if supports_aliasing && types & Type::U8 as u32 != 0 {
+            if self.profile.support_int8 && self.profile.support_uniform_and_storage_buffer_8bit {
+                self.load_const_func_u8 = self.define_constant_buffer_indirect_function(
+                    self.u8_type,
+                    UniformDefinitionKind::U8,
+                );
+            } else {
+                types |= Type::U32 as u32;
+            }
         }
-        if self.profile.support_descriptor_aliasing && types & Type::U16 as u32 != 0 {
-            self.load_const_func_u16 = self.define_constant_buffer_indirect_function(
-                self.u16_type,
-                UniformDefinitionKind::U16,
-            );
+        if supports_aliasing && types & Type::U16 as u32 != 0 {
+            if self.profile.support_int16 && self.profile.support_uniform_and_storage_buffer_16bit {
+                self.load_const_func_u16 = self.define_constant_buffer_indirect_function(
+                    self.u16_type,
+                    UniformDefinitionKind::U16,
+                );
+            } else {
+                types |= Type::U32 as u32;
+            }
         }
-        if self.profile.support_descriptor_aliasing && types & Type::F32 as u32 != 0 {
+        if supports_aliasing && types & Type::F32 as u32 != 0 {
             self.load_const_func_f32 = self.define_constant_buffer_indirect_function(
                 self.f32_type,
                 UniformDefinitionKind::F32,
             );
         }
-        if self.profile.support_descriptor_aliasing && types & Type::U32 as u32 != 0 {
+        if supports_aliasing && types & Type::U32 as u32 != 0 {
             self.load_const_func_u32 = self.define_constant_buffer_indirect_function(
                 self.u32_type,
                 UniformDefinitionKind::U32,
             );
         }
-        if self.profile.support_descriptor_aliasing && types & Type::U32x2 as u32 != 0 {
+        if supports_aliasing && types & Type::U32x2 as u32 != 0 {
             self.load_const_func_u32x2 = self.define_constant_buffer_indirect_function(
                 self.u32_vec2_type,
                 UniformDefinitionKind::U32x2,
             );
         }
-        if !self.profile.support_descriptor_aliasing || types & Type::U32x4 as u32 != 0 {
+        if !supports_aliasing || types & Type::U32x4 as u32 != 0 {
             self.load_const_func_u32x4 = self.define_constant_buffer_indirect_function(
                 self.u32_vec4_type,
                 UniformDefinitionKind::U32x4,
@@ -1305,13 +1396,17 @@ impl SpirvEmitContext {
         }
         self.builder
             .extension("SPV_KHR_storage_buffer_storage_class");
-        let used_types = if self.profile.support_descriptor_aliasing {
+        let mut used_types = if self.profile.support_descriptor_aliasing {
             info.used_storage_buffer_types
         } else {
             Type::U32 as u32
         };
+        used_types |= Type::U32 as u32;
         let first_binding = *binding;
-        if self.profile.support_int8 && used_types & Type::U8 as u32 != 0 {
+        if self.profile.support_int8
+            && self.profile.support_storage_buffer_8bit
+            && used_types & Type::U8 as u32 != 0
+        {
             self.define_storage_buffer_view(
                 &info.storage_buffers_descriptors,
                 first_binding,
@@ -1327,7 +1422,10 @@ impl SpirvEmitContext {
                 StorageDefinitionKind::I8,
             );
         }
-        if self.profile.support_int16 && used_types & Type::U16 as u32 != 0 {
+        if self.profile.support_int16
+            && self.profile.support_storage_buffer_16bit
+            && used_types & Type::U16 as u32 != 0
+        {
             self.define_storage_buffer_view(
                 &info.storage_buffers_descriptors,
                 first_binding,
@@ -2127,7 +2225,6 @@ impl SpirvEmitContext {
     fn define_image_buffers(&mut self, descriptors: &[ImageBufferDescriptor], binding: &mut u32) {
         self.image_buffers.reserve(descriptors.len());
         for desc in descriptors {
-            assert_eq!(desc.count, 1, "SPIR-V: array of image buffers");
             let sampled_type = if desc.is_integer {
                 self.u32_type
             } else {
@@ -2165,6 +2262,7 @@ impl SpirvEmitContext {
             self.image_buffers.push(ImageBufferDefinition {
                 id,
                 image_type,
+                pointer_type,
                 count: desc.count,
                 is_integer: desc.is_integer,
             });
@@ -2179,7 +2277,6 @@ impl SpirvEmitContext {
     fn define_images(&mut self, descriptors: &[ImageDescriptor], binding: &mut u32) {
         self.images.reserve(descriptors.len());
         for desc in descriptors {
-            assert_eq!(desc.count, 1, "SPIR-V: array of images");
             let sampled_type = if desc.is_integer {
                 self.u32_type
             } else {
@@ -2208,6 +2305,7 @@ impl SpirvEmitContext {
             self.images.push(ImageDefinition {
                 id,
                 image_type,
+                pointer_type,
                 count: desc.count,
                 is_integer: desc.is_integer,
             });
@@ -2372,21 +2470,27 @@ impl SpirvEmitContext {
 
     /// Port of upstream `EmitContext::DefineSharedMemory`.
     fn define_shared_memory(&mut self, program: &ir::Program) {
+        // Upstream computes this before the early return: the flag is read back
+        // by the shared 64-bit atomic emitters even when no shared memory is
+        // declared.
+        self.uses_explicit_workgroup_layout = self.profile.support_explicit_workgroup_layout
+            && (!program.info.uses_int8 || self.profile.support_workgroup_layout_8bit_access)
+            && (!program.info.uses_int16 || self.profile.support_workgroup_layout_16bit_access);
         if program.shared_memory_size == 0 {
             return;
         }
-        if self.profile.support_explicit_workgroup_layout {
+        if self.uses_explicit_workgroup_layout {
             self.builder
                 .extension("SPV_KHR_workgroup_memory_explicit_layout");
             self.builder
                 .capability(spirv::Capability::WorkgroupMemoryExplicitLayoutKHR);
-            if program.info.uses_int8 {
+            if program.info.uses_int8 && self.profile.support_int8 {
                 self.builder
                     .capability(spirv::Capability::WorkgroupMemoryExplicitLayout8BitAccessKHR);
                 (self.shared_memory_u8, self.shared_u8, _) =
                     self.define_explicit_shared_memory(self.u8_type, 1, program.shared_memory_size);
             }
-            if program.info.uses_int16 {
+            if program.info.uses_int16 && self.profile.support_int16 {
                 self.builder
                     .capability(spirv::Capability::WorkgroupMemoryExplicitLayout16BitAccessKHR);
                 (self.shared_memory_u16, self.shared_u16, _) = self.define_explicit_shared_memory(
@@ -2395,7 +2499,7 @@ impl SpirvEmitContext {
                     program.shared_memory_size,
                 );
             }
-            if program.info.uses_int64 {
+            if program.info.uses_int64 && self.profile.support_int64 {
                 (self.shared_memory_u64, self.shared_u64, _) = self.define_explicit_shared_memory(
                     self.u64_type,
                     8,
@@ -2841,6 +2945,10 @@ impl SpirvEmitContext {
         if info.uses_sample_id {
             self.sample_id =
                 self.define_input(self.u32_type, false, Some(spirv::BuiltIn::SampleId));
+            if self.stage == ShaderStage::Fragment {
+                self.builder
+                    .decorate(self.sample_id, spirv::Decoration::Flat, vec![]);
+            }
         }
         if info.uses_is_helper_invocation {
             self.is_helper_invocation = self.define_input(
@@ -2849,7 +2957,7 @@ impl SpirvEmitContext {
                 Some(spirv::BuiltIn::HelperInvocation),
             );
         }
-        if info.uses_subgroup_mask {
+        if info.uses_subgroup_mask && self.profile.supports_subgroup_stage(self.stage) {
             self.subgroup_mask_eq = self.define_input(
                 self.u32_vec4_type,
                 false,
@@ -2875,12 +2983,24 @@ impl SpirvEmitContext {
                 false,
                 Some(spirv::BuiltIn::SubgroupGeMaskKHR),
             );
+            if self.stage == ShaderStage::Fragment {
+                for mask in [
+                    self.subgroup_mask_eq,
+                    self.subgroup_mask_lt,
+                    self.subgroup_mask_le,
+                    self.subgroup_mask_gt,
+                    self.subgroup_mask_ge,
+                ] {
+                    self.builder.decorate(mask, spirv::Decoration::Flat, vec![]);
+                }
+            }
         }
-        if info.uses_fswzadd
+        if (info.uses_fswzadd
             || info.uses_subgroup_invocation_id
             || info.uses_subgroup_shuffles
             || (self.profile.warp_size_potentially_larger_than_guest
-                && (info.uses_subgroup_vote || info.uses_subgroup_mask))
+                && (info.uses_subgroup_vote || info.uses_subgroup_mask)))
+            && self.profile.supports_subgroup_stage(self.stage)
         {
             self.builder.capability(spirv::Capability::GroupNonUniform);
             self.subgroup_local_invocation_id = self.define_input(
@@ -2888,11 +3008,13 @@ impl SpirvEmitContext {
                 false,
                 Some(spirv::BuiltIn::SubgroupLocalInvocationId),
             );
-            self.builder.decorate(
-                self.subgroup_local_invocation_id,
-                spirv::Decoration::Flat,
-                vec![],
-            );
+            if self.stage == ShaderStage::Fragment {
+                self.builder.decorate(
+                    self.subgroup_local_invocation_id,
+                    spirv::Decoration::Flat,
+                    vec![],
+                );
+            }
         }
         if info.uses_fswzadd {
             let minus_one = self.constant_f32(-1.0);
@@ -2909,6 +3031,10 @@ impl SpirvEmitContext {
         if loads.get(Attribute::PRIMITIVE_ID.0 as usize) {
             self.primitive_id =
                 self.define_input(self.u32_type, false, Some(spirv::BuiltIn::PrimitiveId));
+            if self.stage == ShaderStage::Fragment {
+                self.builder
+                    .decorate(self.primitive_id, spirv::Decoration::Flat, vec![]);
+            }
         }
         if loads.get(Attribute::LAYER.0 as usize) {
             self.builder.capability(spirv::Capability::Geometry);
@@ -3030,7 +3156,18 @@ impl SpirvEmitContext {
                 self.builder
                     .decorate(id, spirv::Decoration::PassthroughNV, vec![]);
             }
-            if self.stage == ShaderStage::Fragment {
+            if self.stage != ShaderStage::Fragment {
+                continue;
+            }
+            // Integer fragment inputs cannot be interpolated: upstream always
+            // decorates them `Flat` regardless of the recorded interpolation.
+            let is_integer = matches!(
+                input_type,
+                AttributeType::SignedInt | AttributeType::UnsignedInt
+            );
+            if is_integer {
+                self.builder.decorate(id, spirv::Decoration::Flat, vec![]);
+            } else {
                 match info.interpolation[index] {
                     crate::shader_info::Interpolation::Smooth => {}
                     crate::shader_info::Interpolation::NoPerspective => {
@@ -3281,7 +3418,9 @@ impl SpirvEmitContext {
             } else {
                 let mut types = info.used_constant_buffer_types | info.used_indirect_cbuf_types;
                 if types & Type::U8 as u32 != 0 {
-                    if self.profile.support_int8 {
+                    if self.profile.support_int8
+                        && self.profile.support_uniform_and_storage_buffer_8bit
+                    {
                         self.define_constant_buffer_view(
                             &info.constant_buffer_descriptors,
                             first_binding,
@@ -3301,7 +3440,9 @@ impl SpirvEmitContext {
                     }
                 }
                 if types & Type::U16 as u32 != 0 {
-                    if self.profile.support_int16 {
+                    if self.profile.support_int16
+                        && self.profile.support_uniform_and_storage_buffer_16bit
+                    {
                         self.define_constant_buffer_view(
                             &info.constant_buffer_descriptors,
                             first_binding,
@@ -3442,6 +3583,7 @@ impl SpirvEmitContext {
                 image_type,
                 count: desc.count,
                 is_multisample: desc.is_multisample,
+                is_integer: desc.is_integer,
             });
             if self.profile.supported_spirv >= 0x0001_0400 {
                 self.interfaces.push(var);
@@ -3631,7 +3773,7 @@ impl SpirvEmitContext {
         }
     }
 
-    fn begin_ir_block(&mut self, block_idx: u32) {
+    pub(crate) fn begin_ir_block(&mut self, block_idx: u32) {
         let label = self
             .block_labels
             .get(block_idx as usize)
@@ -3640,7 +3782,7 @@ impl SpirvEmitContext {
         self.builder.begin_block(Some(label)).unwrap();
     }
 
-    fn emit_block_instructions(&mut self, program: &ir::Program, block_idx: u32) {
+    pub(crate) fn emit_block_instructions(&mut self, program: &ir::Program, block_idx: u32) {
         let block = program
             .blocks
             .get(block_idx as usize)
@@ -3676,128 +3818,6 @@ impl SpirvEmitContext {
             }
             self.emit_instruction(program, inst, block_idx, inst_idx);
         }
-    }
-
-    /// Define the main() function and emit IR instructions as SPIR-V.
-    pub(crate) fn define_main_function(&mut self, program: &ir::Program) -> spirv::Word {
-        // Create main function
-        let main_fn = self
-            .builder
-            .begin_function(
-                self.void_type,
-                None,
-                spirv::FunctionControl::NONE,
-                self.void_fn_type,
-            )
-            .unwrap();
-
-        self.block_labels = (0..program.blocks.len())
-            .map(|_| self.builder.id())
-            .collect();
-
-        let syntax_list = if program.syntax_list.is_empty() {
-            let mut list = Vec::with_capacity(program.blocks.len() + 1);
-            for block_idx in 0..program.blocks.len() as u32 {
-                list.push(ir::SyntaxNode::Block(block_idx));
-            }
-            list.push(ir::SyntaxNode::Return);
-            list
-        } else {
-            program.syntax_list.clone()
-        };
-
-        let mut current_block: Option<u32> = None;
-        for node in &syntax_list {
-            match *node {
-                ir::SyntaxNode::Block(block_idx) => {
-                    let label = self.block_labels[block_idx as usize];
-                    if current_block.is_some() {
-                        self.builder.branch(label).unwrap();
-                    }
-                    current_block = Some(block_idx);
-                    self.begin_ir_block(block_idx);
-                    self.emit_block_instructions(program, block_idx);
-                }
-                ir::SyntaxNode::If { cond, body, merge } => {
-                    let if_label = self.block_labels[body as usize];
-                    let endif_label = self.block_labels[merge as usize];
-                    let cond = self.resolve_value(&cond);
-                    self.builder
-                        .selection_merge(endif_label, spirv::SelectionControl::NONE)
-                        .unwrap();
-                    self.builder
-                        .branch_conditional(cond, if_label, endif_label, std::iter::empty())
-                        .unwrap();
-                    current_block = None;
-                }
-                ir::SyntaxNode::Loop {
-                    body,
-                    continue_block,
-                    merge,
-                } => {
-                    let body_label = self.block_labels[body as usize];
-                    let continue_label = self.block_labels[continue_block as usize];
-                    let endloop_label = self.block_labels[merge as usize];
-                    self.builder
-                        .loop_merge(
-                            endloop_label,
-                            continue_label,
-                            spirv::LoopControl::NONE,
-                            std::iter::empty(),
-                        )
-                        .unwrap();
-                    self.builder.branch(body_label).unwrap();
-                    current_block = None;
-                }
-                ir::SyntaxNode::Break { cond, merge, skip } => {
-                    let break_label = self.block_labels[merge as usize];
-                    let skip_label = self.block_labels[skip as usize];
-                    let cond = self.resolve_value(&cond);
-                    self.builder
-                        .branch_conditional(cond, break_label, skip_label, std::iter::empty())
-                        .unwrap();
-                    current_block = None;
-                }
-                ir::SyntaxNode::EndIf { merge } => {
-                    if current_block.is_some() {
-                        self.builder
-                            .branch(self.block_labels[merge as usize])
-                            .unwrap();
-                    }
-                    current_block = None;
-                }
-                ir::SyntaxNode::Repeat {
-                    cond,
-                    loop_header,
-                    merge,
-                } => {
-                    let cond = self.resolve_value(&cond);
-                    let loop_header_label = self.block_labels[loop_header as usize];
-                    let merge_label = self.block_labels[merge as usize];
-                    self.builder
-                        .branch_conditional(
-                            cond,
-                            loop_header_label,
-                            merge_label,
-                            std::iter::empty(),
-                        )
-                        .unwrap();
-                    current_block = None;
-                }
-                ir::SyntaxNode::Return => {
-                    self.builder.ret().unwrap();
-                    current_block = None;
-                }
-                ir::SyntaxNode::Unreachable => {
-                    self.builder.unreachable().unwrap();
-                    current_block = None;
-                }
-            }
-        }
-
-        self.builder.end_function().unwrap();
-
-        main_fn
     }
 
     /// Emit a single IR instruction as SPIR-V.
@@ -4305,6 +4325,18 @@ impl SpirvEmitContext {
                 let a = self.resolve_value(inst.arg(0));
                 let b = self.resolve_value(inst.arg(1));
                 let id = super::emit_spirv_integer::emit_imul_32(self, a, b);
+                self.set_value(block_idx, inst_idx, id);
+            }
+            Opcode::SDiv32 => {
+                let a = self.resolve_value(inst.arg(0));
+                let b = self.resolve_value(inst.arg(1));
+                let id = super::emit_spirv_integer::emit_sdiv_32(self, a, b);
+                self.set_value(block_idx, inst_idx, id);
+            }
+            Opcode::UDiv32 => {
+                let a = self.resolve_value(inst.arg(0));
+                let b = self.resolve_value(inst.arg(1));
+                let id = super::emit_spirv_integer::emit_udiv_32(self, a, b);
                 self.set_value(block_idx, inst_idx, id);
             }
             Opcode::INeg32 => {
@@ -5123,6 +5155,33 @@ impl SpirvEmitContext {
                 );
                 self.set_value(block_idx, inst_idx, id);
             }
+            Opcode::CompositeInsertF64x2 => {
+                let composite = self.resolve_value(inst.arg(0));
+                let object = self.resolve_value(inst.arg(1));
+                let index = inst.arg(2).imm_u32();
+                let id = super::emit_spirv_composite::emit_composite_insert_f64x2(
+                    self, composite, object, index,
+                );
+                self.set_value(block_idx, inst_idx, id);
+            }
+            Opcode::CompositeInsertF64x3 => {
+                let composite = self.resolve_value(inst.arg(0));
+                let object = self.resolve_value(inst.arg(1));
+                let index = inst.arg(2).imm_u32();
+                let id = super::emit_spirv_composite::emit_composite_insert_f64x3(
+                    self, composite, object, index,
+                );
+                self.set_value(block_idx, inst_idx, id);
+            }
+            Opcode::CompositeInsertF64x4 => {
+                let composite = self.resolve_value(inst.arg(0));
+                let object = self.resolve_value(inst.arg(1));
+                let index = inst.arg(2).imm_u32();
+                let id = super::emit_spirv_composite::emit_composite_insert_f64x4(
+                    self, composite, object, index,
+                );
+                self.set_value(block_idx, inst_idx, id);
+            }
 
             // ── Context (registers, attributes, cbufs) ────────────────
             Opcode::GetCbufU8
@@ -5541,34 +5600,42 @@ impl SpirvEmitContext {
             Opcode::EndPrimitive => {
                 super::emit_spirv_special::emit_end_primitive(self, inst.arg(0));
             }
-            Opcode::GetRegister
-            | Opcode::SetRegister
-            | Opcode::GetPred
-            | Opcode::SetPred
-            | Opcode::Void
+            Opcode::Void
             | Opcode::GetZeroFromOp
             | Opcode::GetSignFromOp
             | Opcode::GetCarryFromOp
             | Opcode::GetOverflowFromOp
             | Opcode::GetInBoundsFromOp
             | Opcode::GetSparseFromOp
-            | Opcode::GetZFlag
-            | Opcode::SetZFlag
-            | Opcode::GetSFlag
-            | Opcode::SetSFlag
-            | Opcode::GetCFlag
-            | Opcode::SetCFlag
-            | Opcode::GetOFlag
-            | Opcode::SetOFlag
             | Opcode::Reference
-            | Opcode::PhiMove
-            | Opcode::GetGotoVariable
-            | Opcode::SetGotoVariable
-            | Opcode::GetIndirectBranchVariable
-            | Opcode::SetIndirectBranchVariable
-            | Opcode::Join => {
+            | Opcode::PhiMove => {
                 // No SPIR-V emission needed
             }
+            Opcode::GetRegister => super::emit_spirv_context_get_set::emit_get_register(self),
+            Opcode::SetRegister => super::emit_spirv_context_get_set::emit_set_register(self),
+            Opcode::GetPred => super::emit_spirv_context_get_set::emit_get_pred(self),
+            Opcode::SetPred => super::emit_spirv_context_get_set::emit_set_pred(self),
+            Opcode::SetGotoVariable => {
+                super::emit_spirv_context_get_set::emit_set_goto_variable(self)
+            }
+            Opcode::GetGotoVariable => {
+                super::emit_spirv_context_get_set::emit_get_goto_variable(self)
+            }
+            Opcode::SetIndirectBranchVariable => {
+                super::emit_spirv_context_get_set::emit_set_indirect_branch_variable(self)
+            }
+            Opcode::GetIndirectBranchVariable => {
+                super::emit_spirv_context_get_set::emit_get_indirect_branch_variable(self)
+            }
+            Opcode::GetZFlag => super::emit_spirv_context_get_set::emit_get_z_flag(self),
+            Opcode::GetSFlag => super::emit_spirv_context_get_set::emit_get_s_flag(self),
+            Opcode::GetCFlag => super::emit_spirv_context_get_set::emit_get_c_flag(self),
+            Opcode::GetOFlag => super::emit_spirv_context_get_set::emit_get_o_flag(self),
+            Opcode::SetZFlag => super::emit_spirv_context_get_set::emit_set_z_flag(self),
+            Opcode::SetSFlag => super::emit_spirv_context_get_set::emit_set_s_flag(self),
+            Opcode::SetCFlag => super::emit_spirv_context_get_set::emit_set_c_flag(self),
+            Opcode::SetOFlag => super::emit_spirv_context_get_set::emit_set_o_flag(self),
+            Opcode::Join => super::emit_spirv_control_flow::emit_join(self),
 
             // System values
             Opcode::WorkgroupId => {
@@ -5595,12 +5662,28 @@ impl SpirvEmitContext {
                 let id = super::emit_spirv_context_get_set::emit_sample_id(self);
                 self.set_value(block_idx, inst_idx, id);
             }
+            Opcode::SRWScaleFactorXY => {
+                let id = super::emit_spirv_context_get_set::emit_sr_w_scale_factor_xy(self);
+                self.set_value(block_idx, inst_idx, id);
+            }
+            Opcode::SRWScaleFactorZ => {
+                let id = super::emit_spirv_context_get_set::emit_sr_w_scale_factor_z(self);
+                self.set_value(block_idx, inst_idx, id);
+            }
             Opcode::YDirection => {
                 let id = super::emit_spirv_context_get_set::emit_y_direction(self);
                 self.set_value(block_idx, inst_idx, id);
             }
             Opcode::ResolutionDownFactor => {
                 let id = super::emit_spirv_context_get_set::emit_resolution_down_factor(self);
+                self.set_value(block_idx, inst_idx, id);
+            }
+            Opcode::IsTextureScaled => {
+                let id = super::emit_spirv_image::emit_is_texture_scaled(self, inst.args[0]);
+                self.set_value(block_idx, inst_idx, id);
+            }
+            Opcode::IsImageScaled => {
+                let id = super::emit_spirv_image::emit_is_image_scaled(self, inst.args[0]);
                 self.set_value(block_idx, inst_idx, id);
             }
             Opcode::RenderArea => {
@@ -6189,7 +6272,9 @@ mod tests {
             unified_descriptor_binding: true,
             support_descriptor_aliasing: true,
             support_int8: true,
+            support_uniform_and_storage_buffer_8bit: true,
             support_int16: true,
+            support_uniform_and_storage_buffer_16bit: true,
             ..Profile::default()
         };
         let mut ctx = SpirvEmitContext::new(&program, &profile, &RuntimeInfo::default());
@@ -6244,7 +6329,9 @@ mod tests {
             unified_descriptor_binding: true,
             support_descriptor_aliasing: true,
             support_int8: true,
+            support_storage_buffer_8bit: true,
             support_int16: true,
+            support_storage_buffer_16bit: true,
             support_int64: true,
             ..Profile::default()
         };
@@ -6660,6 +6747,49 @@ mod tests {
             )));
     }
 
+    /// Declares generic attribute 0 as a fragment input of `input_type` with
+    /// `Interpolation::Smooth`, then reports whether it was decorated `Flat`.
+    fn generic_input_is_flat(input_type: AttributeType) -> bool {
+        let mut program = ir::Program::new(ShaderStage::Fragment);
+        program
+            .info
+            .loads
+            .set(Attribute::generic(0, 0).0 as usize, true);
+        program.info.interpolation[0] = crate::shader_info::Interpolation::Smooth;
+
+        let mut runtime_info = RuntimeInfo::default();
+        runtime_info.generic_input_types[0] = input_type;
+        runtime_info
+            .previous_stage_stores
+            .set(Attribute::generic(0, 0).0 as usize, true);
+
+        let profile = Profile::default();
+        let mut ctx = SpirvEmitContext::new(&program, &profile, &runtime_info);
+        ctx.define_global_variables(&program, &mut Bindings::default());
+
+        let id = *ctx.input_vars.get(&0).expect("generic input 0 declared");
+        ctx.builder.module_ref().annotations.iter().any(|inst| {
+            inst.class.opcode == spirv::Op::Decorate
+                && matches!(inst.operands.as_slice(), [
+                    Operand::IdRef(decorated),
+                    Operand::Decoration(spirv::Decoration::Flat),
+                ] if *decorated == id)
+        })
+    }
+
+    /// SPIR-V forbids interpolating integer fragment inputs, so upstream
+    /// decorates them `Flat` even when the recorded interpolation is Smooth.
+    #[test]
+    fn integer_fragment_inputs_are_always_flat() {
+        assert!(generic_input_is_flat(AttributeType::SignedInt));
+        assert!(generic_input_is_flat(AttributeType::UnsignedInt));
+    }
+
+    #[test]
+    fn smooth_float_fragment_inputs_are_not_flat() {
+        assert!(!generic_input_is_flat(AttributeType::Float));
+    }
+
     #[test]
     fn fragment_position_load_declares_frag_coord_input() {
         let mut program = ir::Program::new(ShaderStage::Fragment);
@@ -6708,6 +6838,7 @@ mod tests {
             texture_type: TextureType::ColorArray2D,
             is_depth: true,
             is_multisample: true,
+            is_integer: false,
             has_secondary: false,
             cbuf_index: 0,
             cbuf_offset: 0,
@@ -6799,6 +6930,7 @@ mod tests {
             texture_type: TextureType::Color2D,
             is_depth: false,
             is_multisample: false,
+            is_integer: false,
             has_secondary: false,
             cbuf_index: 0,
             cbuf_offset: 0,
@@ -6840,6 +6972,30 @@ mod tests {
         let context =
             context_with_capabilities(&program, &Profile::default(), &RuntimeInfo::default());
         assert!(has_capability(&context, spirv::Capability::SampledBuffer));
+    }
+
+    #[test]
+    fn image_buffer_array_declaration_matches_upstream() {
+        let mut program = ir::Program::new(ShaderStage::Fragment);
+        program
+            .info
+            .image_buffer_descriptors
+            .push(ImageBufferDescriptor {
+                format: ImageFormat::R32Uint,
+                is_written: true,
+                is_read: true,
+                is_integer: true,
+                cbuf_index: 0,
+                cbuf_offset: 0,
+                count: 4,
+                size_shift: 0,
+            });
+
+        let mut ctx = SpirvEmitContext::new(&program, &Profile::default(), &RuntimeInfo::default());
+        ctx.define_global_variables(&program, &mut Bindings::default());
+
+        assert_eq!(ctx.image_buffers.len(), 1);
+        assert_eq!(ctx.image_buffers[0].count, 4);
     }
 
     #[test]
@@ -6891,6 +7047,94 @@ mod tests {
                     if extension == "SPV_KHR_shader_draw_parameters"
             )
         }));
+    }
+
+    #[test]
+    fn setup_capabilities_respects_subgroup_stage_support() {
+        let mut program = ir::Program::new(ShaderStage::Fragment);
+        program.info.uses_subgroup_vote = true;
+        let unsupported = Profile {
+            support_vote: true,
+            supported_subgroup_stages: 0,
+            ..Profile::default()
+        };
+        let unsupported_ctx =
+            context_with_capabilities(&program, &unsupported, &RuntimeInfo::default());
+        assert!(!has_capability(
+            &unsupported_ctx,
+            spirv::Capability::GroupNonUniformBallot
+        ));
+
+        let supported = Profile {
+            supported_subgroup_stages: 1 << ShaderStage::Fragment as u32,
+            ..unsupported
+        };
+        let supported_ctx =
+            context_with_capabilities(&program, &supported, &RuntimeInfo::default());
+        assert!(has_capability(
+            &supported_ctx,
+            spirv::Capability::GroupNonUniformBallot
+        ));
+    }
+
+    #[test]
+    fn setup_capabilities_declares_image_1d() {
+        let mut program = ir::Program::new(ShaderStage::Fragment);
+        program.info.uses_image_1d = true;
+        let ctx = context_with_capabilities(&program, &Profile::default(), &RuntimeInfo::default());
+        assert!(has_capability(&ctx, spirv::Capability::Image1D));
+    }
+
+    #[test]
+    fn w_scale_factor_stub_matches_upstream_value() {
+        let mut program = ir::Program::new(ShaderStage::VertexB);
+        program.blocks.push(Block::new());
+        program
+            .block_mut(0)
+            .append_inst(Inst::new(Opcode::SRWScaleFactorXY, vec![]));
+
+        let mut ctx = SpirvEmitContext::new(&program, &Profile::default(), &RuntimeInfo::default());
+        ctx.emit_program(&program);
+
+        assert!(ctx
+            .builder
+            .module_ref()
+            .types_global_values
+            .iter()
+            .any(|inst| {
+                inst.class.opcode == spirv::Op::Constant
+                    && matches!(
+                        inst.operands.as_slice(),
+                        [Operand::LiteralBit32(0x00ff_0000)]
+                    )
+            }));
+    }
+
+    fn backend_panic_for(opcode: Opcode, args: Vec<Value>) -> Box<dyn std::any::Any + Send> {
+        let mut program = ir::Program::new(ShaderStage::VertexB);
+        program.blocks.push(Block::new());
+        program.block_mut(0).append_inst(Inst::new(opcode, args));
+        let mut ctx = SpirvEmitContext::new(&program, &Profile::default(), &RuntimeInfo::default());
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| ctx.emit_program(&program)))
+            .expect_err("opcode must fail like its upstream emitter")
+    }
+
+    #[test]
+    fn register_opcode_reaching_spirv_is_a_logic_error() {
+        let payload = backend_panic_for(Opcode::GetRegister, vec![Value::Reg(ir::Reg(0))]);
+        let error = payload
+            .downcast_ref::<crate::exception::LogicError>()
+            .expect("typed LogicError");
+        assert_eq!(error.0, "Unreachable instruction");
+    }
+
+    #[test]
+    fn flag_opcode_reaching_spirv_is_not_implemented() {
+        let payload = backend_panic_for(Opcode::GetZFlag, vec![]);
+        let error = payload
+            .downcast_ref::<crate::exception::NotImplementedException>()
+            .expect("typed NotImplementedException");
+        assert_eq!(error.0, "SPIR-V Instruction is not implemented");
     }
 
     #[test]
@@ -7115,7 +7359,7 @@ mod tests {
             })],
         ));
         program.syntax_list = vec![ir::SyntaxNode::Block(0), ir::SyntaxNode::Return];
-        crate::ir_opt::collect_info::collect_shader_info_pass(&mut program);
+        crate::ir_opt::collect_shader_info_pass::collect_shader_info_pass(&mut program);
         assert!(program.info.uses_fp16);
 
         let profile = Profile::default();

@@ -220,13 +220,6 @@ impl DeviceSession {
         self.played_sample_count.load(Ordering::SeqCst)
     }
 
-    pub fn tick(&self) {
-        if let Some(stream) = &self.stream {
-            let played = stream.lock().get_expected_played_sample_count();
-            self.played_sample_count.store(played, Ordering::SeqCst);
-        }
-    }
-
     pub fn set_ring_size(&self, ring_size: u32) {
         if let Some(stream) = &self.stream {
             stream.lock().set_ring_size(ring_size);

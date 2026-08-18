@@ -24,10 +24,7 @@ use crate::vulkan_common::vulkan_library;
 use crate::vulkan_common::vulkan_memory_allocator::{MappedBuffer, MemoryAllocator, MemoryUsage};
 use crate::vulkan_common::vulkan_surface;
 use crate::vulkan_common::vulkan_wrapper::{Instance, VulkanError};
-use common::telemetry::{FieldType, FieldValue};
 use ruzu_core::frontend::framebuffer_layout::{default_frame_layout, FramebufferLayout, Rectangle};
-use ruzu_core::telemetry_session::TelemetrySession;
-use shader_recompiler::host_translate_info::HostTranslateInfo;
 
 use super::blit_screen::{BlitFrame, BlitScreen};
 use super::present::util::{create_wrapped_image, create_wrapped_image_view, download_color_image};
@@ -41,33 +38,21 @@ use super::turbo_mode::TurboMode;
 // Constants (from renderer_vulkan.cpp anonymous namespace)
 // ---------------------------------------------------------------------------
 
-/// Capture image width used for applet capture (1280px).
-/// Maps to `CaptureImageSize.width` in upstream.
-pub const CAPTURE_IMAGE_WIDTH: u32 = 1280;
-
-/// Capture image height used for applet capture (720px).
-/// Maps to `CaptureImageSize.height` in upstream.
-pub const CAPTURE_IMAGE_HEIGHT: u32 = 720;
-
-/// Capture image depth (always 1).
-/// Maps to `CaptureImageExtent.depth` in upstream.
-pub const CAPTURE_IMAGE_DEPTH: u32 = 1;
-
 /// Capture image format.
 /// Maps to `CaptureFormat` in upstream.
 pub const CAPTURE_FORMAT: vk::Format = vk::Format::A8B8G8R8_UNORM_PACK32;
 
 /// Capture image size as a VkExtent2D.
 pub const CAPTURE_IMAGE_SIZE: vk::Extent2D = vk::Extent2D {
-    width: CAPTURE_IMAGE_WIDTH,
-    height: CAPTURE_IMAGE_HEIGHT,
+    width: crate::capture::LINEAR_WIDTH,
+    height: crate::capture::LINEAR_HEIGHT,
 };
 
 /// Capture image extent as a VkExtent3D.
 pub const CAPTURE_IMAGE_EXTENT: vk::Extent3D = vk::Extent3D {
-    width: CAPTURE_IMAGE_WIDTH,
-    height: CAPTURE_IMAGE_HEIGHT,
-    depth: CAPTURE_IMAGE_DEPTH,
+    width: crate::capture::LINEAR_WIDTH,
+    height: crate::capture::LINEAR_HEIGHT,
+    depth: crate::capture::LINEAR_DEPTH,
 };
 
 // ---------------------------------------------------------------------------
@@ -116,61 +101,11 @@ pub fn build_comma_separated_extensions(extensions: &[String]) -> String {
 }
 
 fn build_driver_name(vendor_name: &str, driver_version: &str) -> String {
-    if vendor_name.is_empty() {
-        driver_version.to_string()
-    } else if driver_version.is_empty() {
-        vendor_name.to_string()
-    } else {
-        format!("{} {}", vendor_name, driver_version)
-    }
+    format!("{} {}", vendor_name, driver_version)
 }
 
 fn bytes_to_gib(bytes: u64) -> f64 {
     bytes as f64 / 1024.0 / 1024.0 / 1024.0
-}
-
-/// Port of `CanBlitToSwapchain`.
-fn can_blit_to_swapchain(device: &Device, format: vk::Format) -> bool {
-    let props = device.format_properties(format);
-    props
-        .optimal_tiling_features
-        .contains(vk::FormatFeatureFlags::BLIT_DST)
-}
-
-fn add_report_telemetry_fields(
-    telemetry_session: &mut TelemetrySession,
-    vendor_name: &str,
-    model_name: &str,
-    driver_name: &str,
-    api_version: &str,
-    extensions: &str,
-) {
-    let field = FieldType::UserSystem;
-    telemetry_session.add_field(
-        field,
-        "GPU_Vendor",
-        FieldValue::String(vendor_name.to_string()),
-    );
-    telemetry_session.add_field(
-        field,
-        "GPU_Model",
-        FieldValue::String(model_name.to_string()),
-    );
-    telemetry_session.add_field(
-        field,
-        "GPU_Vulkan_Driver",
-        FieldValue::String(driver_name.to_string()),
-    );
-    telemetry_session.add_field(
-        field,
-        "GPU_Vulkan_Version",
-        FieldValue::String(api_version.to_string()),
-    );
-    telemetry_session.add_field(
-        field,
-        "GPU_Vulkan_Extensions",
-        FieldValue::String(extensions.to_string()),
-    );
 }
 
 // ---------------------------------------------------------------------------
@@ -222,7 +157,7 @@ pub struct RendererVulkan {
     /// Vulkan memory allocator owner.
     memory_allocator: Box<MemoryAllocator>,
     /// Physical/logical Vulkan device owner.
-    device: Device,
+    device: Box<Device>,
     /// Presentation surface owner.
     surface: Arc<std::sync::Mutex<OwnedSurface>>,
     debug_messenger: vk::DebugUtilsMessengerEXT,
@@ -299,7 +234,6 @@ impl RendererVulkan {
     /// swapchain, present_manager, blit_swapchain, blit_capture, blit_applet,
     /// rasterizer, and optionally turbo_mode.
     pub fn new(
-        telemetry_session: Option<&mut TelemetrySession>,
         shader_notify: crate::shader_notify::ShaderNotifyHandle,
         window_info: &ruzu_core::frontend::emu_window::WindowSystemInfo,
         drawable_size: (u32, u32),
@@ -333,25 +267,18 @@ impl RendererVulkan {
             surface_handle,
         )));
 
-        let physical_device = select_physical_device(&instance.instance)?;
+        let device = Box::new(create_device(&instance, surface.lock().unwrap().handle())?);
+        let physical_device = device.get_physical();
         let memory_properties = unsafe {
             instance
                 .instance
                 .get_physical_device_memory_properties(physical_device)
         };
-        let physical_properties = unsafe {
-            instance
-                .instance
-                .get_physical_device_properties(physical_device)
-        };
 
-        let device = create_device(&instance, physical_device, surface.lock().unwrap().handle())?;
-        let mut memory_allocator = Box::new(MemoryAllocator::new(
-            device.get_logical().clone(),
-            memory_properties,
-            physical_properties.limits.buffer_image_granularity,
-            false,
-        ));
+        // `RasterizerVulkan` and its `PipelineCache` retain the upstream
+        // `const Device&`. Box the owner before constructing either borrower
+        // so its address remains stable when `RendererVulkan` is returned.
+        let mut memory_allocator = Box::new(MemoryAllocator::new(&device));
         let mut state_tracker = Box::new(StateTracker::new());
         let device_fault = device.is_device_fault_supported().then(|| {
             vk::ExtDeviceFaultFn::load(|name| unsafe {
@@ -369,7 +296,10 @@ impl RendererVulkan {
                 device.get_graphics_queue(),
                 device.get_graphics_family(),
                 device.is_timeline_semaphore_supported(),
+                device.has_synchronization2() && device.api_version() >= vk::API_VERSION_1_3,
+                device.synchronization2_extension().cloned(),
                 device_fault,
+                device.is_ext_transform_feedback_supported(),
             )
             .map_err(VulkanError::new)?,
         );
@@ -388,7 +318,6 @@ impl RendererVulkan {
             drawable_size.0.max(1),
             drawable_size.1.max(1),
         )?;
-        let blit_supported = can_blit_to_swapchain(&device, swapchain.get_image_view_format());
         let frame_image_format = swapchain.get_image_format();
         let swapchain_image_count = swapchain.get_image_count();
         let swapchain = std::sync::Arc::new(std::sync::Mutex::new(swapchain));
@@ -399,64 +328,33 @@ impl RendererVulkan {
             instance.instance.clone(),
             surface_info,
             Arc::clone(&surface),
-            device.get_logical().clone(),
+            device.as_ref(),
             memory_properties,
             frame_image_format,
             device.get_graphics_family(),
             swapchain_image_count,
-            blit_supported,
             use_present_thread,
             submit_mutex,
             std::sync::Arc::clone(&swapchain),
             device.get_graphics_queue(),
         );
-        let supports_float16 = device.is_float16_supported();
-        let blit_swapchain = BlitScreen::new(
-            device.get_logical().clone(),
-            &PRESENT_FILTERS_FOR_DISPLAY,
-            supports_float16,
-        );
-        let blit_capture = BlitScreen::new(
-            device.get_logical().clone(),
-            &PRESENT_FILTERS_FOR_DISPLAY,
-            supports_float16,
-        );
+        let blit_swapchain =
+            BlitScreen::new(device.get_logical().clone(), &PRESENT_FILTERS_FOR_DISPLAY);
+        let blit_capture =
+            BlitScreen::new(device.get_logical().clone(), &PRESENT_FILTERS_FOR_DISPLAY);
         let blit_applet = BlitScreen::new(
             device.get_logical().clone(),
             &PRESENT_FILTERS_FOR_APPLET_CAPTURE,
-            supports_float16,
         );
-        let driver_id = device.get_driver_id();
-        let shader_profile = super::pipeline_cache::make_shader_profile(&device);
-        let host_info = HostTranslateInfo {
-            support_float64: device.is_float64_supported(),
-            support_float16: device.is_float16_supported(),
-            support_int64: device.is_shader_int64_supported(),
-            needs_demote_reorder: matches!(
-                driver_id,
-                vk::DriverId::AMD_PROPRIETARY
-                    | vk::DriverId::AMD_OPEN_SOURCE
-                    | vk::DriverId::SAMSUNG_PROPRIETARY
-            ),
-            support_snorm_render_buffer: true,
-            support_viewport_index_layer: device.is_ext_shader_viewport_index_layer_supported(),
-            min_ssbo_alignment: device.get_storage_buffer_alignment() as u32,
-            support_geometry_shader_passthrough: device
-                .is_nv_geometry_shader_passthrough_supported(),
-            support_conditional_barrier: device.supports_conditional_barriers(),
-        };
         let rasterizer = super::RasterizerVulkan::new(
             shader_notify,
+            device.as_ref(),
             instance.instance.clone(),
             device.get_physical(),
-            device.get_logical().clone(),
-            driver_id,
-            device.has_broken_parallel_shader_compiling(),
+            device.get_driver_id(),
             device.cant_blit_msaa(),
-            CAPTURE_IMAGE_WIDTH,
-            CAPTURE_IMAGE_HEIGHT,
-            shader_profile,
-            host_info,
+            crate::capture::LINEAR_WIDTH,
+            crate::capture::LINEAR_HEIGHT,
             device.is_depth_bounds_supported(),
             device.is_ext_depth_range_unrestricted_supported(),
             device.is_nv_viewport_swizzle_supported(),
@@ -476,6 +374,19 @@ impl RendererVulkan {
             device.is_ext_extended_dynamic_state2_extras_supported(),
             device.is_ext_extended_dynamic_state3_blending_supported(),
             device.is_ext_extended_dynamic_state3_enables_supported(),
+            device.is_ext_color_write_enable_supported(),
+            super::graphics_pipeline::DynamicState3Support {
+                depth_clamp_enable: device.supports_dynamic_state3_depth_clamp_enable(),
+                logic_op_enable: device.supports_dynamic_state3_logic_op_enable(),
+                line_rasterization_mode: device.supports_dynamic_state3_line_rasterization_mode(),
+                conservative_rasterization_mode: device
+                    .supports_dynamic_state3_conservative_rasterization_mode(),
+                line_stipple_enable: device.supports_dynamic_state3_line_stipple_enable(),
+                alpha_to_coverage_enable: device.supports_dynamic_state3_alpha_to_coverage_enable(),
+                alpha_to_one_enable: device.supports_dynamic_state3_alpha_to_one_enable(),
+            },
+            device.is_ext_line_rasterization_supported(),
+            device.supports_smooth_lines(),
             device.is_ext_vertex_input_dynamic_state_supported(),
             device.is_topology_list_primitive_restart_supported(),
             device.is_patch_list_primitive_restart_supported(),
@@ -490,6 +401,7 @@ impl RendererVulkan {
             device.get_max_viewports(),
             device.get_max_vertex_input_attributes(),
             device.get_max_vertex_input_bindings(),
+            device.get_max_compute_work_group_count(),
             device.is_ext_vertex_attribute_divisor_supported(),
             device.is_ext_provoking_vertex_supported(),
             device.is_khr_draw_indirect_count_supported(),
@@ -543,7 +455,7 @@ impl RendererVulkan {
             base_data: RendererBaseData::new(),
             dummy_context: VulkanDummyContext,
         };
-        renderer.report(telemetry_session);
+        renderer.report();
         Ok(renderer)
     }
 
@@ -563,9 +475,6 @@ impl RendererVulkan {
     /// 8. Notify GPU of frame end
     /// 9. Tick rasterizer frame
     pub fn composite_impl(&mut self, framebuffers: &[FramebufferConfig]) {
-        if framebuffers.is_empty() {
-            return;
-        }
         let _frame_displayed = FrameDisplayedNotifyGuard::new(&self.frame_displayed_notify);
         self.render_applet_capture_layer(framebuffers);
         if !should_present_window(&self.window_shown) {
@@ -583,7 +492,9 @@ impl RendererVulkan {
         // both values in atomics updated at swapchain (re)creation.
         let swapchain_image_count = self.present_manager.swapchain_image_count();
         let swapchain_image_view_format = self.present_manager.swapchain_image_view_format();
+        self.scheduler.request_outside_renderpass();
         self.blit_swapchain.draw_to_present_frame(
+            self.device.as_ref(),
             &mut self.rasterizer,
             &mut self.scheduler,
             &mut self.present_manager,
@@ -600,8 +511,6 @@ impl RendererVulkan {
         self.scheduler.flush_with_signal(render_ready);
         self.present_manager
             .present(frame_index, &mut self.scheduler);
-        self.base_data.current_frame += 1;
-
         (self.frame_end_notify)();
         self.rasterizer.tick_frame();
     }
@@ -649,8 +558,8 @@ impl RendererVulkan {
 
     /// Port of `RendererVulkan::Report`.
     ///
-    /// Logs device information and submits the same telemetry fields as upstream.
-    fn report(&self, telemetry_session: Option<&mut TelemetrySession>) {
+    /// Logs the four device information fields emitted by upstream.
+    fn report(&self) {
         let vendor_name = self.device.get_vendor_name();
         let model_name = self.device.get_model_name();
         let driver_version = get_driver_version(
@@ -672,18 +581,7 @@ impl RendererVulkan {
         log::info!("Device: {}", model_name);
         log::info!("Vulkan: {}", api_version);
         log::info!("Available VRAM: {:.2} GiB", available_vram);
-        log::debug!("Vulkan extensions: {}", extensions);
-
-        if let Some(telemetry_session) = telemetry_session {
-            add_report_telemetry_fields(
-                telemetry_session,
-                &vendor_name,
-                &model_name,
-                &driver_name,
-                &api_version,
-                &extensions,
-            );
-        }
+        let _ = extensions;
     }
 
     /// Port of `RendererVulkan::RenderToBuffer`.
@@ -712,6 +610,7 @@ impl RendererVulkan {
         frame.image_view =
             create_wrapped_image_view(self.device.get_logical(), frame.image, format);
         frame.framebuffer = self.blit_capture.create_framebuffer(
+            self.device.as_ref(),
             &mut self.scheduler,
             &self.present_manager,
             frame.image_view,
@@ -722,6 +621,7 @@ impl RendererVulkan {
 
         let dst_buffer = self.create_download_buffer(buffer_size);
         self.blit_capture.draw_to_frame(
+            self.device.as_ref(),
             &mut self.rasterizer,
             &mut self.scheduler,
             &self.present_manager,
@@ -813,8 +713,8 @@ impl RendererVulkan {
     /// using the applet-specific blit screen and filter configuration.
     fn render_applet_capture_layer(&mut self, framebuffers: &[FramebufferConfig]) {
         if self.applet_frame.image == vk::Image::null() {
-            self.applet_frame.width = CAPTURE_IMAGE_WIDTH;
-            self.applet_frame.height = CAPTURE_IMAGE_HEIGHT;
+            self.applet_frame.width = crate::capture::LINEAR_WIDTH;
+            self.applet_frame.height = crate::capture::LINEAR_HEIGHT;
             self.applet_frame.image = create_wrapped_image(
                 self.device.get_logical(),
                 &self.memory_allocator,
@@ -827,18 +727,20 @@ impl RendererVulkan {
                 CAPTURE_FORMAT,
             );
             self.applet_frame.framebuffer = self.blit_applet.create_framebuffer(
+                self.device.as_ref(),
                 &mut self.scheduler,
                 &self.present_manager,
                 self.applet_frame.image_view,
                 CAPTURE_FORMAT,
-                CAPTURE_IMAGE_WIDTH,
-                CAPTURE_IMAGE_HEIGHT,
+                crate::capture::LINEAR_WIDTH,
+                crate::capture::LINEAR_HEIGHT,
             );
         }
 
         let layout = capture_framebuffer_layout();
         let frame = BlitFrame::from(&self.applet_frame);
         self.blit_applet.draw_to_frame(
+            self.device.as_ref(),
             &mut self.rasterizer,
             &mut self.scheduler,
             &self.present_manager,
@@ -945,7 +847,9 @@ impl RendererBase for RendererVulkan {
         self.base_data.current_frame
     }
 
-    fn refresh_base_settings(&mut self) {}
+    fn refresh_base_settings(&mut self) {
+        crate::renderer_base::update_current_framebuffer_layout(&self.framebuffer_layout);
+    }
 
     fn is_screenshot_pending(&self) -> bool {
         self.base_data.is_screenshot_pending()
@@ -1051,36 +955,28 @@ impl Drop for FrameDisplayedNotifyGuard {
 }
 
 /// Port of free function `CreateDevice`.
-fn create_device(
-    instance: &Instance,
-    physical_device: vk::PhysicalDevice,
-    surface: vk::SurfaceKHR,
-) -> Result<Device, VulkanError> {
-    Device::new(
-        &instance.entry,
-        instance.instance.clone(),
-        physical_device,
-        surface,
-    )
-}
-
-/// Port of the physical-device selection portion of upstream `CreateDevice`.
-fn select_physical_device(instance: &ash::Instance) -> Result<vk::PhysicalDevice, VulkanError> {
+pub fn create_device(instance: &Instance, surface: vk::SurfaceKHR) -> Result<Device, VulkanError> {
     let devices = unsafe {
         instance
+            .instance
             .enumerate_physical_devices()
             .map_err(VulkanError::new)?
     };
     let device_index = *common::settings::values().vulkan_device.get_value();
     let selected_index = validate_physical_device_index(device_index, devices.len())?;
-    Ok(devices[selected_index])
+    Device::new(
+        &instance.entry,
+        instance.instance.clone(),
+        devices[selected_index],
+        surface,
+    )
 }
 
 fn validate_physical_device_index(
-    device_index: i32,
+    device_index: u32,
     device_count: usize,
 ) -> Result<usize, VulkanError> {
-    if device_index < 0 || device_index as usize >= device_count {
+    if device_index >= device_count as u32 {
         log::error!("Invalid Vulkan device index {}!", device_index);
         return Err(VulkanError::new(vk::Result::ERROR_INITIALIZATION_FAILED));
     }
@@ -1090,8 +986,6 @@ fn validate_physical_device_index(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use common::telemetry::{Field, VisitorInterface};
-    use std::collections::BTreeMap;
 
     #[test]
     fn readable_version() {
@@ -1119,8 +1013,9 @@ mod tests {
 
     #[test]
     fn capture_constants() {
-        assert_eq!(CAPTURE_IMAGE_WIDTH, 1280);
-        assert_eq!(CAPTURE_IMAGE_HEIGHT, 720);
+        assert_eq!(CAPTURE_IMAGE_SIZE.width, crate::capture::LINEAR_WIDTH);
+        assert_eq!(CAPTURE_IMAGE_SIZE.height, crate::capture::LINEAR_HEIGHT);
+        assert_eq!(CAPTURE_IMAGE_EXTENT.depth, crate::capture::LINEAR_DEPTH);
         assert_eq!(CAPTURE_FORMAT, vk::Format::A8B8G8R8_UNORM_PACK32);
     }
 
@@ -1128,7 +1023,6 @@ mod tests {
     fn physical_device_index_validation_matches_upstream_bounds() {
         assert_eq!(validate_physical_device_index(0, 1).unwrap(), 0);
         assert_eq!(validate_physical_device_index(1, 2).unwrap(), 1);
-        assert!(validate_physical_device_index(-1, 2).is_err());
         assert!(validate_physical_device_index(2, 2).is_err());
         assert!(validate_physical_device_index(0, 0).is_err());
     }
@@ -1163,8 +1057,8 @@ mod tests {
             build_driver_name("NVIDIA", "525.60.11.0"),
             "NVIDIA 525.60.11.0"
         );
-        assert_eq!(build_driver_name("", "1.2.3"), "1.2.3");
-        assert_eq!(build_driver_name("MoltenVK", ""), "MoltenVK");
+        assert_eq!(build_driver_name("", "1.2.3"), " 1.2.3");
+        assert_eq!(build_driver_name("MoltenVK", ""), "MoltenVK ");
     }
 
     #[test]
@@ -1172,59 +1066,6 @@ mod tests {
         assert_eq!(bytes_to_gib(0), 0.0);
         assert_eq!(bytes_to_gib(1024 * 1024 * 1024), 1.0);
         assert_eq!(bytes_to_gib(5 * 1024 * 1024 * 1024), 5.0);
-    }
-
-    #[test]
-    fn report_telemetry_fields_match_upstream_names() {
-        struct Collector(BTreeMap<String, FieldValue>);
-
-        impl VisitorInterface for Collector {
-            fn visit(&mut self, field: &Field) {
-                self.0
-                    .insert(field.get_name().to_string(), field.get_value().clone());
-            }
-
-            fn complete(&mut self) {}
-
-            fn submit_testcase(&mut self) -> bool {
-                false
-            }
-        }
-
-        let mut session = TelemetrySession::new();
-        add_report_telemetry_fields(
-            &mut session,
-            "MoltenVK",
-            "Apple M2 Pro",
-            "MoltenVK 1.2.3",
-            "1.3.250",
-            "VK_KHR_swapchain,VK_EXT_memory_budget",
-        );
-        let mut collector = Collector(BTreeMap::new());
-        session.field_collection().accept(&mut collector);
-
-        assert_eq!(
-            collector.0.get("GPU_Vendor"),
-            Some(&FieldValue::String("MoltenVK".to_string()))
-        );
-        assert_eq!(
-            collector.0.get("GPU_Model"),
-            Some(&FieldValue::String("Apple M2 Pro".to_string()))
-        );
-        assert_eq!(
-            collector.0.get("GPU_Vulkan_Driver"),
-            Some(&FieldValue::String("MoltenVK 1.2.3".to_string()))
-        );
-        assert_eq!(
-            collector.0.get("GPU_Vulkan_Version"),
-            Some(&FieldValue::String("1.3.250".to_string()))
-        );
-        assert_eq!(
-            collector.0.get("GPU_Vulkan_Extensions"),
-            Some(&FieldValue::String(
-                "VK_KHR_swapchain,VK_EXT_memory_budget".to_string()
-            ))
-        );
     }
 
     #[test]

@@ -88,10 +88,49 @@ pub trait BasicSetting {
 // SettingType trait -- bounds for types usable in Setting
 // ---------------------------------------------------------------------------
 
-/// Trait alias for types that can be stored in a `Setting`.
-pub trait SettingType: Clone + PartialOrd + fmt::Display + FromStr + 'static {}
+/// Types that can be stored in a `Setting`.
+///
+/// The conversion methods mirror `Setting<Type>::ToString` and
+/// `Setting<Type>::Canonicalize`. They are deliberately separate from
+/// `Display`: enum settings are persisted as their numeric underlying value,
+/// while frontends use their canonical variant name.
+pub trait SettingType: Clone + PartialOrd + fmt::Display + FromStr + 'static {
+    fn to_config_string(&self) -> String;
 
-impl<T> SettingType for T where T: Clone + PartialOrd + fmt::Display + FromStr + 'static {}
+    fn canonicalize_value(&self) -> String {
+        self.to_config_string()
+    }
+
+    fn is_enum_type() -> bool {
+        false
+    }
+}
+
+macro_rules! impl_setting_type {
+    ($($type:ty),+ $(,)?) => {
+        $(
+            impl SettingType for $type {
+                fn to_config_string(&self) -> String {
+                    self.to_string()
+                }
+            }
+        )+
+    };
+}
+
+impl_setting_type!(bool, String, i8, i16, i32, i64, i128, isize, u8, u16, u32, u64, u128, usize,);
+
+impl SettingType for f32 {
+    fn to_config_string(&self) -> String {
+        format!("{self:.6}")
+    }
+}
+
+impl SettingType for f64 {
+    fn to_config_string(&self) -> String {
+        format!("{self:.6}")
+    }
+}
 
 // ---------------------------------------------------------------------------
 // IntegralMarker / FloatingPointMarker -- compile-time type classification
@@ -134,16 +173,16 @@ where
     }
 
     fn to_string_repr(&self) -> String {
-        format!("{}", self.get_value())
+        self.get_value().to_config_string()
     }
 
     fn to_string_global(&self) -> String {
         // Non-switchable: global == current.
-        format!("{}", self.get_value())
+        self.get_value().to_config_string()
     }
 
     fn default_to_string(&self) -> String {
-        format!("{}", self.get_default())
+        self.get_default().to_config_string()
     }
 
     fn load_string(&mut self, input: &str) {
@@ -158,11 +197,11 @@ where
     }
 
     fn canonicalize(&self) -> String {
-        self.to_string_repr()
+        self.get_value().canonicalize_value()
     }
 
     fn is_enum(&self) -> bool {
-        false // Rust enums would need a separate marker trait
+        T::is_enum_type()
     }
 
     fn switchable(&self) -> bool {
@@ -219,15 +258,15 @@ where
     }
 
     fn to_string_repr(&self) -> String {
-        format!("{}", self.get_value())
+        self.get_value().to_config_string()
     }
 
     fn to_string_global(&self) -> String {
-        format!("{}", self.get_value_global())
+        self.get_value_global().to_config_string()
     }
 
     fn default_to_string(&self) -> String {
-        format!("{}", self.get_default())
+        self.get_default().to_config_string()
     }
 
     fn load_string(&mut self, input: &str) {
@@ -242,11 +281,11 @@ where
     }
 
     fn canonicalize(&self) -> String {
-        self.to_string_repr()
+        self.get_value().canonicalize_value()
     }
 
     fn is_enum(&self) -> bool {
-        false
+        T::is_enum_type()
     }
 
     fn switchable(&self) -> bool {
@@ -324,7 +363,22 @@ mod tests {
         assert!(s.switchable());
         assert!(s.is_floating_point());
         assert!(!s.is_integral());
-        assert_eq!(s.to_string_repr(), "1");
+        assert_eq!(s.to_string_repr(), "1.000000");
+
+        let fractional = Setting::new(1.25_f64, "fractional", Category::Audio);
+        assert_eq!(fractional.to_string_repr(), "1.250000");
+    }
+
+    #[test]
+    fn enum_setting_uses_numeric_config_and_canonical_ui_representations() {
+        use crate::settings_enums::RendererBackend;
+
+        let setting = Setting::new(RendererBackend::Null, "backend", Category::Renderer);
+
+        assert_eq!(setting.to_string_repr(), "2");
+        assert_eq!(setting.default_to_string(), "2");
+        assert_eq!(setting.canonicalize(), "Null");
+        assert!(setting.is_enum());
     }
 
     #[test]

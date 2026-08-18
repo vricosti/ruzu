@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2025 ruzu contributors
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-//! Port of zuyu/src/core/loader/nro.h and nro.cpp
+//! Port of eden/src/core/loader/nro.h and nro.cpp
 //!
 //! NRO (Nintendo Relocatable Object) loader.
 
@@ -13,12 +13,14 @@ use crate::file_sys::vfs::vfs::VfsFile;
 use crate::file_sys::vfs::vfs_offset::OffsetVfsFile;
 use crate::file_sys::vfs::vfs_types::VirtualFile;
 use crate::hle::kernel::code_set::CodeSet;
+use crate::hle::kernel::k_typed_address::KProcessAddress;
+use common::common_funcs::make_magic;
 
 use super::loader::{
-    make_magic, AppLoader, FileType, FileTypeIdentifier, KProcess, LoadParameters, LoadResult,
-    Modules, ResultStatus, System, NACP,
+    AppLoader, FileType, FileTypeIdentifier, KProcess, LoadParameters, LoadResult, Modules,
+    ResultStatus, System, NACP,
 };
-use super::nso::{read_object, NsoArgumentHeader, NSO_ARGUMENT_DATA_ALLOCATION_SIZE};
+use super::nso::read_object;
 
 // ============================================================================
 // NroSegmentHeader
@@ -126,9 +128,64 @@ const _: () = assert!(std::mem::size_of::<AssetHeader>() == 0x38);
 // ============================================================================
 
 const YUZU_PAGEMASK: u32 = 0xFFF;
+const YUZU_PAGESIZE: usize = 0x1000;
+
+#[derive(Debug, Clone, Copy, Default)]
+#[repr(C)]
+struct ConfigEntry {
+    key: u32,
+    flags: u32,
+    value: [u64; 2],
+}
+
+const _: () = assert!(std::mem::size_of::<ConfigEntry>() == 0x18);
+
+const SVC_EXIT_PROCESS_INSTRUCTION: u32 = 0xD400_00E1;
+const NUM_CONFIG_ENTRIES: usize = 4;
+const CONFIG_TABLE_SIZE: usize = NUM_CONFIG_ENTRIES * std::mem::size_of::<ConfigEntry>();
+const ENTRY_END_OF_LIST: u32 = 0;
+const ENTRY_MAIN_THREAD_HANDLE: u32 = 1;
+const ENTRY_ARGV: u32 = 5;
+const ENTRY_APPLET_TYPE: u32 = 7;
+const APPLET_TYPE_APPLICATION: u64 = 0;
+const MAIN_THREAD_HANDLE_VALUE_OFFSET: u64 = 8;
 
 const fn page_align_size(size: u32) -> u32 {
     (size + YUZU_PAGEMASK) & !YUZU_PAGEMASK
+}
+
+fn build_config_table(argv_addr: u64) -> [u8; CONFIG_TABLE_SIZE] {
+    let entries = [
+        ConfigEntry {
+            key: ENTRY_MAIN_THREAD_HANDLE,
+            flags: 0,
+            value: [0, 0],
+        },
+        ConfigEntry {
+            key: ENTRY_APPLET_TYPE,
+            flags: 0,
+            value: [APPLET_TYPE_APPLICATION, 0],
+        },
+        ConfigEntry {
+            key: ENTRY_ARGV,
+            flags: 0,
+            value: [0, argv_addr],
+        },
+        ConfigEntry {
+            key: ENTRY_END_OF_LIST,
+            flags: 0,
+            value: [0, 0],
+        },
+    ];
+    let mut bytes = [0u8; CONFIG_TABLE_SIZE];
+    for (index, entry) in entries.iter().enumerate() {
+        let offset = index * std::mem::size_of::<ConfigEntry>();
+        bytes[offset..offset + 4].copy_from_slice(&entry.key.to_le_bytes());
+        bytes[offset + 4..offset + 8].copy_from_slice(&entry.flags.to_le_bytes());
+        bytes[offset + 8..offset + 16].copy_from_slice(&entry.value[0].to_le_bytes());
+        bytes[offset + 16..offset + 24].copy_from_slice(&entry.value[1].to_le_bytes());
+    }
+    bytes
 }
 
 // ============================================================================
@@ -261,9 +318,11 @@ impl AppLoaderNro {
 
         // Build program image
         let aligned_size = page_align_size(nro_header.file_size) as usize;
+        if data.len() < aligned_size {
+            return false;
+        }
         let mut program_image = vec![0u8; aligned_size];
-        let copy_len = std::cmp::min(data.len(), program_image.len());
-        program_image[..copy_len].copy_from_slice(&data[..copy_len]);
+        program_image.copy_from_slice(&data[..aligned_size]);
 
         if program_image.len() != aligned_size {
             return false;
@@ -275,32 +334,6 @@ impl AppLoaderNro {
             codeset.segments[i].addr = nro_header.segments[i].offset as u64;
             codeset.segments[i].offset = nro_header.segments[i].offset as usize;
             codeset.segments[i].size = page_align_size(nro_header.segments[i].size);
-        }
-
-        // Upstream: append program arguments to data segment if program_args is non-empty.
-        let program_args = common::settings::values().program_args.get_value().clone();
-        if !program_args.is_empty() {
-            codeset.segments[2].size += NSO_ARGUMENT_DATA_ALLOCATION_SIZE;
-            let arg_header = NsoArgumentHeader {
-                allocated_size: NSO_ARGUMENT_DATA_ALLOCATION_SIZE,
-                actual_size: program_args.len() as u32,
-                _padding: [0u8; 0x18],
-            };
-            let end_offset = program_image.len();
-            program_image.resize(
-                program_image.len() + NSO_ARGUMENT_DATA_ALLOCATION_SIZE as usize,
-                0,
-            );
-            unsafe {
-                std::ptr::copy_nonoverlapping(
-                    &arg_header as *const NsoArgumentHeader as *const u8,
-                    program_image[end_offset..].as_mut_ptr(),
-                    std::mem::size_of::<NsoArgumentHeader>(),
-                );
-            }
-            let arg_data_start = end_offset + std::mem::size_of::<NsoArgumentHeader>();
-            program_image[arg_data_start..arg_data_start + program_args.len()]
-                .copy_from_slice(program_args.as_bytes());
         }
 
         // Default .bss to NRO header bss size if MOD0 section doesn't exist
@@ -328,6 +361,41 @@ impl AppLoaderNro {
         // Upstream: codeset.DataSegment().size += bss_size
         codeset.data_segment_mut().size += bss_size;
         program_image.resize(program_image.len() + bss_size as usize, 0);
+
+        let program_args = common::settings::values().program_args.get_value().clone();
+        let mut argv_string = Vec::new();
+        let mut args_offset_in_image = 0usize;
+        let mut exit_process_offset_in_image = None;
+        if !program_args.is_empty() {
+            argv_string.extend_from_slice(b"homebrew ");
+            argv_string.extend_from_slice(program_args.as_bytes());
+            argv_string.push(0);
+
+            let code = codeset.code_segment();
+            let code_end = program_image.len().min(code.offset + code.size as usize);
+            for offset in (code.offset..code_end.saturating_sub(3)).step_by(4) {
+                let instruction = u32::from_le_bytes(
+                    program_image[offset..offset + 4]
+                        .try_into()
+                        .expect("four-byte instruction"),
+                );
+                if instruction == SVC_EXIT_PROCESS_INSTRUCTION {
+                    exit_process_offset_in_image = Some(offset);
+                    break;
+                }
+            }
+            if exit_process_offset_in_image.is_none() {
+                log::warn!("Unable to find svcExitProcess in NRO; returning from main may fault");
+            }
+
+            let entries_and_argv = common::alignment::align_up(
+                (CONFIG_TABLE_SIZE + argv_string.len()) as u64,
+                YUZU_PAGESIZE as u64,
+            ) as usize;
+            args_offset_in_image = program_image.len();
+            codeset.data_segment_mut().size += entries_and_argv as u32;
+            program_image.resize(args_offset_in_image + entries_and_argv, 0);
+        }
         let image_size = program_image.len() as u64;
 
         // Upstream: NCE patcher (HAS_NCE path). NCE patching is not yet integrated.
@@ -347,6 +415,21 @@ impl AppLoaderNro {
         codeset.memory = program_image;
         process.load_module(codeset, entry_point);
 
+        if !argv_string.is_empty() {
+            let base = process.get_entry_point().get();
+            let config_addr = base + args_offset_in_image as u64;
+            let argv_addr = config_addr + CONFIG_TABLE_SIZE as u64;
+            process.write_memory(config_addr, &build_config_table(argv_addr));
+            process.write_memory(argv_addr, &argv_string);
+            process.set_arg_pointer(KProcessAddress::new(config_addr));
+            if let Some(offset) = exit_process_offset_in_image {
+                process.set_arg_return_address(KProcessAddress::new(base + offset as u64));
+            }
+            process.set_main_thread_handle_addr(KProcessAddress::new(
+                config_addr + MAIN_THREAD_HANDLE_VALUE_OFFSET,
+            ));
+        }
+
         true
     }
 
@@ -361,6 +444,27 @@ impl AppLoaderNro {
     ) -> bool {
         let data = nro_file.read_all_bytes();
         Self::load_nro_impl(system, process, &data)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn homebrew_config_table_matches_eden_binary_layout() {
+        let argv_addr = 0x1234_5678_9ABC_DEF0;
+        let table = build_config_table(argv_addr);
+
+        assert_eq!(table.len(), 0x60);
+        assert_eq!(u32::from_le_bytes(table[0..4].try_into().unwrap()), 1);
+        assert_eq!(u32::from_le_bytes(table[24..28].try_into().unwrap()), 7);
+        assert_eq!(u32::from_le_bytes(table[48..52].try_into().unwrap()), 5);
+        assert_eq!(
+            u64::from_le_bytes(table[64..72].try_into().unwrap()),
+            argv_addr
+        );
+        assert!(table[72..].iter().all(|byte| *byte == 0));
     }
 }
 

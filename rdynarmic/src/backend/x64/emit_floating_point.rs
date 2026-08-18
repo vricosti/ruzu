@@ -1,9 +1,10 @@
-use rxbyak::{JmpType, Reg, RegExp, CL, R15};
+use rxbyak::{qword_ptr, JmpType, Reg, RegExp, CL, R15, RSP};
 
 use crate::backend::x64::abi;
-use crate::backend::x64::emit_context::EmitContext;
+use crate::backend::x64::emit_context::{DeferredEmitCtx, EmitContext};
 use crate::backend::x64::fp_helpers;
-use crate::backend::x64::hostloc::HOST_RCX;
+use crate::backend::x64::host_feature::HostFeature;
+use crate::backend::x64::hostloc::{HostLoc, HOST_RCX};
 use crate::backend::x64::reg_alloc::RegAlloc;
 use crate::common::fp::fpcr::Fpcr;
 use crate::common::fp::fpsr::Fpsr;
@@ -14,26 +15,7 @@ use crate::common::fp::rounding_mode::RoundingMode;
 use crate::common::fp::unpacked::{fp_unpack, FpType};
 use crate::ir::inst::Inst;
 use crate::ir::value::InstRef;
-
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-fn host_supports_sse41() -> bool {
-    std::is_x86_feature_detected!("sse4.1")
-}
-
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-fn host_supports_f16c() -> bool {
-    std::is_x86_feature_detected!("f16c")
-}
-
-#[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
-fn host_supports_sse41() -> bool {
-    false
-}
-
-#[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
-fn host_supports_f16c() -> bool {
-    false
-}
+use crate::jit_config::OptimizationFlag;
 
 // ---------------------------------------------------------------------------
 // Helper: emit a host_call to a Rust function with N args, returning result in RAX
@@ -95,6 +77,38 @@ fn emit_fp_estimate_call(
 
     let fpcr_param = abi::ABI_PARAMS[1].to_reg64();
     let fpsr_param = abi::ABI_PARAMS[2].to_reg64();
+    ra.asm
+        .mov(
+            Reg::gpr32(fpcr_param.get_idx()),
+            ctx.fpcr(true).value() as i32,
+        )
+        .unwrap();
+    ra.asm
+        .lea(
+            fpsr_param,
+            rxbyak::dword_ptr(RegExp::from(R15) + ctx.arch.fpsr_exc_offset() as i32),
+        )
+        .unwrap();
+    ra.asm.mov(rxbyak::RAX, func as i64).unwrap();
+    ra.asm.call_reg(rxbyak::RAX).unwrap();
+}
+
+fn emit_fp_step_fused_call(
+    ctx: &EmitContext,
+    ra: &mut RegAlloc,
+    inst_ref: InstRef,
+    inst: &Inst,
+    func: usize,
+) {
+    let mut args = ra.get_argument_info(inst_ref, &inst.args, inst.num_args());
+    let (first, rest) = args.split_at_mut(1);
+    ra.host_call(
+        Some(inst_ref),
+        &mut [Some(&mut first[0]), Some(&mut rest[0]), None, None],
+    );
+
+    let fpcr_param = abi::ABI_PARAMS[2].to_reg64();
+    let fpsr_param = abi::ABI_PARAMS[3].to_reg64();
     ra.asm
         .mov(
             Reg::gpr32(fpcr_param.get_idx()),
@@ -710,7 +724,7 @@ fn emit_fp_round_int(
     let rounding = inst.args[1].get_u8();
     let exact = inst.args[2].get_u1();
 
-    if esize != 16 && host_supports_sse41() && rounding != 4 && !exact {
+    if esize != 16 && ctx.has_host_feature(HostFeature::SSE41) && rounding != 4 && !exact {
         let mut args = ra.get_argument_info(inst_ref, &inst.args, inst.num_args());
         let result = ra.use_scratch_xmm(&mut args[0]);
         let sse_rmode = match rounding {
@@ -763,42 +777,288 @@ pub fn emit_fp_round_int64(ctx: &EmitContext, ra: &mut RegAlloc, inst_ref: InstR
 // Args: (addend, a, b) → addend + a*b / addend - a*b
 // ---------------------------------------------------------------------------
 
-pub fn emit_fp_mul_add32(_ctx: &EmitContext, ra: &mut RegAlloc, inst_ref: InstRef, inst: &Inst) {
-    let mut args = ra.get_argument_info(inst_ref, &inst.args, inst.num_args());
-    let addend = ra.use_scratch_xmm(&mut args[0]);
-    let a = ra.use_xmm(&mut args[1]);
-    let b = ra.use_xmm(&mut args[2]);
-    // vfmadd231ss addend, a, b → addend = addend + a*b
-    ra.asm.vfmadd231ss(addend, a, b).unwrap();
-    ra.define_value(inst_ref, addend);
+pub fn emit_fp_mul_add32(ctx: &EmitContext, ra: &mut RegAlloc, inst_ref: InstRef, inst: &Inst) {
+    emit_fp_mul_add(ctx, ra, inst_ref, inst, 32, false);
 }
 
-pub fn emit_fp_mul_add64(_ctx: &EmitContext, ra: &mut RegAlloc, inst_ref: InstRef, inst: &Inst) {
-    let mut args = ra.get_argument_info(inst_ref, &inst.args, inst.num_args());
-    let addend = ra.use_scratch_xmm(&mut args[0]);
-    let a = ra.use_xmm(&mut args[1]);
-    let b = ra.use_xmm(&mut args[2]);
-    ra.asm.vfmadd231sd(addend, a, b).unwrap();
-    ra.define_value(inst_ref, addend);
+pub fn emit_fp_mul_add64(ctx: &EmitContext, ra: &mut RegAlloc, inst_ref: InstRef, inst: &Inst) {
+    emit_fp_mul_add(ctx, ra, inst_ref, inst, 64, false);
 }
 
-pub fn emit_fp_mul_sub32(_ctx: &EmitContext, ra: &mut RegAlloc, inst_ref: InstRef, inst: &Inst) {
-    let mut args = ra.get_argument_info(inst_ref, &inst.args, inst.num_args());
-    let addend = ra.use_scratch_xmm(&mut args[0]);
-    let a = ra.use_xmm(&mut args[1]);
-    let b = ra.use_xmm(&mut args[2]);
-    // FPMulSub: addend + (-a)*b = addend - a*b → vfnmadd231ss
-    ra.asm.vfnmadd231ss(addend, a, b).unwrap();
-    ra.define_value(inst_ref, addend);
+pub fn emit_fp_mul_sub32(ctx: &EmitContext, ra: &mut RegAlloc, inst_ref: InstRef, inst: &Inst) {
+    emit_fp_mul_add(ctx, ra, inst_ref, inst, 32, true);
 }
 
-pub fn emit_fp_mul_sub64(_ctx: &EmitContext, ra: &mut RegAlloc, inst_ref: InstRef, inst: &Inst) {
+pub fn emit_fp_mul_sub64(ctx: &EmitContext, ra: &mut RegAlloc, inst_ref: InstRef, inst: &Inst) {
+    emit_fp_mul_add(ctx, ra, inst_ref, inst, 64, true);
+}
+
+fn emit_fp_mul_add(
+    ctx: &EmitContext,
+    ra: &mut RegAlloc,
+    inst_ref: InstRef,
+    inst: &Inst,
+    fsize: usize,
+    negate_product: bool,
+) {
+    let fpcr = ctx.fpcr(true);
+
+    // Upstream's correction-free FMA path.
+    if ctx.has_host_feature(HostFeature::FMA) && !fpcr.fz() && fpcr.dn() {
+        let mut args = ra.get_argument_info(inst_ref, &inst.args, inst.num_args());
+        let result = ra.use_scratch_xmm(&mut args[0]);
+        let operand2 = ra.use_xmm(&mut args[1]);
+        let operand3 = ra.use_xmm(&mut args[2]);
+        match (fsize, negate_product) {
+            (32, false) => ra.asm.vfmadd231ss(result, operand2, operand3).unwrap(),
+            (32, true) => ra.asm.vfnmadd231ss(result, operand2, operand3).unwrap(),
+            (64, false) => ra.asm.vfmadd231sd(result, operand2, operand3).unwrap(),
+            (64, true) => ra.asm.vfnmadd231sd(result, operand2, operand3).unwrap(),
+            _ => unreachable!(),
+        }
+        force_to_default_nan(ra, result, fsize == 64);
+        ra.define_value(inst_ref, result);
+        return;
+    }
+
+    // With DN disabled the native result is exact for the overwhelmingly
+    // common non-NaN case. ARM and x64 disagree only on NaN priority here, so
+    // branch to the common/fp implementation when the result is unordered.
+    // This is the same deferred slow-path boundary as upstream.
+    if ctx.has_host_feature(HostFeature::FMA | HostFeature::AVX) {
+        let mut args = ra.get_argument_info(inst_ref, &inst.args, inst.num_args());
+        let operand1 = ra.use_xmm(&mut args[0]);
+        let operand2 = ra.use_xmm(&mut args[1]);
+        let operand3 = ra.use_xmm(&mut args[2]);
+        let result = ra.scratch_xmm();
+        let fallback = ra.asm.create_label();
+        let end = ra.asm.create_label();
+
+        ra.asm.movaps(result, operand1).unwrap();
+        match (fsize, negate_product) {
+            (32, false) => ra.asm.vfmadd231ss(result, operand2, operand3).unwrap(),
+            (32, true) => ra.asm.vfnmadd231ss(result, operand2, operand3).unwrap(),
+            (64, false) => ra.asm.vfmadd231sd(result, operand2, operand3).unwrap(),
+            (64, true) => ra.asm.vfnmadd231sd(result, operand2, operand3).unwrap(),
+            _ => unreachable!(),
+        }
+        if fpcr.fz() {
+            let magnitude = ra.scratch_xmm();
+            ra.asm.movaps(magnitude, result).unwrap();
+            let (non_sign_mask, smallest_normal) = if fsize == 32 {
+                (0x0000_0000_7fff_ffff, 0x0000_0000_0080_0000)
+            } else {
+                (0x7fff_ffff_ffff_ffff, 0x0010_0000_0000_0000)
+            };
+            let non_sign = ra
+                .constant_pool
+                .as_mut()
+                .expect("constant pool required")
+                .get_constant(non_sign_mask, 0);
+            let smallest = ra
+                .constant_pool
+                .as_mut()
+                .expect("constant pool required")
+                .get_constant(smallest_normal, 0);
+            ra.asm
+                .andps(magnitude, rxbyak::xmmword_ptr(non_sign))
+                .unwrap();
+            if fsize == 32 {
+                ra.asm
+                    .ucomiss(magnitude, rxbyak::xmmword_ptr(smallest))
+                    .unwrap();
+            } else {
+                ra.asm
+                    .ucomisd(magnitude, rxbyak::xmmword_ptr(smallest))
+                    .unwrap();
+            }
+            ra.release(magnitude);
+            // UCOMIS sets ZF both for equality and unordered. The latter also
+            // selects the software path when DN is disabled.
+            ra.asm.jz(&fallback, JmpType::Near).unwrap();
+        } else if fsize == 32 {
+            ra.asm.ucomiss(result, result).unwrap();
+            ra.asm.jp(&fallback, JmpType::Near).unwrap();
+        } else {
+            ra.asm.ucomisd(result, result).unwrap();
+            ra.asm.jp(&fallback, JmpType::Near).unwrap();
+        }
+        ra.asm.bind(&end).unwrap();
+
+        let fpcr_value = fpcr.value();
+        let fpsr_offset = ctx.arch.fpsr_exc_offset() as i32;
+        let function = match (fsize, negate_product) {
+            (32, false) => fp_helpers::fp_mul_add32 as usize,
+            (32, true) => fp_helpers::fp_mul_sub32 as usize,
+            (64, false) => fp_helpers::fp_mul_add64 as usize,
+            (64, true) => fp_helpers::fp_mul_sub64 as usize,
+            _ => unreachable!(),
+        };
+        ctx.deferred_emits
+            .borrow_mut()
+            .push(Box::new(move |dctx: &mut DeferredEmitCtx<'_>| {
+                dctx.asm.bind(&fallback).unwrap();
+                dctx.asm.sub(RSP, 8).unwrap();
+                let frame = abi::push_caller_save_registers_and_adjust_stack_except(
+                    dctx.asm,
+                    Some(HostLoc::Xmm(result.get_idx())),
+                )
+                .unwrap();
+                dctx.asm
+                    .movq(abi::ABI_PARAMS[0].to_reg64(), operand1)
+                    .unwrap();
+                dctx.asm
+                    .movq(abi::ABI_PARAMS[1].to_reg64(), operand2)
+                    .unwrap();
+                dctx.asm
+                    .movq(abi::ABI_PARAMS[2].to_reg64(), operand3)
+                    .unwrap();
+                dctx.asm
+                    .mov(
+                        abi::ABI_PARAMS[3].to_reg64().cvt32().unwrap(),
+                        fpcr_value as i32,
+                    )
+                    .unwrap();
+
+                #[cfg(target_os = "windows")]
+                {
+                    let extra = abi::ABI_SHADOW_SPACE + 16;
+                    dctx.asm.sub(RSP, extra as i32).unwrap();
+                    dctx.asm
+                        .lea(
+                            rxbyak::RAX,
+                            rxbyak::dword_ptr(RegExp::from(R15) + fpsr_offset),
+                        )
+                        .unwrap();
+                    dctx.asm
+                        .mov(
+                            rxbyak::qword_ptr(RegExp::from(RSP) + abi::ABI_SHADOW_SPACE as i32),
+                            rxbyak::RAX,
+                        )
+                        .unwrap();
+                    dctx.asm.mov(rxbyak::RAX, function as i64).unwrap();
+                    dctx.asm.call_reg(rxbyak::RAX).unwrap();
+                    dctx.asm.add(RSP, extra as i32).unwrap();
+                }
+
+                #[cfg(not(target_os = "windows"))]
+                {
+                    dctx.asm
+                        .lea(
+                            abi::ABI_PARAMS[4].to_reg64(),
+                            rxbyak::dword_ptr(RegExp::from(R15) + fpsr_offset),
+                        )
+                        .unwrap();
+                    dctx.asm.mov(rxbyak::RAX, function as i64).unwrap();
+                    dctx.asm.call_reg(rxbyak::RAX).unwrap();
+                }
+
+                dctx.asm.movq(result, rxbyak::RAX).unwrap();
+                abi::pop_caller_save_registers_and_adjust_stack(dctx.asm, &frame).unwrap();
+                dctx.asm.add(RSP, 8).unwrap();
+                dctx.asm.jmp(&end, JmpType::Near).unwrap();
+            }));
+
+        ra.define_value(inst_ref, result);
+        return;
+    }
+
+    if ctx.has_optimization(OptimizationFlag::UNSAFE_UNFUSE_FMA) {
+        let mut args = ra.get_argument_info(inst_ref, &inst.args, inst.num_args());
+        let result = ra.use_scratch_xmm(&mut args[0]);
+        let product = ra.use_scratch_xmm(&mut args[1]);
+        let operand3 = ra.use_xmm(&mut args[2]);
+
+        if negate_product {
+            let sign_mask = if fsize == 32 {
+                (0x8000_0000, 0)
+            } else {
+                (0x8000_0000_0000_0000, 0)
+            };
+            let mask = ra
+                .constant_pool
+                .as_mut()
+                .expect("constant pool required")
+                .get_constant(sign_mask.0, sign_mask.1);
+            ra.asm.xorps(product, rxbyak::xmmword_ptr(mask)).unwrap();
+        }
+        if fsize == 32 {
+            ra.asm.mulss(product, operand3).unwrap();
+            ra.asm.addss(result, product).unwrap();
+        } else {
+            ra.asm.mulsd(product, operand3).unwrap();
+            ra.asm.addsd(result, product).unwrap();
+        }
+        ra.release(product);
+        ra.define_value(inst_ref, result);
+        return;
+    }
+
     let mut args = ra.get_argument_info(inst_ref, &inst.args, inst.num_args());
-    let addend = ra.use_scratch_xmm(&mut args[0]);
-    let a = ra.use_xmm(&mut args[1]);
-    let b = ra.use_xmm(&mut args[2]);
-    ra.asm.vfnmadd231sd(addend, a, b).unwrap();
-    ra.define_value(inst_ref, addend);
+    let (first, rest) = args.split_at_mut(1);
+    let (second, third) = rest.split_at_mut(1);
+    ra.host_call(
+        Some(inst_ref),
+        &mut [
+            Some(&mut first[0]),
+            Some(&mut second[0]),
+            Some(&mut third[0]),
+            None,
+        ],
+    );
+    ra.asm
+        .mov(
+            Reg::gpr32(abi::ABI_PARAMS[3].to_reg64().get_idx()),
+            fpcr.value() as i32,
+        )
+        .unwrap();
+
+    #[cfg(target_os = "windows")]
+    {
+        let frame_size = abi::ABI_SHADOW_SPACE + 16;
+        ra.alloc_stack_space(frame_size);
+        ra.asm
+            .lea(
+                rxbyak::RAX,
+                rxbyak::dword_ptr(RegExp::from(R15) + ctx.arch.fpsr_exc_offset() as i32),
+            )
+            .unwrap();
+        ra.asm
+            .mov(
+                rxbyak::qword_ptr(RegExp::from(rxbyak::RSP) + abi::ABI_SHADOW_SPACE as i32),
+                rxbyak::RAX,
+            )
+            .unwrap();
+        let function = match (fsize, negate_product) {
+            (32, false) => fp_helpers::fp_mul_add32 as usize,
+            (32, true) => fp_helpers::fp_mul_sub32 as usize,
+            (64, false) => fp_helpers::fp_mul_add64 as usize,
+            (64, true) => fp_helpers::fp_mul_sub64 as usize,
+            _ => unreachable!(),
+        };
+        ra.asm.mov(rxbyak::RAX, function as i64).unwrap();
+        ra.asm.call_reg(rxbyak::RAX).unwrap();
+        ra.release_stack_space(frame_size);
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        ra.asm
+            .lea(
+                abi::ABI_PARAMS[4].to_reg64(),
+                rxbyak::dword_ptr(RegExp::from(R15) + ctx.arch.fpsr_exc_offset() as i32),
+            )
+            .unwrap();
+        let function = match (fsize, negate_product) {
+            (32, false) => fp_helpers::fp_mul_add32 as usize,
+            (32, true) => fp_helpers::fp_mul_sub32 as usize,
+            (64, false) => fp_helpers::fp_mul_add64 as usize,
+            (64, true) => fp_helpers::fp_mul_sub64 as usize,
+            _ => unreachable!(),
+        };
+        ra.asm.mov(rxbyak::RAX, function as i64).unwrap();
+        ra.asm.call_reg(rxbyak::RAX).unwrap();
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1005,7 +1265,7 @@ fn emit_fp_to_fixed_s32(
     let fbits = args[1].get_immediate_u8();
     let rounding = args[2].get_immediate_u8();
 
-    if rounding == 4 || (rounding != 3 && !host_supports_sse41()) {
+    if rounding == 4 || (rounding != 3 && !ctx.has_host_feature(HostFeature::SSE41)) {
         let helper = if is_double {
             fp_helpers::fp_double_to_fixed_s32 as usize
         } else {
@@ -1114,7 +1374,7 @@ fn emit_fp_to_fixed_s64(
     let fbits = args[1].get_immediate_u8();
     let rounding = args[2].get_immediate_u8();
 
-    if rounding == 4 || (rounding != 3 && !host_supports_sse41()) {
+    if rounding == 4 || (rounding != 3 && !ctx.has_host_feature(HostFeature::SSE41)) {
         let helper = if is_double {
             fp_helpers::fp_double_to_fixed_s64 as usize
         } else {
@@ -1247,7 +1507,7 @@ fn emit_fp_to_fixed_unsigned(
     let fbits = inst.args[1].get_u8();
     let rounding = inst.args[2].get_u8();
     let truncating = rounding == 3;
-    let native_rounding = rounding <= 3 && (truncating || host_supports_sse41());
+    let native_rounding = rounding <= 3 && (truncating || ctx.has_host_feature(HostFeature::SSE41));
 
     if native_rounding {
         let mut args = ra.get_argument_info(inst_ref, &inst.args, inst.num_args());
@@ -1444,7 +1704,7 @@ pub fn emit_fp_half_to_single(
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    if host_supports_f16c() && !ctx.fpcr(true).ahp() && !ctx.fpcr(true).fz16() {
+    if ctx.has_host_feature(HostFeature::F16C) && !ctx.fpcr(true).ahp() && !ctx.fpcr(true).fz16() {
         let mut args = ra.get_argument_info(inst_ref, &inst.args, inst.num_args());
         let result = ra.scratch_xmm();
         let value = ra.use_xmm(&mut args[0]);
@@ -1472,7 +1732,7 @@ pub fn emit_fp_half_to_double(
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    if host_supports_f16c() && !ctx.fpcr(true).ahp() && !ctx.fpcr(true).fz16() {
+    if ctx.has_host_feature(HostFeature::F16C) && !ctx.fpcr(true).ahp() && !ctx.fpcr(true).fz16() {
         let mut args = ra.get_argument_info(inst_ref, &inst.args, inst.num_args());
         let result = ra.scratch_xmm();
         let value = ra.use_xmm(&mut args[0]);
@@ -1503,7 +1763,7 @@ pub fn emit_fp_single_to_half(
     inst: &Inst,
 ) {
     let rounding = inst.args[1].get_u8();
-    if host_supports_f16c() && !ctx.fpcr(true).ahp() && !ctx.fpcr(true).fz16() {
+    if ctx.has_host_feature(HostFeature::F16C) && !ctx.fpcr(true).ahp() && !ctx.fpcr(true).fz16() {
         let mut args = ra.get_argument_info(inst_ref, &inst.args, inst.num_args());
         let result = ra.use_scratch_xmm(&mut args[0]);
 
@@ -1607,65 +1867,232 @@ pub fn emit_fp_recip_estimate64(
     );
 }
 pub fn emit_fp_recip_exponent16(
-    _ctx: &EmitContext,
+    ctx: &EmitContext,
     ra: &mut RegAlloc,
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_host_call_1(ra, inst_ref, inst, fp_helpers::fp_recip_exponent16 as usize);
-}
-pub fn emit_fp_recip_exponent32(
-    _ctx: &EmitContext,
-    ra: &mut RegAlloc,
-    inst_ref: InstRef,
-    inst: &Inst,
-) {
-    emit_host_call_1(ra, inst_ref, inst, fp_helpers::fp_recip_exponent32 as usize);
-}
-pub fn emit_fp_recip_exponent64(
-    _ctx: &EmitContext,
-    ra: &mut RegAlloc,
-    inst_ref: InstRef,
-    inst: &Inst,
-) {
-    emit_host_call_1(ra, inst_ref, inst, fp_helpers::fp_recip_exponent64 as usize);
-}
-pub fn emit_fp_recip_step_fused16(
-    _ctx: &EmitContext,
-    ra: &mut RegAlloc,
-    inst_ref: InstRef,
-    inst: &Inst,
-) {
-    emit_host_call_2(
+    emit_fp_estimate_call(
+        ctx,
         ra,
         inst_ref,
         inst,
+        fp_helpers::fp_recip_exponent16 as usize,
+    );
+}
+pub fn emit_fp_recip_exponent32(
+    ctx: &EmitContext,
+    ra: &mut RegAlloc,
+    inst_ref: InstRef,
+    inst: &Inst,
+) {
+    emit_fp_estimate_call(
+        ctx,
+        ra,
+        inst_ref,
+        inst,
+        fp_helpers::fp_recip_exponent32 as usize,
+    );
+}
+pub fn emit_fp_recip_exponent64(
+    ctx: &EmitContext,
+    ra: &mut RegAlloc,
+    inst_ref: InstRef,
+    inst: &Inst,
+) {
+    emit_fp_estimate_call(
+        ctx,
+        ra,
+        inst_ref,
+        inst,
+        fp_helpers::fp_recip_exponent64 as usize,
+    );
+}
+
+fn emit_fp_recip_step_fused(
+    ctx: &EmitContext,
+    ra: &mut RegAlloc,
+    inst_ref: InstRef,
+    inst: &Inst,
+    fsize: usize,
+    fallback_function: usize,
+) {
+    if fsize != 16
+        && ctx.has_host_feature(HostFeature::FMA)
+        && ctx.has_optimization(OptimizationFlag::UNSAFE_INACCURATE_NAN)
+    {
+        let mut args = ra.get_argument_info(inst_ref, &inst.args, inst.num_args());
+        let operand1 = ra.use_xmm(&mut args[0]);
+        let operand2 = ra.use_xmm(&mut args[1]);
+        let result = ra.scratch_xmm();
+        let two = ra
+            .constant_pool
+            .as_mut()
+            .expect("constant pool required for FP reciprocal step")
+            .get_constant(
+                if fsize == 32 {
+                    2.0f32.to_bits() as u64
+                } else {
+                    2.0f64.to_bits()
+                },
+                0,
+            );
+        ra.asm.movaps(result, rxbyak::xmmword_ptr(two)).unwrap();
+        if fsize == 32 {
+            ra.asm.vfnmadd231ss(result, operand1, operand2).unwrap();
+        } else {
+            ra.asm.vfnmadd231sd(result, operand1, operand2).unwrap();
+        }
+        ra.define_value(inst_ref, result);
+        return;
+    }
+
+    if fsize != 16 && ctx.has_host_feature(HostFeature::FMA) {
+        let mut args = ra.get_argument_info(inst_ref, &inst.args, inst.num_args());
+        let operand1 = ra.use_xmm(&mut args[0]);
+        let operand2 = ra.use_xmm(&mut args[1]);
+        let result = ra.scratch_xmm();
+        let fallback = ra.asm.create_label();
+        let end = ra.asm.create_label();
+        let two = ra
+            .constant_pool
+            .as_mut()
+            .expect("constant pool required for FP reciprocal step")
+            .get_constant(
+                if fsize == 32 {
+                    2.0f32.to_bits() as u64
+                } else {
+                    2.0f64.to_bits()
+                },
+                0,
+            );
+        ra.asm.movaps(result, rxbyak::xmmword_ptr(two)).unwrap();
+        if fsize == 32 {
+            ra.asm.vfnmadd231ss(result, operand1, operand2).unwrap();
+            ra.asm.ucomiss(result, result).unwrap();
+        } else {
+            ra.asm.vfnmadd231sd(result, operand1, operand2).unwrap();
+            ra.asm.ucomisd(result, result).unwrap();
+        }
+        ra.asm.jp(&fallback, JmpType::Near).unwrap();
+        ra.asm.bind(&end).unwrap();
+
+        let fpcr_value = ctx.fpcr(true).value();
+        let fpsr_exc_offset = ctx.arch.fpsr_exc_offset() as i32;
+        ctx.deferred_emits
+            .borrow_mut()
+            .push(Box::new(move |dctx: &mut DeferredEmitCtx<'_>| {
+                dctx.asm.bind(&fallback).unwrap();
+                dctx.asm.lea(RSP, qword_ptr(RegExp::from(RSP) - 8)).unwrap();
+                let frame = abi::push_caller_save_registers_and_adjust_stack_except(
+                    dctx.asm,
+                    Some(HostLoc::Xmm(result.get_idx())),
+                )
+                .unwrap();
+                dctx.asm
+                    .movq(abi::ABI_PARAMS[0].to_reg64(), operand1)
+                    .unwrap();
+                dctx.asm
+                    .movq(abi::ABI_PARAMS[1].to_reg64(), operand2)
+                    .unwrap();
+                dctx.asm
+                    .mov(
+                        Reg::gpr32(abi::ABI_PARAMS[2].to_reg64().get_idx()),
+                        fpcr_value as i32,
+                    )
+                    .unwrap();
+                dctx.asm
+                    .lea(
+                        abi::ABI_PARAMS[3].to_reg64(),
+                        rxbyak::dword_ptr(RegExp::from(R15) + fpsr_exc_offset),
+                    )
+                    .unwrap();
+                dctx.asm.mov(rxbyak::RAX, fallback_function as i64).unwrap();
+                dctx.asm.call_reg(rxbyak::RAX).unwrap();
+                dctx.asm.movq(result, rxbyak::RAX).unwrap();
+                abi::pop_caller_save_registers_and_adjust_stack(dctx.asm, &frame).unwrap();
+                dctx.asm.add(RSP, 8).unwrap();
+                dctx.asm.jmp(&end, JmpType::Near).unwrap();
+            }));
+
+        ra.define_value(inst_ref, result);
+        return;
+    }
+
+    if fsize != 16 && ctx.has_optimization(OptimizationFlag::UNSAFE_UNFUSE_FMA) {
+        let mut args = ra.get_argument_info(inst_ref, &inst.args, inst.num_args());
+        let operand1 = ra.use_scratch_xmm(&mut args[0]);
+        let operand2 = ra.use_xmm(&mut args[1]);
+        let result = ra.scratch_xmm();
+        let two = ra
+            .constant_pool
+            .as_mut()
+            .expect("constant pool required for FP reciprocal step")
+            .get_constant(
+                if fsize == 32 {
+                    2.0f32.to_bits() as u64
+                } else {
+                    2.0f64.to_bits()
+                },
+                0,
+            );
+        ra.asm.movaps(result, rxbyak::xmmword_ptr(two)).unwrap();
+        if fsize == 32 {
+            ra.asm.mulss(operand1, operand2).unwrap();
+            ra.asm.subss(result, operand1).unwrap();
+        } else {
+            ra.asm.mulsd(operand1, operand2).unwrap();
+            ra.asm.subsd(result, operand1).unwrap();
+        }
+        ra.define_value(inst_ref, result);
+        return;
+    }
+
+    emit_fp_step_fused_call(ctx, ra, inst_ref, inst, fallback_function);
+}
+
+pub fn emit_fp_recip_step_fused16(
+    ctx: &EmitContext,
+    ra: &mut RegAlloc,
+    inst_ref: InstRef,
+    inst: &Inst,
+) {
+    emit_fp_recip_step_fused(
+        ctx,
+        ra,
+        inst_ref,
+        inst,
+        16,
         fp_helpers::fp_recip_step_fused16 as usize,
     );
 }
 pub fn emit_fp_recip_step_fused32(
-    _ctx: &EmitContext,
+    ctx: &EmitContext,
     ra: &mut RegAlloc,
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_host_call_2(
+    emit_fp_recip_step_fused(
+        ctx,
         ra,
         inst_ref,
         inst,
+        32,
         fp_helpers::fp_recip_step_fused32 as usize,
     );
 }
 pub fn emit_fp_recip_step_fused64(
-    _ctx: &EmitContext,
+    ctx: &EmitContext,
     ra: &mut RegAlloc,
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_host_call_2(
+    emit_fp_recip_step_fused(
+        ctx,
         ra,
         inst_ref,
         inst,
+        64,
         fp_helpers::fp_recip_step_fused64 as usize,
     );
 }
@@ -1711,42 +2138,258 @@ pub fn emit_fp_rsqrt_estimate64(
         fp_helpers::fp_rsqrt_estimate64 as usize,
     );
 }
+
+fn emit_fp_rsqrt_step_fused(
+    ctx: &EmitContext,
+    ra: &mut RegAlloc,
+    inst_ref: InstRef,
+    inst: &Inst,
+    fsize: usize,
+    fallback_function: usize,
+) {
+    if fsize != 16
+        && ctx.has_host_feature(HostFeature::FMA | HostFeature::AVX)
+        && ctx.has_optimization(OptimizationFlag::UNSAFE_INACCURATE_NAN)
+    {
+        let mut args = ra.get_argument_info(inst_ref, &inst.args, inst.num_args());
+        let operand1 = ra.use_xmm(&mut args[0]);
+        let operand2 = ra.use_xmm(&mut args[1]);
+        let result = ra.scratch_xmm();
+        let three = ra
+            .constant_pool
+            .as_mut()
+            .expect("constant pool required for FP reciprocal square-root step")
+            .get_constant(
+                if fsize == 32 {
+                    3.0f32.to_bits() as u64
+                } else {
+                    3.0f64.to_bits()
+                },
+                0,
+            );
+        let half = ra
+            .constant_pool
+            .as_mut()
+            .expect("constant pool required for FP reciprocal square-root step")
+            .get_constant(
+                if fsize == 32 {
+                    0.5f32.to_bits() as u64
+                } else {
+                    0.5f64.to_bits()
+                },
+                0,
+            );
+        ra.asm.vmovaps(result, rxbyak::xmmword_ptr(three)).unwrap();
+        if fsize == 32 {
+            ra.asm.vfnmadd231ss(result, operand1, operand2).unwrap();
+            ra.asm
+                .vmulss(result, result, rxbyak::xmmword_ptr(half))
+                .unwrap();
+        } else {
+            ra.asm.vfnmadd231sd(result, operand1, operand2).unwrap();
+            ra.asm
+                .vmulsd(result, result, rxbyak::xmmword_ptr(half))
+                .unwrap();
+        }
+        ra.define_value(inst_ref, result);
+        return;
+    }
+
+    if fsize != 16 && ctx.has_host_feature(HostFeature::FMA | HostFeature::AVX) {
+        let mut args = ra.get_argument_info(inst_ref, &inst.args, inst.num_args());
+        let operand1 = ra.use_xmm(&mut args[0]);
+        let operand2 = ra.use_xmm(&mut args[1]);
+        let result = ra.scratch_xmm();
+        let fallback = ra.asm.create_label();
+        let end = ra.asm.create_label();
+        let three = ra
+            .constant_pool
+            .as_mut()
+            .expect("constant pool required for FP reciprocal square-root step")
+            .get_constant(
+                if fsize == 32 {
+                    3.0f32.to_bits() as u64
+                } else {
+                    3.0f64.to_bits()
+                },
+                0,
+            );
+        ra.asm.vmovaps(result, rxbyak::xmmword_ptr(three)).unwrap();
+        if fsize == 32 {
+            ra.asm.vfnmadd231ss(result, operand1, operand2).unwrap();
+        } else {
+            ra.asm.vfnmadd231sd(result, operand1, operand2).unwrap();
+        }
+
+        let tmp = ra.scratch_gpr();
+        let tmp32 = tmp.cvt32().unwrap();
+        let tmp16 = tmp.cvt16().unwrap();
+        ra.asm
+            .vpextrw(tmp32, result, if fsize == 32 { 1 } else { 3 })
+            .unwrap();
+        ra.asm
+            .and_(tmp16, if fsize == 32 { 0x7f80 } else { 0x7ff0 })
+            .unwrap();
+        ra.asm
+            .cmp(tmp16, if fsize == 32 { 0x7f00 } else { 0x7fe0 })
+            .unwrap();
+        ra.release(tmp);
+        ra.asm.jae(&fallback, JmpType::Near).unwrap();
+
+        let half = ra
+            .constant_pool
+            .as_mut()
+            .expect("constant pool required for FP reciprocal square-root step")
+            .get_constant(
+                if fsize == 32 {
+                    0.5f32.to_bits() as u64
+                } else {
+                    0.5f64.to_bits()
+                },
+                0,
+            );
+        if fsize == 32 {
+            ra.asm
+                .vmulss(result, result, rxbyak::xmmword_ptr(half))
+                .unwrap();
+        } else {
+            ra.asm
+                .vmulsd(result, result, rxbyak::xmmword_ptr(half))
+                .unwrap();
+        }
+        ra.asm.bind(&end).unwrap();
+
+        let fpcr_value = ctx.fpcr(true).value();
+        let fpsr_exc_offset = ctx.arch.fpsr_exc_offset() as i32;
+        ctx.deferred_emits
+            .borrow_mut()
+            .push(Box::new(move |dctx: &mut DeferredEmitCtx<'_>| {
+                dctx.asm.bind(&fallback).unwrap();
+                dctx.asm.lea(RSP, qword_ptr(RegExp::from(RSP) - 8)).unwrap();
+                let frame = abi::push_caller_save_registers_and_adjust_stack_except(
+                    dctx.asm,
+                    Some(HostLoc::Xmm(result.get_idx())),
+                )
+                .unwrap();
+                dctx.asm
+                    .movq(abi::ABI_PARAMS[0].to_reg64(), operand1)
+                    .unwrap();
+                dctx.asm
+                    .movq(abi::ABI_PARAMS[1].to_reg64(), operand2)
+                    .unwrap();
+                dctx.asm
+                    .mov(
+                        Reg::gpr32(abi::ABI_PARAMS[2].to_reg64().get_idx()),
+                        fpcr_value as i32,
+                    )
+                    .unwrap();
+                dctx.asm
+                    .lea(
+                        abi::ABI_PARAMS[3].to_reg64(),
+                        rxbyak::dword_ptr(RegExp::from(R15) + fpsr_exc_offset),
+                    )
+                    .unwrap();
+                dctx.asm.mov(rxbyak::RAX, fallback_function as i64).unwrap();
+                dctx.asm.call_reg(rxbyak::RAX).unwrap();
+                dctx.asm.movq(result, rxbyak::RAX).unwrap();
+                abi::pop_caller_save_registers_and_adjust_stack(dctx.asm, &frame).unwrap();
+                dctx.asm.add(RSP, 8).unwrap();
+                dctx.asm.jmp(&end, JmpType::Near).unwrap();
+            }));
+
+        ra.define_value(inst_ref, result);
+        return;
+    }
+
+    if fsize != 16 && ctx.has_optimization(OptimizationFlag::UNSAFE_UNFUSE_FMA) {
+        let mut args = ra.get_argument_info(inst_ref, &inst.args, inst.num_args());
+        let operand1 = ra.use_scratch_xmm(&mut args[0]);
+        let operand2 = ra.use_xmm(&mut args[1]);
+        let result = ra.scratch_xmm();
+        let three = ra
+            .constant_pool
+            .as_mut()
+            .expect("constant pool required for FP reciprocal square-root step")
+            .get_constant(
+                if fsize == 32 {
+                    3.0f32.to_bits() as u64
+                } else {
+                    3.0f64.to_bits()
+                },
+                0,
+            );
+        let half = ra
+            .constant_pool
+            .as_mut()
+            .expect("constant pool required for FP reciprocal square-root step")
+            .get_constant(
+                if fsize == 32 {
+                    0.5f32.to_bits() as u64
+                } else {
+                    0.5f64.to_bits()
+                },
+                0,
+            );
+        ra.asm.movaps(result, rxbyak::xmmword_ptr(three)).unwrap();
+        if fsize == 32 {
+            ra.asm.mulss(operand1, operand2).unwrap();
+            ra.asm.subss(result, operand1).unwrap();
+            ra.asm.mulss(result, rxbyak::xmmword_ptr(half)).unwrap();
+        } else {
+            ra.asm.mulsd(operand1, operand2).unwrap();
+            ra.asm.subsd(result, operand1).unwrap();
+            ra.asm.mulsd(result, rxbyak::xmmword_ptr(half)).unwrap();
+        }
+        // Preserve current upstream's selected register in this unsafe path.
+        ra.define_value(inst_ref, operand1);
+        return;
+    }
+
+    emit_fp_step_fused_call(ctx, ra, inst_ref, inst, fallback_function);
+}
+
 pub fn emit_fp_rsqrt_step_fused16(
-    _ctx: &EmitContext,
+    ctx: &EmitContext,
     ra: &mut RegAlloc,
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_host_call_2(
+    emit_fp_rsqrt_step_fused(
+        ctx,
         ra,
         inst_ref,
         inst,
+        16,
         fp_helpers::fp_rsqrt_step_fused16 as usize,
     );
 }
 pub fn emit_fp_rsqrt_step_fused32(
-    _ctx: &EmitContext,
+    ctx: &EmitContext,
     ra: &mut RegAlloc,
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_host_call_2(
+    emit_fp_rsqrt_step_fused(
+        ctx,
         ra,
         inst_ref,
         inst,
+        32,
         fp_helpers::fp_rsqrt_step_fused32 as usize,
     );
 }
 pub fn emit_fp_rsqrt_step_fused64(
-    _ctx: &EmitContext,
+    ctx: &EmitContext,
     ra: &mut RegAlloc,
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_host_call_2(
+    emit_fp_rsqrt_step_fused(
+        ctx,
         ra,
         inst_ref,
         inst,
+        64,
         fp_helpers::fp_rsqrt_step_fused64 as usize,
     );
 }

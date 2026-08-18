@@ -21,7 +21,7 @@ impl Manager {
     pub fn new(system: SharedSystem, audio_renderer: AudioRendererHandle) -> Self {
         Self {
             system: system.clone(),
-            session_ids: [0, 1],
+            session_ids: std::array::from_fn(|index| index as i32),
             session_count: 0,
             session_lock: Mutex::new(()),
             system_manager: SystemManager::new(system, audio_renderer),

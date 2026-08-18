@@ -7,6 +7,16 @@
 
 use super::glasm_emit_context::EmitContext;
 
+/// Port of upstream `EmitSR_WScaleFactorXY`.
+pub fn emit_sr_w_scale_factor_xy(_ctx: &mut EmitContext) {
+    log::warn!("(STUBBED) SR_WScaleFactorXY called");
+}
+
+/// Port of upstream `EmitSR_WScaleFactorZ`.
+pub fn emit_sr_w_scale_factor_z(_ctx: &mut EmitContext) {
+    log::warn!("(STUBBED) SR_WScaleFactorZ called");
+}
+
 /// Load from constant buffer with size suffix.
 fn get_cbuf(ctx: &mut EmitContext, binding: u32, offset: u32, size: &str) {
     if offset >= 0x10000 {

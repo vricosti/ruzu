@@ -8,9 +8,31 @@
 //! rescaling and render area data.
 
 use ash::vk;
-use shader_recompiler::shader_info::Info as ShaderInfo;
+use shader_recompiler::shader_info::{num_descriptors, Info as ShaderInfo};
 
-use super::update_descriptor::DescriptorUpdateEntry;
+use super::texture_cache::TextureCache;
+use super::update_descriptor::{DescriptorUpdateEntry, UpdateDescriptorQueue};
+use crate::texture_cache::texture_cache_base::ImageViewInOut;
+use crate::texture_cache::types::{SamplerId, NULL_IMAGE_ID, NULL_IMAGE_VIEW_ID};
+use crate::vulkan_common::vulkan_device::{Device, DeviceReference};
+
+/// Port of `PixelFormatFromImageFormat` from upstream `pipeline_helper.h`.
+pub fn pixel_format_from_image_format(
+    format: shader_recompiler::shader_info::ImageFormat,
+) -> Option<crate::surface::PixelFormat> {
+    use crate::surface::PixelFormat;
+    use shader_recompiler::shader_info::ImageFormat;
+    match format {
+        ImageFormat::Typeless => None,
+        ImageFormat::R8Uint => Some(PixelFormat::R8Uint),
+        ImageFormat::R8Sint => Some(PixelFormat::R8Sint),
+        ImageFormat::R16Uint => Some(PixelFormat::R16Uint),
+        ImageFormat::R16Sint => Some(PixelFormat::R16Sint),
+        ImageFormat::R32Uint => Some(PixelFormat::R32Uint),
+        ImageFormat::R32G32Uint => Some(PixelFormat::R32G32Uint),
+        ImageFormat::R32G32B32A32Uint => Some(PixelFormat::R32G32B32A32Uint),
+    }
+}
 
 /// Number of u32 words used for texture and image scaling bit flags.
 /// Port of `NUM_TEXTURE_AND_IMAGE_SCALING_WORDS` from shader recompiler.
@@ -30,6 +52,130 @@ pub const RENDERAREA_LAYOUT_SIZE: u32 = 16;
 /// Port of `sizeof(DescriptorUpdateEntry)` used as stride.
 const DESCRIPTOR_UPDATE_ENTRY_SIZE: usize = std::mem::size_of::<DescriptorUpdateEntry>();
 
+/// Port of upstream `NumDescriptorEntries` from `pipeline_helper.h`.
+pub fn num_descriptor_entries(info: &ShaderInfo) -> u32 {
+    num_descriptors(&info.constant_buffer_descriptors)
+        + num_descriptors(&info.storage_buffers_descriptors)
+        + num_descriptors(&info.texture_buffer_descriptors)
+        + num_descriptors(&info.image_buffer_descriptors)
+        + num_descriptors(&info.texture_descriptors)
+        + num_descriptors(&info.image_descriptors)
+}
+
+fn descriptor_size_for_type(device: &Device, descriptor_type: vk::DescriptorType) -> usize {
+    let props = device.descriptor_buffer_properties();
+    let robust = device.is_robust_buffer_access_enabled();
+    match descriptor_type {
+        vk::DescriptorType::UNIFORM_BUFFER => {
+            if robust {
+                props.robust_uniform_buffer_descriptor_size
+            } else {
+                props.uniform_buffer_descriptor_size
+            }
+        }
+        vk::DescriptorType::STORAGE_BUFFER => {
+            if robust {
+                props.robust_storage_buffer_descriptor_size
+            } else {
+                props.storage_buffer_descriptor_size
+            }
+        }
+        vk::DescriptorType::UNIFORM_TEXEL_BUFFER => {
+            if robust {
+                props.robust_uniform_texel_buffer_descriptor_size
+            } else {
+                props.uniform_texel_buffer_descriptor_size
+            }
+        }
+        vk::DescriptorType::STORAGE_TEXEL_BUFFER => {
+            if robust {
+                props.robust_storage_texel_buffer_descriptor_size
+            } else {
+                props.storage_texel_buffer_descriptor_size
+            }
+        }
+        vk::DescriptorType::COMBINED_IMAGE_SAMPLER => props.combined_image_sampler_descriptor_size,
+        vk::DescriptorType::STORAGE_IMAGE => props.storage_image_descriptor_size,
+        _ => 0,
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct DescriptorBufferBinding {
+    pub descriptor_type: vk::DescriptorType,
+    pub count: u32,
+    pub offset: vk::DeviceSize,
+    pub stride: vk::DeviceSize,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct DescriptorBufferLayout {
+    pub size: vk::DeviceSize,
+    pub bindings: Vec<DescriptorBufferBinding>,
+}
+
+impl DescriptorBufferLayout {
+    pub fn is_empty(&self) -> bool {
+        self.bindings.is_empty()
+    }
+}
+
+pub unsafe fn write_descriptor_buffer(
+    device: &Device,
+    layout: &DescriptorBufferLayout,
+    mut payload: *const DescriptorUpdateEntry,
+    host: *mut u8,
+) {
+    let extension = device
+        .descriptor_buffer_extension()
+        .expect("descriptor-buffer layout requires VK_EXT_descriptor_buffer");
+    for binding in &layout.bindings {
+        for index in 0..binding.count {
+            let entry = unsafe { &*payload };
+            payload = unsafe { payload.add(1) };
+            let address = unsafe { entry.address };
+            let address_info = vk::DescriptorAddressInfoEXT::builder()
+                .address(address.address)
+                .range(address.range)
+                .format(address.format)
+                .build();
+            let data = match binding.descriptor_type {
+                vk::DescriptorType::UNIFORM_BUFFER => vk::DescriptorDataEXT {
+                    p_uniform_buffer: &address_info,
+                },
+                vk::DescriptorType::STORAGE_BUFFER => vk::DescriptorDataEXT {
+                    p_storage_buffer: &address_info,
+                },
+                vk::DescriptorType::UNIFORM_TEXEL_BUFFER => vk::DescriptorDataEXT {
+                    p_uniform_texel_buffer: &address_info,
+                },
+                vk::DescriptorType::STORAGE_TEXEL_BUFFER => vk::DescriptorDataEXT {
+                    p_storage_texel_buffer: &address_info,
+                },
+                vk::DescriptorType::COMBINED_IMAGE_SAMPLER => vk::DescriptorDataEXT {
+                    p_combined_image_sampler: unsafe { &entry.image },
+                },
+                vk::DescriptorType::STORAGE_IMAGE => vk::DescriptorDataEXT {
+                    p_storage_image: unsafe { &entry.image },
+                },
+                _ => continue,
+            };
+            let get_info = vk::DescriptorGetInfoEXT {
+                ty: binding.descriptor_type,
+                data,
+                ..Default::default()
+            };
+            let destination = unsafe {
+                std::slice::from_raw_parts_mut(
+                    host.add((binding.offset + u64::from(index) * binding.stride) as usize),
+                    binding.stride as usize,
+                )
+            };
+            unsafe { extension.get_descriptor(&get_info, destination) };
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // DescriptorLayoutBuilder
 // ---------------------------------------------------------------------------
@@ -45,6 +191,7 @@ pub struct DescriptorInfo {
 /// Incrementally builds descriptor set layout bindings, update template
 /// entries, and pipeline layouts from shader info.
 pub struct DescriptorLayoutBuilder {
+    device: DeviceReference,
     is_compute: bool,
     bindings: Vec<vk::DescriptorSetLayoutBinding>,
     entries: Vec<vk::DescriptorUpdateTemplateEntry>,
@@ -55,8 +202,22 @@ pub struct DescriptorLayoutBuilder {
 
 impl DescriptorLayoutBuilder {
     /// Port of `DescriptorLayoutBuilder::DescriptorLayoutBuilder`.
-    pub fn new() -> Self {
+    pub fn new(device: &Device) -> Self {
         DescriptorLayoutBuilder {
+            device: DeviceReference::new(device),
+            is_compute: false,
+            bindings: Vec::new(),
+            entries: Vec::new(),
+            binding: 0,
+            num_descriptors: 0,
+            offset: 0,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_for_test() -> Self {
+        Self {
+            device: DeviceReference::dangling_for_test(),
             is_compute: false,
             bindings: Vec::new(),
             entries: Vec::new(),
@@ -67,15 +228,58 @@ impl DescriptorLayoutBuilder {
     }
 
     /// Port of `DescriptorLayoutBuilder::CanUsePushDescriptor`.
-    pub fn can_use_push_descriptor(&self, max_push_descriptors: u32, is_supported: bool) -> bool {
-        is_supported && self.num_descriptors <= max_push_descriptors
+    pub fn can_use_push_descriptor(&self) -> bool {
+        let device = self.device.get();
+        if !device.is_khr_push_descriptor_supported()
+            || self.num_descriptors > device.max_push_descriptors()
+        {
+            return false;
+        }
+        !device.is_ext_descriptor_buffer_supported()
+            || device
+                .descriptor_buffer_properties()
+                .bufferless_push_descriptors
+                != 0
     }
 
-    /// Exposes the generated layout for the Rust split-architecture parity
-    /// check. Upstream has only this description; ruzu also retains binding
-    /// metadata for buffer-bank population.
-    pub fn bindings(&self) -> &[vk::DescriptorSetLayoutBinding] {
-        &self.bindings
+    pub fn can_use_descriptor_buffer(&self) -> bool {
+        let device = self.device.get();
+        let props = device.descriptor_buffer_properties();
+        if !device.is_ext_descriptor_buffer_supported()
+            || self.bindings.is_empty()
+            || props.combined_image_sampler_descriptor_single_array == 0
+        {
+            return false;
+        }
+        props.bufferless_push_descriptors == 0 || !self.can_use_push_descriptor()
+    }
+
+    pub fn make_descriptor_buffer_layout(
+        &self,
+        layout: vk::DescriptorSetLayout,
+    ) -> DescriptorBufferLayout {
+        if layout == vk::DescriptorSetLayout::null() {
+            return DescriptorBufferLayout::default();
+        }
+        let device = self.device.get();
+        let extension = device
+            .descriptor_buffer_extension()
+            .expect("descriptor-buffer layout requires VK_EXT_descriptor_buffer");
+        DescriptorBufferLayout {
+            size: unsafe { extension.get_descriptor_set_layout_size(layout) },
+            bindings: self
+                .bindings
+                .iter()
+                .map(|binding| DescriptorBufferBinding {
+                    descriptor_type: binding.descriptor_type,
+                    count: binding.descriptor_count,
+                    offset: unsafe {
+                        extension.get_descriptor_set_layout_binding_offset(layout, binding.binding)
+                    },
+                    stride: descriptor_size_for_type(device, binding.descriptor_type) as u64,
+                })
+                .collect(),
+        }
     }
 
     pub fn num_descriptors(&self) -> u32 {
@@ -85,31 +289,35 @@ impl DescriptorLayoutBuilder {
     /// Port of `DescriptorLayoutBuilder::CreateDescriptorSetLayout`.
     pub fn create_descriptor_set_layout(
         &self,
-        device: &ash::Device,
         use_push_descriptor: bool,
+        use_descriptor_buffer: bool,
     ) -> Result<vk::DescriptorSetLayout, vk::Result> {
         if self.bindings.is_empty() {
             return Ok(vk::DescriptorSetLayout::null());
         }
-        let flags = if use_push_descriptor {
-            vk::DescriptorSetLayoutCreateFlags::PUSH_DESCRIPTOR_KHR
-        } else {
-            vk::DescriptorSetLayoutCreateFlags::empty()
-        };
-        let ci = vk::DescriptorSetLayoutCreateInfo {
-            s_type: vk::StructureType::DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
-            p_next: std::ptr::null(),
-            flags,
-            binding_count: self.bindings.len() as u32,
-            p_bindings: self.bindings.as_ptr(),
-        };
-        unsafe { device.create_descriptor_set_layout(&ci, None) }
+        let device = self.device.get();
+        let mut flags = vk::DescriptorSetLayoutCreateFlags::empty();
+        if use_push_descriptor {
+            flags |= vk::DescriptorSetLayoutCreateFlags::PUSH_DESCRIPTOR_KHR;
+        }
+        if use_descriptor_buffer {
+            flags |= vk::DescriptorSetLayoutCreateFlags::DESCRIPTOR_BUFFER_EXT;
+        }
+        let binding_flags = vec![vk::DescriptorBindingFlags::PARTIALLY_BOUND; self.bindings.len()];
+        let mut binding_flags_info =
+            vk::DescriptorSetLayoutBindingFlagsCreateInfo::builder().binding_flags(&binding_flags);
+        let mut ci = vk::DescriptorSetLayoutCreateInfo::builder()
+            .flags(flags)
+            .bindings(&self.bindings);
+        if !use_push_descriptor && device.is_descriptor_binding_partially_bound_supported() {
+            ci = ci.push_next(&mut binding_flags_info);
+        }
+        unsafe { device.get_logical().create_descriptor_set_layout(&ci, None) }
     }
 
     /// Port of `DescriptorLayoutBuilder::CreateTemplate`.
     pub fn create_template(
         &self,
-        device: &ash::Device,
         descriptor_set_layout: vk::DescriptorSetLayout,
         pipeline_layout: vk::PipelineLayout,
         use_push_descriptor: bool,
@@ -130,11 +338,20 @@ impl DescriptorLayoutBuilder {
             p_descriptor_update_entries: self.entries.as_ptr(),
             template_type,
             descriptor_set_layout,
-            pipeline_bind_point: vk::PipelineBindPoint::GRAPHICS,
+            pipeline_bind_point: if self.is_compute {
+                vk::PipelineBindPoint::COMPUTE
+            } else {
+                vk::PipelineBindPoint::GRAPHICS
+            },
             pipeline_layout,
             set: 0,
         };
-        unsafe { device.create_descriptor_update_template(&ci, None) }
+        unsafe {
+            self.device
+                .get()
+                .get_logical()
+                .create_descriptor_update_template(&ci, None)
+        }
     }
 
     /// Port of `DescriptorLayoutBuilder::CreatePipelineLayout`.
@@ -143,7 +360,6 @@ impl DescriptorLayoutBuilder {
     /// and render area data.
     pub fn create_pipeline_layout(
         &self,
-        device: &ash::Device,
         descriptor_set_layout: vk::DescriptorSetLayout,
     ) -> Result<vk::PipelineLayout, vk::Result> {
         // Push constant range covers rescaling layout + render area layout
@@ -180,7 +396,12 @@ impl DescriptorLayoutBuilder {
             push_constant_range_count: 1,
             p_push_constant_ranges: &range,
         };
-        unsafe { device.create_pipeline_layout(&ci, None) }
+        unsafe {
+            self.device
+                .get()
+                .get_logical()
+                .create_pipeline_layout(&ci, None)
+        }
     }
 
     /// Port of `DescriptorLayoutBuilder::Add`.
@@ -192,8 +413,6 @@ impl DescriptorLayoutBuilder {
         stage: vk::ShaderStageFlags,
         descriptors: &[DescriptorInfo],
     ) {
-        self.is_compute |= stage.contains(vk::ShaderStageFlags::COMPUTE);
-
         for desc in descriptors {
             self.bindings.push(vk::DescriptorSetLayoutBinding {
                 binding: self.binding,
@@ -212,12 +431,13 @@ impl DescriptorLayoutBuilder {
             });
             self.binding += 1;
             self.num_descriptors += desc.count;
-            self.offset += DESCRIPTOR_UPDATE_ENTRY_SIZE;
+            self.offset += DESCRIPTOR_UPDATE_ENTRY_SIZE * desc.count as usize;
         }
     }
 
     /// Port of `DescriptorLayoutBuilder::Add(const Shader::Info&, ...)`.
     pub fn add(&mut self, info: &ShaderInfo, stage: vk::ShaderStageFlags) {
+        self.is_compute |= stage.contains(vk::ShaderStageFlags::COMPUTE);
         let descriptors = |counts: Vec<u32>| {
             counts
                 .into_iter()
@@ -284,6 +504,104 @@ impl DescriptorLayoutBuilder {
                     .collect(),
             ),
         );
+    }
+}
+
+/// Port of upstream `PushImageDescriptors` from `pipeline_helper.h`.
+///
+/// Rescaling stores one bit per descriptor declaration. Array elements are
+/// ORed together before advancing that descriptor's bit.
+#[allow(clippy::too_many_arguments)]
+pub fn push_image_descriptors(
+    texture_cache: &mut TextureCache,
+    descriptor_queue: &mut UpdateDescriptorQueue,
+    info: &ShaderInfo,
+    rescaling: &mut RescalingPushConstant,
+    samplers: &[SamplerId],
+    sampler_cursor: &mut usize,
+    views: &[ImageViewInOut],
+    view_cursor: &mut usize,
+    fallback_sampler: vk::Sampler,
+) {
+    *view_cursor += num_descriptors(&info.texture_buffer_descriptors) as usize;
+    *view_cursor += num_descriptors(&info.image_buffer_descriptors) as usize;
+
+    for desc in &info.texture_descriptors {
+        let mut is_rescaled = false;
+        for _ in 0..desc.count {
+            let view_id = views[*view_cursor].id;
+            let image_view = texture_cache.get_image_view(view_id);
+            let mut vk_image_view = image_view
+                .map(|view| view.handle(desc.texture_type))
+                .unwrap_or(vk::ImageView::null());
+            if vk_image_view == vk::ImageView::null() {
+                let null_image_view = texture_cache.null_image_view_handle(desc.texture_type);
+                if null_image_view != vk::ImageView::null() {
+                    vk_image_view = null_image_view;
+                }
+            }
+            let supports_anisotropy =
+                image_view.is_some_and(|view| view.base().supports_anisotropy());
+            let format = image_view.map_or(crate::surface::PixelFormat::Invalid, |view| {
+                view.base().format
+            });
+            let supports_depth_comparison =
+                image_view.is_some_and(|view| view.supports_depth_comparison);
+            let sampler = texture_cache
+                .sampler(samplers[*sampler_cursor])
+                .map(|sampler| {
+                    let mut handle = if sampler.has_added_anisotropy() && !supports_anisotropy {
+                        sampler.handle_with_default_anisotropy()
+                    } else {
+                        sampler.handle()
+                    };
+                    if sampler.has_linear_filtering()
+                        && crate::surface::is_pixel_format_integer(format)
+                    {
+                        handle = sampler.handle_with_nearest_filter();
+                    }
+                    if desc.is_depth && sampler.has_depth_comparison() && !supports_depth_comparison
+                    {
+                        handle = sampler.handle_without_depth_comparison();
+                    }
+                    handle
+                })
+                .unwrap_or(fallback_sampler);
+            descriptor_queue.add_sampled_image(vk_image_view, sampler);
+            is_rescaled |= texture_cache.base.is_rescaling_image_view(view_id);
+            *view_cursor += 1;
+            *sampler_cursor += 1;
+        }
+        rescaling.push_texture(is_rescaled);
+    }
+
+    for desc in &info.image_descriptors {
+        let mut is_rescaled = false;
+        for _ in 0..desc.count {
+            let view_id = views[*view_cursor].id;
+            let image_view = if view_id.is_valid() && view_id != NULL_IMAGE_VIEW_ID {
+                if desc.is_written {
+                    let image_id = texture_cache.base.slot_image_views[view_id].image_id;
+                    if image_id.is_valid() && image_id != NULL_IMAGE_ID {
+                        texture_cache.base.mark_modification_by_id(image_id);
+                    }
+                }
+                texture_cache
+                    .image_view_storage_view(view_id, desc.texture_type, desc.format)
+                    .or_else(|| {
+                        texture_cache.null_storage_image_view(desc.texture_type, desc.format)
+                    })
+                    .unwrap_or(vk::ImageView::null())
+            } else {
+                texture_cache
+                    .null_storage_image_view(desc.texture_type, desc.format)
+                    .unwrap_or(vk::ImageView::null())
+            };
+            descriptor_queue.add_image(image_view);
+            is_rescaled |= texture_cache.base.is_rescaling_image_view(view_id);
+            *view_cursor += 1;
+        }
+        rescaling.push_image(is_rescaled);
     }
 }
 
@@ -393,14 +711,8 @@ mod tests {
     }
 
     #[test]
-    fn descriptor_layout_builder_empty() {
-        let builder = DescriptorLayoutBuilder::new();
-        assert!(builder.can_use_push_descriptor(32, true));
-    }
-
-    #[test]
     fn descriptor_layout_builder_matches_upstream_template_stride() {
-        let mut builder = DescriptorLayoutBuilder::new();
+        let mut builder = DescriptorLayoutBuilder::new_for_test();
         builder.add_descriptors(
             vk::DescriptorType::UNIFORM_BUFFER,
             vk::ShaderStageFlags::VERTEX,
@@ -411,7 +723,30 @@ mod tests {
         assert_eq!(builder.entries.len(), 2);
         assert_eq!(builder.entries[0].offset, 0);
         assert_eq!(builder.entries[0].stride, DESCRIPTOR_UPDATE_ENTRY_SIZE);
-        assert_eq!(builder.entries[1].offset, DESCRIPTOR_UPDATE_ENTRY_SIZE);
+        assert_eq!(builder.entries[1].offset, DESCRIPTOR_UPDATE_ENTRY_SIZE * 2);
         assert_eq!(builder.num_descriptors, 3);
+    }
+
+    #[test]
+    fn compute_layout_selects_compute_template_bind_point() {
+        let mut builder = DescriptorLayoutBuilder::new_for_test();
+        let mut info = ShaderInfo::default();
+        info.storage_buffers_descriptors.push(
+            shader_recompiler::shader_info::StorageBufferDescriptor {
+                cbuf_index: 0,
+                cbuf_offset: 0,
+                count: 1,
+                is_written: false,
+            },
+        );
+        builder.add(&info, vk::ShaderStageFlags::COMPUTE);
+        assert!(builder.is_compute);
+    }
+
+    #[test]
+    fn descriptorless_compute_shader_still_selects_compute_layout() {
+        let mut builder = DescriptorLayoutBuilder::new_for_test();
+        builder.add(&ShaderInfo::default(), vk::ShaderStageFlags::COMPUTE);
+        assert!(builder.is_compute);
     }
 }

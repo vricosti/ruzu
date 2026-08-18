@@ -1,12 +1,14 @@
 // SPDX-FileCopyrightText: 2025 ruzu contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! Port of zuyu/src/video_core/renderer_opengl/gl_shader_util.h and gl_shader_util.cpp
+//! Port of Eden `video_core/renderer_opengl/gl_shader_util.{h,cpp}`.
 //!
 //! OpenGL shader compilation utilities.
 
-use std::ffi::{c_void, CString};
+use std::ffi::c_void;
 use std::sync::OnceLock;
+
+use super::gl_resource_manager::{OGLAssemblyProgram, OGLProgram, OGLShader};
 
 type GlSpecializeShader = unsafe extern "system" fn(
     shader: gl::types::GLuint,
@@ -66,7 +68,7 @@ where
 
 /// Load optional OpenGL entry points used by upstream shader utilities but not
 /// emitted by the generated `gl` bindings.
-pub fn load_extra_functions<F>(load_fn: &mut F)
+pub(crate) fn load_extra_functions<F>(load_fn: &mut F)
 where
     F: FnMut(&'static str) -> *const c_void,
 {
@@ -84,7 +86,7 @@ where
     ));
 }
 
-pub fn delete_assembly_program(program: u32) {
+pub(crate) fn delete_assembly_program(program: u32) {
     let delete_programs = GL_DELETE_PROGRAMS_ARB
         .get()
         .and_then(|f| *f)
@@ -94,7 +96,7 @@ pub fn delete_assembly_program(program: u32) {
     }
 }
 
-pub fn bind_assembly_program(target: u32, program: u32) {
+pub(crate) fn bind_assembly_program(target: u32, program: u32) {
     let bind_program = GL_BIND_PROGRAM_ARB
         .get()
         .and_then(|f| *f)
@@ -104,7 +106,14 @@ pub fn bind_assembly_program(target: u32, program: u32) {
     }
 }
 
-pub fn program_local_parameter_4f_arb(target: u32, index: u32, x: f32, y: f32, z: f32, w: f32) {
+pub(crate) fn program_local_parameter_4f_arb(
+    target: u32,
+    index: u32,
+    x: f32,
+    y: f32,
+    z: f32,
+    w: f32,
+) {
     let program_local_parameter = GL_PROGRAM_LOCAL_PARAMETER_4F_ARB
         .get()
         .and_then(|f| *f)
@@ -117,61 +126,57 @@ pub fn program_local_parameter_4f_arb(target: u32, index: u32, x: f32, y: f32, z
 /// Compile and link a separable program from GLSL source code.
 ///
 /// Corresponds to `OpenGL::CreateProgram(std::string_view code, GLenum stage)`.
-pub fn create_program_from_source(code: &str, stage: u32) -> u32 {
+pub fn create_program_from_source(code: &str, stage: u32) -> OGLProgram {
     unsafe {
-        let shader = gl::CreateShader(stage);
-        let c_code = CString::new(code).unwrap();
-        let code_ptr = c_code.as_ptr();
+        let mut shader = OGLShader::new();
+        shader.handle = gl::CreateShader(stage);
+        let code_ptr = code.as_ptr().cast();
         let length = code.len() as gl::types::GLint;
-        gl::ShaderSource(shader, 1, &code_ptr, &length);
-        gl::CompileShader(shader);
+        gl::ShaderSource(shader.handle, 1, &code_ptr, &length);
+        gl::CompileShader(shader.handle);
 
         if renderer_debug_enabled() {
-            log_shader(shader, Some(code));
+            log_shader(shader.handle, Some(code));
         }
 
-        let program = link_separable_program(shader);
-        gl::DeleteShader(shader);
-        program
+        link_separable_program(shader.handle)
     }
 }
 
 /// Compile and link a separable program from SPIR-V binary.
 ///
 /// Corresponds to `OpenGL::CreateProgram(std::span<const u32> code, GLenum stage)`.
-pub fn create_program_from_spirv(code: &[u32], stage: u32) -> u32 {
+pub fn create_program_from_spirv(code: &[u32], stage: u32) -> OGLProgram {
     // GL_SHADER_BINARY_FORMAT_SPIR_V_ARB = 0x9551
     const GL_SHADER_BINARY_FORMAT_SPIR_V_ARB: u32 = 0x9551;
 
     unsafe {
-        let shader = gl::CreateShader(stage);
+        let mut shader = OGLShader::new();
+        shader.handle = gl::CreateShader(stage);
         gl::ShaderBinary(
             1,
-            &shader,
+            &shader.handle,
             GL_SHADER_BINARY_FORMAT_SPIR_V_ARB,
             code.as_ptr() as *const _,
             (code.len() * std::mem::size_of::<u32>()) as gl::types::GLsizei,
         );
 
-        let main = CString::new("main").unwrap();
         GL_SPECIALIZE_SHADER
             .get()
             .and_then(|f| *f)
             .expect("glSpecializeShader must be loaded for SPIR-V shader programs")(
-            shader,
-            main.as_ptr(),
+            shader.handle,
+            c"main".as_ptr(),
             0,
             std::ptr::null(),
             std::ptr::null(),
         );
 
         if renderer_debug_enabled() {
-            log_shader(shader, None);
+            log_shader(shader.handle, None);
         }
 
-        let program = link_separable_program(shader);
-        gl::DeleteShader(shader);
-        program
+        link_separable_program(shader.handle)
     }
 }
 
@@ -179,7 +184,7 @@ pub fn create_program_from_spirv(code: &[u32], stage: u32) -> u32 {
 ///
 /// Corresponds to `OpenGL::CompileProgram(std::string_view code, GLenum target)`.
 ///
-pub fn compile_assembly_program(code: &str, target: u32) -> u32 {
+pub fn compile_assembly_program(code: &str, target: u32) -> OGLAssemblyProgram {
     let gen_programs = GL_GEN_PROGRAMS_ARB
         .get()
         .and_then(|f| *f)
@@ -189,11 +194,11 @@ pub fn compile_assembly_program(code: &str, target: u32) -> u32 {
         .and_then(|f| *f)
         .expect("glNamedProgramStringEXT must be loaded for GLASM shader programs");
 
-    let mut program = 0;
+    let mut program = OGLAssemblyProgram::new();
     unsafe {
-        gen_programs(1, &mut program);
+        gen_programs(1, &mut program.handle);
         named_program_string(
-            program,
+            program.handle,
             target,
             GL_PROGRAM_FORMAT_ASCII_ARB,
             code.len() as gl::types::GLsizei,
@@ -221,26 +226,27 @@ pub fn compile_assembly_program(code: &str, target: u32) -> u32 {
 }
 
 /// Link a shader into a separable program.
-fn link_separable_program(shader: u32) -> u32 {
+fn link_separable_program(shader: u32) -> OGLProgram {
     unsafe {
-        let program = gl::CreateProgram();
-        gl::ProgramParameteri(program, gl::PROGRAM_SEPARABLE, gl::TRUE as i32);
-        gl::AttachShader(program, shader);
-        gl::LinkProgram(program);
-        gl::DetachShader(program, shader);
+        let mut program = OGLProgram::new();
+        program.handle = gl::CreateProgram();
+        gl::ProgramParameteri(program.handle, gl::PROGRAM_SEPARABLE, gl::TRUE as i32);
+        gl::AttachShader(program.handle, shader);
+        gl::LinkProgram(program.handle);
+        gl::DetachShader(program.handle, shader);
 
         if !renderer_debug_enabled() {
             return program;
         }
 
         let mut link_status: gl::types::GLint = 0;
-        gl::GetProgramiv(program, gl::LINK_STATUS, &mut link_status);
+        gl::GetProgramiv(program.handle, gl::LINK_STATUS, &mut link_status);
         let mut log_length: gl::types::GLint = 0;
-        gl::GetProgramiv(program, gl::INFO_LOG_LENGTH, &mut log_length);
+        gl::GetProgramiv(program.handle, gl::INFO_LOG_LENGTH, &mut log_length);
         if log_length > 0 {
             let mut log = vec![0u8; log_length as usize];
             gl::GetProgramInfoLog(
-                program,
+                program.handle,
                 log_length,
                 std::ptr::null_mut(),
                 log.as_mut_ptr() as *mut _,
@@ -287,5 +293,17 @@ fn log_shader(shader: u32, code: Option<&str>) {
                 log::warn!("{}", msg);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn public_compilers_return_the_upstream_raii_owners() {
+        let _: fn(&str, u32) -> OGLProgram = create_program_from_source;
+        let _: fn(&[u32], u32) -> OGLProgram = create_program_from_spirv;
+        let _: fn(&str, u32) -> OGLAssemblyProgram = compile_assembly_program;
     }
 }

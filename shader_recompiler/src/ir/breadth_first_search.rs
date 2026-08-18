@@ -10,7 +10,22 @@
 use std::collections::VecDeque;
 
 use super::instruction::Inst;
-use super::value::Value;
+use super::opcodes::Opcode;
+use super::program::Program;
+use super::value::{InstRef, Value};
+
+fn inst_recursive(program: &Program, mut value: Value) -> Option<InstRef> {
+    loop {
+        let Value::Inst(inst_ref) = value else {
+            return None;
+        };
+        let inst = program.block(inst_ref.block).inst(inst_ref.inst);
+        if inst.opcode != Opcode::Identity {
+            return Some(inst_ref);
+        }
+        value = *inst.arg(0);
+    }
+}
 
 /// Perform a breadth-first search over the SSA graph starting from `value`.
 ///
@@ -19,49 +34,85 @@ use super::value::Value;
 /// If the entire SSA tree is traversed without finding a match, returns `None`.
 ///
 /// Visits the rightmost arguments first, matching upstream behavior.
-pub fn breadth_first_search<T, F>(value: &Value, instructions: &[Vec<Inst>], pred: F) -> Option<T>
+pub fn breadth_first_search<T, F>(value: Value, program: &Program, mut pred: F) -> Option<T>
 where
-    F: Fn(&Inst) -> Option<T>,
+    F: FnMut(&Inst) -> Option<T>,
 {
     if value.is_immediate() {
         return None;
     }
 
-    let mut visited: Vec<(usize, usize)> = Vec::with_capacity(2);
-    let mut queue: VecDeque<(usize, usize)> = VecDeque::new();
+    let mut visited = Vec::with_capacity(2);
+    let mut queue = VecDeque::from([inst_recursive(program, value)?]);
 
-    if let Value::Inst(inst_ref) = value {
-        let key = (inst_ref.block as usize, inst_ref.inst as usize);
-        queue.push_back(key);
-    } else {
-        return None;
-    }
-
-    while let Some((block_idx, inst_idx)) = queue.pop_front() {
-        if block_idx >= instructions.len() || inst_idx >= instructions[block_idx].len() {
-            continue;
-        }
-        let inst = &instructions[block_idx][inst_idx];
+    while let Some(inst_ref) = queue.pop_front() {
+        let inst = program.block(inst_ref.block).inst(inst_ref.inst);
 
         if let Some(result) = pred(inst) {
             return Some(result);
         }
 
-        // Visit rightmost arguments first
-        for i in (0..inst.args.len()).rev() {
-            let arg = &inst.args[i];
+        for index in (0..inst.num_args()).rev() {
+            let arg = *inst.arg(index);
             if arg.is_immediate() {
                 continue;
             }
-            if let Value::Inst(ref arg_ref) = arg {
-                let key = (arg_ref.block as usize, arg_ref.inst as usize);
-                if !visited.contains(&key) {
-                    visited.push(key);
-                    queue.push_back(key);
-                }
+            let Some(arg_ref) = inst_recursive(program, arg) else {
+                continue;
+            };
+            if !visited.contains(&arg_ref) {
+                visited.push(arg_ref);
+                queue.push_back(arg_ref);
             }
         }
     }
 
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ir::basic_block::Block;
+
+    #[test]
+    fn visits_phi_operands_rightmost_first_like_upstream() {
+        let mut program = Program::new(crate::ir::types::ShaderStage::Fragment);
+        program.blocks.push(Block::new());
+        let left = program.blocks[0].append_inst(Inst::new(
+            Opcode::GetCbufU32,
+            vec![Value::ImmU32(1), Value::ImmU32(0x20)],
+        ));
+        let right = program.blocks[0].append_inst(Inst::new(
+            Opcode::GetCbufU32,
+            vec![Value::ImmU32(2), Value::ImmU32(0x40)],
+        ));
+        let mut phi = Inst::phi();
+        phi.add_phi_operand(
+            0,
+            Value::Inst(InstRef {
+                block: 0,
+                inst: left,
+            }),
+        );
+        phi.add_phi_operand(
+            0,
+            Value::Inst(InstRef {
+                block: 0,
+                inst: right,
+            }),
+        );
+        let phi = program.blocks[0].append_inst(phi);
+
+        let found = breadth_first_search(
+            Value::Inst(InstRef {
+                block: 0,
+                inst: phi,
+            }),
+            &program,
+            |inst| (inst.opcode == Opcode::GetCbufU32).then(|| inst.arg(0).imm_u32()),
+        );
+
+        assert_eq!(found, Some(2));
+    }
 }
