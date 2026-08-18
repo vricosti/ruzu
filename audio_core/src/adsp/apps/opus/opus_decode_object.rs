@@ -10,7 +10,8 @@ const OPUS_RESET_STATE: c_int = 4028;
 const OPUS_GET_FINAL_RANGE_REQUEST: c_int = 4031;
 const OPUS_DECODE_OBJECT_SIZE: u32 = 0x20;
 
-#[link(name = "opus")]
+// Linkage against libopus is declared by `audio_core/build.rs`, which probes
+// pkg-config so the linker also learns where the library lives.
 unsafe extern "C" {
     fn opus_decoder_get_size(channels: c_int) -> c_int;
     fn opus_decoder_init(st: *mut c_void, sample_rate: c_int, channels: c_int) -> c_int;
@@ -186,7 +187,6 @@ pub(crate) mod tests {
 
     const OPUS_APPLICATION_AUDIO: c_int = 2049;
 
-    #[link(name = "opus")]
     unsafe extern "C" {
         fn opus_encoder_create(
             sample_rate: c_int,

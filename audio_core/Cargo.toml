@@ -4,6 +4,9 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[build-dependencies]
+pkg-config = "0.3"
+
 [dependencies]
 common = { path = "../common" }
 ruzu_core = { package = "core", path = "../core" }
