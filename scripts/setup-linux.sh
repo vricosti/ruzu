@@ -21,49 +21,70 @@ case "${ID:-}" in
         REQUIRED_PACKAGES="
             build-essential ca-certificates clang cmake curl git
             glslang-tools libasound2-dev libavcodec-dev libavutil-dev
-            libclang-dev libgtk-4-dev libjack-jackd2-dev libpulse-dev
-            libssl-dev libvulkan-dev libx11-dev
-            ninja-build pkg-config vulkan-tools
+            libclang-dev libdbus-1-dev libdecor-0-dev libdrm-dev
+            libegl1-mesa-dev libgbm-dev libgl1-mesa-dev libgtk-4-dev
+            libjack-jackd2-dev libopus-dev libpipewire-0.3-dev libpulse-dev
+            libssl-dev libudev-dev libvulkan-dev libwayland-dev libx11-dev
+            libxcursor-dev libxext-dev libxfixes-dev libxi-dev
+            libxkbcommon-dev libxrandr-dev libxss-dev libxtst-dev
+            ninja-build pkg-config vulkan-tools wayland-protocols
         "
         ;;
     fedora)
         PACKAGE_MANAGER=dnf
         REQUIRED_PACKAGES="
             alsa-lib-devel ca-certificates clang clang-devel cmake
-            curl ffmpeg-free-devel gcc gcc-c++ git
+            curl dbus-devel ffmpeg-free-devel gcc gcc-c++ git
             glslang gtk4-devel jack-audio-connection-kit-devel
-            libX11-devel make ninja-build openssl-devel pkgconf-pkg-config
-            pulseaudio-libs-devel vulkan-headers
-            vulkan-loader-devel vulkan-tools
+            libX11-devel libXcursor-devel libXext-devel libXfixes-devel
+            libXi-devel libXrandr-devel libXScrnSaver-devel libXtst-devel
+            libdecor-devel libdrm-devel libxkbcommon-devel
+            make mesa-libEGL-devel mesa-libGL-devel mesa-libgbm-devel
+            ninja-build openssl-devel opus-devel pipewire-devel
+            pkgconf-pkg-config
+            pulseaudio-libs-devel systemd-devel vulkan-headers
+            vulkan-loader-devel vulkan-tools wayland-devel
+            wayland-protocols-devel
         "
         ;;
     arch|manjaro|endeavouros)
         PACKAGE_MANAGER=pacman
         REQUIRED_PACKAGES="
             base-devel alsa-lib ca-certificates clang cmake curl
-            ffmpeg git glslang gtk4 jack2 libpulse libx11 ninja
-            openssl pkgconf vulkan-headers vulkan-icd-loader
-            vulkan-tools
+            dbus ffmpeg git glslang gtk4 jack2 libdecor libdrm libpulse
+            libx11 libxcursor libxext libxfixes libxi libxkbcommon
+            libxrandr libxss libxtst mesa ninja openssl opus pipewire pkgconf
+            systemd-libs vulkan-headers vulkan-icd-loader vulkan-tools
+            wayland wayland-protocols
         "
         ;;
     opensuse-tumbleweed|opensuse-leap)
         PACKAGE_MANAGER=zypper
         REQUIRED_PACKAGES="
             alsa-devel ca-certificates clang clang-devel cmake curl
-            ffmpeg-8-libavcodec-devel ffmpeg-8-libavutil-devel
+            dbus-1-devel ffmpeg-8-libavcodec-devel ffmpeg-8-libavutil-devel
             gcc gcc-c++ git glslang-devel gtk4-devel
-            libX11-devel libjack-devel libopenssl-devel
-            libpulse-devel make ninja pkgconf-pkg-config
-            vulkan-devel vulkan-tools
+            libX11-devel libXcursor-devel libXext-devel libXfixes-devel
+            libXi-devel libXrandr-devel libXss-devel libXtst-devel
+            libdecor-devel libdrm-devel libjack-devel libopenssl-devel
+            libopus-devel libpulse-devel libxkbcommon-devel make
+            Mesa-libEGL-devel Mesa-libGL-devel ninja pipewire-devel
+            pkgconf-pkg-config systemd-devel vulkan-devel vulkan-tools
+            wayland-devel wayland-protocols-devel
         "
         ;;
     alpine)
         PACKAGE_MANAGER=apk
         REQUIRED_PACKAGES="
             alsa-lib-dev build-base ca-certificates clang clang-dev
-            cmake curl ffmpeg-dev git glslang-dev gtk4.0-dev jack-dev
-            libx11-dev ninja openssl-dev pkgconf pulseaudio-dev
-            vulkan-headers vulkan-loader-dev vulkan-tools
+            cmake curl dbus-dev eudev-dev ffmpeg-dev git glslang-dev
+            gtk4.0-dev jack-dev libdecor-dev libdrm-dev libx11-dev
+            libxcursor-dev libxext-dev libxfixes-dev libxi-dev
+            libxkbcommon-dev libxrandr-dev libxscrnsaver-dev libxtst-dev
+            mesa-dev
+            ninja openssl-dev opus-dev pipewire-dev pkgconf pulseaudio-dev
+            vulkan-headers vulkan-loader-dev vulkan-tools wayland-dev
+            wayland-protocols
         "
         ;;
     *)

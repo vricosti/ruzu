@@ -9,3 +9,9 @@ rustflags = ["-C", "target-feature=-crt-static"]
 # OpenBSD's system compiler and the bundled libcubeb use libc++. setup.sh
 # creates this project-local compatibility library name.
 rustflags = ["-L", "native=.cargo/openbsd-lib"]
+
+[target.'cfg(target_os = "freebsd")']
+# SDL3 is built from source and uses FreeBSD's libusbhid for its joystick
+# backend, but sdl3-sys does not emit the corresponding link flag, so the
+# final binary fails on hid_init and friends.
+rustflags = ["-l", "usbhid"]
