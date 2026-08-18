@@ -521,3 +521,244 @@ and persisted under upstream's `UIGameList\\favorites_expanded` key.
 
 - N/A: this change affects native dependency selection only. `audio_core` and
   `input_common` unit tests pass with the resolved SDL 3.4.14 build.
+
+## 2026-08-18 — `ruzu/Info.plist` and `scripts/build-macos-app.sh` vs Eden `src/yuzu/Info.plist` and `src/yuzu/CMakeLists.txt`
+
+### Intentional differences
+
+- Eden uses CMake's `MACOSX_BUNDLE` target property; ruzu's Cargo workspace uses a dedicated
+  packaging script after `cargo build --release --bin ruzu`. Both produce the same macOS bundle
+  ownership and directory layout.
+- Eden copies prebuilt `eden.icns` and `Assets.car` resources. Ruzu generates `ruzu.icns` from the
+  frontend-owned rusty-lemon PNG because it does not have an Apple asset catalog.
+- The local developer bundle receives an ad-hoc signature after MoltenVK is copied. Distribution
+  identity signing and notarization remain release-pipeline responsibilities.
+
+### Unintentional differences (to fix)
+
+- None found in the application bundle layout or MoltenVK lookup path.
+
+### Missing items
+
+- Ruzu has no liquid-glass `Assets.car` equivalent to Eden's asset catalog.
+
+### Binary layout verification
+
+- PASS: the generated bundle contains an arm64 `Contents/MacOS/ruzu`, a valid `Info.plist`,
+  `Contents/Resources/ruzu.icns`, and an arm64
+  `Contents/Frameworks/libMoltenVK.dylib`. `codesign --verify --deep --strict` passes, and a
+  LaunchServices smoke test starts the bundled executable.
+
+## 2026-08-18 — `video_core/src/vulkan_common/vulkan_library.rs` vs Eden `src/video_core/vulkan_common/vulkan_library.cpp`
+
+### Intentional differences
+
+- Both implementations retain `LIBVULKAN_PATH` as the first explicit lookup and prefer the
+  application bundle next. For an unbundled development `ruzu-cmd`, Rust additionally searches the
+  sibling Eden build so performance and rendering comparisons use Eden's exact bundled MoltenVK.
+- `scripts/build-macos-app.sh` likewise copies Eden's bundled MoltenVK when available, after an
+  explicit `MOLTENVK_LIBRARY` override and before the Homebrew fallback.
+
+### Unintentional differences (to fix)
+
+- None found in lookup priority. The previous development fallback selected a different emulator's
+  MoltenVK 1.4.2 while the current Eden build embeds MoltenVK 1.4.1.
+
+### Missing items
+
+- Distribution builds still need a release-owned MoltenVK artifact rather than relying on a sibling
+  development checkout.
+
+### Binary layout verification
+
+- N/A: the Vulkan loader ABI is unchanged; this only selects the dynamic library implementation.
+
+## 2026-08-18 — `ruzu_cmd/src/emu_window/emu_window_sdl3_vk.rs` vs Eden `src/yuzu_cmd/emu_window/emu_window_sdl3_vk.cpp`
+
+### Intentional differences
+
+- Ruzu stores the `CAMetalLayer` returned by `SDL_Metal_GetLayer` as the render surface and retains
+  the `SDL_MetalView` separately for its lifetime. Eden stores the opaque Metal view directly while
+  its Vulkan surface path consumes it as a `CAMetalLayer`; the Rust split keeps the consumed native
+  object explicit without changing the Cocoa ownership boundary.
+
+### Unintentional differences (to fix)
+
+- None. The SDL3 migration had left `WindowSystemInfo::type_` at `Headless` on macOS; it now assigns
+  `Cocoa` before publishing the Metal layer, matching Eden's constructor ordering.
+
+### Missing items
+
+- None for macOS window-system selection.
+
+### Binary layout verification
+
+- N/A: no serialized or guest-visible structure is changed.
+
+## 2026-08-18 — `video_core/src/vulkan_common/vulkan_device.rs` vs Eden `src/video_core/vulkan_common/vulkan_device.cpp`
+
+### Intentional differences
+
+- None in the format-property probe list.
+
+### Unintentional differences (to fix)
+
+- None. The ten ETC2/EAC formats at the end of Eden's `GetFormatProperties` format list are now
+  queried by ruzu as well. Previously they missed the cache and `is_format_supported` conservatively
+  returned true after logging `Unimplemented format query`, which also prevented device-aware
+  storage, blit, and texel-buffer capability checks from using the real driver properties.
+- Eden explicitly disables `robustBufferAccess2` and `robustImageAccess2` while retaining
+  `nullDescriptor`. Ruzu now applies the same feature mutation before passing the queried feature
+  chain to `vkCreateDevice`; previously all robustness2 features advertised by MoltenVK remained
+  enabled.
+
+### Missing items
+
+- None for the format-property probe list or robustness2 feature selection.
+
+### Binary layout verification
+
+- N/A: the change only extends physical-device capability discovery.
+
+## 2026-08-18 — `video_core/src/renderer_vulkan/query_cache.rs` vs Eden `src/video_core/renderer_vulkan/vk_query_cache.cpp`
+
+### Intentional differences
+
+- Rust query reports share their measured slots and synchronized result through `Arc` rather than
+  Eden's query IDs and `HostQueryBase::IsFinalValueSynced` flag. The report remains unavailable to
+  the guest writeback callback until the matching async-flush set has been popped.
+
+### Unintentional differences (to fix)
+
+- None in the host occlusion-query flush lifecycle. The Vulkan `SamplesStreamer` now participates
+  in `HasUnsyncedQueries`, `PushUnsyncedQueries`, `ShouldWaitAsyncFlushes`, and
+  `PopUnsyncedQueries`. Previously it bypassed that lifecycle and called
+  `vkGetQueryPoolResults` before the corresponding fence, producing `VK_NOT_READY` and thousands
+  of unsynchronized-query errors.
+- `pending_flush_sets` is protected across the GPU and GPU-fencing threads, matching Eden's
+  `flush_guard`. The initial Rust adaptation omitted this synchronization.
+
+### Missing items
+
+- None for host occlusion-query fence synchronization. The existing Rust lease-based bank owner
+  remains an intentional structural adaptation documented in the 2026-08-09 query-cache entry.
+
+### Binary layout verification
+
+- N/A: no guest-visible structure changed. All 17 focused Vulkan query-cache tests pass. A
+  90-second title run produced zero `Query report value not synchronized` and zero
+  `vkGetQueryPoolResults ... NOT_READY` messages; the previous implementation produced roughly
+  8,000 such messages in the same startup/title interval.
+
+## 2026-08-18 — `core/src/gpu_core.rs` and `video_core/src/gpu.rs` vs Eden `src/video_core/gpu.{h,cpp}`
+
+### Intentional differences
+
+- The cross-crate `GpuCoreInterface` exposes Eden's concrete `GPU` methods to `core`; its test
+  doubles in `memory.rs`, `nvhost_as_gpu.rs`, and `nvhost_gpu.rs` implement `wait_for_composite`
+  as a no-op because they have no GPU thread or renderer.
+- Rust stores the pending composite fence in `AtomicU64` because the split interface is callable
+  through shared references. Eden stores the same single pending fence as a plain `u64` under its
+  HWC/GPU-thread lifecycle.
+
+### Unintentional differences (to fix)
+
+- None. `RequestComposite` now records the pending sync-operation fence and returns after
+  `TickGPU`; it no longer waits synchronously. `WaitForComposite` consumes and waits that fence at
+  the next HWC tick, including Eden's zero-fence and shutdown exits.
+
+### Missing items
+
+- None for the composite request/wait lifecycle.
+
+### Binary layout verification
+
+- N/A: no guest-visible or serialized structure changed.
+
+## 2026-08-18 — `core/src/hle/service/nvdrv/devices/nvdisp_disp0.rs` vs Eden `src/core/hle/service/nvdrv/devices/nvdisp_disp0.{h,cpp}`
+
+### Intentional differences
+
+- The Rust owner forwards through `GpuCoreInterface` because `core` cannot own the concrete
+  `video_core::Gpu`; the call position and behavior match Eden's direct `system.GPU()` call.
+
+### Unintentional differences (to fix)
+
+- None. `wait_for_composite` now forwards Eden's HWC synchronization point to the GPU.
+
+### Missing items
+
+- None for composite waiting.
+
+### Binary layout verification
+
+- N/A: no ABI payload changed.
+
+## 2026-08-18 — `core/src/hle/service/nvnflinger/display.rs` and `hardware_composer.rs` vs Eden `src/core/hle/service/nvnflinger/display.h` and `hardware_composer.{h,cpp}`
+
+### Intentional differences
+
+- Rust uses `BTreeMap` and `Arc<Mutex<Layer>>` in place of Eden's `flat_map` and shared pointers;
+  keys, layer ownership and mutation boundaries are unchanged.
+
+### Unintentional differences (to fix)
+
+- None. `Layer` now owns Eden's `z_index` and `is_overlay` fields with the same defaults.
+- `ComposeLocked` now waits for the previous composite, releases eligible buffers before
+  acquisition, interval-gates non-overlay acquisition, excludes overlays from game cadence,
+  stable-sorts real z indices, composites only after a new acquisition, advances exactly one HWC
+  frame, and returns one.
+- Framebuffer release numbers are absolute (`frame_number + interval`), `last_acquire_frame` is
+  tracked, and overlays release independently, matching Eden's lifecycle and ordering.
+
+### Missing items
+
+- None in the framebuffer cadence and release lifecycle covered by this slice.
+
+### Binary layout verification
+
+- N/A: these are host-side service structures. The Layer default regression test passes.
+
+## 2026-08-18 — `core/src/hle/service/nvnflinger/surface_flinger.rs` vs Eden `src/core/hle/service/nvnflinger/surface_flinger.{h,cpp}`
+
+### Intentional differences
+
+- Rust returns `Option<Arc<Mutex<Layer>>>` from `find_layer` instead of a nullable shared pointer.
+
+### Unintentional differences (to fix)
+
+- None. `find_layer` is again a public SurfaceFlinger-owned operation, and the overlay setter
+  updates the matching layer where Eden owns that mutation. Z-index writes remain owned by
+  `Container`, which uses this lookup exactly as Eden does.
+
+### Missing items
+
+- None for layer lookup, z-index, visibility, blending, and overlay state.
+
+### Binary layout verification
+
+- N/A: no guest-visible structure changed.
+
+## 2026-08-18 — `core/src/hle/service/vi/container.rs`, `manager_display_service.rs`, and `system_display_service.rs` vs Eden `src/core/hle/service/vi/container.{h,cpp}`, `manager_display_service.{h,cpp}`, and `system_display_service.{h,cpp}`
+
+### Intentional differences
+
+- Rust returns `Result<T, ResultCode>` rather than writing C++ `Out<T>` parameters. The CMIF
+  handlers retain Eden's wire ordering and signed-to-unsigned bit casts.
+
+### Unintentional differences (to fix)
+
+- None. Container now owns set/get z-index and overlay forwarding. ManagerDisplayService exposes
+  its upstream z-index forwarding method.
+- SystemDisplayService now wires `GetLayerZ`, parses `SetLayerZ` as `layer_id: u64` followed by
+  `z_value: u64`, preserves the low signed 32-bit z pattern, and forwards visibility instead of
+  returning success without changing the layer.
+
+### Missing items
+
+- None for the z-index and visibility methods covered by this slice.
+
+### Binary layout verification
+
+- PASS: SetLayerZ consumes two consecutive 64-bit request values in Eden's signature order;
+  GetLayerZ returns the signed 32-bit z index sign-extended and reinterpreted as `u64`.

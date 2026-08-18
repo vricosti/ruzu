@@ -140,6 +140,7 @@ pub struct Gpu {
     current_sync_fence: AtomicU64,
     last_sync_fence: Mutex<u64>,
     sync_request_cv: Condvar,
+    pending_composite_fence: AtomicU64,
     request_swap_counters: Mutex<RequestSwapCounters>,
 
     // Channel management
@@ -199,6 +200,7 @@ impl Gpu {
             current_sync_fence: AtomicU64::new(0),
             last_sync_fence: Mutex::new(0),
             sync_request_cv: Condvar::new(),
+            pending_composite_fence: AtomicU64::new(0),
             request_swap_counters: Mutex::new(RequestSwapCounters::default()),
             new_channel_id: Mutex::new(1),
             bound_channel: Mutex::new(-1),
@@ -779,10 +781,10 @@ impl Gpu {
     /// Request a composite (frame presentation).
     ///
     /// Matches upstream `GPU::Impl::RequestComposite(layers, fences)`:
-    /// queues fence registration as a sync operation, signals the GPU thread
-    /// via TickGPU, then waits for registration. If fences are present,
-    /// composition runs from the Host1x guest-syncpoint callback once every
-    /// fence has reached its target value.
+    /// queues fence registration as a sync operation and signals the GPU
+    /// thread via TickGPU. The following HWC composition waits for registration
+    /// through `WaitForComposite`. If fences are present, composition runs from
+    /// the Host1x guest-syncpoint callback once every fence reaches its target.
     pub fn request_composite(&self, layers: Vec<FramebufferConfig>) {
         self.request_composite_with_fences(layers, Vec::new());
     }
@@ -796,9 +798,9 @@ impl Gpu {
 
     fn request_composite_with_fences(&self, layers: Vec<FramebufferConfig>, fences: Vec<NvFence>) {
         // Capture a raw pointer to self for the callback via usize (Send-safe).
-        // Safety: the Gpu outlives the sync request (we wait for it below).
+        // Safety: Gpu owns and drains the sync request queue before destruction.
         let gpu_addr = self as *const Gpu as usize;
-        let wait_fence = self.request_sync_operation(Box::new(move || {
+        let pending_fence = self.request_sync_operation(Box::new(move || {
             let gpu = unsafe { &*(gpu_addr as *const Gpu) };
             let valid_fences: Vec<NvFence> =
                 fences.into_iter().filter(|fence| fence.id >= 0).collect();
@@ -832,8 +834,21 @@ impl Gpu {
                 );
             }
         }));
+        self.pending_composite_fence
+            .store(pending_fence, Ordering::Relaxed);
         self.gpu_thread.lock().unwrap().tick_gpu();
-        self.wait_for_sync_operation(wait_fence);
+    }
+
+    /// Wait for registration of the previous composite request.
+    ///
+    /// Matches upstream `GPU::Impl::WaitForComposite`: composition is queued
+    /// asynchronously and the following HWC tick consumes its pending fence.
+    pub fn wait_for_composite(&self) {
+        let fence = self.pending_composite_fence.swap(0, Ordering::Relaxed);
+        if fence == 0 || self.shutting_down.load(Ordering::Relaxed) {
+            return;
+        }
+        self.wait_for_sync_operation(fence);
     }
 
     fn allocate_request_swap_counter(&self, num_fences: usize) -> usize {
@@ -1130,6 +1145,10 @@ impl GpuCoreInterface for Gpu {
             })
             .collect();
         self.request_composite_with_fences(layers, fences);
+    }
+
+    fn wait_for_composite(&self) {
+        Gpu::wait_for_composite(self);
     }
 
     fn notify_shutdown(&self) {

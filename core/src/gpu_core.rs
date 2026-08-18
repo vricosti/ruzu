@@ -124,6 +124,9 @@ pub trait GpuCoreInterface: Any + Send {
     /// Mirrors the upstream `GPU::RequestComposite(layers, fences)`.
     fn request_composite(&self, layers: Vec<FramebufferConfig>, fences: Vec<NvFence>);
 
+    /// Mirrors the upstream `GPU::WaitForComposite()`.
+    fn wait_for_composite(&self);
+
     /// Mirrors the upstream `GPU::NotifyShutdown()`.
     fn notify_shutdown(&self) {}
 

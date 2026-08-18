@@ -35,7 +35,7 @@ impl ISystemDisplayService {
                 (1204, None, "SetDisplayMagnification"),
                 (2201, None, "SetLayerPosition"),
                 (2203, None, "SetLayerSize"),
-                (2204, None, "GetLayerZ"),
+                (2204, Some(Self::get_layer_z), "GetLayerZ"),
                 (2205, Some(Self::set_layer_z), "SetLayerZ"),
                 (2207, Some(Self::set_layer_visibility), "SetLayerVisibility"),
                 (2209, None, "SetLayerAlpha"),
@@ -155,24 +155,41 @@ impl ISystemDisplayService {
     }
 
     /// cmd 2205: SetLayerZ
-    fn set_layer_z(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn set_layer_z(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let svc = Self::as_self(this);
         let mut rp = RequestParser::new(ctx);
-        let z_value = rp.pop_u32();
-        let _padding = rp.pop_u32();
         let layer_id = rp.pop_u64();
-        log::warn!(
-            "ISystemDisplayService::SetLayerZ (STUBBED) layer_id={}, z_value={}",
-            layer_id,
-            z_value
-        );
+        let z_value = rp.pop_u64();
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
-        rb.push_result(RESULT_SUCCESS);
+        rb.push_result(
+            match svc.container.set_layer_z_index(layer_id, z_value as i32) {
+                Ok(()) => RESULT_SUCCESS,
+                Err(error) => error,
+            },
+        );
+    }
+
+    /// cmd 2204: GetLayerZ
+    fn get_layer_z(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let svc = Self::as_self(this);
+        let mut rp = RequestParser::new(ctx);
+        let layer_id = rp.pop_u64();
+        match svc.container.get_layer_z_index(layer_id) {
+            Ok(z_index) => {
+                let mut rb = ResponseBuilder::new(ctx, 4, 0, 0);
+                rb.push_result(RESULT_SUCCESS);
+                rb.push_u64(z_index as i64 as u64);
+            }
+            Err(error) => {
+                let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+                rb.push_result(error);
+            }
+        }
     }
 
     /// cmd 2207: SetLayerVisibility
-    /// This function currently does nothing but return a success error code in
-    /// the vi library itself, so do the same thing, but log out the passed in values.
-    fn set_layer_visibility(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn set_layer_visibility(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let svc = Self::as_self(this);
         let mut rp = RequestParser::new(ctx);
         let visible = rp.pop_u32() != 0;
         let _padding = rp.pop_u32();
@@ -183,7 +200,12 @@ impl ISystemDisplayService {
             visible
         );
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
-        rb.push_result(RESULT_SUCCESS);
+        rb.push_result(
+            match svc.container.set_layer_visibility(layer_id, visible) {
+                Ok(()) => RESULT_SUCCESS,
+                Err(error) => error,
+            },
+        );
     }
 
     /// cmd 3000: ListDisplayModes

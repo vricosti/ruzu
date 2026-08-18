@@ -1198,6 +1198,8 @@ mod tests {
         ) {
         }
 
+        fn wait_for_composite(&self) {}
+
         fn on_cpu_write(&self, _addr: u64, _size: u64) -> bool {
             false
         }

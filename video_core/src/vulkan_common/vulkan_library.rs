@@ -70,10 +70,10 @@ fn open_library_macos() -> Result<ash::Entry, VulkanError> {
         library_paths.push(bundle_dir.join("Contents/Frameworks/libMoltenVK.dylib"));
     }
 
-    // Non-bundled ruzu-cmd development fallback on macOS. Use the exact
-    // MoltenVK embedded in the known-working upstream yuzu.app; do not mix
-    // SDK, Homebrew, DerivedData, or Android-emulator driver installations.
-    library_paths.extend(local_yuzu_bundle_paths());
+    // Non-bundled ruzu-cmd development fallback on macOS. Use the same
+    // MoltenVK as the Eden source-of-truth build so renderer comparisons do
+    // not mix driver versions.
+    library_paths.extend(local_eden_bundle_paths());
 
     let mut errors = Vec::<String>::new();
     for library_path in library_paths {
@@ -113,11 +113,11 @@ fn open_library_macos() -> Result<ash::Entry, VulkanError> {
 }
 
 #[cfg(target_os = "macos")]
-fn local_yuzu_bundle_paths() -> Vec<std::path::PathBuf> {
+fn local_eden_bundle_paths() -> Vec<std::path::PathBuf> {
     let Some(home) = std::env::var_os("HOME") else {
         return Vec::new();
     };
-    let root = std::path::PathBuf::from(home).join("Dev/emulators/zuyu/build/bin/yuzu.app");
+    let root = std::path::PathBuf::from(home).join("Dev/emulators/eden/build/bin/eden.app");
     vec![root.join("Contents/Frameworks/libMoltenVK.dylib")]
 }
 

@@ -155,6 +155,10 @@ impl IManagerDisplayService {
         self.container.set_layer_blending(layer_id, enabled)
     }
 
+    pub fn set_layer_z_index(&self, z_index: i32, layer_id: u64) -> Result<(), ResultCode> {
+        self.container.set_layer_z_index(layer_id, z_index)
+    }
+
     pub fn create_managed_layer(
         &self,
         flags: u32,

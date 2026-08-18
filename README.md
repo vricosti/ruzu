@@ -145,6 +145,18 @@ cargo build --locked --release --bin ruzu
 ./target/release/ruzu
 ```
 
+On macOS, build the native application bundle with:
+
+```sh
+./scripts/build-macos-app.sh
+open ./target/release/ruzu.app
+```
+
+The bundle contains the ruzu executable, application metadata and icon, and
+MoltenVK under `Contents/Frameworks`, matching the upstream macOS bundle
+layout. Set `MOLTENVK_LIBRARY=/path/to/libMoltenVK.dylib` to package a specific
+MoltenVK build instead of the Homebrew installation.
+
 There is also a headless command-line frontend:
 
 ```sh
