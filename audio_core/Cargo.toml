@@ -4,6 +4,9 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[build-dependencies]
+pkg-config = "0.3"
+
 [dependencies]
 common = { path = "../common" }
 ruzu_core = { package = "core", path = "../core" }
@@ -16,8 +19,8 @@ sdl3.workspace = true
 winapi = { version = "0.3", features = ["combaseapi", "objbase"] }
 
 # cubeb-sys 0.34 asks Cargo to link the optional Rust PulseAudio archive on
-# FreeBSD, although its nested CMake build does not place that archive in the
-# target-specific directory expected by build.rs. Keep the portable C backends
-# workaround limited to the affected target.
-[target.'cfg(target_os = "freebsd")'.dependencies]
+# FreeBSD and NetBSD, although its nested CMake build does not place that
+# archive in the target-specific directory expected by build.rs. Keep the
+# portable C backends workaround limited to the affected targets.
+[target.'cfg(any(target_os = "freebsd", target_os = "netbsd"))'.dependencies]
 cubeb-sys = { workspace = true, features = ["unittest-build"] }

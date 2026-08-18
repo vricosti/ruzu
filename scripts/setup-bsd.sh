@@ -13,24 +13,28 @@ case "$(uname -s)" in
         PACKAGE_MANAGER=freebsd-pkg
         REQUIRED_PACKAGES="
             alsa-lib cmake curl ffmpeg git glslang gtk4 jackit libX11
-            ninja pkgconf pulseaudio vulkan-headers vulkan-loader
-            vulkan-tools
+            libXScrnSaver libXcursor libXext libXfixes libXi libXrandr
+            libXtst libxkbcommon mesa-libs ninja opus pkgconf pulseaudio
+            vulkan-headers vulkan-loader vulkan-tools wayland
+            wayland-protocols
         "
         ;;
     NetBSD)
         PLATFORM_NAME="NetBSD $(uname -r)"
         PACKAGE_MANAGER=pkgin
+        # NetBSD fournit X11 et Mesa dans ses jeux de base (xbase/xcomp) :
+        # pkgsrc ne publie pas de paquets libX11 pour cette plateforme.
         REQUIRED_PACKAGES="
-            alsa-lib cmake curl ffmpeg7 git glslang gtk4 jack
-            ninja-build openssl pkgconf pulseaudio vulkan-headers
-            vulkan-loader
+            alsa-lib cmake curl ffmpeg7 git glslang gtk4 jack libopus
+            libxkbcommon ninja-build openssl pkgconf pulseaudio
+            vulkan-headers vulkan-loader
         "
         ;;
     OpenBSD)
         PLATFORM_NAME="OpenBSD $(uname -r)"
         PACKAGE_MANAGER=openbsd-pkg
         REQUIRED_PACKAGES="
-            cmake curl ffmpeg git glslang gmake gtk+4 ninja
+            cmake curl ffmpeg git glslang gmake gtk+4 ninja opus
             vulkan-headers vulkan-loader
         "
         ;;

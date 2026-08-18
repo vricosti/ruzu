@@ -14,7 +14,7 @@ fi
 PLATFORM_NAME="$(sw_vers -productName) $(sw_vers -productVersion)"
 PACKAGE_MANAGER=brew
 REQUIRED_PACKAGES="
-    cmake ffmpeg glslang gtk4 molten-vk ninja openssl@3
+    cmake ffmpeg glslang gtk4 molten-vk ninja openssl@3 opus
     pkgconf vulkan-headers vulkan-loader vulkan-tools
 "
 
@@ -52,6 +52,25 @@ prepare_platform() {
         echo "Setup is incomplete because Homebrew is required on macOS." >&2
         exit 1
     fi
+
+    # Homebrew's pkg-config must win over any other one in PATH. devkitPro
+    # ships its own at /opt/devkitpro/tools/bin/pkg-config which cannot see
+    # Homebrew's .pc files, so whenever it comes first both the GTK probe below
+    # and the Cargo build scripts report installed libraries as missing.
+    brew_bin="$(brew --prefix)/bin"
+    case ":${PATH}:" in
+        "${brew_bin}:"*) ;;
+        *)
+            if [ "$(command -v pkg-config || true)" != "${brew_bin}/pkg-config" ] &&
+                [ -x "${brew_bin}/pkg-config" ]; then
+                echo "[WARN] $(command -v pkg-config) shadows ${brew_bin}/pkg-config."
+                echo "       Prepending ${brew_bin} to PATH for this run; add it to"
+                echo "       your shell profile before building."
+            fi
+            PATH="${brew_bin}:${PATH}"
+            export PATH
+            ;;
+    esac
     if ! xcrun --find clang >/dev/null 2>&1; then
         cat >&2 <<'EOF'
 Apple Command Line Tools are missing. Run `xcode-select --install`, finish the
