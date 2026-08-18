@@ -5,8 +5,8 @@ STRICT MODE ON
 ## Git Commit Policy (MANDATORY)
 
 ALWAYS ask the user for explicit confirmation BEFORE running `git commit` (or
-`git push`, `git merge`), in BOTH the parent `ruzu` repo AND the `rdynarmic`/
-`rxbyak` submodules. Never commit on your own initiative — present what would be
+`git push`, `git merge`), in BOTH the parent `ruzu` repo AND the `rxbyak`
+submodule. Never commit on your own initiative — present what would be
 committed (files + proposed message) and wait for the user to approve. This
 applies even when the work is complete and tests pass.
 
@@ -483,11 +483,11 @@ That is the right mindset for finishing this port.
 
 ---
 
-## Companion Projects: rdynarmic and rxbyak
+## Integrated JIT Port and Companion Project: rdynarmic and rxbyak
 
 The same porting philosophy applies to the companion projects:
 
-- **rdynarmic** (`~/Dev/emulators/rdynarmic/`) — Rust port of the Dynarmic ARM JIT compiler
+- **rdynarmic** (`~/Dev/emulators/ruzu/rdynarmic/`) — Rust port of the Dynarmic ARM JIT compiler, integrated into the ruzu workspace
   - Upstream: `~/Dev/emulators/eden/src/dynarmic/`
   - Must follow the same file structure, method ownership, and behavioral parity rules as ruzu
   - IR opcodes, emitter methods, backend emit handlers, and register allocator must match upstream naming and semantics

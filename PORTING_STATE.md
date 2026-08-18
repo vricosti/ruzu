@@ -84,7 +84,7 @@
 - Interrupted slice: full `cargo test -p rdynarmic --release` validation after
   aligning callback, unwind, SVC and FPSCR emission with upstream.
 - Exact missing prerequisite:
-  `externals/rdynarmic/src/backend/x64/emit_exclusive_memory.rs` assumes every
+  `rdynarmic/src/backend/x64/emit_exclusive_memory.rs` assumes every
   128-bit exclusive-read callback returns a pair in `RAX:RDX`. That is the
   SysV return contract; MSVC uses a hidden return pointer, as represented by
   upstream `Callback::EmitCallWithReturnPointer`.

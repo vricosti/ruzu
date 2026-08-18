@@ -1,0 +1,34 @@
+[package]
+name = "rdynarmic"
+version = "0.1.0"
+edition = "2021"
+description = "Rust port of dynarmic - ARM64 dynamic recompiler"
+
+[features]
+default = []
+# Enable per-IR-opcode emit-time accounting. Off by default — when off,
+# `emit_block`'s inner loop carries no profiling code at all (no extra
+# branch, no Instant::now sites, no HashMap callout). Turn on for the
+# `compile_bench` workflow:
+#   cargo run --release --features profile_opcodes --bin compile_bench
+profile_opcodes = []
+# Match upstream DYNARMIC_ENABLE_NO_EXECUTE_SUPPORT. Disabled by default:
+# the x64 code cache remains RWX and avoids whole-cache mprotect calls.
+no_execute_support = []
+
+[dependencies]
+rxbyak = { path = "../externals/rxbyak" }
+bitflags = "2"
+log = "0.4"
+thiserror = "2"
+libc = "0.2"
+
+[[bin]]
+name = "a32_diff"
+path = "src/bin/a32_diff.rs"
+
+[[bin]]
+name = "compile_bench"
+path = "src/bin/compile_bench.rs"
+
+[dev-dependencies]

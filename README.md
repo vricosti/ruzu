@@ -110,7 +110,8 @@ firmware, see the [ruzu quickstart guide](docs/quickstart.md).
 
 ### Clone
 
-The JIT crates are git submodules, so clone recursively:
+`rdynarmic` is part of the workspace. The remaining external crates (`rxbyak`
+and `rhazel`) are git submodules, so clone recursively:
 
 ```sh
 git clone --recurse-submodules <repository-url> ruzu
