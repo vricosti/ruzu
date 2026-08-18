@@ -51,6 +51,7 @@ enum CacheStatus {
 struct Framebuffer {
     item: BufferItem,
     release_frame_number: ReleaseFrameNumber,
+    last_acquire_frame: u64,
     is_acquired: bool,
 }
 
@@ -94,12 +95,42 @@ impl HardwareComposer {
         let mut composition_stack = Vec::with_capacity(display.stack.layers.len());
         *out_speed_scale = 1.0;
 
+        nvdisp.wait_for_composite();
+        self.release_framebuffers_locked(display);
+
         let mut swap_interval: Option<i32> = None;
         let mut has_acquired_buffer = false;
 
         for layer in &display.stack.layers {
-            let consumer_id = layer.lock().unwrap().consumer_id;
-            let result = self.cache_framebuffer_locked(layer, consumer_id);
+            let (consumer_id, is_overlay) = {
+                let layer = layer.lock().unwrap();
+                (layer.consumer_id, layer.is_overlay)
+            };
+            let should_try_acquire = if is_overlay {
+                true
+            } else {
+                self.framebuffers
+                    .get(&consumer_id)
+                    .is_none_or(|framebuffer| {
+                        !framebuffer.is_acquired
+                            || self
+                                .frame_number
+                                .wrapping_sub(framebuffer.last_acquire_frame)
+                                >= normalize_swap_interval(None, framebuffer.item.swap_interval)
+                                    as u64
+                    })
+            };
+            let result = if should_try_acquire {
+                self.cache_framebuffer_locked(layer, consumer_id)
+            } else if self
+                .framebuffers
+                .get(&consumer_id)
+                .is_some_and(|framebuffer| framebuffer.is_acquired)
+            {
+                CacheStatus::CachedBufferReused
+            } else {
+                CacheStatus::NoBufferAvailable
+            };
 
             if should_trace_hwc() {
                 let count = HWC_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
@@ -159,7 +190,7 @@ impl HardwareComposer {
                     width: graphic_buffer.get_width(),
                     height: graphic_buffer.get_height(),
                     stride: graphic_buffer.get_stride(),
-                    z_index: 0,
+                    z_index: layer_guard.z_index,
                     blending: layer_guard.blending,
                     transform:
                         super::buffer_transform_flags::BufferTransformFlags::from_bits_retain(
@@ -188,6 +219,10 @@ impl HardwareComposer {
                 }
             }
 
+            if layer_guard.is_overlay {
+                continue;
+            }
+
             let item_swap_interval =
                 normalize_swap_interval(Some(out_speed_scale), item.swap_interval);
             swap_interval = Some(match swap_interval {
@@ -196,7 +231,7 @@ impl HardwareComposer {
             });
         }
 
-        if has_acquired_buffer {
+        if has_acquired_buffer && !composition_stack.is_empty() {
             composition_stack.sort_by_key(|layer| layer.z_index);
             super::diagnostics::record_hwc(
                 "compose_submit",
@@ -227,9 +262,11 @@ impl HardwareComposer {
             }
         }
 
-        let frame_advance = swap_interval.unwrap_or(1) as u32;
-        self.frame_number += frame_advance as u64;
+        self.frame_number += 1;
+        1
+    }
 
+    fn release_framebuffers_locked(&mut self, display: &Display) {
         for (layer_id, framebuffer) in &mut self.framebuffers {
             if should_trace_hwc_dense() {
                 log::info!(
@@ -240,7 +277,7 @@ impl HardwareComposer {
                     framebuffer.is_acquired
                 );
             }
-            if framebuffer.release_frame_number > self.frame_number || !framebuffer.is_acquired {
+            if !framebuffer.is_acquired {
                 continue;
             }
 
@@ -251,9 +288,11 @@ impl HardwareComposer {
                 continue;
             };
 
+            let layer = layer.lock().unwrap();
+            if !layer.is_overlay && framebuffer.release_frame_number > self.frame_number {
+                continue;
+            }
             let status = layer
-                .lock()
-                .unwrap()
                 .buffer_item_consumer
                 .release_buffer(&framebuffer.item, &Fence::no_fence());
             if should_trace_hwc_dense() {
@@ -267,8 +306,6 @@ impl HardwareComposer {
             }
             framebuffer.is_acquired = false;
         }
-
-        frame_advance
     }
 
     pub fn remove_layer_locked(&mut self, display: &Display, consumer_id: ConsumerId) {
@@ -292,13 +329,13 @@ impl HardwareComposer {
     fn try_acquire_framebuffer_locked(
         layer: &Arc<Mutex<Layer>>,
         framebuffer: &mut Framebuffer,
+        frame_number: u64,
     ) -> bool {
-        let consumer_id = layer.lock().unwrap().consumer_id;
-        let status = layer.lock().unwrap().buffer_item_consumer.acquire_buffer(
-            &mut framebuffer.item,
-            0,
-            false,
-        );
+        let layer = layer.lock().unwrap();
+        let consumer_id = layer.consumer_id;
+        let status = layer
+            .buffer_item_consumer
+            .acquire_buffer(&mut framebuffer.item, 0, false);
         if should_trace_hwc() {
             let count = HWC_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
             if count < 64 {
@@ -344,8 +381,13 @@ impl HardwareComposer {
             return false;
         }
 
-        framebuffer.release_frame_number =
-            normalize_swap_interval(None, framebuffer.item.swap_interval) as u64;
+        let swap_interval = if layer.is_overlay {
+            1
+        } else {
+            normalize_swap_interval(None, framebuffer.item.swap_interval)
+        };
+        framebuffer.release_frame_number = frame_number + swap_interval as u64;
+        framebuffer.last_acquire_frame = frame_number;
         framebuffer.is_acquired = true;
         super::diagnostics::record_hwc(
             "acquire_ok",
@@ -382,17 +424,18 @@ impl HardwareComposer {
         layer: &Arc<Mutex<Layer>>,
         consumer_id: ConsumerId,
     ) -> CacheStatus {
+        let frame_number = self.frame_number;
         let result = if let Some(framebuffer) = self.framebuffers.get_mut(&consumer_id) {
             if framebuffer.is_acquired {
                 CacheStatus::CachedBufferReused
-            } else if Self::try_acquire_framebuffer_locked(layer, framebuffer) {
+            } else if Self::try_acquire_framebuffer_locked(layer, framebuffer, frame_number) {
                 CacheStatus::BufferAcquired
             } else {
                 CacheStatus::CachedBufferReused
             }
         } else {
             let mut framebuffer = Framebuffer::default();
-            if Self::try_acquire_framebuffer_locked(layer, &mut framebuffer) {
+            if Self::try_acquire_framebuffer_locked(layer, &mut framebuffer, frame_number) {
                 self.framebuffers.insert(consumer_id, framebuffer);
                 CacheStatus::BufferAcquired
             } else {

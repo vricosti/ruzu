@@ -3094,6 +3094,8 @@ mod rasterizer_download_tests {
 
         fn request_composite(&self, _layers: Vec<FramebufferConfig>, _fences: Vec<NvFence>) {}
 
+        fn wait_for_composite(&self) {}
+
         fn on_cpu_write(&self, addr: u64, size: u64) -> bool {
             self.writes.lock().unwrap().push((addr, size));
             true

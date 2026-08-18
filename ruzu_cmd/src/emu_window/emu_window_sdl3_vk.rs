@@ -273,6 +273,10 @@ impl EmuWindowSdl3Vk {
 
         #[cfg(target_os = "macos")]
         let metal_view = {
+            // Upstream selects Cocoa before handing the Metal surface to the
+            // Vulkan renderer. Leaving the default Headless type makes
+            // CreateSurface reject an otherwise valid CAMetalLayer.
+            window_info.type_ = WindowSystemType::Cocoa;
             let view = unsafe { sdl::SDL_Metal_CreateView(render_window) };
             if view.is_null() {
                 let err = unsafe { CStr::from_ptr(sdl::SDL_GetError()) }.to_string_lossy();

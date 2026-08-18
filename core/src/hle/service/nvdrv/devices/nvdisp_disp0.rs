@@ -140,6 +140,15 @@ impl NvDispDisp0 {
             stats.begin_system_frame();
         }
     }
+
+    /// Wait for registration of the previous composite request.
+    pub fn wait_for_composite(&self) {
+        self.system
+            .get()
+            .gpu_core()
+            .expect("GPU core must exist before nvdisp composite")
+            .wait_for_composite();
+    }
 }
 
 impl NvDevice for NvDispDisp0 {

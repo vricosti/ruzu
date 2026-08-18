@@ -1350,7 +1350,8 @@ impl Device {
             supports_provoking_vertex && provoking_vertex_features.provoking_vertex_last != 0;
         let transform_feedback_preserves_provoking_vertex = supports_provoking_vertex
             && provoking_vertex_features.transform_feedback_preserves_provoking_vertex != 0;
-        let supports_null_descriptor = has_robustness2 && robustness2_features.null_descriptor != 0;
+        let supports_null_descriptor =
+            configure_robustness2_features(&mut robustness2_features, has_robustness2);
         let supports_device_fault = has_device_fault && device_fault_features.device_fault != 0;
         let mut supports_shader_demote_to_helper_invocation = has_shader_demote_to_helper_invocation
             && shader_demote_features.shader_demote_to_helper_invocation != 0;
@@ -3488,6 +3489,16 @@ fn collect_format_properties(
         vk::Format::R8_UNORM,
         vk::Format::R8_USCALED,
         vk::Format::S8_UINT,
+        vk::Format::ETC2_R8G8B8_UNORM_BLOCK,
+        vk::Format::ETC2_R8G8B8A8_UNORM_BLOCK,
+        vk::Format::ETC2_R8G8B8A1_UNORM_BLOCK,
+        vk::Format::ETC2_R8G8B8_SRGB_BLOCK,
+        vk::Format::ETC2_R8G8B8A8_SRGB_BLOCK,
+        vk::Format::ETC2_R8G8B8A1_SRGB_BLOCK,
+        vk::Format::EAC_R11_UNORM_BLOCK,
+        vk::Format::EAC_R11_SNORM_BLOCK,
+        vk::Format::EAC_R11G11_UNORM_BLOCK,
+        vk::Format::EAC_R11G11_SNORM_BLOCK,
     ];
     FORMATS
         .iter()
@@ -3565,9 +3576,36 @@ fn cap_moltenvk_vertex_input_limits(limits: &mut vk::PhysicalDeviceLimits) {
     limits.max_vertex_input_bindings = limits.max_vertex_input_bindings.min(16);
 }
 
+fn configure_robustness2_features(
+    features: &mut vk::PhysicalDeviceRobustness2FeaturesEXT,
+    extension_available: bool,
+) -> bool {
+    // Match Eden: robustness2 is enabled only for null descriptors. Enabling
+    // the stricter buffer/image access features adds work without guest benefit.
+    features.robust_buffer_access2 = vk::FALSE;
+    features.robust_image_access2 = vk::FALSE;
+    extension_available && features.null_descriptor != 0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn robustness2_enables_only_null_descriptors() {
+        let mut features = vk::PhysicalDeviceRobustness2FeaturesEXT {
+            robust_buffer_access2: vk::TRUE,
+            robust_image_access2: vk::TRUE,
+            null_descriptor: vk::TRUE,
+            ..Default::default()
+        };
+
+        assert!(configure_robustness2_features(&mut features, true));
+        assert_eq!(features.robust_buffer_access2, vk::FALSE);
+        assert_eq!(features.robust_image_access2, vk::FALSE);
+        assert_eq!(features.null_descriptor, vk::TRUE);
+        assert!(!configure_robustness2_features(&mut features, false));
+    }
 
     #[test]
     fn tiler_driver_set_matches_upstream() {

@@ -235,7 +235,7 @@ impl SurfaceFlinger {
 
     pub fn add_layer_to_display_stack(&self, display_id: u64, consumer_binder_id: i32) {
         let mut inner = self.inner.lock().unwrap();
-        let layer = Self::find_layer(&inner.layers, consumer_binder_id);
+        let layer = Self::find_layer_in_stack(&inner.layers, consumer_binder_id);
         let Some(display) = Self::find_display_mut(&mut inner.displays, display_id) else {
             super::diagnostics::record_surface_flinger(
                 "add_layer_no_display",
@@ -322,19 +322,25 @@ impl SurfaceFlinger {
     }
 
     pub fn set_layer_visibility(&self, consumer_binder_id: i32, visible: bool) {
-        if let Some(layer) =
-            Self::find_layer(&self.inner.lock().unwrap().layers, consumer_binder_id)
-        {
+        if let Some(layer) = self.find_layer(consumer_binder_id) {
             layer.lock().unwrap().visible = visible;
         }
     }
 
     pub fn set_layer_blending(&self, consumer_binder_id: i32, blending: LayerBlending) {
-        if let Some(layer) =
-            Self::find_layer(&self.inner.lock().unwrap().layers, consumer_binder_id)
-        {
+        if let Some(layer) = self.find_layer(consumer_binder_id) {
             layer.lock().unwrap().blending = blending;
         }
+    }
+
+    pub fn set_layer_is_overlay(&self, consumer_binder_id: i32, is_overlay: bool) {
+        if let Some(layer) = self.find_layer(consumer_binder_id) {
+            layer.lock().unwrap().is_overlay = is_overlay;
+        }
+    }
+
+    pub fn find_layer(&self, consumer_binder_id: i32) -> Option<Arc<Mutex<Layer>>> {
+        Self::find_layer_in_stack(&self.inner.lock().unwrap().layers, consumer_binder_id)
     }
 
     pub fn create_buffer_queue(&self) -> (i32, i32) {
@@ -386,7 +392,10 @@ impl SurfaceFlinger {
         displays.iter_mut().find(|display| display.id == display_id)
     }
 
-    fn find_layer(layers: &LayerStack, consumer_binder_id: i32) -> Option<Arc<Mutex<Layer>>> {
+    fn find_layer_in_stack(
+        layers: &LayerStack,
+        consumer_binder_id: i32,
+    ) -> Option<Arc<Mutex<Layer>>> {
         layers.find_layer(consumer_binder_id)
     }
 }

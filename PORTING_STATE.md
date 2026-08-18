@@ -163,3 +163,26 @@
   reproducible SIMD failure against its upstream operation owner; separately
   serialize or isolate A32 oracle-backed tests before treating their parallel
   failures as implementation mismatches.
+
+## 2026-08-18 — interrupted HardwareComposer pacing parity
+
+- Interrupted slice: align `HardwareComposer::ComposeLocked` with Eden after a
+  runtime profile showed the guest CPU cores, GPU thread, and Vulkan worker all
+  mostly idle while presentation varied around 30 FPS.
+- Exact missing prerequisites: the Rust `Layer` omitted upstream `z_index` and
+  `is_overlay`; `Gpu`/`NvDispDisp0` omitted `WaitForComposite` and synchronously
+  waited every `RequestComposite` instead of carrying the pending fence to the
+  next composition tick.
+- Required prerequisite work: port those fields and their owner-local setters,
+  then port the deferred composite fence lifecycle before resuming the HWC
+  acquire/release ordering change.
+- Resume condition: `HardwareComposer` can reproduce Eden's wait, release,
+  interval-gated acquire, z-order, overlay, and frame-number lifecycle without
+  placeholder values.
+- Status: completed. The prerequisite fields and setters are ported, the GPU
+  carries the pending composite fence to the next HWC tick, and the composer
+  now follows Eden's wait/release/acquire/compose/frame-advance order.
+- Runtime result: a release run remained alive and presented at a stable
+  52--55 FPS in the reached scene. This does not establish course performance;
+  the remaining lower and variable course framerate requires a scene-matched
+  profile rather than further HWC approximation.

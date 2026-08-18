@@ -14,6 +14,8 @@ pub struct Layer {
     pub consumer_id: i32,
     pub blending: LayerBlending,
     pub visible: bool,
+    pub z_index: i32,
+    pub is_overlay: bool,
 }
 
 impl Layer {
@@ -23,6 +25,8 @@ impl Layer {
             consumer_id,
             blending: LayerBlending::None,
             visible: true,
+            z_index: 0,
+            is_overlay: false,
         }
     }
 }
@@ -101,5 +105,16 @@ mod tests {
         let guard = layer.lock().unwrap();
         assert!(!guard.visible);
         assert_eq!(guard.blending, LayerBlending::Coverage);
+    }
+
+    #[test]
+    fn layer_defaults_match_upstream() {
+        let consumer = Arc::new(BufferQueueConsumer::new(BufferQueueCore::new()));
+        let layer = Layer::new(Arc::new(BufferItemConsumer::new(consumer)), 7);
+
+        assert!(layer.visible);
+        assert_eq!(layer.blending, LayerBlending::None);
+        assert_eq!(layer.z_index, 0);
+        assert!(!layer.is_overlay);
     }
 }

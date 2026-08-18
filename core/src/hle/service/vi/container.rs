@@ -266,6 +266,46 @@ impl Container {
         Ok(())
     }
 
+    pub fn set_layer_z_index(&self, layer_id: u64, z_index: i32) -> Result<(), ResultCode> {
+        let inner = self.inner.lock().unwrap();
+        let layer = inner
+            .layers
+            .get_layer_by_id(layer_id)
+            .ok_or(vi_results::RESULT_NOT_FOUND)?;
+        if let Some(layer) = self
+            .surface_flinger
+            .find_layer(layer.get_consumer_binder_id())
+        {
+            layer.lock().unwrap().z_index = z_index;
+        }
+        Ok(())
+    }
+
+    pub fn get_layer_z_index(&self, layer_id: u64) -> Result<i32, ResultCode> {
+        let inner = self.inner.lock().unwrap();
+        let layer = inner
+            .layers
+            .get_layer_by_id(layer_id)
+            .ok_or(vi_results::RESULT_NOT_FOUND)?;
+        let layer = self
+            .surface_flinger
+            .find_layer(layer.get_consumer_binder_id())
+            .ok_or(vi_results::RESULT_NOT_FOUND)?;
+        let z_index = layer.lock().unwrap().z_index;
+        Ok(z_index)
+    }
+
+    pub fn set_layer_is_overlay(&self, layer_id: u64, is_overlay: bool) -> Result<(), ResultCode> {
+        let inner = self.inner.lock().unwrap();
+        let layer = inner
+            .layers
+            .get_layer_by_id(layer_id)
+            .ok_or(vi_results::RESULT_NOT_FOUND)?;
+        self.surface_flinger
+            .set_layer_is_overlay(layer.get_consumer_binder_id(), is_overlay);
+        Ok(())
+    }
+
     /// Link a vsync event for a display.
     /// Port of upstream `Container::LinkVsyncEvent`.
     pub fn link_vsync_event(&self, display_id: u64, event: Arc<Event>) {

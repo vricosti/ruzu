@@ -10,6 +10,7 @@
 //! internal state including query pool banks, streamers, and host conditional
 //! rendering state.
 
+use std::collections::VecDeque;
 use std::ptr::NonNull;
 use std::sync::Arc;
 
@@ -244,6 +245,11 @@ struct SamplesStreamer {
     prefix_scan_pass: QueriesPrefixScanPass,
     scan_buffers: Vec<Option<ScanBufferPair>>,
     accumulation_buffer: vk::Buffer,
+    // Port of SamplesStreamer::pending_flush_queries/pending_flush_sets.
+    // Host query results are resolved only after the corresponding scheduler
+    // fence has completed, before the fence callbacks consume them.
+    pending_flush_queries: Vec<Arc<SamplesReportState>>,
+    pending_flush_sets: parking_lot::Mutex<VecDeque<Vec<Arc<SamplesReportState>>>>,
 }
 
 impl SamplesStreamer {
@@ -291,6 +297,8 @@ impl SamplesStreamer {
             prefix_scan_pass,
             scan_buffers,
             accumulation_buffer,
+            pending_flush_queries: Vec::new(),
+            pending_flush_sets: parking_lot::Mutex::new(VecDeque::new()),
         })
     }
 
@@ -401,9 +409,37 @@ impl SamplesStreamer {
     fn take_report(&mut self, scheduler: &mut Scheduler) -> Option<SamplesReport> {
         let mut state = self.state.lock();
         state.pause_counter(scheduler);
-        (!state.history.is_empty()).then(|| SamplesReport {
-            measured: state.history.clone(),
-        })
+        (!state.history.is_empty()).then(|| SamplesReport::new(state.history.clone()))
+    }
+
+    fn queue_host_report(&mut self, report: &SamplesReport) {
+        self.pending_flush_queries.push(Arc::clone(&report.state));
+    }
+
+    fn has_unsynced_queries(&self) -> bool {
+        !self.pending_flush_queries.is_empty()
+    }
+
+    fn push_unsynced_queries(&mut self) {
+        self.pending_flush_sets
+            .lock()
+            .push_back(std::mem::take(&mut self.pending_flush_queries));
+    }
+
+    fn should_wait_async_flushes(&self) -> bool {
+        self.pending_flush_sets
+            .lock()
+            .front()
+            .is_some_and(|reports| !reports.is_empty())
+    }
+
+    fn pop_unsynced_queries(&mut self) {
+        let Some(reports) = self.pending_flush_sets.lock().pop_front() else {
+            return;
+        };
+        for report in reports {
+            report.resolve_queries();
+        }
     }
 
     /// Port of `SamplesStreamer::PresyncWrites` / `SyncWrites` for the
@@ -417,7 +453,7 @@ impl SamplesStreamer {
         report: SamplesReport,
         guest_address: u64,
     ) -> Result<(), SamplesReport> {
-        let count = report.measured.len();
+        let count = report.measured().len();
         if count == 0 {
             return Err(report);
         }
@@ -444,7 +480,7 @@ impl SamplesStreamer {
         let accumulation_buffer = self.accumulation_buffer;
         let device = self.device.clone();
         let queries: Vec<_> = report
-            .measured
+            .measured()
             .iter()
             .map(|query| (query.bank().pool, query.slot()))
             .collect();
@@ -514,12 +550,13 @@ impl SamplesStreamer {
     }
 }
 
-struct SamplesReport {
+struct SamplesReportState {
     measured: Vec<SamplesQuerySlot>,
+    resolved: parking_lot::Mutex<Option<u64>>,
 }
 
-impl SamplesReport {
-    fn resolve(self) -> u64 {
+impl SamplesReportState {
+    fn resolve_queries(&self) {
         let mut total = 0u64;
         for query in &self.measured {
             let mut value = [0u64; 1];
@@ -541,11 +578,35 @@ impl SamplesReport {
                     crate::vulkan_common::vulkan_device::report_device_loss();
                 }
                 log::error!("vkGetQueryPoolResults failed for occlusion query: {error:?}");
-            } else {
-                total = total.wrapping_add(value[0]);
+                return;
             }
+            total = total.wrapping_add(value[0]);
         }
-        total
+        *self.resolved.lock() = Some(total);
+    }
+}
+
+#[derive(Clone)]
+struct SamplesReport {
+    state: Arc<SamplesReportState>,
+}
+
+impl SamplesReport {
+    fn new(measured: Vec<SamplesQuerySlot>) -> Self {
+        Self {
+            state: Arc::new(SamplesReportState {
+                measured,
+                resolved: parking_lot::Mutex::new(None),
+            }),
+        }
+    }
+
+    fn measured(&self) -> &[SamplesQuerySlot] {
+        &self.state.measured
+    }
+
+    fn resolve(self) -> Option<u64> {
+        *self.state.resolved.lock()
     }
 }
 
@@ -678,13 +739,13 @@ fn effective_query_type_and_payload(query_type: u32, payload: u32) -> (u32, u32)
 }
 
 impl HostQueryReport {
-    fn resolve(self) -> u64 {
+    fn resolve(self) -> Option<u64> {
         match self {
             Self::Samples(report) => report.resolve(),
-            Self::TransformFeedback(report) => report.resolve(),
-            Self::Primitives(report) => report.resolve(),
+            Self::TransformFeedback(report) => Some(report.resolve()),
+            Self::Primitives(report) => Some(report.resolve()),
             #[cfg(test)]
-            Self::Test(value) => value,
+            Self::Test(value) => Some(value),
         }
     }
 }
@@ -2265,15 +2326,29 @@ impl QueryCache {
     }
     pub fn commit_async_flushes(&mut self) {
         self.base.commit_async_flushes();
+        if let Some(samples_streamer) = self.samples_streamer.as_mut() {
+            samples_streamer.push_unsynced_queries();
+        }
     }
     pub fn has_uncommitted_flushes(&self) -> bool {
         self.base.has_uncommitted_flushes()
+            || self
+                .samples_streamer
+                .as_ref()
+                .is_some_and(SamplesStreamer::has_unsynced_queries)
     }
     pub fn should_wait_async_flushes(&self) -> bool {
         self.base.should_wait_async_flushes()
+            || self
+                .samples_streamer
+                .as_ref()
+                .is_some_and(SamplesStreamer::should_wait_async_flushes)
     }
     pub fn pop_async_flushes(&mut self) {
         self.base.pop_async_flushes();
+        if let Some(samples_streamer) = self.samples_streamer.as_mut() {
+            samples_streamer.pop_unsynced_queries();
+        }
     }
 
     /// Port of upstream `RasterizerVulkan::Query` →
@@ -2435,6 +2510,13 @@ impl QueryCache {
                     }
                 }
             }
+            if host_report_is_synchronized {
+                if let (Some(samples_streamer), Some(report)) =
+                    (self.samples_streamer.as_mut(), report.as_ref())
+                {
+                    samples_streamer.queue_host_report(report);
+                }
+            }
             report.map(HostQueryReport::Samples)
         } else if has_tfb_streamer {
             self.tfb_streamer
@@ -2489,9 +2571,17 @@ impl QueryCache {
                 );
                 return;
             }
-            let value = host_report
-                .map(HostQueryReport::resolve)
-                .unwrap_or(payload as u64);
+            let value = if let Some(report) = host_report {
+                let Some(value) = report.resolve() else {
+                    log::error!(
+                        "Query report value not synchronized. Consider increasing GPU accuracy."
+                    );
+                    return;
+                };
+                value
+            } else {
+                payload as u64
+            };
             let gpu_ticks = if has_timeout {
                 gpu_ticks_getter
                     .as_ref()
@@ -2559,6 +2649,16 @@ mod tests {
         );
         mm.map(gpu_addr, d_addr, size as u64, 0, false);
         (Arc::new(ParkingMutex::new(mm)), backing)
+    }
+
+    #[test]
+    fn samples_report_becomes_available_only_after_query_sync() {
+        let report = SamplesReport::new(Vec::new());
+        assert_eq!(report.clone().resolve(), None);
+
+        report.state.resolve_queries();
+
+        assert_eq!(report.resolve(), Some(0));
     }
 
     #[test]
