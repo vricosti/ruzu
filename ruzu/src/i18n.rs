@@ -122,6 +122,20 @@ pub fn set_language(locale: &str) {
     CONFIGURED_LANGUAGE.with(|language| *language.borrow_mut() = locale.to_string());
 }
 
+fn toolkit_language_override(locale: &str) -> Option<String> {
+    (!locale.is_empty()).then(|| resolve_catalog_locale(locale))
+}
+
+/// Make GTK's own gettext strings follow the explicitly selected interface
+/// language. This must run before GTK is initialized; otherwise native widget
+/// text such as `About`, `Credits`, and `Created by` remains cached in the
+/// system language. An empty locale deliberately preserves `<System>`.
+pub fn configure_toolkit_language(locale: &str) {
+    if let Some(locale) = toolkit_language_override(locale) {
+        std::env::set_var("LANGUAGE", locale);
+    }
+}
+
 pub fn language() -> String {
     #[cfg(not(test))]
     {
@@ -352,6 +366,13 @@ mod tests {
             Some(value) => std::env::set_var("LANGUAGE", value),
             None => std::env::remove_var("LANGUAGE"),
         }
+    }
+
+    #[test]
+    fn explicit_language_overrides_the_gtk_gettext_locale() {
+        assert_eq!(toolkit_language_override("en").as_deref(), Some("en"));
+        assert_eq!(toolkit_language_override("fr_FR").as_deref(), Some("fr"));
+        assert_eq!(toolkit_language_override(""), None);
     }
 
     #[test]

@@ -136,6 +136,7 @@ fn main() -> glib::ExitCode {
     configuration::qt_config::load_multiplayer_values();
     let interface_language = uisettings::with(|v| v.language.get_value().clone());
     i18n::set_language(&interface_language);
+    i18n::configure_toolkit_language(&interface_language);
 
     // Upstream's `Config` constructor reads every category, controls included,
     // before the window is built. Without this the Controls page would open on
