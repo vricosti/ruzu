@@ -1,14 +1,42 @@
-# ruzu
+<!--
+SPDX-FileCopyrightText: 2025 ruzu contributors
+SPDX-License-Identifier: GPL-3.0-or-later
+-->
 
-**ruzu is a Nintendo Switch emulator written in Rust and it began as an
-experiment nobody expected to work.**
+<h1 align="center">
+  <br>
+  <a href="https://github.com/vricosti/ruzu"><img src="./ruzu/assets/ruzu-rusty-lemon.png" alt="ruzu" width="200"></a>
+  <br>
+  <b>ruzu</b>
+  <br>
+</h1>
+
+<h4 align="center"><b>ruzu</b> is a Nintendo Switch emulator written in Rust
+<br>
+and it began as an experiment nobody expected to work.
+</h4>
+
+<p align="center"><i>Fun fact: the Eden emulator forbids the use of LLMs xD</i></p>
+
+<div align="center">
 
 | | |
 |---|---|
-| **Ported** | ~500,000 lines of C++ |
-| **Duration** | 6 months |
-| **Authors** | yuzu, Eden, ChatGPT, Claude, and yours truly |
 | **Cost** | about the price of two or three Switch consoles |
+| **Ported** | ~500,000 lines of C++ (yuzu/Eden) only with LLMs |
+| **Duration** | 6 months |
+
+</div>
+
+<p align="center">
+  <a href="#what-this-project-actually-is">About</a> |
+  <a href="#ports-produced-along-the-way">Ports</a> |
+  <a href="#platforms">Platforms</a> |
+  <a href="#building">Building</a> |
+  <a href="#legal">License</a>
+</p>
+
+---
 
 ## What this project actually is
 
