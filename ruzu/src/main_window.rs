@@ -73,9 +73,9 @@ const INPUT_UPDATE_TIMEOUT_MS: u64 = 1;
 /// Upstream `status_bar_update_timer` interval.
 const STATUS_BAR_UPDATE_TIMEOUT_MS: u64 = 500;
 
-const QUICKSTART_URL: &str = "https://github.com/vricosti/ruzu/blob/main/docs/quickstart.md";
+const QUICKSTART_URL: &str = "https://github.com/vricosti/ruzu-emu/blob/main/docs/quickstart.md";
 const MISSING_KEYS_TITLE: &str = "Derivation Components Missing";
-const MISSING_KEYS_DETAIL: &str = "Encryption keys are missing. <br>Please follow <a href='https://github.com/vricosti/ruzu/blob/main/docs/quickstart.md'>the ruzu quickstart guide</a> to install your keys and firmware, then add your games.";
+const MISSING_KEYS_DETAIL: &str = "Encryption keys are missing. <br>Please follow <a href='https://github.com/vricosti/ruzu-emu/blob/main/docs/quickstart.md'>the ruzu quickstart guide</a> to install your keys and firmware, then add your games.";
 
 /// Upstream `StartGameType` from `yuzu/main.h`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

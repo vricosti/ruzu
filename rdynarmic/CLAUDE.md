@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-rdynarmic is a Rust reimplementation of [dynarmic](https://github.com/MerryMage/dynarmic), an ARM64 dynamic recompiler. It targets the x86-64 backend and is used by [ruzu](https://github.com/vricosti/ruzu) as its JIT CPU engine.
+rdynarmic is a Rust reimplementation of [dynarmic](https://github.com/MerryMage/dynarmic), an ARM64 dynamic recompiler. It targets the x86-64 backend and is used by [ruzu](https://github.com/vricosti/ruzu-emu) as its JIT CPU engine.
 
 ### Reference Projects
 

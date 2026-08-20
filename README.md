@@ -5,7 +5,7 @@ SPDX-License-Identifier: GPL-3.0-or-later
 
 <h1 align="center">
   <br>
-  <a href="https://github.com/vricosti/ruzu"><img src="./ruzu/assets/ruzu-rusty-lemon.png" alt="ruzu" width="200"></a>
+  <a href="https://github.com/vricosti/ruzu-emu"><img src="./ruzu/assets/ruzu-rusty-lemon.png" alt="ruzu" width="200"></a>
   <br>
   <b>ruzu</b>
   <br>
@@ -93,7 +93,7 @@ adding a RISC-V backend to rdynarmic. That work is not implemented yet.
 ### Compilation compiled(not tested) on
 
 Results from [the compatibility
-report](https://github.com/vricosti/ruzu) of 18 August 2026. Each platform
+report](https://github.com/vricosti/ruzu-emu) of 18 August 2026. Each platform
 started from a clean image with neither build dependencies nor a Rust toolchain
 installed; `setup.sh` installed them, and the validation command was
 `cargo build --locked --bin ruzu`.
