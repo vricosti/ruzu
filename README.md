@@ -1,18 +1,21 @@
 # ruzu
 
-**ruzu is not a new emulator. It is a port.**
+**ruzu is a Nintendo Switch emulator written in Rust — and it began as an
+experiment nobody expected to work.**
 
-Every design decision, file layout, class boundary, constant and control flow in
-this repository comes from yuzu a Nintendo Switch emulator written in C++ with a 
-Qt frontend. ruzu translates that codebase into Rust, with a GTK4 frontend replacing Qt.
+| | |
+|---|---|
+| **Ported** | ~500,000 lines of C++ |
+| **Duration** | 6 months |
+| **LLMs** | Claude & ChatGpt |
+| **Cost** | about the price of two or three Switch consoles |
 
 ## What this project actually is
 
-ruzu is **an experiment in whether large language models can port genuinely
-complex software from one high-level language to another.**
-
-The interesting question is not "can an LLM write Rust?" — it plainly can. The
-question is whether an LLM can carry out a *faithful* port of a codebase that is:
+The question was narrow: **can frontier large language models port a genuinely
+huge piece of software from C++ to Rust?** Not generate a plausible-looking file,
+not translate a self-contained algorithm — carry a whole codebase across, one
+that is:
 
 - large — hundreds of thousands of lines across a dozen subsystems;
 - deeply stateful — an HLE kernel with schedulers, fibers, IPC and services;
@@ -21,7 +24,11 @@ question is whether an LLM can carry out a *faithful* port of a codebase that is
 - built on C++ idioms with no direct Rust equivalent — inheritance hierarchies,
   raw pointer graphs, `shared_ptr` cycles, destructor ordering, `std::variant`.
 
-"Faithful" is the whole point, and it is a much harder target than "works". The
+I had serious doubts it would go anywhere. It did: the experiment ended up
+producing an emulator that boots and runs commercial titles, and that reaches
+the performance of the C++ original.
+
+"Faithful" was the whole point, and it is a much harder target than "works". The
 port is held to **structural parity** with the C++ source: the Rust file tree
 mirrors the upstream directory tree, methods live in the file their C++
 counterpart lives in, constants stay next to the code that owns them, and
@@ -31,11 +38,12 @@ The contract the work is held to is written down in
 [`CLAUDE.md`](CLAUDE.md) — it is the interesting artefact of this project as
 much as the code is.
 
-Rust adaptations are allowed where they preserve behaviour (`Result` for
-exceptions, `Arc<Mutex<T>>` for `shared_ptr` + mutex, `enum` for
-`std::variant`, `Drop` for destructors). Architectural redesigns are not — a
-prettier Rust design that drifts from upstream makes the port unreviewable, and
-review is the only thing that keeps a port of this size honest.
+Every design decision, file layout, class boundary, constant and control flow in
+this repository comes from yuzu, a Nintendo Switch emulator written in C++ with a
+Qt frontend. ruzu translates that codebase into Rust, with a GTK4 frontend
+replacing Qt.
+
+**Now ruzu can fly on its own.**
 
 ## Ports produced along the way
 
