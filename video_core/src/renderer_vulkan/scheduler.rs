@@ -275,9 +275,11 @@ pub struct Scheduler {
     /// installed by the rasterizer once both owners are allocated.
     state_tracker: Option<NonNull<StateTracker>>,
 
-    /// Upstream keeps a `QueryCache*` here and closes ZPass before ending a
-    /// render pass. Sharing only the samples streamer preserves that ordering
-    /// without making the Rust rasterizer self-referential.
+    /// Safe Rust adaptation of upstream `Scheduler::query_cache`.
+    ///
+    /// The scheduler only needs these three independently locked pieces of the
+    /// query cache. Keeping shared state handles preserves the upstream call
+    /// ordering without constructing aliased `&mut QueryCache` references.
     samples_query_state: Option<Arc<parking_lot::Mutex<SamplesQueryState>>>,
     tfb_query_state: Option<Arc<parking_lot::Mutex<TfbCounterState>>>,
     query_runtime_state: Option<Arc<parking_lot::Mutex<QueryRuntimeState>>>,
@@ -672,6 +674,14 @@ impl Scheduler {
         self.tfb_query_state = Some(state);
     }
 
+    /// Release the safe query-cache state handles before their Vulkan owners
+    /// are destroyed by `RasterizerVulkan`.
+    pub(crate) fn clear_query_cache_state(&mut self) {
+        self.samples_query_state = None;
+        self.tfb_query_state = None;
+        self.query_runtime_state = None;
+    }
+
     /// Record a command that only needs the render command buffer.
     pub fn record(&mut self, cmd: impl FnOnce(vk::CommandBuffer) + Send + 'static) {
         self.record_with_upload(move |render_cmd, _upload_cmd| cmd(render_cmd));
@@ -908,6 +918,8 @@ impl Scheduler {
         }
 
         trace!("Scheduler: ending render pass");
+        // Preserve upstream `Scheduler::EndRenderPass` ordering without
+        // re-entering the query-cache owner through an aliased `&mut`.
         if let Some(state) = self.tfb_query_state.as_ref().cloned() {
             state.lock().close_counter(self);
         }
@@ -1123,6 +1135,11 @@ impl Scheduler {
     /// with pipelined submissions the CPU-side tick runs ahead of the GPU.
     pub fn known_gpu_tick(&self) -> u64 {
         self.master_semaphore.known_gpu_tick()
+    }
+
+    /// Port of upstream `Scheduler::GetMasterSemaphore`.
+    pub fn get_master_semaphore(&self) -> &Arc<MasterSemaphore> {
+        &self.master_semaphore
     }
 
     /// Returns true when the GPU has completed `tick`.

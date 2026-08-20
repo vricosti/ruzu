@@ -12,6 +12,7 @@
 
 use std::collections::VecDeque;
 use std::ptr::NonNull;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use ash::vk;
@@ -21,6 +22,7 @@ use crate::buffer_cache::buffer_cache_base::{ObtainBufferOperation, ObtainBuffer
 use crate::control::channel_state::ChannelState;
 use crate::control::channel_state_cache::ChannelCacheAccessor;
 use crate::engines::maxwell_3d::PrimitiveTopology;
+use crate::query_cache::bank_base::{BankBase, BankLike, BankPool};
 use crate::query_cache::query_cache::{
     DeviceMemoryWriter, GpuAddressTranslator, GuestStreamer, QueryCacheRuntimeHandle, StubStreamer,
     SyncValuesRuntime, SyncValuesStruct,
@@ -33,6 +35,7 @@ use crate::vulkan_common::vulkan_memory_allocator::{MappedBuffer, MemoryAllocato
 use super::buffer_cache::VulkanCommonBufferCache;
 use super::compute_pass::{ConditionalRenderingResolvePass, QueriesPrefixScanPass};
 use super::descriptor_pool::DescriptorPool;
+use super::master_semaphore::MasterSemaphore;
 use super::scheduler::Scheduler;
 use super::staging_buffer_pool::StagingBufferPool;
 use super::update_descriptor::ComputePassDescriptorQueue;
@@ -77,23 +80,45 @@ fn query_result_copy_source(count: usize) -> (vk::PipelineStageFlags, vk::Access
     }
 }
 
+/// Port of `SamplesQueryBank` in `vk_query_cache.cpp`.
+///
+/// Upstream derives from `VideoCommon::BankBase` and keeps a `Scheduler&` so
+/// `IsDead` can consult `Scheduler::IsFree`. The port holds the scheduler's
+/// `MasterSemaphore` instead, which is the part of the scheduler that answers
+/// that question and is the only piece reachable from a shared handle.
+///
+/// The port stores banks as `Arc` because a query's spans are resolved on the
+/// fence thread, after the streamer's borrow has ended (see `SamplesQuerySpan`);
+/// shared ownership is what keeps the bank alive until then. `base` is behind a
+/// mutex as a consequence: an `Arc` grants shared access only.
+///
+/// Address stability comes for free with that and is not the reason for it.
+/// Upstream holds a `SamplesQueryBank*` into its `std::deque`, which is a
+/// segmented container whose element references survive `push_back`; the
+/// `VecDeque` that `BankPool` is built on is a single reallocating ring buffer,
+/// so `BankPool<Box<_>>` would be the equivalent had lifetime not been the
+/// binding constraint.
 struct SamplesQueryBank {
+    base: parking_lot::Mutex<BankBase>,
     device: ash::Device,
-    pool: vk::QueryPool,
-    slots: parking_lot::Mutex<SamplesQueryBankSlots>,
+    master_semaphore: Arc<MasterSemaphore>,
+    query_pool: vk::QueryPool,
+    host_results: parking_lot::Mutex<Vec<u64>>,
+    /// Guards host access to the query pool, which Vulkan requires to be
+    /// externally synchronized, against the host-side whole-pool reset.
     host_access: parking_lot::Mutex<()>,
-}
-
-struct SamplesQueryBankSlots {
-    free: Vec<u32>,
-    in_use: usize,
-    last_used_tick: u64,
-    resetting: bool,
+    last_used_tick: AtomicU64,
+    /// Set by `BankLike::reset` when the pool recycles this bank. Rust cannot
+    /// pass `&mut Scheduler` through `BankPool::reserve_bank`, so the GPU-side
+    /// pool reset upstream performs inside `Reset()` is recorded by the
+    /// streamer immediately after, before any slot of the bank is handed out.
+    pending_pool_reset: AtomicBool,
 }
 
 impl SamplesQueryBank {
     fn new(
         device: ash::Device,
+        master_semaphore: Arc<MasterSemaphore>,
         scheduler: &mut Scheduler,
         host_query_reset_supported: bool,
     ) -> Result<Arc<Self>, vk::Result> {
@@ -101,145 +126,198 @@ impl SamplesQueryBank {
             .query_type(vk::QueryType::OCCLUSION)
             .query_count(SAMPLES_QUERY_BANK_SIZE as u32)
             .build();
-        let pool = unsafe { device.create_query_pool(&create_info, None)? };
+        let query_pool = unsafe { device.create_query_pool(&create_info, None)? };
+        let bank = Arc::new(Self {
+            base: parking_lot::Mutex::new(BankBase::new(SAMPLES_QUERY_BANK_SIZE)),
+            device,
+            master_semaphore,
+            query_pool,
+            host_results: parking_lot::Mutex::new(vec![0u64; SAMPLES_QUERY_BANK_SIZE]),
+            host_access: parking_lot::Mutex::new(()),
+            last_used_tick: AtomicU64::new(0),
+            pending_pool_reset: AtomicBool::new(false),
+        });
+        bank.record_pool_reset(scheduler, host_query_reset_supported);
+        Ok(bank)
+    }
+
+    /// GPU-side half of upstream `SamplesQueryBank::Reset()`.
+    fn record_pool_reset(&self, scheduler: &mut Scheduler, host_query_reset_supported: bool) {
         if host_query_reset_supported {
+            let _host_access = self.host_access.lock();
             unsafe {
-                device.reset_query_pool(pool, 0, SAMPLES_QUERY_BANK_SIZE as u32);
+                self.device
+                    .reset_query_pool(self.query_pool, 0, SAMPLES_QUERY_BANK_SIZE as u32);
             }
         } else {
             scheduler.request_outside_renderpass();
-            let reset_device = device.clone();
+            let device = self.device.clone();
+            let query_pool = self.query_pool;
             scheduler.record(move |cmdbuf| unsafe {
-                reset_device.cmd_reset_query_pool(cmdbuf, pool, 0, SAMPLES_QUERY_BANK_SIZE as u32);
+                device.cmd_reset_query_pool(cmdbuf, query_pool, 0, SAMPLES_QUERY_BANK_SIZE as u32);
             });
         }
-        Ok(Arc::new(Self {
-            device,
-            pool,
-            slots: parking_lot::Mutex::new(SamplesQueryBankSlots {
-                free: (0..SAMPLES_QUERY_BANK_SIZE as u32).rev().collect(),
-                in_use: 0,
-                last_used_tick: 0,
-                resetting: false,
-            }),
-            host_access: parking_lot::Mutex::new(()),
-        }))
     }
 
-    fn reserve(&self, scheduler: &mut Scheduler, host_query_reset_supported: bool) -> Option<u32> {
-        loop {
-            {
-                let mut slots = self.slots.lock();
-                if let Some(slot) = slots.free.pop() {
-                    slots.in_use += 1;
-                    // Eden's BankBase records Scheduler::CurrentTick in AddReference and
-                    // requires IsFree(last_used_tick) before recycling the bank.
-                    slots.last_used_tick = scheduler.pending_tick();
-                    return Some(slot);
-                }
-                if slots.in_use != 0 || slots.resetting || !scheduler.is_free(slots.last_used_tick)
-                {
-                    return None;
-                }
-                slots.resetting = true;
-            }
-
-            // Do not hold `slots` while requesting work from the scheduler:
-            // scheduler reset paths release query leases and take this lock.
-            if host_query_reset_supported {
-                let _host_access = self.host_access.lock();
-                unsafe {
-                    self.device
-                        .reset_query_pool(self.pool, 0, SAMPLES_QUERY_BANK_SIZE as u32);
-                }
-            } else {
-                scheduler.request_outside_renderpass();
-                let device = self.device.clone();
-                let pool = self.pool;
-                scheduler.record(move |cmdbuf| unsafe {
-                    device.cmd_reset_query_pool(cmdbuf, pool, 0, SAMPLES_QUERY_BANK_SIZE as u32);
-                });
-            }
-            let mut slots = self.slots.lock();
-            slots.free = (0..SAMPLES_QUERY_BANK_SIZE as u32).rev().collect();
-            slots.resetting = false;
+    /// Record the reset the pool deferred when it recycled this bank.
+    fn flush_pending_pool_reset(
+        &self,
+        scheduler: &mut Scheduler,
+        host_query_reset_supported: bool,
+    ) {
+        if self.pending_pool_reset.swap(false, Ordering::Relaxed) {
+            self.record_pool_reset(scheduler, host_query_reset_supported);
         }
     }
 
-    fn release(&self) {
-        let mut slots = self.slots.lock();
-        slots.in_use = slots
-            .in_use
-            .checked_sub(1)
-            .expect("samples query bank reference count underflow");
+    /// Port of `BankBase::Reserve` as used by `ReserveBankSlot`.
+    fn reserve(&self) -> Option<usize> {
+        let (built, slot) = self.base.lock().reserve();
+        built.then_some(slot)
+    }
+
+    fn is_closed(&self) -> bool {
+        self.base.lock().is_closed()
+    }
+
+    /// Port of `BankBase::Close`, called by `PushUnsyncedQueries`.
+    fn close(&self) {
+        self.base.lock().close();
+    }
+
+    /// Port of `SamplesQueryBank::AddReference`, which also stamps the tick.
+    fn add_reference(&self, how_many: usize, scheduler: &Scheduler) {
+        self.base.lock().add_reference(how_many);
+        self.last_used_tick
+            .store(scheduler.current_tick(), Ordering::Relaxed);
+    }
+
+    fn close_reference(&self, how_many: usize) {
+        self.base.lock().close_reference(how_many);
+    }
+
+    /// Port of `SamplesQueryBank::Sync`: one ranged readback per bank.
+    fn sync(&self, start: usize, size: usize) -> Result<(), vk::Result> {
+        let mut host_results = self.host_results.lock();
+        let _host_access = self.host_access.lock();
+        unsafe {
+            self.device.get_query_pool_results(
+                self.query_pool,
+                start as u32,
+                size as u32,
+                &mut host_results[start..start + size],
+                vk::QueryResultFlags::TYPE_64 | vk::QueryResultFlags::WAIT,
+            )
+        }
+    }
+
+    /// Port of `SamplesQueryBank::GetResults`, summed over one slot range.
+    fn sum_results(&self, start: usize, size: usize) -> u64 {
+        let host_results = self.host_results.lock();
+        host_results[start..start + size]
+            .iter()
+            .fold(0u64, |total, value| total.wrapping_add(*value))
+    }
+}
+
+impl BankLike for Arc<SamplesQueryBank> {
+    /// Port of `SamplesQueryBank::IsDead`.
+    fn is_dead(&self) -> bool {
+        self.base.lock().is_dead()
+            && self
+                .master_semaphore
+                .is_free(self.last_used_tick.load(Ordering::Relaxed))
+    }
+
+    /// CPU-side half of upstream `SamplesQueryBank::Reset()`; the pool reset is
+    /// deferred to `flush_pending_pool_reset`.
+    fn reset(&mut self) {
+        self.base.lock().reset();
+        self.host_results.lock().fill(0);
+        self.pending_pool_reset.store(true, Ordering::Relaxed);
     }
 }
 
 impl Drop for SamplesQueryBank {
     fn drop(&mut self) {
         unsafe {
-            self.device.destroy_query_pool(self.pool, None);
+            self.device.destroy_query_pool(self.query_pool, None);
         }
     }
 }
 
-struct SamplesQueryLease {
+/// One `(bank, start, amount)` triple of upstream's `ApplyBankOp` walk.
+///
+/// Upstream re-walks `next_bank` from the pool every time it touches a query.
+/// The port materializes the walk when the report is taken, because reports are
+/// resolved on the fence thread, where the streamer and its pool are not
+/// reachable. Holding the bank keeps its reference count raised, which is what
+/// upstream's `AddReference`/`CloseReference` pairing does.
+///
+/// Materializing the walk also leaves upstream's `SamplesQueryBank::next_bank`
+/// chaining without a reader, so the port does not carry that field.
+struct SamplesQuerySpan {
     bank: Arc<SamplesQueryBank>,
-    slot: u32,
+    start: usize,
+    amount: usize,
 }
 
-impl Drop for SamplesQueryLease {
+impl Drop for SamplesQuerySpan {
+    /// Port of `SamplesStreamer::Free`, which closes the query's references.
     fn drop(&mut self) {
-        self.bank.release();
+        self.bank.close_reference(self.amount);
     }
 }
 
-#[derive(Clone)]
-struct SamplesQuerySlot(Arc<SamplesQueryLease>);
-
-impl SamplesQuerySlot {
-    fn new(bank: Arc<SamplesQueryBank>, slot: u32) -> Self {
-        Self(Arc::new(SamplesQueryLease { bank, slot }))
-    }
-
-    fn bank(&self) -> &SamplesQueryBank {
-        &self.0.bank
-    }
-
-    fn slot(&self) -> u32 {
-        self.0.slot
-    }
-}
-
+/// Counter state of the samples streamer.
+///
+/// Upstream keeps `current_query`, `current_bank_slot` and `has_started` as
+/// plain members of `SamplesStreamer`.
 pub(crate) struct SamplesQueryState {
-    current: Option<SamplesQuerySlot>,
-    history: Vec<SamplesQuerySlot>,
+    /// Slot currently recording, as `(bank, slot)`.
+    current: Option<(Arc<SamplesQueryBank>, usize)>,
+    /// Slots closed since the last report, in acquisition order.
+    history: Vec<(Arc<SamplesQueryBank>, usize)>,
 }
 
 impl SamplesQueryState {
+    /// Port of `SamplesStreamer::PauseCounter`.
     pub(crate) fn pause_counter(&mut self, scheduler: &mut Scheduler) {
-        let Some(query) = self.current.take() else {
+        let Some((bank, slot)) = self.current.take() else {
             return;
         };
-        let pool = query.bank().pool;
-        let slot = query.slot();
-        let device = query.bank().device.clone();
+        let device = bank.device.clone();
+        let query_pool = bank.query_pool;
         scheduler.record(move |cmdbuf| unsafe {
-            device.cmd_end_query(cmdbuf, pool, slot);
+            device.cmd_end_query(cmdbuf, query_pool, slot as u32);
         });
-        self.history.push(query);
+        self.history.push((bank, slot));
     }
 
+    /// Port of `SamplesStreamer::ResetCounter`, which abandons the current
+    /// query after pausing it.
     pub(crate) fn reset_counter(&mut self, scheduler: &mut Scheduler) {
         self.pause_counter(scheduler);
-        self.history.clear();
+        self.abandon_history();
+    }
+
+    /// Port of `SamplesStreamer::AbandonCurrentQuery` -> `Free`: closes the
+    /// references `ReserveHostQuery` took for slots that are never reported.
+    fn abandon_history(&mut self) {
+        for (bank, _) in self.history.drain(..) {
+            bank.close_reference(1);
+        }
     }
 }
 
 struct SamplesStreamer {
     device: ash::Device,
     memory_allocator: NonNull<MemoryAllocator>,
-    banks: Vec<Arc<SamplesQueryBank>>,
+    /// Port of `SamplesStreamer::bank_pool` / `current_bank`. Upstream also
+    /// keeps `current_bank_id`, which it needs to chain banks through
+    /// `next_bank`; the port resolves spans eagerly and has no reader for it.
+    bank_pool: BankPool<Arc<SamplesQueryBank>>,
+    current_bank: Option<Arc<SamplesQueryBank>>,
     host_query_reset_supported: bool,
     state: Arc<parking_lot::Mutex<SamplesQueryState>>,
     prefix_scan_pass: QueriesPrefixScanPass,
@@ -288,7 +366,8 @@ impl SamplesStreamer {
         Ok(Self {
             device,
             memory_allocator: NonNull::from(memory_allocator),
-            banks: Vec::new(),
+            bank_pool: BankPool::new(),
+            current_bank: None,
             host_query_reset_supported,
             state: Arc::new(parking_lot::Mutex::new(SamplesQueryState {
                 current: None,
@@ -353,45 +432,98 @@ impl SamplesStreamer {
         Arc::clone(&self.state)
     }
 
-    fn reserve(&mut self, scheduler: &mut Scheduler) -> Result<SamplesQuerySlot, vk::Result> {
-        if let Some(query) = self.banks.iter().find_map(|bank| {
-            bank.reserve(scheduler, self.host_query_reset_supported)
-                .map(|slot| SamplesQuerySlot::new(Arc::clone(bank), slot))
-        }) {
-            return Ok(query);
-        }
-        let bank = SamplesQueryBank::new(
-            self.device.clone(),
-            scheduler,
-            self.host_query_reset_supported,
-        )?;
-        let slot = bank
-            .reserve(scheduler, self.host_query_reset_supported)
-            .expect("a new samples query bank must have a free slot");
-        self.banks.push(Arc::clone(&bank));
-        Ok(SamplesQuerySlot::new(bank, slot))
+    /// Port of `SamplesStreamer::ReserveBank`.
+    fn reserve_bank(&mut self, scheduler: &mut Scheduler) -> Result<(), vk::Result> {
+        // `BankPool::reserve_bank` recycles a dead bank when it can and calls
+        // the builder otherwise. Creating a query pool can fail and the builder
+        // cannot, so build the replacement up front only when no dead bank is
+        // available to recycle.
+        let prepared = if self.bank_pool.can_recycle_front() {
+            None
+        } else {
+            Some(SamplesQueryBank::new(
+                self.device.clone(),
+                Arc::clone(scheduler.get_master_semaphore()),
+                scheduler,
+                self.host_query_reset_supported,
+            )?)
+        };
+        // INVARIANT: nothing between the `can_recycle_front` test above and the
+        // `reserve_bank` call below may reserve a bank, or `prepared` no longer
+        // matches what the pool is about to decide and the `expect` fires.
+        //
+        // It holds today because the only re-entrant path here is
+        // `SamplesQueryBank::new` -> `record_pool_reset` ->
+        // `request_outside_renderpass` (taken only when the device lacks host
+        // query reset) -> `Scheduler::end_render_pass`, which calls
+        // `counter_close`, `counter_enable(.., false)` and `notify_segment`.
+        // All three only pause counters; none reserves a slot, so neither the
+        // pool nor `current_bank` can change under us. A future call on that
+        // path that does reserve would turn this into a panic, not silent
+        // corruption.
+        let new_bank_id = self.bank_pool.reserve_bank(move |queue, _index| {
+            queue.push_back(prepared.expect("bank pre-built when none can be recycled"));
+        });
+        let new_bank = Arc::clone(self.bank_pool.get_bank(new_bank_id));
+        new_bank.flush_pending_pool_reset(scheduler, self.host_query_reset_supported);
+        self.current_bank = Some(new_bank);
+        Ok(())
     }
 
+    /// Port of `SamplesStreamer::ReserveBankSlot`.
+    fn reserve_bank_slot(&mut self, scheduler: &mut Scheduler) -> Result<usize, vk::Result> {
+        if self
+            .current_bank
+            .as_ref()
+            .is_none_or(|bank| bank.is_closed())
+        {
+            self.reserve_bank(scheduler)?;
+        }
+        let bank = self
+            .current_bank
+            .as_ref()
+            .expect("reserve_bank leaves a current bank");
+        Ok(bank
+            .reserve()
+            .expect("a bank that is not closed has a free slot"))
+    }
+
+    /// Port of `SamplesStreamer::ReserveHostQuery`, which takes the slot's
+    /// reference on the owning bank.
+    fn reserve_host_query(
+        &mut self,
+        scheduler: &mut Scheduler,
+    ) -> Result<(Arc<SamplesQueryBank>, usize), vk::Result> {
+        let slot = self.reserve_bank_slot(scheduler)?;
+        let bank = Arc::clone(
+            self.current_bank
+                .as_ref()
+                .expect("reserve_bank_slot leaves a current bank"),
+        );
+        bank.add_reference(1, scheduler);
+        Ok((bank, slot))
+    }
+
+    /// Port of `SamplesStreamer::StartCounter`.
     fn start_counter(&mut self, scheduler: &mut Scheduler) {
         if self.state.lock().current.is_some() {
             return;
         }
-        let query = match self.reserve(scheduler) {
+        let (bank, slot) = match self.reserve_host_query(scheduler) {
             Ok(query) => query,
             Err(error) => {
                 log::error!("Failed to allocate a Vulkan occlusion query bank: {error:?}");
                 return;
             }
         };
-        let pool = query.bank().pool;
-        let slot = query.slot();
-        let device = query.bank().device.clone();
+        let device = bank.device.clone();
+        let query_pool = bank.query_pool;
         scheduler.record(move |cmdbuf| unsafe {
             let use_precise = common::settings::is_gpu_level_high(&common::settings::values());
             device.cmd_begin_query(
                 cmdbuf,
-                pool,
-                slot,
+                query_pool,
+                slot as u32,
                 if use_precise {
                     vk::QueryControlFlags::PRECISE
                 } else {
@@ -399,17 +531,33 @@ impl SamplesStreamer {
                 },
             );
         });
-        self.state.lock().current = Some(query);
+        self.state.lock().current = Some((bank, slot));
     }
 
     fn reset_counter(&mut self, scheduler: &mut Scheduler) {
         self.state.lock().reset_counter(scheduler);
     }
 
+    /// Port of `SamplesStreamer::CloseCounter`, which upstream defines as a
+    /// plain `PauseCounter()`.
+    fn close_counter(&mut self, scheduler: &mut Scheduler) {
+        self.state.lock().pause_counter(scheduler);
+    }
+
     fn take_report(&mut self, scheduler: &mut Scheduler) -> Option<SamplesReport> {
         let mut state = self.state.lock();
         state.pause_counter(scheduler);
-        (!state.history.is_empty()).then(|| SamplesReport::new(state.history.clone()))
+        if state.history.is_empty() {
+            return None;
+        }
+        // Upstream `WriteCounter` copies the whole current query and takes one
+        // additional bank reference per copied slot. Keep `history` as the
+        // current cumulative query until `ResetCounter`, and give this report
+        // its own matching references.
+        let history = clone_cumulative_history(&state.history, |bank| {
+            bank.add_reference(1, scheduler);
+        });
+        Some(SamplesReport::new(coalesce_query_spans(history)))
     }
 
     fn queue_host_report(&mut self, report: &SamplesReport) {
@@ -420,7 +568,12 @@ impl SamplesStreamer {
         !self.pending_flush_queries.is_empty()
     }
 
-    fn push_unsynced_queries(&mut self) {
+    /// Port of `SamplesStreamer::PushUnsyncedQueries`.
+    fn push_unsynced_queries(&mut self, scheduler: &mut Scheduler) {
+        self.state.lock().pause_counter(scheduler);
+        if let Some(current_bank) = self.current_bank.as_ref() {
+            current_bank.close();
+        }
         self.pending_flush_sets
             .lock()
             .push_back(std::mem::take(&mut self.pending_flush_queries));
@@ -433,12 +586,16 @@ impl SamplesStreamer {
             .is_some_and(|reports| !reports.is_empty())
     }
 
+    /// Port of `SamplesStreamer::PopUnsyncedQueries`: sync each bank range
+    /// once, then sum the results of every query in the set.
     fn pop_unsynced_queries(&mut self) {
         let Some(reports) = self.pending_flush_sets.lock().pop_front() else {
             return;
         };
-        for report in reports {
-            report.resolve_queries();
+        if sync_report_ranges(&reports) {
+            for report in reports {
+                report.resolve_from_synced_results();
+            }
         }
     }
 
@@ -453,7 +610,7 @@ impl SamplesStreamer {
         report: SamplesReport,
         guest_address: u64,
     ) -> Result<(), SamplesReport> {
-        let count = report.measured().len();
+        let count = report.slot_count();
         if count == 0 {
             return Err(report);
         }
@@ -479,11 +636,7 @@ impl SamplesStreamer {
         let dst_buffer = scan_buffers.intermediary;
         let accumulation_buffer = self.accumulation_buffer;
         let device = self.device.clone();
-        let queries: Vec<_> = report
-            .measured()
-            .iter()
-            .map(|query| (query.bank().pool, query.slot()))
-            .collect();
+        let queries = report.slots();
 
         scheduler.request_outside_renderpass();
         scheduler.record(move |cmdbuf| unsafe {
@@ -550,39 +703,121 @@ impl SamplesStreamer {
     }
 }
 
+/// Snapshot the whole current query while retaining its original history.
+/// Each copy takes the independent bank reference that upstream `WriteCounter`
+/// adds to the newly built host query.
+fn clone_cumulative_history<T>(
+    history: &[(Arc<T>, usize)],
+    mut add_reference: impl FnMut(&Arc<T>),
+) -> Vec<(Arc<T>, usize)> {
+    history
+        .iter()
+        .map(|(bank, slot)| {
+            add_reference(bank);
+            (Arc::clone(bank), *slot)
+        })
+        .collect()
+}
+
+/// Coalesce per-slot acquisitions into upstream's `(bank, start, amount)`
+/// ranges, so a query that filled contiguous slots of one bank is synced with a
+/// single `vkGetQueryPoolResults` like upstream's `ApplyBanksWideOp`.
+///
+/// Reference ownership moves from the acquisition list into the spans: each
+/// entry contributed one `AddReference`, and the span closes `amount` of them.
+fn coalesce_query_spans(history: Vec<(Arc<SamplesQueryBank>, usize)>) -> Vec<SamplesQuerySpan> {
+    let mut spans: Vec<SamplesQuerySpan> = Vec::new();
+    for (bank, slot) in history {
+        if let Some(last) = spans.last_mut() {
+            if Arc::ptr_eq(&last.bank, &bank) && last.start + last.amount == slot {
+                last.amount += 1;
+                continue;
+            }
+        }
+        spans.push(SamplesQuerySpan {
+            bank,
+            start: slot,
+            amount: 1,
+        });
+    }
+    spans
+}
+
+/// Extend the min/max range associated with one bank.
+///
+/// This is upstream `ApplyBanksWideOp`'s indexing operation. `value` carries
+/// the object needed by the caller while `key` identifies it; keeping the
+/// merge mechanical makes the range behavior independently testable.
+fn include_wide_range<K: Eq, V>(
+    ranges: &mut Vec<(K, V, usize, usize)>,
+    key: K,
+    value: V,
+    start: usize,
+    amount: usize,
+) {
+    if let Some((_, _, range_start, range_end)) =
+        ranges.iter_mut().find(|(current, _, _, _)| current == &key)
+    {
+        *range_start = (*range_start).min(start);
+        *range_end = (*range_end).max(start + amount);
+    } else {
+        ranges.push((key, value, start, start + amount));
+    }
+}
+
+/// Port of `SamplesStreamer::ApplyBanksWideOp<false>` as used by
+/// `PopUnsyncedQueries`: merge all report spans by bank before issuing host
+/// readbacks.
+fn sync_report_ranges(reports: &[Arc<SamplesReportState>]) -> bool {
+    let mut ranges: Vec<(usize, Arc<SamplesQueryBank>, usize, usize)> = Vec::new();
+    for report in reports {
+        for span in &report.spans {
+            include_wide_range(
+                &mut ranges,
+                Arc::as_ptr(&span.bank) as usize,
+                Arc::clone(&span.bank),
+                span.start,
+                span.amount,
+            );
+        }
+    }
+    for (_, bank, start, end) in ranges {
+        if let Err(error) = bank.sync(start, end - start) {
+            if error == vk::Result::ERROR_DEVICE_LOST {
+                crate::vulkan_common::vulkan_device::report_device_loss();
+            }
+            log::error!("vkGetQueryPoolResults failed for occlusion query: {error:?}");
+            return false;
+        }
+    }
+    true
+}
+
 struct SamplesReportState {
-    measured: Vec<SamplesQuerySlot>,
+    spans: Vec<SamplesQuerySpan>,
     resolved: parking_lot::Mutex<Option<u64>>,
 }
 
 impl SamplesReportState {
-    fn resolve_queries(&self) {
-        let mut total = 0u64;
-        for query in &self.measured {
-            let mut value = [0u64; 1];
-            // Vulkan host access to a query pool is externally synchronized.
-            // `host_access` serializes result reads against the host-side
-            // whole-pool reset performed by `reserve`.
-            let _query_pool_guard = query.bank().host_access.lock();
-            let result = unsafe {
-                query.bank().device.get_query_pool_results(
-                    query.bank().pool,
-                    query.slot(),
-                    1,
-                    &mut value,
-                    vk::QueryResultFlags::TYPE_64 | vk::QueryResultFlags::WAIT,
-                )
-            };
-            if let Err(error) = result {
-                if error == vk::Result::ERROR_DEVICE_LOST {
-                    crate::vulkan_common::vulkan_device::report_device_loss();
-                }
-                log::error!("vkGetQueryPoolResults failed for occlusion query: {error:?}");
-                return;
-            }
-            total = total.wrapping_add(value[0]);
-        }
+    /// Finish upstream `PopUnsyncedQueries` after `ApplyBanksWideOp` populated
+    /// the bank result arrays.
+    fn resolve_from_synced_results(&self) {
+        let total = self.spans.iter().fold(0u64, |total, span| {
+            total.wrapping_add(span.bank.sum_results(span.start, span.amount))
+        });
         *self.resolved.lock() = Some(total);
+    }
+
+    /// Slots this query owns, in acquisition order, as `(query pool, slot)`.
+    fn slots(&self) -> impl Iterator<Item = (vk::QueryPool, u32)> + '_ {
+        self.spans.iter().flat_map(|span| {
+            (span.start..span.start + span.amount)
+                .map(move |slot| (span.bank.query_pool, slot as u32))
+        })
+    }
+
+    fn slot_count(&self) -> usize {
+        self.spans.iter().map(|span| span.amount).sum()
     }
 }
 
@@ -592,17 +827,21 @@ struct SamplesReport {
 }
 
 impl SamplesReport {
-    fn new(measured: Vec<SamplesQuerySlot>) -> Self {
+    fn new(spans: Vec<SamplesQuerySpan>) -> Self {
         Self {
             state: Arc::new(SamplesReportState {
-                measured,
+                spans,
                 resolved: parking_lot::Mutex::new(None),
             }),
         }
     }
 
-    fn measured(&self) -> &[SamplesQuerySlot] {
-        &self.state.measured
+    fn slot_count(&self) -> usize {
+        self.state.slot_count()
+    }
+
+    fn slots(&self) -> Vec<(vk::QueryPool, u32)> {
+        self.state.slots().collect()
     }
 
     fn resolve(self) -> Option<u64> {
@@ -2136,9 +2375,7 @@ impl QueryCache {
             driver_id,
             conditional_rendering_supported,
         )?);
-        scheduler.set_samples_query_state(samples_streamer.shared_state());
-        scheduler.set_tfb_query_state(tfb_streamer.shared_state());
-        scheduler.set_query_runtime_state(runtime.shared_state());
+
         let mut cache = QueryCache {
             base: QueryCacheBase::new(),
             runtime,
@@ -2299,7 +2536,38 @@ impl QueryCache {
         self.gpu_ticks_getter = Some(getter);
     }
 
-    pub fn reset_counter(&mut self, scheduler: &mut Scheduler, query_type: u32) {
+    pub(crate) fn samples_query_state(&self) -> Option<Arc<parking_lot::Mutex<SamplesQueryState>>> {
+        self.samples_streamer
+            .as_ref()
+            .map(SamplesStreamer::shared_state)
+    }
+
+    pub(crate) fn tfb_query_state(&self) -> Option<Arc<parking_lot::Mutex<TfbCounterState>>> {
+        self.tfb_streamer
+            .as_ref()
+            .map(TfbCounterStreamer::shared_state)
+    }
+
+    pub(crate) fn query_runtime_state(&self) -> Arc<parking_lot::Mutex<QueryRuntimeState>> {
+        self.runtime.shared_state()
+    }
+
+    /// Port of `QueryCacheBase::CounterClose`, which calls `CloseCounter` on
+    /// the streamer owning `query_type`.
+    pub fn counter_close(&mut self, scheduler: &mut Scheduler, query_type: u32) {
+        if query_type == crate::query_cache::types::QueryType::ZPassPixelCount64 as u32 {
+            if let Some(samples_streamer) = self.samples_streamer.as_mut() {
+                samples_streamer.close_counter(scheduler);
+            }
+        } else if query_type == crate::query_cache::types::QueryType::StreamingByteCount as u32 {
+            if let Some(tfb_streamer) = self.tfb_streamer.as_mut() {
+                tfb_streamer.close_counter(scheduler);
+            }
+        }
+    }
+
+    /// Port of `QueryCacheBase::CounterReset`.
+    pub fn counter_reset(&mut self, scheduler: &mut Scheduler, query_type: u32) {
         if query_type == crate::query_cache::types::QueryType::ZPassPixelCount64 as u32 {
             if let Some(samples_streamer) = self.samples_streamer.as_mut() {
                 samples_streamer.reset_counter(scheduler);
@@ -2324,10 +2592,12 @@ impl QueryCache {
     pub fn notify_wfi(&mut self) {
         self.base.notify_wfi();
     }
-    pub fn commit_async_flushes(&mut self) {
+    pub fn commit_async_flushes(&mut self, scheduler: &mut Scheduler) {
         self.base.commit_async_flushes();
         if let Some(samples_streamer) = self.samples_streamer.as_mut() {
-            samples_streamer.push_unsynced_queries();
+            if samples_streamer.has_unsynced_queries() {
+                samples_streamer.push_unsynced_queries(scheduler);
+            }
         }
     }
     pub fn has_uncommitted_flushes(&self) -> bool {
@@ -2656,9 +2926,42 @@ mod tests {
         let report = SamplesReport::new(Vec::new());
         assert_eq!(report.clone().resolve(), None);
 
-        report.state.resolve_queries();
+        report.state.resolve_from_synced_results();
 
         assert_eq!(report.resolve(), Some(0));
+    }
+
+    #[test]
+    fn samples_reports_snapshot_the_full_history_without_draining_it() {
+        let bank = Arc::new(());
+        let mut history = vec![(Arc::clone(&bank), 3), (Arc::clone(&bank), 4)];
+        let mut references_added = 0;
+
+        let first = clone_cumulative_history(&history, |_| references_added += 1);
+        history.push((Arc::clone(&bank), 5));
+        let second = clone_cumulative_history(&history, |_| references_added += 1);
+
+        assert_eq!(
+            first.iter().map(|(_, slot)| *slot).collect::<Vec<_>>(),
+            [3, 4]
+        );
+        assert_eq!(
+            second.iter().map(|(_, slot)| *slot).collect::<Vec<_>>(),
+            [3, 4, 5]
+        );
+        assert_eq!(history.len(), 3);
+        assert_eq!(references_added, first.len() + second.len());
+    }
+
+    #[test]
+    fn samples_wide_ranges_merge_all_reports_per_bank() {
+        let mut ranges = Vec::new();
+        include_wide_range(&mut ranges, 7u8, (), 4, 2);
+        include_wide_range(&mut ranges, 9u8, (), 12, 1);
+        include_wide_range(&mut ranges, 7u8, (), 2, 3);
+        include_wide_range(&mut ranges, 7u8, (), 8, 2);
+
+        assert_eq!(ranges, vec![(7, (), 2, 10), (9, (), 12, 13)]);
     }
 
     #[test]

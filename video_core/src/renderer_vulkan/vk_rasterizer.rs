@@ -1049,6 +1049,17 @@ impl RasterizerVulkan {
             })
         });
 
+        // Safe Rust adaptation of upstream `scheduler.SetQueryCache(query_cache)`.
+        // Install only the independently locked state used by Scheduler, and do
+        // it after every fallible construction step has succeeded.
+        if let Some(state) = query_cache.samples_query_state() {
+            scheduler.set_samples_query_state(state);
+        }
+        if let Some(state) = query_cache.tfb_query_state() {
+            scheduler.set_tfb_query_state(state);
+        }
+        scheduler.set_query_runtime_state(query_cache.query_runtime_state());
+
         let fence_wait_handle = scheduler.wait_handle();
         Ok(Self {
             device: DeviceReference::new(vulkan_device),
@@ -1496,7 +1507,7 @@ impl RasterizerVulkan {
             self.texture_cache.commit_async_flushes();
             self.common_buffer_cache.commit_async_flushes();
         }
-        self.query_cache.commit_async_flushes();
+        self.query_cache.commit_async_flushes(&mut self.scheduler);
     }
 
     /// Callback adaptation of upstream `FenceManager::SignalOrdering`, which
@@ -3431,7 +3442,7 @@ impl RasterizerInterface for RasterizerVulkan {
             return;
         }
         self.query_cache
-            .reset_counter(&mut self.scheduler, query_type);
+            .counter_reset(&mut self.scheduler, query_type);
     }
 
     fn query(
@@ -3941,6 +3952,9 @@ impl Drop for RasterizerVulkan {
         // are still alive, submits the command chunk, and waits for completion.
         self.scheduler.wait_worker();
         self.scheduler.finish();
+        // The renderer destroys this rasterizer before the scheduler. Drop its
+        // shared query-state handles before the Vulkan resources they describe.
+        self.scheduler.clear_query_cache_state();
         let device = self.device.get().get_logical();
         unsafe {
             device.unmap_memory(self.readback_memory);

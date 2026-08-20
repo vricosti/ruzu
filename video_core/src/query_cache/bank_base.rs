@@ -125,6 +125,19 @@ impl<B: BankLike> BankPool<B> {
         }
     }
 
+    /// Whether `reserve_bank` will recycle the front bank instead of calling
+    /// its builder.
+    ///
+    /// Rust-only: upstream's builder can throw, so `ReserveBank` needs no such
+    /// hint, while `reserve_bank`'s builder cannot fail. Callers that allocate
+    /// fallible GPU resources use this to build the replacement before the
+    /// borrow starts. It reports exactly the condition `reserve_bank` tests.
+    pub fn can_recycle_front(&self) -> bool {
+        self.bank_indices
+            .front()
+            .is_some_and(|&front_idx| self.bank_pool[front_idx].is_dead())
+    }
+
     /// Reserve a bank from the pool, recycling a dead one if possible.
     /// If no dead bank is available, `builder` is called to construct a new one.
     ///
@@ -166,5 +179,65 @@ impl<B: BankLike> BankPool<B> {
 impl<B: BankLike> Default for BankPool<B> {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Upstream `BankBase::Close` freezes the bank at its allocation point, so
+    /// a closed bank hands out no further slots (`bank_base.h:55`).
+    #[test]
+    fn close_freezes_the_bank_at_the_current_slot() {
+        let mut bank = BankBase::new(4);
+        assert_eq!(bank.reserve(), (true, 0));
+        assert_eq!(bank.reserve(), (true, 1));
+
+        bank.close();
+
+        assert!(bank.is_closed());
+        assert_eq!(bank.size(), 2);
+        assert_eq!(bank.reserve(), (false, 2));
+    }
+
+    /// `IsDead` requires both conditions: closed *and* unreferenced.
+    #[test]
+    fn is_dead_requires_closed_and_unreferenced() {
+        let mut bank = BankBase::new(2);
+        let (_, _) = bank.reserve();
+        bank.add_reference(1);
+        bank.close();
+        assert!(!bank.is_dead());
+
+        bank.close_reference(1);
+        assert!(bank.is_dead());
+    }
+
+    /// `can_recycle_front` must report exactly what `reserve_bank` tests, or a
+    /// caller that pre-builds a replacement bank would build the wrong number.
+    #[test]
+    fn can_recycle_front_matches_reserve_bank() {
+        let mut pool: BankPool<BankBase> = BankPool::new();
+        assert!(!pool.can_recycle_front());
+
+        let first = pool.reserve_bank(|queue, _index| queue.push_back(BankBase::new(1)));
+        assert_eq!(pool.bank_count(), 1);
+
+        // The only bank is still open, so nothing can be recycled and
+        // `reserve_bank` must build a second one.
+        assert!(!pool.can_recycle_front());
+        let second = pool.reserve_bank(|queue, _index| queue.push_back(BankBase::new(1)));
+        assert_ne!(first, second);
+        assert_eq!(pool.bank_count(), 2);
+
+        // Exhaust the first bank so it becomes dead, and it is recycled instead.
+        let bank = pool.get_bank(first);
+        let (_, _) = bank.reserve();
+        assert!(bank.is_dead());
+        assert!(pool.can_recycle_front());
+        let recycled = pool.reserve_bank(|_queue, _index| panic!("builder must not run"));
+        assert_eq!(recycled, first);
+        assert_eq!(pool.bank_count(), 2);
     }
 }
