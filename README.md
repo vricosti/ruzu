@@ -11,22 +11,20 @@ SPDX-License-Identifier: GPL-3.0-or-later
   <br>
 </h1>
 
-<h4 align="center"><b>ruzu</b> is a Nintendo Switch emulator written in Rust
-<br>
-and it began as an experiment nobody expected to work.
+<h4 align="center"><b>ruzu</b> is a Nintendo Switch emulator written in Rust and it began as an experiment <br>nobody expected to work.
 </h4>
-
-<p align="center"><i>Fun fact: the Eden emulator forbids the use of LLMs xD</i></p>
 
 <div align="center">
 
 | | |
 |---|---|
-| **Cost** | about the price of two or three Switch consoles |
+| **Cost** | about the price of two Switch consoles |
 | **Ported** | ~500,000 lines of C++ (yuzu/Eden) only with LLMs |
 | **Duration** | 6 months |
 
 </div>
+
+<p align="center"><i>Fun fact: the Eden emulator forbids the use of LLMs xD</i></p>
 
 <p align="center">
   <a href="#what-this-project-actually-is">About</a> |
@@ -40,16 +38,16 @@ and it began as an experiment nobody expected to work.
 
 ## What this project actually is
 
-The question was narrow: **can frontier large language models port a genuinely
+The question was narrow: **can frontier LLMs port a genuinely
 huge piece of software from C++ to Rust?** Not generate a plausible-looking file,
-not translate a self-contained algorithm — carry a whole codebase across, one
+not translate a self-contained algorithm, carry a whole codebase across, one
 that is:
 
 - large: hundreds of thousands of lines across a dozen subsystems;
 - deeply stateful: an HLE kernel with schedulers, fibers, IPC and services;
 - unforgiving: a GPU command processor, a shader recompiler, and a JIT where a
   single wrong bit produces a black screen rather than a stack trace;
-- built on C++ idioms with no direct Rust equivalent — inheritance hierarchies,
+- built on C++ idioms with no direct Rust equivalent: inheritance hierarchies,
   raw pointer graphs, `shared_ptr` cycles, destructor ordering, `std::variant`.
 
 I had serious doubts it would go anywhere. It did: the experiment ended up
@@ -92,7 +90,7 @@ architecture rather than interpreted.
 A **RISC-V** host was planned — compiling the workspace on riscv64 first, then
 adding a RISC-V backend to rdynarmic. That work is not implemented yet.
 
-### Compilation tested on
+### Compilation compiled(not tested) on
 
 Results from [the compatibility
 report](https://github.com/vricosti/ruzu) of 18 August 2026. Each platform
