@@ -31,7 +31,14 @@ fn catalogs() -> &'static Catalogs {
         let menu_translations: HashMap<String, HashMap<String, String>> =
             serde_json::from_str(include_str!("../i18n/menu_catalogs.json"))
                 .expect("embedded menu translation catalogs are valid JSON");
-        for extra_catalog in [migration_translations, menu_translations] {
+        let overlay_translations: HashMap<String, HashMap<String, String>> =
+            serde_json::from_str(include_str!("../i18n/overlay_catalogs.json"))
+                .expect("embedded overlay translation catalogs are valid JSON");
+        for extra_catalog in [
+            migration_translations,
+            menu_translations,
+            overlay_translations,
+        ] {
             for (locale, messages) in extra_catalog {
                 translations.entry(locale).or_default().extend(messages);
             }
@@ -448,6 +455,16 @@ mod tests {
         assert_eq!(toolkit_language_override("en").as_deref(), Some("en"));
         assert_eq!(toolkit_language_override("fr_FR").as_deref(), Some("fr"));
         assert_eq!(toolkit_language_override(""), None);
+    }
+
+    #[test]
+    fn closing_software_uses_the_selected_interface_language() {
+        let _guard = test_lock();
+        set_language("fr");
+        assert_eq!(tr("Closing software..."), "Fermeture du logiciel...");
+
+        set_language("en");
+        assert_eq!(tr("Closing software..."), "Closing software...");
     }
 
     #[test]

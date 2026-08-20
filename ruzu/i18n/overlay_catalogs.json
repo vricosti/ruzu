@@ -1,0 +1,38 @@
+{
+  "ar": {
+    "Closing software...": "جارٍ إغلاق البرنامج..."
+  },
+  "de": {
+    "Closing software...": "Software wird geschlossen..."
+  },
+  "es": {
+    "Closing software...": "Cerrando el programa..."
+  },
+  "fr": {
+    "Closing software...": "Fermeture du logiciel..."
+  },
+  "it": {
+    "Closing software...": "Chiusura del software in corso..."
+  },
+  "ko_KR": {
+    "Closing software...": "소프트웨어 닫는 중..."
+  },
+  "nb": {
+    "Closing software...": "Lukker programvare ..."
+  },
+  "pl": {
+    "Closing software...": "Zamykanie aplikacji..."
+  },
+  "ru_RU": {
+    "Closing software...": "Закрываем программу..."
+  },
+  "sv": {
+    "Closing software...": "Stänger programvara..."
+  },
+  "uk": {
+    "Closing software...": "Закриття програмного засобу..."
+  },
+  "zh_CN": {
+    "Closing software...": "正在关闭软件..."
+  }
+}
