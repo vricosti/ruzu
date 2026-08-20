@@ -16,6 +16,7 @@ use common::param_package::ParamPackage;
 use common::uuid::UUID;
 
 use crate::drivers::camera::Camera;
+use crate::drivers::joycon::Joycons;
 use crate::drivers::keyboard::Keyboard;
 use crate::drivers::mouse::Mouse;
 use crate::drivers::sdl_driver::SDLDriver;
@@ -133,7 +134,10 @@ struct InputSubsystemImpl {
     /// Upstream registers this under `HAVE_SDL3`; it backs every `engine:sdl`
     /// binding, i.e. all physical gamepads.
     sdl: Option<SDLDriver>,
-    // GCAdapter, Joycons and Android remain unported.
+    /// Upstream registers the dedicated Nintendo-controller engine immediately
+    /// after SDL when SDL support is available.
+    joycon: Option<Joycons>,
+    // GCAdapter and Android remain unported.
 }
 
 impl InputSubsystemImpl {
@@ -150,6 +154,7 @@ impl InputSubsystemImpl {
             virtual_amiibo: None,
             virtual_gamepad: None,
             sdl: None,
+            joycon: None,
         }
     }
 
@@ -199,6 +204,9 @@ impl InputSubsystemImpl {
         let sdl_engine = sdl.engine();
         register_engine(sdl_engine, &mapping_factory);
         self.sdl = Some(sdl);
+        let joycon = Joycons::new("joycon".to_string());
+        register_engine(joycon.engine(), &mapping_factory);
+        self.joycon = Some(joycon);
 
         register_input_factory("touch_from_button", Arc::new(TouchFromButton::new()));
         register_input_factory("analog_from_button", Arc::new(StickFromButton::new()));
@@ -217,6 +225,7 @@ impl InputSubsystemImpl {
             "virtual_amiibo",
             "virtual_gamepad",
             "sdl",
+            "joycon",
         ] {
             unregister_input_factory(name);
             unregister_output_factory(name);
@@ -233,6 +242,7 @@ impl InputSubsystemImpl {
         self.virtual_amiibo = None;
         self.virtual_gamepad = None;
         self.sdl = None;
+        self.joycon = None;
         self.mapping_factory = None;
     }
 
@@ -253,6 +263,9 @@ impl InputSubsystemImpl {
         }
         if let Some(ref udp_client) = self.udp_client {
             devices.extend(udp_client.get_input_devices());
+        }
+        if let Some(ref joycon) = self.joycon {
+            devices.extend(joycon.get_input_devices());
         }
         if let Some(ref sdl) = self.sdl {
             devices.extend(sdl.get_input_devices());
@@ -275,6 +288,9 @@ impl InputSubsystemImpl {
         if let Some(ref sdl) = self.sdl {
             sdl.engine().lock().begin_configuration();
         }
+        if let Some(ref joycon) = self.joycon {
+            joycon.engine().lock().begin_configuration();
+        }
     }
 
     /// Port of Impl::EndConfiguration.
@@ -290,6 +306,9 @@ impl InputSubsystemImpl {
         }
         if let Some(ref sdl) = self.sdl {
             sdl.engine().lock().end_configuration();
+        }
+        if let Some(ref joycon) = self.joycon {
+            joycon.engine().lock().end_configuration();
         }
     }
 
@@ -328,14 +347,19 @@ impl InputSubsystemImpl {
                 .unwrap()
                 .get_analog_mapping_for_device(params);
         }
+        if let Some(ref udp_client) = self.udp_client {
+            if udp_client.engine().lock().get_engine_name() == engine {
+                return udp_client.get_analog_mapping_for_device(params);
+            }
+        }
         if let Some(ref sdl) = self.sdl {
             if sdl.engine().lock().get_engine_name() == engine {
                 return sdl.get_analog_mapping_for_device(params);
             }
         }
-        if let Some(ref udp_client) = self.udp_client {
-            if udp_client.engine().lock().get_engine_name() == engine {
-                return udp_client.get_analog_mapping_for_device(params);
+        if let Some(ref joycon) = self.joycon {
+            if joycon.engine().lock().get_engine_name() == engine {
+                return joycon.get_analog_mapping_for_device(params);
             }
         }
         // Keyboard, touch_screen, tas_input, camera, virtual_amiibo, virtual_gamepad
@@ -350,14 +374,19 @@ impl InputSubsystemImpl {
         if engine.is_empty() || engine == "any" {
             return HashMap::new();
         }
+        if let Some(ref udp_client) = self.udp_client {
+            if udp_client.engine().lock().get_engine_name() == engine {
+                return udp_client.get_button_mapping_for_device(params);
+            }
+        }
         if let Some(ref sdl) = self.sdl {
             if sdl.engine().lock().get_engine_name() == engine {
                 return sdl.get_button_mapping_for_device(params);
             }
         }
-        if let Some(ref udp_client) = self.udp_client {
-            if udp_client.engine().lock().get_engine_name() == engine {
-                return udp_client.get_button_mapping_for_device(params);
+        if let Some(ref joycon) = self.joycon {
+            if joycon.engine().lock().get_engine_name() == engine {
+                return joycon.get_button_mapping_for_device(params);
             }
         }
         // The remaining engines provide no custom button mappings.
@@ -371,14 +400,19 @@ impl InputSubsystemImpl {
         if engine.is_empty() || engine == "any" {
             return HashMap::new();
         }
+        if let Some(ref udp_client) = self.udp_client {
+            if udp_client.engine().lock().get_engine_name() == engine {
+                return udp_client.get_motion_mapping_for_device(params);
+            }
+        }
         if let Some(ref sdl) = self.sdl {
             if sdl.engine().lock().get_engine_name() == engine {
                 return sdl.get_motion_mapping_for_device(params);
             }
         }
-        if let Some(ref udp_client) = self.udp_client {
-            if udp_client.engine().lock().get_engine_name() == engine {
-                return udp_client.get_motion_mapping_for_device(params);
+        if let Some(ref joycon) = self.joycon {
+            if joycon.engine().lock().get_engine_name() == engine {
+                return joycon.get_motion_mapping_for_device(params);
             }
         }
         HashMap::new()
@@ -406,6 +440,11 @@ impl InputSubsystemImpl {
         if let Some(ref sdl) = self.sdl {
             if sdl.engine().lock().get_engine_name() == engine {
                 return sdl.get_ui_name(params);
+            }
+        }
+        if let Some(ref joycon) = self.joycon {
+            if joycon.engine().lock().get_engine_name() == engine {
+                return joycon.get_ui_name(params);
             }
         }
         ButtonNames::Invalid
@@ -779,6 +818,21 @@ mod tests {
         udp.force_update();
         assert_eq!(udp_status.lock().unwrap().input_type, InputType::Motion);
 
+        // `EmulatedController::SetDefaultOutputParams` always installs
+        // `engine:joycon` bindings. Upstream registers that engine alongside
+        // SDL, even when no physical Joy-Con is connected.
+        let mut joycon_params = ParamPackage::default();
+        joycon_params.set_str("engine", "joycon".to_string());
+        joycon_params.set_str("guid", UUID::default().raw_string());
+        joycon_params.set_int("port", 0);
+        joycon_params.set_int("pad", 0);
+        joycon_params.set_int("axis_x", 100);
+        joycon_params.set_int("axis_y", 101);
+        let mut joycon = common::input::create_input_device(&joycon_params);
+        let joycon_status = capture_status(joycon.as_mut());
+        joycon.force_update();
+        assert_eq!(joycon_status.lock().unwrap().input_type, InputType::Stick);
+
         let mut amiibo_params = ParamPackage::default();
         amiibo_params.set_str("engine", "virtual_amiibo".to_string());
         amiibo_params.set_int("nfc", 0);
@@ -868,6 +922,7 @@ mod tests {
         drop(camera_input);
         drop(camera_output);
         drop(gamepad_input);
+        drop(joycon);
         drop(udp);
         drop(touch);
         drop(analog);

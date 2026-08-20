@@ -7,6 +7,8 @@
 
 use std::sync::Arc;
 
+use parking_lot::Mutex;
+
 use common::input::{
     BatteryLevel, BodyColorStatus, ButtonNames, CameraFormat, CameraStatus, DriverResult,
     LedStatus, MifareRequest, NfcState, NfcStatus, PollingMode, VibrationStatus,
@@ -27,7 +29,9 @@ const MAX_SUPPORTED_CONTROLLERS: usize = 8;
 
 /// Port of `Joycons` class from joycon.h / joycon.cpp
 pub struct Joycons {
-    engine: InputEngine,
+    /// Shared with the factories registered by `InputSubsystem::Impl`, matching
+    /// upstream's shared `Joycons` instance.
+    engine: Arc<Mutex<InputEngine>>,
     // In C++ these hold shared_ptr<JoyconDriver>. Since JoyconDriver requires
     // SDL HID API for actual operation, we track connection status only.
 }
@@ -39,8 +43,13 @@ impl Joycons {
         // calls SDL_hid_init(), then Setup().
         log::info!("Joycon driver initialization started");
         Self {
-            engine: InputEngine::new(input_engine),
+            engine: Arc::new(Mutex::new(InputEngine::new(input_engine))),
         }
+    }
+
+    /// Shared handle to the underlying input engine for factory registration.
+    pub fn engine(&self) -> Arc<Mutex<InputEngine>> {
+        Arc::clone(&self.engine)
     }
 
     /// Port of Joycons::IsVibrationEnabled (override)
@@ -349,7 +358,7 @@ impl Joycons {
     fn get_param_package(&self, port: usize, controller_type: ControllerType) -> ParamPackage {
         let identifier = self.get_identifier(port, controller_type);
         let mut params = ParamPackage::default();
-        params.set_str("engine", self.engine.get_engine_name().to_string());
+        params.set_str("engine", self.engine.lock().get_engine_name().to_string());
         params.set_str("guid", identifier.guid.raw_string());
         params.set_int("port", identifier.port as i32);
         params.set_int("pad", identifier.pad as i32);
