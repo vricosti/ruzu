@@ -478,28 +478,24 @@ impl Memory {
         }
     }
 
-    /// Set the current page table (called when switching processes).
-    /// Set the current page table and wire up the fastmem arena.
-    /// Matches upstream `Memory::Impl::SetCurrentPageTable`.
-    ///
-    /// Upstream conditionally sets fastmem_arena based on
-    /// `process.IsApplication() && Settings::IsFastmemEnabled()`.
-    /// Settings are available via `common::settings::values()` but fastmem
-    /// enablement depends on the process context which varies at runtime.
     /// Raw pointer to current page table (for diagnostics).
     pub fn current_page_table_raw(&self) -> *mut PageTable {
         self.current_page_table
     }
 
-    pub fn set_current_page_table(&mut self, page_table: *mut PageTable) {
+    /// Set the current page table and wire up the fastmem arena.
+    /// Matches upstream `Memory::Impl::SetCurrentPageTable`.
+    pub fn set_current_page_table(&mut self, page_table: *mut PageTable, is_application: bool) {
         self.current_page_table = page_table;
         if !page_table.is_null() && !self.buffer.is_null() {
             let pt = unsafe { &mut *page_table };
-            // Upstream: if (process.IsApplication() && Settings::IsFastmemEnabled())
-            //     page_table.fastmem_arena = buffer.VirtualBasePointer();
-            // else
-            //     page_table.fastmem_arena = nullptr;
-            pt.fastmem_arena = unsafe { (*self.buffer).virtual_base_pointer() };
+            let settings = common::settings::values();
+            pt.fastmem_arena = if is_application && common::settings::is_fastmem_enabled(&settings)
+            {
+                unsafe { (*self.buffer).virtual_base_pointer() }
+            } else {
+                std::ptr::null_mut()
+            };
 
             // On Android, create a HeapTracker wrapping the HostMemory buffer.
             // Upstream: heap_tracker.emplace(system.DeviceMemory().buffer);
@@ -757,6 +753,12 @@ impl Memory {
                 }
             }
         }
+    }
+
+    /// Temporarily select a page table for slow-path memory copies without
+    /// changing its process-owned fastmem policy.
+    pub(crate) fn set_current_page_table_raw(&mut self, page_table: *mut PageTable) {
+        self.current_page_table = page_table;
     }
 
     /// Map a physical memory region into the guest virtual address space.
@@ -2962,6 +2964,114 @@ mod cmpxchg16b_tests {
     }
 }
 
+#[cfg(test)]
+mod process_fastmem_tests {
+    use super::*;
+    use common::host_memory::MemoryPermission;
+
+    fn memory_for_device(device_memory: &DeviceMemory) -> Memory {
+        unsafe {
+            Memory::new(
+                SystemRef::null(),
+                device_memory as *const _,
+                &device_memory.buffer,
+            )
+        }
+    }
+
+    #[test]
+    fn only_application_page_tables_receive_the_fastmem_arena() {
+        let device_memory = DeviceMemory::with_size(0x20_000);
+        let mut application_memory = memory_for_device(&device_memory);
+        let mut applet_memory = memory_for_device(&device_memory);
+        let mut application_page_table = PageTable::new();
+        let mut applet_page_table = PageTable::new();
+        application_page_table.resize(32, PAGE_BITS);
+        applet_page_table.resize(32, PAGE_BITS);
+
+        application_memory.set_current_page_table(&mut application_page_table, true);
+        applet_memory.set_current_page_table(&mut applet_page_table, false);
+
+        let settings = common::settings::values();
+        if common::settings::is_fastmem_enabled(&settings) {
+            assert_eq!(
+                application_page_table.fastmem_arena,
+                device_memory.buffer.virtual_base_pointer()
+            );
+        } else {
+            assert!(application_page_table.fastmem_arena.is_null());
+        }
+        assert!(applet_page_table.fastmem_arena.is_null());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn applet_mapping_does_not_replace_the_application_fastmem_alias() {
+        const VADDR: u64 = 0x4000;
+        const APPLICATION_OFFSET: usize = 0x2000;
+        const APPLET_OFFSET: usize = 0x6000;
+        const APPLICATION_VALUE: u64 = 0x1122_3344_5566_7788;
+        const APPLET_VALUE: u64 = 0x8877_6655_4433_2211;
+
+        let device_memory = DeviceMemory::with_size(0x20_000);
+        let mut application_memory = memory_for_device(&device_memory);
+        let mut applet_memory = memory_for_device(&device_memory);
+        let mut application_page_table = PageTable::new();
+        let mut applet_page_table = PageTable::new();
+        application_page_table.resize(32, PAGE_BITS);
+        applet_page_table.resize(32, PAGE_BITS);
+
+        unsafe {
+            device_memory
+                .buffer
+                .backing_base_pointer()
+                .add(APPLICATION_OFFSET)
+                .cast::<u64>()
+                .write(APPLICATION_VALUE);
+            device_memory
+                .buffer
+                .backing_base_pointer()
+                .add(APPLET_OFFSET)
+                .cast::<u64>()
+                .write(APPLET_VALUE);
+        }
+
+        application_memory.set_current_page_table(&mut application_page_table, true);
+        if application_page_table.fastmem_arena.is_null() {
+            return;
+        }
+        application_memory.map_memory_region(
+            &mut application_page_table,
+            VADDR,
+            PAGE_SIZE,
+            dram_memory_map::BASE + APPLICATION_OFFSET as u64,
+            MemoryPermission::READ_WRITE,
+            false,
+        );
+        let fastmem_value = || unsafe {
+            application_page_table
+                .fastmem_arena
+                .add(VADDR as usize)
+                .cast::<u64>()
+                .read()
+        };
+        assert_eq!(fastmem_value(), APPLICATION_VALUE);
+
+        applet_memory.set_current_page_table(&mut applet_page_table, false);
+        applet_memory.map_memory_region(
+            &mut applet_page_table,
+            VADDR,
+            PAGE_SIZE,
+            dram_memory_map::BASE + APPLET_OFFSET as u64,
+            MemoryPermission::READ_WRITE,
+            false,
+        );
+
+        assert_eq!(fastmem_value(), APPLICATION_VALUE);
+        assert_eq!(applet_memory.read_64(VADDR), APPLET_VALUE);
+    }
+}
+
 #[cfg(all(test, target_os = "linux"))]
 mod zero_phys_block_tests {
     use super::{dram_memory_map, DeviceMemory, Memory};
@@ -3244,7 +3354,7 @@ mod rasterizer_download_tests {
                 &device_memory.buffer,
             )
         };
-        memory.set_current_page_table(&mut *page_table);
+        memory.set_current_page_table(&mut *page_table, true);
 
         (device_memory, page_table, memory, vaddr, device_addr)
     }

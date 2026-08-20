@@ -245,7 +245,8 @@ fn get_info_impl(
                 return RESULT_INVALID_COMBINATION;
             }
 
-            let process = system.current_process_arc().lock().unwrap();
+            let process_arc = system.current_process_arc();
+            let process = process_arc.lock().unwrap();
             *result = process.get_random_entropy(info_sub_id as usize);
             RESULT_SUCCESS
         }

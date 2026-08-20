@@ -76,12 +76,6 @@ absolute timeline events and are both recorded in `capture-manifest.json`. Each 
 the emulation window before using XTEST keyboard injection, so the harness intentionally takes
 keyboard focus while an input timeline is active.
 
-The repository includes two MK8D Reden scenarios. `mk8d_input_reden_20260816.toml` preserves the
-requested 2-second cadence exactly; on Reden, menu transitions can consume some of those presses.
-`mk8d_race_reden_20260816.toml` uses 4-second menu intervals (and the requested final 6-second gap)
-and has been verified to reach the Mario Kart Stadium course introduction. The equivalent exact
-`ruzu-cmd` scenario is `mk8d_input_20260816.toml`.
-
 ## Timing contract
 
 - The timer origin is immediately after the target process has been accepted by the OS.

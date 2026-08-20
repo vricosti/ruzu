@@ -94,7 +94,8 @@ pub fn create_device_address_space(
         return RESULT_INVALID_MEMORY_REGION;
     }
 
-    let mut process = system.current_process_arc().lock().unwrap();
+    let process_arc = system.current_process_arc();
+    let mut process = process_arc.lock().unwrap();
 
     let mut das = KDeviceAddressSpace::new();
     let init_result = das.initialize(das_address, das_size);
@@ -133,7 +134,8 @@ pub fn attach_device_address_space(
     das_handle: Handle,
 ) -> ResultCode {
     let das = {
-        let process = system.current_process_arc().lock().unwrap();
+        let process_arc = system.current_process_arc();
+        let process = process_arc.lock().unwrap();
 
         // Validate the handle.
         let object_id = match process.handle_table.get_object(das_handle) {
@@ -159,7 +161,8 @@ pub fn detach_device_address_space(
     das_handle: Handle,
 ) -> ResultCode {
     let das = {
-        let process = system.current_process_arc().lock().unwrap();
+        let process_arc = system.current_process_arc();
+        let process = process_arc.lock().unwrap();
 
         // Validate the handle.
         let object_id = match process.handle_table.get_object(das_handle) {

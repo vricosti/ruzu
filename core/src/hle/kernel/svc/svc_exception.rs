@@ -293,7 +293,7 @@ fn dump_a64_break_context(system: &System, info1: u64, info2: u64) {
         return;
     };
     let core_index = kernel.current_physical_core_index() as usize;
-    let Some(process_arc) = system.current_process_arc.as_ref().cloned() else {
+    let Some(process_arc) = system.current_process_arc_opt() else {
         return;
     };
     let process = process_arc.lock().unwrap();
@@ -419,7 +419,7 @@ fn dump_a32_break_context(system: &System, info1: u64, info2: u64, args: &[u64])
 
     if let Some(kernel) = system.kernel() {
         let core_index = kernel.current_physical_core_index() as usize;
-        if let Some(process_arc) = system.current_process_arc.as_ref().cloned() {
+        if let Some(process_arc) = system.current_process_arc_opt() {
             let process = process_arc.lock().unwrap();
             if let Some(jit) = process.get_arm_interface(core_index) {
                 let mut ctx = crate::arm::arm_interface::ThreadContext::default();
@@ -456,7 +456,8 @@ fn dump_a32_break_context(system: &System, info1: u64, info2: u64, args: &[u64])
             let m = memory.lock().unwrap();
             m.read_block(info1, &mut buf);
         } else {
-            let process = system.current_process_arc().lock().unwrap();
+            let process_arc = system.current_process_arc();
+            let process = process_arc.lock().unwrap();
             let mem = process.process_memory.read().unwrap();
             if mem.is_valid_range(info1, len) {
                 for (index, byte) in buf.iter_mut().enumerate() {

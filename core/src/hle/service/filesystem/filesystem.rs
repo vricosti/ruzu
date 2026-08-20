@@ -491,10 +491,39 @@ impl FileSystemController {
 mod tests {
     use super::FileSystemController;
     use crate::file_sys::registered_cache::{ContentProviderUnion, ContentProviderUnionSlot};
+    use crate::file_sys::romfs_factory::RomFSFactory;
+    use crate::file_sys::vfs::vfs_types::VirtualFile;
+    use crate::file_sys::vfs::vfs_vector::VectorVfsFile;
     use common::fs::path_util::{get_ruzu_path, set_ruzu_path, RuzuPath};
     use std::fs;
     use std::sync::{Arc, Mutex};
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn registered_nca_process_exposes_its_romfs_controller() {
+        let controller = FileSystemController::new();
+        let process_id = 0x42;
+        let program_id = 0x0500_0000_0000_0001;
+        let romfs: VirtualFile = Arc::new(VectorVfsFile::new(
+            vec![0x5A; 0x40],
+            "test-applet.romfs".to_string(),
+            None,
+        ));
+        let factory = Arc::new(RomFSFactory::new_with_file(
+            Some(Arc::clone(&romfs)),
+            false,
+            None,
+            None,
+        ));
+
+        controller.register_process(process_id, program_id, Some(factory));
+
+        let (registered_program_id, _, romfs_controller) =
+            controller.open_process(process_id).unwrap();
+        assert_eq!(registered_program_id, program_id);
+        let opened = romfs_controller.open_romfs_current_process().unwrap();
+        assert!(Arc::ptr_eq(&opened, &romfs));
+    }
 
     #[test]
     fn create_factories_initializes_bis_factory_from_ruzu_paths() {

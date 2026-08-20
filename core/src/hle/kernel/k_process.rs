@@ -1860,7 +1860,8 @@ impl KProcess {
             if let (Some(memory), Some(impl_pt)) = (memory_clone, base.get_impl_mut()) {
                 let pt_ptr = impl_pt as *mut common::page_table::PageTable;
                 let mut memory = memory.lock().unwrap();
-                memory.set_current_page_table(pt_ptr);
+                let is_application = (flags & CreateProcessFlag::IS_APPLICATION.bits()) != 0;
+                memory.set_current_page_table(pt_ptr, is_application);
             }
         }
 
@@ -2148,13 +2149,40 @@ impl KProcess {
     ///
     /// Terminates child threads (other than the caller) and finalizes the
     /// handle table if the process isn't immortal.
+    fn finalize_handle_table(&mut self) {
+        // Upstream `KHandleTable::Finalize` closes every object stored in the
+        // table before clearing its slots. Rust keeps the typed owners in the
+        // process registries, so notify every client endpoint explicitly while
+        // its parent KSession is still available.
+        let client_sessions = std::mem::take(&mut self.client_session_objects);
+        for client_session in client_sessions.values() {
+            client_session.lock().unwrap().destroy_with_process(self);
+        }
+        self.client_session_parent_ids.clear();
+
+        // Session/service destruction may call back into the owning process.
+        // Release these owners after the process termination path returns,
+        // matching the deferred destruction performed by the kernel worker.
+        let sessions = std::mem::take(&mut self.session_objects);
+        KWorkerTaskManager::add_task_static(
+            0,
+            WorkerType::Exit,
+            Box::new(move || {
+                drop(client_sessions);
+                drop(sessions);
+            }),
+        );
+
+        self.handle_table.finalize();
+        self.is_handle_table_initialized = false;
+    }
+
     fn start_termination(&mut self, current_thread_id: Option<u64>) -> u32 {
         let terminate_result = self.terminate_children(current_thread_id);
 
         // Finalize the handle table when done, if the process isn't immortal.
         if !self.is_immortal && self.is_handle_table_initialized {
-            self.handle_table.finalize();
-            self.is_handle_table_initialized = false;
+            self.finalize_handle_table();
         }
 
         terminate_result
@@ -2306,8 +2334,7 @@ impl KProcess {
 
         // Finalize the handle table, if we're not immortal.
         if !self.is_immortal && self.is_handle_table_initialized {
-            self.handle_table.finalize();
-            self.is_handle_table_initialized = false;
+            self.finalize_handle_table();
         }
 
         // Finish termination.
@@ -3980,6 +4007,38 @@ mod tests {
             super::super::k_thread::ThreadState::TERMINATED
         );
         assert!(!current.lock().unwrap().is_termination_requested());
+    }
+
+    #[test]
+    fn finalize_handle_table_closes_client_sessions_and_detaches_owners() {
+        let mut process = KProcess::new();
+        assert_eq!(
+            process.initialize_handle_table(),
+            RESULT_SUCCESS.get_inner_value()
+        );
+
+        let session = Arc::new(Mutex::new(KSession::new()));
+        {
+            let mut session_guard = session.lock().unwrap();
+            session_guard.initialize(None, 0);
+            session_guard.client.lock().unwrap().initialize(0x1000);
+            session_guard.server.lock().unwrap().initialize(0x1000);
+        }
+        let client_session = session.lock().unwrap().get_client_session().clone();
+        let server_session = session.lock().unwrap().get_server_session().clone();
+        process.register_session_object(0x1000, Arc::clone(&session));
+        process.register_client_session_object(0x2000, client_session, 0x1000);
+        process.handle_table.add(0x2000).unwrap();
+
+        process.finalize_handle_table();
+        KWorkerTaskManager::wait_for_global_idle();
+
+        assert!(!process.is_handle_table_initialized);
+        assert_eq!(process.handle_table.get_count(), 0);
+        assert!(process.client_session_objects.is_empty());
+        assert!(process.client_session_parent_ids.is_empty());
+        assert!(process.session_objects.is_empty());
+        assert!(server_session.lock().unwrap().client_closed);
     }
 
     #[test]

@@ -34,7 +34,8 @@ pub fn send_sync_request_light(
 
     // Get the light client session from its handle.
     // Upstream: GetCurrentProcess(kernel).GetHandleTable().GetObject<KLightClientSession>(session_handle)
-    let process = system.current_process_arc().lock().unwrap();
+    let process_arc = system.current_process_arc();
+    let process = process_arc.lock().unwrap();
     let Some(object_id) = process.handle_table.get_object(session_handle) else {
         return RESULT_INVALID_HANDLE;
     };
@@ -63,7 +64,8 @@ pub fn reply_and_receive_light(
 
     // Get the light server session from its handle.
     // Upstream: GetCurrentProcess(kernel).GetHandleTable().GetObject<KLightServerSession>(session_handle)
-    let process = system.current_process_arc().lock().unwrap();
+    let process_arc = system.current_process_arc();
+    let process = process_arc.lock().unwrap();
     let Some(object_id) = process.handle_table.get_object(session_handle) else {
         return RESULT_INVALID_HANDLE;
     };

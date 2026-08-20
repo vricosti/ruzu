@@ -2517,10 +2517,17 @@ impl ArmDynarmic32 {
                         .map(|page_table| page_table.pointers.data() as *const u8)
                         .filter(|p| !p.is_null())
                 };
-                let fastmem_pointer = core_memory
-                    .as_ref()
-                    .map(|memory| memory.lock().unwrap().fastmem_pointer())
-                    .filter(|p| !p.is_null());
+                let fastmem_pointer = {
+                    let kernel_process = unsafe {
+                        &*(process as *const _ as *const crate::hle::kernel::k_process::KProcess)
+                    };
+                    kernel_process
+                        .page_table
+                        .get_base()
+                        .get_impl()
+                        .map(|page_table| page_table.fastmem_arena)
+                }
+                .filter(|p| !p.is_null());
                 (page_table_pointer, fastmem_pointer)
             };
 

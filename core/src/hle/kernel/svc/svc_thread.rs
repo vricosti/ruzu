@@ -42,7 +42,8 @@ fn resolve_thread_handle(system: &System, handle: Handle) -> Option<Arc<KThreadL
         return system.current_thread();
     }
 
-    let process = system.current_process_arc().lock().unwrap();
+    let process_arc = system.current_process_arc();
+    let process = process_arc.lock().unwrap();
     let object_id = process.handle_table.get_object(handle)?;
     process.get_thread_by_object_id(object_id)
 }
@@ -512,11 +513,11 @@ pub fn sleep_thread(system: &System, ns: i64) {
     // scheduler mutex is held while KScopedSchedulerLock unlock callbacks run.
     unsafe {
         if ns == YieldType::WithoutCoreMigration as i64 {
-            (*scheduler_ptr).yield_without_core_migration(current_process, current_thread_id);
+            (*scheduler_ptr).yield_without_core_migration(&current_process, current_thread_id);
         } else if ns == YieldType::WithCoreMigration as i64 {
-            (*scheduler_ptr).yield_with_core_migration(current_process, current_thread_id);
+            (*scheduler_ptr).yield_with_core_migration(&current_process, current_thread_id);
         } else if ns == YieldType::ToAnyThread as i64 {
-            (*scheduler_ptr).yield_to_any_thread(current_process, current_thread_id);
+            (*scheduler_ptr).yield_to_any_thread(&current_process, current_thread_id);
         }
     }
 }
@@ -671,7 +672,8 @@ pub fn set_thread_core_mask(
         affinity_mask,
         RESULT_SUCCESS,
     );
-    let process = system.current_process_arc().lock().unwrap();
+    let process_arc = system.current_process_arc();
+    let process = process_arc.lock().unwrap();
     if core_id == IDEAL_CORE_USE_PROCESS_VALUE {
         core_id = process.get_ideal_core_id();
         affinity_mask = 1u64 << core_id;
@@ -807,7 +809,8 @@ mod tests {
         assert_eq!(result, RESULT_SUCCESS);
         assert_ne!(handle, INVALID_HANDLE);
 
-        let process = system.current_process_arc().lock().unwrap();
+        let process_arc = system.current_process_arc();
+        let process = process_arc.lock().unwrap();
         let object_id = process.handle_table.get_object(handle).unwrap();
         let thread = process.get_thread_by_object_id(object_id).unwrap();
         drop(process);
@@ -867,7 +870,8 @@ mod tests {
 
         // Get the new thread's ID by looking up its handle.
         let new_thread_id = {
-            let process = system.current_process_arc().lock().unwrap();
+            let process_arc = system.current_process_arc();
+            let process = process_arc.lock().unwrap();
             let object_id = process.handle_table.get_object(handle).unwrap();
             let thread = process.get_thread_by_object_id(object_id).unwrap();
             let tid = thread.lock().unwrap().get_thread_id();
@@ -875,11 +879,12 @@ mod tests {
         };
 
         let current_thread_id = system.current_thread_id().unwrap();
+        let current_process = system.current_process_arc();
         let next_before_yield = system
             .scheduler_arc()
             .lock()
             .unwrap()
-            .select_next_thread_id(system.current_process_arc(), current_thread_id);
+            .select_next_thread_id(&current_process, current_thread_id);
         assert_eq!(next_before_yield, Some(current_thread_id));
 
         {
@@ -893,7 +898,7 @@ mod tests {
             .scheduler_arc()
             .lock()
             .unwrap()
-            .select_next_thread_id(system.current_process_arc(), current_thread_id);
+            .select_next_thread_id(&current_process, current_thread_id);
         assert_eq!(next_after_yield, Some(new_thread_id));
     }
 

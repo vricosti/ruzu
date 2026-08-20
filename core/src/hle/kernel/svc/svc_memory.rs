@@ -71,7 +71,8 @@ fn map_unmap_memory_sanity_checks(
     }
 
     // Check that the source range is within the current process address space.
-    let process = system.current_process_arc().lock().unwrap();
+    let process_arc = system.current_process_arc();
+    let process = process_arc.lock().unwrap();
     let src_addr_kpa = crate::hle::kernel::k_typed_address::KProcessAddress::new(src_addr);
     if !process.page_table.contains(src_addr_kpa, size as usize) {
         log::error!(
@@ -116,7 +117,8 @@ pub fn set_memory_permission(
     }
 
     // Validate that the region is in range for the current process.
-    let mut process = system.current_process_arc().lock().unwrap();
+    let process_arc = system.current_process_arc();
+    let mut process = process_arc.lock().unwrap();
     let addr_kpa = crate::hle::kernel::k_typed_address::KProcessAddress::new(address);
     if !process.page_table.contains(addr_kpa, size as usize) {
         return RESULT_INVALID_CURRENT_MEMORY;
@@ -172,7 +174,8 @@ pub fn set_memory_attribute(
     }
 
     // Validate that the region is in range for the current process.
-    let mut process = system.current_process_arc().lock().unwrap();
+    let process_arc = system.current_process_arc();
+    let mut process = process_arc.lock().unwrap();
     let addr_kpa = crate::hle::kernel::k_typed_address::KProcessAddress::new(address);
     if !process.page_table.contains(addr_kpa, size as usize) {
         return RESULT_INVALID_CURRENT_MEMORY;
@@ -207,7 +210,8 @@ pub fn map_memory(system: &System, dst_addr: u64, src_addr: u64, size: u64) -> R
         return result;
     }
 
-    let mut process = system.current_process_arc().lock().unwrap();
+    let process_arc = system.current_process_arc();
+    let mut process = process_arc.lock().unwrap();
     let dst_kpa = crate::hle::kernel::k_typed_address::KProcessAddress::new(dst_addr);
     let src_kpa = crate::hle::kernel::k_typed_address::KProcessAddress::new(src_addr);
     let r = process
@@ -283,7 +287,8 @@ pub fn unmap_memory(system: &System, dst_addr: u64, src_addr: u64, size: u64) ->
         return result;
     }
 
-    let mut process = system.current_process_arc().lock().unwrap();
+    let process_arc = system.current_process_arc();
+    let mut process = process_arc.lock().unwrap();
     let dst_kpa = crate::hle::kernel::k_typed_address::KProcessAddress::new(dst_addr);
     let src_kpa = crate::hle::kernel::k_typed_address::KProcessAddress::new(src_addr);
     let r = process

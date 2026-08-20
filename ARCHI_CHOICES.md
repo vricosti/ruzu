@@ -147,6 +147,39 @@ Upstream allocates its pending query vector but does not materialize spans.
 
 ---
 
+## 5. Server session closure queue and wait-holder teardown
+
+**Upstream.** `ServerManager::WaitSignaled` waits on intrusive
+`MultiWaitHolder` nodes. It unlinks the selected node before returning it to
+`Process`; consequently, every normal call to `DestroySession` receives a
+session whose holder is already absent from `m_multi_wait`. The C++ kernel
+objects notify closure through the synchronization object itself, so there is
+no separate session-closure queue.
+
+**The port.** Host IPC processing cannot retain the outer
+`Arc<Mutex<ServerManager>>` while it blocks or dispatches a request. Client-end
+closure is therefore forwarded through `pending_session_closures`, and the
+manager drains that queue while holding its owner lock. Because this path can
+destroy a session without first selecting its holder, `destroy_session`
+explicitly calls `unlink_from_multi_wait` before removing and dropping the
+boxed `Session`. On the ordinary selected-session path this is a no-op and
+preserves Eden's selection → unlink → process order.
+
+**Why.** `MultiWait` mirrors Eden's intrusive list with raw pointers to stable
+boxed holders. Dropping a queued-closed session while its holder remains in
+either `multi_wait` or `deferred_list` leaves a dangling pointer that another
+host service thread can dereference in `native_waitable_object`. Centralizing
+the unlink at the Rust destruction boundary keeps the additional notification
+mechanism memory-safe without changing the ownership of the underlying kernel
+session.
+
+**Cost.** Session destruction performs one idempotent linkage check and, only
+when the queue bypassed normal selection, one linear `Vec::retain` over the
+manager's wait holders. The adaptation also adds a closure queue and wakeup to
+the Rust manager that have no direct C++ counterpart.
+
+---
+
 ## Verification status of the above
 
 - `cargo test -p video_core --lib`: 1464 passed, 0 failed, including focused
@@ -155,6 +188,8 @@ Upstream allocates its pending query vector but does not materialize spans.
 - Successive samples reports are cumulative until `ResetCounter`, matching
   upstream `WriteCounter`; focused tests cover history snapshots and wide-range
   merging.
+- `ServerManager` regressions cover queued session destruction while the holder
+  is linked to either `deferred_list` or the main `multi_wait`.
 - `cargo build --bin ruzu`: clean.
 - **Not covered:** no test exercises the real GPU path. Reference counting, bank
   recycling and the ranged readback are validated only by cross-reading against

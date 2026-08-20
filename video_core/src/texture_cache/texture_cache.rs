@@ -2803,6 +2803,9 @@ impl<P: TextureCacheParams> TextureCacheBase<P> {
                 .contains(ImageFlagBits::REGISTERED),
             "TextureCache::register_image: image already registered"
         );
+        self.slot_images[image_id]
+            .flags
+            .insert(ImageFlagBits::REGISTERED);
         let memory_size = Self::registered_image_memory_size(&self.slot_images[image_id]);
         self.total_used_memory = self.total_used_memory.wrapping_add(memory_size);
         let lru_index = self.lru_cache.insert(image_id, self.frame_tick);
@@ -2816,26 +2819,20 @@ impl<P: TextureCacheParams> TextureCacheBase<P> {
                 image.flags.contains(ImageFlagBits::SPARSE),
             )
         };
-        if let Some(table_index) = self.current_gpu_page_table_index(false) {
-            let table = &mut self.gpu_page_table_storage[table_index];
-            Self::for_each_gpu_page(gpu_addr, guest_size_bytes, |page| {
-                let entries = table.entry(page).or_default();
-                if !entries.contains(&image_id) {
-                    entries.push(image_id);
-                }
-            });
-        }
-        if is_sparse {
-            if let Some(table_index) = self.current_gpu_page_table_index(true) {
-                let table = &mut self.gpu_page_table_storage[table_index];
-                Self::for_each_gpu_page(gpu_addr, guest_size_bytes, |page| {
-                    let entries = table.entry(page).or_default();
-                    if !entries.contains(&image_id) {
-                        entries.push(image_id);
-                    }
-                });
-            }
-        }
+        let table_index = self
+            .current_gpu_page_table_index(false)
+            .expect("TextureCache::register_image requires a bound GPU page table");
+        let previous_owner = self
+            .image_gpu_page_table_indices
+            .insert(image_id, table_index);
+        debug_assert!(
+            previous_owner.is_none(),
+            "TextureCache::register_image: image already has a GPU page-table owner"
+        );
+        let table = &mut self.gpu_page_table_storage[table_index];
+        Self::for_each_gpu_page(gpu_addr, guest_size_bytes, |page| {
+            table.entry(page).or_default().push(image_id);
+        });
 
         if is_sparse {
             let segments = self.sparse_segments_for_image(image_id, "TextureCache::register_image");
@@ -2848,17 +2845,15 @@ impl<P: TextureCacheParams> TextureCacheBase<P> {
                     image_id,
                 ));
                 Self::for_each_cpu_page(cpu_addr, segment_size, |page| {
-                    let entries = self.page_table.entry(page).or_default();
-                    if !entries.contains(&map_id) {
-                        entries.push(map_id);
-                    }
+                    self.page_table.entry(page).or_default().push(map_id);
                 });
                 sparse_maps.push(map_id);
             }
             self.sparse_views.insert(image_id, sparse_maps);
-            self.slot_images[image_id]
-                .flags
-                .insert(ImageFlagBits::REGISTERED);
+            let table = &mut self.gpu_page_table_storage[table_index + 1];
+            Self::for_each_gpu_page(gpu_addr, guest_size_bytes, |page| {
+                table.entry(page).or_default().push(image_id);
+            });
             return;
         }
 
@@ -2875,14 +2870,8 @@ impl<P: TextureCacheParams> TextureCacheBase<P> {
             (map.cpu_addr, map.size)
         };
         Self::for_each_cpu_page(cpu_addr, size, |page| {
-            let entries = self.page_table.entry(page).or_default();
-            if !entries.contains(&map_id) {
-                entries.push(map_id);
-            }
+            self.page_table.entry(page).or_default().push(map_id);
         });
-        self.slot_images[image_id]
-            .flags
-            .insert(ImageFlagBits::REGISTERED);
     }
 
     /// Port of `lru_cache.Touch(image.lru_index, frame_tick)` in
@@ -2901,21 +2890,42 @@ impl<P: TextureCacheParams> TextureCacheBase<P> {
     ///
     /// Removes the image from CPU page tables and clears registration state.
     pub fn unregister_image(&mut self, image_id: ImageId) {
-        let (is_sparse, gpu_addr, guest_size_bytes, map_view_id) = {
-            let image = &self.slot_images[image_id];
+        let (is_sparse, gpu_addr, guest_size_bytes, map_view_id, lru_index) = {
+            let image = &mut self.slot_images[image_id];
             debug_assert!(
                 image.flags.contains(ImageFlagBits::REGISTERED),
                 "TextureCache::unregister_image: image not registered"
             );
+            image.flags.remove(ImageFlagBits::REGISTERED);
+            image.flags.remove(ImageFlagBits::BAD_OVERLAP);
+            let lru_index = image.lru_index;
+            image.lru_index = usize::MAX;
             (
                 image.flags.contains(ImageFlagBits::SPARSE),
                 image.gpu_addr,
                 image.guest_size_bytes as usize,
                 image.map_view_id,
+                lru_index,
             )
         };
-        if let Some(table_index) = self.current_gpu_page_table_index(false) {
-            let table = &mut self.gpu_page_table_storage[table_index];
+        if lru_index != usize::MAX {
+            self.lru_cache.free(lru_index);
+        }
+        let table_index = self
+            .image_gpu_page_table_indices
+            .remove(&image_id)
+            .expect("TextureCache::unregister_image missing GPU page-table owner");
+        let table = &mut self.gpu_page_table_storage[table_index];
+        Self::for_each_gpu_page(gpu_addr, guest_size_bytes, |page| {
+            if let Some(image_ids) = table.get_mut(&page) {
+                image_ids.retain(|&id| id != image_id);
+                if image_ids.is_empty() {
+                    table.remove(&page);
+                }
+            }
+        });
+        if is_sparse {
+            let table = &mut self.gpu_page_table_storage[table_index + 1];
             Self::for_each_gpu_page(gpu_addr, guest_size_bytes, |page| {
                 if let Some(image_ids) = table.get_mut(&page) {
                     image_ids.retain(|&id| id != image_id);
@@ -2924,19 +2934,6 @@ impl<P: TextureCacheParams> TextureCacheBase<P> {
                     }
                 }
             });
-        }
-        if is_sparse {
-            if let Some(table_index) = self.current_gpu_page_table_index(true) {
-                let table = &mut self.gpu_page_table_storage[table_index];
-                Self::for_each_gpu_page(gpu_addr, guest_size_bytes, |page| {
-                    if let Some(image_ids) = table.get_mut(&page) {
-                        image_ids.retain(|&id| id != image_id);
-                        if image_ids.is_empty() {
-                            table.remove(&page);
-                        }
-                    }
-                });
-            }
         }
         let map_ids = if is_sparse {
             self.sparse_views
@@ -2972,15 +2969,8 @@ impl<P: TextureCacheParams> TextureCacheBase<P> {
             }
         }
 
-        let image = &mut self.slot_images[image_id];
-        image.flags.remove(ImageFlagBits::REGISTERED);
-        image.flags.remove(ImageFlagBits::BAD_OVERLAP);
         if !is_sparse {
-            image.map_view_id = ImageMapId::default();
-        }
-        if image.lru_index != usize::MAX {
-            self.lru_cache.free(image.lru_index);
-            image.lru_index = usize::MAX;
+            self.slot_images[image_id].map_view_id = ImageMapId::default();
         }
     }
 
@@ -6012,6 +6002,53 @@ mod tests {
         assert!(cache
             .collect_images_in_gpu_region(0x4000, 4, false)
             .is_empty());
+    }
+
+    #[test]
+    fn unregister_image_uses_registration_address_space_after_channel_switch() {
+        use crate::control::channel_state::ChannelState;
+        use crate::memory_manager::MemoryManager;
+        use parking_lot::Mutex as ParkingMutex;
+        use std::sync::Arc;
+
+        let mut cache = unbound_test_cache();
+        let memory_a = Arc::new(ParkingMutex::new(MemoryManager::new(17)));
+        let memory_b = Arc::new(ParkingMutex::new(MemoryManager::new(18)));
+        let mut channel_a = ChannelState::new(10);
+        let mut channel_b = ChannelState::new(11);
+        channel_a.memory_manager = Some(memory_a);
+        channel_b.memory_manager = Some(memory_b);
+        cache.create_channel(&channel_a);
+        cache.create_channel(&channel_b);
+        cache.bind_to_channel(10);
+
+        let info = ImageInfo {
+            format: surface::PixelFormat::A8B8G8R8Unorm,
+            size: crate::texture_cache::types::Extent3D {
+                width: 16,
+                height: 16,
+                depth: 1,
+            },
+            ..ImageInfo::default()
+        };
+        let image_id = cache.insert_image(&info, 0x4000);
+        let owner_table = cache
+            .image_gpu_page_table_indices
+            .get(&image_id)
+            .copied()
+            .expect("registered image must retain its GPU page-table owner");
+        assert!(cache.gpu_page_table_storage[owner_table]
+            .values()
+            .any(|image_ids| image_ids.contains(&image_id)));
+
+        cache.bind_to_channel(11);
+        assert_ne!(cache.current_gpu_page_table_index(false), Some(owner_table));
+        cache.unregister_image(image_id);
+
+        assert!(cache.gpu_page_table_storage[owner_table]
+            .values()
+            .all(|image_ids| !image_ids.contains(&image_id)));
+        assert!(!cache.image_gpu_page_table_indices.contains_key(&image_id));
     }
 
     #[test]

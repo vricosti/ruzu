@@ -400,6 +400,7 @@ impl Applet {
     pub fn update_suspension_state_locked(&mut self, force_message: bool) {
         self.lifecycle_manager.remove_force_resume_if_possible();
 
+        let update_requested_focus_state = self.lifecycle_manager.update_requested_focus_state();
         let curr_activity_runnable = self.lifecycle_manager.is_runnable();
         let prev_activity_runnable = self.is_activity_runnable;
         let was_changed = curr_activity_runnable != prev_activity_runnable;
@@ -418,7 +419,7 @@ impl Applet {
             return;
         }
 
-        if self.lifecycle_manager.update_requested_focus_state() || was_changed || force_message {
+        if update_requested_focus_state || was_changed || force_message {
             self.lifecycle_manager.signal_system_event_if_needed();
         }
     }
@@ -453,10 +454,10 @@ impl Applet {
         }
     }
 
-    /// Port of Applet::OnProcessTerminatedLocked
-    pub fn on_process_terminated_locked(&mut self, process: &mut KProcess) {
+    /// Port of `Applet::OnProcessTerminatedLocked`.
+    pub fn on_process_terminated_locked(&mut self) {
         self.is_completed = true;
-        self.signal_state_changed_event(process);
+        self.signal_state_changed_event_without_process();
     }
 }
 
@@ -464,8 +465,9 @@ impl Applet {
 mod tests {
     use super::Applet;
     use crate::hle::kernel::k_process::ProcessLock;
+    use crate::hle::kernel::k_readable_event::KReadableEvent;
     use crate::hle::service::os::process::Process;
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
 
     #[test]
     fn new_initializes_aruid_and_program_id_from_process() {
@@ -480,5 +482,20 @@ mod tests {
 
         assert_eq!(applet.aruid.pid, 0x1234);
         assert_eq!(applet.program_id, 0x0102_0304_0506_0708);
+    }
+
+    #[test]
+    fn process_termination_completes_applet_and_signals_state_change() {
+        let process = Process::with_process(Arc::new(ProcessLock::from_value(
+            crate::hle::kernel::k_process::KProcess::new(),
+        )));
+        let mut applet = Applet::new(crate::core::SystemRef::null(), process, false);
+        let state_changed_event = Arc::new(Mutex::new(KReadableEvent::new()));
+        applet.state_changed_event = Some(Arc::clone(&state_changed_event));
+
+        applet.on_process_terminated_locked();
+
+        assert!(applet.is_completed);
+        assert!(state_changed_event.lock().unwrap().is_signaled());
     }
 }

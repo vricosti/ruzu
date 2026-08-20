@@ -1,6 +1,6 @@
 Avant de continuer a investiguer j'ai une question: comment on peut utiliser MoltenVk 1.4.2 alors qu'il n'est pas sorti, v1.4.2-rc1 est sorti il y a 2 jours ? Tu utilises le repository ? https://github.com/KhronosGroup/MoltenVK/releases/tag/v1.4.2-rc1
 ---
-verifier que eden et reden utilisent les memes appels opengl glsl/vulkan sur MK8D, on pourra commencer
+verifier que eden et reden utilisent les memes appels opengl glsl/vulkan sur ..., on pourra commencer
  
   par le titre, puis ensuite attendre au moins 45s que l'attract mode se declenche et comparer les 7 premieres
  

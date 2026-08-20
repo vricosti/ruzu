@@ -4304,11 +4304,83 @@ pub fn update_ui_theme() {
         _ => true,
     };
 
+    // Yaru compiles its accent directly into each widget selector instead of
+    // resolving the public GTK named colours at runtime. Select Ubuntu's
+    // complete blue variant so menus, notebooks, checks, switches, focus
+    // rings, and selections all change together instead of requiring a local
+    // override for every Ruzu widget.
+    if let Some(theme_name) = settings.gtk_theme_name() {
+        if let Some(blue_theme_name) = blue_accent_theme_variant(&theme_name, dark) {
+            settings.set_gtk_theme_name(Some(blue_theme_name));
+        }
+    }
     settings.set_gtk_application_prefer_dark_theme(dark);
+    install_blue_accent_css();
     log::debug!(
         "UI theme '{internal}' resolved to {} mode",
         if dark { "dark" } else { "light" }
     );
+}
+
+/// Eden's Fusion selection colour, sampled from its configuration dialog.
+const EDEN_ACCENT_COLOR: &str = "#308CC6";
+
+fn blue_accent_theme_variant(theme_name: &str, dark: bool) -> Option<&'static str> {
+    let normalized = theme_name.to_ascii_lowercase();
+    if !normalized.starts_with("yaru") {
+        return None;
+    }
+
+    Some(if dark { "Yaru-blue-dark" } else { "Yaru-blue" })
+}
+
+#[cfg(test)]
+mod blue_accent_theme_tests {
+    use super::blue_accent_theme_variant;
+
+    #[test]
+    fn yaru_uses_the_complete_blue_variant() {
+        assert_eq!(blue_accent_theme_variant("Yaru", false), Some("Yaru-blue"));
+        assert_eq!(
+            blue_accent_theme_variant("Yaru", true),
+            Some("Yaru-blue-dark")
+        );
+        assert_eq!(
+            blue_accent_theme_variant("Yaru-purple-dark", false),
+            Some("Yaru-blue")
+        );
+    }
+
+    #[test]
+    fn unrelated_desktop_themes_keep_their_identity() {
+        assert_eq!(blue_accent_theme_variant("Adwaita", false), None);
+    }
+}
+
+/// Keep GTK desktop themes from replacing Eden's blue accent with their own
+/// distribution-specific colour (orange in Ubuntu's Yaru theme).
+fn install_blue_accent_css() {
+    use std::sync::Once;
+    static ONCE: Once = Once::new();
+
+    ONCE.call_once(|| {
+        let Some(display) = gtk::gdk::Display::default() else {
+            return;
+        };
+        let provider = gtk::CssProvider::new();
+        provider.load_from_data(&format!(
+            "@define-color theme_selected_bg_color {EDEN_ACCENT_COLOR};\
+             @define-color theme_selected_fg_color #ffffff;\
+             @define-color accent_bg_color {EDEN_ACCENT_COLOR};\
+             @define-color accent_fg_color #ffffff;\
+             @define-color accent_color {EDEN_ACCENT_COLOR};"
+        ));
+        gtk::style_context_add_provider_for_display(
+            &display,
+            &provider,
+            gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
+        );
+    });
 }
 
 /// Install the black backdrop CSS for the render page once.

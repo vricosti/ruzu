@@ -2206,7 +2206,7 @@ mod tests {
             PageType::Memory,
             unsafe { host_ptr.add(PAGE_SIZE as usize) } as usize,
         );
-        memory.set_current_page_table(&mut *page_table);
+        memory.set_current_page_table(&mut *page_table, true);
 
         let asid = mgr.smmu_register_process(Some(Arc::new(Mutex::new(memory))));
         mgr.smmu_map(0x8000, 0x4000_0000, 0x2000, asid, true);
@@ -2262,7 +2262,7 @@ mod tests {
             PageType::Memory,
             second_host_ptr as usize,
         );
-        memory.set_current_page_table(&mut *page_table);
+        memory.set_current_page_table(&mut *page_table, true);
 
         let asid = mgr.smmu_register_process(Some(Arc::new(Mutex::new(memory))));
         mgr.smmu_map(0x8000, 0x4000_0000, 0x2000, asid, true);
@@ -2303,7 +2303,7 @@ mod tests {
             PageType::Memory,
             unsafe { host_ptr.add(PAGE_SIZE as usize) } as usize,
         );
-        memory.set_current_page_table(&mut *page_table);
+        memory.set_current_page_table(&mut *page_table, true);
 
         let asid = mgr.smmu_register_process(Some(Arc::new(Mutex::new(memory))));
         mgr.smmu_map(0x8000, 0x4000_0080, 0x2000, asid, true);

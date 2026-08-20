@@ -110,7 +110,8 @@ pub fn connect_to_named_port(system: &System, out: &mut Handle, user_name: u64) 
     };
 
     let handler = service_manager.lock().unwrap().get_service(&name);
-    let mut process = system.current_process_arc().lock().unwrap();
+    let process_arc = system.current_process_arc();
+    let mut process = process_arc.lock().unwrap();
     let reserved_handle = match process.handle_table.reserve() {
         Ok(handle) => handle,
         Err(_) => return RESULT_OUT_OF_HANDLES,
@@ -231,7 +232,8 @@ pub fn create_port(
     let client_port_object_id = kernel.create_new_object_id() as u64;
     let server_port_object_id = kernel.create_new_object_id() as u64;
 
-    let mut process = system.current_process_arc().lock().unwrap();
+    let process_arc = system.current_process_arc();
+    let mut process = process_arc.lock().unwrap();
     process.register_client_port_object(client_port_object_id, port.clone());
     process.register_server_port_object(server_port_object_id, port);
     kernel.register_kernel_object(client_port_object_id);
@@ -322,7 +324,8 @@ pub fn connect_to_port(system: &System, out: &mut Handle, port: Handle) -> Resul
     }
 
     let kernel = system.kernel().expect("kernel not initialized");
-    let mut process = system.current_process_arc().lock().unwrap();
+    let process_arc = system.current_process_arc();
+    let mut process = process_arc.lock().unwrap();
     let Some(object_id) = process.handle_table.get_object(port) else {
         return RESULT_INVALID_HANDLE;
     };
@@ -441,7 +444,8 @@ pub fn manage_named_port(
         let server_port_object_id = kernel.create_new_object_id() as u64;
         let client_port_object_id = kernel.create_new_object_id() as u64;
 
-        let mut process = system.current_process_arc().lock().unwrap();
+        let process_arc = system.current_process_arc();
+        let mut process = process_arc.lock().unwrap();
         process.register_server_port_object(server_port_object_id, port.clone());
         process.register_client_port_object(client_port_object_id, port);
         kernel.register_kernel_object(server_port_object_id);
@@ -493,7 +497,8 @@ pub fn manage_named_port(
                     return RESULT_NOT_FOUND;
                 }
                 let object_id = obj as u64;
-                let mut process = system.current_process_arc().lock().unwrap();
+                let process_arc = system.current_process_arc();
+                let mut process = process_arc.lock().unwrap();
                 process.unregister_client_port_object_by_object_id(object_id);
                 kernel.unregister_kernel_object(object_id);
             } else {
@@ -562,7 +567,8 @@ mod tests {
             RESULT_SUCCESS
         );
 
-        let process = system.current_process_arc().lock().unwrap();
+        let process_arc = system.current_process_arc();
+        let process = process_arc.lock().unwrap();
         let server_object_id = process.handle_table.get_object(server).unwrap();
         let client_object_id = process.handle_table.get_object(client).unwrap();
         assert!(process
@@ -590,7 +596,8 @@ mod tests {
             RESULT_SUCCESS
         );
 
-        let process = system.current_process_arc().lock().unwrap();
+        let process_arc = system.current_process_arc();
+        let process = process_arc.lock().unwrap();
         let client_session_object_id = process.handle_table.get_object(session_handle).unwrap();
         let client_session = process
             .get_client_session_by_object_id(client_session_object_id)
@@ -627,7 +634,8 @@ mod tests {
             RESULT_SUCCESS
         );
 
-        let mut process = system.current_process_arc().lock().unwrap();
+        let process_arc = system.current_process_arc();
+        let mut process = process_arc.lock().unwrap();
         let client_port_object_id = process.handle_table.get_object(client).unwrap();
         let session_client_object_id = process.handle_table.get_object(session_handle).unwrap();
         let session_object_id = process
@@ -673,7 +681,8 @@ mod tests {
             RESULT_SUCCESS
         );
 
-        let process = system.current_process_arc().lock().unwrap();
+        let process_arc = system.current_process_arc();
+        let process = process_arc.lock().unwrap();
         let client_session_object_id = process.handle_table.get_object(session_handle).unwrap();
         assert!(process
             .get_light_client_session_by_object_id(client_session_object_id)
@@ -703,7 +712,8 @@ mod tests {
 
         let client_port_object_id = 0x1234_u64;
         {
-            let mut process = system.current_process_arc().lock().unwrap();
+            let process_arc = system.current_process_arc();
+            let mut process = process_arc.lock().unwrap();
             process.register_client_port_object(client_port_object_id, port);
         }
         kernel.register_kernel_object(client_port_object_id);
@@ -726,7 +736,8 @@ mod tests {
             RESULT_SUCCESS
         );
 
-        let process = system.current_process_arc().lock().unwrap();
+        let process_arc = system.current_process_arc();
+        let process = process_arc.lock().unwrap();
         let client_session_object_id = process.handle_table.get_object(handle).unwrap();
         assert!(process
             .get_client_session_by_object_id(client_session_object_id)
@@ -749,7 +760,8 @@ mod tests {
             RESULT_SUCCESS
         );
 
-        let process = system.current_process_arc().lock().unwrap();
+        let process_arc = system.current_process_arc();
+        let process = process_arc.lock().unwrap();
         let client_session_object_id = process.handle_table.get_object(handle).unwrap();
         let client_session = process
             .get_client_session_by_object_id(client_session_object_id)

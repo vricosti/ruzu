@@ -43,7 +43,8 @@ pub fn create_resource_limit(system: &System, out_handle: &mut Handle) -> Result
     let kernel = system.kernel().expect("kernel not initialized");
     let object_id = kernel.create_new_object_id() as u64;
 
-    let mut process = system.current_process_arc().lock().unwrap();
+    let process_arc = system.current_process_arc();
+    let mut process = process_arc.lock().unwrap();
     // Once KProcess has register_resource_limit_object, call it here:
     // process.register_resource_limit_object(object_id, resource_limit);
 
@@ -88,7 +89,8 @@ pub fn get_resource_limit_limit_value(
     }
 
     // Upstream: GetCurrentProcess(kernel).GetHandleTable().GetObject<KResourceLimit>(handle)
-    let process = system.current_process_arc().lock().unwrap();
+    let process_arc = system.current_process_arc();
+    let process = process_arc.lock().unwrap();
     let Some(_object_id) = process.handle_table.get_object(resource_limit_handle) else {
         return RESULT_INVALID_HANDLE;
     };
@@ -132,7 +134,8 @@ pub fn get_resource_limit_current_value(
         return RESULT_INVALID_ENUM_VALUE;
     }
 
-    let process = system.current_process_arc().lock().unwrap();
+    let process_arc = system.current_process_arc();
+    let process = process_arc.lock().unwrap();
     let Some(_object_id) = process.handle_table.get_object(resource_limit_handle) else {
         return RESULT_INVALID_HANDLE;
     };
@@ -168,7 +171,8 @@ pub fn set_resource_limit_limit_value(
         return RESULT_INVALID_ENUM_VALUE;
     }
 
-    let process = system.current_process_arc().lock().unwrap();
+    let process_arc = system.current_process_arc();
+    let process = process_arc.lock().unwrap();
     let Some(_object_id) = process.handle_table.get_object(resource_limit_handle) else {
         return RESULT_INVALID_HANDLE;
     };

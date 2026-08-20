@@ -88,11 +88,11 @@ impl UUID {
         u128::from_le_bytes(self.uuid)
     }
 
-    /// Creates the default UUID "yuzu Default UID".
+    /// Creates the default UUID "Eden Default UID".
     pub const fn make_default() -> Self {
         Self {
             uuid: [
-                b'y', b'u', b'z', b'u', b' ', b'D', b'e', b'f', b'a', b'u', b'l', b't', b' ', b'U',
+                b'E', b'd', b'e', b'n', b' ', b'D', b'e', b'f', b'a', b'u', b'l', b't', b' ', b'U',
                 b'I', b'D',
             ],
         }
@@ -263,7 +263,7 @@ mod tests {
     fn test_uuid_make_default() {
         let uuid = UUID::make_default();
         assert!(uuid.is_valid());
-        assert_eq!(&uuid.uuid, b"yuzu Default UID");
+        assert_eq!(&uuid.uuid, b"Eden Default UID");
     }
 
     #[test]

@@ -66,7 +66,8 @@ pub fn map_shared_memory(
     }
 
     // Get the KSharedMemory from the handle table.
-    let mut process = system.current_process_arc().lock().unwrap();
+    let process_arc = system.current_process_arc();
+    let mut process = process_arc.lock().unwrap();
 
     let object_id = match process.handle_table.get_object(shmem_handle) {
         Some(id) => id,
@@ -247,7 +248,8 @@ pub fn unmap_shared_memory(
         return RESULT_INVALID_CURRENT_MEMORY;
     }
 
-    let mut process = system.current_process_arc().lock().unwrap();
+    let process_arc = system.current_process_arc();
+    let mut process = process_arc.lock().unwrap();
 
     let object_id = match process.handle_table.get_object(shmem_handle) {
         Some(id) => id,

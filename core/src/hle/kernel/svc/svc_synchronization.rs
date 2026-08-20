@@ -323,7 +323,8 @@ pub fn wait_synchronization(
 pub fn cancel_synchronization(system: &System, handle: Handle) -> ResultCode {
     log::trace!("svc::CancelSynchronization called handle=0x{:X}", handle);
 
-    let process = system.current_process_arc().lock().unwrap();
+    let process_arc = system.current_process_arc();
+    let process = process_arc.lock().unwrap();
     let Some(object_id) = process.handle_table.get_object(handle) else {
         return RESULT_INVALID_HANDLE;
     };
@@ -357,7 +358,8 @@ pub fn synchronize_preemption_state(system: &System) {
         None => return,
     };
 
-    let mut process = system.current_process_arc().lock().unwrap();
+    let process_arc = system.current_process_arc();
+    let mut process = process_arc.lock().unwrap();
 
     // If the current thread is pinned, unpin it.
     if let Some(pinned_id) = process.get_pinned_thread(core_id) {
@@ -492,11 +494,12 @@ mod tests {
         memory
             .lock()
             .unwrap()
-            .set_current_page_table(impl_pt.as_mut() as *mut _);
+            .set_current_page_table(impl_pt.as_mut() as *mut _, true);
     }
 
     fn write_wait_handles(system: &System, handles: &[Handle]) -> u64 {
-        let mut process = system.current_process_arc().lock().unwrap();
+        let process_arc = system.current_process_arc();
+        let mut process = process_arc.lock().unwrap();
         let (result, heap_base) = process.set_heap_size(0x200000);
         assert_eq!(result, RESULT_SUCCESS.get_inner_value());
         let addr = heap_base.get() + 0x100;
@@ -604,7 +607,8 @@ mod tests {
         let _kernel = kernel_with_application_pool_for_test(0x80000);
         let system = test_system();
         let (heap_base, heap_size) = {
-            let mut process = system.current_process_arc().lock().unwrap();
+            let process_arc = system.current_process_arc();
+            let mut process = process_arc.lock().unwrap();
             let (result, heap_base) = process.set_heap_size(0x200000);
             assert_eq!(result, RESULT_SUCCESS.get_inner_value());
 
@@ -630,7 +634,8 @@ mod tests {
         );
 
         let transfer_object_id = {
-            let process = system.current_process_arc().lock().unwrap();
+            let process_arc = system.current_process_arc();
+            let process = process_arc.lock().unwrap();
             let object_id = process
                 .handle_table
                 .get_object(handle)
@@ -649,7 +654,8 @@ mod tests {
 
         assert_eq!(close_handle(&system, handle), RESULT_SUCCESS);
 
-        let process = system.current_process_arc().lock().unwrap();
+        let process_arc = system.current_process_arc();
+        let process = process_arc.lock().unwrap();
         let merged_info = process
             .page_table
             .query_info(heap_base as usize)
@@ -666,7 +672,8 @@ mod tests {
         let _kernel = kernel_with_application_pool_for_test(0x80000);
         let system = test_system();
         let heap_base = {
-            let mut process = system.current_process_arc().lock().unwrap();
+            let process_arc = system.current_process_arc();
+            let mut process = process_arc.lock().unwrap();
             let (result, heap_base) = process.set_heap_size(0x200000);
             assert_eq!(result, RESULT_SUCCESS.get_inner_value());
             heap_base.get()
@@ -685,7 +692,8 @@ mod tests {
         );
 
         {
-            let process = system.current_process_arc().lock().unwrap();
+            let process_arc = system.current_process_arc();
+            let process = process_arc.lock().unwrap();
             let current = process
                 .resource_limit
                 .as_ref()
@@ -700,7 +708,8 @@ mod tests {
 
         assert_eq!(close_handle(&system, handle), RESULT_SUCCESS);
 
-        let process = system.current_process_arc().lock().unwrap();
+        let process_arc = system.current_process_arc();
+        let process = process_arc.lock().unwrap();
         let current = process
             .resource_limit
             .as_ref()
@@ -913,7 +922,8 @@ mod tests {
         let system = test_system();
 
         let process_handle = {
-            let mut process = system.current_process_arc().lock().unwrap();
+            let process_arc = system.current_process_arc();
+            let mut process = process_arc.lock().unwrap();
             let process_id = process.process_id;
             process.state = crate::hle::kernel::k_process::ProcessState::RunningAttached;
             process.is_signaled = false;

@@ -919,13 +919,6 @@ impl GpuChannelHandle for VideoGpuChannelHandle {
             .expect("GPU memory manager handle must come from video_core::gpu::Gpu");
         let mut channel_state = self.channel_state.lock();
         channel_state.memory_manager = Some(Arc::clone(&memory_manager.memory_manager));
-        if channel_state.initialized {
-            let gpu = unsafe { &*self.gpu };
-            if let Some(rasterizer) = gpu.rasterizer_handle() {
-                let rasterizer = unsafe { rasterizer.as_mut() };
-                rasterizer.bind_channel(&mut channel_state);
-            }
-        }
     }
 
     fn init_channel(&self, program_id: u64) {
@@ -945,9 +938,6 @@ impl GpuChannelHandle for VideoGpuChannelHandle {
             let rasterizer = unsafe { rasterizer.as_mut() };
             channel_state.bind_rasterizer(rasterizer);
             rasterizer.initialize_channel(&mut channel_state);
-            if channel_state.memory_manager.is_some() {
-                rasterizer.bind_channel(&mut channel_state);
-            }
         }
     }
 
@@ -1336,7 +1326,7 @@ mod tests {
     }
 
     #[test]
-    fn init_channel_binds_rasterizer_and_initializes_channel() {
+    fn init_channel_initializes_without_changing_the_bound_channel() {
         let gpu = Gpu::new(false, false);
         let channel_state = gpu.create_channel(7);
         channel_state.lock().memory_manager = Some(Arc::new(parking_lot::Mutex::new(
@@ -1370,7 +1360,7 @@ mod tests {
             .lock()
             .has_bound_rasterizer());
         assert_eq!(*initialized_channels.lock().unwrap(), vec![7]);
-        assert_eq!(*bound_channels.lock().unwrap(), vec![7]);
+        assert!(bound_channels.lock().unwrap().is_empty());
 
         unsafe {
             drop(Box::from_raw(rasterizer_ptr));
@@ -1420,7 +1410,7 @@ mod tests {
     }
 
     #[test]
-    fn bind_memory_manager_defers_rasterizer_bind_until_channel_initialized() {
+    fn bind_memory_manager_and_init_do_not_change_the_bound_channel() {
         let gpu = Gpu::new(false, false);
         let channel_state = gpu.create_channel(7);
 
@@ -1455,7 +1445,7 @@ mod tests {
         channel_handle.init_channel(0x1234);
 
         assert_eq!(*initialized_channels.lock().unwrap(), vec![7]);
-        assert_eq!(*bound_channels.lock().unwrap(), vec![7]);
+        assert!(bound_channels.lock().unwrap().is_empty());
 
         unsafe {
             drop(Box::from_raw(rasterizer_ptr));

@@ -121,7 +121,7 @@ mod tests {
 
     #[test]
     fn get_device_id_returns_upstream_default_uuid() {
-        assert_eq!(get_device_id().to_le_bytes(), *b"yuzu Default UID");
+        assert_eq!(get_device_id().to_le_bytes(), *b"Eden Default UID");
     }
 
     #[test]

@@ -32,7 +32,8 @@ pub fn get_process_id(system: &System, out_process_id: &mut u64, handle: Handle)
 
     // Handle pseudo-handle for current process.
     if handle == PseudoHandle::CurrentProcess as Handle {
-        let process = system.current_process_arc().lock().unwrap();
+        let process_arc = system.current_process_arc();
+        let process = process_arc.lock().unwrap();
         *out_process_id = process.get_process_id();
         return RESULT_SUCCESS;
     }
@@ -85,7 +86,8 @@ pub fn get_process_list(
     }
 
     // In our single-process model, we have one process.
-    let process = system.current_process_arc().lock().unwrap();
+    let process_arc = system.current_process_arc();
+    let process = process_arc.lock().unwrap();
     let process_id = process.get_process_id();
     let num_processes: i32 = 1;
 
@@ -249,7 +251,8 @@ mod tests {
 
         exit_process(&system);
 
-        let process = system.current_process_arc().lock().unwrap();
+        let process_arc = system.current_process_arc();
+        let process = process_arc.lock().unwrap();
         let current_thread = process.get_thread_by_thread_id(1).unwrap();
         assert_eq!(process.state, ProcessState::Running);
         drop(process);

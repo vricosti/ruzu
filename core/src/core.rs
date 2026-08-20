@@ -2550,14 +2550,14 @@ impl System {
 
     /// Get the current process Arc. Panics if not set.
     /// Upstream: `Kernel::GetCurrentProcess(kernel)`.
-    pub fn current_process_arc(&self) -> &Arc<ProcessLock> {
-        self.current_process_arc
-            .as_ref()
+    pub fn current_process_arc(&self) -> Arc<ProcessLock> {
+        self.current_process_arc_opt()
             .expect("current_process_arc not set; call set_current_process_arc() first")
     }
 
     pub fn current_process_arc_opt(&self) -> Option<Arc<ProcessLock>> {
-        self.current_process_arc.clone()
+        crate::hle::kernel::k_thread::get_current_process_pointer()
+            .or_else(|| self.current_process_arc.clone())
     }
 
     /// Get the scheduler Arc for the current core.
@@ -2611,14 +2611,13 @@ impl System {
     /// `GetCurrentProcess(kernel).GetMemory()`.
     /// Returns None when Memory is not wired (tests).
     pub fn get_svc_memory(&self) -> Option<Arc<StdMutex<Memory>>> {
-        self.current_process_arc
-            .as_ref()?
-            .lock()
-            .unwrap()
-            .page_table
-            .get_base()
-            .m_memory
-            .clone()
+        crate::hle::kernel::k_thread::get_current_memory().or_else(|| {
+            self.current_process_arc
+                .as_ref()?
+                .lock()
+                .unwrap()
+                .get_memory()
+        })
     }
 
     /// Create a minimal System for SVC handler unit tests.

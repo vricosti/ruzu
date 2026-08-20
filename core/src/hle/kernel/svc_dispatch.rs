@@ -659,7 +659,8 @@ fn call32(system: &System, imm: u32, args: &mut SvcArgs) {
                 result.get_inner_value()
             );
             if result.is_error() {
-                let process = system.current_process_arc().lock().unwrap();
+                let process_arc = system.current_process_arc();
+                let process = process_arc.lock().unwrap();
                 let prio_mask = process.get_priority_mask();
                 let prio_check = process.check_thread_priority(priority);
                 log::error!(
@@ -1962,8 +1963,7 @@ pub fn call(system: &System, imm: u32, is_64bit: bool, args: &mut SvcArgs) {
                     if common::trace::tid_svc_pc_enabled() {
                         if let Some(kernel) = system.kernel() {
                             let core_index = kernel.current_physical_core_index() as usize;
-                            if let Some(process_arc) = system.current_process_arc.as_ref().cloned()
-                            {
+                            if let Some(process_arc) = system.current_process_arc_opt() {
                                 let process = process_arc.lock().unwrap();
                                 if let Some(jit) = process.get_arm_interface(core_index) {
                                     use crate::arm::arm_interface::ThreadContext;
@@ -2034,7 +2034,7 @@ pub fn call(system: &System, imm: u32, is_64bit: bool, args: &mut SvcArgs) {
     let _svc_exit_guard = SvcExitGuard(svc_track_core);
 
     if let Some(kernel) = system.kernel() {
-        if let Some(process_arc) = system.current_process_arc.as_ref().cloned() {
+        if let Some(process_arc) = system.current_process_arc_opt() {
             let process = process_arc.lock().unwrap();
             kernel
                 .current_physical_core()
@@ -2232,7 +2232,7 @@ pub fn call(system: &System, imm: u32, is_64bit: bool, args: &mut SvcArgs) {
             {
                 let (pc, lr) = if let Some(kernel) = system.kernel() {
                     let core_index = kernel.current_physical_core_index() as usize;
-                    if let Some(process_arc) = system.current_process_arc.as_ref().cloned() {
+                    if let Some(process_arc) = system.current_process_arc_opt() {
                         let process = process_arc.lock().unwrap();
                         if let Some(jit) = process.get_arm_interface(core_index) {
                             use crate::arm::arm_interface::ThreadContext;
@@ -2334,7 +2334,7 @@ pub fn call(system: &System, imm: u32, is_64bit: bool, args: &mut SvcArgs) {
     }
 
     if let Some(kernel) = system.kernel() {
-        if let Some(process_arc) = system.current_process_arc.as_ref().cloned() {
+        if let Some(process_arc) = system.current_process_arc_opt() {
             let mut process = process_arc.lock().unwrap();
             kernel
                 .current_physical_core()
@@ -3175,7 +3175,7 @@ fn dump_svc_full_regs(system: &System, imm: u32, tid: i64, label: &str) {
         None => return,
     };
     let core_index = kernel.current_physical_core_index() as usize;
-    let process_arc = match system.current_process_arc.as_ref().cloned() {
+    let process_arc = match system.current_process_arc_opt() {
         Some(p) => p,
         None => return,
     };
@@ -3262,7 +3262,7 @@ fn maybe_dump_process_memory(system: &System, tid: i64) {
             return;
         }
     };
-    let process_arc = match system.current_process_arc.as_ref().cloned() {
+    let process_arc = match system.current_process_arc_opt() {
         Some(p) => p,
         None => {
             eprintln!("[DUMP] no current process; skipping");
@@ -3467,7 +3467,8 @@ mod tests {
         assert_eq!(args[0], RESULT_SUCCESS.get_inner_value() as u64);
 
         {
-            let process = system.current_process_arc().lock().unwrap();
+            let process_arc = system.current_process_arc();
+            let process = process_arc.lock().unwrap();
             let object_id = process.handle_table.get_object(read_handle).unwrap();
             let event = process.get_readable_event_by_object_id(object_id).unwrap();
             assert!(event.lock().unwrap().is_signaled());
@@ -3478,7 +3479,8 @@ mod tests {
         call64(&system, SvcId::ClearEvent as u32, &mut args);
         assert_eq!(args[0], RESULT_SUCCESS.get_inner_value() as u64);
 
-        let process = system.current_process_arc().lock().unwrap();
+        let process_arc = system.current_process_arc();
+        let process = process_arc.lock().unwrap();
         let object_id = process.handle_table.get_object(read_handle).unwrap();
         let event = process.get_readable_event_by_object_id(object_id).unwrap();
         assert!(!event.lock().unwrap().is_signaled());

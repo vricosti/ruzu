@@ -106,6 +106,10 @@ impl MultiWait {
         let trace_boot = Self::boot_trace_enabled();
         let trace_wait = std::env::var_os("RUZU_TRACE_MULTI_WAIT").is_some();
         let holders = self.holders_snapshot();
+        assert!(
+            holders.len() <= k_synchronization_object::ARGUMENT_HANDLE_COUNT_MAX,
+            "MultiWait exceeds ArgumentHandleCountMax"
+        );
         if holders.is_empty() {
             if trace_wait {
                 eprintln!("[MULTI_WAIT] timeout={} holders=empty → None", timeout_ns);
@@ -166,16 +170,19 @@ impl MultiWait {
         };
 
         let mut object_ids = Vec::with_capacity(holders.len());
+        let mut waitable_objects = Vec::with_capacity(holders.len());
         let mut kinds: Vec<&'static str> = if trace_wait {
             Vec::with_capacity(holders.len())
         } else {
             Vec::new()
         };
         for holder in &holders {
-            let Some(object_id) = (unsafe { &**holder }).object_id() else {
+            let Some((object_id, waitable_object)) =
+                (unsafe { &**holder }).native_waitable_object()
+            else {
                 if trace_boot || trace_wait {
                     eprintln!(
-                        "[MULTI_WAIT] holders={} → falling back local (holder missing object_id)",
+                        "[MULTI_WAIT] holders={} → falling back local (holder missing native object)",
                         holders.len()
                     );
                 }
@@ -185,6 +192,7 @@ impl MultiWait {
                 kinds.push((unsafe { &**holder }).kind_name());
             }
             object_ids.push(object_id);
+            waitable_objects.push(waitable_object);
         }
 
         let mut out_index = -1;
@@ -193,12 +201,12 @@ impl MultiWait {
         } else {
             Vec::new()
         };
-        let result = k_synchronization_object::wait(
-            &process,
+        let result = k_synchronization_object::wait_on_objects(
             &current_thread,
             &scheduler,
             &mut out_index,
             object_ids,
+            waitable_objects,
             timeout_ns,
         );
 

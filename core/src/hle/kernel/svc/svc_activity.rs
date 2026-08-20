@@ -39,7 +39,8 @@ pub fn set_thread_activity(
     let Some(current_thread_id) = system.current_thread_id() else {
         return RESULT_INVALID_HANDLE;
     };
-    let process = system.current_process_arc().lock().unwrap();
+    let process_arc = system.current_process_arc();
+    let process = process_arc.lock().unwrap();
     let Some(object_id) = process.handle_table.get_object(thread_handle) else {
         return RESULT_INVALID_HANDLE;
     };
@@ -132,7 +133,8 @@ mod tests {
             RESULT_SUCCESS
         );
 
-        let process = system.current_process_arc().lock().unwrap();
+        let process_arc = system.current_process_arc();
+        let process = process_arc.lock().unwrap();
         let object_id = process.handle_table.get_object(handle).unwrap();
         let thread = process.get_thread_by_object_id(object_id).unwrap();
         drop(process);

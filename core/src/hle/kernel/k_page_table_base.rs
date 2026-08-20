@@ -5875,9 +5875,9 @@ impl KPageTableBase {
     {
         let mut memory = memory.lock().unwrap();
         let old_page_table = memory.current_page_table_raw();
-        memory.set_current_page_table(page_table);
+        memory.set_current_page_table_raw(page_table);
         let result = f(&mut memory);
-        memory.set_current_page_table(old_page_table);
+        memory.set_current_page_table_raw(old_page_table);
         result
     }
 
@@ -7836,7 +7836,7 @@ mod tests {
             memory
                 .lock()
                 .unwrap()
-                .set_current_page_table(page_table_impl.as_mut() as *mut _);
+                .set_current_page_table(page_table_impl.as_mut() as *mut _, true);
         }
     }
 

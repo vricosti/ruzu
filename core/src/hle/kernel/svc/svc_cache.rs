@@ -63,7 +63,8 @@ pub fn flush_process_data_cache(
     // Get the process from its handle.
     // Upstream: GetCurrentProcess(kernel).GetHandleTable().GetObject<KProcess>(process_handle).
     // `GetObject<KProcess>` accepts CurrentProcess as a typed pseudo-handle.
-    let process = system.current_process_arc().lock().unwrap();
+    let process_arc = system.current_process_arc();
+    let process = process_arc.lock().unwrap();
     if process_handle != PseudoHandle::CurrentProcess as Handle
         && process.handle_table.get_object(process_handle).is_none()
     {

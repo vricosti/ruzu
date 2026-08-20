@@ -322,7 +322,8 @@ fn send_sync_request_impl(
     trace_svc_ipc_progress(1, session_handle, 0, message_address, 0, 0, 0);
     let trace_sync = should_trace_sync_handle(session_handle);
     let (session_object_id, parent_id) = {
-        let process = system.current_process_arc().lock().unwrap();
+        let process_arc = system.current_process_arc();
+        let process = process_arc.lock().unwrap();
         let Some(object_id) = process.handle_table.get_object(session_handle) else {
             log::error!(
                 "  SendSyncRequest: handle {:#x} not in handle table",
@@ -389,7 +390,8 @@ fn send_sync_request_impl(
             0,
             0,
         );
-        let process = system.current_process_arc().lock().unwrap();
+        let process_arc = system.current_process_arc();
+        let process = process_arc.lock().unwrap();
         trace_svc_ipc_progress(
             12,
             session_handle,
@@ -530,7 +532,8 @@ fn send_sync_request_impl(
         let send_result = {
             trace_host_thread_ipc("before_process_lock", session_handle);
             let _lo_p = common::lock_order::guard("process");
-            let mut process = system.current_process_arc().lock().unwrap();
+            let process_arc = system.current_process_arc();
+            let mut process = process_arc.lock().unwrap();
             trace_host_thread_ipc("after_process_lock", session_handle);
             trace_host_thread_ipc("before_parent_lookup", session_handle);
             let Some(parent_session) = process.get_session_by_object_id(parent_id) else {
@@ -627,7 +630,8 @@ fn send_sync_request_impl(
     let (request_manager, mut context, request_message_address) = {
         let (server_session, manager, request) = {
             let _lo_p = common::lock_order::guard("process");
-            let mut process = system.current_process_arc().lock().unwrap();
+            let process_arc = system.current_process_arc();
+            let mut process = process_arc.lock().unwrap();
             record_phase("02_process_lock_2", &mut phase_last);
             trace_svc_ipc_progress(
                 3,
@@ -1317,7 +1321,7 @@ mod tests {
         memory
             .lock()
             .unwrap()
-            .set_current_page_table(page_table as *mut PageTable);
+            .set_current_page_table(page_table as *mut PageTable, true);
         memory
     }
 
@@ -1733,7 +1737,8 @@ pub fn send_sync_request_with_user_buffer(
 
     // Lock the message buffer in the process page table.
     {
-        let mut process = system.current_process_arc().lock().unwrap();
+        let process_arc = system.current_process_arc();
+        let mut process = process_arc.lock().unwrap();
         let msg_addr = crate::hle::kernel::k_typed_address::KProcessAddress::new(message);
         let mut paddr: u64 = 0;
         let lock_result =
@@ -1751,7 +1756,8 @@ pub fn send_sync_request_with_user_buffer(
 
     // Unlock the message buffer.
     {
-        let mut process = system.current_process_arc().lock().unwrap();
+        let process_arc = system.current_process_arc();
+        let mut process = process_arc.lock().unwrap();
         let msg_addr = crate::hle::kernel::k_typed_address::KProcessAddress::new(message);
         let unlock_result = process
             .page_table
@@ -1779,7 +1785,8 @@ pub fn send_async_request_with_user_buffer(
     buffer_size: u64,
     session_handle: Handle,
 ) -> ResultCode {
-    let mut process = system.current_process_arc().lock().unwrap();
+    let process_arc = system.current_process_arc();
+    let mut process = process_arc.lock().unwrap();
     let mut event_reservation = KScopedResourceReservation::new(
         process.resource_limit.clone(),
         LimitableResource::EventCountMax,
@@ -1964,7 +1971,8 @@ pub fn reply_and_receive_with_user_buffer(
 
     // Lock the message buffer.
     {
-        let mut process = system.current_process_arc().lock().unwrap();
+        let process_arc = system.current_process_arc();
+        let mut process = process_arc.lock().unwrap();
         let msg_addr = crate::hle::kernel::k_typed_address::KProcessAddress::new(message);
         let mut paddr: u64 = 0;
         let lock_result =
@@ -2017,7 +2025,8 @@ pub fn reply_and_receive_with_user_buffer(
 
     // Unlock the message buffer.
     {
-        let mut process = system.current_process_arc().lock().unwrap();
+        let process_arc = system.current_process_arc();
+        let mut process = process_arc.lock().unwrap();
         let msg_addr = crate::hle::kernel::k_typed_address::KProcessAddress::new(message);
         let unlock_result = process
             .page_table

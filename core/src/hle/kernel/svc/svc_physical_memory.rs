@@ -69,7 +69,8 @@ pub fn set_heap_size_current_process(
     }
 
     let (result, address, target_info) = {
-        let mut process = system.current_process_arc().lock().unwrap();
+        let process_arc = system.current_process_arc();
+        let mut process = process_arc.lock().unwrap();
         let (result, address) = process.set_heap_size(size as usize);
         let target_info = super::svc_memory_history::target_address()
             .and_then(|target| process.page_table.query_info(target as usize));
@@ -167,7 +168,8 @@ pub fn map_physical_memory(system: &System, addr: u64, size: u64) -> ResultCode 
         return RESULT_INVALID_MEMORY_REGION;
     }
 
-    let mut process = system.current_process_arc().lock().unwrap();
+    let process_arc = system.current_process_arc();
+    let mut process = process_arc.lock().unwrap();
 
     if process.get_total_system_resource_size() == 0 {
         log::error!("System Resource Size is zero");
@@ -332,7 +334,8 @@ pub fn unmap_physical_memory(system: &System, addr: u64, size: u64) -> ResultCod
         return RESULT_INVALID_MEMORY_REGION;
     }
 
-    let mut process = system.current_process_arc().lock().unwrap();
+    let process_arc = system.current_process_arc();
+    let mut process = process_arc.lock().unwrap();
 
     if process.get_total_system_resource_size() == 0 {
         log::error!("System Resource Size is zero");

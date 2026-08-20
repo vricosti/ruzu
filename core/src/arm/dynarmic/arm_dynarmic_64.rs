@@ -2290,9 +2290,11 @@ impl ArmDynarmic64 {
             );
             None
         } else {
-            core_memory
-                .as_ref()
-                .map(|cm| cm.lock().unwrap().fastmem_pointer())
+            kernel_process
+                .page_table
+                .get_base()
+                .get_impl()
+                .map(|page_table| page_table.fastmem_arena)
                 .filter(|p| !p.is_null())
         };
 

@@ -5,10 +5,13 @@
 //!
 //! NCA (Nintendo Content Archive) loader.
 
+use std::sync::Arc;
+
 use crate::file_sys::content_archive::{NCAContentType, NCA};
 use crate::file_sys::nca_metadata::ContentRecordType;
 use crate::file_sys::partition_filesystem::ResultStatus as FsResultStatus;
 use crate::file_sys::registered_cache::{get_update_title_id, ContentProvider};
+use crate::file_sys::romfs_factory::RomFSFactory;
 use crate::file_sys::vfs::vfs_types::VirtualFile;
 
 use super::deconstructed_rom_directory::AppLoaderDeconstructedRomDirectory;
@@ -153,23 +156,34 @@ impl AppLoader for AppLoaderNca {
             return load_result;
         }
 
+        // Keep the loaded directory owned by this loader before constructing
+        // the factory, matching upstream's `directory_loader` ownership at
+        // this point in `AppLoader_NCA::Load`.
+        self.directory_loader = Some(dir_loader);
+
         // Upstream: system.GetFileSystemController().RegisterProcess(
         //     process.GetProcessId(), nca->GetTitleId(),
         //     make_shared<RomFSFactory>(*this, system.GetContentProvider(),
         //                               system.GetFileSystemController()));
-        // In the Rust port, process_id is assigned after Load() returns (in
-        // core.rs), so RegisterProcess is called there instead.  RomFSFactory
-        // construction is also deferred until the factory types accept the
-        // content_provider/filesystem_controller references.
+        // `Process::initialize` assigns the process id before invoking the
+        // loader, so both application and LLE applet processes must be fully
+        // registered here. The application load path may replace the same
+        // registration later when applying its packed-update state.
         if let Some(ref fsc) = system.filesystem_controller {
+            let romfs_factory = system.content_provider.as_ref().map(|content_provider| {
+                Arc::new(RomFSFactory::new(
+                    self,
+                    Arc::clone(content_provider),
+                    Arc::clone(fsc),
+                ))
+            });
             fsc.lock().unwrap().register_process(
                 process.process_id,
                 self.nca.get_title_id(),
-                None, // romfs_factory — constructed in core.rs when content_provider is available
+                romfs_factory,
             );
         }
 
-        self.directory_loader = Some(dir_loader);
         self.is_loaded = true;
         load_result
     }

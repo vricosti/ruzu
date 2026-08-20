@@ -53,9 +53,6 @@
   Upstream routes the immediate through `ArgCallback`'s ABI-selected parameter
   list; on Windows the fixed callback context occupies `RCX` and the SVC
   immediate must be written to `RDX`.
-- Resume condition: restore upstream callback-owned argument selection for both
-  x64 SVC emitters, verify the emitted Windows register choice with focused
-  tests, then resume the MK8D boot validation.
 
 ## 2026-07-31 — Windows game-list population
 
@@ -109,44 +106,6 @@
   upstream comparison; the focused callback, unwind, SVC, FPSCR, LDXP and
   `LDR Q` regressions all pass.
 
-## 2026-07-31 — interrupted MK8D boot after 128-bit callback repair
-
-- Interrupted slice: MK8D runtime validation after rebuilding the Windows
-  release with callback, SVC, FPSCR, SEH and 128-bit return fixes.
-- Reproduction: the base NSP reaches GPU submission, HID, account and save-data
-  initialization, then terminates in `RtlVirtualUnwind2` while unwinding an
-  access violation from an x64 JIT run.
-- Exact missing prerequisite found by the upstream comparison:
-  A32 and A64 ordinary fastmem fallback emitters still hard-coded SysV
-  `RSI`/`RDX` for callback address/value arguments. Upstream uses
-  `ABI_PARAM2`/`ABI_PARAM3`, which are `RDX`/`R8` on Windows.
-- Prerequisite result: both owners now select `ABI_PARAMS[1]` and
-  `ABI_PARAMS[2]`; a generated A64 read/write fallback test passes on Windows.
-  A separate native `RtlVirtualUnwind` test confirms that the registered
-  dispatcher unwind table itself restores caller `RSP` and `RIP` correctly.
-- Resume condition: rebuild Ruzu and launch the exact MK8D base NSP under
-  ProcDump to determine whether the corrected fastmem ABI removes the runtime
-  failure.
-
-## 2026-07-31 — MK8D Windows boot reached rendering
-
-- Status: the startup-crash prerequisite is completed for the tested base
-  title.
-- Validation title:
-  `Mario Kart 8 Deluxe [0100152000022000][v0].nsp` (base application, not the
-  update NSP).
-- Result: the Windows release passed loader, CPU/GPU initialization and guest
-  execution, displayed MK8D, and remained alive, responsive and rendering for
-  continued observation. The launched process is PID 21620 and was deliberately
-  left running for the user.
-- Runtime corrections verified on this path: MSVC callback argument placement,
-  dispatcher `StackLayout`/shadow-space addressing, dynamic SEH unwind metadata,
-  ordinary and exclusive 128-bit callback returns, A32/A64 SVC emission, A32
-  FPSCR lifecycle, fastmem fallback parameters, vector fallback frames, table
-  lookup frame placement, and native upstream `VectorTranspose` emission.
-- Remaining scope: longer gameplay compatibility is not established by this
-  startup validation.
-
 ## 2026-07-31 — remaining rdynarmic validation debt
 
 - Focused status: callback, dispatcher-prologue, real `RtlVirtualUnwind`,
@@ -186,3 +145,274 @@
   52--55 FPS in the reached scene. This does not establish course performance;
   the remaining lower and variable course framerate requires a scene-matched
   profile rather than further HWC approximation.
+
+## 2026-08-20 — interrupted Mii applet startup after fastmem isolation
+
+- Interrupted slice: resume the Mii LLE applet after restricting fastmem to the
+  application process, matching Eden's `KProcess::Initialize` policy.
+- Reproduction: the applet `rtld` calls `QueryMemory`, receives an error, then
+  branches to its fatal self-loop at guest PC `0x80000788`. The SVC attempts to
+  write its 40-byte result at guest address zero.
+- Exact missing prerequisite: Rust has no counterpart for
+  `k_thread.cpp::GetCurrentProcessPointer` / `GetCurrentMemory`. SVC dispatch
+  and handlers therefore use `System::current_process_arc`, which is the
+  frontend application process even while an applet thread is running. This
+  replaces the applet's SVC registers with the application's registers and
+  routes all SVC memory access to the wrong address space.
+- Resume condition: resolve the current process and memory from the current
+  thread's owner, use that process for SVC register save/load and handlers, add
+  focused ownership regressions, then rebuild and rerun the applet.
+- Status: completed. Current-process/current-memory lookup now follows the
+  current thread owner, and SVC register save/load uses that same process.
+
+## 2026-08-20 — interrupted Mii applet retest after current-process repair
+
+- Interrupted slice: retest the Mii LLE applet after restoring upstream
+  current-thread process ownership for SVC dispatch.
+- Reproduction: after selecting a Mii, host `CPUCore_3` remains at 100% in
+  `ServerManager::WaitSignaled` / `MultiWait::TimedWaitImpl`; profiling shows
+  repeated wait-object resolution without service dispatch.
+- Exact missing prerequisite: Eden `MultiWait::TimedWaitImpl` passes the native
+  `KSynchronizationObject*` values owned by each `MultiWaitHolder` directly to
+  `KSynchronizationObject::Wait`. Ruzu instead reduces them to numeric ids and
+  resolves those ids through the current process object maps. A guest service
+  process does not necessarily own registrations for every port/session held
+  by its `ServerManager`, so resolution returns `ResultInvalidHandle`
+  immediately and the service fiber busy-loops.
+- Resume condition: preserve the holder's native synchronization-object owner
+  through `MultiWait`, keep numeric process-table resolution only at SVC handle
+  boundaries, add a focused direct-native-object regression, reread the three
+  upstream owners, then rebuild and rerun the applet.
+
+## 2026-08-20 — interrupted Mii LLE applet retest after native MultiWait repair
+
+- Interrupted slice: retest the Mii LLE applet after restoring native
+  synchronization-object ownership in `MultiWait`.
+- Reproduction: the applet reaches `OpenDataStorageByCurrentProcess`, but FSP
+  reports that no RomFS is available; the applet then enters its fatal path and
+  its caller remains waiting for an applet result that can no longer arrive.
+- Exact missing prerequisite: Eden `AppLoader_NCA::Load` registers every NCA
+  process with a `RomFSFactory` built from that loader, the content provider,
+  and the filesystem controller. Rust `loader/nca.rs` registers the process
+  with `romfs_factory: None`; the later application-only replacement in
+  `System::load` never runs for LLE library applets created by
+  `AM::CreateProcess`.
+- Resume condition: construct and register the upstream-owned `RomFSFactory`
+  in `loader/nca.rs`, add a focused registration/controller regression, reread
+  the upstream NCA loader and RomFS factory, then rebuild and rerun the applet.
+- Status: prerequisite completed. `AppLoaderNca::load` now registers its
+  process with the same loader-owned `RomFSFactory` inputs as Eden, and the
+  controller regression confirms that `OpenProcess` exposes the registered
+  RomFS to FSP.
+- Runtime validation pending: rebuild and rerun the LLE applet to confirm it
+  now completes instead of entering the fatal path.
+
+## 2026-08-20 — interrupted Mii LLE applet retest after RomFS registration
+
+- Interrupted slice: resume the Mii LLE applet after registering its NCA-owned
+  RomFS factory.
+- Reproduction: the GPU thread receives a command list whose uniform-buffer
+  address belongs to the previously active application channel, but the Vulkan
+  buffer cache is bound to the Mii applet channel and panics when translating
+  the address in the applet memory manager.
+- Exact missing prerequisite: `VideoGpuChannelHandle::init_channel` and
+  `bind_memory_manager` directly call `RasterizerInterface::bind_channel`.
+  Eden's `GPU::Impl::InitChannel` only initializes the channel and binds the
+  rasterizer interface to its engines; `nvhost_as_gpu::BindChannel` only stores
+  the memory manager. Only `Scheduler::Push` calls `GPU::BindChannel` before
+  dispatching commands. The extra Rust calls change the rasterizer owner
+  without updating `Gpu::bound_channel`, so the scheduler can incorrectly skip
+  the next required bind.
+- Resume condition: remove both out-of-order rasterizer binds, retain channel
+  binding exclusively in `Gpu::bind_channel`, add focused lifecycle
+  regressions, rebuild, and rerun the applet selection.
+- Status: implementation and focused regressions completed. The Rust lifecycle
+  now matches Eden: initialization creates the per-channel rasterizer state,
+  while `Scheduler::push` is the sole command path that changes the active
+  rasterizer channel through `Gpu::bind_channel`. Runtime validation pending.
+
+## 2026-08-20 — interrupted Mii LLE applet teardown after GPU-channel repair
+
+- Interrupted slice: resume the application after the Mii applet has rendered
+  and returned the selected profile.
+- Reproduction: the applet now progresses past the former uniform-buffer
+  failure, then `HLE:nvservices` panics in
+  `TextureCache::unmap_gpu_memory` because an address-space GPU page table still
+  contains an `ImageId` whose `SlotVector` entry has already been erased.
+- Exact missing prerequisite under investigation: preserve the owning GPU
+  address-space table when unregistering an image during deferred
+  `MemoryManager` rasterizer notifications. The current Rust implementation
+  selects the table through the rasterizer's currently bound channel, while the
+  notification itself identifies the memory manager being modified.
+- Resume condition: prove the table-owner mismatch at unregister time, restore
+  Eden-equivalent cleanup ordering/ownership, add a multi-address-space
+  regression, reread the upstream texture-cache and memory-manager owners, then
+  rebuild and rerun the applet teardown.
+- Status: implementation and tests completed. Runtime tracing proved that
+  application images registered in dense table 0 were being unregistered while
+  the applet's dense table 2 was current. Each registered image now retains its
+  dense GPU page-table owner until `UnregisterImage`, including the paired
+  sparse table. Registration/unregistration flag, LRU, dense-table, map-view,
+  and sparse-table ordering was also restored to Eden's order. All 1,465
+  `video_core` tests pass (one ignored); runtime validation pending.
+
+## 2026-08-20 — interrupted Mii LLE applet return after texture cleanup repair
+
+- Interrupted slice: resume the application after creating a Mii and closing
+  the LLE Mii editor.
+- Reproduction: no panic occurs and guest processes remain alive, but the
+  application waits indefinitely for its library-applet state-changed event
+  after the Mii editor process terminates.
+- Exact missing prerequisite: Eden's
+  `WindowSystem::PruneTerminatedAppletsLocked` calls
+  `Applet::OnProcessTerminatedLocked`, which both sets `is_completed` and
+  signals `state_changed_event`. Ruzu's prune path only set `is_completed`, so
+  a caller already waiting on `GetAppletStateChangedEvent` was never woken.
+- Resume condition: restore the termination callback in the upstream-owned
+  `applet.rs`, invoke it from `window_system.rs`, add a focused event regression,
+  reread both upstream files, rebuild, and rerun the Mii return path.
+- Status: implementation and upstream re-verification completed. The focused
+  AM tests pass, including the new completion/event regression. The full
+  `core` suite still has four independently reproducible pre-existing
+  `k_process` failures; the unrelated parallel `k_server_session` abort passes
+  when run alone. Runtime validation of the Mii return path is pending.
+
+## 2026-08-20 — interrupted Mii output retrieval after process completion
+
+- Interrupted slice: return the Mii editor's output to its caller after the
+  applet process has completed and its state-changed event has fired.
+- Reproduction: the applet reaches `PushOutData` and
+  `ExitProcessAndReturn`; the observer removes the terminated process, but the
+  caller remains in its applet transition while continuing to submit frames.
+- Exact missing prerequisite: Eden's
+  `ILibraryAppletAccessor::PopOutData` directly signals the caller lifecycle
+  system event, requests its resume notification, clears that event, and
+  updates the requested focus state before popping output. Rust omitted the
+  complete sequence. Porting it requires the upstream-owned
+  `LifecycleManager::GetSystemEvent` counterpart, which is also missing.
+- Resume condition: add `LifecycleManager::get_system_event` in
+  `lifecycle_manager.rs`, verify it against the upstream header/implementation,
+  then port the exact `PopOutData` ordering in `library_applet_accessor.rs`,
+  add a focused lifecycle regression, rebuild, and rerun the return path.
+- Status: prerequisite and interrupted slice completed. The getter and the
+  `PopOutData` ordering now match Eden, the focused regression passes, and the
+  runtime trace confirms the sequence executes and returns 2008 bytes to the
+  Mii editor. Runtime validation exposed the next independent lifecycle issue
+  below.
+
+## 2026-08-20 — interrupted teardown of a completed processless HLE applet
+
+- Interrupted slice: prune the completed HLE software-keyboard child so the
+  terminated LLE Mii editor can itself be finalized and return to the game.
+- Reproduction: the keyboard completes, its caller retrieves its output, and
+  `is_completed` is true; the keyboard was deliberately created with an
+  uninitialized `Process`, however. When the Mii process terminates,
+  `WindowSystem::PruneTerminatedAppletsLocked` sees one child, calls the
+  no-op `Process::Terminate`, and waits forever because a processless applet
+  can never satisfy `Process::IsTerminated`.
+- Exact missing prerequisite: the C++ frontend path also creates a processless
+  applet and `FrontendApplet::Exit` only marks it completed, so this is a
+  confirmed upstream lifecycle hole rather than a missing guest-process port.
+  Ruzu's explicit `FrontendApplet::is_complete` adaptation provides the
+  completion state needed to close that hole without inventing a synthetic
+  kernel process.
+- Resume condition: let the upstream-owned prune path finalize an applet when
+  either its real process is terminated or it has no process and is already
+  completed; add a regression proving the processless applet is unlinked,
+  reread the upstream window/process/frontend owners, rebuild, and rerun.
+
+## 2026-08-20 — interrupted Mii database insertion after applet return
+
+- Interrupted slice: resume the application after the LLE Mii editor creates
+  and returns a new Mii.
+- Reproduction: `AddOrReplace` is called, but the following database-only
+  `Get` returns zero entries. The application then dereferences the absent Mii
+  and performs an indirect call through a null vtable slot at guest PC zero.
+- Exact missing prerequisite: Eden's `GetMiiAuthorId` replaces an invalid
+  stored UUID with `Common::UUID::MakeDefault()` and marks the settings save as
+  needed. Ruzu returned the all-zero UUID unchanged, while `MiiUtil` validated
+  the resulting device checksum against a different default UUID. The LLE
+  editor therefore produced a `StoreData` that the Mii database rejected.
+  Ruzu's `UUID::make_default` also still contained the old yuzu value instead
+  of Eden's upstream-owned `"Eden Default UID"` constant.
+- Resume condition: restore Eden's default UUID bytes in `common/uuid.rs`,
+  restore the invalid-ID initialization and save-needed ordering in
+  `set/system_settings_server.rs`, add focused regressions, then rebuild and
+  verify that `AddOrReplace` persists one entry and the caller resumes.
+
+## 2026-08-20 — interrupted library-applet display-layer teardown
+
+- Interrupted slice: resume the caller after a completed LLE library applet
+  has returned its output.
+- Reproduction: the caller receives the output and the window system prunes
+  the terminated applet, but SurfaceFlinger continues composing two layers.
+- Exact missing prerequisite: Eden's `KProcess::FinalizeHandleTable` closes
+  every client-session handle. That releases `ISelfController`, whose
+  destructor calls `DisplayLayerManager::Finalize` and destroys the applet's
+  shared layer. Ruzu's `KHandleTable::finalize` only cleared numeric object
+  identifiers; the process-owned Rust `Arc` session owners remained alive
+  until whole-system shutdown.
+- Resume condition: restore `KProcess` ownership of handle-table finalization,
+  close process client sessions in upstream order, defer dropping their Rust
+  owners until the process lock is released, add a focused lifecycle
+  regression, then rebuild and rerun the applet return path.
+- Status: implementation, focused lifecycle regression, upstream reread, and
+  release build completed. Runtime validation of the Mii return path remains.
+
+## 2026-08-20 — interrupted reply after applet client-session closure
+
+- Interrupted slice: complete the active `ExitProcessAndReturn` IPC after the
+  applet process closes its client-session handles.
+- Reproduction: `KProcess::FinalizeHandleTable` now closes the applet's active
+  `appletOE` session, but `ServerManager` panics because `SendReplyHLE` returns
+  `ResultInvalidState` (`0xFA01`) instead of `ResultSessionClosed`.
+- Exact missing prerequisite: Eden `KServerSession::OnClientClosed` preserves
+  `m_current_request` while marking its terminating client thread unavailable;
+  the subsequent `SendReplyHLE` consumes that request and returns
+  `ResultSessionClosed`. Ruzu called `cleanup_requests`, which removed and
+  finalized the active request before the reply path could consume it.
+- Resume condition: port Eden's active-request preservation and pending-request
+  ordering in `k_server_session.rs`, add a focused close-during-dispatch
+  regression, rebuild, and rerun the applet return path.
+- Status: implementation, focused regression, upstream reread, UI tests, and
+  release build completed. Runtime validation remains.
+
+## 2026-08-20 — interrupted ServerManager handling of the closed applet session
+
+- Interrupted slice: let `appletOE` complete its active dispatch after
+  `KServerSession::SendReplyHLE` correctly reports the closed client endpoint.
+- Reproduction: the reply now returns kernel `ResultSessionClosed` (`0xF601`),
+  but `ServerManager(appletOE)` still asserts because it compares the reply to
+  IPC `ResultSessionClosed` instead of the kernel result.
+- Exact missing prerequisite: Eden `CompleteSyncRequest` compares the
+  `SendReplyHLE` result with `Kernel::ResultSessionClosed` and independently
+  compares the service result with `IPC::ResultSessionClosed`. Both Ruzu event
+  paths used the IPC constant for both values.
+- Resume condition: use the kernel result for receive/reply results in both
+  ServerManager paths, retain the IPC result for service dispatch, add the
+  close-during-shared-dispatch regression, rebuild, and rerun.
+- Status: both event paths now distinguish kernel and IPC session-closed
+  results like Eden; the focused shared-dispatch regression and release build
+  pass. Runtime validation remains.
+
+## 2026-08-20 — interrupted ServerManager session-holder destruction
+
+- Interrupted slice: resume the application after the completed Mii editor's
+  display layer and client sessions are closed.
+- Reproduction: after `SF_REMOVE_LAYER` removes the applet layer, the process
+  exits with `SIGSEGV`. GDB shows the fault in
+  `MultiWaitHolder::native_waitable_object` on the `HLE:audio` host thread.
+- Exact missing prerequisite: Eden's `DestroySession` is reached only after
+  `WaitSignaled` has unlinked the selected holder. Ruzu's additional
+  `pending_session_closures` path can call `destroy_session` for a holder that
+  is still linked to either `m_multi_wait` or `m_deferred_list`; dropping its
+  `Box<MultiWaitHolder>` then leaves a dangling raw pointer in the wait list.
+- Resume condition: make the Rust session destruction boundary unlink its
+  holder before freeing the session, add regressions for destruction from both
+  wait lists, reread Eden's `WaitSignaled`/`DestroySession` and MultiWait holder
+  ownership, rebuild, and rerun the Mii return path.
+- Status: the destruction boundary now restores Eden's already-unlinked
+  invariant for both the ordinary and queued-close paths. Both wait-list
+  regressions and the prior closed-reply regression pass, post-implementation
+  upstream re-verification is complete, `ARCHI_CHOICES.md` documents the Rust
+  adaptation, and the release build succeeds. Runtime validation remains.

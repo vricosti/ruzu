@@ -2180,7 +2180,7 @@ mod tests {
             memory
                 .lock()
                 .unwrap()
-                .set_current_page_table(page_table.as_mut() as *mut PageTable);
+                .set_current_page_table(page_table.as_mut() as *mut PageTable, true);
 
             Self {
                 _device_memory: device_memory,

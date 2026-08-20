@@ -17,6 +17,7 @@ use crate::hle::kernel::k_server_session::KServerSession;
 use super::event::Event;
 use super::multi_wait::MultiWait;
 use crate::hle::kernel::k_process::ProcessLock;
+use crate::hle::kernel::k_synchronization_object::WaitableObject;
 
 enum WaitableHandle {
     None,
@@ -141,6 +142,48 @@ impl MultiWaitHolder {
         }
     }
 
+    /// Return the native synchronization object held by this holder.
+    ///
+    /// Mirrors upstream `MultiWaitHolder::GetNativeHandle()`: `MultiWait`
+    /// already owns the synchronization object and must pass it directly to
+    /// `KSynchronizationObject::Wait`, without resolving its numeric identity
+    /// through the current process object table.
+    pub(crate) fn native_waitable_object(&self) -> Option<(u64, WaitableObject)> {
+        match &self.native_handle {
+            WaitableHandle::None => None,
+            WaitableHandle::Event(event) => {
+                let readable_event = event.readable_event()?;
+                let object_id = readable_event.lock().unwrap().object_id;
+                Some((
+                    object_id,
+                    WaitableObject::from_readable_event(readable_event),
+                ))
+            }
+            WaitableHandle::ReadableEvent(event) => {
+                let object_id = event.lock().unwrap().object_id;
+                Some((
+                    object_id,
+                    WaitableObject::from_readable_event(Arc::clone(event)),
+                ))
+            }
+            WaitableHandle::Process(process) => {
+                let object_id = process.lock().unwrap().get_process_id();
+                Some((object_id, WaitableObject::from_process(Arc::clone(process))))
+            }
+            WaitableHandle::ServerPort { port, object_id } => Some((
+                (*object_id)?,
+                WaitableObject::from_server_port(Arc::clone(port)),
+            )),
+            WaitableHandle::ServerSession(server_session) => {
+                let object_id = server_session.lock().unwrap().get_parent_id()?;
+                Some((
+                    object_id,
+                    WaitableObject::from_server_session(Arc::clone(server_session)),
+                ))
+            }
+        }
+    }
+
     pub fn kind_name(&self) -> &'static str {
         match &self.native_handle {
             WaitableHandle::None => "none",
@@ -194,5 +237,28 @@ impl MultiWaitHolder {
 impl Default for MultiWaitHolder {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn native_readable_event_does_not_require_process_table_resolution() {
+        let mut readable_event = KReadableEvent::new();
+        readable_event.initialize(0, 0x1234);
+        assert_eq!(
+            readable_event.signal(),
+            crate::hle::result::RESULT_SUCCESS.get_inner_value()
+        );
+        let holder = MultiWaitHolder::from_readable_event(Arc::new(Mutex::new(readable_event)));
+
+        let (object_id, waitable) = holder
+            .native_waitable_object()
+            .expect("holder must retain its native readable event");
+
+        assert_eq!(object_id, 0x1234);
+        assert!(waitable.is_signaled());
     }
 }

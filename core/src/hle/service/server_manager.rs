@@ -27,6 +27,7 @@ use crate::hle::kernel::k_process::KProcess;
 use crate::hle::kernel::k_process::ProcessLock;
 use crate::hle::kernel::k_readable_event::KReadableEvent;
 use crate::hle::kernel::k_server_session::KServerSession;
+use crate::hle::kernel::svc::svc_results::RESULT_SESSION_CLOSED as KERNEL_RESULT_SESSION_CLOSED;
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 use crate::hle::service::hle_ipc::{
     self, HLERequestContext, PendingRegistrationQueue, SessionRequestHandlerFactory,
@@ -1192,6 +1193,13 @@ impl ServerManager {
             return;
         }
 
+        // `pending_session_closures` is a Rust-side bridge with no direct
+        // upstream equivalent: it can reach this ownership boundary without
+        // the holder first being selected by `WaitSignaled`. Eden's selected
+        // session is already unlinked before `DestroySession`; preserve that
+        // invariant here before freeing the boxed intrusive-list node.
+        self.sessions[session_index].holder.unlink_from_multi_wait();
+
         let session = self.sessions.remove(session_index);
         let session_id = session.id;
 
@@ -1334,9 +1342,7 @@ impl ServerManager {
         let (mut context, _, _) = match result {
             Ok(result) => result,
             Err(result) => {
-                if result
-                    == crate::hle::service::ipc_helpers::RESULT_SESSION_CLOSED.get_inner_value()
-                {
+                if result == KERNEL_RESULT_SESSION_CLOSED.get_inner_value() {
                     let mut owner = manager_owner.lock().unwrap();
                     if let Some(session_index) = owner.session_index_by_id(event.session_id) {
                         owner.destroy_session(session_index);
@@ -1409,7 +1415,7 @@ impl ServerManager {
             return true;
         };
 
-        if reply_result == crate::hle::service::ipc_helpers::RESULT_SESSION_CLOSED.get_inner_value()
+        if reply_result == KERNEL_RESULT_SESSION_CLOSED.get_inner_value()
             || service_result == crate::hle::service::ipc_helpers::RESULT_SESSION_CLOSED
         {
             log::debug!(
@@ -1619,9 +1625,7 @@ impl ServerManager {
                 record_ipc_phase("server_04_store_context", &mut phase_last);
             }
             Err(result) => {
-                if result
-                    == crate::hle::service::ipc_helpers::RESULT_SESSION_CLOSED.get_inner_value()
-                {
+                if result == KERNEL_RESULT_SESSION_CLOSED.get_inner_value() {
                     log::debug!(
                         "ServerManager({}): session {} closed (result={}), removing",
                         self.name,
@@ -1776,7 +1780,7 @@ impl ServerManager {
         record_ipc_phase("server_10_send_reply_hle", &mut phase_last);
 
         // Check for session close.
-        if reply_result == crate::hle::service::ipc_helpers::RESULT_SESSION_CLOSED.get_inner_value()
+        if reply_result == KERNEL_RESULT_SESSION_CLOSED.get_inner_value()
             || service_result == crate::hle::service::ipc_helpers::RESULT_SESSION_CLOSED
         {
             log::debug!(
@@ -1970,6 +1974,17 @@ mod tests {
         }
     }
 
+    struct CloseClientSessionHandler {
+        server_session: Arc<Mutex<KServerSession>>,
+    }
+
+    impl crate::hle::service::hle_ipc::SessionRequestHandler for CloseClientSessionHandler {
+        fn handle_sync_request(&self, _context: &mut HLERequestContext) -> ResultCode {
+            self.server_session.lock().unwrap().on_client_closed();
+            RESULT_SUCCESS
+        }
+    }
+
     #[test]
     fn request_stop_sets_flag_and_signals_wakeup_event() {
         let manager = ServerManager::new(SystemRef::null());
@@ -2125,6 +2140,7 @@ mod tests {
             RESULT_SUCCESS
         );
         assert!(manager.sessions[0].holder.is_linked());
+        assert_eq!(manager.deferred_list.lock().unwrap().holders.len(), 1);
 
         server_session.lock().unwrap().on_client_closed();
         assert!(manager.wakeup_event.is_signaled());
@@ -2132,7 +2148,76 @@ mod tests {
 
         manager.drain_pending_session_closures();
         assert!(manager.sessions.is_empty());
+        assert!(manager.deferred_list.lock().unwrap().holders.is_empty());
         assert!(manager.pending_session_closures.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn session_close_unlinks_holder_from_main_wait_before_destruction() {
+        let mut manager = ServerManager::new(SystemRef::null());
+        let server_session = Arc::new(Mutex::new(KServerSession::new()));
+        server_session.lock().unwrap().initialize(0x1000);
+        let request_manager = Arc::new(Mutex::new(SessionRequestManager::new()));
+
+        assert_eq!(
+            manager.register_session(Arc::clone(&server_session), request_manager),
+            RESULT_SUCCESS
+        );
+        manager.link_deferred();
+        assert_eq!(manager.multi_wait.holders.len(), 1);
+        assert!(manager.deferred_list.lock().unwrap().holders.is_empty());
+
+        server_session.lock().unwrap().on_client_closed();
+        manager.drain_pending_session_closures();
+
+        assert!(manager.sessions.is_empty());
+        assert!(manager.multi_wait.holders.is_empty());
+    }
+
+    #[test]
+    fn shared_dispatch_accepts_kernel_session_closed_reply() {
+        let manager = Arc::new(Mutex::new(ServerManager::new(SystemRef::null())));
+        let server_session = Arc::new(Mutex::new(KServerSession::new()));
+        server_session.lock().unwrap().initialize(0x1000);
+        let request_manager = Arc::new(Mutex::new(SessionRequestManager::new()));
+        request_manager
+            .lock()
+            .unwrap()
+            .set_session_handler(Arc::new(CloseClientSessionHandler {
+                server_session: Arc::clone(&server_session),
+            }));
+        {
+            let mut manager = manager.lock().unwrap();
+            assert_eq!(
+                manager
+                    .register_session(Arc::clone(&server_session), Arc::clone(&request_manager),),
+                RESULT_SUCCESS
+            );
+        }
+
+        let client_thread = Arc::new(crate::hle::kernel::k_thread::KThreadLock::new(
+            crate::hle::kernel::k_thread::KThread::new(),
+        ));
+        let mut request = crate::hle::kernel::k_session_request::KSessionRequest::new();
+        request.thread = Some(Arc::downgrade(&client_thread));
+        request.thread_id = Some(1);
+        server_session
+            .lock()
+            .unwrap()
+            .request_list
+            .push_back(Arc::new(Mutex::new(request)));
+
+        assert!(ServerManager::process_session_event_shared(
+            &manager,
+            SharedSessionEvent {
+                session_id: 1,
+                server_session,
+                manager: request_manager,
+                service_manager: None,
+                server_name: "test".to_string(),
+            },
+        ));
+        assert!(manager.lock().unwrap().sessions.is_empty());
     }
 
     #[test]

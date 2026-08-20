@@ -88,7 +88,7 @@ impl EventObserver {
     /// Upstream: void TrackAppletProcess(Applet& applet)
     ///
     pub fn track_applet_process(&self, applet: &Arc<Mutex<Applet>>) {
-        let process = {
+        let (process, aruid, applet_id) = {
             let applet = applet.lock().unwrap();
             if !applet.process.is_initialized() {
                 return;
@@ -96,8 +96,16 @@ impl EventObserver {
             let Some(process) = applet.process.get_handle() else {
                 return;
             };
-            process
+            (process, applet.aruid.pid, applet.applet_id)
         };
+
+        if std::env::var_os("RUZU_TRACE_APPLET_RETURN").is_some() {
+            log::info!(
+                "[APPLET_RETURN] track aruid={} applet_id={:?}",
+                aruid,
+                applet_id
+            );
+        }
 
         let mut holder = Box::new(ProcessHolder::new(applet.clone(), process));
         holder
@@ -191,7 +199,7 @@ impl EventObserver {
                 window_system.update();
             }
             x if x == UserDataTag::AppletProcess as usize => {
-                let (applet, process_running, terminated) = {
+                let (applet, process_running, terminated, process_state) = {
                     let mut state = shared.state.lock().unwrap();
                     let Some(index) = state.process_holder_list.iter().position(|candidate| {
                         std::ptr::eq(candidate.get_multi_wait_holder(), unsafe { &*holder })
@@ -201,7 +209,7 @@ impl EventObserver {
 
                     let process = state.process_holder_list[index].get_process().clone();
                     let applet = state.process_holder_list[index].get_applet().clone();
-                    let (terminated, process_running) = {
+                    let (terminated, process_running, process_state) = {
                         let process = process.lock().unwrap();
                         let state = process.get_state();
                         (
@@ -209,6 +217,7 @@ impl EventObserver {
                             state == ProcessState::Running
                                 || state == ProcessState::RunningAttached
                                 || state == ProcessState::DebugBreak,
+                            state,
                         )
                     };
 
@@ -222,13 +231,22 @@ impl EventObserver {
                             .link_to_multi_wait(deferred_wait_list);
                     }
 
-                    (applet, process_running, terminated)
+                    (applet, process_running, terminated, process_state)
                 };
 
                 {
                     let mut applet = applet.lock().unwrap();
+                    if std::env::var_os("RUZU_TRACE_APPLET_RETURN").is_some() {
+                        log::info!(
+                            "[APPLET_RETURN] process event aruid={} applet_id={:?} state={:?} terminated={} running={}",
+                            applet.aruid.pid,
+                            applet.applet_id,
+                            process_state,
+                            terminated,
+                            process_running
+                        );
+                    }
                     applet.is_process_running = process_running;
-                    let _ = terminated;
                 }
 
                 let window_system = unsafe { &*(shared.window_system as *const WindowSystem) };

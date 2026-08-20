@@ -32,6 +32,7 @@ use crate::hle::kernel::svc::svc_results::{
 };
 use crate::hle::kernel::svc_types::THREAD_LOCAL_REGION_SIZE;
 use crate::hle::result::RESULT_SUCCESS;
+use crate::memory::memory::Memory;
 // RBEntry kept for structural parity with upstream m_condvar_arbiter_tree_node.
 // Currently unused: we use BTreeSet externally instead of an intrusive tree.
 
@@ -55,6 +56,32 @@ pub(crate) const CONTEXT_GUARD_UNOWNED: i32 = -1;
 // serialization is the scheduler spin-lock's job. Mirrors step 5a's
 // ProcessLock swap: `pub type ProcessLock = SyncCell<KProcess>`.
 pub type KThreadLock = super::sync_cell::KThreadCell;
+
+/// Return the process that owns the current emulated thread.
+///
+/// Upstream: `GetCurrentProcessPointer(KernelCore&)` in `k_thread.cpp`.
+pub fn get_current_process_pointer() -> Option<Arc<ProcessLock>> {
+    let current_thread = super::kernel::get_current_thread_pointer()?;
+    let parent = current_thread.lock().ok()?.parent.clone()?;
+    parent.upgrade()
+}
+
+/// Return the process that owns the current emulated thread.
+///
+/// Upstream: `GetCurrentProcess(KernelCore&)` in `k_thread.cpp`. Rust returns
+/// the owning `Arc` rather than a C++ reference.
+pub fn get_current_process() -> Option<Arc<ProcessLock>> {
+    get_current_process_pointer()
+}
+
+/// Return the memory owned by the current emulated thread's process.
+///
+/// Upstream: `GetCurrentMemory(KernelCore&)` in `k_thread.cpp`.
+pub fn get_current_memory() -> Option<Arc<Mutex<Memory>>> {
+    let process = get_current_process_pointer()?;
+    let process = process.lock().ok()?;
+    process.get_memory()
+}
 
 /// Upstream anonymous `ThreadLocalRegion` in `k_thread.cpp`.
 #[repr(C)]
@@ -4170,6 +4197,40 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     #[test]
+    fn current_process_and_memory_follow_the_current_threads_owner() {
+        let mut system = crate::core::System::new();
+        system.initialize();
+
+        let mut application = KProcess::new();
+        application.create_memory(&system);
+        let application = Arc::new(ProcessLock::from_value(application));
+
+        let mut applet = KProcess::new();
+        applet.create_memory(&system);
+        let applet = Arc::new(ProcessLock::from_value(applet));
+        let applet_memory = applet.lock().unwrap().get_memory().unwrap();
+
+        system.set_current_process_arc(Arc::clone(&application));
+
+        let mut thread = KThread::new();
+        thread.parent = Some(Arc::downgrade(&applet));
+        let thread = Arc::new(KThreadLock::new(thread));
+        crate::hle::kernel::kernel::set_current_emu_thread(Some(&thread));
+
+        let resolved_process = get_current_process_pointer().unwrap();
+        assert!(Arc::ptr_eq(&resolved_process, &applet));
+        assert!(!Arc::ptr_eq(&resolved_process, &application));
+        assert!(Arc::ptr_eq(&get_current_memory().unwrap(), &applet_memory));
+        assert!(Arc::ptr_eq(&system.current_process_arc(), &applet));
+        assert!(Arc::ptr_eq(
+            &system.get_svc_memory().unwrap(),
+            &applet_memory
+        ));
+
+        crate::hle::kernel::kernel::set_current_emu_thread(None);
+    }
+
+    #[test]
     fn test_thread_state_values() {
         assert_eq!(ThreadState::WAITING.bits(), 1);
         assert_eq!(ThreadState::RUNNABLE.bits(), 2);
@@ -4279,7 +4340,7 @@ mod tests {
             memory
                 .lock()
                 .unwrap()
-                .set_current_page_table(impl_page_table.as_mut() as *mut _);
+                .set_current_page_table(impl_page_table.as_mut() as *mut _, true);
         }
 
         let tls_address = tls_address.get();

@@ -811,6 +811,14 @@ pub struct TextureCacheBase<P: TextureCacheParams = CommonTextureCacheParams> {
     /// Upstream `gpu_page_table_storage`, two maps per registered GPU address
     /// space: dense pages at `storage_id * 2`, sparse pages at `storage_id * 2 + 1`.
     pub gpu_page_table_storage: Vec<TextureCacheGPUMap>,
+    /// Dense GPU page-table owner captured when each image is registered.
+    ///
+    /// Upstream unregisters through `channel_state->gpu_page_table` while the
+    /// originating channel is still current. Ruzu replays memory-manager
+    /// notifications after releasing its Rust mutex, so another channel can be
+    /// current by then; retaining the registration owner preserves the same
+    /// page-table removal without changing image ownership.
+    pub image_gpu_page_table_indices: HashMap<ImageId, usize, BuildUnorderedDenseHasher>,
 
     /// Per-channel descriptor state (TIC/TSC tables + cached id arrays).
     /// Upstream: inherited `ChannelSetupCaches<TextureCacheChannelInfo>`.
@@ -1082,6 +1090,7 @@ impl<P: TextureCacheParams> TextureCacheBase<P> {
                 TextureCacheGPUMap::default(),
                 TextureCacheGPUMap::default(),
             ],
+            image_gpu_page_table_indices: HashMap::default(),
             channel_caches: ChannelSetupCaches::new(),
             channel_state: fallback_channel_state,
             mutex: ReentrantMutex::new(()),

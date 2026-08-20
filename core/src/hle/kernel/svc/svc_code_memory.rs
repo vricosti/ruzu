@@ -57,7 +57,8 @@ pub fn create_code_memory(
     }
 
     // Verify that the region is in range.
-    let mut process = system.current_process_arc().lock().unwrap();
+    let process_arc = system.current_process_arc();
+    let mut process = process_arc.lock().unwrap();
     let addr_kpa = crate::hle::kernel::k_typed_address::KProcessAddress::new(address);
     if !process.page_table.contains(addr_kpa, size as usize) {
         return RESULT_INVALID_CURRENT_MEMORY;

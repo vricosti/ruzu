@@ -325,7 +325,7 @@ impl ThreadQueueImplForKSynchronizationObjectWait {
 
 /// Enum wrapping the possible sync-object sources so wait() can query the
 /// right state_ptr + signaled check per object_id.
-enum WaitableObject {
+pub(crate) enum WaitableObject {
     ReadableEvent {
         _event: Arc<Mutex<KReadableEvent>>,
         is_signaled: *const std::sync::atomic::AtomicBool,
@@ -348,7 +348,48 @@ enum WaitableObject {
 }
 
 impl WaitableObject {
-    fn is_signaled(&self) -> bool {
+    pub(crate) fn from_readable_event(event: Arc<Mutex<KReadableEvent>>) -> Self {
+        let (is_signaled, sync_state) = {
+            let mut guard = event.lock().unwrap();
+            (
+                &guard.is_signaled as *const std::sync::atomic::AtomicBool,
+                &mut guard.sync_object as *mut SynchronizationObjectState,
+            )
+        };
+        Self::ReadableEvent {
+            _event: event,
+            is_signaled,
+            sync_state,
+        }
+    }
+
+    pub(crate) fn from_server_port(port: Arc<Mutex<KPort>>) -> Self {
+        let port_ptr = {
+            let mut guard = port.lock().unwrap();
+            &mut *guard as *mut KPort
+        };
+        Self::ServerPort {
+            _port: port,
+            port: port_ptr,
+        }
+    }
+
+    pub(crate) fn from_server_session(session: Arc<Mutex<KServerSession>>) -> Self {
+        let session_ptr = {
+            let mut guard = session.lock().unwrap();
+            &mut *guard as *mut KServerSession
+        };
+        Self::ServerSession {
+            _session: session,
+            session: session_ptr,
+        }
+    }
+
+    pub(crate) fn from_process(process: Arc<ProcessLock>) -> Self {
+        Self::Process(process)
+    }
+
+    pub(crate) fn is_signaled(&self) -> bool {
         match self {
             Self::ReadableEvent { is_signaled, .. } => unsafe {
                 (**is_signaled).load(std::sync::atomic::Ordering::Relaxed)
@@ -397,14 +438,7 @@ fn resolve_waitable_object(
     object_id: u64,
 ) -> Option<WaitableObject> {
     if let Some(port) = process_guard.get_server_port_by_object_id(object_id) {
-        let port_ptr = {
-            let mut guard = port.lock().unwrap();
-            &mut *guard as *mut KPort
-        };
-        return Some(WaitableObject::ServerPort {
-            _port: port,
-            port: port_ptr,
-        });
+        return Some(WaitableObject::from_server_port(port));
     }
     if let Some(port) = process_guard.get_client_port_by_object_id(object_id) {
         let port_ptr = {
@@ -417,34 +451,16 @@ fn resolve_waitable_object(
         });
     }
     if let Some(event) = process_guard.get_readable_event_by_object_id(object_id) {
-        let (is_signaled, sync_state) = {
-            let mut guard = event.lock().unwrap();
-            (
-                &guard.is_signaled as *const std::sync::atomic::AtomicBool,
-                &mut guard.sync_object as *mut SynchronizationObjectState,
-            )
-        };
-        return Some(WaitableObject::ReadableEvent {
-            _event: event,
-            is_signaled,
-            sync_state,
-        });
+        return Some(WaitableObject::from_readable_event(event));
     }
     if let Some(session) = process_guard.get_server_session_by_object_id(object_id) {
-        let session_ptr = {
-            let mut guard = session.lock().unwrap();
-            &mut *guard as *mut KServerSession
-        };
-        return Some(WaitableObject::ServerSession {
-            _session: session,
-            session: session_ptr,
-        });
+        return Some(WaitableObject::from_server_session(session));
     }
     if let Some(thread) = process_guard.get_thread_by_object_id(object_id) {
         return Some(WaitableObject::Thread(thread));
     }
     if process_guard.process_id == object_id {
-        return Some(WaitableObject::Process(process.clone()));
+        return Some(WaitableObject::from_process(process.clone()));
     }
     None
 }
@@ -609,22 +625,41 @@ pub unsafe fn notify_waiters_on_state(
 pub fn wait(
     process: &Arc<ProcessLock>,
     current_thread: &Arc<KThreadLock>,
-    _scheduler: &Arc<Mutex<super::k_scheduler::KScheduler>>,
+    scheduler: &Arc<Mutex<super::k_scheduler::KScheduler>>,
     out_index: &mut i32,
     object_ids: Vec<u64>,
     timeout_ns: i64,
 ) -> ResultCode {
-    {
-        let mut guard = current_thread.lock().unwrap();
-        if guard.is_termination_requested() {
-            return RESULT_TERMINATION_REQUESTED;
-        }
-        if guard.is_wait_cancelled() {
-            guard.clear_wait_cancelled();
-            *out_index = -1;
-            return RESULT_CANCELLED;
-        }
-    }
+    let Some(waitable_objects) = resolve_waitable_objects(process, &object_ids) else {
+        return RESULT_INVALID_HANDLE;
+    };
+
+    wait_on_objects(
+        current_thread,
+        scheduler,
+        out_index,
+        object_ids,
+        waitable_objects,
+        timeout_ns,
+    )
+}
+
+/// Wait on synchronization objects already owned by the caller.
+///
+/// This is the direct counterpart of upstream
+/// `KSynchronizationObject::Wait(kernel, ..., KSynchronizationObject** objects,
+/// ...)`. SVC entry points first resolve guest handles through their process
+/// table and call `wait`; `Service::MultiWait` already owns native objects and
+/// calls this function without a second process-table lookup.
+pub(crate) fn wait_on_objects(
+    current_thread: &Arc<KThreadLock>,
+    _scheduler: &Arc<Mutex<super::k_scheduler::KScheduler>>,
+    out_index: &mut i32,
+    object_ids: Vec<u64>,
+    waitable_objects: Vec<WaitableObject>,
+    timeout_ns: i64,
+) -> ResultCode {
+    debug_assert_eq!(object_ids.len(), waitable_objects.len());
 
     let current_thread_id = current_thread.lock().unwrap().thread_id;
     // Upstream's `KSynchronizationObject::Wait` opens
@@ -638,10 +673,6 @@ pub fn wait(
         let guard = current_thread.lock().unwrap();
         &*guard as *const KThread as usize
     };
-    let Some(waitable_objects) = resolve_waitable_objects(process, &object_ids) else {
-        return RESULT_INVALID_HANDLE;
-    };
-
     let _result = {
         let (mut sleep_guard, timer) = KScopedSchedulerLockAndSleep::new(
             scheduler_lock,
@@ -650,6 +681,11 @@ pub fn wait(
             thread_ptr,
             timeout_ns,
         );
+
+        if current_thread.lock().unwrap().is_termination_requested() {
+            sleep_guard.cancel_sleep();
+            return RESULT_TERMINATION_REQUESTED;
+        }
 
         if let Some(index) = first_signaled_waitable_index(&waitable_objects) {
             if std::env::var_os("RUZU_TRACE_NOTIFY_WAITERS").is_some() {
@@ -669,6 +705,15 @@ pub fn wait(
         if timeout_ns == 0 {
             sleep_guard.cancel_sleep();
             return RESULT_TIMED_OUT;
+        }
+
+        {
+            let mut guard = current_thread.lock().unwrap();
+            if guard.is_wait_cancelled() {
+                sleep_guard.cancel_sleep();
+                guard.clear_wait_cancelled();
+                return RESULT_CANCELLED;
+            }
         }
 
         // Allocate the node buffer and resolve sync-state pointers for every

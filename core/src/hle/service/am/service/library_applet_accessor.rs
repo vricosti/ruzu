@@ -122,6 +122,15 @@ impl ILibraryAppletAccessor {
             .ensure_state_changed_event_object_id(ctx)
             .unwrap_or(0);
 
+        if std::env::var_os("RUZU_TRACE_APPLET_RETURN").is_some() {
+            let applet = service.applet.lock().unwrap();
+            log::info!(
+                "[APPLET_RETURN] GetAppletStateChangedEvent aruid={} object_id={}",
+                applet.aruid.pid,
+                handle
+            );
+        }
+
         let mut rb = ResponseBuilder::new(ctx, 2, 1, 0);
         rb.push_result(RESULT_SUCCESS);
         rb.push_copy_object_id(handle);
@@ -133,6 +142,15 @@ impl ILibraryAppletAccessor {
         log::debug!("ILibraryAppletAccessor::IsCompleted called");
         let is_completed = service.applet.lock().unwrap().is_completed;
 
+        if std::env::var_os("RUZU_TRACE_APPLET_RETURN").is_some() {
+            let aruid = service.applet.lock().unwrap().aruid.pid;
+            log::info!(
+                "[APPLET_RETURN] IsCompleted aruid={} completed={}",
+                aruid,
+                is_completed
+            );
+        }
+
         let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
         rb.push_result(RESULT_SUCCESS);
         rb.push_bool(is_completed);
@@ -143,6 +161,15 @@ impl ILibraryAppletAccessor {
             unsafe { &*(this as *const dyn ServiceFramework as *const ILibraryAppletAccessor) };
         log::debug!("ILibraryAppletAccessor::GetResult called");
         let result = ResultCode::new(service.applet.lock().unwrap().terminate_result);
+
+        if std::env::var_os("RUZU_TRACE_APPLET_RETURN").is_some() {
+            let aruid = service.applet.lock().unwrap().aruid.pid;
+            log::info!(
+                "[APPLET_RETURN] GetResult aruid={} result=0x{:X}",
+                aruid,
+                result.get_inner_value()
+            );
+        }
 
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(result);
@@ -254,8 +281,31 @@ impl ILibraryAppletAccessor {
             unsafe { &*(this as *const dyn ServiceFramework as *const ILibraryAppletAccessor) };
         log::debug!("ILibraryAppletAccessor::PopOutData called");
 
+        let caller_applet = service.applet.lock().unwrap().caller_applet.upgrade();
+        if let Some(caller_applet) = caller_applet {
+            let mut caller_applet = caller_applet.lock().unwrap();
+            caller_applet.lifecycle_manager.get_system_event().signal();
+            caller_applet
+                .lifecycle_manager
+                .request_resume_notification();
+            caller_applet.lifecycle_manager.get_system_event().clear();
+            caller_applet
+                .lifecycle_manager
+                .update_requested_focus_state();
+
+            if std::env::var_os("RUZU_TRACE_APPLET_RETURN").is_some() {
+                log::info!(
+                    "[APPLET_RETURN] PopOutData resumed caller aruid={}",
+                    caller_applet.aruid.pid
+                );
+            }
+        }
+
         match service.broker.get_out_data().pop() {
             Ok(data) => {
+                if std::env::var_os("RUZU_TRACE_APPLET_RETURN").is_some() {
+                    log::info!("[APPLET_RETURN] PopOutData size={}", data.len());
+                }
                 let storage = Arc::new(IStorage::new_with_system(service.system, data));
                 let mut rb = ResponseBuilder::new(ctx, 2, 0, 1);
                 rb.push_result(RESULT_SUCCESS);

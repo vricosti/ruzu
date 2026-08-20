@@ -2120,10 +2120,7 @@ impl KServerSession {
     /// kernel registry to rediscover the owner process and is unsafe under a
     /// held process lock.
     pub fn on_client_closed(&mut self) {
-        self.client_closed = true;
-        self.cleanup_requests();
-        self.notify_available(RESULT_SESSION_CLOSED.get_inner_value());
-        self.notify_manager_closed();
+        self.on_client_closed_impl();
     }
 
     /// Port of upstream `KServerSession::OnClientClosed`, when the owner
@@ -2132,8 +2129,38 @@ impl KServerSession {
         &mut self,
         _process: &mut crate::hle::kernel::k_process::KProcess,
     ) {
+        self.on_client_closed_impl();
+    }
+
+    fn on_client_closed_impl(&mut self) {
         self.client_closed = true;
-        self.cleanup_requests();
+
+        // Eden keeps the request currently being dispatched in
+        // `m_current_request`. If its client thread is terminating, only the
+        // request's thread/event references are cleared. `SendReplyHLE` must
+        // still consume the request and report ResultSessionClosed.
+        if let Some(current_request) = self.current_request.as_ref() {
+            let client_thread = Self::resolve_request_client_thread(current_request);
+            if client_thread
+                .as_ref()
+                .is_some_and(|thread| thread.lock().unwrap().is_termination_requested())
+            {
+                let mut request = current_request.lock().unwrap();
+                request.clear_thread();
+                request.clear_event();
+            }
+        }
+
+        // Pending requests have not been received by the server and therefore
+        // have no IPC mappings. Eden only replies to asynchronous requests;
+        // synchronous callers belong to the closing client process.
+        while let Some(request) = self.request_list.pop_front() {
+            if request.lock().unwrap().get_event_id().is_some() {
+                Self::complete_aborted_request(&request, RESULT_SESSION_CLOSED);
+            }
+            Self::finalize_request(&request);
+        }
+
         self.notify_available(RESULT_SESSION_CLOSED.get_inner_value());
         self.notify_manager_closed();
     }
@@ -3200,7 +3227,7 @@ mod tests {
         memory
             .lock()
             .unwrap()
-            .set_current_page_table(impl_pt.as_mut() as *mut _);
+            .set_current_page_table(impl_pt.as_mut() as *mut _, true);
     }
 
     fn bind_request_client_thread_for_session_test(
@@ -3309,6 +3336,34 @@ mod tests {
         assert!(!server.is_signaled());
         server.on_client_closed();
         assert!(server.is_signaled());
+    }
+
+    #[test]
+    fn client_close_preserves_active_request_for_session_closed_reply() {
+        let client_thread = Arc::new(KThreadLock::new(
+            crate::hle::kernel::k_thread::KThread::new(),
+        ));
+        client_thread.lock().unwrap().request_terminate();
+
+        let request = Arc::new(Mutex::new(KSessionRequest::new()));
+        bind_request_client_thread_for_session_test(&mut request.lock().unwrap(), &client_thread);
+
+        let server = Arc::new(Mutex::new(KServerSession::new()));
+        {
+            let mut server = server.lock().unwrap();
+            server.initialize(0x1000);
+            server.current_request = Some(Arc::clone(&request));
+            server.on_client_closed();
+
+            assert!(server.current_request.is_some());
+            assert!(request.lock().unwrap().get_thread().is_none());
+        }
+
+        assert_eq!(
+            KServerSession::send_reply_hle_unlocked(&server),
+            RESULT_SESSION_CLOSED.get_inner_value()
+        );
+        assert!(server.lock().unwrap().current_request.is_none());
     }
 
     #[test]

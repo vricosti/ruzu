@@ -34,7 +34,8 @@ fn log_sync_context(system: &System, label: &str) {
         return;
     };
     let core_index = current_thread.lock().unwrap().get_current_core().max(0) as usize;
-    let process = system.current_process_arc().lock().unwrap();
+    let process_arc = system.current_process_arc();
+    let process = process_arc.lock().unwrap();
     let Some(cpu) = process.get_arm_interface(core_index) else {
         return;
     };

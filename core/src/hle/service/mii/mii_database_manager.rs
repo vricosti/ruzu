@@ -142,7 +142,7 @@ impl DatabaseManager {
     }
 
     pub fn is_full_database(&self) -> bool {
-        self.database.get_database_length() as usize >= MAX_MII_COUNT
+        self.database.get_database_length() as usize == MAX_MII_COUNT
     }
 
     pub fn get_count(&self, metadata: &DatabaseSessionMetadata) -> u32 {

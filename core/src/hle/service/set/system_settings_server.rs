@@ -8,6 +8,8 @@
 use std::collections::BTreeMap;
 use std::sync::Mutex;
 
+use common::uuid::UUID;
+
 use super::settings_types::*;
 use crate::hle::result::{ErrorModule, ResultCode, RESULT_SUCCESS};
 use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
@@ -577,8 +579,12 @@ impl ISystemSettingsServer {
         self.set_save_needed();
     }
 
-    pub fn get_mii_author_id(&self) -> [u8; 16] {
+    pub fn get_mii_author_id(&mut self) -> [u8; 16] {
         log::debug!("ISystemSettingsServer::GetMiiAuthorId called");
+        if self.mii_author_id == [0; 16] {
+            self.mii_author_id = UUID::make_default().uuid;
+            self.set_save_needed();
+        }
         self.mii_author_id
     }
 
@@ -2817,5 +2823,24 @@ mod tests {
         let fw = get_firmware_version_impl(GetFirmwareVersionType::Version1);
         assert_eq!(fw.major, 18);
         assert_eq!(fw.minor, 0);
+    }
+
+    #[test]
+    fn get_mii_author_id_initializes_invalid_uuid_and_marks_save_needed() {
+        let mut server = ISystemSettingsServer::new();
+        assert_eq!(server.mii_author_id, [0; 16]);
+        assert!(!server.save_needed);
+
+        assert_eq!(server.get_mii_author_id(), *b"Eden Default UID");
+        assert!(server.save_needed);
+    }
+
+    #[test]
+    fn get_mii_author_id_preserves_valid_uuid() {
+        let mut server = ISystemSettingsServer::new();
+        server.mii_author_id = *b"custom author id";
+
+        assert_eq!(server.get_mii_author_id(), *b"custom author id");
+        assert!(!server.save_needed);
     }
 }

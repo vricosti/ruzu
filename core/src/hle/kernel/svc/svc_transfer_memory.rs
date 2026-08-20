@@ -161,7 +161,8 @@ pub fn map_transfer_memory(
         return RESULT_INVALID_STATE;
     }
 
-    let mut process = system.current_process_arc().lock().unwrap();
+    let process_arc = system.current_process_arc();
+    let mut process = process_arc.lock().unwrap();
 
     // Get transfer memory from handle.
     let object_id = match process.handle_table.get_object(trmem_handle) {
@@ -215,7 +216,8 @@ pub fn unmap_transfer_memory(
         return RESULT_INVALID_CURRENT_MEMORY;
     }
 
-    let mut process = system.current_process_arc().lock().unwrap();
+    let process_arc = system.current_process_arc();
+    let mut process = process_arc.lock().unwrap();
 
     // Get transfer memory from handle.
     let object_id = match process.handle_table.get_object(trmem_handle) {

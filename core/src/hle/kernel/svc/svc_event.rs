@@ -21,7 +21,8 @@ pub fn signal_event(system: &System, event_handle: Handle) -> ResultCode {
         event_handle
     );
 
-    let mut process = system.current_process_arc().lock().unwrap();
+    let process_arc = system.current_process_arc();
+    let mut process = process_arc.lock().unwrap();
     let Some(object_id) = process.handle_table.get_object(event_handle) else {
         return RESULT_INVALID_HANDLE;
     };
@@ -40,7 +41,8 @@ pub fn clear_event(system: &System, event_handle: Handle) -> ResultCode {
         event_handle
     );
 
-    let process = system.current_process_arc().lock().unwrap();
+    let process_arc = system.current_process_arc();
+    let process = process_arc.lock().unwrap();
     let Some(object_id) = process.handle_table.get_object(event_handle) else {
         return RESULT_INVALID_HANDLE;
     };
@@ -68,13 +70,15 @@ pub fn create_event(system: &System, out_write: &mut Handle, out_read: &mut Hand
     {
         let mut event_guard = event.lock().unwrap();
         let mut readable_event_guard = readable_event.lock().unwrap();
-        let process = system.current_process_arc().lock().unwrap();
+        let process_arc = system.current_process_arc();
+        let process = process_arc.lock().unwrap();
 
         readable_event_guard.initialize(event_object_id, readable_event_object_id);
         event_guard.initialize(process.process_id, readable_event_object_id);
     }
 
-    let mut process = system.current_process_arc().lock().unwrap();
+    let process_arc = system.current_process_arc();
+    let mut process = process_arc.lock().unwrap();
     if process.ensure_handle_table_initialized() != RESULT_SUCCESS.get_inner_value() {
         return RESULT_OUT_OF_RESOURCE;
     }
@@ -162,7 +166,8 @@ mod tests {
 
         assert_eq!(signal_event(&system, write_handle), RESULT_SUCCESS);
 
-        let process = system.current_process_arc().lock().unwrap();
+        let process_arc = system.current_process_arc();
+        let process = process_arc.lock().unwrap();
         let readable_object_id = process.handle_table.get_object(read_handle).unwrap();
         let readable = process
             .get_readable_event_by_object_id(readable_object_id)
@@ -171,7 +176,8 @@ mod tests {
         drop(process);
 
         assert_eq!(clear_event(&system, read_handle), RESULT_SUCCESS);
-        let process = system.current_process_arc().lock().unwrap();
+        let process_arc = system.current_process_arc();
+        let process = process_arc.lock().unwrap();
         let readable_object_id = process.handle_table.get_object(read_handle).unwrap();
         let readable = process
             .get_readable_event_by_object_id(readable_object_id)

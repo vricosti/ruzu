@@ -297,11 +297,9 @@ impl IAddOnContentManager {
         let mut rp = RequestParser::new(ctx);
         let offset = rp.pop_u32();
         let count = rp.pop_u32();
-        let (out_count, add_on_content) =
-            service.list_add_on_content(offset, count, ctx.get_pid());
+        let (out_count, add_on_content) = service.list_add_on_content(offset, count, ctx.get_pid());
 
-        let mut out_bytes =
-            Vec::with_capacity(add_on_content.len() * std::mem::size_of::<u32>());
+        let mut out_bytes = Vec::with_capacity(add_on_content.len() * std::mem::size_of::<u32>());
         for add_on_content_id in add_on_content {
             out_bytes.extend_from_slice(&add_on_content_id.to_le_bytes());
         }

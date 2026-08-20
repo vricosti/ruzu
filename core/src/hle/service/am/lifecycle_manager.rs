@@ -120,6 +120,11 @@ impl LifecycleManager {
         self.system_event.copy_handle(ctx)
     }
 
+    /// Upstream: `Event& LifecycleManager::GetSystemEvent()`.
+    pub fn get_system_event(&self) -> &Event {
+        self.system_event.as_ref()
+    }
+
     pub fn ensure_system_event_object_id(&mut self, ctx: &HLERequestContext) -> Option<u64> {
         self.system_event.copy_object_id(ctx)
     }
@@ -543,5 +548,20 @@ mod tests {
         assert!(lifecycle.pop_message(&mut message));
         assert_eq!(message, AppletMessage::ChangeIntoForeground);
         assert!(!lifecycle.system_event.is_signaled());
+    }
+
+    #[test]
+    fn caller_resume_sequence_preserves_upstream_event_ordering() {
+        let mut lifecycle = LifecycleManager::new(true);
+        lifecycle.set_resume_notification_enabled(true);
+
+        lifecycle.get_system_event().signal();
+        assert!(lifecycle.get_system_event().is_signaled());
+        lifecycle.request_resume_notification();
+        lifecycle.get_system_event().clear();
+        lifecycle.update_requested_focus_state();
+
+        assert!(lifecycle.has_resume);
+        assert!(!lifecycle.get_system_event().is_signaled());
     }
 }

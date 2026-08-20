@@ -289,8 +289,22 @@ impl WindowSystem {
 
             let mut a = applet.lock().unwrap();
 
-            if !a.process.is_terminated() {
+            // Frontend applets mirror upstream's processless `Process` owner.
+            // Their `FrontendApplet::Exit` completion is therefore the only
+            // termination state available to the window-system owner.
+            let processless_frontend_completed = !a.process.is_initialized() && a.is_completed;
+            if !a.process.is_terminated() && !processless_frontend_completed {
                 continue;
+            }
+
+            if std::env::var_os("RUZU_TRACE_APPLET_RETURN").is_some() {
+                log::info!(
+                    "[APPLET_RETURN] prune aruid={} applet_id={:?} children={} caller={}",
+                    aruid,
+                    a.applet_id,
+                    a.child_applets.len(),
+                    a.caller_applet.strong_count() != 0
+                );
             }
 
             // Terminated, so ensure all child applets are terminated.
@@ -346,10 +360,18 @@ impl WindowSystem {
                 inner.overlay_display_aruid = None;
             }
 
-            // Finalize applet.
-            // NOTE: upstream calls applet->OnProcessTerminatedLocked() which needs a KProcess
-            // reference. We call a simplified version here since the process is already terminated.
-            a.is_completed = true;
+            // Finalize applet. This also signals the state-changed event so
+            // the caller observing ILibraryAppletAccessor can resume.
+            a.on_process_terminated_locked();
+
+            if std::env::var_os("RUZU_TRACE_APPLET_RETURN").is_some() {
+                log::info!(
+                    "[APPLET_RETURN] completed aruid={} applet_id={:?} state_event_present={}",
+                    aruid,
+                    a.applet_id,
+                    a.state_changed_event.is_some()
+                );
+            }
 
             // Request update to ensure quiescence.
             if let Some(ref observer) = self.event_observer {
@@ -499,6 +521,7 @@ impl Drop for WindowSystem {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::hle::service::os::process::Process;
     use std::sync::atomic::{AtomicBool, Ordering};
 
     #[test]
@@ -514,5 +537,20 @@ mod tests {
         window_system.update();
 
         assert!(exit_requested.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn completed_processless_frontend_applet_is_pruned() {
+        let window_system = WindowSystem::new(crate::core::SystemRef::null());
+        let mut applet = Applet::new(crate::core::SystemRef::null(), Process::new(), false);
+        applet.is_completed = true;
+        let applet = Arc::new(Mutex::new(applet));
+
+        window_system.track_applet(Arc::clone(&applet), false);
+        assert!(window_system.get_by_applet_resource_user_id(0).is_some());
+
+        window_system.update();
+
+        assert!(window_system.get_by_applet_resource_user_id(0).is_none());
     }
 }

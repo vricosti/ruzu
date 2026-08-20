@@ -57,7 +57,8 @@ fn log_sync_context(system: &System, label: &str) {
         return;
     };
     let core_index = current_thread.lock().unwrap().get_current_core().max(0) as usize;
-    let process = system.current_process_arc().lock().unwrap();
+    let process_arc = system.current_process_arc();
+    let process = process_arc.lock().unwrap();
     let Some(cpu) = process.get_arm_interface(core_index) else {
         return;
     };
@@ -134,7 +135,8 @@ pub fn arbitrate_lock(
             )
         };
         let (thread_type, tls_handle) = {
-            let process = system.current_process_arc().lock().unwrap();
+            let process_arc = system.current_process_arc();
+            let process = process_arc.lock().unwrap();
             let is_64bit = process.is_64bit();
             process
                 .get_memory()
@@ -185,7 +187,8 @@ pub fn arbitrate_lock(
                 .unwrap_or((0, 0))
         };
         let (owner_tid, tag_tid, current_handle, owner_object_id, tag_object_id) = {
-            let process = system.current_process_arc().lock().unwrap();
+            let process_arc = system.current_process_arc();
+            let process = process_arc.lock().unwrap();
             let owner_object_id = process.handle_table.get_object(thread_handle);
             let owner_tid = owner_object_id
                 .and_then(|object_id| process.get_thread_by_object_id(object_id))
@@ -263,7 +266,8 @@ pub fn arbitrate_lock(
         } else if tls_handle != 0 && tag != tls_handle {
             let (pc, lr, sp, x0, x1, x2, x20, jit_tpidrro) = {
                 let core_index = current_thread.lock().unwrap().get_current_core().max(0) as usize;
-                let process = system.current_process_arc().lock().unwrap();
+                let process_arc = system.current_process_arc();
+                let process = process_arc.lock().unwrap();
                 if let Some(cpu) = process.get_arm_interface(core_index) {
                     let mut ctx = crate::arm::arm_interface::ThreadContext::default();
                     cpu.get_context(&mut ctx);
@@ -322,8 +326,9 @@ pub fn arbitrate_lock(
         }
     }
 
+    let process = system.current_process_arc();
     let result = KConditionVariable::wait_for_address(
-        system.current_process_arc(),
+        &process,
         &current_thread,
         thread_handle,
         address,
@@ -365,11 +370,8 @@ pub fn arbitrate_unlock(system: &System, address: u64) -> ResultCode {
         return RESULT_INVALID_HANDLE;
     };
 
-    let result = KConditionVariable::signal_to_address(
-        system.current_process_arc(),
-        &current_thread,
-        address,
-    );
+    let process = system.current_process_arc();
+    let result = KConditionVariable::signal_to_address(&process, &current_thread, address);
 
     log::trace!(
         "svc::ArbitrateUnlock return address=0x{:X}, result={:#x}",
