@@ -26,12 +26,14 @@ use gtk::{gdk, gio, glib};
 use ruzu_core::file_sys::content_archive::NCA;
 use ruzu_core::file_sys::control_metadata::NACP;
 use ruzu_core::file_sys::fs_filesystem::OpenMode;
+use ruzu_core::file_sys::kernel_executable::KIP;
 use ruzu_core::file_sys::nca_metadata::TitleType;
 use ruzu_core::file_sys::partition_filesystem::ResultStatus as FsResultStatus;
 use ruzu_core::file_sys::patch_manager::{Patch, PatchManager};
+use ruzu_core::file_sys::program_metadata::ProgramMetadata;
 use ruzu_core::file_sys::registered_cache::{
-    get_cr_type_from_nca_type, ContentProvider, ContentProviderEntry, ContentProviderUnion,
-    ContentProviderUnionSlot, ExternalUpdateEntry, ManualContentProvider,
+    get_cr_type_from_nca_type, get_update_title_id, ContentProvider, ContentProviderEntry,
+    ContentProviderUnion, ContentProviderUnionSlot, ExternalUpdateEntry, ManualContentProvider,
 };
 use ruzu_core::file_sys::vfs::vfs_real::RealVfsFilesystem;
 use ruzu_core::file_sys::vfs::vfs_types::VirtualFile;
@@ -205,6 +207,7 @@ mod imp {
         pub developer: RefCell<String>,
         pub version: RefCell<String>,
         pub kind: RefCell<String>,
+        pub architecture: RefCell<String>,
         pub size: RefCell<String>,
         pub play_time: RefCell<String>,
         pub add_ons: RefCell<String>,
@@ -243,6 +246,7 @@ impl GameEntry {
         developer: &str,
         version: &str,
         kind: &str,
+        architecture: &str,
         size: &str,
         play_time: &str,
         add_ons: &str,
@@ -256,6 +260,7 @@ impl GameEntry {
         *imp.developer.borrow_mut() = developer.to_owned();
         *imp.version.borrow_mut() = version.to_owned();
         *imp.kind.borrow_mut() = kind.to_owned();
+        *imp.architecture.borrow_mut() = architecture.to_owned();
         *imp.size.borrow_mut() = size.to_owned();
         *imp.play_time.borrow_mut() = play_time.to_owned();
         *imp.add_ons.borrow_mut() = add_ons.to_owned();
@@ -301,6 +306,7 @@ impl GameEntry {
             &self.developer(),
             &self.version(),
             &self.kind(),
+            &self.architecture(),
             &self.size(),
             &self.play_time(),
             &self.add_ons(),
@@ -321,6 +327,9 @@ impl GameEntry {
     }
     fn kind(&self) -> String {
         self.imp().kind.borrow().clone()
+    }
+    fn architecture(&self) -> String {
+        self.imp().architecture.borrow().clone()
     }
     fn size(&self) -> String {
         self.imp().size.borrow().clone()
@@ -366,6 +375,7 @@ struct GameListView {
     filter_result: gtk::Label,
     column_view: gtk::ColumnView,
     file_type_column: gtk::ColumnViewColumn,
+    architecture_column: gtk::ColumnViewColumn,
     size_column: gtk::ColumnViewColumn,
     play_time_column: gtk::ColumnViewColumn,
     add_ons_column: gtk::ColumnViewColumn,
@@ -545,6 +555,11 @@ pub fn build<
         GameEntry::kind,
         Rc::clone(&on_context_menu),
     );
+    let architecture_column = make_text_column(
+        &crate::i18n::tr("Architecture"),
+        GameEntry::architecture,
+        Rc::clone(&on_context_menu),
+    );
     let size_column = make_text_column(
         &crate::i18n::tr("Size"),
         GameEntry::size,
@@ -562,6 +577,7 @@ pub fn build<
     );
     for column in [
         &file_type_column,
+        &architecture_column,
         &size_column,
         &play_time_column,
         &add_ons_column,
@@ -642,6 +658,7 @@ pub fn build<
         filter_result,
         column_view: column_view.clone(),
         file_type_column,
+        architecture_column,
         size_column,
         play_time_column,
         add_ons_column,
@@ -1733,6 +1750,7 @@ impl GameListView {
                     &game.developer,
                     &game.version,
                     &game.kind,
+                    &game.architecture,
                     &human_size(game.size),
                     &frontend_common::play_time_manager::PlayTimeManager::get_readable_play_time(
                         self.play_time_manager.get_play_time(game.program_id),
@@ -1769,6 +1787,7 @@ impl GameListView {
         uisettings::with(|values| {
             self.file_type_column
                 .set_visible(*values.show_types.get_value());
+            self.architecture_column.set_visible(true);
             self.size_column.set_visible(*values.show_size.get_value());
             self.play_time_column
                 .set_visible(*values.show_play_time.get_value());
@@ -2262,6 +2281,7 @@ struct GameFile {
     developer: String,
     version: String,
     kind: String,
+    architecture: String,
     size: u64,
     path: PathBuf,
     program_id: u64,
@@ -2320,6 +2340,7 @@ fn scan_dir_games(dir: &Path, deep_scan: bool, reader: &mut MetadataReader) -> V
         game.icon = metadata.icon;
         game.program_id = metadata.program_id;
         game.add_ons = metadata.add_ons;
+        game.architecture = metadata.architecture;
         games.push(game);
     }
 
@@ -2440,6 +2461,7 @@ fn collect_candidates(dir: &Path, deep_scan: bool, games: &mut Vec<GameFile>) {
             developer: String::new(),
             version: "1.0.0".to_string(),
             kind: ext_lower.as_deref().unwrap_or("NCA").to_uppercase(),
+            architecture: String::new(),
             size: metadata.len(),
             path,
             program_id: 0,
@@ -2494,7 +2516,7 @@ impl MetadataReader {
             return None;
         }
         if matches!(file_type, FileType::NSP | FileType::XCI)
-            && !is_bootable_game_container(file, file_type, 0, 0)
+            && !is_bootable_game_container(file.clone(), file_type, 0, 0)
         {
             return None;
         }
@@ -2528,7 +2550,7 @@ impl MetadataReader {
 
         let mut update_raw = None;
         loader.read_update_raw(&mut update_raw);
-        let patches = {
+        let (patches, architecture) = {
             let controller = self
                 .controller
                 .lock()
@@ -2537,7 +2559,14 @@ impl MetadataReader {
                 .content_provider
                 .lock()
                 .unwrap_or_else(|error| error.into_inner());
-            PatchManager::new(program_id, &controller, &*content_provider).get_patches(update_raw)
+            let patch_manager = PatchManager::new(program_id, &controller, &*content_provider);
+            let patches = patch_manager.get_patches(update_raw);
+            let architecture = normalize_architecture_label(get_game_list_cached_string(
+                program_id,
+                "arch.txt",
+                || read_program_architecture(file_type, &file, &patch_manager, &*content_provider),
+            ));
+            (patches, architecture)
         };
         let rom_fs_updatable = loader.is_rom_fs_updatable();
         let add_ons = get_game_list_cached_string(program_id, "pv.txt", || {
@@ -2551,6 +2580,7 @@ impl MetadataReader {
             developer,
             version,
             add_ons,
+            architecture,
         })
     }
 }
@@ -2563,6 +2593,73 @@ struct GameMetadata {
     developer: String,
     version: String,
     add_ons: String,
+    architecture: String,
+}
+
+fn architecture_label(is_64_bit: Option<bool>) -> String {
+    match is_64_bit {
+        Some(true) => "aarch64".to_owned(),
+        Some(false) => "aarch32".to_owned(),
+        None => "Unknown".to_owned(),
+    }
+}
+
+fn normalize_architecture_label(label: String) -> String {
+    match label.as_str() {
+        "AArch64" | "aarch64" => "aarch64".to_owned(),
+        "AArch32" | "aarch32" => "aarch32".to_owned(),
+        _ => label,
+    }
+}
+
+/// Read only the NPDM bit which selects the guest instruction set.
+///
+/// `pv.txt` remains Eden's patch-version cache verbatim. Architecture has its
+/// own `arch.txt` cache so a warm game-list scan only reads a few bytes and
+/// Eden can continue consuming `pv.txt` unchanged.
+fn read_program_architecture(
+    file_type: FileType,
+    file: &VirtualFile,
+    patch_manager: &PatchManager<'_>,
+    content_provider: &dyn ContentProvider,
+) -> String {
+    let is_64_bit = match file_type {
+        // Both standalone loaders use ProgramMetadata::GetDefault(), whose
+        // upstream instruction-set bit is 64-bit.
+        FileType::NRO | FileType::NSO => Some(true),
+        FileType::KIP => {
+            let kip = KIP::new(file);
+            (kip.get_status() == FsResultStatus::Success).then(|| kip.is_64_bit())
+        }
+        FileType::DeconstructedRomDirectory => file
+            .get_containing_directory()
+            .and_then(|exefs| architecture_from_exefs(exefs, patch_manager)),
+        FileType::NCA | FileType::NSP | FileType::XCI | FileType::NAX => content_provider
+            .get_entry_raw(
+                patch_manager.get_title_id(),
+                ruzu_core::file_sys::nca_metadata::ContentRecordType::Program,
+            )
+            .or_else(|| {
+                content_provider.get_entry_raw(
+                    get_update_title_id(patch_manager.get_title_id()),
+                    ruzu_core::file_sys::nca_metadata::ContentRecordType::Program,
+                )
+            })
+            .and_then(|program| NCA::new(program, None).get_exefs())
+            .and_then(|exefs| architecture_from_exefs(exefs, patch_manager)),
+        FileType::Error | FileType::Unknown => None,
+    };
+    architecture_label(is_64_bit)
+}
+
+fn architecture_from_exefs(
+    exefs: ruzu_core::file_sys::vfs::vfs_types::VirtualDir,
+    patch_manager: &PatchManager<'_>,
+) -> Option<bool> {
+    let exefs = patch_manager.patch_exefs(exefs);
+    let npdm = exefs.get_file("main.npdm")?;
+    let mut metadata = ProgramMetadata::new();
+    (metadata.load(npdm) == FsResultStatus::Success).then(|| metadata.is_64_bit_program())
 }
 
 /// Eden `FormatPatchNameVersions` used by the game-list Add-ons column.
@@ -2775,6 +2872,7 @@ mod tests {
             "",
             "1.0.0",
             "NSP",
+            "aarch64",
             "1 B",
             "",
             "",
@@ -2787,6 +2885,7 @@ mod tests {
             "",
             "1.0.0",
             "NSP",
+            "aarch64",
             "1 B",
             "",
             "",
@@ -2799,6 +2898,7 @@ mod tests {
             "",
             "1.0.0",
             "XCI",
+            "aarch64",
             "2 B",
             "",
             "",
@@ -2812,6 +2912,7 @@ mod tests {
 
         assert_eq!(favorites.len(), 2);
         assert_eq!(favorites[0].program_id(), 2);
+        assert_eq!(favorites[0].architecture(), "aarch64");
         assert_eq!(favorites[1].name(), "First copy");
         assert_ne!(favorites[1], first, "favorite rows must be cloned");
     }
@@ -3004,6 +3105,21 @@ mod tests {
         assert_eq!(
             format_patch_name_versions(&patches, FileType::NRO, false),
             "[D] Example Mod"
+        );
+    }
+
+    #[test]
+    fn architecture_column_uses_switch_instruction_set_names() {
+        assert_eq!(architecture_label(Some(true)), "aarch64");
+        assert_eq!(architecture_label(Some(false)), "aarch32");
+        assert_eq!(architecture_label(None), "Unknown");
+        assert_eq!(
+            normalize_architecture_label("AArch64".to_owned()),
+            "aarch64"
+        );
+        assert_eq!(
+            normalize_architecture_label("AArch32".to_owned()),
+            "aarch32"
         );
     }
 }

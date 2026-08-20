@@ -79,6 +79,7 @@ pub mod hex_util;
 pub mod input;
 pub mod lock_order;
 pub mod logging;
+pub mod scm_rev;
 pub mod steady_clock;
 pub mod string_util;
 pub mod telemetry;

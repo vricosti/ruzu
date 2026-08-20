@@ -100,9 +100,13 @@ impl FlowStack {
         self.entries.push(FlowStackEntry { token, target });
     }
 
-    pub fn pop(&self, token: Token) -> Option<(Location, Self)> {
-        let pc = self.peek(token)?;
-        Some((pc, self.remove(token)))
+    pub fn pop(&self, token: Token) -> (Location, Self) {
+        let pc = self.peek(token).unwrap_or_else(|| {
+            std::panic::panic_any(crate::exception::LogicError::new(
+                "Token could not be found",
+            ))
+        });
+        (pc, self.remove(token))
     }
 
     pub fn peek(&self, token: Token) -> Option<Location> {
@@ -293,7 +297,7 @@ impl FlowCfg {
             return false;
         };
         if self.blocks[visited].begin == pc {
-            return true;
+            std::panic::panic_any(crate::exception::LogicError::new("Dangling block"));
         }
         self.split_block(function_id, visited, label.block, pc);
         true
@@ -311,7 +315,7 @@ impl FlowCfg {
             return AnalysisState::Continue;
         };
         match opcode {
-            MaxwellOpcode::BRA | MaxwellOpcode::JMP | MaxwellOpcode::RET | MaxwellOpcode::PRET => {
+            MaxwellOpcode::BRA | MaxwellOpcode::JMP | MaxwellOpcode::RET => {
                 if !self.analyze_branch(block, function_id, pc, inst, opcode) {
                     return AnalysisState::Continue;
                 }
@@ -319,7 +323,7 @@ impl FlowCfg {
                     MaxwellOpcode::BRA | MaxwellOpcode::JMP => {
                         self.analyze_bra(block, function_id, pc, inst, is_absolute_jump(opcode));
                     }
-                    MaxwellOpcode::RET | MaxwellOpcode::PRET => {
+                    MaxwellOpcode::RET => {
                         self.blocks[block].end_class = EndClass::Return;
                     }
                     _ => {}
@@ -334,12 +338,9 @@ impl FlowCfg {
                 if !self.analyze_branch(block, function_id, pc, inst, opcode) {
                     return AnalysisState::Continue;
                 }
-                if let Some((stack_pc, new_stack)) =
-                    self.blocks[block].stack.pop(opcode_token(opcode))
-                {
-                    self.blocks[block].branch_true =
-                        Some(self.add_label(block, new_stack, stack_pc, function_id));
-                }
+                let (stack_pc, new_stack) = self.blocks[block].stack.pop(opcode_token(opcode));
+                self.blocks[block].branch_true =
+                    Some(self.add_label(block, new_stack, stack_pc, function_id));
                 self.blocks[block].end = pc;
                 AnalysisState::Branch
             }
@@ -362,6 +363,11 @@ impl FlowCfg {
                 self.analyze_indirect_branch(env, block, pc, inst, opcode, function_id)
             }
             MaxwellOpcode::EXIT => self.analyze_exit(block, function_id, pc, inst),
+            MaxwellOpcode::PRET => {
+                std::panic::panic_any(crate::exception::NotImplementedException::new(
+                    "PRET flow analysis",
+                ));
+            }
             MaxwellOpcode::CAL | MaxwellOpcode::JCAL => {
                 let cal_pc = if is_absolute_jump(opcode) {
                     pc.with_offset(inst.branch_absolute())
@@ -453,7 +459,9 @@ impl FlowCfg {
         opcode: MaxwellOpcode,
     ) -> bool {
         if inst.branch_is_cbuf() {
-            log::warn!("Branch with constant buffer offset is not implemented");
+            std::panic::panic_any(crate::exception::NotImplementedException::new(
+                "Branch with constant buffer offset",
+            ));
         }
         let pred = inst.pred();
         if pred == Predicate::from_bool(false) {
@@ -504,12 +512,18 @@ impl FlowCfg {
         opcode: MaxwellOpcode,
         function_id: usize,
     ) -> AnalysisState {
-        let table = track_indirect_branch_table(env, pc, self.program_start)
-            .unwrap_or_else(|| panic!("Failed to track indirect branch"));
+        let table = track_indirect_branch_table(env, pc, self.program_start).unwrap_or_else(|| {
+            track_indirect_branch_table(env, pc, self.program_start);
+            std::panic::panic_any(crate::exception::NotImplementedException::new(
+                "Failed to track indirect branch",
+            ));
+        });
         let flow_test = inst.branch_flow_test().unwrap_or(FlowTest::T);
         let pred = inst.pred();
         if flow_test != FlowTest::T || pred != Predicate::from_bool(true) {
-            panic!("Conditional indirect branch");
+            std::panic::panic_any(crate::exception::NotImplementedException::new(
+                "Conditional indirect branch",
+            ));
         }
 
         let mut targets = Vec::with_capacity(table.num_entries as usize);
@@ -566,7 +580,17 @@ impl FlowCfg {
         if pred == Predicate::from_bool(false) || flow_test == FlowTest::F {
             return AnalysisState::Continue;
         }
+        if self.exits_to_dispatcher && function_id != 0 {
+            std::panic::panic_any(crate::exception::NotImplementedException::new(
+                "Dispatch EXIT on external function",
+            ));
+        }
         if pred != Predicate::from_bool(true) || flow_test != FlowTest::T {
+            if self.blocks[block].stack.peek(Token::Pexit).is_some() {
+                std::panic::panic_any(crate::exception::NotImplementedException::new(
+                    "Conditional EXIT with PEXIT token",
+                ));
+            }
             if self.exits_to_dispatcher {
                 self.blocks[block].end = pc;
                 self.blocks[block].end_class = EndClass::Branch;
@@ -689,7 +713,9 @@ impl FlowCfg {
         pc: Location,
     ) {
         if pc <= self.blocks[old_block].begin || pc >= self.blocks[old_block].end {
-            return;
+            std::panic::panic_any(crate::exception::InvalidArgument::new(format!(
+                "Invalid address to split={pc}"
+            )));
         }
         let mut split = self.blocks[old_block].clone();
         split.begin = pc;
@@ -762,7 +788,9 @@ fn opcode_token(opcode: MaxwellOpcode) -> Token {
         MaxwellOpcode::PLONGJMP | MaxwellOpcode::LONGJMP => Token::Plongjmp,
         MaxwellOpcode::PRET | MaxwellOpcode::RET | MaxwellOpcode::CAL => Token::Pret,
         MaxwellOpcode::SSY | MaxwellOpcode::SYNC => Token::Ssy,
-        _ => Token::Ssy,
+        _ => std::panic::panic_any(crate::exception::InvalidArgument::new(format!(
+            "{opcode:?}"
+        ))),
     }
 }
 
@@ -787,7 +815,9 @@ fn has_flow_test(opcode: MaxwellOpcode) -> bool {
         | MaxwellOpcode::RET
         | MaxwellOpcode::SYNC => true,
         MaxwellOpcode::CAL | MaxwellOpcode::JCAL => false,
-        _ => panic!("invalid branch opcode {opcode:?}"),
+        _ => std::panic::panic_any(crate::exception::InvalidArgument::new(format!(
+            "Invalid branch {opcode:?}"
+        ))),
     }
 }
 
@@ -1169,6 +1199,130 @@ fn decode_condition(insn: u64, opcode: MaxwellOpcode) -> Condition {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::environment::TexturePassCaches;
+    use crate::program_header::ProgramHeader;
+    use crate::shader_info::{ReplaceConstant, TexturePixelFormat, TextureType};
+    use crate::stage::Stage;
+
+    struct PretEnvironment {
+        texture_pass_caches: TexturePassCaches,
+        sph: ProgramHeader,
+    }
+
+    impl Default for PretEnvironment {
+        fn default() -> Self {
+            Self {
+                texture_pass_caches: TexturePassCaches::default(),
+                sph: ProgramHeader::default(),
+            }
+        }
+    }
+
+    impl Environment for PretEnvironment {
+        fn texture_pass_caches(&mut self) -> &mut TexturePassCaches {
+            &mut self.texture_pass_caches
+        }
+
+        fn read_instruction(&mut self, _address: u32) -> u64 {
+            0xe270_0000_0007_000f
+        }
+
+        fn read_cbuf_value(&mut self, _cbuf_index: u32, _cbuf_offset: u32) -> u32 {
+            0
+        }
+
+        fn read_texture_type(&mut self, _raw_handle: u32) -> TextureType {
+            TextureType::Color2D
+        }
+
+        fn read_texture_pixel_format(&mut self, _raw_handle: u32) -> TexturePixelFormat {
+            TexturePixelFormat::A8B8G8R8Unorm
+        }
+
+        fn is_texture_pixel_format_integer(&mut self, _raw_handle: u32) -> bool {
+            false
+        }
+
+        fn read_viewport_transform_state(&mut self) -> u32 {
+            0
+        }
+
+        fn texture_bound_buffer(&self) -> u32 {
+            0
+        }
+
+        fn local_memory_size(&self) -> u32 {
+            0
+        }
+
+        fn shared_memory_size(&self) -> u32 {
+            0
+        }
+
+        fn workgroup_size(&self) -> [u32; 3] {
+            [1; 3]
+        }
+
+        fn has_hle_macro_state(&self) -> bool {
+            false
+        }
+
+        fn get_replace_const_buffer(
+            &mut self,
+            _bank: u32,
+            _offset: u32,
+        ) -> Option<ReplaceConstant> {
+            None
+        }
+
+        fn dump(&mut self, _pipeline_hash: u64, _shader_hash: u64) {}
+
+        fn sph(&self) -> &ProgramHeader {
+            &self.sph
+        }
+
+        fn gp_passthrough_mask(&self) -> &[u32; 8] {
+            static MASK: [u32; 8] = [0; 8];
+            &MASK
+        }
+
+        fn shader_stage(&self) -> Stage {
+            Stage::Compute
+        }
+
+        fn start_address(&self) -> u32 {
+            0
+        }
+
+        fn is_proprietary_driver(&self) -> bool {
+            false
+        }
+    }
+
+    #[test]
+    fn pret_flow_analysis_raises_typed_shader_exception() {
+        let mut env = PretEnvironment::default();
+        assert_eq!(
+            maxwell_opcodes::decode_opcode(env.read_instruction(8)),
+            Some(MaxwellOpcode::PRET)
+        );
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            FlowCfg::new(&mut env, Location::new_code_start(0), false)
+        }));
+        let payload = match result {
+            Ok(_) => panic!("PRET flow analysis must fail like upstream"),
+            Err(payload) => payload,
+        };
+        let exception = payload
+            .downcast_ref::<crate::exception::NotImplementedException>()
+            .expect("PRET must use a catchable shader exception");
+
+        assert_eq!(
+            exception.to_string(),
+            "PRET flow analysis is not implemented"
+        );
+    }
 
     #[test]
     fn branch_offset_uses_upstream_signed_24_bit_field() {

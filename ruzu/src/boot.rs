@@ -93,12 +93,22 @@ pub struct LoadingScreenAssets {
     pub banner: Option<Vec<u8>>,
 }
 
+/// Values passed to Eden's `MainWindow::UpdateWindowTitle` after a title has
+/// loaded and before disk shaders are prepared.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunningTitle {
+    pub title_name: String,
+    pub title_version: String,
+    pub gpu_vendor: String,
+}
+
 /// Cross-thread events consumed by the GTK loading screen.
 #[derive(Debug)]
 pub enum LoadingEvent {
     /// Per-title/global settings have been selected and are ready for the GUI
     /// to display, matching Eden's pre-launch `UpdateStatusButtons()` point.
     ConfigurationApplied,
+    TitleChanged(RunningTitle),
     Assets(LoadingScreenAssets),
     Progress {
         stage: LoadStage,
@@ -117,6 +127,63 @@ pub enum LoadingEvent {
         before_first_frame: bool,
     },
     StopComplete,
+}
+
+fn running_title(system: &ruzu_core::core::System, filepath: &str) -> RunningTitle {
+    use ruzu_core::file_sys::patch_manager::PatchManager;
+    use ruzu_core::loader::loader::ResultStatus;
+
+    let loader = system.get_app_loader();
+    let mut title_name = String::new();
+    let title_result = loader.read_title(&mut title_name);
+    let mut title_version = String::new();
+
+    if let Some(content_provider) = system.get_content_provider().cloned() {
+        let filesystem_controller = system.get_filesystem_controller();
+        let filesystem_controller = filesystem_controller
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let content_provider = content_provider
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let patch_manager = PatchManager::new(
+            system.runtime_program_id(),
+            &filesystem_controller,
+            &*content_provider,
+        );
+        if let Some(metadata) = patch_manager.get_control_metadata().0 {
+            title_version = metadata.get_version_string();
+            title_name = metadata.get_application_name();
+        }
+    }
+
+    if title_result != ResultStatus::Success || title_name.is_empty() {
+        title_name = std::path::Path::new(filepath).file_name().map_or_else(
+            || filepath.to_owned(),
+            |name| name.to_string_lossy().into_owned(),
+        );
+    }
+    let instruction_set_suffix = if system.runtime_is_64bit() {
+        crate::i18n::tr("(64-bit)")
+    } else {
+        crate::i18n::tr("(32-bit)")
+    };
+    title_name = format!("{title_name} {instruction_set_suffix}");
+    let gpu_vendor = system
+        .gpu_core()
+        .map_or_else(String::new, |gpu| gpu.get_device_vendor());
+    log::info!(
+        "Booting game: {:016X} | {} | {}",
+        system.runtime_program_id(),
+        title_name,
+        title_version
+    );
+
+    RunningTitle {
+        title_name,
+        title_version,
+        gpu_vendor,
+    }
 }
 
 /// Loading event callback marshaled to the GTK main thread.
@@ -755,6 +822,9 @@ fn run_boot(
         return;
     }
     program_id.store(system.runtime_program_id(), Ordering::Release);
+    loading_event(LoadingEvent::TitleChanged(running_title(
+        &system, &filepath,
+    )));
 
     let loader = system.get_app_loader();
     let mut assets = LoadingScreenAssets::default();

@@ -30,9 +30,9 @@ struct ShortcutData {
 
 /// Eden `QtCommon::Game::ResetMetadata`.
 ///
-/// The game-list cache includes the `pv.txt` files used by the Add-ons column,
-/// so a manual refresh must remove the complete directory before rebuilding
-/// the frontend content provider.
+/// The game-list cache includes the `pv.txt` files used by the Add-ons column
+/// and ruzu's `arch.txt` files, so a manual refresh must remove the complete
+/// directory before rebuilding the frontend content provider.
 pub fn reset_metadata(parent: Option<&gtk::Window>, show_message: bool) {
     let cache_dir = common::fs::path_util::get_ruzu_path(common::fs::path_util::RuzuPath::CacheDir)
         .join("game_list");

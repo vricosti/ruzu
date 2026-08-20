@@ -26,7 +26,7 @@ use common::settings_enums::{ConfirmStop, FullscreenMode};
 use input_common::drivers::mouse::MouseButton;
 use ruzu_core::frontend::framebuffer_layout::{default_frame_layout, FramebufferLayout};
 
-use crate::boot::{EmulationSession, LoadingEvent};
+use crate::boot::{EmulationSession, LoadingEvent, RunningTitle};
 use crate::loading_screen::{LoadStage, LoadingScreen};
 use crate::status_bar::StatusBar;
 
@@ -44,8 +44,29 @@ const PAGE_RENDER: &str = "render";
 const DEFAULT_WIDTH: i32 = 1280;
 const DEFAULT_HEIGHT: i32 = 720;
 
-/// Window title. Upstream uses "yuzu"; adapted to the ruzu app name.
-const WINDOW_TITLE: &str = "ruzu";
+fn idle_window_title() -> String {
+    format!(
+        "{} | {} | {}",
+        common::scm_rev::BUILD_NAME,
+        common::scm_rev::BUILD_VERSION,
+        common::scm_rev::COMPILER_ID
+    )
+}
+
+fn window_title(running: Option<&RunningTitle>) -> String {
+    let idle = idle_window_title();
+    let Some(running) = running else {
+        return idle;
+    };
+    if running.title_version.is_empty() {
+        format!("{idle} | {} | {}", running.title_name, running.gpu_vendor)
+    } else {
+        format!(
+            "{idle} | {} | {} | {}",
+            running.title_name, running.title_version, running.gpu_vendor
+        )
+    }
+}
 
 /// Upstream `default_input_update_timeout`, the interval of `update_input_timer`.
 const INPUT_UPDATE_TIMEOUT_MS: u64 = 1;
@@ -390,6 +411,40 @@ mod loading_event_mailbox_tests {
     }
 
     #[test]
+    fn running_title_is_preserved_before_cache_progress() {
+        let mut mailbox = LoadingEventMailbox::default();
+        mailbox.push(LoadingEvent::TitleChanged(RunningTitle {
+            title_name: "Mario Kart 8 Deluxe (64-bit)".to_owned(),
+            title_version: "3.0.5".to_owned(),
+            gpu_vendor: "RadeonSI".to_owned(),
+        }));
+        mailbox.push(LoadingEvent::Progress {
+            stage: LoadStage::Build,
+            value: 1,
+            total: 2,
+        });
+
+        assert!(matches!(
+            mailbox.pop(),
+            Some(LoadingEvent::TitleChanged(RunningTitle {
+                title_name,
+                title_version,
+                gpu_vendor,
+            })) if title_name == "Mario Kart 8 Deluxe (64-bit)"
+                && title_version == "3.0.5"
+                && gpu_vendor == "RadeonSI"
+        ));
+        assert!(matches!(
+            mailbox.pop(),
+            Some(LoadingEvent::Progress {
+                stage: LoadStage::Build,
+                value: 1,
+                total: 2,
+            })
+        ));
+    }
+
+    #[test]
     fn completed_hot_cache_does_not_force_build_stage_visible() {
         let mut mailbox = LoadingEventMailbox::default();
         mailbox.push(LoadingEvent::Progress {
@@ -613,6 +668,59 @@ mod startup_prerequisite_tests {
 }
 
 #[cfg(test)]
+mod window_title_tests {
+    use super::*;
+
+    #[test]
+    fn idle_title_contains_generated_build_identity() {
+        assert_eq!(
+            idle_window_title(),
+            format!(
+                "Ruzu | {} | {}",
+                common::scm_rev::BUILD_VERSION,
+                common::scm_rev::COMPILER_ID
+            )
+        );
+    }
+
+    #[test]
+    fn running_title_matches_upstream_field_order() {
+        let running = RunningTitle {
+            title_name: "Mario Kart 8 Deluxe (64-bit)".to_owned(),
+            title_version: "3.0.5".to_owned(),
+            gpu_vendor: "RadeonSI".to_owned(),
+        };
+
+        assert_eq!(
+            window_title(Some(&running)),
+            format!(
+                "Ruzu | {} | {} | Mario Kart 8 Deluxe (64-bit) | 3.0.5 | RadeonSI",
+                common::scm_rev::BUILD_VERSION,
+                common::scm_rev::COMPILER_ID
+            )
+        );
+    }
+
+    #[test]
+    fn empty_title_version_is_omitted_like_upstream() {
+        let running = RunningTitle {
+            title_name: "Homebrew (64-bit)".to_owned(),
+            title_version: String::new(),
+            gpu_vendor: "RADV".to_owned(),
+        };
+
+        assert_eq!(
+            window_title(Some(&running)),
+            format!(
+                "Ruzu | {} | {} | Homebrew (64-bit) | RADV",
+                common::scm_rev::BUILD_VERSION,
+                common::scm_rev::COMPILER_ID
+            )
+        );
+    }
+}
+
+#[cfg(test)]
 mod help_menu_tests {
     use super::*;
 
@@ -743,6 +851,10 @@ mod render_pointer_tests {
 }
 
 impl GMainWindow {
+    fn update_window_title(&self, running: Option<&RunningTitle>) {
+        self.window.set_title(Some(&window_title(running)));
+    }
+
     /// Construct and lay out the main window. Mirrors the body of the upstream
     /// `GMainWindow::GMainWindow` constructor (widget creation + `Initialize*`
     /// calls), minus the not-yet-ported subsystems.
@@ -760,9 +872,10 @@ impl GMainWindow {
     }
 
     fn new_with_config_import_offer(app: &Application, offer_config_import: bool) -> Rc<Self> {
+        let idle_title = idle_window_title();
         let window = ApplicationWindow::builder()
             .application(app)
-            .title(WINDOW_TITLE)
+            .title(&idle_title)
             .default_width(DEFAULT_WIDTH)
             .default_height(DEFAULT_HEIGHT)
             .build();
@@ -2777,6 +2890,9 @@ impl GMainWindow {
             }
             match mailbox.lock().unwrap().pop() {
                 Some(LoadingEvent::ConfigurationApplied) => this.status_bar.refresh(),
+                Some(LoadingEvent::TitleChanged(title)) => {
+                    this.update_window_title(Some(&title));
+                }
                 Some(LoadingEvent::Assets(assets)) => {
                     loading.set_assets(assets.logo.as_deref(), assets.banner.as_deref());
                 }
@@ -2968,6 +3084,9 @@ impl GMainWindow {
             }
             match mailbox.lock().unwrap().pop() {
                 Some(LoadingEvent::ConfigurationApplied) => this.status_bar.refresh(),
+                Some(LoadingEvent::TitleChanged(title)) => {
+                    this.update_window_title(Some(&title));
+                }
                 Some(LoadingEvent::Assets(assets)) => {
                     loading.set_assets(assets.logo.as_deref(), assets.banner.as_deref());
                 }
@@ -3147,6 +3266,9 @@ impl GMainWindow {
             }
             match mailbox.lock().unwrap().pop() {
                 Some(LoadingEvent::ConfigurationApplied) => this.status_bar.refresh(),
+                Some(LoadingEvent::TitleChanged(title)) => {
+                    this.update_window_title(Some(&title));
+                }
                 Some(LoadingEvent::Assets(assets)) => {
                     loading.set_assets(assets.logo.as_deref(), assets.banner.as_deref());
                 }
@@ -3595,6 +3717,7 @@ impl GMainWindow {
         }
 
         self.loading_screen.clear();
+        self.update_window_title(None);
         self.current_game_path.borrow_mut().take();
         self.show_game_list();
         if let Some(game_list) = self.game_list.borrow().as_ref() {

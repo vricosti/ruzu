@@ -1248,3 +1248,131 @@ and persisted under upstream's `UIGameList\\favorites_expanded` key.
 
 - PASS: add-on IDs are emitted as packed four-byte little-endian values, matching Eden's raw
   `u32` buffer copy; no shared structs changed.
+
+## 2026-08-20 — `shader_recompiler/src/frontend/control_flow.rs` vs Eden `src/shader_recompiler/frontend/maxwell/control_flow.{h,cpp}`
+
+### Intentional differences
+
+- Rust represents upstream `Shader::Exception` subclasses as typed panic payloads at the CFG
+  boundary. The Vulkan and OpenGL pipeline-cache owners catch those exact payload types at the
+  same `catch (const Shader::Exception&)` boundaries used by Eden.
+- Rust stores CFG links as stable vector indices instead of pointers allocated by `ObjectPool`;
+  method ownership and branch/link ordering remain in the matching control-flow module.
+- `to_cfg_blocks` converts the upstream-shaped flow graph into the existing Rust translation
+  consumer's index-based `CfgBlock` representation. The older slice-based `build_cfg` entry point
+  remains for callers that already own decoded instruction words.
+
+### Unintentional differences (to fix)
+
+- None in the corrected exception/lifecycle slice. `PRET`, constant-buffer branches, unsupported
+  indirect branches, invalid stack pops, invalid split addresses, and unsupported `EXIT` forms now
+  raise the same shader exception categories as Eden instead of killing the GPU worker with an
+  untyped panic or silently continuing.
+
+### Missing items
+
+- `PRET` flow analysis itself remains unimplemented, matching Eden. The pipeline cache now rejects
+  that shader without terminating the GPU thread.
+
+### Binary layout verification
+
+- N/A: CFG nodes are host-only analysis structures and are not copied to guest or GPU memory.
+
+## 2026-08-20 — `common/src/scm_rev.rs` and `common/build.rs` vs Eden `src/common/scm_rev.{h,cpp.in}` and `CMakeModules/GenerateSCMRev.cmake`
+
+### Intentional differences
+
+- Cargo runs a Rust build script instead of CMake `configure_file`; both publish the full revision,
+  branch, ten-character revision-plus-branch build version, build name, and detected native C++
+  compiler identity as build-time constants.
+- Source archives without Git metadata fall back to `unknown-detached`; CI/package builds can
+  provide `GIT_REV` and `GIT_BRANCH` explicitly. Eden obtains equivalent overrides through its
+  CMake SCM module.
+- Ruzu currently exposes only the SCM/compiler constants consumed by its frontend. Eden's update
+  feed, nightly-build, build-date, and custom title-format constants remain outside this slice.
+
+### Unintentional differences (to fix)
+
+- None in the development-build identity slice. The generated values on this host are
+  `08b3fb5169-main` and `GNU 13.3.0`; the compiler string is detected, not hard-coded.
+
+### Missing items
+
+- Stable/nightly release tag formatting and auto-update endpoint constants are not used by Ruzu.
+
+### Binary layout verification
+
+- N/A: Rust string constants replace generated C++ character arrays and are not guest-visible.
+
+## 2026-08-20 — `ruzu/src/boot.rs` vs Eden `src/yuzu/main_window.cpp` `MainWindow::BootGame`
+
+### Intentional differences
+
+- The boot thread sends a typed `TitleChanged` event to GTK's main thread because GTK widgets may
+  only be changed by their owning thread; Eden computes the same values on its Qt GUI thread.
+
+### Unintentional differences (to fix)
+
+- None in the running-title metadata slice. Ruzu reads the loader title, lets
+  `PatchManager::GetControlMetadata` replace it with the selected add-on NACP title/version,
+  applies Eden's filename fallback and translated 64/32-bit suffix, obtains the renderer vendor,
+  logs the boot identity, and publishes it before disk-cache construction.
+
+### Missing items
+
+- None for the default running-title fields.
+
+### Binary layout verification
+
+- N/A: title metadata is host UI text.
+
+## 2026-08-20 — `ruzu/src/main_window.rs` vs Eden `src/yuzu/main_window.{h,cpp}` `UpdateWindowTitle`
+
+### Intentional differences
+
+- Ruzu formats the default title directly instead of supporting Eden's optional
+  `TITLE_BAR_FORMAT_IDLE` override, which has no Ruzu configuration owner.
+- The same handler exists in each platform-specific GTK launch loop because those loops own their
+  native render surfaces; all three consume the identical `TitleChanged` event.
+
+### Unintentional differences (to fix)
+
+- None. Idle, versioned-running, versionless-running, and shutdown-reset title ordering matches
+  Eden: `Ruzu | build-version | compiler | game | optional-version | GPU vendor`.
+
+### Missing items
+
+- User-defined idle title-bar format overrides are not ported.
+
+### Binary layout verification
+
+- N/A: window titles are host UI strings.
+
+## 2026-08-20 — `ruzu/src/game_list.rs` vs Eden `src/qt_common/game_list/worker.cpp` and `src/core/file_sys/program_metadata.{h,cpp}`
+
+### Intentional differences
+
+- Ruzu adds a frontend-only Architecture column immediately after File type; Eden has no matching
+  column. Application architecture comes from the selected/patched ExeFS `main.npdm` bit, KIP
+  architecture comes from its header, and standalone NRO/NSO uses Eden's 64-bit default program
+  metadata.
+- Architecture is cached independently as `<title-id>.arch.txt`. This leaves Eden's
+  `<title-id>.pv.txt` add-on cache byte-compatible and lets warm scans read only the small cached
+  label. A manual refresh removes the complete cache directory, including both files.
+- The frontend renders the architecture names as lowercase `aarch64`/`aarch32`; cached labels
+  written by earlier Ruzu builds are normalized while loading, without changing the cache format.
+
+### Unintentional differences (to fix)
+
+- None in the `pv.txt` format: enabled/disabled names, version parentheses, packed-update file
+  type substitution, update filtering, UTF-8 encoding, and newline joining match Eden.
+
+### Missing items
+
+- Eden has no architecture-column behavior to port. Files whose executable metadata cannot be
+  recovered display `Unknown`.
+
+### Binary layout verification
+
+- PASS: `ProgramMetadata::is_64_bit_program` reads the existing NPDM bit; no guest or container
+  binary structure was changed.
