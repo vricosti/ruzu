@@ -1,13 +1,13 @@
 # ruzu
 
-**ruzu is a Nintendo Switch emulator written in Rust — and it began as an
+**ruzu is a Nintendo Switch emulator written in Rust and it began as an
 experiment nobody expected to work.**
 
 | | |
 |---|---|
 | **Ported** | ~500,000 lines of C++ |
 | **Duration** | 6 months |
-| **LLMs** | Claude & ChatGpt |
+| **Authors** | yuzu, Eden, ChatGPT, Claude, and yours truly |
 | **Cost** | about the price of two or three Switch consoles |
 
 ## What this project actually is
@@ -17,9 +17,9 @@ huge piece of software from C++ to Rust?** Not generate a plausible-looking file
 not translate a self-contained algorithm — carry a whole codebase across, one
 that is:
 
-- large — hundreds of thousands of lines across a dozen subsystems;
-- deeply stateful — an HLE kernel with schedulers, fibers, IPC and services;
-- unforgiving — a GPU command processor, a shader recompiler, and a JIT where a
+- large: hundreds of thousands of lines across a dozen subsystems;
+- deeply stateful: an HLE kernel with schedulers, fibers, IPC and services;
+- unforgiving: a GPU command processor, a shader recompiler, and a JIT where a
   single wrong bit produces a black screen rather than a stack trace;
 - built on C++ idioms with no direct Rust equivalent — inheritance hierarchies,
   raw pointer graphs, `shared_ptr` cycles, destructor ordering, `std::variant`.
@@ -37,11 +37,6 @@ should be able to answer *which C++ file is this, and what is still missing?*
 The contract the work is held to is written down in
 [`CLAUDE.md`](CLAUDE.md) — it is the interesting artefact of this project as
 much as the code is.
-
-Every design decision, file layout, class boundary, constant and control flow in
-this repository comes from yuzu, a Nintendo Switch emulator written in C++ with a
-Qt frontend. ruzu translates that codebase into Rust, with a GTK4 frontend
-replacing Qt.
 
 **Now ruzu can fly on its own.**
 
