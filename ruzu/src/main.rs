@@ -22,6 +22,7 @@ mod emu_window;
 mod file_menu;
 mod game_list;
 mod gtk_compat;
+mod homebrew_vfs;
 mod i18n;
 mod loading_screen;
 mod main_window;

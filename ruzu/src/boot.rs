@@ -508,11 +508,24 @@ fn run_boot(
         if system.get_filesystem().is_none() {
             system.set_filesystem(crate::game_list::frontend_vfs());
         }
-        system
-            .get_filesystem_controller()
-            .lock()
-            .unwrap()
-            .create_factories(system.get_filesystem().unwrap().clone(), false);
+        let vfs = system.get_filesystem().unwrap().clone();
+        let filesystem_controller = system.get_filesystem_controller();
+        let mut filesystem_controller = filesystem_controller.lock().unwrap();
+        filesystem_controller.create_factories(Arc::clone(&vfs), false);
+        if let Ok(sdmc_root) = filesystem_controller.open_sdmc() {
+            if let Some(homebrew_sdmc) = crate::homebrew_vfs::make_homebrew_sdmc_view(
+                vfs,
+                std::path::Path::new(&filepath),
+                sdmc_root,
+            ) {
+                log::info!(
+                    "Using the standalone NRO directory as the writable SDMC layer for {}",
+                    filepath
+                );
+                filesystem_controller.set_sdmc_open_override(Some(homebrew_sdmc));
+            }
+        }
+        drop(filesystem_controller);
         system.clear_user_channel();
     }
 
