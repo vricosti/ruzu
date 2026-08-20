@@ -1826,6 +1826,11 @@ mod tests {
         let resource = applet_resource.lock();
         let shared = resource.get_shared_memory_format(ARUID).unwrap();
         let state = &shared.npad.npad_entry[0].internal_state;
+        // `WriteEmptyEntry` derives each state sample from the preceding
+        // atomic marker, while `Lifo::WriteNextEntry` publishes twice that
+        // state sample. Nineteen upstream prefill writes therefore produce
+        // 2^19 - 1 rather than a linear sample count.
+        const EXPECTED_PREFILL_SAMPLE: i64 = (1 << 19) - 1;
         assert_eq!(state.fullkey_lifo.buffer_count, 16);
         assert_eq!(state.fullkey_lifo.buffer_tail, 2);
         assert_eq!(
@@ -1834,7 +1839,7 @@ mod tests {
                 .read_current_entry()
                 .state
                 .sampling_number,
-            19
+            EXPECTED_PREFILL_SAMPLE
         );
         assert_eq!(
             state
@@ -1842,7 +1847,7 @@ mod tests {
                 .read_current_entry()
                 .state
                 .sampling_number,
-            19
+            EXPECTED_PREFILL_SAMPLE
         );
         assert_eq!(
             state
@@ -1850,7 +1855,7 @@ mod tests {
                 .read_current_entry()
                 .state
                 .sampling_number,
-            19
+            EXPECTED_PREFILL_SAMPLE
         );
     }
 

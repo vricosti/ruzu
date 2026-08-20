@@ -612,15 +612,10 @@ impl KProcess {
     /// callers to perform the final current-thread exit after dropping the
     /// process mutex.
     pub fn exit_with_current_thread(process: &Arc<ProcessLock>) {
-        let current_thread = {
-            let process_guard = process.lock().unwrap();
-            let current_thread_id = process_guard
-                .scheduler
-                .as_ref()
-                .and_then(Weak::upgrade)
-                .and_then(|scheduler| scheduler.lock().unwrap().get_scheduler_current_thread_id());
-            current_thread_id.and_then(|thread_id| process_guard.get_thread_by_thread_id(thread_id))
-        };
+        // Upstream uses GetCurrentThread(kernel), i.e. the thread-local KThread
+        // for the calling host thread. The scheduler's current guest thread is
+        // not equivalent while an HLE service thread is dispatching a request.
+        let current_thread = super::kernel::get_current_thread_pointer();
 
         process.lock().unwrap().exit();
 
@@ -2221,11 +2216,9 @@ impl KProcess {
 
         // If we need to start termination, do so.
         if needs_terminate {
-            let current_thread_id = self
-                .scheduler
-                .as_ref()
-                .and_then(Weak::upgrade)
-                .and_then(|scheduler| scheduler.lock().unwrap().get_scheduler_current_thread_id());
+            // Upstream passes GetCurrentThreadPointer(kernel), not the guest
+            // thread currently selected by this process's scheduler.
+            let current_thread_id = super::kernel::get_current_thread_id_fast();
             self.start_termination(current_thread_id);
 
             if let Some(process) = self.self_reference.as_ref().and_then(Weak::upgrade) {
@@ -2277,12 +2270,12 @@ impl KProcess {
 
         // If we need to terminate, do so.
         if needs_terminate {
-            // `StartTermination()` excludes the current thread upstream.
-            let current_thread_id = self
-                .scheduler
-                .as_ref()
-                .and_then(Weak::upgrade)
-                .and_then(|scheduler| scheduler.lock().unwrap().get_scheduler_current_thread_id());
+            // `StartTermination()` excludes the actual calling KThread
+            // upstream. In particular, an HLE service call must exclude its
+            // host dummy thread and terminate every guest thread in the target
+            // process. Looking at KScheduler::m_current_thread here leaves the
+            // IPC client alive and permanently blocked in SendSyncRequest.
+            let current_thread_id = super::kernel::get_current_thread_id_fast();
             let start_result = self.start_termination(current_thread_id);
             if start_result == RESULT_SUCCESS.get_inner_value() {
                 // Finish termination.
@@ -3689,10 +3682,12 @@ mod tests {
     }
 
     #[test]
-    fn exit_excludes_scheduler_current_thread_from_start_termination() {
+    fn exit_excludes_actual_calling_thread_from_start_termination() {
         let process = Arc::new(ProcessLock::from_value(KProcess::new()));
         let scheduler = Arc::new(Mutex::new(KScheduler::new(0)));
-        scheduler.lock().unwrap().set_scheduler_current_thread_id(1);
+        // A stale/different scheduler selection must not decide which thread
+        // KProcess::Exit preserves.
+        scheduler.lock().unwrap().set_scheduler_current_thread_id(2);
 
         let current = Arc::new(KThreadLock::new(KThread::new()));
         {
@@ -3718,11 +3713,52 @@ mod tests {
             process_guard.state = ProcessState::Running;
             process_guard.register_thread_object(current.clone());
             process_guard.register_thread_object(other.clone());
+            crate::hle::kernel::kernel::set_current_emu_thread(Some(&current));
             process_guard.exit();
         }
+        crate::hle::kernel::kernel::set_current_emu_thread(None);
 
         assert!(!current.lock().unwrap().is_termination_requested());
         assert!(other.lock().unwrap().is_termination_requested());
+    }
+
+    #[test]
+    fn terminate_from_hle_thread_terminates_scheduler_current_guest() {
+        let process = Arc::new(ProcessLock::from_value(KProcess::new()));
+        let scheduler = Arc::new(Mutex::new(KScheduler::new(0)));
+        scheduler.lock().unwrap().set_scheduler_current_thread_id(1);
+
+        let guest_main = Arc::new(KThreadLock::new(KThread::new()));
+        {
+            let mut guard = guest_main.lock().unwrap();
+            guard.thread_id = 1;
+            guard.object_id = 10;
+            guard.parent = Some(Arc::downgrade(&process));
+            guard.set_state(super::super::k_thread::ThreadState::RUNNABLE);
+        }
+
+        let hle_caller = Arc::new(KThreadLock::new(KThread::new()));
+        {
+            let mut guard = hle_caller.lock().unwrap();
+            guard.thread_id = 99;
+            guard.object_id = 199;
+            guard.set_state(super::super::k_thread::ThreadState::RUNNABLE);
+        }
+
+        {
+            let mut process_guard = process.lock().unwrap();
+            process_guard.attach_scheduler(&scheduler);
+            process_guard.state = ProcessState::Running;
+            process_guard.register_thread_object(guest_main.clone());
+        }
+
+        crate::hle::kernel::kernel::set_current_emu_thread(Some(&hle_caller));
+        let result = process.lock().unwrap().terminate();
+        crate::hle::kernel::kernel::set_current_emu_thread(None);
+
+        assert_eq!(result, RESULT_SUCCESS.get_inner_value());
+        assert!(guest_main.lock().unwrap().is_termination_requested());
+        assert_eq!(process.lock().unwrap().state, ProcessState::Terminated);
     }
 
     #[test]
@@ -3900,7 +3936,9 @@ mod tests {
             process_guard.register_thread_object(other.clone());
         }
 
+        crate::hle::kernel::kernel::set_current_emu_thread(Some(&current));
         KProcess::exit_with_current_thread(&process);
+        crate::hle::kernel::kernel::set_current_emu_thread(None);
         KWorkerTaskManager::wait_for_global_idle();
 
         assert!(current.lock().unwrap().is_termination_requested());

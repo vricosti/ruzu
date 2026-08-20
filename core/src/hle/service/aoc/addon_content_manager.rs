@@ -66,6 +66,11 @@ impl IAddOnContentManager {
                 "CountAddOnContent",
             ),
             (
+                commands::LIST_ADD_ON_CONTENT,
+                Some(Self::list_add_on_content_handler),
+                "ListAddOnContent",
+            ),
+            (
                 commands::GET_ADD_ON_CONTENT_BASE_ID,
                 Some(Self::get_add_on_content_base_id_handler),
                 "GetAddOnContentBaseId",
@@ -279,11 +284,34 @@ impl IAddOnContentManager {
     fn count_add_on_content_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         let service =
             unsafe { &*(this as *const dyn ServiceFramework as *const IAddOnContentManager) };
-        let count = service.count_add_on_content(0);
+        let count = service.count_add_on_content(ctx.get_pid());
 
         let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
         rb.push_result(RESULT_SUCCESS);
         rb.push_u32(count);
+    }
+
+    fn list_add_on_content_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let service =
+            unsafe { &*(this as *const dyn ServiceFramework as *const IAddOnContentManager) };
+        let mut rp = RequestParser::new(ctx);
+        let offset = rp.pop_u32();
+        let count = rp.pop_u32();
+        let (out_count, add_on_content) =
+            service.list_add_on_content(offset, count, ctx.get_pid());
+
+        let mut out_bytes =
+            Vec::with_capacity(add_on_content.len() * std::mem::size_of::<u32>());
+        for add_on_content_id in add_on_content {
+            out_bytes.extend_from_slice(&add_on_content_id.to_le_bytes());
+        }
+        if !out_bytes.is_empty() {
+            ctx.write_buffer(&out_bytes, 0);
+        }
+
+        let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_u32(out_count);
     }
 
     fn get_add_on_content_base_id_handler(
@@ -458,11 +486,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn mount_status_handlers_match_upstream_function_table() {
+    fn implemented_handlers_match_upstream_function_table() {
         let system = crate::core::System::new();
         let service = IAddOnContentManager::new(crate::core::SystemRef::from_ref(&system));
 
         for command in [
+            commands::LIST_ADD_ON_CONTENT,
             commands::NOTIFY_MOUNT_ADD_ON_CONTENT,
             commands::NOTIFY_UNMOUNT_ADD_ON_CONTENT,
             commands::CHECK_ADD_ON_CONTENT_MOUNT_STATUS,

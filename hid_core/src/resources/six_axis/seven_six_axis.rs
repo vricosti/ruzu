@@ -5,7 +5,7 @@
 
 use crate::hid_types::Vec3f;
 use crate::resources::controller_base::ControllerActivation;
-use crate::resources::ring_lifo::Lifo;
+use crate::resources::ring_lifo::{Lifo, LifoState};
 
 /// Internal state for the seven-six-axis sensor.
 #[derive(Debug, Clone, Copy, Default)]
@@ -21,6 +21,12 @@ pub struct SevenSixAxisState {
     pub quaternion: [f32; 4],
 }
 const _: () = assert!(std::mem::size_of::<SevenSixAxisState>() == 0x48);
+
+impl LifoState for SevenSixAxisState {
+    fn sampling_number(&self) -> i64 {
+        self.sampling_number as i64
+    }
+}
 
 /// SevenSixAxis controller — reads console motion from EmulatedConsole and
 /// writes a LIFO buffer to transfer memory. Used for

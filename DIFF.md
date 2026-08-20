@@ -762,3 +762,489 @@ and persisted under upstream's `UIGameList\\favorites_expanded` key.
 
 - PASS: SetLayerZ consumes two consecutive 64-bit request values in Eden's signature order;
   GetLayerZ returns the signed 32-bit z index sign-extended and reinterpreted as `u64`.
+
+## 2026-08-20 — `video_core/src/query_cache/bank_base.rs` vs Eden `src/video_core/query_cache/bank_base.h`
+
+### Intentional differences
+
+- `BankPool::can_recycle_front` exposes the exact predicate used by `ReserveBank` so the Vulkan
+  caller can construct fallible resources before entering Rust's infallible builder closure.
+- The file was normalized from CRLF to LF while formatting the new implementation and tests.
+
+### Unintentional differences (to fix)
+
+- None. Reserve, close, reference counting, reset, dead-bank selection and queue rotation retain
+  Eden's ordering and conditions.
+
+### Missing items
+
+- None for `BankBase` and `BankPool`.
+
+### Binary layout verification
+
+- N/A: these are host-only bookkeeping types.
+
+## 2026-08-20 — `video_core/src/renderer_vulkan/query_cache.rs` vs Eden `src/video_core/renderer_vulkan/vk_query_cache.{h,cpp}`
+
+### Intentional differences
+
+- Samples banks live in `Arc` and hold `BankBase` behind a mutex so fence-thread reports can own
+  their banks safely; Eden stores banks by value in `std::deque`.
+- Reports materialize bank spans instead of following `next_bank`. They retain independent bank
+  references, remain cumulative until reset, and merge min/max ranges per bank across each flush
+  set before host readback.
+- The CPU and GPU halves of recycled pool reset are split because `BankLike::reset` cannot receive
+  `&mut Scheduler`; the GPU reset is still recorded before the first reused slot.
+- Scheduler-facing accessors return the three independently locked state handles needed by the
+  safe cross-owner adaptation.
+
+### Unintentional differences (to fix)
+
+- None in samples report ownership, async-flush gating, bank-wide host readback, or the scheduler
+  bridge covered by this correction.
+
+### Missing items
+
+- Existing parity debt outside this correction remains in the full Eden samples accumulation
+  state machine (`amend_value`, `accumulation_value`, checkpoints and the complete
+  `PresyncWrites`/`SyncWrites` lifecycle).
+- A real Vulkan occlusion-query title run is still required; unit tests do not execute a device
+  query pool.
+
+### Binary layout verification
+
+- N/A: no guest-visible raw-memory structure changed.
+
+## 2026-08-20 — `video_core/src/renderer_vulkan/scheduler.rs` vs Eden `src/video_core/renderer_vulkan/vk_scheduler.{h,cpp}`
+
+### Intentional differences
+
+- Rust stores shared handles to `SamplesQueryState`, `TfbCounterState` and `QueryRuntimeState`
+  instead of Eden's non-owning `QueryCache*`. This avoids aliased `&mut` references while keeping
+  `EndPendingOperations` and `EndRenderPass` call ordering identical.
+- `clear_query_cache_state` releases those handles before the rasterizer's Vulkan resources are
+  destroyed; Eden relies on C++ member lifetime and its raw pointer is not dereferenced afterward.
+
+### Unintentional differences (to fix)
+
+- None in the reviewed counter-reset, counter-close and conditional-rendering ordering.
+
+### Missing items
+
+- None for this scheduler/query-cache interaction slice.
+
+### Binary layout verification
+
+- N/A: scheduler state is host-only.
+
+## 2026-08-20 — `video_core/src/renderer_vulkan/vk_rasterizer.rs` vs Eden `src/video_core/renderer_vulkan/vk_rasterizer.{h,cpp}`
+
+### Intentional differences
+
+- The Rust constructor installs safe query-state handles only after every fallible resource
+  creation succeeds, rather than storing Eden's direct `QueryCache*`. This prevents failed
+  construction from leaving a dangling scheduler registration.
+- The destructor explicitly clears those handles after `finish` and before destroying the query
+  cache's Vulkan resource owners.
+
+### Unintentional differences (to fix)
+
+- None in construction registration, async query flush forwarding, or teardown ordering.
+
+### Missing items
+
+- None for the reviewed scheduler/query-cache ownership slice.
+
+### Binary layout verification
+
+- N/A: no guest ABI or serialized payload changed.
+
+## 2026-08-20 — `core/src/hle/service/am/service/library_applet_creator.rs` vs Eden `src/core/hle/service/am/service/library_applet_creator.{h,cpp}`
+
+### Intentional differences
+
+- Rust manually parses CMIF arguments and resolves the transfer-memory handle through the current
+  process, replacing Eden's typed `InCopyHandle<KTransferMemory>` deserializer.
+- Rust returns service objects through `ResponseBuilder` rather than C++ `Out<SharedPointer<T>>`.
+
+### Unintentional differences (to fix)
+
+- None. `CreateTransferMemoryStorage` now naturally aligns the `s64` following the `bool`, and
+  both transfer-memory creation commands validate `size` before resolving the handle, matching
+  Eden's argument layout and validation order.
+
+### Missing items
+
+- None for the storage creation handlers reviewed in this slice.
+
+### Binary layout verification
+
+- PASS: `RequestParser::align_for::<i64>()` advances the raw CMIF cursor to the same 8-byte
+  boundary used by Eden's typed serialization.
+
+## 2026-08-20 — `ruzu/src/applets/software_keyboard.rs` vs Eden `src/yuzu/applets/qt_software_keyboard.{h,cpp}`
+
+### Intentional differences
+
+- GTK widgets, CSS and a main-loop channel replace Qt Designer widgets, Qt queued signals and the
+  dedicated `InputInterpreter` thread; the frontend remains owned by the GUI module.
+- Inline hide destroys the GTK dialog and recreates it on the next show while retaining guest text
+  state; Eden hides and reuses its Qt dialog. This avoids retaining a hidden modal GTK window.
+- The GTK frontend uses a single-line `Entry` for every draw type and does not reproduce Eden's
+  framebuffer-relative geometry, controller artwork or DPI-specific Qt layout.
+
+### Unintentional differences (to fix)
+
+- None in the reviewed applet contract. Normal submissions now retain the active dialog through
+  `Failure`/`Confirm` text checks, and only `ExitKeyboard` tears it down.
+- Controller callbacks no longer re-enter `active: RefCell` while it is borrowed, and the input
+  edge which opened the keyboard is discarded instead of immediately activating X/Cancel.
+- Inline appear parameters, guest text/cursor updates, `ChangedString`, `MovedCursor`, key-disable
+  flags, optional number-pad symbols, Shift/Caps Lock transitions and wrapped grid navigation now
+  follow Eden's corresponding paths.
+
+### Missing items
+
+- Eden's held-button autorepeat and rich multi-line `SwkbdTextDrawType::Box` presentation remain UI
+  features of the excluded Qt frontend; they are not part of this GTK crash/lifecycle correction.
+
+### Binary layout verification
+
+- N/A: this is host UI state. Guest-visible string lengths and cursor positions are explicitly
+  converted to UTF-16 code-unit counts, with a focused regression test.
+
+## 2026-08-20 — `ruzu/src/applets/mod.rs`, `ruzu/src/boot.rs`, and `ruzu/src/main_window.rs` vs Eden `src/yuzu/main_window.{h,cpp}` software-keyboard ownership
+
+### Intentional differences
+
+- `GMainWindow` creates the persistent GTK channel frontend and passes its trait object through
+  `boot_game`; Eden owns a persistent `QtSoftwareKeyboard` signal bridge and allocates the dialog
+  from its main-window slots.
+- The module and boot wiring have no direct file counterpart because Eden's Qt frontend directory
+  is excluded and ruzu owns its GTK frontend under `ruzu/src/applets`.
+
+
+## 2026-08-20 — `core/src/hle/service/am/frontend/applet_software_keyboard.rs` vs Eden `src/core/hle/service/am/frontend/applet_software_keyboard.{h,cpp}`
+
+### Intentional differences
+
+- Eden's frontend callbacks invoke `SubmitTextNormal` and `SubmitTextInline` directly on the
+  owning C++ object. Rust queues callback arguments to avoid aliasing the applet through a GUI
+  callback, then resumes the owning frontend applet through its weak `Applet` reference.
+- `frontend_executing` distinguishes synchronous frontend callbacks from delayed GUI callbacks;
+  queued work is drained before an active call returns, while delayed work reacquires the applet
+
+### Binary layout verification
+
+- PASS: the foreground result remains a zero-initialized `sizeof(SwkbdResult) +
+  STRING_BUFFER_SIZE` buffer, with the result followed by UTF-8 or UTF-16 text exactly as before.
+
+## 2026-08-20 — `core/src/hle/kernel/k_process.rs` vs Eden `src/core/hle/kernel/k_process.{h,cpp}` termination caller selection
+
+### Intentional differences
+
+- Rust represents Eden's `KThread* thread_to_not_terminate` as an `Option<u64>` thread id while
+  preserving the same identity comparison in `terminate_children`.
+- `exit_with_current_thread` performs Eden's final `GetCurrentThread(kernel).Exit(kernel)` after
+  releasing the process guard because Rust cannot re-enter the thread lifecycle while borrowing
+  `KProcess` through its owning cell.
+
+## 2026-08-20 — `ruzu/src/overlay_dialog.rs` and `ruzu/src/main_window.rs` vs Eden `src/yuzu/util/overlay_dialog.{h,cpp,ui}` and `src/yuzu/main_window.{h,cpp}`
+
+### Intentional differences
+
+- The GTK shutdown-only counterpart is an undecorated transient window sized to Eden's visible
+  780-by-300 regular-text panel proportions. Eden uses a parent-sized translucent Qt dialog whose
+  internal grid draws that panel; a GTK top-level is required to remain above ruzu's native render
+  child window.
+- The GTK module implements only the non-interactive regular-text configuration used by
+  `OnShutdownBeginDialog`; controller navigation and rich text belong to Eden's other overlay uses.
+
+### Unintentional differences (to fix)
+
+- None in the Stop/Restart lifecycle: the panel is created only after a successful asynchronous
+  stop request and is closed when `StopComplete` reaches `on_emulation_stopped`.
+
+### Missing items
+
+- Generic interactive and rich-text overlay modes are outside this shutdown-dialog slice.
+
+### Binary layout verification
+
+- N/A: the overlay contains host UI state only.
+
+## 2026-08-20 — `ruzu/src/game_list.rs` and `ruzu/src/main_window.rs` vs Eden `src/yuzu/game/game_list.{h,cpp}` and `src/yuzu/main_window.{h,cpp}` shortcut dispatch
+
+### Intentional differences
+
+- A Rust callback replaces Eden's Qt `GameList::CreateShortcut` signal while retaining the same
+  `(program_id, game_path, target)` payload and `GMainWindow` ownership of argument construction.
+- GTK `gio::SimpleAction` objects replace the two `QAction` objects. Both remain hidden on macOS,
+  matching Eden's compile-time guard.
+
+### Unintentional differences (to fix)
+
+- None. Both context-menu actions now reach `on_game_list_create_shortcut`; the former
+  unavailable-action placeholders were removed.
+
+### Missing items
+
+- None for per-game shortcut dispatch.
+
+### Binary layout verification
+
+- N/A: this is host frontend dispatch.
+
+## 2026-08-20 — `ruzu/src/util/game.rs` vs Eden `src/qt_common/util/game.{h,cpp}` shortcut creation
+
+### Intentional differences
+
+- GTK message dialogs replace `QtCommon::Frontend` dialogs, and GLib's XDG directory resolvers
+  replace `QStandardPaths` on Linux.
+- Linux icons and comments use the ruzu name (`ruzu-*.png`, `Ruzu Emulator`) instead of Eden's
+  branding while preserving Eden's icon directory and title-id naming scheme.
+- Windows creates the equivalent `.lnk` through the installed PowerShell `WScript.Shell` COM
+  bridge and standard user-profile paths rather than directly owning `IShellLinkW`; this avoids a
+  second Windows COM binding while preserving target, arguments, description and icon fields.
+
+### Unintentional differences (to fix)
+
+- None in the Linux shortcut slice. Target validation, patched control metadata precedence,
+  loader fallbacks, illegal-character removal, icon creation, one-time AppImage warning,
+  fullscreen argument ordering and result messages follow Eden's order.
+
+### Missing items
+
+- `CreateHomeMenuShortcut` and the unrelated content-removal helpers from `qt_common/util/game.cpp`
+  are outside this per-game shortcut slice.
+- Eden's multi-resolution Windows ICO encoder is not yet ported; Windows currently stores the
+  decoded icon as PNG before assigning it to the `.lnk`.
+
+### Binary layout verification
+
+- N/A on Linux. The `.desktop` field order and optional-field rules are covered by a focused test.
+
+## 2026-08-20 — `ruzu/src/game_list.rs` vs Eden `src/yuzu/game/game_list.cpp` context-menu submenu presentation
+
+### Intentional differences
+
+- GTK `PopoverMenuFlags::NESTED` supplies the traditional child-popover behavior provided by
+  Eden's `QMenu`; the toolkit-specific construction differs while retaining hover, click and
+  keyboard access to each submenu.
+
+### Unintentional differences (to fix)
+
+- None. `Remove`, `Dump RomFS`, and `Create Shortcut` no longer use GTK's click-only sliding-page
+  presentation and now open as nested menus on pointer hover like Eden.
+
+### Missing items
+
+- None for game-list submenu presentation.
+
+### Binary layout verification
+
+- N/A: this is host UI behavior only.
+
+## 2026-08-20 — `ruzu/src/overlay_dialog.rs` vs Eden `src/yuzu/util/overlay_dialog.cpp` and `src/yuzu/main_window.cpp` shutdown-dialog destruction
+
+### Intentional differences
+
+- GTK exposes window-manager closure and programmatic `Window::close` through the same
+  `close-request` signal. Ruzu retains the signal id so it can remove the user-close guard before
+  performing Eden's `OnEmulationStopped`-owned destruction.
+
+### Unintentional differences (to fix)
+
+- None. The initial port incorrectly returned `Stop` for the programmatic close request too, which
+  left `Closing software...` visible after `StopComplete`; the guard is now disconnected first.
+
+### Missing items
+
+- None for shutdown-dialog destruction.
+
+### Binary layout verification
+
+- N/A: this is host UI lifecycle state only.
+
+## 2026-08-20 — `ruzu/src/main_window.rs` and `ruzu/src/game_list.rs` vs Eden `src/yuzu/main_window.{h,cpp}` and `src/qt_common/game_list/model.{h,cpp}` refresh ownership
+
+### Intentional differences
+
+- Per explicit project UI direction, Ruzu keeps Refresh beside Add Game Directory in the upper
+  game-list toolbar instead of Eden's bottom status bar. The widget forwards its action to
+  `GMainWindow::OnGameListRefresh`, and its handle is disabled and enabled across the same
+  emulation lifecycle as Eden's button.
+- Ruzu's game-directory worker clears and rebuilds the frontend manual content provider in the
+  same scan that rebuilds the visible rows. `refresh_external_content` therefore records that the
+  already-started directory refresh covers external content instead of starting a second racing
+  Rust worker; Eden can safely run two sequential `Repopulate()` calls because destroying its
+  current worker waits for completion.
+
+### Unintentional differences (to fix)
+
+- None for the manual refresh behavior. The upper-toolbar button clears cached metadata before
+  scanning, refreshes the directory/provider data, and is disabled from boot until emulation
+  stops.
+
+### Missing items
+
+- Eden's independent filesystem watchers for `Settings::values.external_content_dirs` are not
+  present in Ruzu; configured game directories are refreshed explicitly by this button.
+- `SetFirmwareVersion()` has no Ruzu status-label counterpart to update after refresh.
+
+### Binary layout verification
+
+- N/A: this is host frontend state and worker dispatch.
+
+## 2026-08-20 — `ruzu/src/util/game.rs` and `ruzu/src/uisettings.rs` vs Eden `src/qt_common/util/game.{h,cpp}` and `src/yuzu/uisettings.h` metadata reset
+
+### Intentional differences
+
+- Rust reports recursive-removal errors through `std::io::Error` and GTK message dialogs; Eden
+  uses `Common::FS::RemoveDirRecursively` and `QtCommon::Frontend` dialogs.
+- The reload-pending flag is a module-level `AtomicBool` next to the frontend settings because
+  Ruzu's cloneable `UISettings::Values` cannot directly contain an atomic member.
+
+### Unintentional differences (to fix)
+
+- None. `ResetMetadata` now removes the complete Ruzu `cache/game_list` directory, including the
+  stale `<title-id>.pv.txt` Add-ons cache, and marks the game-list reload pending after success.
+
+### Missing items
+
+- None for metadata-cache removal and reload-pending signaling.
+
+### Binary layout verification
+
+- N/A: cache entries are host files; the focused test verifies complete directory removal.
+
+## 2026-08-20 — `ruzu/src/configuration/configure_filesystem.rs` vs Eden `src/yuzu/configuration/configure_filesystem.{h,cpp}` metadata-reset action
+
+### Intentional differences
+
+- The GTK button resolves its transient parent from the live widget root before calling the shared
+  utility; Eden passes its `ConfigureFilesystem` widget through the global frontend dialog owner.
+
+### Unintentional differences (to fix)
+
+- None. The button now calls the shared metadata reset instead of logging an unavailable-action
+  placeholder, and the main-window apply callback consumes the resulting reload-pending flag.
+
+### Missing items
+
+- None for `ConfigureFilesystem::ResetMetadata`.
+
+### Binary layout verification
+
+- N/A: this is host UI dispatch.
+
+## 2026-08-20 — `hid_core/src/resources/ring_lifo.rs` vs Eden `src/hid_core/resources/ring_lifo.h`
+
+### Intentional differences
+
+- Rust uses the `LifoState` trait to express the C++ template requirement that every state expose
+  `sampling_number`; this avoids an untyped raw-layout cast and does not change LIFO ownership.
+- Rust bounds a corrupt `buffer_tail` to the backing array instead of reproducing C++ undefined
+  behavior; the existing diagnostic remains available through `RUZU_TRACE_LIFO_CORRUPTION`.
+
+### Unintentional differences (to fix)
+
+- None. `write_next_entry` now publishes `new_state.sampling_number << 1` exactly like Eden. The
+  previous `previous_atomic_marker + 1` calculation could publish an odd marker, which newer
+  Nintendo SDK readers treat as an in-progress write and retry indefinitely.
+
+### Missing items
+
+- None for `AtomicStorage` and `Lifo` behavior.
+
+### Binary layout verification
+
+- PASS: `AtomicStorage` and `Lifo` remain `repr(C)` with unchanged fields; the full HID shared
+  memory layout test passes, and focused tests verify the even marker and source sample contract.
+
+## 2026-08-20 — `hid_core/src/resources/shared_memory_format.rs` vs Eden `src/hid_core/resources/shared_memory_format.h`
+
+### Intentional differences
+
+- The concrete shared-memory state types implement Rust's `LifoState` trait at their LIFO
+  instantiation owner; Eden's C++ template accesses the same `sampling_number` members directly.
+
+### Unintentional differences (to fix)
+
+- None introduced by the atomic-publication correction.
+
+### Missing items
+
+- None for the LIFO state sampling accessors.
+
+### Binary layout verification
+
+- PASS: trait implementations add no fields or vtables to the state values, and
+  `shared_memory_layout_matches_upstream` passes.
+
+## 2026-08-20 — `hid_core/src/resources/six_axis/seven_six_axis.rs` vs Eden `src/hid_core/resources/six_axis/seven_six_axis.{h,cpp}`
+
+### Intentional differences
+
+- `SevenSixAxisState` converts its unsigned sampling number to `i64` for the common Rust
+  `LifoState` interface; `as` preserves the underlying two's-complement bit pattern.
+
+### Unintentional differences (to fix)
+
+- None introduced by the LIFO marker correction.
+
+### Missing items
+
+- The pre-existing incomplete `SevenSixAxis::on_update` integration remains outside this fix.
+
+### Binary layout verification
+
+- PASS: the state remains `repr(C)` and its existing `0x48` size assertion is unchanged.
+
+## 2026-08-20 — `hid_core/src/resources/npad/npad.rs` vs Eden `src/hid_core/resources/npad/npad.{h,cpp}` prefill regression
+
+### Intentional differences
+
+- Rust regression tests observe the shared-memory result directly after activation; Eden has no
+  matching C++ unit test in the ported source tree.
+
+### Unintentional differences (to fix)
+
+- None. The prefill expectation now reflects Eden's exact recurrence: each empty state derives
+  from the preceding atomic marker and the marker is twice the state sample.
+
+### Missing items
+
+- None for `NPad::WriteEmptyEntry` in this verification slice.
+
+### Binary layout verification
+
+- PASS: no Npad production struct changed; the full HID layout test and all Npad tests pass.
+
+## 2026-08-20 — `core/src/hle/service/aoc/addon_content_manager.rs` vs Eden `src/core/hle/service/aoc/addon_content_manager.{h,cpp}`
+
+### Intentional differences
+
+- Rust serializes the returned `u32` add-on IDs explicitly with `to_le_bytes`; Eden copies the
+  native little-endian `u32` vector into the HIPC map-alias output buffer with `std::memcpy`.
+- The Rust service obtains `ClientProcessId` from `HLERequestContext::get_pid`; Eden's CMIF
+  serializer supplies the same request PID through its typed `ClientProcessId` argument.
+
+### Unintentional differences (to fix)
+
+- The pre-existing Rust constructor still initializes `add_on_content` as an empty vector instead
+  of calling Eden's `AccumulateAOCTitleIDs` over the content provider. Restoring that requires the
+  content-provider enumeration integration and is separate from the missing command dispatch that
+  produced the invalid CMIF response.
+- The pre-existing `GetAddOnContentBaseId` implementation always takes Eden's no-control-metadata
+  fallback because the required `PatchManager` integration is not wired at the system level.
+
+### Missing items
+
+- None for command 3 dispatch: `ListAddOnContent` now parses `offset` and `count`, forwards the
+  client PID, writes the returned IDs to output buffer 0, and returns the output count.
+
+### Binary layout verification
+
+- PASS: add-on IDs are emitted as packed four-byte little-endian values, matching Eden's raw
+  `u32` buffer copy; no shared structs changed.

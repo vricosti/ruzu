@@ -126,6 +126,7 @@ impl FrontendAppletHolder {
             AppletId::MiiEdit => Some(Box::new(MiiEdit::new(system, broker, mode))),
             AppletId::SoftwareKeyboard => Some(Box::new(SoftwareKeyboard::new(
                 system,
+                applet,
                 broker,
                 mode,
                 Arc::clone(

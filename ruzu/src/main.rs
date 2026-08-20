@@ -27,6 +27,7 @@ mod i18n;
 mod loading_screen;
 mod main_window;
 mod multiplayer;
+mod overlay_dialog;
 #[cfg(target_os = "macos")]
 mod render_window;
 #[cfg(target_os = "windows")]

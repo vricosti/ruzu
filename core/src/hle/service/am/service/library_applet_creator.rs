@@ -415,6 +415,9 @@ impl ILibraryAppletCreator {
             unsafe { &*(this as *const dyn ServiceFramework as *const ILibraryAppletCreator) };
         let mut rp = RequestParser::new(ctx);
         let is_writable = rp.pop_bool();
+        // Upstream's HIPC deserializer aligns each argument to its natural
+        // alignment, so the s64 begins at offset 8 after the bool.
+        rp.align_for::<i64>();
         let size = rp.pop_i64();
         let transfer_memory_handle = ctx.get_copy_handle(0);
 
@@ -424,6 +427,12 @@ impl ILibraryAppletCreator {
             size
         );
 
+        if size <= 0 {
+            let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+            rb.push_result(RESULT_UNKNOWN);
+            return;
+        }
+
         let Some((memory, transfer_memory, object_id)) =
             Self::resolve_transfer_memory(ctx, transfer_memory_handle)
         else {
@@ -431,12 +440,6 @@ impl ILibraryAppletCreator {
             rb.push_result(RESULT_UNKNOWN);
             return;
         };
-
-        if size <= 0 {
-            let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
-            rb.push_result(RESULT_UNKNOWN);
-            return;
-        }
 
         let backing =
             create_transfer_memory_storage(memory, transfer_memory, object_id, is_writable, size);
@@ -456,6 +459,12 @@ impl ILibraryAppletCreator {
             size
         );
 
+        if size <= 0 {
+            let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+            rb.push_result(RESULT_UNKNOWN);
+            return;
+        }
+
         let Some((memory, transfer_memory, object_id)) =
             Self::resolve_transfer_memory(ctx, transfer_memory_handle)
         else {
@@ -463,12 +472,6 @@ impl ILibraryAppletCreator {
             rb.push_result(RESULT_UNKNOWN);
             return;
         };
-
-        if size <= 0 {
-            let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
-            rb.push_result(RESULT_UNKNOWN);
-            return;
-        }
 
         let backing = create_handle_storage(memory, transfer_memory, object_id, size);
         let storage = Arc::new(IStorage::new_with_backing(creator.system, backing));

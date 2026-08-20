@@ -12,11 +12,40 @@ use crate::hid_types::{
 use crate::resources::debug_pad::debug_pad_types::DebugPadState;
 use crate::resources::keyboard::keyboard_types::KeyboardState;
 use crate::resources::npad::npad_types::*;
-use crate::resources::ring_lifo::Lifo;
+use crate::resources::ring_lifo::{Lifo, LifoState};
 use crate::resources::system_buttons::system_button_types;
 use crate::resources::touch_screen::touch_types::*;
 
 pub const HID_ENTRY_COUNT: usize = 17;
+
+macro_rules! impl_lifo_state {
+    ($($state:ty),+ $(,)?) => {
+        $(
+            impl LifoState for $state {
+                fn sampling_number(&self) -> i64 {
+                    self.sampling_number
+                }
+            }
+        )+
+    };
+}
+
+// These are the concrete states used by the Lifo members below. Upstream's
+// C++ template accesses `new_state.sampling_number` directly; the trait keeps
+// that requirement explicit without relying on a raw layout cast.
+impl_lifo_state!(
+    DebugPadState,
+    TouchScreenState,
+    hid_types::MouseState,
+    KeyboardState,
+    system_button_types::HomeButtonState,
+    system_button_types::SleepButtonState,
+    system_button_types::CaptureButtonState,
+    SixAxisSensorState,
+    NPadGenericState,
+    NpadGcTriggerState,
+    GestureState,
+);
 
 #[derive(Debug, Clone, Copy, Default)]
 #[repr(C)]

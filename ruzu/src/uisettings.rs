@@ -15,10 +15,22 @@
 // `common::settings_common::Setting<T>`, which provides the same
 // `get_value` / `set_value` / `get_default` contract.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use common::settings_common::Setting;
 use common::settings_enums::{Category, ConfirmStop};
+
+/// Upstream `UISettings::values.is_game_list_reload_pending`.
+static GAME_LIST_RELOAD_PENDING: AtomicBool = AtomicBool::new(false);
+
+pub fn request_game_list_reload() {
+    GAME_LIST_RELOAD_PENDING.store(true, Ordering::Release);
+}
+
+pub fn take_game_list_reload_pending() -> bool {
+    GAME_LIST_RELOAD_PENDING.swap(false, Ordering::AcqRel)
+}
 
 /// One configured game directory — upstream `UISettings::GameDir`.
 ///

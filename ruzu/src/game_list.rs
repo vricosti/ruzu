@@ -386,6 +386,11 @@ struct GameListView {
     hid_core: Arc<parking_lot::Mutex<hid_core::hid_core::HIDCore>>,
     play_time_manager: Arc<frontend_common::play_time_manager::PlayTimeManager>,
     on_activate: Rc<dyn Fn(String, StartGameType)>,
+    /// GTK equivalent of Eden's `GameList::CreateShortcut` signal. The owner
+    /// remains `GMainWindow::OnGameListCreateShortcut`.
+    on_create_shortcut: Rc<dyn Fn(u64, String, crate::util::game::ShortcutTarget)>,
+    on_refresh: Rc<dyn Fn()>,
+    refresh_button: gtk::Button,
     runtime_lock: Rc<dyn Fn() -> bool>,
     property_dialog:
         RefCell<Option<Rc<crate::configuration::configure_per_game::ConfigurePerGame>>>,
@@ -427,6 +432,25 @@ impl GameListHandle {
         self.0.reload();
     }
 
+    /// Upstream `GameListModel::RefreshGameDirectory`.
+    pub fn refresh_game_directory(&self) {
+        self.0.reload();
+    }
+
+    /// Upstream `GameListModel::RefreshExternalContent`.
+    ///
+    /// Ruzu rebuilds its frontend manual content provider as part of the same
+    /// worker pass as the game-directory scan. `refresh_game_directory`
+    /// therefore already performs the external-content repopulation that Eden
+    /// starts as a second `Repopulate()` call.
+    pub fn refresh_external_content(&self) {
+        log::info!("Game list: external content refreshed with directory scan");
+    }
+
+    pub fn set_refresh_enabled(&self, enabled: bool) {
+        self.0.refresh_button.set_sensitive(enabled);
+    }
+
     /// Give keyboard navigation back to the list after returning from a game.
     pub fn focus(&self) {
         self.0.column_view.grab_focus();
@@ -453,10 +477,17 @@ impl GameListHandle {
 
 /// Build the game list widget. `on_activate` is invoked with the game's path
 /// when a game row is activated (double-click / Enter).
-pub fn build<F: Fn(String, StartGameType) + 'static, R: Fn() -> bool + 'static>(
+pub fn build<
+    F: Fn(String, StartGameType) + 'static,
+    S: Fn(u64, String, crate::util::game::ShortcutTarget) + 'static,
+    T: Fn() + 'static,
+    R: Fn() -> bool + 'static,
+>(
     hid_core: &Arc<parking_lot::Mutex<hid_core::hid_core::HIDCore>>,
     play_time_manager: &Arc<frontend_common::play_time_manager::PlayTimeManager>,
     on_activate: F,
+    on_create_shortcut: S,
+    on_refresh: T,
     runtime_lock: R,
 ) -> (gtk::Widget, GameListHandle) {
     install_list_css();
@@ -492,6 +523,9 @@ pub fn build<F: Fn(String, StartGameType) + 'static, R: Fn() -> bool + 'static>(
     });
 
     let on_activate: Rc<dyn Fn(String, StartGameType)> = Rc::new(on_activate);
+    let on_create_shortcut: Rc<dyn Fn(u64, String, crate::util::game::ShortcutTarget)> =
+        Rc::new(on_create_shortcut);
+    let on_refresh: Rc<dyn Fn()> = Rc::new(on_refresh);
     let context_view: Rc<RefCell<Weak<GameListView>>> = Rc::new(RefCell::new(Weak::new()));
     let on_context_menu: ContextMenuHandler = {
         let context_view = Rc::clone(&context_view);
@@ -620,6 +654,9 @@ pub fn build<F: Fn(String, StartGameType) + 'static, R: Fn() -> bool + 'static>(
         hid_core: Arc::clone(hid_core),
         play_time_manager: Arc::clone(play_time_manager),
         on_activate,
+        on_create_shortcut,
+        on_refresh,
+        refresh_button: refresh_button.clone(),
         runtime_lock: Rc::new(runtime_lock),
         property_dialog: RefCell::new(None),
         scan_generation: Arc::new(AtomicU64::new(0)),
@@ -701,10 +738,14 @@ pub fn build<F: Fn(String, StartGameType) + 'static, R: Fn() -> bool + 'static>(
         let view = Rc::clone(&view);
         button.connect_clicked(move |_| view.prompt_add_directory());
     }
-    {
-        let view = Rc::clone(&view);
-        refresh_button.connect_clicked(move |_| view.reload());
-    }
+    refresh_button.connect_clicked({
+        let view = Rc::downgrade(&view);
+        move |_| {
+            if let Some(view) = view.upgrade() {
+                (view.on_refresh)();
+            }
+        }
+    });
     filter_entry.connect_search_changed({
         let view = Rc::downgrade(&view);
         move |entry| {
@@ -1296,6 +1337,26 @@ impl GameListView {
         }
         actions.add_action(&remove_play_time);
 
+        #[cfg(not(target_os = "macos"))]
+        for (name, target) in [
+            (
+                "shortcut-desktop",
+                crate::util::game::ShortcutTarget::Desktop,
+            ),
+            (
+                "shortcut-applications",
+                crate::util::game::ShortcutTarget::Applications,
+            ),
+        ] {
+            let shortcut = gio::SimpleAction::new(name, None);
+            let on_create_shortcut = Rc::clone(&self.on_create_shortcut);
+            let path = path.clone();
+            shortcut.connect_activate(move |_, _| {
+                on_create_shortcut(program_id, path.clone(), target);
+            });
+            actions.add_action(&shortcut);
+        }
+
         for (name, detail) in [
             (
                 "remove-update",
@@ -1334,14 +1395,6 @@ impl GameListView {
             (
                 "verify-integrity",
                 "Integrity verification is not available yet.",
-            ),
-            (
-                "shortcut-desktop",
-                "Desktop shortcut creation is not available yet.",
-            ),
-            (
-                "shortcut-applications",
-                "Applications-menu shortcut creation is not available yet.",
             ),
         ] {
             add_unavailable_action(&actions, name, self.parent_window(), detail);
@@ -2095,12 +2148,10 @@ fn show_context_menu(
     x: f64,
     y: f64,
 ) {
-    // Install the action group before materializing the menu model. Otherwise
-    // GTK initially builds stateful rows such as Favorite without resolving
-    // their boolean action, then rebuilds the indicator after the group is
-    // attached. That produces a visible one-frame relayout when the popover
-    // opens.
-    let popover = gtk::PopoverMenu::from_model(Option::<&gio::Menu>::None);
+    // `from_model` defaults to GTK's touch-oriented sliding pages, which only
+    // open after clicking the chevron. Eden's QMenu uses traditional nested
+    // popovers that open when the pointer enters their row.
+    let popover = gtk::PopoverMenu::from_model_full(menu, context_menu_flags());
     // Upstream `QMenu` uses straight edges with the default Fusion style.
     // Override GTK themes that round popovers so the title menu matches it.
     popover.add_css_class("ruzu-context-menu");
@@ -2108,12 +2159,15 @@ fn show_context_menu(
     popover.insert_action_group("game-list", Some(actions));
     popover.set_parent(anchor);
     popover.set_pointing_to(Some(&gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
-    popover.set_menu_model(Some(menu));
     popover.connect_closed(|popover| {
         let popover = popover.clone();
         glib::idle_add_local_once(move || popover.unparent());
     });
     popover.popup();
+}
+
+fn context_menu_flags() -> gtk::PopoverMenuFlags {
+    gtk::PopoverMenuFlags::NESTED
 }
 
 fn add_unavailable_action(
@@ -2611,6 +2665,11 @@ fn human_size(bytes: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn context_menu_uses_traditional_nested_submenus() {
+        assert_eq!(context_menu_flags(), gtk::PopoverMenuFlags::NESTED);
+    }
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static TEMP_DIR_COUNTER: AtomicU64 = AtomicU64::new(0);

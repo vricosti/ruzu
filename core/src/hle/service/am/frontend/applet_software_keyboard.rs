@@ -5,7 +5,8 @@
 //! Port of zuyu/src/core/hle/service/am/frontend/applet_software_keyboard.cpp
 
 use std::collections::VecDeque;
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, Weak};
 
 use crate::core::SystemRef;
 use crate::frontend::applets::software_keyboard::{
@@ -14,6 +15,7 @@ use crate::frontend::applets::software_keyboard::{
 };
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 use crate::hle::service::am::am_types::{CommonArguments, LibraryAppletMode};
+use crate::hle::service::am::applet::Applet;
 use crate::hle::service::am::applet_data_broker::AppletDataBroker;
 
 use super::applet_software_keyboard_types::*;
@@ -82,6 +84,7 @@ fn version_is_old2(version: u32) -> bool {
 
 pub struct SoftwareKeyboard {
     system: SystemRef,
+    applet: Weak<Mutex<Applet>>,
     broker: Arc<AppletDataBroker>,
     applet_mode: LibraryAppletMode,
     frontend: Arc<dyn SoftwareKeyboardApplet>,
@@ -106,17 +109,21 @@ pub struct SoftwareKeyboard {
     complete: bool,
     status: ResultCode,
     frontend_submissions: Arc<Mutex<VecDeque<FrontendSubmission>>>,
+    frontend_executing: Arc<AtomicBool>,
+    normal_keyboard_shown: bool,
 }
 
 impl SoftwareKeyboard {
     pub fn new(
         system: SystemRef,
+        applet: Weak<Mutex<Applet>>,
         broker: Arc<AppletDataBroker>,
         applet_mode: LibraryAppletMode,
         frontend: Arc<dyn SoftwareKeyboardApplet>,
     ) -> Self {
         Self {
             system,
+            applet,
             broker,
             applet_mode,
             frontend,
@@ -141,6 +148,43 @@ impl SoftwareKeyboard {
             complete: false,
             status: RESULT_SUCCESS,
             frontend_submissions: Arc::new(Mutex::new(VecDeque::new())),
+            frontend_executing: Arc::new(AtomicBool::new(false)),
+            normal_keyboard_shown: false,
+        }
+    }
+
+    /// Queue a frontend callback and, when it arrived asynchronously, resume
+    /// the owning frontend applet immediately. Upstream callbacks invoke
+    /// `SubmitTextNormal` / `SubmitTextInline` directly; the queue is the Rust
+    /// adaptation needed to avoid borrowing the applet across a GUI callback.
+    fn enqueue_frontend_submission(
+        applet: &Weak<Mutex<Applet>>,
+        queue: &Arc<Mutex<VecDeque<FrontendSubmission>>>,
+        executing: &Arc<AtomicBool>,
+        submission: FrontendSubmission,
+    ) {
+        queue.lock().unwrap().push_back(submission);
+
+        // A synchronous callback is consumed before the current frontend call
+        // returns. Trying to lock the Applet here would deadlock because the
+        // accessor already owns its mutex.
+        if executing.load(Ordering::Acquire) {
+            return;
+        }
+
+        let Some(applet) = applet.upgrade() else {
+            return;
+        };
+        let mut applet = applet.lock().unwrap();
+        let complete = if let Some(frontend) = applet.frontend.as_mut() {
+            frontend.execute();
+            frontend.is_complete()
+        } else {
+            false
+        };
+        if complete {
+            applet.is_completed = true;
+            applet.signal_state_changed_event_without_process();
         }
     }
 
@@ -336,18 +380,27 @@ impl SoftwareKeyboard {
         self.send_reply(reply_type);
     }
 
-    fn drain_frontend_submissions(&mut self) {
-        let submissions = {
-            let mut queue = self.frontend_submissions.lock().unwrap();
-            queue.drain(..).collect::<Vec<_>>()
-        };
-        for submission in submissions {
-            match submission {
-                FrontendSubmission::Normal(result, text, confirmed) => {
-                    self.submit_text_normal(result, text, confirmed)
+    fn finish_frontend_execution(&mut self) {
+        loop {
+            let submissions = {
+                let mut queue = self.frontend_submissions.lock().unwrap();
+                if queue.is_empty() {
+                    // Keep this transition under the queue lock: a callback
+                    // either observes `executing` and leaves work for this
+                    // loop, or observes false and resumes the applet itself.
+                    self.frontend_executing.store(false, Ordering::Release);
+                    return;
                 }
-                FrontendSubmission::Inline(reply, text, cursor) => {
-                    self.submit_text_inline(reply, text, cursor)
+                queue.drain(..).collect::<Vec<_>>()
+            };
+            for submission in submissions {
+                match submission {
+                    FrontendSubmission::Normal(result, text, confirmed) => {
+                        self.submit_text_normal(result, text, confirmed)
+                    }
+                    FrontendSubmission::Inline(reply, text, cursor) => {
+                        self.submit_text_inline(reply, text, cursor)
+                    }
                 }
             }
         }
@@ -471,41 +524,57 @@ impl SoftwareKeyboard {
                 >= SwkbdAppletVersion::Version393227 as u32
                 && self.swkbd_config_new.disable_cancel_button,
         };
+        let normal_applet = self.applet.clone();
+        let inline_applet = self.applet.clone();
         let normal_queue = Arc::clone(&self.frontend_submissions);
         let inline_queue = Arc::clone(&self.frontend_submissions);
+        let normal_executing = Arc::clone(&self.frontend_executing);
+        let inline_executing = Arc::clone(&self.frontend_executing);
         let normal: SubmitNormalCallback = Box::new(move |result, text, confirmed| {
-            normal_queue
-                .lock()
-                .unwrap()
-                .push_back(FrontendSubmission::Normal(result, text, confirmed));
+            Self::enqueue_frontend_submission(
+                &normal_applet,
+                &normal_queue,
+                &normal_executing,
+                FrontendSubmission::Normal(result, text, confirmed),
+            );
         });
         let inline: SubmitInlineCallback = Box::new(move |reply, text, cursor| {
-            inline_queue
-                .lock()
-                .unwrap()
-                .push_back(FrontendSubmission::Inline(reply, text, cursor));
+            Self::enqueue_frontend_submission(
+                &inline_applet,
+                &inline_queue,
+                &inline_executing,
+                FrontendSubmission::Inline(reply, text, cursor),
+            );
         });
         self.frontend
             .initialize_keyboard(false, parameters, normal, inline);
     }
 
     fn initialize_frontend_inline_keyboard(&mut self, parameters: KeyboardInitializeParameters) {
+        let normal_applet = self.applet.clone();
+        let inline_applet = self.applet.clone();
         let normal_queue = Arc::clone(&self.frontend_submissions);
         let inline_queue = Arc::clone(&self.frontend_submissions);
+        let normal_executing = Arc::clone(&self.frontend_executing);
+        let inline_executing = Arc::clone(&self.frontend_executing);
         self.frontend.initialize_keyboard(
             true,
             parameters,
             Box::new(move |result, text, confirmed| {
-                normal_queue
-                    .lock()
-                    .unwrap()
-                    .push_back(FrontendSubmission::Normal(result, text, confirmed));
+                Self::enqueue_frontend_submission(
+                    &normal_applet,
+                    &normal_queue,
+                    &normal_executing,
+                    FrontendSubmission::Normal(result, text, confirmed),
+                );
             }),
             Box::new(move |reply, text, cursor| {
-                inline_queue
-                    .lock()
-                    .unwrap()
-                    .push_back(FrontendSubmission::Inline(reply, text, cursor));
+                Self::enqueue_frontend_submission(
+                    &inline_applet,
+                    &inline_queue,
+                    &inline_executing,
+                    FrontendSubmission::Inline(reply, text, cursor),
+                );
             }),
         );
     }
@@ -591,18 +660,15 @@ impl SoftwareKeyboard {
 
     fn show_normal_keyboard(&mut self) {
         self.frontend.show_normal_keyboard();
-        self.drain_frontend_submissions();
     }
 
     fn show_text_check_dialog(&mut self, result: SwkbdTextCheckResult, message: String) {
         self.frontend.show_text_check_dialog(result, message);
-        self.drain_frontend_submissions();
     }
 
     fn show_inline_keyboard(&mut self, parameters: InlineAppearParameters) {
         self.frontend.show_inline_keyboard(parameters);
         self.change_state(SwkbdState::InitializedIsShown);
-        self.drain_frontend_submissions();
     }
 
     fn show_inline_keyboard_old(&mut self) {
@@ -683,7 +749,6 @@ impl SoftwareKeyboard {
             input_text: String::from_utf16_lossy(&self.current_text),
             cursor_position: self.current_cursor_position,
         });
-        self.drain_frontend_submissions();
     }
 
     fn exit_keyboard(&mut self) {
@@ -983,6 +1048,7 @@ impl SoftwareKeyboard {
 
 impl FrontendApplet for SoftwareKeyboard {
     fn initialize(&mut self) {
+        self.frontend_executing.store(true, Ordering::Release);
         let common_data = self
             .broker
             .get_in_data()
@@ -1000,6 +1066,7 @@ impl FrontendApplet for SoftwareKeyboard {
             mode => panic!("Invalid LibraryAppletMode={mode:?}"),
         }
         self.initialized = true;
+        self.finish_frontend_execution();
     }
 
     fn get_status(&self) -> ResultCode {
@@ -1007,7 +1074,9 @@ impl FrontendApplet for SoftwareKeyboard {
     }
 
     fn execute_interactive(&mut self) {
+        self.frontend_executing.store(true, Ordering::Release);
         if self.complete {
+            self.finish_frontend_execution();
             return;
         }
         if self.is_background {
@@ -1015,13 +1084,20 @@ impl FrontendApplet for SoftwareKeyboard {
         } else {
             self.process_text_check();
         }
+        self.finish_frontend_execution();
     }
 
     fn execute(&mut self) {
+        self.frontend_executing.store(true, Ordering::Release);
         if self.complete || self.is_background {
+            self.finish_frontend_execution();
             return;
         }
-        self.show_normal_keyboard();
+        if !self.normal_keyboard_shown {
+            self.normal_keyboard_shown = true;
+            self.show_normal_keyboard();
+        }
+        self.finish_frontend_execution();
     }
 
     fn request_exit(&mut self) {
@@ -1041,13 +1117,122 @@ impl FrontendApplet for SoftwareKeyboard {
 #[cfg(test)]
 mod tests {
     use crate::core::System;
+    use crate::frontend::applets::applet::Applet as FrontendUiApplet;
     use crate::frontend::applets::software_keyboard::DefaultSoftwareKeyboardApplet;
-    use crate::hle::service::am::am_types::CommonArgumentVersion;
+    use crate::hle::service::am::am_types::{AppletId, CommonArgumentVersion};
+    use crate::hle::service::os::process::Process;
 
     use super::*;
 
     fn owned_bytes<T>(value: &T) -> Vec<u8> {
         bytes_of(value).to_vec()
+    }
+
+    struct DeferredSoftwareKeyboardApplet {
+        submit_normal: Mutex<Option<SubmitNormalCallback>>,
+    }
+
+    impl FrontendUiApplet for DeferredSoftwareKeyboardApplet {
+        fn close(&self) {}
+    }
+
+    impl SoftwareKeyboardApplet for DeferredSoftwareKeyboardApplet {
+        fn initialize_keyboard(
+            &self,
+            _is_inline: bool,
+            _initialize_parameters: KeyboardInitializeParameters,
+            submit_normal_callback: SubmitNormalCallback,
+            _submit_inline_callback: SubmitInlineCallback,
+        ) {
+            *self.submit_normal.lock().unwrap() = Some(submit_normal_callback);
+        }
+
+        fn show_normal_keyboard(&self) {}
+
+        fn show_text_check_dialog(
+            &self,
+            _text_check_result: SwkbdTextCheckResult,
+            _text_check_message: String,
+        ) {
+        }
+
+        fn show_inline_keyboard(&self, _appear_parameters: InlineAppearParameters) {}
+
+        fn hide_inline_keyboard(&self) {}
+
+        fn inline_text_changed(&self, _text_parameters: InlineTextParameters) {}
+
+        fn exit_keyboard(&self) {}
+    }
+
+    #[test]
+    fn deferred_normal_submission_completes_and_signals_owning_applet() {
+        let system = System::new();
+        let system_ref = SystemRef::from_ref(&system);
+        let owner = Arc::new(Mutex::new(Applet::new(system_ref, Process::new(), false)));
+        let broker = Arc::new(AppletDataBroker::new());
+        let frontend_impl = Arc::new(DeferredSoftwareKeyboardApplet {
+            submit_normal: Mutex::new(None),
+        });
+        let frontend: Arc<dyn SoftwareKeyboardApplet> = frontend_impl.clone();
+
+        let common = CommonArguments {
+            arguments_version: CommonArgumentVersion::Version3,
+            library_version: SwkbdAppletVersion::Version524301 as u32,
+            ..CommonArguments::default()
+        };
+        let mut config = owned_bytes(&SwkbdConfigCommon::default());
+        config.extend_from_slice(bytes_of(&SwkbdConfigNew::default()));
+        broker.get_in_data().push(owned_bytes(&common));
+        broker.get_in_data().push(config);
+        broker.get_in_data().push(Vec::new());
+
+        let keyboard = SoftwareKeyboard::new(
+            system_ref,
+            Arc::downgrade(&owner),
+            Arc::clone(&broker),
+            LibraryAppletMode::AllForeground,
+            frontend,
+        );
+        {
+            let mut owner = owner.lock().unwrap();
+            owner.applet_id = AppletId::SoftwareKeyboard;
+            owner.frontend = Some(Box::new(keyboard));
+            let frontend = owner.frontend.as_mut().unwrap();
+            frontend.initialize();
+            frontend.execute();
+            assert!(!frontend.is_complete());
+        }
+
+        frontend_impl
+            .submit_normal
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()(SwkbdResult::Ok, "ABC".to_string(), false);
+
+        let owner = owner.lock().unwrap();
+        assert!(owner.is_completed);
+        assert!(owner.frontend.as_ref().unwrap().is_complete());
+        drop(owner);
+
+        let output = broker.get_out_data().pop().unwrap();
+        assert_eq!(
+            u32::from_le_bytes(output[..4].try_into().unwrap()),
+            SwkbdResult::Ok as u32
+        );
+        assert_eq!(
+            u16::from_le_bytes(output[4..6].try_into().unwrap()),
+            'A' as u16
+        );
+        assert_eq!(
+            u16::from_le_bytes(output[6..8].try_into().unwrap()),
+            'B' as u16
+        );
+        assert_eq!(
+            u16::from_le_bytes(output[8..10].try_into().unwrap()),
+            'C' as u16
+        );
     }
 
     #[test]
@@ -1058,6 +1243,7 @@ mod tests {
             Arc::new(DefaultSoftwareKeyboardApplet::new());
         let mut applet = SoftwareKeyboard::new(
             SystemRef::from_ref(&system),
+            Weak::new(),
             Arc::clone(&broker),
             LibraryAppletMode::PartialForegroundIndirectDisplay,
             frontend,

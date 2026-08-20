@@ -10,6 +10,12 @@ pub struct AtomicStorage<State: Copy + Default> {
     pub state: State,
 }
 
+/// Rust counterpart of the `State::sampling_number` member required by the
+/// upstream `Lifo::WriteNextEntry` template.
+pub trait LifoState: Copy + Default {
+    fn sampling_number(&self) -> i64;
+}
+
 #[repr(C)]
 pub struct Lifo<State: Copy + Default, const MAX_BUFFER_SIZE: usize> {
     pub timestamp: i64,
@@ -93,14 +99,63 @@ impl<State: Copy + Default, const MAX_BUFFER_SIZE: usize> Lifo<State, MAX_BUFFER
         (tail + 1) % MAX_BUFFER_SIZE
     }
 
-    pub fn write_next_entry(&mut self, new_state: State) {
+    pub fn write_next_entry(&mut self, new_state: State)
+    where
+        State: LifoState,
+    {
         if self.buffer_count < (MAX_BUFFER_SIZE as i64) - 1 {
             self.buffer_count += 1;
         }
         self.buffer_tail = self.get_next_entry_index() as i64;
-        let previous_sampling = self.entries[self.get_previous_entry_index()].sampling_number;
         let tail = self.buffer_tail as usize;
-        self.entries[tail].sampling_number = previous_sampling + 1;
+        self.entries[tail].sampling_number = new_state.sampling_number() << 1;
         self.entries[tail].state = new_state;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+    #[repr(C)]
+    struct TestState {
+        sampling_number: i64,
+        value: u64,
+    }
+
+    impl LifoState for TestState {
+        fn sampling_number(&self) -> i64 {
+            self.sampling_number
+        }
+    }
+
+    #[test]
+    fn write_next_entry_publishes_an_even_atomic_sampling_number() {
+        let mut lifo = Lifo::<TestState, 17>::default();
+        let state = TestState {
+            sampling_number: 7,
+            value: 0x1234,
+        };
+
+        lifo.write_next_entry(state);
+
+        let entry = lifo.read_current_entry();
+        assert_eq!(entry.sampling_number, 14);
+        assert_eq!(entry.sampling_number & 1, 0);
+        assert_eq!(entry.state, state);
+    }
+
+    #[test]
+    fn write_next_entry_uses_state_sampling_instead_of_previous_marker() {
+        let mut lifo = Lifo::<TestState, 17>::default();
+        lifo.entries[0].sampling_number = 0x1235;
+
+        lifo.write_next_entry(TestState {
+            sampling_number: 3,
+            value: 1,
+        });
+
+        assert_eq!(lifo.read_current_entry().sampling_number, 6);
     }
 }

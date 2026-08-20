@@ -137,10 +137,9 @@ pub fn page() -> Page {
     connect_folder_picker(&dump_browse, &dump_root, "Select Dump Directory...");
     connect_folder_picker(&load_browse, &load_root, "Select Mod Load Directory...");
 
-    // Upstream deletes the metadata cache directory here; the cache is not
-    // ported yet, so log rather than deleting something unrelated.
-    reset_cache.connect_clicked(|_| {
-        log::info!("Filesystem: Reset Metadata Cache requested (cache not yet wired)");
+    reset_cache.connect_clicked(|button| {
+        let parent = button.root().and_downcast::<gtk::Window>();
+        crate::util::game::reset_metadata(parent.as_ref(), true);
     });
 
     Page::new("Filesystem", scroller, move || {

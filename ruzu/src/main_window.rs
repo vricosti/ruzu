@@ -164,6 +164,9 @@ pub struct GMainWindow {
     close_confirmed: Cell<bool>,
     /// Prevent duplicate asynchronous `ConfirmShutdownGame` dialogs.
     stop_confirmation_pending: Cell<bool>,
+    /// Borderless status panel shown between `OnShutdownBeginDialog` and
+    /// `OnEmulationStopped` while a Stop/Restart request tears the title down.
+    shutdown_dialog: RefCell<Option<crate::overlay_dialog::OverlayDialog>>,
     /// Invalidates the previous session's GTK event poller when another title
     /// is booted before that poller receives a terminal event.
     session_generation: Cell<u64>,
@@ -200,6 +203,9 @@ pub struct GMainWindow {
     /// GUI controller applet installed for each boot unless explicitly disabled.
     /// Upstream owner: `GMainWindow` through `QtControllerSelector`.
     controller_applet: Arc<crate::applets::controller::GtkControllerSelector>,
+    /// GUI software keyboard applet installed for each boot.
+    /// Upstream owner: `GMainWindow` through `QtSoftwareKeyboard`.
+    software_keyboard: Arc<crate::applets::software_keyboard::GtkSoftwareKeyboard>,
 }
 
 /// Handles needed to resize the embedded render surface on window resize.
@@ -852,6 +858,15 @@ impl GMainWindow {
             Rc::clone(&input_subsystem),
             controller_applet_requests,
         );
+        let (software_keyboard, software_keyboard_requests) =
+            crate::applets::software_keyboard::GtkSoftwareKeyboard::new();
+        let software_keyboard_frontend =
+            crate::applets::software_keyboard::SoftwareKeyboardFrontend::new(
+                &window,
+                &software_keyboard,
+                software_keyboard_requests,
+                Arc::clone(&hid_core),
+            );
 
         let this = Rc::new(Self {
             window,
@@ -865,6 +880,7 @@ impl GMainWindow {
             close_confirmation_pending: Cell::new(false),
             close_confirmed: Cell::new(false),
             stop_confirmation_pending: Cell::new(false),
+            shutdown_dialog: RefCell::new(None),
             session_generation: Cell::new(0),
             status_bar,
             tas_state: Cell::new(input_common::drivers::tas_input::TasState::Stopped),
@@ -877,9 +893,11 @@ impl GMainWindow {
             input_subsystem,
             hid_core,
             controller_applet,
+            software_keyboard,
         });
 
         controller_applet_frontend.start();
+        software_keyboard_frontend.start();
 
         // Eden's `OnToggleGpuAccuracy` applies the new setting to the active
         // system. Its context-menu action and the other status actions only
@@ -917,6 +935,20 @@ impl GMainWindow {
                 move |path: String, start_type: StartGameType| {
                     w.boot_game_from_list(path, start_type)
                 }
+            ),
+            glib::clone!(
+                #[weak(rename_to = w)]
+                this,
+                move |program_id: u64,
+                      game_path: String,
+                      target: crate::util::game::ShortcutTarget| {
+                    w.on_game_list_create_shortcut(program_id, game_path, target)
+                }
+            ),
+            glib::clone!(
+                #[weak(rename_to = w)]
+                this,
+                move || w.on_game_list_refresh()
             ),
             glib::clone!(
                 #[weak(rename_to = w)]
@@ -1765,6 +1797,18 @@ impl GMainWindow {
         self.room_member.leave();
     }
 
+    /// Upstream `MainWindow::OnGameListRefresh`.
+    fn on_game_list_refresh(&self) {
+        // `pv.txt` is part of this cache. Removing it before the worker
+        // rebuilds the manual provider makes moved update/DLC containers
+        // visible in the Add-ons column on the same refresh.
+        crate::util::game::reset_metadata(Some(self.window.upcast_ref()), false);
+        if let Some(game_list) = self.game_list.borrow().as_ref() {
+            game_list.refresh_game_directory();
+            game_list.refresh_external_content();
+        }
+    }
+
     /// Re-read everything that came from the freshly imported configuration.
     fn on_yuzu_config_imported(self: &Rc<Self>) {
         let game_dirs = crate::configuration::qt_config::load_game_dirs();
@@ -2499,6 +2543,12 @@ impl GMainWindow {
                     let _ = session.apply_renderer_settings();
                 }
                 this.status_bar.refresh();
+                if crate::uisettings::take_game_list_reload_pending() {
+                    let game_list = this.game_list.borrow().clone();
+                    if let Some(game_list) = game_list {
+                        game_list.reload();
+                    }
+                }
             }
         ));
         dialog.connect_closed(glib::clone!(
@@ -2577,6 +2627,35 @@ impl GMainWindow {
     /// Upstream `GMainWindow::BootGameFromList`.
     fn boot_game_from_list(self: &Rc<Self>, filepath: String, start_type: StartGameType) {
         self.boot_game_with_parameters(filepath, boot_parameters_for_start_type(start_type));
+    }
+
+    /// Eden `MainWindow::OnGameListCreateShortcut`.
+    fn on_game_list_create_shortcut(
+        &self,
+        program_id: u64,
+        game_path: String,
+        target: crate::util::game::ShortcutTarget,
+    ) {
+        let arguments = format!("-g \"{game_path}\"");
+        crate::util::game::create_shortcut(
+            &self.window,
+            &game_path,
+            program_id,
+            "",
+            target,
+            arguments,
+            true,
+        );
+    }
+
+    fn software_keyboard_for_boot(
+        &self,
+    ) -> Option<Arc<dyn ruzu_core::frontend::applets::software_keyboard::SoftwareKeyboardApplet>>
+    {
+        Some(Arc::clone(&self.software_keyboard)
+            as Arc<
+                dyn ruzu_core::frontend::applets::software_keyboard::SoftwareKeyboardApplet,
+            >)
     }
 
     fn controller_applet_for_boot(
@@ -2755,6 +2834,7 @@ impl GMainWindow {
             None,
             Arc::clone(&self.hid_core),
             self.controller_applet_for_boot(),
+            self.software_keyboard_for_boot(),
             self.input_subsystem.borrow().get_tas(),
             filepath,
             parameters,
@@ -2762,6 +2842,9 @@ impl GMainWindow {
         );
         *self.session.borrow_mut() = Some(session);
         self.status_bar.set_emulation_running(true);
+        if let Some(game_list) = self.game_list.borrow().as_ref() {
+            game_list.set_refresh_enabled(false);
+        }
         if let Some(app) = self.window.application() {
             update_menu_state(&app, true, false);
         }
@@ -2941,6 +3024,7 @@ impl GMainWindow {
                 .map(crate::boot::OpenGLContextSource::from_glx),
             Arc::clone(&self.hid_core),
             self.controller_applet_for_boot(),
+            self.software_keyboard_for_boot(),
             self.input_subsystem.borrow().get_tas(),
             filepath,
             parameters,
@@ -2948,6 +3032,9 @@ impl GMainWindow {
         );
         *self.session.borrow_mut() = Some(session);
         self.status_bar.set_emulation_running(true);
+        if let Some(game_list) = self.game_list.borrow().as_ref() {
+            game_list.set_refresh_enabled(false);
+        }
         if let Some(app) = self.window.application() {
             update_menu_state(&app, true, false);
         }
@@ -3114,6 +3201,7 @@ impl GMainWindow {
             None,
             Arc::clone(&self.hid_core),
             self.controller_applet_for_boot(),
+            self.software_keyboard_for_boot(),
             self.input_subsystem.borrow().get_tas(),
             filepath,
             parameters,
@@ -3121,6 +3209,9 @@ impl GMainWindow {
         );
         *self.session.borrow_mut() = Some(session);
         self.status_bar.set_emulation_running(true);
+        if let Some(game_list) = self.game_list.borrow().as_ref() {
+            game_list.set_refresh_enabled(false);
+        }
         if let Some(app) = self.window.application() {
             update_menu_state(&app, true, false);
         }
@@ -3456,6 +3547,9 @@ impl GMainWindow {
                 }
             }
         }
+        *self.shutdown_dialog.borrow_mut() = Some(
+            crate::overlay_dialog::OverlayDialog::closing_software(&self.window),
+        );
         true
     }
 
@@ -3473,10 +3567,16 @@ impl GMainWindow {
             close_after_stop,
         );
         self.stop_confirmation_pending.set(false);
+        if let Some(dialog) = self.shutdown_dialog.borrow_mut().take() {
+            dialog.close();
+        }
         if let Some(mut session) = self.session.borrow_mut().take() {
             session.stop();
         }
         self.status_bar.set_emulation_running(false);
+        if let Some(game_list) = self.game_list.borrow().as_ref() {
+            game_list.set_refresh_enabled(true);
+        }
         if let Some(tas) = self.input_subsystem.borrow().get_tas() {
             tas.lock().stop();
         }
