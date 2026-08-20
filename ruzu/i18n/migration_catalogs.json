@@ -1,0 +1,245 @@
+{
+  "ar": {
+    "&Migration Tool": "أداة الترحيل",
+    "Copy from (recommended)": "النسخ من (موصى به)",
+    "Migration Tool": "أداة الترحيل",
+    "No compatible source emulator data was found.": "لم يتم العثور على بيانات متوافقة لمحاكي مصدر.",
+    "Share with (symbolic link / junction point)": "المشاركة مع (رابط رمزي / نقطة وصل)",
+    "The existing Ruzu copy of the selected data will be deleted and replaced with a symbolic link (or a junction point on Windows).": "سيتم حذف نسخة Ruzu الحالية من البيانات المحددة واستبدالها برابط رمزي (أو نقطة وصل على Windows).",
+    "The existing symbolic link (or junction point on Windows) will be deleted and the selected source data will be copied into Ruzu.": "سيتم حذف الرابط الرمزي الحالي (أو نقطة الوصل على Windows) وستُنسخ بيانات المصدر المحددة إلى Ruzu."
+  },
+  "ca": {
+    "&Migration Tool": "Eina de migració",
+    "Copy from (recommended)": "Copia des de (recomanat)",
+    "Migration Tool": "Eina de migració",
+    "No compatible source emulator data was found.": "No s'han trobat dades compatibles de cap emulador d'origen.",
+    "Share with (symbolic link / junction point)": "Comparteix amb (enllaç simbòlic / punt d’unió)",
+    "The existing Ruzu copy of the selected data will be deleted and replaced with a symbolic link (or a junction point on Windows).": "La còpia existent de Ruzu de les dades seleccionades se suprimirà i se substituirà per un enllaç simbòlic (o un punt d’unió al Windows).",
+    "The existing symbolic link (or junction point on Windows) will be deleted and the selected source data will be copied into Ruzu.": "L’enllaç simbòlic existent (o punt d’unió al Windows) se suprimirà i les dades d’origen seleccionades es copiaran a Ruzu."
+  },
+  "cs": {
+    "&Migration Tool": "Nástroj pro migraci",
+    "Copy from (recommended)": "Kopírovat z (doporučeno)",
+    "Migration Tool": "Nástroj pro migraci",
+    "No compatible source emulator data was found.": "Nebyla nalezena žádná kompatibilní data zdrojového emulátoru.",
+    "Share with (symbolic link / junction point)": "Sdílet s (symbolický odkaz / přípojný bod)",
+    "The existing Ruzu copy of the selected data will be deleted and replaced with a symbolic link (or a junction point on Windows).": "Stávající kopie vybraných dat v Ruzu bude odstraněna a nahrazena symbolickým odkazem (nebo přípojným bodem ve Windows).",
+    "The existing symbolic link (or junction point on Windows) will be deleted and the selected source data will be copied into Ruzu.": "Stávající symbolický odkaz (nebo přípojný bod ve Windows) bude odstraněn a vybraná zdrojová data budou zkopírována do Ruzu."
+  },
+  "da": {
+    "&Migration Tool": "Migreringsværktøj",
+    "Copy from (recommended)": "Kopiér fra (anbefalet)",
+    "Migration Tool": "Migreringsværktøj",
+    "No compatible source emulator data was found.": "Der blev ikke fundet kompatible data fra en kildeemulator.",
+    "Share with (symbolic link / junction point)": "Del med (symbolsk link / forbindelsespunkt)",
+    "The existing Ruzu copy of the selected data will be deleted and replaced with a symbolic link (or a junction point on Windows).": "Den eksisterende Ruzu-kopi af de valgte data slettes og erstattes med et symbolsk link (eller et forbindelsespunkt i Windows).",
+    "The existing symbolic link (or junction point on Windows) will be deleted and the selected source data will be copied into Ruzu.": "Det eksisterende symbolske link (eller forbindelsespunkt i Windows) slettes, og de valgte kildedata kopieres til Ruzu."
+  },
+  "de": {
+    "&Migration Tool": "Migrationswerkzeug",
+    "Copy from (recommended)": "Kopieren von (empfohlen)",
+    "Migration Tool": "Migrationswerkzeug",
+    "No compatible source emulator data was found.": "Es wurden keine kompatiblen Daten eines Quell-Emulators gefunden.",
+    "Share with (symbolic link / junction point)": "Teilen mit (symbolischer Link / Verbindungspunkt)",
+    "The existing Ruzu copy of the selected data will be deleted and replaced with a symbolic link (or a junction point on Windows).": "Die vorhandene Ruzu-Kopie der ausgewählten Daten wird gelöscht und durch einen symbolischen Link (oder einen Verbindungspunkt unter Windows) ersetzt.",
+    "The existing symbolic link (or junction point on Windows) will be deleted and the selected source data will be copied into Ruzu.": "Der vorhandene symbolische Link (oder Verbindungspunkt unter Windows) wird gelöscht und die ausgewählten Quelldaten werden nach Ruzu kopiert."
+  },
+  "el": {
+    "&Migration Tool": "Εργαλείο μετεγκατάστασης",
+    "Copy from (recommended)": "Αντιγραφή από (προτείνεται)",
+    "Migration Tool": "Εργαλείο μετεγκατάστασης",
+    "No compatible source emulator data was found.": "Δεν βρέθηκαν συμβατά δεδομένα από εξομοιωτή προέλευσης.",
+    "Share with (symbolic link / junction point)": "Κοινή χρήση με (συμβολικός σύνδεσμος / σημείο σύνδεσης)",
+    "The existing Ruzu copy of the selected data will be deleted and replaced with a symbolic link (or a junction point on Windows).": "Το υπάρχον αντίγραφο των επιλεγμένων δεδομένων στο Ruzu θα διαγραφεί και θα αντικατασταθεί από συμβολικό σύνδεσμο (ή σημείο σύνδεσης στα Windows).",
+    "The existing symbolic link (or junction point on Windows) will be deleted and the selected source data will be copied into Ruzu.": "Ο υπάρχων συμβολικός σύνδεσμος (ή σημείο σύνδεσης στα Windows) θα διαγραφεί και τα επιλεγμένα δεδομένα προέλευσης θα αντιγραφούν στο Ruzu."
+  },
+  "es": {
+    "&Migration Tool": "Herramienta de migración",
+    "Copy from (recommended)": "Copiar desde (recomendado)",
+    "Migration Tool": "Herramienta de migración",
+    "No compatible source emulator data was found.": "No se encontraron datos compatibles de un emulador de origen.",
+    "Share with (symbolic link / junction point)": "Compartir con (enlace simbólico / punto de unión)",
+    "The existing Ruzu copy of the selected data will be deleted and replaced with a symbolic link (or a junction point on Windows).": "La copia existente de Ruzu de los datos seleccionados se eliminará y se sustituirá por un enlace simbólico (o un punto de unión en Windows).",
+    "The existing symbolic link (or junction point on Windows) will be deleted and the selected source data will be copied into Ruzu.": "El enlace simbólico existente (o punto de unión en Windows) se eliminará y los datos de origen seleccionados se copiarán en Ruzu."
+  },
+  "fi": {
+    "&Migration Tool": "Siirtotyökalu",
+    "Copy from (recommended)": "Kopioi lähteestä (suositus)",
+    "Migration Tool": "Siirtotyökalu",
+    "No compatible source emulator data was found.": "Yhteensopivia lähde-emulaattorin tietoja ei löytynyt.",
+    "Share with (symbolic link / junction point)": "Jaa lähteen kanssa (symbolinen linkki / liitospiste)",
+    "The existing Ruzu copy of the selected data will be deleted and replaced with a symbolic link (or a junction point on Windows).": "Valittujen tietojen nykyinen Ruzu-kopio poistetaan ja korvataan symbolisella linkillä (tai Windowsin liitospisteellä).",
+    "The existing symbolic link (or junction point on Windows) will be deleted and the selected source data will be copied into Ruzu.": "Nykyinen symbolinen linkki (tai Windowsin liitospiste) poistetaan ja valitut lähdetiedot kopioidaan Ruzuun."
+  },
+  "fr": {
+    "&Migration Tool": "Outil de migration",
+    "Copy from (recommended)": "Copier depuis (recommandé)",
+    "Migration Tool": "Outil de migration",
+    "No compatible source emulator data was found.": "Aucune donnée compatible d’un émulateur source n’a été trouvée.",
+    "Share with (symbolic link / junction point)": "Partager avec (lien symbolique / point de jonction)",
+    "The existing Ruzu copy of the selected data will be deleted and replaced with a symbolic link (or a junction point on Windows).": "La copie Ruzu existante des données sélectionnées sera supprimée et remplacée par un lien symbolique (ou un point de jonction sous Windows).",
+    "The existing symbolic link (or junction point on Windows) will be deleted and the selected source data will be copied into Ruzu.": "Le lien symbolique existant (ou point de jonction sous Windows) sera supprimé et les données source sélectionnées seront copiées dans Ruzu."
+  },
+  "hu": {
+    "&Migration Tool": "Migrációs eszköz",
+    "Copy from (recommended)": "Másolás innen (ajánlott)",
+    "Migration Tool": "Migrációs eszköz",
+    "No compatible source emulator data was found.": "Nem találhatók kompatibilis forrásemulátor-adatok.",
+    "Share with (symbolic link / junction point)": "Megosztás ezzel (szimbolikus hivatkozás / csomópont)",
+    "The existing Ruzu copy of the selected data will be deleted and replaced with a symbolic link (or a junction point on Windows).": "A kiválasztott adatok meglévő Ruzu-másolata törlődik, és szimbolikus hivatkozás (Windows alatt csomópont) váltja fel.",
+    "The existing symbolic link (or junction point on Windows) will be deleted and the selected source data will be copied into Ruzu.": "A meglévő szimbolikus hivatkozás (Windows alatt csomópont) törlődik, és a kiválasztott forrásadatok a Ruzuba lesznek másolva."
+  },
+  "id": {
+    "&Migration Tool": "Alat Migrasi",
+    "Copy from (recommended)": "Salin dari (disarankan)",
+    "Migration Tool": "Alat Migrasi",
+    "No compatible source emulator data was found.": "Data emulator sumber yang kompatibel tidak ditemukan.",
+    "Share with (symbolic link / junction point)": "Bagikan dengan (tautan simbolis / titik junction)",
+    "The existing Ruzu copy of the selected data will be deleted and replaced with a symbolic link (or a junction point on Windows).": "Salinan Ruzu yang ada dari data terpilih akan dihapus dan diganti dengan tautan simbolis (atau titik junction di Windows).",
+    "The existing symbolic link (or junction point on Windows) will be deleted and the selected source data will be copied into Ruzu.": "Tautan simbolis yang ada (atau titik junction di Windows) akan dihapus dan data sumber terpilih akan disalin ke Ruzu."
+  },
+  "it": {
+    "&Migration Tool": "Strumento di migrazione",
+    "Copy from (recommended)": "Copia da (consigliato)",
+    "Migration Tool": "Strumento di migrazione",
+    "No compatible source emulator data was found.": "Non sono stati trovati dati compatibili di un emulatore di origine.",
+    "Share with (symbolic link / junction point)": "Condividi con (collegamento simbolico / punto di giunzione)",
+    "The existing Ruzu copy of the selected data will be deleted and replaced with a symbolic link (or a junction point on Windows).": "La copia Ruzu esistente dei dati selezionati verrà eliminata e sostituita con un collegamento simbolico (o un punto di giunzione su Windows).",
+    "The existing symbolic link (or junction point on Windows) will be deleted and the selected source data will be copied into Ruzu.": "Il collegamento simbolico esistente (o punto di giunzione su Windows) verrà eliminato e i dati sorgente selezionati verranno copiati in Ruzu."
+  },
+  "ja_JP": {
+    "&Migration Tool": "移行ツール",
+    "Copy from (recommended)": "コピー元からコピー（推奨）",
+    "Migration Tool": "移行ツール",
+    "No compatible source emulator data was found.": "互換性のある移行元エミュレーターのデータが見つかりませんでした。",
+    "Share with (symbolic link / junction point)": "共有（シンボリックリンク / ジャンクションポイント）",
+    "The existing Ruzu copy of the selected data will be deleted and replaced with a symbolic link (or a junction point on Windows).": "選択したデータの既存のRuzuコピーは削除され、シンボリックリンク（Windowsではジャンクションポイント）に置き換えられます。",
+    "The existing symbolic link (or junction point on Windows) will be deleted and the selected source data will be copied into Ruzu.": "既存のシンボリックリンク（Windowsではジャンクションポイント）は削除され、選択した移行元データがRuzuにコピーされます。"
+  },
+  "ko_KR": {
+    "&Migration Tool": "마이그레이션 도구",
+    "Copy from (recommended)": "다음에서 복사(권장)",
+    "Migration Tool": "마이그레이션 도구",
+    "No compatible source emulator data was found.": "호환되는 원본 에뮬레이터 데이터를 찾을 수 없습니다.",
+    "Share with (symbolic link / junction point)": "다음과 공유(심볼릭 링크 / 정션 포인트)",
+    "The existing Ruzu copy of the selected data will be deleted and replaced with a symbolic link (or a junction point on Windows).": "선택한 데이터의 기존 Ruzu 복사본이 삭제되고 심볼릭 링크(Windows에서는 정션 포인트)로 대체됩니다.",
+    "The existing symbolic link (or junction point on Windows) will be deleted and the selected source data will be copied into Ruzu.": "기존 심볼릭 링크(Windows에서는 정션 포인트)가 삭제되고 선택한 원본 데이터가 Ruzu로 복사됩니다."
+  },
+  "nb": {
+    "&Migration Tool": "Migreringsverktøy",
+    "Copy from (recommended)": "Kopier fra (anbefalt)",
+    "Migration Tool": "Migreringsverktøy",
+    "No compatible source emulator data was found.": "Fant ingen kompatible data fra en kildeemulator.",
+    "Share with (symbolic link / junction point)": "Del med (symbolsk lenke / koblingspunkt)",
+    "The existing Ruzu copy of the selected data will be deleted and replaced with a symbolic link (or a junction point on Windows).": "Den eksisterende Ruzu-kopien av de valgte dataene slettes og erstattes med en symbolsk lenke (eller et koblingspunkt i Windows).",
+    "The existing symbolic link (or junction point on Windows) will be deleted and the selected source data will be copied into Ruzu.": "Den eksisterende symbolske lenken (eller koblingspunktet i Windows) slettes, og de valgte kildedataene kopieres til Ruzu."
+  },
+  "nl": {
+    "&Migration Tool": "Migratiehulpmiddel",
+    "Copy from (recommended)": "Kopiëren van (aanbevolen)",
+    "Migration Tool": "Migratiehulpmiddel",
+    "No compatible source emulator data was found.": "Er zijn geen compatibele gegevens van een bronemulator gevonden.",
+    "Share with (symbolic link / junction point)": "Delen met (symbolische koppeling / verbindingspunt)",
+    "The existing Ruzu copy of the selected data will be deleted and replaced with a symbolic link (or a junction point on Windows).": "De bestaande Ruzu-kopie van de geselecteerde gegevens wordt verwijderd en vervangen door een symbolische koppeling (of een verbindingspunt in Windows).",
+    "The existing symbolic link (or junction point on Windows) will be deleted and the selected source data will be copied into Ruzu.": "De bestaande symbolische koppeling (of het verbindingspunt in Windows) wordt verwijderd en de geselecteerde brongegevens worden naar Ruzu gekopieerd."
+  },
+  "pl": {
+    "&Migration Tool": "Narzędzie migracji",
+    "Copy from (recommended)": "Kopiuj z (zalecane)",
+    "Migration Tool": "Narzędzie migracji",
+    "No compatible source emulator data was found.": "Nie znaleziono zgodnych danych emulatora źródłowego.",
+    "Share with (symbolic link / junction point)": "Udostępnij za pomocą (dowiązanie symboliczne / punkt połączenia)",
+    "The existing Ruzu copy of the selected data will be deleted and replaced with a symbolic link (or a junction point on Windows).": "Istniejąca kopia wybranych danych w Ruzu zostanie usunięta i zastąpiona dowiązaniem symbolicznym (lub punktem połączenia w Windows).",
+    "The existing symbolic link (or junction point on Windows) will be deleted and the selected source data will be copied into Ruzu.": "Istniejące dowiązanie symboliczne (lub punkt połączenia w Windows) zostanie usunięte, a wybrane dane źródłowe zostaną skopiowane do Ruzu."
+  },
+  "pt_BR": {
+    "&Migration Tool": "Ferramenta de migração",
+    "Copy from (recommended)": "Copiar de (recomendado)",
+    "Migration Tool": "Ferramenta de migração",
+    "No compatible source emulator data was found.": "Não foram encontrados dados compatíveis de um emulador de origem.",
+    "Share with (symbolic link / junction point)": "Compartilhar com (link simbólico / ponto de junção)",
+    "The existing Ruzu copy of the selected data will be deleted and replaced with a symbolic link (or a junction point on Windows).": "A cópia existente do Ruzu dos dados selecionados será excluída e substituída por um link simbólico (ou um ponto de junção no Windows).",
+    "The existing symbolic link (or junction point on Windows) will be deleted and the selected source data will be copied into Ruzu.": "O link simbólico existente (ou ponto de junção no Windows) será excluído e os dados de origem selecionados serão copiados para o Ruzu."
+  },
+  "pt_PT": {
+    "&Migration Tool": "Ferramenta de migração",
+    "Copy from (recommended)": "Copiar de (recomendado)",
+    "Migration Tool": "Ferramenta de migração",
+    "No compatible source emulator data was found.": "Não foram encontrados dados compatíveis de um emulador de origem.",
+    "Share with (symbolic link / junction point)": "Partilhar com (ligação simbólica / ponto de junção)",
+    "The existing Ruzu copy of the selected data will be deleted and replaced with a symbolic link (or a junction point on Windows).": "A cópia existente do Ruzu dos dados selecionados será eliminada e substituída por uma ligação simbólica (ou um ponto de junção no Windows).",
+    "The existing symbolic link (or junction point on Windows) will be deleted and the selected source data will be copied into Ruzu.": "A ligação simbólica existente (ou ponto de junção no Windows) será eliminada e os dados de origem selecionados serão copiados para o Ruzu."
+  },
+  "ru_RU": {
+    "&Migration Tool": "Инструмент миграции",
+    "Copy from (recommended)": "Копировать из (рекомендуется)",
+    "Migration Tool": "Инструмент миграции",
+    "No compatible source emulator data was found.": "Не найдены совместимые данные исходного эмулятора.",
+    "Share with (symbolic link / junction point)": "Общий доступ с (символическая ссылка / точка соединения)",
+    "The existing Ruzu copy of the selected data will be deleted and replaced with a symbolic link (or a junction point on Windows).": "Существующая копия выбранных данных в Ruzu будет удалена и заменена символической ссылкой (или точкой соединения в Windows).",
+    "The existing symbolic link (or junction point on Windows) will be deleted and the selected source data will be copied into Ruzu.": "Существующая символическая ссылка (или точка соединения в Windows) будет удалена, а выбранные исходные данные будут скопированы в Ruzu."
+  },
+  "sv": {
+    "&Migration Tool": "Migreringsverktyg",
+    "Copy from (recommended)": "Kopiera från (rekommenderas)",
+    "Migration Tool": "Migreringsverktyg",
+    "No compatible source emulator data was found.": "Inga kompatibla data från en källemulator hittades.",
+    "Share with (symbolic link / junction point)": "Dela med (symbolisk länk / kopplingspunkt)",
+    "The existing Ruzu copy of the selected data will be deleted and replaced with a symbolic link (or a junction point on Windows).": "Den befintliga Ruzu-kopian av valda data tas bort och ersätts med en symbolisk länk (eller en kopplingspunkt i Windows).",
+    "The existing symbolic link (or junction point on Windows) will be deleted and the selected source data will be copied into Ruzu.": "Den befintliga symboliska länken (eller kopplingspunkten i Windows) tas bort och valda källdata kopieras till Ruzu."
+  },
+  "tr_TR": {
+    "&Migration Tool": "Geçiş Aracı",
+    "Copy from (recommended)": "Şuradan kopyala (önerilen)",
+    "Migration Tool": "Geçiş Aracı",
+    "No compatible source emulator data was found.": "Uyumlu kaynak emülatör verisi bulunamadı.",
+    "Share with (symbolic link / junction point)": "Şununla paylaş (sembolik bağlantı / bağlantı noktası)",
+    "The existing Ruzu copy of the selected data will be deleted and replaced with a symbolic link (or a junction point on Windows).": "Seçilen verilerin mevcut Ruzu kopyası silinecek ve sembolik bağlantıyla (Windows'ta bağlantı noktasıyla) değiştirilecektir.",
+    "The existing symbolic link (or junction point on Windows) will be deleted and the selected source data will be copied into Ruzu.": "Mevcut sembolik bağlantı (veya Windows'taki bağlantı noktası) silinecek ve seçilen kaynak verileri Ruzu'ya kopyalanacaktır."
+  },
+  "uk": {
+    "&Migration Tool": "Засіб міграції",
+    "Copy from (recommended)": "Копіювати з (рекомендовано)",
+    "Migration Tool": "Засіб міграції",
+    "No compatible source emulator data was found.": "Не знайдено сумісних даних вихідного емулятора.",
+    "Share with (symbolic link / junction point)": "Спільне використання з (символічне посилання / точка з’єднання)",
+    "The existing Ruzu copy of the selected data will be deleted and replaced with a symbolic link (or a junction point on Windows).": "Наявну копію вибраних даних у Ruzu буде видалено й замінено символічним посиланням (або точкою з’єднання у Windows).",
+    "The existing symbolic link (or junction point on Windows) will be deleted and the selected source data will be copied into Ruzu.": "Наявне символічне посилання (або точку з’єднання у Windows) буде видалено, а вибрані вихідні дані буде скопійовано до Ruzu."
+  },
+  "vi": {
+    "&Migration Tool": "Công cụ di chuyển",
+    "Copy from (recommended)": "Sao chép từ (khuyến nghị)",
+    "Migration Tool": "Công cụ di chuyển",
+    "No compatible source emulator data was found.": "Không tìm thấy dữ liệu trình giả lập nguồn tương thích.",
+    "Share with (symbolic link / junction point)": "Chia sẻ với (liên kết tượng trưng / điểm nối)",
+    "The existing Ruzu copy of the selected data will be deleted and replaced with a symbolic link (or a junction point on Windows).": "Bản sao Ruzu hiện có của dữ liệu đã chọn sẽ bị xóa và thay bằng liên kết tượng trưng (hoặc điểm nối trên Windows).",
+    "The existing symbolic link (or junction point on Windows) will be deleted and the selected source data will be copied into Ruzu.": "Liên kết tượng trưng hiện có (hoặc điểm nối trên Windows) sẽ bị xóa và dữ liệu nguồn đã chọn sẽ được sao chép vào Ruzu."
+  },
+  "vi_VN": {
+    "&Migration Tool": "Công cụ di chuyển",
+    "Copy from (recommended)": "Sao chép từ (khuyến nghị)",
+    "Migration Tool": "Công cụ di chuyển",
+    "No compatible source emulator data was found.": "Không tìm thấy dữ liệu trình giả lập nguồn tương thích.",
+    "Share with (symbolic link / junction point)": "Chia sẻ với (liên kết tượng trưng / điểm nối)",
+    "The existing Ruzu copy of the selected data will be deleted and replaced with a symbolic link (or a junction point on Windows).": "Bản sao Ruzu hiện có của dữ liệu đã chọn sẽ bị xóa và thay bằng liên kết tượng trưng (hoặc điểm nối trên Windows).",
+    "The existing symbolic link (or junction point on Windows) will be deleted and the selected source data will be copied into Ruzu.": "Liên kết tượng trưng hiện có (hoặc điểm nối trên Windows) sẽ bị xóa và dữ liệu nguồn đã chọn sẽ được sao chép vào Ruzu."
+  },
+  "zh_CN": {
+    "&Migration Tool": "迁移工具",
+    "Copy from (recommended)": "从源复制（推荐）",
+    "Migration Tool": "迁移工具",
+    "No compatible source emulator data was found.": "未找到兼容的源模拟器数据。",
+    "Share with (symbolic link / junction point)": "与源共享（符号链接 / 联接点）",
+    "The existing Ruzu copy of the selected data will be deleted and replaced with a symbolic link (or a junction point on Windows).": "选定数据的现有 Ruzu 副本将被删除，并替换为符号链接（在 Windows 上为联接点）。",
+    "The existing symbolic link (or junction point on Windows) will be deleted and the selected source data will be copied into Ruzu.": "现有符号链接（在 Windows 上为联接点）将被删除，选定的源数据将复制到 Ruzu。"
+  },
+  "zh_TW": {
+    "&Migration Tool": "遷移工具",
+    "Copy from (recommended)": "從來源複製（建議）",
+    "Migration Tool": "遷移工具",
+    "No compatible source emulator data was found.": "找不到相容的來源模擬器資料。",
+    "Share with (symbolic link / junction point)": "與來源共用（符號連結 / 接合點）",
+    "The existing Ruzu copy of the selected data will be deleted and replaced with a symbolic link (or a junction point on Windows).": "所選資料現有的 Ruzu 副本將被刪除，並替換為符號連結（Windows 上為接合點）。",
+    "The existing symbolic link (or junction point on Windows) will be deleted and the selected source data will be copied into Ruzu.": "現有的符號連結（Windows 上為接合點）將被刪除，所選來源資料將複製到 Ruzu。"
+  }
+}

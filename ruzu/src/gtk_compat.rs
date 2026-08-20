@@ -14,6 +14,17 @@ pub fn show_message<P: IsA<gtk::Window>>(parent: Option<&P>, message: &str, deta
     show_message_with_type(parent, message, detail, MessageType::Info, false);
 }
 
+/// Show an informational message whose title and detail were already passed
+/// through the translation layer. This preserves dynamic values such as
+/// emulator names and filesystem paths from brand normalization.
+pub fn show_pretranslated_message<P: IsA<gtk::Window>>(
+    parent: Option<&P>,
+    message: &str,
+    detail: &str,
+) {
+    show_pretranslated_message_with_type(parent, message, detail, MessageType::Info, false);
+}
+
 /// Show a modal warning using the GTK 4.0 MessageDialog API.
 pub fn show_warning<P: IsA<gtk::Window>>(parent: Option<&P>, message: &str, detail: &str) {
     show_message_with_type(parent, message, detail, MessageType::Warning, false);
@@ -22,6 +33,15 @@ pub fn show_warning<P: IsA<gtk::Window>>(parent: Option<&P>, message: &str, deta
 /// Show a modal error using the GTK 4.0 MessageDialog API.
 pub fn show_error<P: IsA<gtk::Window>>(parent: Option<&P>, message: &str, detail: &str) {
     show_message_with_type(parent, message, detail, MessageType::Error, false);
+}
+
+/// Show an error whose title and detail were already translated.
+pub fn show_pretranslated_error<P: IsA<gtk::Window>>(
+    parent: Option<&P>,
+    message: &str,
+    detail: &str,
+) {
+    show_pretranslated_message_with_type(parent, message, detail, MessageType::Error, false);
 }
 
 /// Show a warning whose translated detail contains trusted Pango markup.
@@ -38,17 +58,33 @@ fn show_message_with_type<P: IsA<gtk::Window>>(
 ) {
     let message = crate::i18n::tr(message);
     let detail = crate::i18n::tr(detail);
+    show_pretranslated_message_with_type(
+        parent,
+        &message,
+        &detail,
+        message_type,
+        detail_uses_markup,
+    );
+}
+
+fn show_pretranslated_message_with_type<P: IsA<gtk::Window>>(
+    parent: Option<&P>,
+    message: &str,
+    detail: &str,
+    message_type: MessageType,
+    detail_uses_markup: bool,
+) {
     let detail = if detail_uses_markup {
         // Qt rich text uses HTML line breaks; GtkLabel consumes Pango markup.
         detail.replace("<br>", "\n").replace("<br/>", "\n")
     } else {
-        detail
+        detail.to_owned()
     };
     let dialog = gtk::MessageDialog::builder()
         .modal(true)
         .message_type(message_type)
         .buttons(ButtonsType::Ok)
-        .text(&message)
+        .text(message)
         .secondary_text(&detail)
         .secondary_use_markup(detail_uses_markup)
         .build();

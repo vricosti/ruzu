@@ -5,7 +5,7 @@
 use gtk::prelude::*;
 
 const PROJECT_URL: &str = "https://github.com/vricosti/ruzu";
-const CREDITS: [&str; 5] = ["yuzu", "Eden", "Codex", "ChatGPT", "vricosti"];
+const CREDITS: [&str; 5] = ["Yuzu", "Eden", "Codex", "ChatGPT", "vricosti"];
 const RUSTY_LEMON_ICON: &[u8] = include_bytes!("../assets/ruzu-rusty-lemon.png");
 const ABOUT_DESCRIPTION: &str =
     "ruzu is an experimental open-source emulator for the Nintendo Switch licensed under GPLv3.0+.";
@@ -69,7 +69,7 @@ mod tests {
     #[test]
     fn project_metadata_is_ruzu_owned() {
         assert_eq!(PROJECT_URL, "https://github.com/vricosti/ruzu");
-        assert_eq!(CREDITS, ["yuzu", "Eden", "Codex", "ChatGPT", "vricosti"]);
+        assert_eq!(CREDITS, ["Yuzu", "Eden", "Codex", "ChatGPT", "vricosti"]);
         assert!(ABOUT_DESCRIPTION.starts_with("ruzu is an experimental"));
         assert!(!ABOUT_DESCRIPTION.contains("yuzu"));
         assert!(!build_version().is_empty());

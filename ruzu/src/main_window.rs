@@ -141,6 +141,46 @@ fn should_warn_about_missing_keys(keys_present: bool) -> bool {
     !keys_present
 }
 
+fn corrected_migration_path(
+    migrated_path: &std::path::Path,
+    legacy_user_dir: &std::path::Path,
+    ruzu_destination: &std::path::Path,
+) -> Option<std::path::PathBuf> {
+    migrated_path
+        .starts_with(legacy_user_dir)
+        .then(|| ruzu_destination.to_path_buf())
+}
+
+#[cfg(test)]
+mod migration_path_tests {
+    use super::*;
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn paths_inside_the_legacy_user_tree_are_replaced() {
+        assert_eq!(
+            corrected_migration_path(
+                Path::new("legacy/yuzu/nand"),
+                Path::new("legacy/yuzu"),
+                Path::new("new/ruzu/nand"),
+            ),
+            Some(PathBuf::from("new/ruzu/nand"))
+        );
+    }
+
+    #[test]
+    fn custom_paths_outside_the_legacy_user_tree_are_preserved() {
+        assert_eq!(
+            corrected_migration_path(
+                Path::new("games/shared-nand"),
+                Path::new("legacy/yuzu"),
+                Path::new("new/ruzu/nand"),
+            ),
+            None
+        );
+    }
+}
+
 fn restart_path_after_shutdown(
     pending_restart_path: Option<String>,
     shutdown_failed: bool,
@@ -686,7 +726,7 @@ mod window_title_tests {
     #[test]
     fn running_title_matches_upstream_field_order() {
         let running = RunningTitle {
-            title_name: "Mario Kart 8 Deluxe (64-bit)".to_owned(),
+            title_name: "Synthetic Homebrew (64-bit)".to_owned(),
             title_version: "3.0.5".to_owned(),
             gpu_vendor: "RadeonSI".to_owned(),
         };
@@ -694,7 +734,7 @@ mod window_title_tests {
         assert_eq!(
             window_title(Some(&running)),
             format!(
-                "Ruzu | {} | {} | Mario Kart 8 Deluxe (64-bit) | 3.0.5 | RadeonSI",
+                "Ruzu | {} | {} | Synthetic Homebrew (64-bit) | 3.0.5 | RadeonSI",
                 common::scm_rev::BUILD_VERSION,
                 common::scm_rev::COMPILER_ID
             )
@@ -761,6 +801,23 @@ mod help_menu_tests {
         assert!(!room_actions_enabled(RoomMemberState::Joining));
         assert!(room_actions_enabled(RoomMemberState::Joined));
         assert!(room_actions_enabled(RoomMemberState::Moderator));
+    }
+}
+
+#[cfg(test)]
+mod tools_menu_tests {
+    use super::*;
+
+    #[test]
+    fn migration_tool_is_immediately_below_controller_menu() {
+        assert!(MENU_ACTION_NAMES.contains(&"migration_tool"));
+        let controller = MENU_UI.find("app.open_controller_menu").unwrap();
+        let migration = MENU_UI.find("app.migration_tool").unwrap();
+        let screenshot = MENU_UI.find("app.capture_screenshot").unwrap();
+        assert!(controller < migration);
+        assert!(migration < screenshot);
+        assert!(MENU_UI[controller..migration].contains("</section>\n      <section>"));
+        assert_eq!(MENU_UI.matches("app.migration_tool").count(), 1);
     }
 }
 
@@ -1294,6 +1351,7 @@ impl GMainWindow {
         window_action!("load_album", on_album);
         window_action!("load_mii_edit", on_mii_edit);
         window_action!("open_controller_menu", on_open_controller_menu);
+        window_action!("migration_tool", on_migration_tool);
         window_action!("capture_screenshot", on_capture_screenshot);
         window_action!("tas_start", on_tas_start_stop);
         window_action!("tas_record", on_tas_record);
@@ -1790,50 +1848,29 @@ impl GMainWindow {
 
     /// Run the checks that upstream performs after presenting the main window.
     fn run_startup_checks(self: &Rc<Self>, offer_config_import: bool) {
-        if offer_config_import && self.maybe_offer_yuzu_import() {
+        if offer_config_import && self.maybe_offer_user_data_migration() {
             return;
         }
         self.on_check_firmware_decryption();
     }
 
-    /// On a first run with an existing yuzu installation, offer to import its
-    /// configuration.
-    ///
-    /// ruzu has no upstream counterpart for this — yuzu has nothing to migrate
-    /// *from*. The offer is made once, and the key check follows its response.
-    /// Return whether the asynchronous import question was presented.
-    fn maybe_offer_yuzu_import(self: &Rc<Self>) -> bool {
-        let Some(import) = crate::config_import::available_import() else {
-            return false;
-        };
-
-        crate::gtk_compat::ask_question(
-            Some(&self.window),
-            "Import your yuzu configuration?",
-            &format!(
-                "A yuzu configuration was found at:\n{}\n\n\
-                 ruzu can copy its settings — including your game directories — \
-                 so you can carry on where you left off. \
-                 Your yuzu configuration is only read, never modified.",
-                import.yuzu_dir.display()
-            ),
-            "Start Fresh",
-            "Import Settings",
+    /// Eden's `UserDataMigrator` owner, adapted to Ruzu's GTK frontend and its
+    /// non-destructive copy/share policies. Return whether the asynchronous
+    /// prompt was presented so the firmware check can wait for it.
+    fn maybe_offer_user_data_migration(self: &Rc<Self>) -> bool {
+        crate::user_data_migration::show(
+            &self.window,
             glib::clone!(
                 #[weak(rename_to = this)]
                 self,
-                move |accepted| {
-                    if accepted {
-                        import.accept();
-                        this.on_yuzu_config_imported();
-                    } else {
-                        import.decline();
+                move |completion| {
+                    if let Some(completion) = completion {
+                        this.on_user_data_migrated(&completion);
                     }
                     this.on_check_firmware_decryption();
                 }
             ),
-        );
-        true
+        )
     }
 
     /// Upstream `GMainWindow::OnCheckFirmwareDecryption`.
@@ -1922,21 +1959,88 @@ impl GMainWindow {
         }
     }
 
-    /// Re-read everything that came from the freshly imported configuration.
-    fn on_yuzu_config_imported(self: &Rc<Self>) {
-        let game_dirs = crate::configuration::qt_config::load_game_dirs();
+    /// Re-read everything that came from a freshly migrated configuration and
+    /// apply Eden's post-migration correction for paths that still point into
+    /// the legacy emulator's user directory.
+    fn on_user_data_migrated(
+        self: &Rc<Self>,
+        completion: &crate::user_data_migration::MigrationCompletion,
+    ) {
         log::info!(
-            "Imported configuration provides {} game directory(ies)",
-            game_dirs.len()
+            "Migrated {} verified tree(s), {} file(s), and {} byte(s) from {}",
+            completion.report.trees,
+            completion.report.files,
+            completion.report.bytes,
+            completion.emulator.name
         );
-        crate::uisettings::with_mut(|v| v.game_dirs = game_dirs);
 
-        // The imported file also carries the widget theme and the emulator
-        // settings the status bar reflects.
-        update_ui_theme();
+        if completion.selection.configuration {
+            use common::fs::path_util::{get_ruzu_path, set_ruzu_path, RuzuPath};
+
+            // Capture Ruzu's active destinations before loading the imported
+            // config, which may temporarily replace them with Yuzu paths.
+            let ruzu_destinations = [
+                (RuzuPath::NANDDir, get_ruzu_path(RuzuPath::NANDDir)),
+                (RuzuPath::SDMCDir, get_ruzu_path(RuzuPath::SDMCDir)),
+                (RuzuPath::DumpDir, get_ruzu_path(RuzuPath::DumpDir)),
+                (RuzuPath::LoadDir, get_ruzu_path(RuzuPath::LoadDir)),
+            ];
+
+            crate::configuration::qt_config::load_global_values();
+            for (path, ruzu_destination) in ruzu_destinations {
+                let migrated_path = get_ruzu_path(path);
+                if let Some(corrected) = corrected_migration_path(
+                    &migrated_path,
+                    completion.emulator.get_user_dir(),
+                    &ruzu_destination,
+                ) {
+                    set_ruzu_path(path, &corrected);
+                }
+            }
+            if let Err(error) = crate::configuration::qt_config::save_global_values() {
+                log::warn!("Could not persist corrected post-migration paths: {error}");
+            }
+
+            crate::configuration::qt_config::load_control_values();
+            crate::configuration::qt_config::load_ui_language();
+            let interface_language =
+                crate::uisettings::with(|values| values.language.get_value().clone());
+            crate::i18n::set_language(&interface_language);
+            crate::i18n::configure_toolkit_language(&interface_language);
+            self.retranslate();
+            crate::configuration::qt_config::load_view_values();
+            crate::configuration::qt_config::load_multiplayer_values();
+            let favorited_ids = crate::configuration::qt_config::load_favorited_ids();
+            crate::uisettings::with_mut(|values| values.favorited_ids = favorited_ids);
+            crate::configuration::qt_config::load_favorites_expanded();
+
+            let game_dirs = crate::configuration::qt_config::load_game_dirs();
+            log::info!(
+                "Migrated configuration provides {} game directory(ies)",
+                game_dirs.len()
+            );
+            crate::uisettings::with_mut(|values| values.game_dirs = game_dirs);
+            update_ui_theme();
+        }
+
+        if completion.selection.keys {
+            ruzu_core::crypto::key_manager::KeyManager::instance()
+                .lock()
+                .unwrap()
+                .reload_keys();
+        }
+
         self.status_bar.refresh();
-        if let Some(game_list) = self.game_list.borrow().as_ref() {
-            game_list.reload();
+        let reload_game_list = completion.selection.configuration
+            || completion.selection.keys
+            || completion.selection.nand
+            || completion.selection.sdmc
+            || !completion.selection.mod_games.is_empty();
+        if reload_game_list {
+            if let Some(game_list) = self.game_list.borrow().as_ref() {
+                game_list.reload();
+                game_list.refresh_external_content();
+            }
         }
     }
 
@@ -1954,8 +2058,8 @@ impl GMainWindow {
         }
 
         let filter = gtk::FileFilter::new();
-        filter.set_name(Some("prod.keys (prod.keys)"));
-        filter.add_pattern("prod.keys");
+        filter.set_name(Some("Decryption Keys (*.keys)"));
+        filter.add_pattern("*.keys");
 
         log::info!("Install Decryption Keys: opening file chooser");
         crate::gtk_compat::open_file(
@@ -1981,87 +2085,29 @@ impl GMainWindow {
         );
     }
 
-    /// Copy the key files sitting beside `prod_keys` into the keys directory.
+    /// Install the selected key file and the adjacent optional key files.
     fn install_decryption_keys_from(self: &Rc<Self>, prod_keys: &std::path::Path) {
-        log::info!("Installing key files from {}", prod_keys.display());
-        let Some(source_dir) = prod_keys.parent() else {
-            return;
-        };
+        use frontend_common::firmware_manager::{install_keys, KeyInstallResult};
 
-        // There must be at least prod.keys; the other two are optional.
-        if !prod_keys.is_file() {
-            self.alert(
-                "Decryption Keys install failed",
-                "prod.keys is a required decryption key file.",
-            );
-            return;
-        }
-        let mut sources = vec![prod_keys.to_path_buf()];
-        for optional in ["title.keys", "key_retail.bin"] {
-            let candidate = source_dir.join(optional);
-            if candidate.is_file() {
-                sources.push(candidate);
-            }
-        }
-
-        let keys_dir =
-            common::fs::path_util::get_ruzu_path(common::fs::path_util::RuzuPath::KeysDir);
-        if let Err(e) = std::fs::create_dir_all(&keys_dir) {
-            log::error!("Could not create keys dir {}: {e}", keys_dir.display());
-            self.alert(
-                "Decryption Keys install failed",
-                "Could not create the keys directory.",
-            );
-            return;
-        }
-
-        for source in &sources {
-            let Some(name) = source.file_name() else {
-                continue;
-            };
-            let destination = keys_dir.join(name);
-            // Selecting the keys that are *already* installed would make source
-            // and destination the same file, and `fs::copy` onto itself
-            // truncates it — destroying the user's keys. Nothing to do anyway.
-            if same_file(source, &destination) {
-                log::info!("{} is already installed; skipping", source.display());
-                continue;
-            }
-            if let Err(e) = std::fs::copy(source, &destination) {
-                log::error!(
-                    "Failed to copy file {} to {}: {e}",
-                    source.display(),
-                    destination.display()
-                );
-                self.alert(
-                    "Decryption Keys install failed",
-                    "One or more keys failed to copy.",
-                );
-                return;
-            }
-        }
-
-        // Reinitialize the key manager and re-populate the game list, so titles
-        // that could not be decrypted before are picked up.
-        ruzu_core::crypto::key_manager::KeyManager::instance()
-            .lock()
-            .unwrap()
-            .reload_keys();
+        let result = install_keys(prod_keys, "keys");
         if let Some(game_list) = self.game_list.borrow().as_ref() {
             game_list.reload();
         }
 
-        if frontend_common::content_manager::are_keys_present() {
-            self.alert(
-                "Decryption Keys install succeeded",
-                "Decryption Keys were successfully installed",
-            );
-        } else {
-            self.alert(
-                "Decryption Keys install failed",
-                "Decryption Keys failed to initialize. Check that your dumping tools are \
-                 up to date and re-dump keys.",
-            );
+        let message = match result {
+            KeyInstallResult::Success => "Decryption Keys were successfully installed",
+            KeyInstallResult::InvalidDir => "Unable to read key directory, aborting",
+            KeyInstallResult::ErrorFailedCopy => "One or more keys failed to copy.",
+            KeyInstallResult::ErrorWrongFilename => {
+                "Verify your keys file has a .keys extension and try again."
+            }
+            KeyInstallResult::ErrorFailedInit => {
+                "Decryption Keys failed to initialize. Check that your dumping tools are up to date and re-dump keys."
+            }
+        };
+        match result {
+            KeyInstallResult::Success => self.alert("Decryption Keys install succeeded", message),
+            _ => self.alert("Decryption Keys install failed", message),
         }
     }
 
@@ -2412,6 +2458,31 @@ impl GMainWindow {
             "Controller Menu",
             None,
         );
+    }
+
+    /// Explicit migration entry point owned by the Tools menu. This bypasses
+    /// only the one-time startup marker; completion still applies Eden's
+    /// post-migration path corrections.
+    fn on_migration_tool(self: &Rc<Self>) {
+        let shown = crate::user_data_migration::show_manual(
+            &self.window,
+            glib::clone!(
+                #[weak(rename_to = this)]
+                self,
+                move |completion| {
+                    if let Some(completion) = completion {
+                        this.on_user_data_migrated(&completion);
+                    }
+                }
+            ),
+        );
+        if !shown {
+            crate::gtk_compat::show_message(
+                Some(&self.window),
+                "Migration Tool",
+                "No compatible source emulator data was found.",
+            );
+        }
     }
 
     fn on_capture_screenshot(self: &Rc<Self>) {
@@ -4070,18 +4141,6 @@ fn gdk_key_to_switch_key(keyval: gtk::gdk::Key) -> i32 {
     key as i32
 }
 
-/// Whether two paths refer to the same file on disk, resolving symlinks.
-///
-/// Used to keep `fs::copy` from being handed identical source and destination,
-/// which truncates the file rather than being a no-op.
-fn same_file(a: &std::path::Path, b: &std::path::Path) -> bool {
-    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
-        (Ok(a), Ok(b)) => a == b,
-        // A destination that does not exist yet cannot be the source.
-        _ => false,
-    }
-}
-
 /// A modal progress window — upstream's `QProgressDialog`.
 ///
 /// The operations it covers (firmware copy, integrity verification) run
@@ -4427,6 +4486,7 @@ const MENU_ACTION_NAMES: &[&str] = &[
     "load_album",
     "load_mii_edit",
     "open_controller_menu",
+    "migration_tool",
     "capture_screenshot",
     "tas_start",
     "tas_record",
@@ -4506,6 +4566,7 @@ pub fn update_menu_state(app: &Application, emulation_running: bool, is_paused: 
 
     set_enabled("install_firmware", !emulation_running);
     set_enabled("install_keys", !emulation_running);
+    set_enabled("migration_tool", !emulation_running);
 
     let firmware_available = check_firmware_presence();
     for &name in APPLET_ACTIONS {
@@ -4722,6 +4783,12 @@ const MENU_UI: &str = r##"<?xml version="1.0" encoding="UTF-8"?>
         <item>
           <attribute name="label" translatable="yes">Open _Controller Menu</attribute>
           <attribute name="action">app.open_controller_menu</attribute>
+        </item>
+      </section>
+      <section>
+        <item>
+          <attribute name="label" translatable="yes">_Migration Tool</attribute>
+          <attribute name="action">app.migration_tool</attribute>
         </item>
       </section>
       <section>

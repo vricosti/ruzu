@@ -110,26 +110,28 @@ impl PathManager {
         } else {
             #[cfg(windows)]
             {
-                let appdata_roaming = get_app_data_roaming_directory();
-                ruzu_path = appdata_roaming.join(RUZU_DIR);
+                let executable_dir = std::env::current_exe()
+                    .ok()
+                    .and_then(|path| path.parent().map(Path::to_path_buf))
+                    .unwrap_or_default();
+                let portable = executable_dir.join(PORTABLE_DIR);
+                ruzu_path = if fs::is_dir(&portable) {
+                    portable
+                } else {
+                    get_app_data_roaming_directory().join(RUZU_DIR)
+                };
                 ruzu_path_cache = ruzu_path.join(CACHE_DIR);
                 ruzu_path_config = ruzu_path.join(CONFIG_DIR);
             }
 
             #[cfg(not(windows))]
             {
-                let data_dir = get_data_directory("XDG_DATA_HOME");
-                let candidate = data_dir.join(RUZU_DIR);
-
-                if fs::exists(&candidate) && fs::is_dir(&candidate) {
-                    ruzu_path = candidate.clone();
-                    ruzu_path_cache = ruzu_path.join(CACHE_DIR);
-                    ruzu_path_config = ruzu_path.join(CONFIG_DIR);
-                } else {
-                    ruzu_path = get_data_directory("XDG_DATA_HOME").join(RUZU_DIR);
-                    ruzu_path_cache = get_data_directory("XDG_CACHE_HOME").join(RUZU_DIR);
-                    ruzu_path_config = get_data_directory("XDG_CONFIG_HOME").join(RUZU_DIR);
-                }
+                (ruzu_path, ruzu_path_cache, ruzu_path_config) = resolve_unix_default_paths(
+                    &fs::get_current_dir(),
+                    &get_data_directory("XDG_DATA_HOME"),
+                    &get_data_directory("XDG_CACHE_HOME"),
+                    &get_data_directory("XDG_CONFIG_HOME"),
+                );
             }
         }
 
@@ -155,6 +157,29 @@ impl PathManager {
     fn generate_ruzu_path(&mut self, ruzu_path: RuzuPath, new_path: &Path) {
         let _ = fs::create_dir(new_path);
         self.set_ruzu_path_impl(ruzu_path, new_path.to_path_buf());
+    }
+}
+
+#[cfg(not(windows))]
+fn resolve_unix_default_paths(
+    current_dir: &Path,
+    data_dir: &Path,
+    cache_dir: &Path,
+    config_dir: &Path,
+) -> (PathBuf, PathBuf, PathBuf) {
+    let portable = current_dir.join(PORTABLE_DIR);
+    if fs::is_dir(&portable) {
+        (
+            portable.clone(),
+            portable.join(CACHE_DIR),
+            portable.join(CONFIG_DIR),
+        )
+    } else {
+        (
+            data_dir.join(RUZU_DIR),
+            cache_dir.join(RUZU_DIR),
+            config_dir.join(RUZU_DIR),
+        )
     }
 }
 
@@ -684,6 +709,46 @@ mod tests {
         assert_eq!(get_extension_from_filename("archive.tar.gz"), "gz");
     }
 
+    #[cfg(not(windows))]
+    #[test]
+    fn existing_xdg_data_directory_does_not_enable_portable_layout() {
+        let root = unique_test_directory("ruzu-xdg-paths");
+        let current = root.join("current");
+        let data = root.join("data");
+        let cache = root.join("cache");
+        let config = root.join("config");
+        fs::create_dir_all(&current).unwrap();
+        fs::create_dir_all(data.join(RUZU_DIR)).unwrap();
+
+        let paths = resolve_unix_default_paths(&current, &data, &cache, &config);
+
+        assert_eq!(paths.0, data.join(RUZU_DIR));
+        assert_eq!(paths.1, cache.join(RUZU_DIR));
+        assert_eq!(paths.2, config.join(RUZU_DIR));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn current_directory_user_folder_enables_portable_layout() {
+        let root = unique_test_directory("ruzu-portable-paths");
+        let current = root.join("current");
+        let portable = current.join(PORTABLE_DIR);
+        fs::create_dir_all(&portable).unwrap();
+
+        let paths = resolve_unix_default_paths(
+            &current,
+            &root.join("data"),
+            &root.join("cache"),
+            &root.join("config"),
+        );
+
+        assert_eq!(paths.0, portable);
+        assert_eq!(paths.1, portable.join(CACHE_DIR));
+        assert_eq!(paths.2, portable.join(CONFIG_DIR));
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[cfg(windows)]
     #[test]
     fn test_app_data_roaming_directory_matches_windows_known_folder() {
@@ -715,11 +780,7 @@ mod tests {
 
     #[test]
     fn test_explicit_ruzu_root_owns_all_runtime_directories() {
-        let unique = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let root = std::env::temp_dir().join(format!("ruzu-owned-paths-{unique}"));
+        let root = unique_test_directory("ruzu-owned-paths");
         fs::create_dir_all(&root).unwrap();
 
         let mut manager = PathManager {
@@ -753,5 +814,13 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    fn unique_test_directory(prefix: &str) -> PathBuf {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("{prefix}-{unique}"))
     }
 }

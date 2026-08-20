@@ -17,7 +17,6 @@ use gtk::{gio, glib};
 mod about_dialog;
 mod applets;
 mod boot;
-mod config_import;
 mod configuration;
 mod emu_window;
 mod file_menu;
@@ -26,6 +25,7 @@ mod gtk_compat;
 mod i18n;
 mod loading_screen;
 mod main_window;
+mod migration_worker;
 mod multiplayer;
 mod overlay_dialog;
 #[cfg(target_os = "macos")]
@@ -36,6 +36,7 @@ mod render_window_windows;
 mod render_window_x11;
 mod status_bar;
 mod uisettings;
+mod user_data_migration;
 mod util;
 mod vk_device_info;
 
@@ -115,9 +116,9 @@ fn main() -> glib::ExitCode {
         log::info!("Using the X11 GDK backend for the embedded Linux render surface");
     }
 
-    // A yuzu configuration is *offered* for import on first run, not copied
-    // silently — the prompt is raised from `GMainWindow` once the UI is up (see
-    // `main_window::maybe_offer_yuzu_import`).
+    // Legacy user data is offered for verified, non-destructive migration once
+    // the main window is mapped. The explicit `migration_prompt_seen` marker,
+    // rather than the eagerly-created config directory, owns first-run state.
 
     // Load the configured game directories out of ruzu's own config, the way
     // upstream's `Config::ReadUIValues` fills `UISettings::values.game_dirs`

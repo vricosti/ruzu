@@ -84,6 +84,7 @@ x11 = { version = "2", features = ["glx", "xlib"] }
 # `RenderWidget::setAttribute(Qt::WA_NativeWindow)`, then hand its HWND to
 # `VkWin32SurfaceCreateInfoKHR`.
 [target.'cfg(target_os = "windows")'.dependencies]
+junction = "2.0"
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
     "Win32_System_LibraryLoader",

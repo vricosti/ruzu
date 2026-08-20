@@ -22,14 +22,34 @@ struct Catalogs {
 fn catalogs() -> &'static Catalogs {
     static CATALOGS: OnceLock<Catalogs> = OnceLock::new();
     CATALOGS.get_or_init(|| {
-        let translations: HashMap<String, HashMap<String, String>> =
+        let mut translations: HashMap<String, HashMap<String, String>> =
             serde_json::from_str(include_str!("../i18n/catalogs.json"))
                 .expect("embedded interface translation catalogs are valid JSON");
+        let migration_translations: HashMap<String, HashMap<String, String>> =
+            serde_json::from_str(include_str!("../i18n/migration_catalogs.json"))
+                .expect("embedded migration translation catalogs are valid JSON");
+        let menu_translations: HashMap<String, HashMap<String, String>> =
+            serde_json::from_str(include_str!("../i18n/menu_catalogs.json"))
+                .expect("embedded menu translation catalogs are valid JSON");
+        for extra_catalog in [migration_translations, menu_translations] {
+            for (locale, messages) in extra_catalog {
+                translations.entry(locale).or_default().extend(messages);
+            }
+        }
         let mut sources = HashMap::new();
         for messages in translations.values() {
             for (source, translated) in messages {
                 sources
                     .entry(translated.clone())
+                    .and_modify(|existing: &mut String| {
+                        // Prefer the plain source when menu and dialog text
+                        // intentionally share a translation. This prevents a
+                        // translated dialog title from becoming "&Title"
+                        // when switching back to English.
+                        if existing.starts_with('&') && !source.starts_with('&') {
+                            existing.clone_from(source);
+                        }
+                    })
                     .or_insert_with(|| source.clone());
             }
         }
@@ -353,6 +373,61 @@ mod tests {
         assert_eq!(tr("Annuler"), "Abbrechen");
         set_language("en");
         assert_eq!(tr("Annuler"), "Cancel");
+    }
+
+    #[test]
+    fn migration_tool_messages_exist_in_every_supported_catalog() {
+        let _guard = test_lock();
+        for &(locale, _) in AVAILABLE_LANGUAGES {
+            if locale.is_empty() || locale == "en" {
+                continue;
+            }
+            set_language(locale);
+            assert_ne!(tr("_Migration Tool"), "_Migration Tool", "{locale}");
+            assert_ne!(
+                tr("Copy from (recommended)"),
+                "Copy from (recommended)",
+                "{locale}"
+            );
+            assert_ne!(
+                tr("Share with (symbolic link / junction point)"),
+                "Share with (symbolic link / junction point)",
+                "{locale}"
+            );
+            assert_ne!(
+                tr("The existing Ruzu copy of the selected data will be deleted and replaced with a symbolic link (or a junction point on Windows)."),
+                "The existing Ruzu copy of the selected data will be deleted and replaced with a symbolic link (or a junction point on Windows).",
+                "{locale}"
+            );
+            assert_ne!(
+                tr("The existing symbolic link (or junction point on Windows) will be deleted and the selected source data will be copied into Ruzu."),
+                "The existing symbolic link (or junction point on Windows) will be deleted and the selected source data will be copied into Ruzu.",
+                "{locale}"
+            );
+            assert_ne!(
+                tr("No compatible source emulator data was found."),
+                "No compatible source emulator data was found.",
+                "{locale}"
+            );
+        }
+        set_language("fr");
+        let french_title = tr("Migration Tool");
+        set_language("en");
+        assert_eq!(tr(&french_title), "Migration Tool");
+    }
+
+    #[test]
+    fn multiplayer_menu_uses_edens_french_translations() {
+        let _guard = test_lock();
+        set_language("fr");
+        assert_eq!(tr("_Multiplayer"), "_Multijoueur");
+        assert_eq!(
+            tr("_Browse Public Game Lobby"),
+            "_Parcourir le menu des jeux publics"
+        );
+        assert_eq!(tr("_Direct Connect to Room"), "_Connexion directe au salon");
+        assert_eq!(tr("_Show Current Room"), "_Afficher le salon actuel");
+        assert_eq!(tr("_Leave Room"), "_Quitter le salon");
     }
 
     #[test]

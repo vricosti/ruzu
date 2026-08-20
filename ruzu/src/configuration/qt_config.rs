@@ -13,8 +13,9 @@
 // here.
 //
 // The file written is **ruzu's own** config (`RuzuPath::ConfigDir`), never
-// yuzu's — yuzu's is read once at first launch by `crate::config_import` and
-// copied in, and is never written to afterwards.
+// yuzu's — legacy configurations are read once by
+// `crate::user_data_migration` through the copy-only migration worker and are
+// never written to afterwards.
 
 use std::io;
 use std::path::PathBuf;

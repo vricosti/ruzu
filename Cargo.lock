@@ -1405,6 +1405,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "junction"
+version = "2.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "160f2eade097f30263b548aae5deb12ad349c909baa710fa24b92c9090b2e006"
+dependencies = [
+ "scopeguard",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "khronos_api"
 version = "3.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1965,6 +1975,7 @@ dependencies = [
  "gtk4",
  "hid_core",
  "input_common",
+ "junction",
  "libc",
  "log",
  "network",
