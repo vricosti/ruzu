@@ -3,7 +3,6 @@
 
 use std::collections::HashMap;
 use std::sync::LazyLock;
-use std::time::SystemTime;
 
 // Time zone strings — matches upstream constexpr array exactly
 const TIMEZONES: [&str; 46] = [
@@ -76,38 +75,51 @@ fn tm_spec_to_seconds(tm_year: i32, tm_yday: i32, tm_hour: i32, tm_min: i32, tm_
     cumulative
 }
 
+#[cfg(unix)]
+fn current_local_and_gmt() -> (libc::tm, libc::tm) {
+    unsafe {
+        let time = libc::time(std::ptr::null_mut());
+        (*libc::localtime(&time), *libc::gmtime(&time))
+    }
+}
+
+#[cfg(windows)]
+fn current_local_and_gmt() -> (libc::tm, libc::tm) {
+    unsafe {
+        let time = libc::time(std::ptr::null_mut());
+        let mut local = std::mem::zeroed();
+        let mut gmt = std::mem::zeroed();
+        libc::localtime_s(&mut local, &time);
+        libc::gmtime_s(&mut gmt, &time);
+        (local, gmt)
+    }
+}
+
 /// Gets the offset of the current timezone (from GMT), in seconds.
 pub fn get_current_offset_seconds() -> i64 {
-    // Use libc to get local and gmt time, matching upstream behavior
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     {
-        unsafe {
-            let t = libc::time(std::ptr::null_mut());
-            let local = *libc::localtime(&t);
-            let gmt = *libc::gmtime(&t);
+        let (local, gmt) = current_local_and_gmt();
+        let gmt_seconds = tm_spec_to_seconds(
+            gmt.tm_year,
+            gmt.tm_yday,
+            gmt.tm_hour,
+            gmt.tm_min,
+            gmt.tm_sec,
+        );
+        let local_seconds = tm_spec_to_seconds(
+            local.tm_year,
+            local.tm_yday,
+            local.tm_hour,
+            local.tm_min,
+            local.tm_sec,
+        );
 
-            let gmt_seconds = tm_spec_to_seconds(
-                gmt.tm_year,
-                gmt.tm_yday,
-                gmt.tm_hour,
-                gmt.tm_min,
-                gmt.tm_sec,
-            );
-            let local_seconds = tm_spec_to_seconds(
-                local.tm_year,
-                local.tm_yday,
-                local.tm_hour,
-                local.tm_min,
-                local.tm_sec,
-            );
-
-            local_seconds - gmt_seconds
-        }
+        local_seconds - gmt_seconds
     }
 
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     {
-        // Fallback: return 0 (GMT)
         0
     }
 }
@@ -142,14 +154,10 @@ pub fn find_system_time_zone() -> String {
     let minutes_off = minutes - hours * 60;
 
     if minutes_off != 0 {
-        #[cfg(unix)]
-        let is_dst = unsafe {
-            let t = libc::time(std::ptr::null_mut());
-            let local = *libc::localtime(&t);
-            local.tm_isdst != 0
-        };
+        #[cfg(any(unix, windows))]
+        let is_dst = current_local_and_gmt().0.tm_isdst != 0;
 
-        #[cfg(not(unix))]
+        #[cfg(not(any(unix, windows)))]
         let is_dst = false;
 
         let tz_index = (hours * 100 + minutes_off) * if is_dst { 100 } else { 1 };

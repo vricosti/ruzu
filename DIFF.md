@@ -2901,3 +2901,28 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 ### Binary layout verification
 
 - N/A: the platform loader handle is host-only state and is never serialized.
+
+## 2026-08-21 — `src/common/src/time_zone.rs` vs Eden `src/common/time_zone.{h,cpp}`
+
+### Intentional differences
+
+- Rust uses a `LazyLock<HashMap<...>>` for Eden's immutable `std::map`; the key/value contents and
+  lookup behavior are identical.
+- Windows uses the thread-safe CRT functions `localtime_s` and `gmtime_s` to obtain owned `tm`
+  values. Eden immediately copies the results of `std::localtime` and `std::gmtime`, so subsequent
+  calculations see the same state without retaining their static buffers.
+- Targets that are neither Unix nor Windows retain a GMT fallback because Eden does not define a
+  separate platform implementation for them.
+
+### Unintentional differences (to fix)
+
+- None. Windows now calculates the local/GMT offset and DST state like Eden instead of always
+  returning zero and selecting GMT.
+
+### Missing items
+
+- None from the upstream `Common::TimeZone` interface or offset table.
+
+### Binary layout verification
+
+- N/A: timezone values are host-side strings and scalar calculations, not serialized structures.
