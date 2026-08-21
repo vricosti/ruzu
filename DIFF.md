@@ -3977,3 +3977,30 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 ### Binary layout verification
 
 - PASS: XMM, YMM, and extended-register encodings are asserted byte-for-byte against NASM output.
+
+## 2026-08-21 — `src/rdynarmic/src/backend/x64/emit_vector_basic.rs` vs `src/dynarmic/src/dynarmic/backend/x64/emit_x64.h` and `emit_x64_vector.cpp` (CLZ/popcount/reverse-bits slice)
+
+### Intentional differences
+
+- Rust explicitly releases temporary register-allocation locks; Eden releases its scoped register
+  wrappers on scope exit. The emitted instruction ordering is otherwise preserved.
+- Eden's single `emit_x64_vector.cpp` translation unit is split into responsibility-based Rust
+  emitter modules; these methods remain together in `emit_vector_basic.rs` and retain their
+  one-to-one upstream names and dispatch ownership.
+
+### Unintentional differences (to fix)
+
+- None in the focused slice. The CLZ emitters now preserve Eden's GFNI, SSSE3, AVX, AVX2,
+  AVX-512 and fallback selections. Population count now preserves the AVX-512, SSSE3 and fallback
+  paths. Reverse-bits now preserves the GFNI, SSSE3 and baseline SSE2 instruction sequences.
+- Removed the unused 32-bit CLZ and reverse-bits host fallbacks: Eden has no corresponding
+  fallbacks because every supported x86-64 host executes their baseline SSE implementations.
+
+### Missing items
+
+- None among `VectorCountLeadingZeros8/16/32`, `VectorPopulationCount`, and `VectorReverseBits`.
+  Other vector-basic methods were outside this warning-driven audit slice.
+
+### Binary layout verification
+
+- N/A: these methods emit JIT instructions and define no shared or serialized structures.

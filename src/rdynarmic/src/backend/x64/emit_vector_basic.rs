@@ -6,6 +6,7 @@
 
 use crate::backend::x64::emit_context::EmitContext;
 use crate::backend::x64::emit_vector_helpers::*;
+use crate::backend::x64::host_feature::HostFeature;
 use crate::backend::x64::reg_alloc::RegAlloc;
 use crate::ir::inst::Inst;
 use crate::ir::value::InstRef;
@@ -152,7 +153,7 @@ pub fn emit_vector_zero_upper(
 }
 
 // ---------------------------------------------------------------------------
-// VectorCountLeadingZeros8/16/32 — fallback
+// VectorCountLeadingZeros8/16/32
 // ---------------------------------------------------------------------------
 
 extern "C" fn fallback_vector_clz8(result: *mut [u8; 16], a: *const [u8; 16]) {
@@ -176,105 +177,247 @@ extern "C" fn fallback_vector_clz16(result: *mut [u8; 16], a: *const [u8; 16]) {
     }
 }
 
-extern "C" fn fallback_vector_clz32(result: *mut [u8; 16], a: *const [u8; 16]) {
-    unsafe {
-        let src: [u32; 4] = std::mem::transmute(*a);
-        let mut out = [0u32; 4];
-        for i in 0..4 {
-            out[i] = src[i].leading_zeros();
-        }
-        *result = std::mem::transmute(out);
+pub fn emit_vector_clz8(ctx: &EmitContext, ra: &mut RegAlloc, inst_ref: InstRef, inst: &Inst) {
+    if ctx.has_host_feature(HostFeature::GFNI) {
+        let mut args = ra.get_argument_info(inst_ref, &inst.args, inst.num_args());
+        let data = ra.use_scratch_xmm(&mut args[0]);
+        let result = ra.scratch_xmm();
+        let reverse_matrix = ra
+            .constant_pool
+            .as_mut()
+            .expect("constant pool required")
+            .get_constant(0x8040_2010_0804_0201, 0x8040_2010_0804_0201);
+        ra.asm
+            .gf2p8affineqb(data, rxbyak::xmmword_ptr(reverse_matrix), 0)
+            .unwrap();
+        ra.asm.pcmpeqb(result, result).unwrap();
+        ra.asm.paddb(result, data).unwrap();
+        ra.asm.pandn(result, data).unwrap();
+        let index_matrix = ra
+            .constant_pool
+            .as_mut()
+            .expect("constant pool required")
+            .get_constant(0xaacc_f0ff_0000_0000, 0xaacc_f0ff_0000_0000);
+        ra.asm
+            .gf2p8affineqb(result, rxbyak::xmmword_ptr(index_matrix), 8)
+            .unwrap();
+        ra.define_value(inst_ref, result);
+    } else if ctx.has_host_feature(HostFeature::SSSE3) {
+        let mut args = ra.get_argument_info(inst_ref, &inst.args, inst.num_args());
+        let data = ra.use_scratch_xmm(&mut args[0]);
+        let tmp1 = ra.scratch_xmm();
+        let tmp2 = ra.scratch_xmm();
+        let lookup = ra
+            .constant_pool
+            .as_mut()
+            .expect("constant pool required")
+            .get_constant(0x0101_0101_0202_0304, 0);
+        ra.asm.movdqa(tmp1, rxbyak::xmmword_ptr(lookup)).unwrap();
+        ra.asm.movdqa(tmp2, tmp1).unwrap();
+        ra.asm.pshufb(tmp2, data).unwrap();
+        ra.asm.psrlw_imm(data, 4).unwrap();
+        let nibble_mask = ra
+            .constant_pool
+            .as_mut()
+            .expect("constant pool required")
+            .get_constant(0x0f0f_0f0f_0f0f_0f0f, 0x0f0f_0f0f_0f0f_0f0f);
+        ra.asm.pand(data, rxbyak::xmmword_ptr(nibble_mask)).unwrap();
+        ra.asm.pshufb(tmp1, data).unwrap();
+        let fours = ra
+            .constant_pool
+            .as_mut()
+            .expect("constant pool required")
+            .get_constant(0x0404_0404_0404_0404, 0x0404_0404_0404_0404);
+        ra.asm.movdqa(data, rxbyak::xmmword_ptr(fours)).unwrap();
+        ra.asm.pcmpeqb(data, tmp1).unwrap();
+        ra.asm.pand(data, tmp2).unwrap();
+        ra.asm.paddb(data, tmp1).unwrap();
+        ra.release(tmp1);
+        ra.release(tmp2);
+        ra.define_value(inst_ref, data);
+    } else {
+        emit_one_arg_fallback(ra, inst_ref, inst, fallback_vector_clz8 as usize);
     }
 }
 
-// VectorCountLeadingZeros8: pshufb nibble lookup
-// clz8(x) = if hi_nibble != 0 { clz4(hi_nibble) } else { 4 + clz4(lo_nibble) }
-// clz4 table: [4,3,2,2,1,1,1,1,0,0,0,0,0,0,0,0]
-pub fn emit_vector_clz8(_ctx: &EmitContext, ra: &mut RegAlloc, inst_ref: InstRef, inst: &Inst) {
+pub fn emit_vector_clz16(ctx: &EmitContext, ra: &mut RegAlloc, inst_ref: InstRef, inst: &Inst) {
+    if ctx.has_host_feature(HostFeature::AVX512_ORTHO | HostFeature::AVX512CD) {
+        let mut args = ra.get_argument_info(inst_ref, &inst.args, inst.num_args());
+        let data = ra.use_scratch_xmm(&mut args[0]);
+        let zero = ra.scratch_xmm();
+        let wide = data.cvt256().unwrap();
+        ra.asm.vpmovzxwd(wide, data).unwrap();
+        ra.asm.vplzcntd(wide, wide).unwrap();
+        ra.asm.vpxor(zero, zero, zero).unwrap();
+        ra.asm.vpackusdw(data, data, zero).unwrap();
+        let subtract_sixteen = ra
+            .constant_pool
+            .as_mut()
+            .expect("constant pool required")
+            .get_constant(0xfff0_fff0_fff0_fff0, 0xfff0_fff0_fff0_fff0);
+        ra.asm
+            .vpaddw(data, data, rxbyak::xmmword_ptr(subtract_sixteen))
+            .unwrap();
+        ra.asm.vzeroupper().unwrap();
+        ra.release(zero);
+        ra.define_value(inst_ref, data);
+    } else if ctx.has_host_feature(HostFeature::AVX) {
+        let mut args = ra.get_argument_info(inst_ref, &inst.args, inst.num_args());
+        let data = ra.use_scratch_xmm(&mut args[0]);
+        let result = ra.scratch_xmm();
+        let zeros = ra.scratch_xmm();
+        let tmp = ra.scratch_xmm();
+        ra.asm.vpsrlw_imm(tmp, data, 1).unwrap();
+        ra.asm.vpor(data, data, tmp).unwrap();
+        ra.asm.vpsrlw_imm(tmp, data, 2).unwrap();
+        ra.asm.vpor(data, data, tmp).unwrap();
+        ra.asm.vpsrlw_imm(tmp, data, 4).unwrap();
+        ra.asm.vpor(data, data, tmp).unwrap();
+        ra.asm.vpsrlw_imm(tmp, data, 8).unwrap();
+        ra.asm.vpor(data, data, tmp).unwrap();
+        ra.asm.vpcmpeqw(zeros, zeros, zeros).unwrap();
+        ra.asm.vpcmpeqw(tmp, tmp, tmp).unwrap();
+        ra.asm.vpcmpeqw(zeros, zeros, data).unwrap();
+        let multiplier = ra
+            .constant_pool
+            .as_mut()
+            .expect("constant pool required")
+            .get_constant(0xf0d3_f0d3_f0d3_f0d3, 0xf0d3_f0d3_f0d3_f0d3);
+        ra.asm
+            .vpmullw(data, data, rxbyak::xmmword_ptr(multiplier))
+            .unwrap();
+        ra.asm.vpsllw_imm(tmp, tmp, 15).unwrap();
+        ra.asm.vpsllw_imm(zeros, zeros, 7).unwrap();
+        ra.asm.vpsrlw_imm(data, data, 12).unwrap();
+        let lookup = ra
+            .constant_pool
+            .as_mut()
+            .expect("constant pool required")
+            .get_constant(0x0903_060a_040b_0c10, 0x0f08_0e02_0705_0d01);
+        ra.asm.vmovdqa(result, rxbyak::xmmword_ptr(lookup)).unwrap();
+        ra.asm.vpor(tmp, tmp, zeros).unwrap();
+        ra.asm.vpor(data, data, tmp).unwrap();
+        ra.asm.vpshufb(result, result, data).unwrap();
+        ra.release(zeros);
+        ra.release(tmp);
+        ra.define_value(inst_ref, result);
+    } else if ctx.has_host_feature(HostFeature::SSSE3) {
+        let mut args = ra.get_argument_info(inst_ref, &inst.args, inst.num_args());
+        let data = ra.use_scratch_xmm(&mut args[0]);
+        let result = ra.scratch_xmm();
+        let zeros = ra.scratch_xmm();
+        let tmp = ra.scratch_xmm();
+        ra.asm.movdqa(tmp, data).unwrap();
+        ra.asm.psrlw_imm(tmp, 1).unwrap();
+        ra.asm.por(data, tmp).unwrap();
+        ra.asm.movdqa(tmp, data).unwrap();
+        ra.asm.psrlw_imm(tmp, 2).unwrap();
+        ra.asm.por(data, tmp).unwrap();
+        ra.asm.movdqa(tmp, data).unwrap();
+        ra.asm.psrlw_imm(tmp, 4).unwrap();
+        ra.asm.por(data, tmp).unwrap();
+        ra.asm.movdqa(tmp, data).unwrap();
+        ra.asm.psrlw_imm(tmp, 8).unwrap();
+        ra.asm.por(data, tmp).unwrap();
+        ra.asm.pcmpeqw(zeros, zeros).unwrap();
+        ra.asm.pcmpeqw(tmp, tmp).unwrap();
+        ra.asm.pcmpeqw(zeros, data).unwrap();
+        let multiplier = ra
+            .constant_pool
+            .as_mut()
+            .expect("constant pool required")
+            .get_constant(0xf0d3_f0d3_f0d3_f0d3, 0xf0d3_f0d3_f0d3_f0d3);
+        ra.asm
+            .pmullw(data, rxbyak::xmmword_ptr(multiplier))
+            .unwrap();
+        ra.asm.psllw_imm(tmp, 15).unwrap();
+        ra.asm.psllw_imm(zeros, 7).unwrap();
+        ra.asm.psrlw_imm(data, 12).unwrap();
+        let lookup = ra
+            .constant_pool
+            .as_mut()
+            .expect("constant pool required")
+            .get_constant(0x0903_060a_040b_0c10, 0x0f08_0e02_0705_0d01);
+        ra.asm.movdqa(result, rxbyak::xmmword_ptr(lookup)).unwrap();
+        ra.asm.por(tmp, zeros).unwrap();
+        ra.asm.por(data, tmp).unwrap();
+        ra.asm.pshufb(result, data).unwrap();
+        ra.release(zeros);
+        ra.release(tmp);
+        ra.define_value(inst_ref, result);
+    } else {
+        emit_one_arg_fallback(ra, inst_ref, inst, fallback_vector_clz16 as usize);
+    }
+}
+
+pub fn emit_vector_clz32(ctx: &EmitContext, ra: &mut RegAlloc, inst_ref: InstRef, inst: &Inst) {
     let mut args = ra.get_argument_info(inst_ref, &inst.args, inst.num_args());
-    let data = ra.use_xmm(&mut args[0]);
-    let result = ra.scratch_xmm();
-    let lo_nibble = ra.scratch_xmm();
-    let hi_nibble = ra.scratch_xmm();
-    let clz4_table = ra.scratch_xmm();
-    let clz4_hi = ra.scratch_xmm();
-
-    let pool = ra.constant_pool.as_mut().expect("constant pool required");
-    // clz4 = {4,3,2,2,1,1,1,1,0,0,0,0,0,0,0,0} as bytes
-    let clz4_addr = pool.get_constant(
-        0x01_01_01_01_02_02_03_04u64, // byte[0]=4, [1]=3, [2]=2, [3]=2, [4-7]=1
-        0x00_00_00_00_00_00_00_00u64, // byte[8-15]=0
-    );
-    let nibble_mask_addr =
-        pool.get_constant(0x0F_0F_0F_0F_0F_0F_0F_0Fu64, 0x0F_0F_0F_0F_0F_0F_0F_0Fu64);
-
-    // lo_nibble = data & 0x0F
-    ra.asm.movaps(lo_nibble, data).unwrap();
-    ra.asm
-        .pand(lo_nibble, rxbyak::xmmword_ptr(nibble_mask_addr))
-        .unwrap();
-
-    // hi_nibble = (data >> 4) & 0x0F
-    ra.asm.movaps(hi_nibble, data).unwrap();
-    ra.asm.psrlw_imm(hi_nibble, 4).unwrap();
-    ra.asm
-        .pand(hi_nibble, rxbyak::xmmword_ptr(nibble_mask_addr))
-        .unwrap();
-
-    // clz4_lo = clz4[lo_nibble]: load table, shuffle by indices
-    ra.asm
-        .movaps(result, rxbyak::xmmword_ptr(clz4_addr))
-        .unwrap();
-    ra.asm.pshufb(result, lo_nibble).unwrap();
-    // result now has clz4(lo_nibble) per byte
-
-    // clz4_hi = clz4[hi_nibble]
-    ra.asm
-        .movaps(clz4_table, rxbyak::xmmword_ptr(clz4_addr))
-        .unwrap();
-    ra.asm.pshufb(clz4_table, hi_nibble).unwrap();
-    ra.asm.movaps(clz4_hi, clz4_table).unwrap();
-    // clz4_hi now has clz4(hi_nibble) per byte
-
-    // If hi_nibble != 0: clz = clz4_hi; else: clz = 4 + clz4_lo = result + 4
-    // Method: result += 4 (add 4 to lo-nibble CLZ)
-    // Then: if hi_nibble != 0, replace with clz4_hi
-    // hi_is_zero = pcmpeqb(hi_nibble, zero)
-    let zero = lo_nibble; // reuse
-    ra.asm.xorps(zero, zero).unwrap();
-    let hi_is_zero = hi_nibble; // reuse (hi_nibble no longer needed after clz4_hi computed)
-    ra.asm.pcmpeqb(hi_is_zero, zero).unwrap();
-    // hi_is_zero = 0xFF where hi_nibble was 0, 0x00 otherwise
-
-    // result = result + 4 (for the lo-nibble case)
-    let pool = ra.constant_pool.as_mut().expect("constant pool required");
-    let four_addr = pool.get_constant(0x04_04_04_04_04_04_04_04u64, 0x04_04_04_04_04_04_04_04u64);
-    ra.asm
-        .paddb(result, rxbyak::xmmword_ptr(four_addr))
-        .unwrap();
-
-    // result = (hi_is_zero & result) | (~hi_is_zero & clz4_hi)
-    // = blend: where hi_is_zero, keep result(=4+clz4_lo); else use clz4_hi
-    // pand(result, hi_is_zero): keep result where hi was zero
-    ra.asm.pand(result, hi_is_zero).unwrap();
-    // pandn(hi_is_zero, clz4_hi): keep clz4_hi where hi was nonzero
-    ra.asm.pandn(hi_is_zero, clz4_hi).unwrap();
-    // por: merge
-    ra.asm.por(result, hi_is_zero).unwrap();
-
-    ra.release(data);
-    ra.release(clz4_hi);
-    ra.define_value(inst_ref, result);
-}
-pub fn emit_vector_clz16(_ctx: &EmitContext, ra: &mut RegAlloc, inst_ref: InstRef, inst: &Inst) {
-    emit_one_arg_fallback(ra, inst_ref, inst, fallback_vector_clz16 as usize);
-}
-pub fn emit_vector_clz32(_ctx: &EmitContext, ra: &mut RegAlloc, inst_ref: InstRef, inst: &Inst) {
-    emit_one_arg_fallback(ra, inst_ref, inst, fallback_vector_clz32 as usize);
+    if ctx.has_host_feature(HostFeature::AVX512_ORTHO | HostFeature::AVX512CD) {
+        let data = ra.use_scratch_xmm(&mut args[0]);
+        ra.asm.vplzcntd(data, data).unwrap();
+        ra.define_value(inst_ref, data);
+    } else if ctx.has_host_feature(HostFeature::AVX2) {
+        let data = ra.use_scratch_xmm(&mut args[0]);
+        let temp = ra.scratch_xmm();
+        ra.asm.vmovdqa(temp, data).unwrap();
+        ra.asm.vpsrld_imm(data, data, 8).unwrap();
+        ra.asm.vpandn(data, data, temp).unwrap();
+        let exponent = ra
+            .constant_pool
+            .as_mut()
+            .expect("constant pool required")
+            .get_constant(0x0000_009e_0000_009e, 0x0000_009e_0000_009e);
+        ra.asm.vmovdqa(temp, rxbyak::xmmword_ptr(exponent)).unwrap();
+        ra.asm.vcvtdq2ps(data, data).unwrap();
+        ra.asm.vpsrld_imm(data, data, 23).unwrap();
+        ra.asm.vpsubusw(data, temp, data).unwrap();
+        let thirty_two = ra
+            .constant_pool
+            .as_mut()
+            .expect("constant pool required")
+            .get_constant(0x0000_0020_0000_0020, 0x0000_0020_0000_0020);
+        ra.asm
+            .vpminsw(data, data, rxbyak::xmmword_ptr(thirty_two))
+            .unwrap();
+        ra.release(temp);
+        ra.define_value(inst_ref, data);
+    } else {
+        let result = ra.use_scratch_xmm(&mut args[0]);
+        let tmp1 = ra.scratch_xmm();
+        let tmp2 = ra.scratch_xmm();
+        ra.asm.pxor(tmp1, tmp1).unwrap();
+        ra.asm.movdqa(tmp2, result).unwrap();
+        ra.asm.pcmpeqd(tmp1, result).unwrap();
+        ra.asm.psrld_imm(result, 1).unwrap();
+        ra.asm.psrld_imm(tmp2, 2).unwrap();
+        ra.asm.pandn(tmp2, result).unwrap();
+        ra.asm.cvtdq2ps(result, tmp2).unwrap();
+        ra.asm.addps(result, result).unwrap();
+        let one = ra
+            .constant_pool
+            .as_mut()
+            .expect("constant pool required")
+            .get_constant(0x3f80_0000_3f80_0000, 0x3f80_0000_3f80_0000);
+        ra.asm.addps(result, rxbyak::xmmword_ptr(one)).unwrap();
+        ra.asm.psrld_imm(result, 23).unwrap();
+        ra.asm.paddd(tmp1, result).unwrap();
+        let exponent = ra
+            .constant_pool
+            .as_mut()
+            .expect("constant pool required")
+            .get_constant(0x0000_009e_0000_009e, 0x0000_009e_0000_009e);
+        ra.asm
+            .movdqa(result, rxbyak::xmmword_ptr(exponent))
+            .unwrap();
+        ra.asm.psubd(result, tmp1).unwrap();
+        ra.release(tmp1);
+        ra.release(tmp2);
+        ra.define_value(inst_ref, result);
+    }
 }
 
 // ---------------------------------------------------------------------------
-// VectorPopulationCount — fallback
+// VectorPopulationCount
 // ---------------------------------------------------------------------------
 
 extern "C" fn fallback_vector_popcount(result: *mut [u8; 16], a: *const [u8; 16]) {
@@ -287,138 +430,142 @@ extern "C" fn fallback_vector_popcount(result: *mut [u8; 16], a: *const [u8; 16]
     }
 }
 
-// VectorPopulationCount: pshufb nibble lookup, add halves
-// popcount4 = {0,1,1,2,1,2,2,3,1,2,2,3,2,3,3,4}
-pub fn emit_vector_popcount(_ctx: &EmitContext, ra: &mut RegAlloc, inst_ref: InstRef, inst: &Inst) {
-    let mut args = ra.get_argument_info(inst_ref, &inst.args, inst.num_args());
-    let data = ra.use_xmm(&mut args[0]);
-    let lo_nibble = ra.scratch_xmm();
-    let hi_nibble = ra.scratch_xmm();
-    let result = ra.scratch_xmm();
-    let table_copy = ra.scratch_xmm();
-
-    let pool = ra.constant_pool.as_mut().expect("constant pool required");
-    // popcount4 = {0,1,1,2,1,2,2,3,1,2,2,3,2,3,3,4}
-    let pop4_addr = pool.get_constant(
-        0x03_02_02_01_02_01_01_00u64, // byte[0]=0,[1]=1,[2]=1,[3]=2,[4]=1,[5]=2,[6]=2,[7]=3
-        0x04_03_03_02_03_02_02_01u64, // byte[8]=1,[9]=2,[10]=2,[11]=3,[12]=2,[13]=3,[14]=3,[15]=4
-    );
-    let nibble_mask_addr =
-        pool.get_constant(0x0F_0F_0F_0F_0F_0F_0F_0Fu64, 0x0F_0F_0F_0F_0F_0F_0F_0Fu64);
-
-    // lo_nibble = data & 0x0F
-    ra.asm.movaps(lo_nibble, data).unwrap();
-    ra.asm
-        .pand(lo_nibble, rxbyak::xmmword_ptr(nibble_mask_addr))
-        .unwrap();
-
-    // hi_nibble = (data >> 4) & 0x0F
-    ra.asm.movaps(hi_nibble, data).unwrap();
-    ra.asm.psrlw_imm(hi_nibble, 4).unwrap();
-    ra.asm
-        .pand(hi_nibble, rxbyak::xmmword_ptr(nibble_mask_addr))
-        .unwrap();
-
-    // pop_lo = pop4[lo_nibble]
-    ra.asm
-        .movaps(result, rxbyak::xmmword_ptr(pop4_addr))
-        .unwrap();
-    ra.asm.pshufb(result, lo_nibble).unwrap();
-
-    // pop_hi = pop4[hi_nibble]
-    ra.asm
-        .movaps(table_copy, rxbyak::xmmword_ptr(pop4_addr))
-        .unwrap();
-    ra.asm.pshufb(table_copy, hi_nibble).unwrap();
-
-    // result = pop_lo + pop_hi
-    ra.asm.paddb(result, table_copy).unwrap();
-
-    ra.release(data);
-    ra.release(lo_nibble);
-    ra.release(hi_nibble);
-    ra.release(table_copy);
-    ra.define_value(inst_ref, result);
-}
-
-// ---------------------------------------------------------------------------
-// VectorReverseBits — fallback
-// ---------------------------------------------------------------------------
-
-extern "C" fn fallback_vector_reverse_bits(result: *mut [u8; 16], a: *const [u8; 16]) {
-    unsafe {
-        let src = &*a;
-        let dst = &mut *result;
-        for i in 0..16 {
-            dst[i] = src[i].reverse_bits();
-        }
+pub fn emit_vector_popcount(ctx: &EmitContext, ra: &mut RegAlloc, inst_ref: InstRef, inst: &Inst) {
+    if ctx.has_host_feature(HostFeature::AVX512VL | HostFeature::AVX512BITALG) {
+        let mut args = ra.get_argument_info(inst_ref, &inst.args, inst.num_args());
+        let data = ra.use_scratch_xmm(&mut args[0]);
+        ra.asm.vpopcntb(data, data).unwrap();
+        ra.define_value(inst_ref, data);
+        return;
     }
+
+    if ctx.has_host_feature(HostFeature::SSSE3) {
+        let mut args = ra.get_argument_info(inst_ref, &inst.args, inst.num_args());
+        let low = ra.use_scratch_xmm(&mut args[0]);
+        let high = ra.scratch_xmm();
+        let tmp1 = ra.scratch_xmm();
+        let tmp2 = ra.scratch_xmm();
+        ra.asm.movdqa(high, low).unwrap();
+        ra.asm.psrlw_imm(high, 4).unwrap();
+        let nibble_mask = ra
+            .constant_pool
+            .as_mut()
+            .expect("constant pool required")
+            .get_constant(0x0f0f_0f0f_0f0f_0f0f, 0x0f0f_0f0f_0f0f_0f0f);
+        ra.asm
+            .movdqa(tmp1, rxbyak::xmmword_ptr(nibble_mask))
+            .unwrap();
+        ra.asm.pand(high, tmp1).unwrap();
+        ra.asm.pand(low, tmp1).unwrap();
+        let lookup = ra
+            .constant_pool
+            .as_mut()
+            .expect("constant pool required")
+            .get_constant(0x0302_0201_0201_0100, 0x0403_0302_0302_0201);
+        ra.asm.movdqa(tmp1, rxbyak::xmmword_ptr(lookup)).unwrap();
+        ra.asm.movdqa(tmp2, tmp1).unwrap();
+        ra.asm.pshufb(tmp1, low).unwrap();
+        ra.asm.pshufb(tmp2, high).unwrap();
+        ra.asm.paddb(tmp1, tmp2).unwrap();
+        ra.release(high);
+        ra.release(tmp2);
+        ra.define_value(inst_ref, tmp1);
+        return;
+    }
+
+    emit_one_arg_fallback(ra, inst_ref, inst, fallback_vector_popcount as usize);
 }
 
-// VectorReverseBits: pshufb nibble bit-reverse lookup, swap nibbles
-// reverse_bits(byte) = (reverse4(hi_nib) << 0) | (reverse4(lo_nib) << 4)
-// reverse4 = {0,8,4,C,2,A,6,E,1,9,5,D,3,B,7,F}
+// ---------------------------------------------------------------------------
+// VectorReverseBits
+// ---------------------------------------------------------------------------
+
 pub fn emit_vector_reverse_bits(
-    _ctx: &EmitContext,
+    ctx: &EmitContext,
     ra: &mut RegAlloc,
     inst_ref: InstRef,
     inst: &Inst,
 ) {
     let mut args = ra.get_argument_info(inst_ref, &inst.args, inst.num_args());
-    let data = ra.use_xmm(&mut args[0]);
-    let lo_nibble = ra.scratch_xmm();
-    let hi_nibble = ra.scratch_xmm();
-    let result = ra.scratch_xmm();
-    let table_copy = ra.scratch_xmm();
+    let data = ra.use_scratch_xmm(&mut args[0]);
+    if ctx.has_host_feature(HostFeature::GFNI) {
+        let reverse_matrix = ra
+            .constant_pool
+            .as_mut()
+            .expect("constant pool required")
+            .get_constant(0x8040_2010_0804_0201, 0x8040_2010_0804_0201);
+        ra.asm
+            .gf2p8affineqb(data, rxbyak::xmmword_ptr(reverse_matrix), 0)
+            .unwrap();
+    } else {
+        let high_nibble = ra.scratch_xmm();
+        let high_mask = ra
+            .constant_pool
+            .as_mut()
+            .expect("constant pool required")
+            .get_constant(0xf0f0_f0f0_f0f0_f0f0, 0xf0f0_f0f0_f0f0_f0f0);
+        ra.asm
+            .movdqa(high_nibble, rxbyak::xmmword_ptr(high_mask))
+            .unwrap();
+        ra.asm.pand(high_nibble, data).unwrap();
+        ra.asm.pxor(data, high_nibble).unwrap();
+        ra.asm.psrld_imm(high_nibble, 4).unwrap();
 
-    let pool = ra.constant_pool.as_mut().expect("constant pool required");
-    // reverse4 = {0x0,0x8,0x4,0xC,0x2,0xA,0x6,0xE,0x1,0x9,0x5,0xD,0x3,0xB,0x7,0xF}
-    let rev4_addr = pool.get_constant(0x0E_06_0A_02_0C_04_08_00u64, 0x0F_07_0B_03_0D_05_09_01u64);
-    let nibble_mask_addr =
-        pool.get_constant(0x0F_0F_0F_0F_0F_0F_0F_0Fu64, 0x0F_0F_0F_0F_0F_0F_0F_0Fu64);
-
-    // lo_nibble = data & 0x0F
-    ra.asm.movaps(lo_nibble, data).unwrap();
-    ra.asm
-        .pand(lo_nibble, rxbyak::xmmword_ptr(nibble_mask_addr))
-        .unwrap();
-
-    // hi_nibble = (data >> 4) & 0x0F
-    ra.asm.movaps(hi_nibble, data).unwrap();
-    ra.asm.psrlw_imm(hi_nibble, 4).unwrap();
-    ra.asm
-        .pand(hi_nibble, rxbyak::xmmword_ptr(nibble_mask_addr))
-        .unwrap();
-
-    // rev_lo = reverse4[lo_nibble] — goes to HIGH nibble of result
-    ra.asm
-        .movaps(result, rxbyak::xmmword_ptr(rev4_addr))
-        .unwrap();
-    ra.asm.pshufb(result, lo_nibble).unwrap();
-    ra.asm.psllw_imm(result, 4).unwrap();
-    // Mask to keep only high nibble per byte
-    let pool = ra.constant_pool.as_mut().expect("constant pool required");
-    let hi_mask_addr =
-        pool.get_constant(0xF0_F0_F0_F0_F0_F0_F0_F0u64, 0xF0_F0_F0_F0_F0_F0_F0_F0u64);
-    ra.asm
-        .pand(result, rxbyak::xmmword_ptr(hi_mask_addr))
-        .unwrap();
-
-    // rev_hi = reverse4[hi_nibble] — goes to LOW nibble of result
-    ra.asm
-        .movaps(table_copy, rxbyak::xmmword_ptr(rev4_addr))
-        .unwrap();
-    ra.asm.pshufb(table_copy, hi_nibble).unwrap();
-    // table_copy already has values in low nibble
-
-    // result = rev_lo_shifted | rev_hi
-    ra.asm.por(result, table_copy).unwrap();
-
-    ra.release(data);
-    ra.release(lo_nibble);
-    ra.release(hi_nibble);
-    ra.release(table_copy);
-    ra.define_value(inst_ref, result);
+        if ctx.has_host_feature(HostFeature::SSSE3) {
+            let high_reversed = ra.scratch_xmm();
+            let high_lookup = ra
+                .constant_pool
+                .as_mut()
+                .expect("constant pool required")
+                .get_constant(0xe060_a020_c040_8000, 0xf070_b030_d050_9010);
+            ra.asm
+                .movdqa(high_reversed, rxbyak::xmmword_ptr(high_lookup))
+                .unwrap();
+            ra.asm.pshufb(high_reversed, data).unwrap();
+            let low_lookup = ra
+                .constant_pool
+                .as_mut()
+                .expect("constant pool required")
+                .get_constant(0x0e06_0a02_0c04_0800, 0x0f07_0b03_0d05_0901);
+            ra.asm
+                .movdqa(data, rxbyak::xmmword_ptr(low_lookup))
+                .unwrap();
+            ra.asm.pshufb(data, high_nibble).unwrap();
+            ra.asm.por(data, high_reversed).unwrap();
+            ra.release(high_reversed);
+        } else {
+            ra.asm.pslld_imm(data, 4).unwrap();
+            ra.asm.por(data, high_nibble).unwrap();
+            let pairs = ra
+                .constant_pool
+                .as_mut()
+                .expect("constant pool required")
+                .get_constant(0xcccc_cccc_cccc_cccc, 0xcccc_cccc_cccc_cccc);
+            ra.asm
+                .movdqa(high_nibble, rxbyak::xmmword_ptr(pairs))
+                .unwrap();
+            ra.asm.pand(high_nibble, data).unwrap();
+            ra.asm.pxor(data, high_nibble).unwrap();
+            ra.asm.psrld_imm(high_nibble, 2).unwrap();
+            ra.asm.pslld_imm(data, 2).unwrap();
+            ra.asm.por(data, high_nibble).unwrap();
+            let alternating = ra
+                .constant_pool
+                .as_mut()
+                .expect("constant pool required")
+                .get_constant(0xaaaa_aaaa_aaaa_aaaa, 0xaaaa_aaaa_aaaa_aaaa);
+            ra.asm
+                .movdqa(high_nibble, rxbyak::xmmword_ptr(alternating))
+                .unwrap();
+            ra.asm.pand(high_nibble, data).unwrap();
+            ra.asm.pxor(data, high_nibble).unwrap();
+            ra.asm.psrld_imm(high_nibble, 1).unwrap();
+            ra.asm.paddd(data, data).unwrap();
+            ra.asm.por(data, high_nibble).unwrap();
+        }
+        ra.release(high_nibble);
+    }
+    ra.define_value(inst_ref, data);
 }
 
 // ---------------------------------------------------------------------------
@@ -540,25 +687,31 @@ mod tests {
 
     #[test]
     fn test_fallback_vector_clz8() {
-        let input: [u8; 16] = [0, 1, 2, 4, 8, 16, 32, 64, 128, 255, 3, 7, 15, 31, 63, 127];
-        let mut output = [0u8; 16];
-        fallback_vector_clz8(&mut output, &input);
-        assert_eq!(output[0], 8); // clz(0) = 8
-        assert_eq!(output[1], 7); // clz(1) = 7
-        assert_eq!(output[8], 0); // clz(128) = 0
-        assert_eq!(output[9], 0); // clz(255) = 0
+        for base in (0..=u8::MAX).step_by(16) {
+            let input = std::array::from_fn(|lane| base.wrapping_add(lane as u8));
+            let mut output = [0u8; 16];
+            fallback_vector_clz8(&mut output, &input);
+            assert_eq!(output, input.map(|value| value.leading_zeros() as u8));
+        }
+    }
+
+    #[test]
+    fn test_fallback_vector_clz16() {
+        let input: [u16; 8] = [0, 1, 2, 0x7f, 0x80, 0xff, 0x8000, 0xffff];
+        let input_bytes: [u8; 16] = unsafe { std::mem::transmute(input) };
+        let mut output_bytes = [0u8; 16];
+        fallback_vector_clz16(&mut output_bytes, &input_bytes);
+        let output: [u16; 8] = unsafe { std::mem::transmute(output_bytes) };
+        assert_eq!(output, input.map(|value| value.leading_zeros() as u16));
     }
 
     #[test]
     fn test_fallback_vector_popcount() {
-        let input: [u8; 16] = [
-            0, 1, 3, 7, 15, 31, 63, 127, 255, 0x80, 0xAA, 0x55, 0xFF, 0, 0, 0,
-        ];
-        let mut output = [0u8; 16];
-        fallback_vector_popcount(&mut output, &input);
-        assert_eq!(output[0], 0);
-        assert_eq!(output[1], 1);
-        assert_eq!(output[2], 2);
-        assert_eq!(output[8], 8);
+        for base in (0..=u8::MAX).step_by(16) {
+            let input = std::array::from_fn(|lane| base.wrapping_add(lane as u8));
+            let mut output = [0u8; 16];
+            fallback_vector_popcount(&mut output, &input);
+            assert_eq!(output, input.map(|value| value.count_ones() as u8));
+        }
     }
 }
