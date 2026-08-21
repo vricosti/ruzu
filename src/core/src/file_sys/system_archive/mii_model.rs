@@ -8,7 +8,7 @@
 
 use std::sync::Arc;
 
-use crate::file_sys::vfs::vfs_types::{VirtualDir, VirtualFile};
+use crate::file_sys::vfs::vfs_types::VirtualDir;
 use crate::file_sys::vfs::vfs_vector::{make_array_file, VectorVfsDirectory};
 
 /// NFTR standard header — 'N','F','T','R' + version 1 + padding.

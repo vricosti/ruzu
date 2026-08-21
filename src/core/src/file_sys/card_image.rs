@@ -9,7 +9,6 @@ use std::sync::Arc;
 use common::common_funcs::make_magic;
 
 use super::content_archive::{NCAContentType, NCA};
-use super::nca_metadata::CNMT;
 use super::partition_filesystem::{PartitionFilesystem, ResultStatus};
 use super::submission_package::NSP;
 use super::vfs::vfs::{VfsDirectory, VfsFile};

@@ -369,7 +369,7 @@ impl BucketTree {
     /// Find an entry in the bucket tree for the given virtual address.
     ///
     /// Corresponds to upstream `BucketTree::Find`.
-    pub fn find(&self, virtual_address: i64) -> Result<Visitor, ResultCode> {
+    pub fn find(&self, virtual_address: i64) -> Result<Visitor<'_>, ResultCode> {
         assert!(self.is_initialized());
 
         if virtual_address < 0 {
@@ -626,7 +626,7 @@ impl<'a> Visitor<'a> {
         }
 
         // Get the entry set index.
-        let mut entry_set_index: i32;
+        let entry_set_index: i32;
 
         if tree.is_exist_offset_l2_on_l1() && virtual_address < tree.get_l1_begin_offset() {
             // Search in the L2 offset area on L1.

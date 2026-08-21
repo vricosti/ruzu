@@ -5,9 +5,8 @@
 
 use super::bucket_tree::BucketTree;
 use super::compression_common::{
-    compression_type_utility, CompressionType, GetDecompressorFunction, COMPRESSION_BLOCK_ALIGNMENT,
+    CompressionType, GetDecompressorFunction,
 };
-use super::pooled_buffer::PooledBuffer;
 use crate::file_sys::errors::*;
 use crate::file_sys::vfs::vfs::VfsFile;
 use crate::file_sys::vfs::vfs_types::{VirtualDir, VirtualFile};

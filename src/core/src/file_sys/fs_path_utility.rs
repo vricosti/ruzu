@@ -7,7 +7,6 @@ use common::ResultCode;
 
 use super::errors::*;
 use super::fs_directory::ENTRY_NAME_LENGTH_MAX;
-use super::fs_memory_management;
 use super::fs_string_util::*;
 
 /// Maximum mount name length.

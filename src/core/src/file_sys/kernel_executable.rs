@@ -370,7 +370,7 @@ impl INI {
             return ini;
         }
 
-        let mut offset = header_size as u64;
+        let offset = header_size as u64;
         for _i in 0..ini.header.kip_count {
             let kip_file: VirtualFile = Arc::new(OffsetVfsFile::new(
                 file.clone(),

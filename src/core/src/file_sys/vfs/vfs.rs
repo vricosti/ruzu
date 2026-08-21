@@ -7,7 +7,6 @@
 //! DeepEquals, VfsRawCopy, VfsRawCopyD, GetOrCreateDirectoryRelative.
 
 use std::collections::BTreeMap;
-use std::sync::Arc;
 
 use common::fs::path_util;
 

@@ -502,7 +502,7 @@ impl Path {
             }
 
             let size = align_up(len as u64, WRITE_BUFFER_ALIGNMENT_LENGTH as u64) as usize;
-            let mut buf = WriteBuffer::make(size);
+            let buf = WriteBuffer::make(size);
             if buf.get().is_null() {
                 return Err(RESULT_ALLOCATION_MEMORY_FAILED_MAKE_UNIQUE);
             }

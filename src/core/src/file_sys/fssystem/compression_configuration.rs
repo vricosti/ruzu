@@ -7,7 +7,7 @@
 //!
 //! Provides the global NCA compression configuration with decompressor functions.
 
-use super::compression_common::{CompressionType, DecompressorFunction, GetDecompressorFunction};
+use super::compression_common::{CompressionType, DecompressorFunction};
 use super::nca_file_system_driver::NcaCompressionConfiguration;
 use crate::file_sys::errors;
 use common::ResultCode;
