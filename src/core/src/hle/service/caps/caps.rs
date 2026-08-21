@@ -6,6 +6,56 @@
 //!
 //! Screenshot/album service registration.
 
+use std::collections::BTreeMap;
+
+use crate::hle::result::ResultCode;
+use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
+use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
+
+/// Decoder control endpoint. Upstream intentionally gives the object the
+/// internal service identity `grc:d` while registering it as `caps:dc`.
+pub struct IDecoderControlService {
+    handlers: BTreeMap<u32, FunctionInfo>,
+    handlers_tipc: BTreeMap<u32, FunctionInfo>,
+}
+
+impl IDecoderControlService {
+    pub fn new() -> Self {
+        Self {
+            handlers: build_handler_map(&[
+                (3001, None, "DecodeJpeg"),
+                (4001, None, "ShrinkJpeg"),
+                (4002, None, "ShrinkJpegEx"),
+            ]),
+            handlers_tipc: BTreeMap::new(),
+        }
+    }
+}
+
+impl SessionRequestHandler for IDecoderControlService {
+    fn handle_sync_request(&self, ctx: &mut HLERequestContext) -> ResultCode {
+        ServiceFramework::handle_sync_request_impl(self, ctx)
+    }
+
+    fn service_name(&self) -> &str {
+        "grc:d"
+    }
+}
+
+impl ServiceFramework for IDecoderControlService {
+    fn get_service_name(&self) -> &str {
+        "grc:d"
+    }
+
+    fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers
+    }
+
+    fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers_tipc
+    }
+}
+
 /// LoopProcess — registers "caps:a", "caps:c", "caps:u", "caps:ss", "caps:sc", "caps:su".
 ///
 /// Corresponds to `Service::Capture::LoopProcess` in upstream caps.cpp.
@@ -85,7 +135,37 @@ pub fn loop_process(system: crate::core::SystemRef) {
             }),
             64,
         );
+
+        let firmware_major =
+            crate::hle::service::set::system_settings_server::get_firmware_version_impl(
+                crate::hle::service::set::settings_types::GetFirmwareVersionType::Version1,
+            )
+            .major;
+        if firmware_major >= 4 {
+            server_manager.register_named_service(
+                "caps:dc",
+                Box::new(|| -> SessionRequestHandlerPtr {
+                    Arc::new(IDecoderControlService::new())
+                }),
+                64,
+            );
+        }
     }
 
     ServerManager::run_server_shared(server_manager);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decoder_control_identity_and_commands_match_upstream() {
+        let service = IDecoderControlService::new();
+        assert_eq!(SessionRequestHandler::service_name(&service), "grc:d");
+        assert_eq!(
+            service.handlers().keys().copied().collect::<Vec<_>>(),
+            [3001, 4001, 4002]
+        );
+    }
 }

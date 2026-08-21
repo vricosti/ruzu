@@ -6,9 +6,60 @@
 //!
 //! Socket service registration and common types.
 
-use super::bsd::{Bsd, BsdCfg};
+use super::bsd::{Bsd, BsdCfg, BsdNu};
 use super::nsd::Nsd;
-use super::sfdnsres::Sfdnsres;
+use super::sfdnsres::{DnsPriv, Sfdnsres};
+use std::collections::BTreeMap;
+
+use crate::hle::result::ResultCode;
+use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
+use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
+
+macro_rules! define_stub_service {
+    ($type:ident, $service:literal, [$(($id:expr, $command:literal)),* $(,)?]) => {
+        pub struct $type { handlers: BTreeMap<u32, FunctionInfo>, handlers_tipc: BTreeMap<u32, FunctionInfo> }
+        impl $type { pub fn new() -> Self { Self { handlers: build_handler_map(&[$(($id, None, $command)),*]), handlers_tipc: BTreeMap::new() } } }
+        impl SessionRequestHandler for $type {
+            fn handle_sync_request(&self, ctx: &mut HLERequestContext) -> ResultCode { ServiceFramework::handle_sync_request_impl(self, ctx) }
+            fn service_name(&self) -> &str { $service }
+        }
+        impl ServiceFramework for $type {
+            fn get_service_name(&self) -> &str { $service }
+            fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> { &self.handlers }
+            fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> { &self.handlers_tipc }
+        }
+    };
+}
+
+define_stub_service!(
+    EthcC,
+    "ethc:c",
+    [
+        (0, "Initialize"),
+        (1, "Cancel"),
+        (2, "GetResult"),
+        (3, "GetMediaList"),
+        (4, "SetMediaType"),
+        (5, "GetMediaType"),
+        (6, "GetMacAddress")
+    ]
+);
+define_stub_service!(
+    EthcI,
+    "ethc:i",
+    [
+        (0, "GetReadableHandle"),
+        (1, "Cancel"),
+        (2, "GetResult"),
+        (3, "GetInterfaceList"),
+        (4, "GetInterfaceCount")
+    ]
+);
+define_stub_service!(
+    ISfDriverServiceCreator,
+    "eth:nd",
+    [(0, "CreateDriverService")]
+);
 
 /// Errno values matching upstream.
 ///
@@ -244,16 +295,34 @@ pub fn loop_process(system: crate::core::SystemRef) {
 
     {
         let mut server_manager = server_manager.lock().unwrap();
-        let bsd_s: SessionRequestHandlerPtr = Arc::new(Mutex::new(Bsd::new(true)));
-        let bsd_u: SessionRequestHandlerPtr = Arc::new(Mutex::new(Bsd::new(false)));
-        let bsdcfg: SessionRequestHandlerPtr = Arc::new(BsdCfg::new());
+        let bsd_s: SessionRequestHandlerPtr = Arc::new(Mutex::new(Bsd::new("bsd:s", false)));
+        let bsd_u: SessionRequestHandlerPtr = Arc::new(Mutex::new(Bsd::new("bsd:u", true)));
+        let bsd_a: SessionRequestHandlerPtr = Arc::new(Mutex::new(Bsd::new("bsd:a", true)));
+        let bsd_nu: SessionRequestHandlerPtr = Arc::new(BsdNu::new());
+        let bsdcfg: SessionRequestHandlerPtr = Arc::new(BsdCfg::new("bsdcfg"));
+        let ifcfg: SessionRequestHandlerPtr = Arc::new(BsdCfg::new("ifcfg"));
         let nsd_a: SessionRequestHandlerPtr = Arc::new(Nsd::new("nsd:a"));
         let nsd_u: SessionRequestHandlerPtr = Arc::new(Nsd::new("nsd:u"));
         let sfdnsres: SessionRequestHandlerPtr = Arc::new(Sfdnsres::new());
 
+        server_manager.register_named_service("ethc:c", Box::new(|| Arc::new(EthcC::new())), 64);
+        server_manager.register_named_service("ethc:i", Box::new(|| Arc::new(EthcI::new())), 64);
         server_manager.register_named_service_handler("bsd:s", bsd_s, 64);
         server_manager.register_named_service_handler("bsd:u", bsd_u, 64);
+        server_manager.register_named_service_handler("bsd:a", bsd_a, 64);
+        server_manager.register_named_service_handler("bsd:nu", bsd_nu, 64);
         server_manager.register_named_service_handler("bsdcfg", bsdcfg, 64);
+        server_manager.register_named_service_handler("ifcfg", ifcfg, 64);
+        server_manager.register_named_service(
+            "dns:priv",
+            Box::new(|| Arc::new(DnsPriv::new())),
+            64,
+        );
+        server_manager.register_named_service(
+            "eth:nd",
+            Box::new(|| Arc::new(ISfDriverServiceCreator::new())),
+            64,
+        );
         server_manager.register_named_service_handler("nsd:a", nsd_a, 64);
         server_manager.register_named_service_handler("nsd:u", nsd_u, 64);
         server_manager.register_named_service_handler("sfdnsres", sfdnsres, 64);

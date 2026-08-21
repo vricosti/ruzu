@@ -477,6 +477,22 @@ impl NCM {
 
 impl_service_framework!(NCM, "ncm");
 
+pub struct NcmV {
+    handlers: BTreeMap<u32, FunctionInfo>,
+    handlers_tipc: BTreeMap<u32, FunctionInfo>,
+}
+
+impl NcmV {
+    pub fn new() -> Self {
+        Self {
+            handlers: build_handler_map(&[(0, None, "GetSystemVersion")]),
+            handlers_tipc: BTreeMap::new(),
+        }
+    }
+}
+
+impl_service_framework!(NcmV, "ncm:v");
+
 /// Registers "lr" and "ncm" services.
 ///
 /// Corresponds to `LoopProcess` in upstream `ncm.cpp`.
@@ -497,6 +513,12 @@ pub fn loop_process(system: crate::core::SystemRef) {
             Box::new(|| -> SessionRequestHandlerPtr { std::sync::Arc::new(NCM::new()) }),
             64,
         );
+        // Upstream deliberately uses `if (1 /* not retail */)` here.
+        server_manager.register_named_service(
+            "ncm:v",
+            Box::new(|| -> SessionRequestHandlerPtr { std::sync::Arc::new(NcmV::new()) }),
+            64,
+        );
     }
 
     ServerManager::run_server_shared(server_manager);
@@ -513,6 +535,7 @@ mod tests {
         assert_eq!(IAddOnContentLocationResolver::new().handlers.len(), 5);
         assert_eq!(LR::new().handlers.len(), 4);
         assert_eq!(NCM::new().handlers.len(), 16);
+        assert_eq!(NcmV::new().handlers.len(), 1);
     }
 
     #[test]

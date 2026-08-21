@@ -510,6 +510,11 @@ pub fn loop_process(system: crate::core::SystemRef) {
             Box::new(|| -> SessionRequestHandlerPtr { std::sync::Arc::new(LM::new()) }),
             64,
         );
+        server_manager.register_named_service(
+            "lm:get",
+            Box::new(|| -> SessionRequestHandlerPtr { std::sync::Arc::new(LmGet::new()) }),
+            64,
+        );
     }
     ServerManager::run_server_shared(server_manager);
 }
@@ -585,9 +590,62 @@ impl crate::hle::service::service::ServiceFramework for LM {
     }
 }
 
+/// Development log retrieval service added by upstream.
+pub struct LmGet {
+    handlers: std::collections::BTreeMap<u32, crate::hle::service::service::FunctionInfo>,
+    handlers_tipc: std::collections::BTreeMap<u32, crate::hle::service::service::FunctionInfo>,
+}
+
+impl LmGet {
+    pub fn new() -> Self {
+        Self {
+            handlers: crate::hle::service::service::build_handler_map(&[
+                (0, None, "StartLogging"),
+                (1, None, "StopLogging"),
+                (2, None, "GetLog"),
+                (100, None, "CreateDevNotificationReceiver"),
+            ]),
+            handlers_tipc: std::collections::BTreeMap::new(),
+        }
+    }
+}
+
+impl crate::hle::service::hle_ipc::SessionRequestHandler for LmGet {
+    fn handle_sync_request(
+        &self,
+        ctx: &mut crate::hle::service::hle_ipc::HLERequestContext,
+    ) -> crate::hle::result::ResultCode {
+        crate::hle::service::service::ServiceFramework::handle_sync_request_impl(self, ctx)
+    }
+    fn service_name(&self) -> &str {
+        "lm:get"
+    }
+}
+
+impl crate::hle::service::service::ServiceFramework for LmGet {
+    fn get_service_name(&self) -> &str {
+        "lm:get"
+    }
+    fn handlers(
+        &self,
+    ) -> &std::collections::BTreeMap<u32, crate::hle::service::service::FunctionInfo> {
+        &self.handlers
+    }
+    fn handlers_tipc(
+        &self,
+    ) -> &std::collections::BTreeMap<u32, crate::hle::service::service::FunctionInfo> {
+        &self.handlers_tipc
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lm_get_table_matches_upstream() {
+        assert_eq!(LmGet::new().handlers.len(), 4);
+    }
 
     #[test]
     fn test_read_leb128() {

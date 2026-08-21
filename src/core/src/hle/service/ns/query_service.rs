@@ -48,6 +48,12 @@ pub const IQUERY_SERVICE_COMMANDS: &[(u32, bool, &str)] = &[
         false,
         "QueryApplicationPlayStatisticsByUserAccountIdForSystem",
     ),
+    (30, false, "Cmd30"),
+    (31, false, "Cmd31"),
+    (100, false, "Cmd100"),
+    (110, false, "Cmd110"),
+    (118, false, "Cmd118"),
+    (119, false, "Cmd119"),
 ];
 
 /// `pdm:qry` query service.

@@ -10,42 +10,75 @@ use std::collections::HashMap;
 
 /// PerformanceConfiguration enum. Upstream: `PerformanceConfiguration` in `apm_controller.h`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[repr(u32)]
-pub enum PerformanceConfiguration {
-    Config1 = 0x00010000,
-    Config2 = 0x00010001,
-    Config3 = 0x00010002,
-    Config4 = 0x00020000,
-    Config5 = 0x00020001,
-    Config6 = 0x00020002,
-    Config7 = 0x00020003,
-    Config8 = 0x00020004,
-    Config9 = 0x00020005,
-    Config10 = 0x00020006,
-    Config11 = 0x92220007,
-    Config12 = 0x92220008,
-    Config13 = 0x92220009,
-    Config14 = 0x9222000A,
-    Config15 = 0x9222000B,
-    Config16 = 0x9222000C,
+#[repr(transparent)]
+pub struct PerformanceConfiguration(u32);
+
+#[allow(non_upper_case_globals)]
+impl PerformanceConfiguration {
+    pub const Config1: Self = Self(0x00010000);
+    pub const Config2: Self = Self(0x00010001);
+    pub const Config3: Self = Self(0x00010002);
+    pub const Config4: Self = Self(0x00020000);
+    pub const Config5: Self = Self(0x00020001);
+    pub const Config6: Self = Self(0x00020002);
+    pub const Config7: Self = Self(0x00020003);
+    pub const Config8: Self = Self(0x00020004);
+    pub const Config9: Self = Self(0x00020005);
+    pub const Config10: Self = Self(0x00020006);
+    pub const Config11: Self = Self(0x92220007);
+    pub const Config12: Self = Self(0x92220008);
+    pub const Config13: Self = Self(0x92220009);
+    pub const Config14: Self = Self(0x9222000A);
+    pub const Config15: Self = Self(0x9222000B);
+    pub const Config16: Self = Self(0x9222000C);
+
+    pub const fn from_raw(raw: u32) -> Self {
+        Self(raw)
+    }
+
+    pub const fn raw(self) -> u32 {
+        self.0
+    }
 }
 
 /// CpuBoostMode enum. Upstream: `CpuBoostMode` in `apm_controller.h`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u32)]
-pub enum CpuBoostMode {
-    Normal = 0,
-    FastLoad = 1,
-    Partial = 2,
+#[repr(transparent)]
+pub struct CpuBoostMode(u32);
+
+#[allow(non_upper_case_globals)]
+impl CpuBoostMode {
+    pub const Normal: Self = Self(0);
+    pub const FastLoad: Self = Self(1);
+    pub const Partial: Self = Self(2);
+
+    pub const fn from_raw(raw: u32) -> Self {
+        Self(raw)
+    }
+
+    pub const fn raw(self) -> u32 {
+        self.0
+    }
 }
 
 /// PerformanceMode enum. Upstream: `PerformanceMode` in `apm_controller.h`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[repr(i32)]
-pub enum PerformanceMode {
-    Invalid = -1,
-    Normal = 0,
-    Boost = 1,
+#[repr(transparent)]
+pub struct PerformanceMode(i32);
+
+#[allow(non_upper_case_globals)]
+impl PerformanceMode {
+    pub const Invalid: Self = Self(-1);
+    pub const Normal: Self = Self(0);
+    pub const Boost: Self = Self(1);
+
+    pub const fn from_raw(raw: i32) -> Self {
+        Self(raw)
+    }
+
+    pub const fn raw(self) -> i32 {
+        self.0
+    }
 }
 
 /// Default performance configuration.
@@ -83,20 +116,14 @@ const BOOST_MODE_TO_CONFIG_MAP: [PerformanceConfiguration; 3] = [
 ///
 /// Corresponds to `Controller` class in upstream `apm_controller.h`.
 pub struct Controller {
-    configs: HashMap<i32, PerformanceConfiguration>,
+    configs: HashMap<PerformanceMode, PerformanceConfiguration>,
 }
 
 impl Controller {
     pub fn new() -> Self {
         let mut configs = HashMap::new();
-        configs.insert(
-            PerformanceMode::Normal as i32,
-            DEFAULT_PERFORMANCE_CONFIGURATION,
-        );
-        configs.insert(
-            PerformanceMode::Boost as i32,
-            DEFAULT_PERFORMANCE_CONFIGURATION,
-        );
+        configs.insert(PerformanceMode::Normal, DEFAULT_PERFORMANCE_CONFIGURATION);
+        configs.insert(PerformanceMode::Boost, DEFAULT_PERFORMANCE_CONFIGURATION);
         Self { configs }
     }
 
@@ -112,7 +139,7 @@ impl Controller {
 
         if let Some(mhz) = speed {
             self.set_clock_speed(mhz);
-            self.configs.insert(mode as i32, config);
+            self.configs.insert(mode, config);
         } else {
             log::error!(
                 "Invalid performance configuration value provided: {:?}",
@@ -122,8 +149,11 @@ impl Controller {
     }
 
     pub fn set_from_cpu_boost_mode(&mut self, mode: CpuBoostMode) {
-        let config = BOOST_MODE_TO_CONFIG_MAP[mode as usize];
-        self.set_performance_configuration(PerformanceMode::Boost, config);
+        if let Some(&config) = BOOST_MODE_TO_CONFIG_MAP.get(mode.raw() as usize) {
+            self.set_performance_configuration(PerformanceMode::Boost, config);
+        } else {
+            log::error!("{:?} invalid mode", mode);
+        }
     }
 
     pub fn get_current_performance_mode(&self) -> PerformanceMode {
@@ -138,11 +168,10 @@ impl Controller {
         &mut self,
         mode: PerformanceMode,
     ) -> PerformanceConfiguration {
-        let key = mode as i32;
-        if !self.configs.contains_key(&key) {
-            self.configs.insert(key, DEFAULT_PERFORMANCE_CONFIGURATION);
+        if !self.configs.contains_key(&mode) {
+            self.configs.insert(mode, DEFAULT_PERFORMANCE_CONFIGURATION);
         }
-        *self.configs.get(&key).unwrap()
+        *self.configs.get(&mode).unwrap()
     }
 
     fn set_clock_speed(&self, mhz: u32) {

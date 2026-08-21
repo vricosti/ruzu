@@ -86,6 +86,56 @@ impl ServiceFramework for EctxAW {
     }
 }
 
+macro_rules! define_stub_service {
+    ($type:ident, $name:literal, [$(($id:expr, $command:literal)),* $(,)?]) => {
+        pub struct $type {
+            handlers: BTreeMap<u32, FunctionInfo>,
+            handlers_tipc: BTreeMap<u32, FunctionInfo>,
+        }
+
+        impl $type {
+            pub fn new() -> Self {
+                Self {
+                    handlers: build_handler_map(&[$(($id, None, $command)),*]),
+                    handlers_tipc: BTreeMap::new(),
+                }
+            }
+        }
+
+        impl SessionRequestHandler for $type {
+            fn handle_sync_request(&self, ctx: &mut HLERequestContext) -> ResultCode {
+                ServiceFramework::handle_sync_request_impl(self, ctx)
+            }
+            fn service_name(&self) -> &str { $name }
+        }
+
+        impl ServiceFramework for $type {
+            fn get_service_name(&self) -> &str { $name }
+            fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> { &self.handlers }
+            fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> { &self.handlers_tipc }
+        }
+    };
+}
+
+define_stub_service!(
+    EctxW,
+    "ectx:w",
+    [
+        (0, "CreateContextRegistrar"),
+        (1, "CommitContext"),
+        (2, "RemoveContext")
+    ]
+);
+define_stub_service!(
+    EctxR,
+    "ectx:r",
+    [
+        (0, "GetContextInfo"),
+        (1, "PullContext"),
+        (2, "ListContextDescriptorWithResultForDebug")
+    ]
+);
+
 /// IContextRegistrar: nn::err::context::IContextRegistrar.
 ///
 /// Defined in upstream `ectx.cpp`.
@@ -170,6 +220,12 @@ mod tests {
         assert!(service.handlers[&ectx_aw_commands::COMMIT_CONTEXT]
             .handler_callback
             .is_none());
+    }
+
+    #[test]
+    fn writer_and_reader_tables_match_upstream() {
+        assert_eq!(EctxW::new().handlers.len(), 3);
+        assert_eq!(EctxR::new().handlers.len(), 3);
     }
 
     #[test]

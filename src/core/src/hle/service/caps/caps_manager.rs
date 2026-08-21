@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use super::caps_types::*;
-use crate::hle::result::ResultCode;
+use crate::hle::result::{ResultCode, RESULT_UNKNOWN};
 
 /// Nand album file limit.
 const NAND_ALBUM_FILE_LIMIT: usize = 1000;
@@ -334,6 +334,9 @@ impl AlbumManager {
         aruid: u64,
     ) -> ResultCode {
         log::debug!("AlbumManager::save_screen_shot_with_app_data called");
+        if image_data.is_empty() {
+            return RESULT_UNKNOWN;
+        }
         // Upstream delegates to the simpler overload
         self.save_screen_shot(out_entry, attribute, report_option, image_data, aruid)
     }
@@ -346,9 +349,12 @@ impl AlbumManager {
         out_entry: &mut ApplicationAlbumEntry,
         _attribute: &ScreenShotAttribute,
         _file_id: &AlbumFileId,
-        _image_data: &[u8],
+        image_data: &[u8],
     ) -> ResultCode {
         log::debug!("AlbumManager::save_edited_screen_shot called");
+        if image_data.is_empty() {
+            return RESULT_UNKNOWN;
+        }
         // Upstream obtains current time from the user system clock via time:u service.
         // Since we don't have the time service wired here, use SystemTime as a fallback.
         let now = Self::current_album_date_time();

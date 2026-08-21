@@ -184,6 +184,75 @@ impl ServiceFramework for BpcR {
     }
 }
 
+macro_rules! define_stub_service {
+    ($type:ident, $service_name:literal, [$(($id:expr, $name:literal)),* $(,)?]) => {
+        pub struct $type {
+            handlers: BTreeMap<u32, FunctionInfo>,
+            handlers_tipc: BTreeMap<u32, FunctionInfo>,
+        }
+
+        impl $type {
+            pub fn new() -> Self {
+                Self {
+                    handlers: build_handler_map(&[$(($id, None, $name)),*]),
+                    handlers_tipc: BTreeMap::new(),
+                }
+            }
+        }
+
+        impl SessionRequestHandler for $type {
+            fn handle_sync_request(&self, ctx: &mut HLERequestContext) -> ResultCode {
+                ServiceFramework::handle_sync_request_impl(self, ctx)
+            }
+
+            fn service_name(&self) -> &str {
+                $service_name
+            }
+        }
+
+        impl ServiceFramework for $type {
+            fn get_service_name(&self) -> &str {
+                $service_name
+            }
+
+            fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> {
+                &self.handlers
+            }
+
+            fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
+                &self.handlers_tipc
+            }
+        }
+    };
+}
+
+define_stub_service!(
+    BpcC,
+    "bpc:c",
+    [
+        (0, "ShutdownSystem"),
+        (1, "RebootSystem"),
+        (2, "GetWakeupReason"),
+        (3, "GetShutdownReason"),
+        (4, "GetAcOk"),
+        (5, "GetPowerEvent"),
+    ]
+);
+define_stub_service!(
+    BpcB,
+    "bpc:b",
+    [(0, "GetSleepButtonState"), (1, "GetPowerButtonEvent")]
+);
+define_stub_service!(
+    BpcW,
+    "bpc:w",
+    [
+        (0, "CreateWakeupTimer"),
+        (1, "CancelWakeupTimer"),
+        (2, "EnableWakeupTimerOnDevice"),
+    ]
+);
+
 /// Registers "bpc" and "bpc:r" services.
 ///
 /// Corresponds to `LoopProcess` in upstream `bpc.cpp`:
@@ -205,6 +274,33 @@ pub fn loop_process(system: crate::core::SystemRef) {
             Box::new(|| -> SessionRequestHandlerPtr { std::sync::Arc::new(BpcR::new()) }),
             64,
         );
+        server_manager.register_named_service(
+            "bpc:c",
+            Box::new(|| -> SessionRequestHandlerPtr { std::sync::Arc::new(BpcC::new()) }),
+            64,
+        );
+        server_manager.register_named_service(
+            "bpc:b",
+            Box::new(|| -> SessionRequestHandlerPtr { std::sync::Arc::new(BpcB::new()) }),
+            64,
+        );
+        server_manager.register_named_service(
+            "bpc:w",
+            Box::new(|| -> SessionRequestHandlerPtr { std::sync::Arc::new(BpcW::new()) }),
+            64,
+        );
     }
     crate::hle::service::server_manager::ServerManager::run_server_shared(server_manager);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn homebrew_service_tables_match_upstream() {
+        assert_eq!(BpcC::new().handlers().len(), 6);
+        assert_eq!(BpcB::new().handlers().len(), 2);
+        assert_eq!(BpcW::new().handlers().len(), 3);
+    }
 }

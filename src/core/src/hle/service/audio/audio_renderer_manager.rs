@@ -245,7 +245,7 @@ impl IAudioRendererManager {
         handle: u32,
     ) -> Option<*mut KProcess> {
         let mut process_guard = owner_process.lock().unwrap();
-        if handle == PseudoHandle::CurrentProcess as u32 || handle == 0 {
+        if handle == PseudoHandle::CurrentProcess as u32 {
             return Some(&mut *process_guard as *mut KProcess);
         }
 

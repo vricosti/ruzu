@@ -183,6 +183,44 @@ impl ServiceFramework for PCIe {
     }
 }
 
+pub struct PcieLog {
+    handlers: BTreeMap<u32, FunctionInfo>,
+    handlers_tipc: BTreeMap<u32, FunctionInfo>,
+}
+
+impl PcieLog {
+    pub fn new() -> Self {
+        Self {
+            handlers: build_handler_map(&[
+                (0, None, "GetLoggedState"),
+                (1, None, "GetLoggedStateEvent"),
+            ]),
+            handlers_tipc: BTreeMap::new(),
+        }
+    }
+}
+
+impl SessionRequestHandler for PcieLog {
+    fn handle_sync_request(&self, ctx: &mut HLERequestContext) -> ResultCode {
+        ServiceFramework::handle_sync_request_impl(self, ctx)
+    }
+    fn service_name(&self) -> &str {
+        "pcie:log"
+    }
+}
+
+impl ServiceFramework for PcieLog {
+    fn get_service_name(&self) -> &str {
+        "pcie:log"
+    }
+    fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers
+    }
+    fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers_tipc
+    }
+}
+
 /// Registers "pcie" service.
 ///
 /// Corresponds to `LoopProcess` in upstream `pcie.cpp`.
@@ -198,6 +236,18 @@ pub fn loop_process(system: crate::core::SystemRef) {
             Box::new(|| -> SessionRequestHandlerPtr { std::sync::Arc::new(PCIe::new()) }),
             16,
         );
+        let firmware_major =
+            crate::hle::service::set::system_settings_server::get_firmware_version_impl(
+                crate::hle::service::set::settings_types::GetFirmwareVersionType::Version1,
+            )
+            .major;
+        if firmware_major >= 6 {
+            server_manager.register_named_service(
+                "pcie:log",
+                Box::new(|| -> SessionRequestHandlerPtr { std::sync::Arc::new(PcieLog::new()) }),
+                16,
+            );
+        }
     }
 
     ServerManager::run_server_shared(server_manager);
@@ -211,5 +261,6 @@ mod tests {
     fn pcie_service_tables_match_upstream_command_counts() {
         assert_eq!(PCIe::new().handlers.len(), 2);
         assert_eq!(ISession::new().handlers.len(), 24);
+        assert_eq!(PcieLog::new().handlers.len(), 2);
     }
 }

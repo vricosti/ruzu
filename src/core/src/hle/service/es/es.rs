@@ -659,6 +659,144 @@ impl ServiceFramework for ETicket {
     }
 }
 
+/// `ndrm:lu`, matching upstream `NDRM_LU` in `es.cpp`.
+pub struct NdrmLu {
+    handlers: BTreeMap<u32, FunctionInfo>,
+    handlers_tipc: BTreeMap<u32, FunctionInfo>,
+}
+
+impl NdrmLu {
+    pub fn new() -> Self {
+        Self {
+            handlers: build_handler_map(&[
+                (1, None, "Cmd1"),
+                (2, None, "Cmd2"),
+                (3, None, "Cmd3"),
+                (1000, None, "Cmd1000"),
+                (8000, None, "Cmd8000"),
+            ]),
+            handlers_tipc: BTreeMap::new(),
+        }
+    }
+}
+
+impl SessionRequestHandler for NdrmLu {
+    fn handle_sync_request(&self, ctx: &mut HLERequestContext) -> ResultCode {
+        ServiceFramework::handle_sync_request_impl(self, ctx)
+    }
+    fn service_name(&self) -> &str {
+        "ndrm:lu"
+    }
+}
+
+impl ServiceFramework for NdrmLu {
+    fn get_service_name(&self) -> &str {
+        "ndrm:lu"
+    }
+    fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers
+    }
+    fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers_tipc
+    }
+}
+
+/// `ndrm:la`, matching upstream `NDRM_LA` in `es.cpp`.
+pub struct NdrmLa {
+    handlers: BTreeMap<u32, FunctionInfo>,
+    handlers_tipc: BTreeMap<u32, FunctionInfo>,
+}
+
+impl NdrmLa {
+    pub fn new() -> Self {
+        macro_rules! command {
+            ($id:literal) => {
+                ($id, None, concat!("Cmd", stringify!($id)))
+            };
+        }
+        Self {
+            handlers: build_handler_map(&[
+                command!(1),
+                command!(2),
+                command!(3),
+                command!(4),
+                command!(5),
+                command!(6),
+                command!(7),
+                command!(8),
+                command!(9),
+                command!(10),
+                command!(11),
+                command!(12),
+                command!(13),
+                command!(14),
+                command!(15),
+                command!(16),
+                command!(17),
+                command!(18),
+                command!(19),
+                command!(20),
+                command!(21),
+                command!(22),
+                command!(23),
+                command!(24),
+                command!(25),
+                command!(26),
+                command!(27),
+                command!(28),
+                command!(29),
+                command!(30),
+                command!(31),
+                command!(32),
+                command!(33),
+                command!(34),
+                command!(35),
+                command!(36),
+                command!(37),
+                command!(38),
+                command!(39),
+                command!(40),
+                command!(42),
+                command!(43),
+                command!(44),
+                command!(45),
+                command!(46),
+                command!(47),
+                command!(48),
+                command!(49),
+                command!(50),
+                command!(51),
+                command!(8000),
+                command!(8001),
+                command!(8002),
+                command!(8003),
+            ]),
+            handlers_tipc: BTreeMap::new(),
+        }
+    }
+}
+
+impl SessionRequestHandler for NdrmLa {
+    fn handle_sync_request(&self, ctx: &mut HLERequestContext) -> ResultCode {
+        ServiceFramework::handle_sync_request_impl(self, ctx)
+    }
+    fn service_name(&self) -> &str {
+        "ndrm:la"
+    }
+}
+
+impl ServiceFramework for NdrmLa {
+    fn get_service_name(&self) -> &str {
+        "ndrm:la"
+    }
+    fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers
+    }
+    fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers_tipc
+    }
+}
+
 /// Registers "es" service.
 ///
 /// Corresponds to `LoopProcess` in upstream `es.cpp`.
@@ -676,7 +814,34 @@ pub fn loop_process(system: crate::core::SystemRef) {
             Box::new(|| -> SessionRequestHandlerPtr { Arc::new(ETicket::new()) }),
             64,
         );
+        let firmware = crate::hle::service::set::system_settings_server::get_firmware_version_impl(
+            crate::hle::service::set::settings_types::GetFirmwareVersionType::Version1,
+        );
+        if firmware.major >= 13 {
+            server_manager.register_named_service(
+                "ndrm:lu",
+                Box::new(|| -> SessionRequestHandlerPtr { Arc::new(NdrmLu::new()) }),
+                64,
+            );
+            server_manager.register_named_service(
+                "ndrm:la",
+                Box::new(|| -> SessionRequestHandlerPtr { Arc::new(NdrmLa::new()) }),
+                64,
+            );
+        }
     }
 
     ServerManager::run_server_shared(server_manager);
+}
+
+#[cfg(test)]
+mod a41_tests {
+    use super::*;
+
+    #[test]
+    fn ndrm_service_tables_match_upstream() {
+        assert_eq!(NdrmLu::new().handlers().len(), 5);
+        assert_eq!(NdrmLa::new().handlers().len(), 54);
+        assert!(!NdrmLa::new().handlers().contains_key(&41));
+    }
 }

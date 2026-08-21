@@ -119,7 +119,7 @@ impl NPadResource {
         }
     }
 
-    fn get_index_from_aruid(&self, aruid: u64) -> Option<usize> {
+    pub fn get_index_from_aruid(&self, aruid: u64) -> Option<usize> {
         for i in 0..self.state.len() {
             if self.state[i].aruid == aruid {
                 return Some(i);
@@ -581,14 +581,14 @@ impl NPadResource {
 
     /// Port of NPadResource::UnregisterAppletResourceUserId.
     pub fn unregister_applet_resource_user_id(&mut self, aruid: u64) {
-        let aruid_index = self.get_index_from_aruid(aruid);
+        let Some(aruid_index) = self.get_index_from_aruid(aruid) else {
+            return;
+        };
 
         self.free_applet_resource_id(aruid);
 
-        if let Some(idx) = aruid_index {
-            self.state[idx] = NpadState::default();
-            self.registration_list.flag[idx] = RegistrationStatus::PendingDelete;
-        }
+        self.state[aruid_index] = NpadState::default();
+        self.registration_list.flag[aruid_index] = RegistrationStatus::PendingDelete;
 
         for i in 0..ARUID_INDEX_MAX {
             if self.registration_list.flag[i] == RegistrationStatus::Initialized {
@@ -693,6 +693,24 @@ mod tests {
         assert_eq!(
             resource.signal_style_set_update_event(ARUID, NpadIdType::Player1),
             hid_result::RESULT_NPAD_NOT_CONNECTED
+        );
+    }
+
+    #[test]
+    fn unregister_unknown_aruid_does_not_clear_first_registered_resource() {
+        let mut resource = NPadResource::new();
+        assert!(resource
+            .register_applet_resource_user_id(ARUID)
+            .is_success());
+        assert!(resource
+            .set_supported_npad_style_set(ARUID, NpadStyleSet::FULLKEY)
+            .is_success());
+
+        resource.unregister_applet_resource_user_id(0x5678);
+
+        assert_eq!(
+            resource.get_supported_npad_style_set(ARUID).unwrap(),
+            NpadStyleSet::FULLKEY
         );
     }
 

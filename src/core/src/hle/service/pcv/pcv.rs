@@ -268,6 +268,45 @@ impl ServiceFramework for PCV {
     }
 }
 
+macro_rules! define_single_command_service {
+    ($type:ident, $service:literal, $command:literal) => {
+        pub struct $type {
+            handlers: BTreeMap<u32, FunctionInfo>,
+            handlers_tipc: BTreeMap<u32, FunctionInfo>,
+        }
+        impl $type {
+            pub fn new() -> Self {
+                Self {
+                    handlers: build_handler_map(&[(0, None, $command)]),
+                    handlers_tipc: BTreeMap::new(),
+                }
+            }
+        }
+        impl SessionRequestHandler for $type {
+            fn handle_sync_request(&self, ctx: &mut HLERequestContext) -> ResultCode {
+                ServiceFramework::handle_sync_request_impl(self, ctx)
+            }
+            fn service_name(&self) -> &str {
+                $service
+            }
+        }
+        impl ServiceFramework for $type {
+            fn get_service_name(&self) -> &str {
+                $service
+            }
+            fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> {
+                &self.handlers
+            }
+            fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
+                &self.handlers_tipc
+            }
+        }
+    };
+}
+
+define_single_command_service!(PcvArb, "pcv:arb", "ReleaseControl");
+define_single_command_service!(PcvImm, "pcv:imm", "SetClockRate");
+
 /// IClkrstSession.
 pub struct IClkrstSession {
     device_code: u32,
@@ -565,6 +604,16 @@ pub fn loop_process(system: crate::core::SystemRef) {
             Box::new(|| -> SessionRequestHandlerPtr { std::sync::Arc::new(ClkrstA::new()) }),
             16,
         );
+        server_manager.register_named_service(
+            "pcv:arb",
+            Box::new(|| -> SessionRequestHandlerPtr { std::sync::Arc::new(PcvArb::new()) }),
+            16,
+        );
+        server_manager.register_named_service(
+            "pcv:imm",
+            Box::new(|| -> SessionRequestHandlerPtr { std::sync::Arc::new(PcvImm::new()) }),
+            16,
+        );
     }
 
     ServerManager::run_server_shared(server_manager);
@@ -587,5 +636,11 @@ mod tests {
         let session = IClkrstSession::new(DeviceCode::Gpu as u32);
         session.set_clock_rate(768_000_000);
         assert_eq!(session.get_clock_rate(), 768_000_000);
+    }
+
+    #[test]
+    fn additional_pcv_tables_match_upstream() {
+        assert_eq!(PcvArb::new().handlers.len(), 1);
+        assert_eq!(PcvImm::new().handlers.len(), 1);
     }
 }

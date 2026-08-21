@@ -606,3 +606,170 @@ impl ServiceFramework for INotificationService {
         &self.handlers_tipc
     }
 }
+
+/// `nd:app`, matching upstream `IServiceForApplication` in `friend.cpp`.
+pub struct IServiceForApplication {
+    handlers: BTreeMap<u32, FunctionInfo>,
+    handlers_tipc: BTreeMap<u32, FunctionInfo>,
+}
+
+impl IServiceForApplication {
+    pub fn new() -> Self {
+        Self {
+            handlers: build_handler_map(&[
+                (0, None, "GetReceivableNeighborInfoCountMax"),
+                (10, None, "IsNeighborDetectionEnabled"),
+            ]),
+            handlers_tipc: BTreeMap::new(),
+        }
+    }
+}
+
+impl SessionRequestHandler for IServiceForApplication {
+    fn handle_sync_request(&self, ctx: &mut HLERequestContext) -> ResultCode {
+        ServiceFramework::handle_sync_request_impl(self, ctx)
+    }
+    fn service_name(&self) -> &str {
+        "nd:app"
+    }
+}
+
+impl ServiceFramework for IServiceForApplication {
+    fn get_service_name(&self) -> &str {
+        "nd:app"
+    }
+    fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers
+    }
+    fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers_tipc
+    }
+}
+
+/// `nd:sys`, matching upstream `IServiceForSystem` in `friend.cpp`.
+pub struct IServiceForSystem {
+    handlers: BTreeMap<u32, FunctionInfo>,
+    handlers_tipc: BTreeMap<u32, FunctionInfo>,
+}
+
+impl IServiceForSystem {
+    pub fn new() -> Self {
+        Self {
+            handlers: build_handler_map(&[
+                (0, None, "GetReceivableNeighborInfoCountMax"),
+                (10, None, "IsNeighborDetectionEnabled"),
+                (200, None, "SetSystemData"),
+                (201, None, "ClearSystemData"),
+                (203, None, "GetReceivableNeighborInfoCountForSystem"),
+                (204, None, "ReceiveNeighborInfoForSystem"),
+                (205, None, "SetSender"),
+                (206, None, "GetSender"),
+                (207, None, "CreateScannerForSystem"),
+                (208, None, "CreateReceiveEventHolderForSystem"),
+                (223, None, "EnableNeighborDetection"),
+                (224, None, "DisableNeighborDetection"),
+                (226, None, "EnablePowerSave"),
+                (227, None, "DisablePowerSave"),
+                (228, None, "IsPowerSaveEnabled"),
+                (232, None, "ClearBlockedUsers"),
+                (233, None, "GetBlockedUserCount"),
+                (234, None, "BlockUserByLocalUserId"),
+                (235, None, "BlockUserByNetworkUserId"),
+                (236, None, "UnblockUserByLocalUserId"),
+                (237, None, "UnblockUserByNetworkUserId"),
+                (240, None, "DeleteApplication"),
+                (250, None, "InitializeApplicationInfo"),
+                (260, None, "CreateAccountSystemSaveDataAccessSuppressor"),
+                (300, None, "AddReceivedNeighborInfoForSystemForDebug"),
+                (301, None, "GetSendDataForDebug"),
+                (302, None, "ClearReceiveCounterForDebug"),
+                (303, None, "GetNextReceiveCounterForDebug"),
+                (304, None, "ListBlockedUsersForDebug"),
+                (305, None, "RefreshSendDataIdForDebug"),
+                (306, None, "ReloadFwdbgSettingsForDebug"),
+                (307, None, "EnableApplicationForDebug"),
+                (308, None, "GetNextReceiveCountersForDebug"),
+                (309, None, "ListApplicationInfoForDebug"),
+                (310, None, "SetApplicationDataForDebug"),
+                (400, None, "GetNetworkUserId"),
+                (401, None, "DeleteNetworkUserId"),
+            ]),
+            handlers_tipc: BTreeMap::new(),
+        }
+    }
+}
+
+impl SessionRequestHandler for IServiceForSystem {
+    fn handle_sync_request(&self, ctx: &mut HLERequestContext) -> ResultCode {
+        ServiceFramework::handle_sync_request_impl(self, ctx)
+    }
+    fn service_name(&self) -> &str {
+        "nd:sys"
+    }
+}
+
+impl ServiceFramework for IServiceForSystem {
+    fn get_service_name(&self) -> &str {
+        "nd:sys"
+    }
+    fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers
+    }
+    fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers_tipc
+    }
+}
+
+/// Registers the friend and neighbor-detection services.
+///
+/// Corresponds to `LoopProcess` in upstream `friend.cpp` and deliberately
+/// lives in this file rather than `friend_interface.rs`.
+pub fn loop_process(system: crate::core::SystemRef) {
+    use crate::hle::service::hle_ipc::SessionRequestHandlerPtr;
+    use crate::hle::service::server_manager::ServerManager;
+
+    let module = Arc::new(Module);
+    let server_manager = ServerManager::new_shared(system);
+
+    {
+        let mut server_manager = server_manager.lock().unwrap();
+        server_manager.register_named_service(
+            "nd:app",
+            Box::new(|| -> SessionRequestHandlerPtr { Arc::new(IServiceForApplication::new()) }),
+            64,
+        );
+        server_manager.register_named_service(
+            "nd:sys",
+            Box::new(|| -> SessionRequestHandlerPtr { Arc::new(IServiceForSystem::new()) }),
+            64,
+        );
+
+        for &name in &["friend:a", "friend:m", "friend:s", "friend:u", "friend:v"] {
+            let module = Arc::clone(&module);
+            server_manager.register_named_service(
+                name,
+                Box::new(move || -> SessionRequestHandlerPtr {
+                    Arc::new(super::friend_interface::Friend::new(
+                        system,
+                        Arc::clone(&module),
+                        name,
+                    ))
+                }),
+                64,
+            );
+        }
+    }
+
+    ServerManager::run_server_shared(server_manager);
+}
+
+#[cfg(test)]
+mod a41_tests {
+    use super::*;
+
+    #[test]
+    fn neighbor_detection_tables_match_upstream() {
+        assert_eq!(IServiceForApplication::new().handlers().len(), 2);
+        assert_eq!(IServiceForSystem::new().handlers().len(), 37);
+    }
+}

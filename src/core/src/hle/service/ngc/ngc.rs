@@ -134,6 +134,55 @@ impl ServiceFramework for NgctServiceImpl {
     }
 }
 
+/// `ngct:s` management API. Every command is intentionally stubbed upstream.
+pub struct NgctServiceWithManagementApi {
+    handlers: BTreeMap<u32, FunctionInfo>,
+    handlers_tipc: BTreeMap<u32, FunctionInfo>,
+}
+
+impl NgctServiceWithManagementApi {
+    pub fn new() -> Self {
+        Self {
+            handlers: build_handler_map(&[
+                (0, None, "Match"),
+                (1, None, "Filter"),
+                (100, None, "ConfigureAutoUpdateSetting"),
+                (101, None, "RequestResourceUpdateCheck"),
+                (110, None, "Reload"),
+                (111, None, "IsReloadRequired"),
+                (112, None, "TryAcquireReloadRequestNotifier"),
+                (120, None, "CalculateContentFingerprint"),
+                (130, None, "TryEnableTemporalPassThrough"),
+            ]),
+            handlers_tipc: BTreeMap::new(),
+        }
+    }
+}
+
+impl SessionRequestHandler for NgctServiceWithManagementApi {
+    fn handle_sync_request(&self, ctx: &mut HLERequestContext) -> ResultCode {
+        ServiceFramework::handle_sync_request_impl(self, ctx)
+    }
+
+    fn service_name(&self) -> &str {
+        "ngct:s"
+    }
+}
+
+impl ServiceFramework for NgctServiceWithManagementApi {
+    fn get_service_name(&self) -> &str {
+        "ngct:s"
+    }
+
+    fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers
+    }
+
+    fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers_tipc
+    }
+}
+
 /// NgcServiceImpl ("ngc:u").
 pub struct NgcServiceImpl {
     handlers: BTreeMap<u32, FunctionInfo>,
@@ -294,6 +343,13 @@ pub fn loop_process(system: crate::core::SystemRef) {
             Box::new(|| -> SessionRequestHandlerPtr { std::sync::Arc::new(NgcServiceImpl::new()) }),
             64,
         );
+        server_manager.register_named_service(
+            "ngct:s",
+            Box::new(|| -> SessionRequestHandlerPtr {
+                std::sync::Arc::new(NgctServiceWithManagementApi::new())
+            }),
+            64,
+        );
     }
 
     ServerManager::run_server_shared(server_manager);
@@ -313,5 +369,17 @@ mod tests {
     fn fixed_zero_terminated_string_stops_at_first_nul() {
         assert_eq!(fixed_zero_terminated_string(b"abc\0def"), "abc");
         assert_eq!(fixed_zero_terminated_string(b"abc"), "abc");
+    }
+
+    #[test]
+    fn management_api_table_matches_upstream() {
+        assert_eq!(
+            NgctServiceWithManagementApi::new()
+                .handlers()
+                .keys()
+                .copied()
+                .collect::<Vec<_>>(),
+            [0, 1, 100, 101, 110, 111, 112, 120, 130]
+        );
     }
 }

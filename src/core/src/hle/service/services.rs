@@ -423,6 +423,12 @@ impl Services {
         guest_service!("ssl", move || {
             Self::loop_process_ssl(&sm, system);
         });
+        guest_service!("wlan", move || {
+            crate::hle::service::wlan::wlan::loop_process(system);
+        });
+        guest_service!("tma", move || {
+            crate::hle::service::tma::tma::loop_process(system);
+        });
         let sm = service_manager.clone();
         guest_service!("usb", move || {
             Self::loop_process_usb(&sm, system);
@@ -524,7 +530,7 @@ impl Services {
     }
 
     fn loop_process_friends(_sm: &Arc<Mutex<ServiceManager>>, system: crate::core::SystemRef) {
-        crate::hle::service::friend::friend_interface::loop_process(system);
+        crate::hle::service::friend::friend::loop_process(system);
     }
 
     fn loop_process_settings(_sm: &Arc<Mutex<ServiceManager>>, system: crate::core::SystemRef) {
@@ -569,7 +575,7 @@ impl Services {
     }
 
     fn loop_process_mnpp(_sm: &Arc<Mutex<ServiceManager>>, system: crate::core::SystemRef) {
-        crate::hle::service::mnpp::mnpp_app::loop_process(system);
+        crate::hle::service::mnpp::mnpp::loop_process(system);
     }
 
     fn loop_process_nvnflinger(_sm: &Arc<Mutex<ServiceManager>>, system: crate::core::SystemRef) {

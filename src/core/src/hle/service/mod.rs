@@ -72,5 +72,7 @@ pub mod set;
 pub mod sockets;
 pub mod spl;
 pub mod ssl;
+pub mod tma;
 pub mod usb;
 pub mod vi;
+pub mod wlan;

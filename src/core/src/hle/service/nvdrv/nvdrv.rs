@@ -5,7 +5,7 @@
 //! Port of zuyu/src/core/hle/service/nvdrv/nvdrv.h
 //! Port of zuyu/src/core/hle/service/nvdrv/nvdrv.cpp
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 
 use super::core::container::{Container, SessionId};
@@ -25,6 +25,9 @@ use crate::hle::kernel::k_process::KProcess;
 use crate::hle::kernel::k_process::ProcessLock;
 use crate::hle::kernel::k_readable_event::KReadableEvent;
 use crate::hle::kernel::k_scheduler::KScheduler;
+use crate::hle::result::ResultCode;
+use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
+use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
 
 fn should_trace_ioctl_summary() -> bool {
     std::env::var_os("RUZU_NVDRV_TRACE").is_some()
@@ -421,4 +424,102 @@ impl Module {
     pub fn get_nvmap_device(&self, fd: DeviceFD) -> Option<Arc<NvMapDevice>> {
         self.nvmap_files.lock().unwrap().get(&fd).cloned()
     }
+}
+
+macro_rules! define_stub_service {
+    ($type:ident, $service:literal, [$(($id:expr, $command:literal)),* $(,)?]) => {
+        pub struct $type { handlers: BTreeMap<u32, FunctionInfo>, handlers_tipc: BTreeMap<u32, FunctionInfo> }
+        impl $type { pub fn new() -> Self { Self { handlers: build_handler_map(&[$(($id, None, $command)),*]), handlers_tipc: BTreeMap::new() } } }
+        impl SessionRequestHandler for $type {
+            fn handle_sync_request(&self, ctx: &mut HLERequestContext) -> ResultCode { ServiceFramework::handle_sync_request_impl(self, ctx) }
+            fn service_name(&self) -> &str { $service }
+        }
+        impl ServiceFramework for $type {
+            fn get_service_name(&self) -> &str { $service }
+            fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> { &self.handlers }
+            fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> { &self.handlers_tipc }
+        }
+    };
+}
+
+define_stub_service!(
+    NvgemC,
+    "nvgem:c",
+    [
+        (0, "Initialize"),
+        (1, "GetEventHandle"),
+        (2, "ControlNotification"),
+        (3, "SetNotificationPerm"),
+        (4, "SetCoreDumpPerm"),
+        (5, "GetAruid"),
+        (6, "Reset"),
+        (7, "GetAruid2")
+    ]
+);
+define_stub_service!(
+    NvgemCd,
+    "nvgem:cd",
+    [
+        (0, "Initialize"),
+        (1, "GetAruid"),
+        (2, "ReadNextBlock"),
+        (3, "GetNextBlockSize"),
+        (4, "ReadNextBlock2")
+    ]
+);
+define_stub_service!(
+    NvdbgD,
+    "nvdbg:d",
+    [
+        (0, "Open"),
+        (1, "Ioctl"),
+        (2, "Close"),
+        (4, "QueryEvent"),
+        (9, "DumpStatus"),
+        (10, "InitializeDevtools"),
+        (11, "Ioctl2"),
+        (12, "Ioctl3"),
+        (13, "SetConfiguration")
+    ]
+);
+
+/// Launches Nvidia services. Ownership matches Eden `nvdrv.cpp::LoopProcess`.
+pub fn loop_process(system: crate::core::SystemRef) {
+    use super::nvdrv_interface::NvdrvService;
+    use super::nvmemp::Nvmemp;
+
+    let server_manager = crate::hle::service::server_manager::ServerManager::new_shared(system);
+    let module = Module::new(system);
+    {
+        let mut server_manager = server_manager.lock().unwrap();
+        for name in ["nvdrv", "nvdrv:a", "nvdrv:s", "nvdrv:t"] {
+            let service_name = name.to_owned();
+            let module = Arc::clone(&module);
+            server_manager.register_named_service(
+                name,
+                Box::new(move || Arc::new(NvdrvService::new(Arc::clone(&module), &service_name))),
+                64,
+            );
+        }
+        server_manager.register_named_service("nvgem:c", Box::new(|| Arc::new(NvgemC::new())), 64);
+        server_manager.register_named_service(
+            "nvgem:cd",
+            Box::new(|| Arc::new(NvgemCd::new())),
+            64,
+        );
+        let firmware_major =
+            crate::hle::service::set::system_settings_server::get_firmware_version_impl(
+                crate::hle::service::set::settings_types::GetFirmwareVersionType::Version1,
+            )
+            .major;
+        if firmware_major >= 10 {
+            server_manager.register_named_service(
+                "nvdbg:d",
+                Box::new(|| Arc::new(NvdbgD::new())),
+                64,
+            );
+        }
+        server_manager.register_named_service("nvmemp", Box::new(|| Arc::new(Nvmemp::new())), 64);
+    }
+    crate::hle::service::server_manager::ServerManager::run_server_shared(server_manager);
 }

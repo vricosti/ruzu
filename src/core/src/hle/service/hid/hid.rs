@@ -15,9 +15,135 @@ use hid_core::resources::shared_memory_holder::KSharedMemoryBacking;
 
 use crate::core_timing;
 use crate::hle::kernel::k_shared_memory::{KSharedMemory, MemoryPermission};
-use crate::hle::service::hle_ipc::{SessionRequestHandlerFactory, SessionRequestHandlerPtr};
+use crate::hle::result::ResultCode;
+use crate::hle::service::hle_ipc::{
+    HLERequestContext, SessionRequestHandler, SessionRequestHandlerFactory,
+    SessionRequestHandlerPtr,
+};
 use crate::hle::service::os::event::Event;
 use crate::hle::service::server_manager::ServerManager;
+use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
+
+/// `hid:tmp`, matching upstream `IHidTemporaryServer` in `hid.cpp`.
+struct IHidTemporaryServer {
+    handlers: BTreeMap<u32, FunctionInfo>,
+    handlers_tipc: BTreeMap<u32, FunctionInfo>,
+}
+
+impl IHidTemporaryServer {
+    fn new() -> Self {
+        Self {
+            handlers: build_handler_map(&[(0, None, "GetConsoleSixAxisSensorCalibrationValues")]),
+            handlers_tipc: BTreeMap::new(),
+        }
+    }
+}
+
+impl SessionRequestHandler for IHidTemporaryServer {
+    fn handle_sync_request(&self, ctx: &mut HLERequestContext) -> ResultCode {
+        ServiceFramework::handle_sync_request_impl(self, ctx)
+    }
+    fn service_name(&self) -> &str {
+        "hid:tmp"
+    }
+}
+
+impl ServiceFramework for IHidTemporaryServer {
+    fn get_service_name(&self) -> &str {
+        "hid:tmp"
+    }
+    fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers
+    }
+    fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers_tipc
+    }
+}
+
+/// `ahid:cd`, matching upstream `AHID_CD` in `hid.cpp`.
+struct AhidCd {
+    handlers: BTreeMap<u32, FunctionInfo>,
+    handlers_tipc: BTreeMap<u32, FunctionInfo>,
+}
+
+impl AhidCd {
+    fn new() -> Self {
+        Self {
+            handlers: build_handler_map(&[
+                (0, None, "AcquireDevice"),
+                (1, None, "ReleaseDevice"),
+                (2, None, "GetCtrlSession"),
+                (3, None, "GetReadSession"),
+                (4, None, "GetWriteSession"),
+            ]),
+            handlers_tipc: BTreeMap::new(),
+        }
+    }
+}
+
+impl SessionRequestHandler for AhidCd {
+    fn handle_sync_request(&self, ctx: &mut HLERequestContext) -> ResultCode {
+        ServiceFramework::handle_sync_request_impl(self, ctx)
+    }
+    fn service_name(&self) -> &str {
+        "ahid:cd"
+    }
+}
+
+impl ServiceFramework for AhidCd {
+    fn get_service_name(&self) -> &str {
+        "ahid:cd"
+    }
+    fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers
+    }
+    fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers_tipc
+    }
+}
+
+/// `ahid:hdr`, matching upstream `AHID_HDR` in `hid.cpp`.
+struct AhidHdr {
+    handlers: BTreeMap<u32, FunctionInfo>,
+    handlers_tipc: BTreeMap<u32, FunctionInfo>,
+}
+
+impl AhidHdr {
+    fn new() -> Self {
+        Self {
+            handlers: build_handler_map(&[
+                (0, None, "GetDeviceEntries"),
+                (1, None, "GetDeviceList"),
+                (2, None, "GetDeviceParameters"),
+                (3, None, "AttachDevice"),
+                (4, None, "DetachDevice"),
+                (5, None, "SetDeviceFilter"),
+            ]),
+            handlers_tipc: BTreeMap::new(),
+        }
+    }
+}
+
+impl SessionRequestHandler for AhidHdr {
+    fn handle_sync_request(&self, ctx: &mut HLERequestContext) -> ResultCode {
+        ServiceFramework::handle_sync_request_impl(self, ctx)
+    }
+    fn service_name(&self) -> &str {
+        "ahid:hdr"
+    }
+}
+
+impl ServiceFramework for AhidHdr {
+    fn get_service_name(&self) -> &str {
+        "ahid:hdr"
+    }
+    fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers
+    }
+    fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers_tipc
+    }
+}
 
 /// Implementation of `hid_core::KSharedMemoryBacking` that allocates real
 /// `KSharedMemory` objects from the kernel.
@@ -265,6 +391,12 @@ pub fn loop_process(system: crate::core::SystemRef) {
             server_manager.register_named_service("hid:sys", factory, 64);
         }
 
+        server_manager.register_named_service(
+            "hid:tmp",
+            Box::new(|| -> SessionRequestHandlerPtr { Arc::new(IHidTemporaryServer::new()) }),
+            64,
+        );
+
         // "hidbus" -> Hidbus
         {
             let factory: SessionRequestHandlerFactory =
@@ -293,6 +425,17 @@ pub fn loop_process(system: crate::core::SystemRef) {
             server_manager.register_named_service("irs:sys", factory, 64);
         }
 
+        server_manager.register_named_service(
+            "ahid:cd",
+            Box::new(|| -> SessionRequestHandlerPtr { Arc::new(AhidCd::new()) }),
+            64,
+        );
+        server_manager.register_named_service(
+            "ahid:hdr",
+            Box::new(|| -> SessionRequestHandlerPtr { Arc::new(AhidHdr::new()) }),
+            64,
+        );
+
         // "xcd:sys" -> XCD_SYS
         {
             let factory: SessionRequestHandlerFactory =
@@ -304,4 +447,16 @@ pub fn loop_process(system: crate::core::SystemRef) {
     }
 
     ServerManager::run_server_shared(server_manager);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a41_service_tables_match_upstream() {
+        assert_eq!(IHidTemporaryServer::new().handlers().len(), 1);
+        assert_eq!(AhidCd::new().handlers().len(), 5);
+        assert_eq!(AhidHdr::new().handlers().len(), 6);
+    }
 }

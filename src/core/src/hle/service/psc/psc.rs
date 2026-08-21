@@ -12,8 +12,85 @@
 //!   time:su   -> Time::StaticService
 //!   time:al   -> Time::IAlarmService
 
+use std::collections::BTreeMap;
+
+use crate::hle::result::ResultCode;
+use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
+use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
+
+macro_rules! define_stub_service {
+    ($type:ident, $service:literal, [$(($id:expr, $command:literal)),* $(,)?]) => {
+        pub struct $type { handlers: BTreeMap<u32, FunctionInfo>, handlers_tipc: BTreeMap<u32, FunctionInfo> }
+        impl $type {
+            pub fn new() -> Self { Self { handlers: build_handler_map(&[$(($id, None, $command)),*]), handlers_tipc: BTreeMap::new() } }
+        }
+        impl SessionRequestHandler for $type {
+            fn handle_sync_request(&self, ctx: &mut HLERequestContext) -> ResultCode { ServiceFramework::handle_sync_request_impl(self, ctx) }
+            fn service_name(&self) -> &str { $service }
+        }
+        impl ServiceFramework for $type {
+            fn get_service_name(&self) -> &str { $service }
+            fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> { &self.handlers }
+            fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> { &self.handlers_tipc }
+        }
+    };
+}
+
+define_stub_service!(
+    PscL,
+    "psc:l",
+    [
+        (0, "Initialize_3"),
+        (1, "Lock"),
+        (2, "Unlock"),
+        (3, "IsLocked"),
+        (4, "GetRelatedState")
+    ]
+);
+define_stub_service!(
+    InsR,
+    "ins:r",
+    [(0, "GetInputSourceState"), (1, "GetTriggerTargetEvent")]
+);
+define_stub_service!(InsS, "ins:s", [(0, "GetNotifyEvent")]);
+define_stub_service!(
+    HshlSys,
+    "hshl:sys",
+    [
+        (0, "GetBatteryPercentage"),
+        (1, "GetChargerType"),
+        (2, "OpenChargeSession"),
+        (3, "GetRawBatteryPercentage"),
+        (4, "GetBatteryVoltageLevel"),
+        (5, "OpenThermalSession"),
+        (6, "GetAbnormalTemperatureSet"),
+        (7, "OpenClockSession"),
+        (8, "GetClockRate"),
+        (9, "OpenBridgeSession"),
+        (10, "GetBridgePowerSupply"),
+        (11, "OpenVsysVoltageSession"),
+        (12, "GetIsBatteryEnoughForFullAwake"),
+        (13, "GetIsCharging"),
+        (14, "Cmd14"),
+        (15, "Cmd15")
+    ]
+);
+define_stub_service!(
+    HshlSet,
+    "hshl:set",
+    [
+        (0, "OpenChargeSession_2"),
+        (1, "OpenThermalSession_2"),
+        (2, "SetClockRate"),
+        (3, "SetBridgePowerSupply"),
+        (4, "Cmd4"),
+        (5, "Cmd5")
+    ]
+);
+
 pub const PSC_SERVICE_NAMES: &[&str] = &[
-    "psc:c", "psc:m", "ovln:rcv", "ovln:snd", "time:m", "time:su", "time:al",
+    "psc:c", "psc:m", "psc:l", "ins:r", "ins:s", "hshl:sys", "hshl:set", "ovln:rcv", "ovln:snd",
+    "time:m", "time:su", "time:al",
 ];
 
 /// Register all PSC services.
@@ -48,6 +125,31 @@ pub fn loop_process(
 
         stub(&mut server_manager, "psc:c");
         stub(&mut server_manager, "psc:m");
+        server_manager.register_named_service(
+            "psc:l",
+            Box::new(|| -> Arc<dyn SessionRequestHandler> { Arc::new(PscL::new()) }),
+            64,
+        );
+        server_manager.register_named_service(
+            "ins:r",
+            Box::new(|| -> Arc<dyn SessionRequestHandler> { Arc::new(InsR::new()) }),
+            64,
+        );
+        server_manager.register_named_service(
+            "ins:s",
+            Box::new(|| -> Arc<dyn SessionRequestHandler> { Arc::new(InsS::new()) }),
+            64,
+        );
+        server_manager.register_named_service(
+            "hshl:sys",
+            Box::new(|| -> Arc<dyn SessionRequestHandler> { Arc::new(HshlSys::new()) }),
+            64,
+        );
+        server_manager.register_named_service(
+            "hshl:set",
+            Box::new(|| -> Arc<dyn SessionRequestHandler> { Arc::new(HshlSet::new()) }),
+            64,
+        );
         stub(&mut server_manager, "ovln:rcv");
         stub(&mut server_manager, "ovln:snd");
 

@@ -118,18 +118,8 @@ impl ISession {
     ) {
         let session = unsafe { &*(this as *const dyn ServiceFramework as *const ISession) };
         let mut rp = RequestParser::new(ctx);
-        let mode = match rp.pop_u32() {
-            0 => PerformanceMode::Normal,
-            1 => PerformanceMode::Boost,
-            _ => PerformanceMode::Normal,
-        };
-        let config = match rp.pop_u32() {
-            0 => PerformanceConfiguration::Config1,
-            1 => PerformanceConfiguration::Config2,
-            2 => PerformanceConfiguration::Config3,
-            3 => PerformanceConfiguration::Config4,
-            _ => PerformanceConfiguration::Config1,
-        };
+        let mode = PerformanceMode::from_raw(rp.pop_u32() as i32);
+        let config = PerformanceConfiguration::from_raw(rp.pop_u32());
         session.set_performance_configuration(mode, config);
 
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
@@ -142,16 +132,12 @@ impl ISession {
     ) {
         let session = unsafe { &*(this as *const dyn ServiceFramework as *const ISession) };
         let mut rp = RequestParser::new(ctx);
-        let mode = match rp.pop_u32() {
-            0 => PerformanceMode::Normal,
-            1 => PerformanceMode::Boost,
-            _ => PerformanceMode::Normal,
-        };
+        let mode = PerformanceMode::from_raw(rp.pop_u32() as i32);
         let config = session.get_performance_configuration(mode);
 
         let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
         rb.push_result(RESULT_SUCCESS);
-        rb.push_u32(config as u32);
+        rb.push_u32(config.raw());
     }
 
     fn set_cpu_overclock_enabled_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
@@ -263,7 +249,7 @@ impl APM {
 
         let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
         rb.push_result(RESULT_SUCCESS);
-        rb.push_u32(mode as u32);
+        rb.push_u32(mode.raw() as u32);
     }
 
     fn is_cpu_overclock_enabled_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
@@ -373,12 +359,7 @@ impl ApmSys {
     fn set_cpu_boost_mode_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         let service = unsafe { &*(this as *const dyn ServiceFramework as *const ApmSys) };
         let mut rp = RequestParser::new(ctx);
-        let mode = match rp.pop_u32() {
-            0 => CpuBoostMode::Normal,
-            1 => CpuBoostMode::FastLoad,
-            2 => CpuBoostMode::Partial,
-            _ => CpuBoostMode::Normal,
-        };
+        let mode = CpuBoostMode::from_raw(rp.pop_u32());
         service.set_cpu_boost_mode(mode);
 
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
@@ -394,7 +375,7 @@ impl ApmSys {
 
         let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
         rb.push_result(RESULT_SUCCESS);
-        rb.push_u32(config as u32);
+        rb.push_u32(config.raw());
     }
 }
 

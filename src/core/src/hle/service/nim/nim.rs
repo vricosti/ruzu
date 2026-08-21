@@ -5,6 +5,12 @@
 //!
 //! NIM, NIM_ECA, NIM_SHP, NTC, and related sub-services.
 
+use std::collections::BTreeMap;
+
+use crate::hle::result::ResultCode;
+use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
+use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
+
 /// IPC command IDs for IShopServiceAsync.
 ///
 /// Corresponds to the function table in `IShopServiceAsync` constructor (upstream nim.cpp).
@@ -185,6 +191,48 @@ impl NimEca {
     }
 }
 
+/// `nim:ecas` special-client registration service.
+pub struct NimEcas {
+    handlers: BTreeMap<u32, FunctionInfo>,
+    handlers_tipc: BTreeMap<u32, FunctionInfo>,
+}
+
+impl NimEcas {
+    pub fn new() -> Self {
+        Self {
+            handlers: build_handler_map(&[
+                (0, None, "RegisterSpecialClient"),
+                (1, None, "UnregisterSpecialClient"),
+            ]),
+            handlers_tipc: BTreeMap::new(),
+        }
+    }
+}
+
+impl SessionRequestHandler for NimEcas {
+    fn handle_sync_request(&self, ctx: &mut HLERequestContext) -> ResultCode {
+        ServiceFramework::handle_sync_request_impl(self, ctx)
+    }
+
+    fn service_name(&self) -> &str {
+        "nim:ecas"
+    }
+}
+
+impl ServiceFramework for NimEcas {
+    fn get_service_name(&self) -> &str {
+        "nim:ecas"
+    }
+
+    fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers
+    }
+
+    fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers_tipc
+    }
+}
+
 /// NIM_SHP service ("nim:shp"). All commands are nullptr stubs in upstream.
 ///
 /// Corresponds to `NIM_SHP` in upstream nim.cpp.
@@ -331,8 +379,30 @@ pub fn loop_process(system: crate::core::SystemRef) {
         let mut server_manager = server_manager.lock().unwrap();
         stub(&mut server_manager, "nim");
         stub(&mut server_manager, "nim:eca");
+        server_manager.register_named_service(
+            "nim:ecas",
+            Box::new(|| -> SessionRequestHandlerPtr { std::sync::Arc::new(NimEcas::new()) }),
+            64,
+        );
         stub(&mut server_manager, "nim:shp");
         stub(&mut server_manager, "ntc");
     }
     ServerManager::run_server_shared(server_manager);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ecas_table_matches_upstream() {
+        assert_eq!(
+            NimEcas::new()
+                .handlers()
+                .keys()
+                .copied()
+                .collect::<Vec<_>>(),
+            [0, 1]
+        );
+    }
 }

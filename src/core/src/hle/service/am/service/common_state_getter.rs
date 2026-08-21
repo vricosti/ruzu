@@ -176,7 +176,8 @@ impl ICommonStateGetter {
             .apm_controller()
             .lock()
             .unwrap()
-            .get_current_performance_mode() as u32
+            .get_current_performance_mode()
+            .raw() as u32
     }
 
     /// Port of ICommonStateGetter::IsVrModeEnabled
@@ -564,12 +565,7 @@ impl ICommonStateGetter {
         let service =
             unsafe { &*(this as *const dyn ServiceFramework as *const ICommonStateGetter) };
         let mut rp = RequestParser::new(ctx);
-        let mode = match rp.pop_u32() {
-            0 => crate::hle::service::apm::apm_controller::CpuBoostMode::Normal,
-            1 => crate::hle::service::apm::apm_controller::CpuBoostMode::FastLoad,
-            2 => crate::hle::service::apm::apm_controller::CpuBoostMode::Partial,
-            _ => crate::hle::service::apm::apm_controller::CpuBoostMode::Normal,
-        };
+        let mode = crate::hle::service::apm::apm_controller::CpuBoostMode::from_raw(rp.pop_u32());
 
         if let Some(service_manager) = service.system.get().service_manager() {
             let apm_sys = crate::hle::service::sm::sm::ServiceManager::get_service_blocking(

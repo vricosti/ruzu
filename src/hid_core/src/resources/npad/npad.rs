@@ -225,6 +225,7 @@ impl NPad {
 
         let aruid_index = applet_resource.get_index_from_aruid(aruid);
         if aruid_index >= ARUID_INDEX_MAX {
+            log::error!("Invalid aruid:{aruid:016X}");
             return ResultCode::SUCCESS;
         }
 
@@ -279,6 +280,18 @@ impl NPad {
 
     /// Port of NPad::UnregisterAppletResourceUserId.
     pub fn unregister_applet_resource_user_id(&mut self, aruid: u64) {
+        let aruid_index = match self.npad_resource.get_index_from_aruid(aruid) {
+            Some(index) => index,
+            None => {
+                log::error!("Invalid aruid:{aruid:016X}");
+                0
+            }
+        };
+        for controller in &mut self.controller_data[aruid_index] {
+            controller.is_active = false;
+            controller.is_connected = false;
+            controller.shared_memory_assigned = false;
+        }
         self.npad_resource.unregister_applet_resource_user_id(aruid);
     }
 
