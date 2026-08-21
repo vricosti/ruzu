@@ -592,3 +592,20 @@
   native instruction sequences, including its AVX-512 and baseline SSE2 branches for signed
   32-bit lanes. The all-width JIT regression passes and `rdynarmic` reports only the intentionally
   ignored opcode naming warnings.
+
+## 2026-08-21 — buffer-cache word manager interrupted by batched page-tracking prerequisite
+
+- Interrupted slice: audit and remove the `word_manager.rs` unused-local warnings while restoring
+  current Eden parity for `IterateWords`, `ChangeRegionState`, `ForEachModifiedRange`, and
+  `FlushCachedWrites`.
+- Exact missing prerequisite: current Eden coalesces changed page ranges and calls
+  `DeviceMemoryManager::UpdatePagesCachedBatch`; Ruzu's `DeviceTracker` trait and
+  `MaxwellDeviceMemoryManager` only expose the single-range update, so faithfully porting the word
+  manager would otherwise require retaining the older notification behavior.
+- Required next action: split `update_pages_cached_count` into the upstream-owned no-lock helper,
+  port sorted/coalesced `update_pages_cached_batch` under one range lock, expose it through
+  `DeviceTracker`, add focused coalescing and transition regressions, re-verify against Eden, then
+  resume `word_manager.rs`.
+- Status: prerequisite completed and re-verified. `update_pages_cached_count_no_lock` now owns the
+  counter transitions, both public paths acquire the matching lock scope, and focused empty plus
+  sorted/overlapping/adjacent batch regressions pass. The word-manager slice can resume.

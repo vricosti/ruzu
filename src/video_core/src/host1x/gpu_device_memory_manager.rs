@@ -57,7 +57,8 @@ pub struct MaxwellDeviceMemoryManager {
     /// `CachedPages`, whose entries contain `std::atomic_uint8_t` counters.
     cached_pages: Box<[AtomicU8]>,
     /// Port of upstream `Common::RangeMutex counter_guard`, used by
-    /// `UpdatePagesCachedCount` through `ScopedRangeLock`.
+    /// `UpdatePagesCachedCount` and `UpdatePagesCachedBatch` through
+    /// `ScopedRangeLock`.
     cached_pages_guard: RangeMutex,
 
     /// Test-only fallback invoked when reduced fixtures do not install a
@@ -696,6 +697,10 @@ impl Default for MaxwellDeviceMemoryManager {
 impl DeviceTracker for MaxwellDeviceMemoryManager {
     fn update_pages_cached_count(&self, addr: DAddr, size: u64, delta: i32) {
         MaxwellDeviceMemoryManager::update_pages_cached_count(self, addr, size as usize, delta);
+    }
+
+    fn update_pages_cached_batch(&self, ranges: &[(DAddr, usize)], delta: i32) {
+        MaxwellDeviceMemoryManager::update_pages_cached_batch(self, ranges, delta);
     }
 }
 
@@ -1662,6 +1667,52 @@ impl MaxwellDeviceMemoryManager {
             return;
         }
 
+        let _counter_guard = ScopedRangeLock::new(&self.cached_pages_guard, addr, size as u64);
+        self.update_pages_cached_count_no_lock(addr, size, delta);
+    }
+
+    /// Port of upstream
+    /// `Core::DeviceMemoryManager<Traits>::UpdatePagesCachedBatch`.
+    pub fn update_pages_cached_batch(&self, ranges: &[(DAddr, usize)], delta: i32) {
+        if ranges.is_empty() {
+            return;
+        }
+
+        let mut sorted = ranges.to_vec();
+        sorted.sort_unstable_by_key(|&(addr, _)| addr);
+
+        let mut coalesced = Vec::with_capacity(sorted.len());
+        let (mut current_addr, mut current_size) = sorted[0];
+        for &(next_addr, next_size) in &sorted[1..] {
+            if current_addr + current_size as u64 >= next_addr {
+                let end = (current_addr + current_size as u64).max(next_addr + next_size as u64);
+                current_size = (end - current_addr) as usize;
+            } else {
+                coalesced.push((current_addr, current_size));
+                current_addr = next_addr;
+                current_size = next_size;
+            }
+        }
+        coalesced.push((current_addr, current_size));
+
+        let lock_begin = coalesced[0].0;
+        let &(last_addr, last_size) = coalesced.last().expect("coalesced ranges are not empty");
+        let lock_end = last_addr + last_size as u64;
+        let _counter_guard =
+            ScopedRangeLock::new(&self.cached_pages_guard, lock_begin, lock_end - lock_begin);
+
+        for &(addr, size) in &coalesced {
+            self.update_pages_cached_count_no_lock(addr, size, delta);
+        }
+    }
+
+    /// Port of upstream
+    /// `Core::DeviceMemoryManager<Traits>::UpdatePagesCachedCountNoLock`.
+    fn update_pages_cached_count_no_lock(&self, addr: DAddr, size: usize, delta: i32) {
+        if size == 0 {
+            return;
+        }
+
         let page_begin = addr >> PAGE_BITS;
         let page_end = (addr + size as u64 + PAGE_SIZE - 1) >> PAGE_BITS;
 
@@ -1672,11 +1723,6 @@ impl MaxwellDeviceMemoryManager {
         let mut uncache_bytes: u64 = 0;
         let mut cache_begin: u64 = 0;
         let mut cache_bytes: u64 = 0;
-
-        // Upstream holds `counter_guard` while it calls MarkRegionCaching and
-        // never materializes a callback list. Keep that lifecycle literally:
-        // the common path performs no heap allocation.
-        let _counter_guard = ScopedRangeLock::new(&self.cached_pages_guard, addr, size as u64);
 
         fn release_pending(
             manager: &MaxwellDeviceMemoryManager,
@@ -1946,6 +1992,45 @@ mod tests {
 
         let calls = log.lock().unwrap();
         assert_eq!(*calls, vec![(0x4000, 4 * 0x1000, true)]);
+    }
+
+    #[test]
+    fn cached_batch_sorts_and_coalesces_overlapping_ranges() {
+        let mgr = MaxwellDeviceMemoryManager::default();
+        let (cb, log) = recorder();
+        mgr.set_mark_region_caching(cb);
+        let backing = vec![0u8; 4 * 0x1000];
+        install_test_physical_base(&mgr, backing.as_ptr());
+        mgr.smmu_map_with_cpu_backing(0x1000, backing.as_ptr(), 0x1000, 4 * 0x1000, 3, true);
+
+        let ranges = [(0x3000, 0x1000), (0x1000, 0x1800), (0x2000, 0x1000)];
+        mgr.update_pages_cached_batch(&ranges, 1);
+
+        assert_eq!(mgr.cached_pages[1].load(Ordering::Relaxed), 1);
+        assert_eq!(mgr.cached_pages[2].load(Ordering::Relaxed), 1);
+        assert_eq!(mgr.cached_pages[3].load(Ordering::Relaxed), 1);
+        assert_eq!(*log.lock().unwrap(), vec![(0x1000, 0x3000, true)]);
+
+        mgr.update_pages_cached_batch(&ranges, -1);
+        assert_eq!(
+            *log.lock().unwrap(),
+            vec![(0x1000, 0x3000, true), (0x1000, 0x3000, false)]
+        );
+    }
+
+    #[test]
+    fn empty_cached_batch_is_noop() {
+        let mgr = MaxwellDeviceMemoryManager::default();
+        let (cb, log) = recorder();
+        mgr.set_mark_region_caching(cb);
+
+        mgr.update_pages_cached_batch(&[], 1);
+
+        assert!(log.lock().unwrap().is_empty());
+        assert!(mgr
+            .cached_pages
+            .iter()
+            .all(|count| count.load(Ordering::Relaxed) == 0));
     }
 
     #[test]

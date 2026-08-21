@@ -252,6 +252,10 @@ pub trait DeviceTracker {
     /// `delta` is +1 when the tracker should start watching or -1 when it
     /// should stop.
     fn update_pages_cached_count(&self, addr: VAddr, size: u64, delta: i32);
+
+    /// Adjust cached-page reference counts for multiple ranges under one
+    /// tracker-side lock acquisition.
+    fn update_pages_cached_batch(&self, ranges: &[(VAddr, usize)], delta: i32);
 }
 
 // ---------------------------------------------------------------------------
@@ -703,5 +707,7 @@ mod tests {
     struct DummyTracker;
     impl DeviceTracker for DummyTracker {
         fn update_pages_cached_count(&self, _addr: VAddr, _size: u64, _delta: i32) {}
+
+        fn update_pages_cached_batch(&self, _ranges: &[(VAddr, usize)], _delta: i32) {}
     }
 }

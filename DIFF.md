@@ -4432,3 +4432,14 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 - Rust omits Eden's `last_index_count` and `immediate_buffer_capacity` members. Neither member is
   read or updated upstream: indirect draw state is held by the channel bindings, while
   `ScratchBuffer::resize_destructive` manages the immediate allocation capacity internally.
+
+## 2026-08-21 — `src/video_core/src/host1x/gpu_device_memory_manager.rs` vs `src/core/device_memory_manager.h` and `.inc` (`UpdatePagesCachedBatch`)
+
+### Intentional differences
+
+- Ruzu exposes the single-range and batch operations through its `DeviceTracker` trait so the
+  generic Rust word manager can call the concrete `MaxwellDeviceMemoryManager`; Eden's C++
+  template parameter calls those concrete methods directly.
+- Ruzu's public single-range path returns before acquiring a range lock when `size == 0`. Eden
+  still acquires a zero-length lock and reads the initial CPU-backing entry, but performs no page
+  counter update or caching callback.
