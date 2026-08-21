@@ -3442,3 +3442,27 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 
 - N/A: these translators construct internal SSA operations and serialize no guest-visible
   payload.
+
+## 2026-08-21 — `src/rdynarmic/src/backend/x64/{a32_emit_a32.rs,emit_a64.rs,emit_vector_multiply.rs}` warning-only cleanup vs Eden x64 emitter owners
+
+### Intentional differences
+
+- The Rust A32 emitter keeps the uniform `EmitContext` argument required by opcode dispatch but
+  names it `_ctx`; Eden's `EmitA32ClearExclusive` likewise retains and leaves its
+  `A32EmitContext&` parameter unnamed.
+- Rust-native emitter regressions have no direct Eden test-file counterpart. Removing one unused
+  synthetic `Inst` and three unnecessary `unsafe` call sites changes neither the emitted code nor
+  the paired-min/max fallback calculations rechecked against Eden's `emit_x64_vector.cpp`.
+
+### Unintentional differences (to fix)
+
+- None introduced or found in this warning-only slice. Production vector-emitter parity outside
+  the three existing lower-paired regressions was not re-audited here.
+
+### Missing items
+
+- None for this warning-only slice.
+
+### Binary layout verification
+
+- N/A: parameter naming and Rust test call-site cleanup define no serialized layout.

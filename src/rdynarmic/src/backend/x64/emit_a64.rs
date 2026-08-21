@@ -955,9 +955,6 @@ pub fn emit_get_lower_from_op(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ir::inst::Inst;
-    use crate::ir::opcode::Opcode;
-    use crate::ir::value::Value;
     use rxbyak::CodeAssembler;
 
     fn make_inst_info(count: usize) -> Vec<(u32, usize)> {
@@ -970,10 +967,6 @@ mod tests {
         let inst_info = make_inst_info(2);
         let mut ra = RegAlloc::new_default(&mut asm, inst_info);
 
-        let inst = Inst::new(
-            Opcode::A64GetX,
-            &[Value::ImmA64Reg(crate::frontend::a64::types::Reg::R0)],
-        );
         let inst_ref = InstRef(0);
 
         let start = ra.asm.size();

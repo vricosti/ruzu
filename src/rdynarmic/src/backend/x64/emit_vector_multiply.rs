@@ -1214,9 +1214,7 @@ mod tests {
             b[i] = 0xA0 + i as u8;
         }
         let mut out = [0u8; 16];
-        unsafe {
-            fallback_paired_max_lower_u8(&mut out, &a, &b);
-        }
+        fallback_paired_max_lower_u8(&mut out, &a, &b);
         // Pairs from a: max(0x10,0x11)=0x11, max(0x12,0x13)=0x13,
         //               max(0x14,0x15)=0x15, max(0x16,0x17)=0x17
         // Pairs from b: max(0xA0,0xA1)=0xA1, ..., max(0xA6,0xA7)=0xA7
@@ -1240,9 +1238,7 @@ mod tests {
             b[i] = 0xA0 + i as u8;
         }
         let mut out = [0u8; 16];
-        unsafe {
-            fallback_paired_min_lower_u8(&mut out, &a, &b);
-        }
+        fallback_paired_min_lower_u8(&mut out, &a, &b);
         let expected: [u8; 16] = [
             0x10, 0x12, 0x14, 0x16, 0xA0, 0xA2, 0xA4, 0xA6, 0, 0, 0, 0, 0, 0, 0, 0,
         ];
@@ -1260,9 +1256,7 @@ mod tests {
         a_bytes[..8].copy_from_slice(&unsafe { std::mem::transmute::<_, [u8; 8]>(a_words) });
         b_bytes[..8].copy_from_slice(&unsafe { std::mem::transmute::<_, [u8; 8]>(b_words) });
         let mut out = [0u8; 16];
-        unsafe {
-            fallback_paired_max_lower_u16(&mut out, &a_bytes, &b_bytes);
-        }
+        fallback_paired_max_lower_u16(&mut out, &a_bytes, &b_bytes);
         let out_words: [u16; 8] = unsafe { std::mem::transmute(out) };
         assert_eq!(
             out_words,

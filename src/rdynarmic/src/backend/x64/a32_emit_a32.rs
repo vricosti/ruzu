@@ -2436,7 +2436,7 @@ pub fn emit_a32_exclusive_write_memory_64(
 
 /// A32ClearExclusive: clear exclusive monitor
 pub fn emit_a32_clear_exclusive(
-    ctx: &EmitContext,
+    _ctx: &EmitContext,
     ra: &mut RegAlloc,
     _inst_ref: InstRef,
     _inst: &Inst,
