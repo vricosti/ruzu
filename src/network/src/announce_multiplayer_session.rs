@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2017 Citra Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-//! Port of zuyu/src/network/announce_multiplayer_session.h and
+//! Port of Eden src/network/announce_multiplayer_session.h and
 //! announce_multiplayer_session.cpp
 //!
 //! Instruments `AnnounceMultiplayerRoom::Backend`. Creates a thread that
@@ -9,24 +9,17 @@
 //! room information is also possible.
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, Weak};
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
 
-use common::announce_multiplayer_room::{
-    self, Backend, NullBackend, RoomList, WebResult, WebResultCode,
-};
+use common::announce_multiplayer_room::{Backend, RoomList, WebResult, WebResultCode};
+use common::thread::Event;
 
 use crate::network::RoomNetwork;
 use crate::room::{Room, RoomState, NETWORK_VERSION};
-
-// ---------------------------------------------------------------------------
-// Constants
-// ---------------------------------------------------------------------------
-
-/// Time between room announcements to web_service.
-const ANNOUNCE_TIME_INTERVAL: Duration = Duration::from_secs(15);
 
 // ---------------------------------------------------------------------------
 // AnnounceMultiplayerSession
@@ -38,49 +31,51 @@ pub type CallbackHandle = Arc<Box<dyn Fn(&WebResult) + Send + Sync>>;
 /// Instruments `AnnounceMultiplayerRoom::Backend`.
 /// Maps to C++ `Core::AnnounceMultiplayerSession`.
 pub struct AnnounceMultiplayerSession {
-    error_callbacks: Mutex<Vec<CallbackHandle>>,
+    shutdown_event: Arc<Event>,
+    error_callbacks: Arc<Mutex<Vec<CallbackHandle>>>,
+    announce_multiplayer_thread: Mutex<Option<JoinHandle<()>>>,
 
     /// Backend interface that logs fields.
-    backend: Mutex<Box<dyn Backend>>,
+    backend: Arc<Mutex<Box<dyn Backend>>>,
 
     /// Whether the room has been registered.
-    registered: AtomicBool,
+    registered: Arc<AtomicBool>,
 
-    /// Whether the session is running (announce thread is active).
-    running: AtomicBool,
-    // NOTE: The actual announce thread, shutdown_event, and RoomNetwork weak
-    // reference are not fully ported since the networking layer (ENet) is
-    // stubbed. The public API is preserved for structural parity.
+    room: Weak<Room>,
 }
 
 impl AnnounceMultiplayerSession {
     /// Creates a new session.
     ///
-    /// NOTE: In the C++ version this takes `RoomNetwork&` and optionally
-    /// creates a `WebService::RoomJson` backend when `ENABLE_WEB_SERVICE` is
-    /// defined, from `web_api_url` / username / token. The web service is
-    /// always compiled in here, so the `NullBackend` branch is only taken when
-    /// no announce host is configured.
-    pub fn new(_room_network: &RoomNetwork) -> Self {
-        let backend: Box<dyn Backend> = {
-            let values = common::settings::values();
-            let host = values.web_api_url.get_value().clone();
-            if host.is_empty() {
-                Box::new(NullBackend)
-            } else {
-                Box::new(web_service::announce_room_json::RoomJson::new(
-                    &host,
-                    values.yuzu_username.get_value(),
-                    values.yuzu_token.get_value(),
-                ))
-            }
-        };
+    /// The explicit `RoomNetwork` reference replaces Eden's module-global
+    /// `Network::GetRoom()` owner without changing the room lifetime.
+    pub fn new(room_network: &RoomNetwork) -> Self {
+        let values = common::settings::values();
+        let backend: Box<dyn Backend> = Box::new(web_service::announce_room_json::RoomJson::new(
+            values.web_api_url.get_value(),
+            values.yuzu_username.get_value(),
+            values.yuzu_token.get_value(),
+        ));
 
         Self {
-            error_callbacks: Mutex::new(Vec::new()),
-            backend: Mutex::new(backend),
-            registered: AtomicBool::new(false),
-            running: AtomicBool::new(false),
+            shutdown_event: Arc::new(Event::new()),
+            error_callbacks: Arc::new(Mutex::new(Vec::new())),
+            announce_multiplayer_thread: Mutex::new(None),
+            backend: Arc::new(Mutex::new(backend)),
+            registered: Arc::new(AtomicBool::new(false)),
+            room: room_network.get_room(),
+        }
+    }
+
+    #[cfg(test)]
+    fn with_backend(room_network: &RoomNetwork, backend: Box<dyn Backend>) -> Self {
+        Self {
+            shutdown_event: Arc::new(Event::new()),
+            error_callbacks: Arc::new(Mutex::new(Vec::new())),
+            announce_multiplayer_thread: Mutex::new(None),
+            backend: Arc::new(Mutex::new(backend)),
+            registered: Arc::new(AtomicBool::new(false)),
+            room: room_network.get_room(),
         }
     }
 
@@ -103,14 +98,39 @@ impl AnnounceMultiplayerSession {
 
     /// Registers a room to web services.
     pub fn register(&self) -> WebResult {
-        // NOTE: Full implementation requires access to Room via RoomNetwork.
-        // Stubbed to call backend.register() directly.
-        let result = self.backend.lock().register();
+        Self::register_impl(&self.room, &self.backend, &self.registered)
+    }
+
+    fn register_impl(
+        room: &Weak<Room>,
+        backend: &Mutex<Box<dyn Backend>>,
+        registered: &AtomicBool,
+    ) -> WebResult {
+        let Some(room) = room.upgrade() else {
+            return WebResult {
+                result_code: WebResultCode::LibError,
+                result_string: "Network is not initialized".to_string(),
+                returned_data: String::new(),
+            };
+        };
+        if room.get_state() != RoomState::Open {
+            return WebResult {
+                result_code: WebResultCode::LibError,
+                result_string: "Room is not open".to_string(),
+                returned_data: String::new(),
+            };
+        }
+        let result = {
+            let mut backend = backend.lock();
+            Self::update_backend_data(&room, backend.as_mut());
+            backend.register()
+        };
         if result.result_code != WebResultCode::Success {
             return result;
         }
         log::info!("Room has been registered");
-        self.registered.store(true, Ordering::SeqCst);
+        room.set_verify_uid(&result.returned_data);
+        registered.store(true, Ordering::SeqCst);
         WebResult {
             result_code: WebResultCode::Success,
             result_string: String::new(),
@@ -120,16 +140,73 @@ impl AnnounceMultiplayerSession {
 
     /// Starts the announce of a room to web services.
     pub fn start(&self) {
-        // NOTE: Thread-based announce loop is not ported (ENet dependency).
-        // This sets the running flag for API parity.
-        self.running.store(true, Ordering::SeqCst);
-        log::warn!("AnnounceMultiplayerSession::start: networking thread not ported; announce loop will not run");
+        if self.is_running() {
+            self.stop();
+        }
+
+        let shutdown_event = Arc::clone(&self.shutdown_event);
+        let error_callbacks = Arc::clone(&self.error_callbacks);
+        let backend = Arc::clone(&self.backend);
+        let registered = Arc::clone(&self.registered);
+        let room = self.room.clone();
+        let thread = std::thread::spawn(move || {
+            let error_callback = |result: WebResult| {
+                let callbacks = error_callbacks.lock();
+                for callback in callbacks.iter() {
+                    callback(&result);
+                }
+            };
+
+            if !registered.load(Ordering::SeqCst) {
+                let result = Self::register_impl(&room, &backend, &registered);
+                if result.result_code != WebResultCode::Success {
+                    error_callback(result);
+                    return;
+                }
+            }
+
+            // Time between room announcements to web_service.
+            const ANNOUNCE_TIME_INTERVAL: Duration = Duration::from_secs(15);
+            let mut update_time = Instant::now();
+            loop {
+                let wait_time = update_time.saturating_duration_since(Instant::now());
+                if shutdown_event.wait_for(wait_time) {
+                    break;
+                }
+                update_time = Instant::now() + ANNOUNCE_TIME_INTERVAL;
+
+                let Some(room_handle) = room.upgrade() else {
+                    break;
+                };
+                if room_handle.get_state() != RoomState::Open {
+                    break;
+                }
+                let result = {
+                    let mut backend = backend.lock();
+                    Self::update_backend_data(&room_handle, backend.as_mut());
+                    backend.update()
+                };
+                if result.result_code != WebResultCode::Success {
+                    error_callback(result.clone());
+                }
+                if result.result_string == "404" {
+                    registered.store(false, Ordering::SeqCst);
+                    let register_result = Self::register_impl(&room, &backend, &registered);
+                    if register_result.result_code != WebResultCode::Success {
+                        error_callback(register_result);
+                    }
+                }
+            }
+        });
+        *self.announce_multiplayer_thread.lock() = Some(thread);
     }
 
     /// Stops the announce to web services.
     pub fn stop(&self) {
-        if self.running.load(Ordering::SeqCst) {
-            self.running.store(false, Ordering::SeqCst);
+        let thread = self.announce_multiplayer_thread.lock().take();
+        if let Some(thread) = thread {
+            self.shutdown_event.set();
+            let _ = thread.join();
             self.backend.lock().delete();
             self.registered.store(false, Ordering::SeqCst);
         }
@@ -142,7 +219,7 @@ impl AnnounceMultiplayerSession {
 
     /// Whether the announce session is still running.
     pub fn is_running(&self) -> bool {
-        self.running.load(Ordering::SeqCst)
+        self.announce_multiplayer_thread.lock().is_some()
     }
 
     /// Recreates the backend, updating the credentials.
@@ -153,16 +230,29 @@ impl AnnounceMultiplayerSession {
             "Credentials can only be updated when session is not running"
         );
         let values = common::settings::values();
-        let host = values.web_api_url.get_value().clone();
-        *self.backend.lock() = if host.is_empty() {
-            Box::new(NullBackend)
-        } else {
-            Box::new(web_service::announce_room_json::RoomJson::new(
-                &host,
-                values.yuzu_username.get_value(),
-                values.yuzu_token.get_value(),
-            ))
-        };
+        *self.backend.lock() = Box::new(web_service::announce_room_json::RoomJson::new(
+            values.web_api_url.get_value(),
+            values.yuzu_username.get_value(),
+            values.yuzu_token.get_value(),
+        ));
+    }
+
+    fn update_backend_data(room: &Room, backend: &mut dyn Backend) {
+        let room_information = room.get_room_information();
+        let member_list = room.get_room_member_list();
+        backend.set_room_information(
+            &room_information.name,
+            &room_information.description,
+            room_information.port,
+            room_information.member_slots,
+            NETWORK_VERSION,
+            room.has_password(),
+            &room_information.preferred_game,
+        );
+        backend.clear_players();
+        for member in &member_list {
+            backend.add_player(member);
+        }
     }
 }
 
@@ -176,42 +266,225 @@ impl Drop for AnnounceMultiplayerSession {
 mod tests {
     use super::*;
     use crate::network::RoomNetwork;
+    use common::announce_multiplayer_room::{GameInfo, Member};
+    use std::sync::mpsc::{self, Sender};
 
-    /// Replaces a test that assumed the session always used `NullBackend`.
-    /// The backend now depends on `web_api_url`, so both branches are covered.
-    #[test]
-    fn backend_selection_follows_the_configured_announce_host() {
-        let rn = RoomNetwork::new();
+    #[derive(Default)]
+    struct BackendState {
+        name: String,
+        description: String,
+        port: u16,
+        member_slots: u32,
+        network_version: u32,
+        has_password: bool,
+        preferred_game: String,
+        clear_calls: usize,
+        register_calls: usize,
+        update_calls: usize,
+        delete_calls: usize,
+    }
 
-        // Empty host: no web service at all, exactly upstream's #else branch.
-        let previous = common::settings::values().web_api_url.get_value().clone();
-        common::settings::values_mut()
-            .web_api_url
-            .set_value(String::new());
-        let session = AnnounceMultiplayerSession::new(&rn);
-        assert_eq!(session.register().result_code, WebResultCode::NoWebservice);
+    struct RecordingBackend {
+        state: Arc<Mutex<BackendState>>,
+        register_result: WebResult,
+        update_result: WebResult,
+        register_signal: Option<Sender<usize>>,
+        update_signal: Option<Sender<()>>,
+    }
 
-        // A configured host builds the RoomJson backend; registering a room
-        // needs credentials, which this test deliberately does not provide, so
-        // it must stop before any request leaves the machine.
-        common::settings::values_mut()
-            .web_api_url
-            .set_value("api.ynet-fun.xyz".to_string());
-        let session = AnnounceMultiplayerSession::new(&rn);
-        assert_eq!(
-            session.register().result_code,
-            WebResultCode::CredentialsMissing
-        );
+    impl RecordingBackend {
+        fn new(state: Arc<Mutex<BackendState>>) -> Self {
+            Self {
+                state,
+                register_result: WebResult {
+                    result_code: WebResultCode::Success,
+                    result_string: String::new(),
+                    returned_data: "verification-id".to_string(),
+                },
+                update_result: WebResult {
+                    result_code: WebResultCode::Success,
+                    result_string: String::new(),
+                    returned_data: String::new(),
+                },
+                register_signal: None,
+                update_signal: None,
+            }
+        }
+    }
 
-        common::settings::values_mut()
-            .web_api_url
-            .set_value(previous);
+    impl Backend for RecordingBackend {
+        fn set_room_information(
+            &mut self,
+            name: &str,
+            description: &str,
+            port: u16,
+            max_player: u32,
+            net_version: u32,
+            has_password: bool,
+            preferred_game: &GameInfo,
+        ) {
+            let mut state = self.state.lock();
+            state.name = name.to_string();
+            state.description = description.to_string();
+            state.port = port;
+            state.member_slots = max_player;
+            state.network_version = net_version;
+            state.has_password = has_password;
+            state.preferred_game = preferred_game.name.clone();
+        }
+
+        fn add_player(&mut self, _member: &Member) {}
+
+        fn update(&mut self) -> WebResult {
+            self.state.lock().update_calls += 1;
+            if let Some(signal) = &self.update_signal {
+                let _ = signal.send(());
+            }
+            self.update_result.clone()
+        }
+
+        fn register(&mut self) -> WebResult {
+            let calls = {
+                let mut state = self.state.lock();
+                state.register_calls += 1;
+                state.register_calls
+            };
+            if let Some(signal) = &self.register_signal {
+                let _ = signal.send(calls);
+            }
+            self.register_result.clone()
+        }
+
+        fn clear_players(&mut self) {
+            self.state.lock().clear_calls += 1;
+        }
+
+        fn get_room_list(&mut self) -> RoomList {
+            Vec::new()
+        }
+
+        fn delete(&mut self) {
+            self.state.lock().delete_calls += 1;
+        }
+    }
+
+    fn open_room(network: &RoomNetwork) -> Arc<Room> {
+        let room = network.get_room().upgrade().unwrap();
+        assert!(room.create(
+            "Free Room",
+            "Free homebrew multiplayer",
+            "",
+            24872,
+            "secret",
+            4,
+            "FreeHost",
+            GameInfo {
+                name: "OpenArenaNX".to_string(),
+                id: 0,
+                version: "1.0".to_string(),
+            },
+            None,
+            &(Vec::new(), Vec::new()),
+            false,
+        ));
+        room
     }
 
     #[test]
-    fn test_session_is_not_running_by_default() {
-        let rn = RoomNetwork::new();
-        let session = AnnounceMultiplayerSession::new(&rn);
+    fn register_rejects_missing_and_closed_rooms_like_upstream() {
+        let state = Arc::new(Mutex::new(BackendState::default()));
+        let session = {
+            let network = RoomNetwork::new();
+            AnnounceMultiplayerSession::with_backend(
+                &network,
+                Box::new(RecordingBackend::new(Arc::clone(&state))),
+            )
+        };
+        let result = session.register();
+        assert_eq!(result.result_code, WebResultCode::LibError);
+        assert_eq!(result.result_string, "Network is not initialized");
+
+        let network = RoomNetwork::new();
+        let session = AnnounceMultiplayerSession::with_backend(
+            &network,
+            Box::new(RecordingBackend::new(Arc::clone(&state))),
+        );
+        let result = session.register();
+        assert_eq!(result.result_code, WebResultCode::LibError);
+        assert_eq!(result.result_string, "Room is not open");
+    }
+
+    #[test]
+    fn register_populates_backend_and_sets_verification_id() {
+        let network = RoomNetwork::new();
+        let room = open_room(&network);
+        let state = Arc::new(Mutex::new(BackendState::default()));
+        let session = AnnounceMultiplayerSession::with_backend(
+            &network,
+            Box::new(RecordingBackend::new(Arc::clone(&state))),
+        );
+
+        let result = session.register();
+        assert_eq!(result.result_code, WebResultCode::Success);
+        assert!(result.returned_data.is_empty());
+        assert_eq!(room.get_verify_uid(), "verification-id");
+        let state = state.lock();
+        assert_eq!(state.name, "Free Room");
+        assert_eq!(state.description, "Free homebrew multiplayer");
+        assert_eq!(state.port, 24872);
+        assert_eq!(state.member_slots, 4);
+        assert_eq!(state.network_version, NETWORK_VERSION);
+        assert!(state.has_password);
+        assert_eq!(state.preferred_game, "OpenArenaNX");
+        assert_eq!(state.clear_calls, 1);
+        assert_eq!(state.register_calls, 1);
+    }
+
+    #[test]
+    fn start_updates_immediately_and_stop_deletes_registration() {
+        let network = RoomNetwork::new();
+        let _room = open_room(&network);
+        let state = Arc::new(Mutex::new(BackendState::default()));
+        let (sender, receiver) = mpsc::channel();
+        let mut backend = RecordingBackend::new(Arc::clone(&state));
+        backend.update_signal = Some(sender);
+        let session = AnnounceMultiplayerSession::with_backend(&network, Box::new(backend));
+
         assert!(!session.is_running());
+        session.start();
+        receiver
+            .recv_timeout(Duration::from_secs(2))
+            .expect("the first Eden announce update is immediate");
+        assert!(session.is_running());
+        session.stop();
+        assert!(!session.is_running());
+
+        let state = state.lock();
+        assert_eq!(state.register_calls, 1);
+        assert_eq!(state.update_calls, 1);
+        assert_eq!(state.delete_calls, 1);
+    }
+
+    #[test]
+    fn update_404_registers_the_room_again() {
+        let network = RoomNetwork::new();
+        let _room = open_room(&network);
+        let state = Arc::new(Mutex::new(BackendState::default()));
+        let (sender, receiver) = mpsc::channel();
+        let mut backend = RecordingBackend::new(Arc::clone(&state));
+        backend.register_signal = Some(sender);
+        backend.update_result = WebResult {
+            result_code: WebResultCode::HttpError,
+            result_string: "404".to_string(),
+            returned_data: String::new(),
+        };
+        let session = AnnounceMultiplayerSession::with_backend(&network, Box::new(backend));
+
+        session.start();
+        assert_eq!(receiver.recv_timeout(Duration::from_secs(2)).unwrap(), 1);
+        assert_eq!(receiver.recv_timeout(Duration::from_secs(2)).unwrap(), 2);
+        session.stop();
+
+        assert_eq!(state.lock().register_calls, 2);
     }
 }

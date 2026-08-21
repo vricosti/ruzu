@@ -17,9 +17,7 @@ use rusty_enet as enet;
 use common::announce_multiplayer_room::{GameInfo, IPv4Address, RoomInformation};
 
 use crate::packet::Packet;
-use crate::room::{
-    BanList, RoomMessageTypes, StatusMessageTypes, NETWORK_VERSION, NO_PREFERRED_IP, NUM_CHANNELS,
-};
+use crate::room::{BanList, RoomMessageTypes, StatusMessageTypes, NETWORK_VERSION, NUM_CHANNELS};
 
 // ---------------------------------------------------------------------------
 // Constants (from room_member.cpp)

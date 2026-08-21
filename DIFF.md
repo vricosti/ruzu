@@ -4210,3 +4210,55 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 ### Binary layout verification
 
 - N/A: the frontend passes typed network values and does not serialize these values by raw layout.
+
+## 2026-08-21 — `src/network/src/announce_multiplayer_session.rs` vs `src/network/announce_multiplayer_session.h` and `.cpp`
+
+### Intentional differences
+
+- Rust retains a `Weak<Room>` obtained from the constructor's explicit `RoomNetwork`; Eden reaches
+  the same room through the process-global `Network::GetRoom()`.
+- Rust shares thread-owned state with `Arc`, protects its backend with a mutex, and stores a
+  `JoinHandle`; Eden's `std::jthread` captures `this`, relying on destruction/`Stop()` to join before
+  the object is released. Both lifecycles signal the same event before joining and delete the web
+  registration afterward.
+- Rust stores callback handles in a `Vec` rather than `std::set`. Each bind creates a fresh `Arc`,
+  unbind still removes only the matching identity, and invocation remains serialized under the
+  callback mutex.
+- The target always links `web_service`, so construction and credential updates always create
+  `RoomJson`, matching Eden's `ENABLE_WEB_SERVICE` build. The target setting fields retain their
+  existing `yuzu_username`/`yuzu_token` names.
+- Rust computes the remaining duration before calling `Event::wait_for`; Eden passes the equivalent
+  absolute `steady_clock` deadline to `WaitUntil`.
+
+### Unintentional differences (to fix)
+
+- None in this slice. Room validation, backend data ordering, verify-UID propagation, immediate
+  first update, 15-second cadence, error callbacks, 404 re-registration, stop/delete ordering,
+  running-state definition, and credential-update guard now match Eden.
+
+### Missing items
+
+- None in `AnnounceMultiplayerSession`'s declared API or worker lifecycle.
+
+### Binary layout verification
+
+- N/A: announcement state is host-only and is submitted through the typed backend interface.
+
+## 2026-08-21 — `src/network/src/room_member.rs` vs `src/network/room_member.h` (default join-argument import audit)
+
+### Intentional differences
+
+- Rust has no default function arguments, so callers pass `NO_PREFERRED_IP` explicitly to `join`
+  and `send_join_request`; the constant remains owned by `room.rs`, matching Eden's `room.h`.
+
+### Unintentional differences (to fix)
+
+- None. The unused local import was dead code and did not provide Eden's declaration-level default.
+
+### Missing items
+
+- None in the preferred-address argument behavior.
+
+### Binary layout verification
+
+- N/A: this change only removes an unused import.
