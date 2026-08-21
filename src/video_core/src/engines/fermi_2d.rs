@@ -1245,9 +1245,9 @@ impl Fermi2D {
     }
 
     /// Corresponds to upstream `Fermi2D::CallMethod`.
-    pub fn call_method(&mut self, method: u32, argument: u32, is_last_call: bool) {
+    pub fn call_method(&mut self, method: u32, argument: u32, _is_last_call: bool) {
         #[cfg(test)]
-        self.call_method_last_flags.push(is_last_call);
+        self.call_method_last_flags.push(_is_last_call);
 
         let idx = method as usize;
         assert!(
@@ -1266,11 +1266,11 @@ impl Fermi2D {
         &mut self,
         method: u32,
         args: &[u32],
-        _amount: u32,
+        amount: u32,
         methods_pending: u32,
     ) {
-        for (i, &arg) in args.iter().enumerate() {
-            let is_last_call = methods_pending.saturating_sub(i as u32) <= 1;
+        for (i, &arg) in args.iter().take(amount as usize).enumerate() {
+            let is_last_call = methods_pending.wrapping_sub(i as u32) <= 1;
             self.call_method(method, arg, is_last_call);
         }
     }
@@ -2318,6 +2318,11 @@ mod tests {
         eng.call_method_last_flags.clear();
         eng.call_multi_method(0x100, &[1, 2], 2, 5);
         assert_eq!(eng.call_method_last_flags, vec![false, false]);
+
+        eng.call_method_last_flags.clear();
+        eng.call_multi_method(0x100, &[1, 2, 3], 2, 0);
+        assert_eq!(eng.call_method_last_flags, vec![true, false]);
+        assert_eq!(eng.words()[0x100], 2);
     }
 
     #[test]
