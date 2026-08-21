@@ -2307,3 +2307,24 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 ### Binary layout verification
 
 - N/A: logging state is host-only and is not serialized or exposed to guest memory.
+
+## 2026-08-21 — removal of `src/web_service/src/telemetry_json.rs` vs current Eden `src/web_service/`
+
+### Intentional differences
+
+- None. This is a structural correction to the current Eden source tree rather than a Rust
+  adaptation.
+
+### Unintentional differences (to fix)
+
+- None. Ruzu's `telemetry_json.rs` was an incomplete port from an older source tree: current Eden
+  has no `telemetry_json.{h,cpp}`, Ruzu had no production caller, and both HTTP submission methods
+  were explicit stubs. The module and its public export were removed.
+
+### Missing items
+
+- None relative to current Eden's `web_service` file list.
+
+### Binary layout verification
+
+- N/A: the removed component was host-only JSON state.
