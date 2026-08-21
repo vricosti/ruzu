@@ -1,8 +1,14 @@
 #!/bin/sh
-# Shared dependency checks used by the platform-specific setup scripts.
+# Shared dependency checks and build driver used by the per-OS build scripts.
 
 RUST_MINIMUM=1.85.0
 SETUP_COMPLETE=true
+
+# Build options, overridden by parse_build_args.
+BUILD_PROFILE=release
+RUN_DEPENDENCY_CHECK=true
+RUN_BUILD=true
+CARGO_EXTRA_ARGS=
 
 confirm_install() {
     prompt=$1
@@ -83,10 +89,6 @@ verify_native_libraries() {
 
 run_setup() {
     echo "Detected platform: $PLATFORM_NAME"
-
-    if command -v prepare_platform >/dev/null 2>&1; then
-        prepare_platform
-    fi
 
     MISSING_PACKAGES=
     echo "Checking system libraries and build tools..."
@@ -175,5 +177,85 @@ run_setup() {
 
     if command -v print_platform_build_notes >/dev/null 2>&1; then
         print_platform_build_notes
+    fi
+}
+
+# Reads the options understood by build.sh. Everything after `--` is kept for
+# cargo, so callers can target a single crate or add their own flags.
+parse_build_args() {
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --debug)
+                BUILD_PROFILE=debug
+                ;;
+            --release)
+                BUILD_PROFILE=release
+                ;;
+            --deps-only)
+                RUN_BUILD=false
+                ;;
+            --skip-deps)
+                RUN_DEPENDENCY_CHECK=false
+                ;;
+            --)
+                shift
+                CARGO_EXTRA_ARGS="$*"
+                break
+                ;;
+            *)
+                echo "Unknown option: $1" >&2
+                echo "Run ./build.sh --help for the available options." >&2
+                exit 1
+                ;;
+        esac
+        shift
+    done
+}
+
+# Compiles the workspace. Runs after run_setup so it inherits any PATH or
+# PKG_CONFIG_PATH the platform hook exported: on macOS in particular, Homebrew's
+# pkg-config has to come first or every probe fails.
+run_build() {
+    REPO_ROOT=$(CDPATH= cd -- "${PLATFORM_SCRIPT_DIR}/.." && pwd)
+
+    set -- build
+    if [ "$BUILD_PROFILE" = release ]; then
+        set -- "$@" --release
+    fi
+    if [ -n "$CARGO_EXTRA_ARGS" ]; then
+        # Word splitting is intentional: these are separate cargo arguments.
+        # shellcheck disable=SC2086
+        set -- "$@" $CARGO_EXTRA_ARGS
+    fi
+
+    echo
+    echo "Building the $BUILD_PROFILE profile..."
+    echo "  cargo $*"
+    if ! (cd "$REPO_ROOT" && cargo "$@"); then
+        echo "Build failed." >&2
+        exit 1
+    fi
+
+    echo
+    echo "Build finished ($BUILD_PROFILE)."
+    echo "Binaries: ${REPO_ROOT}/target/${BUILD_PROFILE}"
+}
+
+# Full entry point used by every platform script.
+run_pipeline() {
+    parse_build_args "$@"
+    # Always runs, even with --skip-deps: this is where a platform exports the
+    # PATH and PKG_CONFIG_PATH the build itself needs, not just the checks.
+    if command -v prepare_platform >/dev/null 2>&1; then
+        prepare_platform
+    fi
+    if [ "$RUN_DEPENDENCY_CHECK" = true ]; then
+        run_setup
+    fi
+    if [ "$RUN_BUILD" = true ]; then
+        run_build
+        if command -v post_build_platform >/dev/null 2>&1; then
+            post_build_platform
+        fi
     fi
 }

@@ -1,10 +1,10 @@
 #!/bin/sh
-# Install the tools and native libraries required to build ruzu on Linux.
+# Install the tools and native libraries ruzu needs on Linux, then build it.
 set -eu
 
 PLATFORM_SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-# shellcheck source=setup-common.sh
-. "${PLATFORM_SCRIPT_DIR}/setup-common.sh"
+# shellcheck source=build-common.sh
+. "${PLATFORM_SCRIPT_DIR}/build-common.sh"
 
 if [ ! -r /etc/os-release ]; then
     echo "Unable to determine the Linux distribution." >&2
@@ -136,4 +136,4 @@ install_packages() {
     esac
 }
 
-run_setup
+run_pipeline "$@"

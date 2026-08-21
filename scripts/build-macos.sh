@@ -1,10 +1,10 @@
 #!/bin/sh
-# Install the tools and native libraries required to build ruzu on macOS.
+# Install the tools and native libraries ruzu needs on macOS, then build it.
 set -eu
 
 PLATFORM_SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-# shellcheck source=setup-common.sh
-. "${PLATFORM_SCRIPT_DIR}/setup-common.sh"
+# shellcheck source=build-common.sh
+. "${PLATFORM_SCRIPT_DIR}/build-common.sh"
 
 if [ "$(uname -s)" != Darwin ]; then
     echo "This setup script only supports macOS." >&2
@@ -91,4 +91,24 @@ install_packages() {
     brew install $MISSING_PACKAGES
 }
 
-run_setup
+# macOS ships an app bundle, not a bare binary: a .app is what carries the
+# Info.plist, the icon and the bundled MoltenVK, and it is the only form that
+# launches from Finder. Skipped when the build did not produce the `ruzu`
+# binary, which happens when the caller targeted another crate.
+post_build_platform() {
+    if [ "$BUILD_PROFILE" != release ]; then
+        echo
+        echo "Skipping the .app bundle: it is only built for the release profile."
+        return 0
+    fi
+    if [ ! -x "${PLATFORM_SCRIPT_DIR}/../target/release/ruzu" ]; then
+        echo
+        echo "Skipping the .app bundle: target/release/ruzu was not built."
+        return 0
+    fi
+    echo
+    echo "Packaging ruzu.app..."
+    "${PLATFORM_SCRIPT_DIR}/build-macos-app.sh" --no-build
+}
+
+run_pipeline "$@"
