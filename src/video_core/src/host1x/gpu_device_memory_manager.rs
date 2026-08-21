@@ -695,10 +695,6 @@ impl Default for MaxwellDeviceMemoryManager {
 }
 
 impl DeviceTracker for MaxwellDeviceMemoryManager {
-    fn update_pages_cached_count(&self, addr: DAddr, size: u64, delta: i32) {
-        MaxwellDeviceMemoryManager::update_pages_cached_count(self, addr, size as usize, delta);
-    }
-
     fn update_pages_cached_batch(&self, ranges: &[(DAddr, usize)], delta: i32) {
         MaxwellDeviceMemoryManager::update_pages_cached_batch(self, ranges, delta);
     }

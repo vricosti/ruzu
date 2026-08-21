@@ -247,12 +247,6 @@ impl<const STACK_WORDS: usize> Drop for Words<STACK_WORDS> {
 ///
 /// Corresponds to the `DeviceTracker` template parameter in C++.
 pub trait DeviceTracker {
-    /// Adjust the cached-page reference count for a range.
-    ///
-    /// `delta` is +1 when the tracker should start watching or -1 when it
-    /// should stop.
-    fn update_pages_cached_count(&self, addr: VAddr, size: u64, delta: i32);
-
     /// Adjust cached-page reference counts for multiple ranges under one
     /// tracker-side lock acquisition.
     fn update_pages_cached_batch(&self, ranges: &[(VAddr, usize)], delta: i32);
@@ -328,7 +322,7 @@ impl<DT: DeviceTracker, const STACK_WORDS: usize> WordManager<DT, STACK_WORDS> {
         F: FnMut(usize, u64) -> Option<bool>,
     {
         let start = (offset as i64).max(0) as usize;
-        let end = ((offset + size) as i64).max(0) as usize;
+        let end = (offset.wrapping_add(size) as i64).max(0) as usize;
         if start >= self.size_bytes() as usize || end <= start {
             return;
         }
@@ -340,14 +334,14 @@ impl<DT: DeviceTracker, const STACK_WORDS: usize> WordManager<DT, STACK_WORDS> {
         let diff = end_word - start_word;
         end_word += (end_page + PAGES_PER_WORD as usize - 1) / PAGES_PER_WORD as usize;
         end_word = end_word.min(num_words);
-        let mut current_end_page = end_page + diff * PAGES_PER_WORD as usize;
+        end_page += diff * PAGES_PER_WORD as usize;
         let mut current_start_page = start_page;
         let base_mask: u64 = !0u64;
 
         for word_index in start_word..end_word {
-            let mask = Self::extract_bits(base_mask, current_start_page, current_end_page);
+            let mask = Self::extract_bits(base_mask, current_start_page, end_page);
             current_start_page = 0;
-            current_end_page = current_end_page.saturating_sub(PAGES_PER_WORD as usize);
+            end_page = end_page.wrapping_sub(PAGES_PER_WORD as usize);
             if let Some(true) = func(word_index, mask) {
                 return;
             }
@@ -385,7 +379,6 @@ impl<DT: DeviceTracker, const STACK_WORDS: usize> WordManager<DT, STACK_WORDS> {
         // We need to work with raw pointers to allow simultaneous mutable access
         // to different word arrays, matching the C++ approach.
         let is_short = self.words.is_short();
-        let num_words = self.words.num_words;
 
         let state_ptr = self.words.span_mut(ty).as_mut_ptr();
         let untracked_ptr = self.words.untracked.pointer_mut(is_short);
@@ -393,8 +386,9 @@ impl<DT: DeviceTracker, const STACK_WORDS: usize> WordManager<DT, STACK_WORDS> {
 
         let cpu_addr = self.cpu_addr;
         let tracker = self.tracker;
+        let mut ranges = Vec::new();
 
-        self.iterate_words(dirty_addr - cpu_addr, size, |index, mask| {
+        self.iterate_words(dirty_addr.wrapping_sub(cpu_addr), size, |index, mask| {
             unsafe {
                 let state_word = state_ptr.add(index);
                 let untracked_word = untracked_ptr.add(index);
@@ -402,17 +396,14 @@ impl<DT: DeviceTracker, const STACK_WORDS: usize> WordManager<DT, STACK_WORDS> {
 
                 match ty {
                     Type::Cpu | Type::CachedCpu => {
-                        // NotifyRasterizer<!enable>
-                        if !tracker.is_null() {
-                            Self::notify_rasterizer_raw(
-                                tracker,
-                                cpu_addr,
-                                !enable,
-                                index,
-                                *untracked_word,
-                                mask,
-                            );
-                        }
+                        Self::collect_changed_ranges(
+                            cpu_addr,
+                            !enable,
+                            index,
+                            *untracked_word,
+                            mask,
+                            &mut ranges,
+                        );
                     }
                     _ => {}
                 }
@@ -438,6 +429,7 @@ impl<DT: DeviceTracker, const STACK_WORDS: usize> WordManager<DT, STACK_WORDS> {
             }
             None
         });
+        Self::apply_collected_ranges(tracker, &mut ranges, if enable { -1 } else { 1 });
     }
 
     /// Call `func` for each modified range and optionally clear the modified bits.
@@ -451,20 +443,19 @@ impl<DT: DeviceTracker, const STACK_WORDS: usize> WordManager<DT, STACK_WORDS> {
     ) where
         F: FnMut(VAddr, u64),
     {
-        assert_ne!(ty, Type::Untracked);
-
         let is_short = self.words.is_short();
         let state_ptr = self.words.span_mut(ty).as_mut_ptr();
         let untracked_ptr = self.words.untracked.pointer_mut(is_short);
         let cached_ptr = self.words.cached_cpu.pointer_mut(is_short);
 
-        let offset = query_cpu_range - self.cpu_addr;
+        let offset = query_cpu_range.wrapping_sub(self.cpu_addr);
         let cpu_addr = self.cpu_addr;
         let tracker = self.tracker;
 
         let mut pending = false;
         let mut pending_offset: usize = 0;
         let mut pending_pointer: usize = 0;
+        let mut ranges = Vec::new();
 
         self.iterate_words(offset, size, |index, mut mask| {
             unsafe {
@@ -476,16 +467,14 @@ impl<DT: DeviceTracker, const STACK_WORDS: usize> WordManager<DT, STACK_WORDS> {
                 if clear {
                     match ty {
                         Type::Cpu | Type::CachedCpu => {
-                            if !tracker.is_null() {
-                                Self::notify_rasterizer_raw(
-                                    tracker,
-                                    cpu_addr,
-                                    true,
-                                    index,
-                                    *untracked_ptr.add(index),
-                                    mask,
-                                );
-                            }
+                            Self::collect_changed_ranges(
+                                cpu_addr,
+                                true,
+                                index,
+                                *untracked_ptr.add(index),
+                                mask,
+                                &mut ranges,
+                            );
                         }
                         _ => {}
                     }
@@ -527,12 +516,11 @@ impl<DT: DeviceTracker, const STACK_WORDS: usize> WordManager<DT, STACK_WORDS> {
                 (pending_pointer - pending_offset) as u64 * BYTES_PER_PAGE,
             );
         }
+        Self::apply_collected_ranges(tracker, &mut ranges, 1);
     }
 
     /// Returns true when a region has been modified for the given type.
     pub fn is_region_modified(&self, ty: Type, offset: u64, size: u64) -> bool {
-        assert_ne!(ty, Type::Untracked);
-
         let state_words = self.words.span(ty);
         let untracked_words = self.words.span(Type::Untracked);
         let mut result = false;
@@ -553,8 +541,6 @@ impl<DT: DeviceTracker, const STACK_WORDS: usize> WordManager<DT, STACK_WORDS> {
 
     /// Returns the inclusive modified region as a `(begin, end)` pair in bytes.
     pub fn modified_region(&self, ty: Type, offset: u64, size: u64) -> (u64, u64) {
-        assert_ne!(ty, Type::Untracked);
-
         let state_words = self.words.span(ty);
         let untracked_words = self.words.span(Type::Untracked);
         let mut begin: u64 = u64::MAX;
@@ -610,42 +596,39 @@ impl<DT: DeviceTracker, const STACK_WORDS: usize> WordManager<DT, STACK_WORDS> {
         let cpu_ptr = self.words.cpu.pointer_mut(is_short);
         let tracker = self.tracker;
         let cpu_addr = self.cpu_addr;
+        let mut ranges = Vec::new();
 
         for word_index in 0..num_words {
             unsafe {
                 let cached_bits = *cached_ptr.add(word_index);
-                if !tracker.is_null() {
-                    Self::notify_rasterizer_raw(
-                        tracker,
-                        cpu_addr,
-                        false,
-                        word_index,
-                        *untracked_ptr.add(word_index),
-                        cached_bits,
-                    );
-                }
+                Self::collect_changed_ranges(
+                    cpu_addr,
+                    false,
+                    word_index,
+                    *untracked_ptr.add(word_index),
+                    cached_bits,
+                    &mut ranges,
+                );
                 *untracked_ptr.add(word_index) |= cached_bits;
                 *cpu_ptr.add(word_index) |= cached_bits;
                 *cached_ptr.add(word_index) = 0;
             }
         }
+        Self::apply_collected_ranges(tracker, &mut ranges, -1);
     }
 
     // -----------------------------------------------------------------------
     // Private helpers
     // -----------------------------------------------------------------------
 
-    /// Low-level rasterizer notification using raw pointer to tracker.
-    ///
-    /// Safety: `tracker` must be a valid pointer or null (null is handled by caller).
-    #[inline]
-    unsafe fn notify_rasterizer_raw(
-        tracker: *const DT,
+    /// Port of `WordManager::CollectChangedRanges`.
+    fn collect_changed_ranges(
         cpu_addr: VAddr,
         add_to_tracker: bool,
         word_index: usize,
         current_bits: u64,
         new_bits: u64,
+        ranges: &mut Vec<(VAddr, usize)>,
     ) {
         let changed_bits = if add_to_tracker {
             current_bits & new_bits
@@ -654,19 +637,46 @@ impl<DT: DeviceTracker, const STACK_WORDS: usize> WordManager<DT, STACK_WORDS> {
         };
         let addr = cpu_addr + word_index as u64 * BYTES_PER_WORD;
         Self::iterate_pages(changed_bits, |page_offset, page_size| {
-            let delta = if add_to_tracker { 1 } else { -1 };
-            (*tracker).update_pages_cached_count(
+            ranges.push((
                 addr + page_offset as u64 * BYTES_PER_PAGE,
-                page_size as u64 * BYTES_PER_PAGE,
-                delta,
-            );
+                page_size * BYTES_PER_PAGE as usize,
+            ));
         });
+    }
+
+    /// Port of `WordManager::ApplyCollectedRanges`.
+    fn apply_collected_ranges(tracker: *const DT, ranges: &mut Vec<(VAddr, usize)>, delta: i32) {
+        if ranges.is_empty() {
+            return;
+        }
+
+        ranges.sort_unstable_by_key(|&(addr, _)| addr);
+        let mut coalesced = Vec::with_capacity(ranges.len());
+        let (mut current_addr, mut current_size) = ranges[0];
+        for &(next_addr, next_size) in &ranges[1..] {
+            if current_addr + current_size as u64 == next_addr {
+                current_size += next_size;
+            } else {
+                coalesced.push((current_addr, current_size));
+                current_addr = next_addr;
+                current_size = next_size;
+            }
+        }
+        coalesced.push((current_addr, current_size));
+
+        if !tracker.is_null() {
+            unsafe {
+                (*tracker).update_pages_cached_batch(&coalesced, delta);
+            }
+        }
+        ranges.clear();
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
 
     #[test]
     fn test_extract_bits() {
@@ -704,10 +714,61 @@ mod tests {
         assert_eq!(ranges, vec![(0, 2), (5, 3)]);
     }
 
+    #[test]
+    fn change_region_state_batches_across_word_boundaries() {
+        let tracker = RecordingTracker::default();
+        let base = 0x4000_0000;
+        let mut manager =
+            WordManager::<RecordingTracker, 2>::new(base, &tracker, BYTES_PER_WORD * 2);
+        let addr = base + 63 * BYTES_PER_PAGE;
+        let size = 3 * BYTES_PER_PAGE;
+
+        manager.change_region_state(Type::Cpu, false, addr, size);
+        manager.change_region_state(Type::Cpu, true, addr, size);
+
+        assert_eq!(
+            *tracker.calls.lock().unwrap(),
+            vec![
+                (vec![(addr, size as usize)], 1),
+                (vec![(addr, size as usize)], -1)
+            ]
+        );
+    }
+
+    #[test]
+    fn flush_cached_writes_coalesces_word_ranges() {
+        let tracker = RecordingTracker::default();
+        let base = 0x5000_0000;
+        let mut manager =
+            WordManager::<RecordingTracker, 2>::new(base, &tracker, BYTES_PER_WORD * 2);
+
+        manager.words.span_mut(Type::CachedCpu)[0] = 1 << 63;
+        manager.words.span_mut(Type::CachedCpu)[1] = 0b11;
+        manager.words.span_mut(Type::Untracked)[0] &= !(1 << 63);
+        manager.words.span_mut(Type::Untracked)[1] &= !0b11;
+
+        manager.flush_cached_writes();
+
+        let addr = base + 63 * BYTES_PER_PAGE;
+        assert_eq!(
+            *tracker.calls.lock().unwrap(),
+            vec![(vec![(addr, (3 * BYTES_PER_PAGE) as usize)], -1)]
+        );
+    }
+
+    #[derive(Default)]
+    struct RecordingTracker {
+        calls: Mutex<Vec<(Vec<(VAddr, usize)>, i32)>>,
+    }
+
+    impl DeviceTracker for RecordingTracker {
+        fn update_pages_cached_batch(&self, ranges: &[(VAddr, usize)], delta: i32) {
+            self.calls.lock().unwrap().push((ranges.to_vec(), delta));
+        }
+    }
+
     struct DummyTracker;
     impl DeviceTracker for DummyTracker {
-        fn update_pages_cached_count(&self, _addr: VAddr, _size: u64, _delta: i32) {}
-
         fn update_pages_cached_batch(&self, _ranges: &[(VAddr, usize)], _delta: i32) {}
     }
 }

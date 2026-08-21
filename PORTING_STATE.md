@@ -608,4 +608,7 @@
   resume `word_manager.rs`.
 - Status: prerequisite completed and re-verified. `update_pages_cached_count_no_lock` now owns the
   counter transitions, both public paths acquire the matching lock scope, and focused empty plus
-  sorted/overlapping/adjacent batch regressions pass. The word-manager slice can resume.
+  sorted/overlapping/adjacent batch regressions pass. The resumed word-manager slice now batches
+  `ChangeRegionState`, `ForEachModifiedRange`, and `FlushCachedWrites`, uses Eden's helper
+  boundaries, and passes focused cross-word coalescing regressions plus the full `video_core` test
+  suite.

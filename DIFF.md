@@ -4437,9 +4437,29 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 
 ### Intentional differences
 
-- Ruzu exposes the single-range and batch operations through its `DeviceTracker` trait so the
-  generic Rust word manager can call the concrete `MaxwellDeviceMemoryManager`; Eden's C++
-  template parameter calls those concrete methods directly.
+- Ruzu exposes the batch operation through its `DeviceTracker` trait so the generic Rust word
+  manager can call the concrete `MaxwellDeviceMemoryManager`; Eden's C++ template parameter calls
+  that concrete method directly.
 - Ruzu's public single-range path returns before acquiring a range lock when `size == 0`. Eden
   still acquires a zero-length lock and reads the initial CPU-backing entry, but performs no page
   counter update or caching callback.
+
+## 2026-08-21 — `src/video_core/src/buffer_cache/word_manager.rs` vs `src/video_core/buffer_cache/word_manager.h`
+
+### Intentional differences
+
+- Ruzu omits Eden's now-unused `NotifyRasterizer` helper after all three mutation paths moved to
+  `CollectChangedRanges` and `ApplyCollectedRanges`; keeping the superseded single-range helper
+  would only retain dead code.
+- The Rust callback adapter uses `Option<bool>` to represent Eden's compile-time distinction
+  between callbacks returning `bool` and callbacks returning `void`.
+- A null tracker is tolerated by the default/empty Rust manager and discards collected ranges;
+  Eden's default constructor also leaves `tracker` null, but invoking a notifying mutation on that
+  object would dereference it.
+
+### Unintentional differences (to fix)
+
+- Eden's `size_bytes` is a template parameter and its five tracking channels occupy one fixed
+  `std::array`. Ruzu stores `size_bytes` at runtime and uses separate stack-or-heap channel views.
+  Restoring that structural/layout parity requires changing the manager-pool type graph and is
+  outside this local batching slice.

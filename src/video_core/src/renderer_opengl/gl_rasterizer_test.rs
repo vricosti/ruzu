@@ -143,8 +143,6 @@ fn install_query_memory_manager(rast: &mut RasterizerOpenGL) -> Vec<u8> {
 struct DummyTracker;
 
 impl DeviceTracker for DummyTracker {
-    fn update_pages_cached_count(&self, _addr: u64, _size: u64, _delta: i32) {}
-
     fn update_pages_cached_batch(&self, _ranges: &[(u64, usize)], _delta: i32) {}
 }
 
