@@ -3,7 +3,13 @@
 
 //! Port of hid_core/hidbus/ringcon.h and ringcon.cpp
 
-use super::hidbus_base::HidbusBase;
+use std::sync::Arc;
+
+use common::input::PollingMode;
+use parking_lot::Mutex;
+
+use super::hidbus_base::{HidbusBase, JoyPollingMode};
+use crate::frontend::emulated_controller::{EmulatedController, EmulatedDeviceIndex};
 
 // These values are obtained from a real ring controller
 const IDLE_VALUE: i16 = 2280;
@@ -71,6 +77,7 @@ impl RingConCommands {
 enum DataValid {
     Valid = 0,
     BadCRC = 1,
+    #[allow(dead_code)] // Protocol value retained for parity; Eden does not construct it either.
     Cal = 2,
 }
 
@@ -187,6 +194,7 @@ struct ErrorReply {
 
 pub struct RingController {
     base: HidbusBase,
+    input: Option<Arc<Mutex<EmulatedController>>>,
     command: RingConCommands,
     total_rep_count: u8,
     total_push_count: u8,
@@ -200,6 +208,7 @@ impl RingController {
     pub fn new() -> Self {
         Self {
             base: HidbusBase::new(),
+            input: None,
             command: RingConCommands::Error,
             total_rep_count: 0,
             total_push_count: 0,
@@ -231,14 +240,27 @@ impl RingController {
         }
     }
 
+    pub fn new_with_input(input: Arc<Mutex<EmulatedController>>) -> Self {
+        Self {
+            input: Some(input),
+            ..Self::new()
+        }
+    }
+
     pub fn on_init(&mut self) {
-        // Upstream calls input->SetPollingMode(EmulatedDeviceIndex::RightIndex, PollingMode::Ring).
-        // Requires EmulatedController integration which is not yet wired up to RingController.
+        if let Some(input) = &self.input {
+            input
+                .lock()
+                .set_polling_mode(EmulatedDeviceIndex::RightIndex, PollingMode::Ring);
+        }
     }
 
     pub fn on_release(&mut self) {
-        // Upstream calls input->SetPollingMode(EmulatedDeviceIndex::RightIndex, PollingMode::Active).
-        // Requires EmulatedController integration which is not yet wired up to RingController.
+        if let Some(input) = &self.input {
+            input
+                .lock()
+                .set_polling_mode(EmulatedDeviceIndex::RightIndex, PollingMode::Active);
+        }
     }
 
     pub fn on_update(&mut self) {
@@ -252,14 +274,46 @@ impl RingController {
             return;
         }
 
-        // Upstream increments multitasking counters from motion and sensor data,
-        // then handles JoyPollingMode::SixAxisSensorEnable by writing ring lifo data
-        // (RingConData from GetSensorValue) into transfer_memory via system.ApplicationMemory().
-        // This requires kernel memory write support (ApplicationMemory) which is not yet available.
-        log::error!(
-            "Polling mode not fully supported {:?}",
-            self.base.polling_mode
-        );
+        // Upstream TODO: increment multitasking counters from motion and sensor data.
+        match self.base.polling_mode {
+            JoyPollingMode::SixAxisSensorEnable => {
+                let ringcon_value = self.get_sensor_value();
+                let accessor = &mut self.base.enable_sixaxis_data;
+                accessor.header.total_entries = 10;
+                accessor.header.result = common::ResultCode::SUCCESS;
+
+                let last_index = accessor.header.latest_entry as usize;
+                let last_sampling_number = accessor.entries[last_index].sampling_number;
+                accessor.header.latest_entry = (accessor.header.latest_entry + 1) % 10;
+
+                let current_index = accessor.header.latest_entry as usize;
+                let current_entry = &mut accessor.entries[current_index];
+                current_entry.sampling_number = last_sampling_number + 1;
+                current_entry.polling_data.sampling_number = current_entry.sampling_number;
+                current_entry.polling_data.out_size = std::mem::size_of::<RingConData>() as u8;
+
+                let bytes = unsafe {
+                    std::slice::from_raw_parts(
+                        &ringcon_value as *const RingConData as *const u8,
+                        std::mem::size_of::<RingConData>(),
+                    )
+                };
+                current_entry.polling_data.data[..bytes.len()].copy_from_slice(bytes);
+            }
+            _ => log::error!("Polling mode not supported {:?}", self.base.polling_mode),
+        }
+    }
+
+    fn get_sensor_value(&self) -> RingConData {
+        let force = self
+            .input
+            .as_ref()
+            .map_or(0.0, |input| input.lock().get_ring_sensor_force().force);
+        RingConData {
+            status: DataValid::Valid as u32,
+            data: (force * RANGE as f32) as i16 + IDLE_VALUE,
+            _padding: [0; 2],
+        }
     }
 
     pub fn get_device_id(&self) -> u8 {
@@ -477,5 +531,38 @@ impl RingController {
 impl Default for RingController {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sixaxis_polling_updates_the_ring_lifo_like_upstream() {
+        let mut controller = RingController::new();
+        controller.base.activate_device();
+        controller.base.enable(true);
+        controller
+            .base
+            .set_polling_mode(JoyPollingMode::SixAxisSensorEnable);
+        controller.base.set_transfer_memory_address(0x1000);
+
+        controller.on_update();
+
+        let accessor = &controller.base.enable_sixaxis_data;
+        assert_eq!(accessor.header.result, common::ResultCode::SUCCESS);
+        assert_eq!(accessor.header.total_entries, 10);
+        assert_eq!(accessor.header.latest_entry, 1);
+        assert_eq!(accessor.entries[1].sampling_number, 1);
+        assert_eq!(accessor.entries[1].polling_data.sampling_number, 1);
+        assert_eq!(accessor.entries[1].polling_data.out_size, 8);
+        assert_eq!(
+            i16::from_ne_bytes([
+                accessor.entries[1].polling_data.data[4],
+                accessor.entries[1].polling_data.data[5],
+            ]),
+            IDLE_VALUE
+        );
     }
 }

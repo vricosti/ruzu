@@ -40,7 +40,7 @@ impl Default for ClusteringProcessorConfig {
                 height: HEIGHT as i16,
             },
             pixel_count_min: 3,
-            pixel_count_max: (WIDTH * HEIGHT) as u32,
+            pixel_count_max: ProcessorBase::get_data_size(FORMAT) as u32,
             object_intensity_min: 150,
             is_external_light_filter_enabled: true,
         }
@@ -267,5 +267,22 @@ impl ClusteringProcessor {
         self.current_config.is_external_light_filter_enabled =
             config.is_external_light_filter_enabled;
         self.current_config.object_intensity_min = config.object_intensity_min as u32;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_config_uses_the_owned_camera_format() {
+        let config = ClusteringProcessorConfig::default();
+        assert_eq!(FORMAT, ImageTransferProcessorFormat::Size320x240);
+        assert_eq!(
+            config.pixel_count_max,
+            ProcessorBase::get_data_size(FORMAT) as u32
+        );
+        assert_eq!(config.window_of_interest.width, WIDTH as i16);
+        assert_eq!(config.window_of_interest.height, HEIGHT as i16);
     }
 }

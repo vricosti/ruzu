@@ -4589,3 +4589,29 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 - The base still lacks Eden's service-context-owned asynchronous command event. Its activation
   callbacks are consequently dispatched by the concrete Rust device owner rather than through
   C++ virtual calls in `HidbusBase`.
+
+## 2026-08-22 — `src/hid_core/src/irsensor/clustering_processor.rs` vs `src/hid_core/irsensor/clustering_processor.h` and `.cpp`
+
+### Missing items
+
+- The clustering algorithm is ported, but the IRS service does not yet construct this processor.
+  Consequently Ruzu cannot yet retain Eden's `EmulatedController`, register its IR callback, set
+  the camera format on that controller, or publish states into the device-owned clustering LIFO.
+  The default configuration now derives its maximum pixel count from the same owner-local format
+  constant as Eden instead of duplicating `width * height`.
+
+## 2026-08-22 — `src/hid_core/src/hidbus/ringcon.rs` vs `src/hid_core/hidbus/ringcon.h` and `.cpp`
+
+### Intentional differences
+
+- The default Rust constructor has no controller so isolated HIDBus tests can build the device;
+  production construction can provide Eden's Player1 controller through `new_with_input`.
+
+### Missing items
+
+- `RingController::on_update` now fills the same ten-entry six-axis accessor in Eden's order, but
+  cannot perform Eden's final `ApplicationMemory::WriteBlock`: process memory is owned by Ruzu's
+  `core` crate and `hid_core` cannot depend back on it. The HIDBus service owner must copy this
+  accessor to the configured transfer-memory address after calling the device update.
+- Command completion still lacks Eden's service-context-owned asynchronous event, as recorded for
+  `hidbus_base.rs`.
