@@ -131,6 +131,7 @@ pub struct RendererVulkan {
     /// Applet capture frame. Its raw Vulkan handles are released in `Drop`.
     applet_frame: Frame,
     /// Optional maximum-clock workload owner.
+    #[allow(dead_code)]
     turbo_mode: Option<TurboMode>,
     /// Vulkan rasterizer owner.
     rasterizer: super::RasterizerVulkan,
@@ -156,16 +157,20 @@ pub struct RendererVulkan {
     ///
     /// Like `scheduler`, this is a renderer-owned upstream member boxed only
     /// to provide a stable address for Rust's non-owning owner bridge.
+    #[allow(dead_code)]
     state_tracker: Box<StateTracker>,
     /// Vulkan memory allocator owner.
     memory_allocator: Box<MemoryAllocator>,
     /// Physical/logical Vulkan device owner.
     device: Box<Device>,
     /// Presentation surface owner.
+    #[allow(dead_code)]
     surface: Arc<std::sync::Mutex<OwnedSurface>>,
     /// Validation callback owner, present when renderer debugging is enabled.
+    #[allow(dead_code)]
     debug_messenger: Option<DebugUtilsMessenger>,
     /// Vulkan instance owner.
+    #[allow(dead_code)]
     instance: Instance,
 
     /// Shared Tegra device memory manager used by presentation uploads.

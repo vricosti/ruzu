@@ -1823,6 +1823,9 @@ pub struct RasterizerOpenGL {
     fence_manager: FenceManagerOpenGL,
     num_queued_commands: usize,
     has_written_global_memory: bool,
+    /// Upstream `staging_buffer_pool` owner. Rust cache runtimes retain `Arc`
+    /// clones, so ownership itself is the only direct use of this field.
+    #[allow(dead_code)]
     staging_buffer_pool: SharedStagingBufferPool,
     // Rust drops fields in declaration order.  Declare the borrower before
     // both boxed cache owners so it is destroyed first, matching C++ reverse

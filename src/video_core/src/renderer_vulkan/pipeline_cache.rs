@@ -779,11 +779,17 @@ pub struct PipelineCache {
     /// `RendererVulkan` boxes the owner and drops this cache first.
     device_owner: DeviceReference,
     device: ash::Device,
+    /// Upstream reference retained by this owner. Pipeline runtime bridges
+    /// copy the same stable pointer for worker-thread construction.
+    #[allow(dead_code)]
     descriptor_pool: NonNull<DescriptorPool>,
     shader_notify: crate::shader_notify::ShaderNotifyHandle,
     use_asynchronous_shaders: bool,
     use_vulkan_pipeline_cache: bool,
     channel_caches: ChannelSetupCaches<ChannelInfo>,
+    /// Upstream reference retained by this owner. Graphics runtime bridges
+    /// copy the same stable pointer for worker-thread construction.
+    #[allow(dead_code)]
     render_pass_cache: NonNull<RenderPassCache>,
     graphics_runtime: GraphicsPipelineRuntime,
     compute_runtime: ComputePipelineRuntime,

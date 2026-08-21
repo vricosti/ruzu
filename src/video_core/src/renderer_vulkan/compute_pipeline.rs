@@ -90,6 +90,9 @@ pub struct ComputePipeline {
     descriptor_buffer_ring: NonNull<DescriptorBufferRing>,
     /// Upstream `Shader::Info info`.
     info: ShaderInfo,
+    /// Retained for upstream state parity. The Rust build closure captures the
+    /// scalar value because it cannot borrow a partially constructed `Self`.
+    #[allow(dead_code)]
     shader_hash: u64,
 
     /// SPV shader module.

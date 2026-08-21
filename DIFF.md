@@ -4496,3 +4496,16 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 - An unmapped scalar `MemoryManager::read`/`write` logs and returns the upstream fallback value or
   performs no write. Eden logs through its configurable fail-soft `ASSERT(false)` before reaching
   the same fallback, while Ruzu has no equivalent global fail-soft assertion controller.
+
+## 2026-08-22 — renderer lifetime owners vs Eden OpenGL/Vulkan renderer owners
+
+### Intentional differences
+
+- Rust runtime bridges copy `NonNull` pointers or `Arc` handles from the renderer-owned staging,
+  descriptor, render-pass, memory, state, surface, and instance members. The original members stay
+  in their upstream owners to preserve stable addresses and destruction order, even though their
+  remaining direct role is ownership; each resulting `dead_code` false positive is suppressed on
+  that field only.
+- The asynchronous compute-pipeline closure captures the shader hash by value because it is built
+  before `ComputePipeline` exists. Eden captures `this` and reads the corresponding member; Ruzu
+  retains that member for structural parity and annotates only its otherwise unread field.

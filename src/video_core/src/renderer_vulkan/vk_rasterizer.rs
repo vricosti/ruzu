@@ -491,6 +491,7 @@ pub struct RasterizerVulkan {
     syncpoints: Arc<SyncpointManager>,
     /// Shared owner counterpart of upstream
     /// `Tegra::MaxwellDeviceMemoryManager& device_memory`.
+    #[allow(dead_code)]
     device_memory: Arc<MaxwellDeviceMemoryManager>,
     channel_caches: ChannelSetupCaches<ChannelInfo>,
 
@@ -501,6 +502,8 @@ pub struct RasterizerVulkan {
     /// rasterizer. The stable pointer preserves upstream ownership without a
     /// self-referential Rust struct.
     scheduler: OwnerReference<Scheduler>,
+    /// Stable non-owning counterpart of upstream `MemoryAllocator&`.
+    #[allow(dead_code)]
     memory_allocator: NonNull<MemoryAllocator>,
     /// Non-owning counterpart of upstream `StateTracker& state_tracker`.
     state_tracker: OwnerReference<StateTracker>,
@@ -515,6 +518,8 @@ pub struct RasterizerVulkan {
     // constructor returns `Self`, leaving those pointers dangling on the old
     // stack frame — observed as an UpdateDescriptorQueue whose `acquire()`
     // clamped the real instance while `add_buffer` grew a stale cursor until
+    // allocation failure.
+    #[allow(dead_code)]
     descriptor_pool: Box<DescriptorPool>,
     desc_queue: Box<UpdateDescriptorQueue>,
     compute_pass_desc_queue: Box<UpdateDescriptorQueue>,
@@ -534,6 +539,7 @@ pub struct RasterizerVulkan {
     // cache that retains a non-owning pointer to it, matching C++ reverse
     // member destruction where RenderPassCache outlives TextureCache and
     // PipelineCache.
+    #[allow(dead_code)]
     render_pass_cache: Box<RenderPassCache>,
     wfi_event: vk::Event,
 
