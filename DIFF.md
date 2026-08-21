@@ -3756,3 +3756,24 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 ### Binary layout verification
 
 - N/A: loader reference ownership is not serialized.
+
+## 2026-08-21 — `tools/capture_harness/{src/main.rs,example.toml}` vs no Eden source counterpart
+
+### Intentional differences
+
+- `capture_harness` is a Ruzu-specific developer tool and has no file under Eden's `src/` tree.
+  Its embedded parser regression now uses the checked-in generic homebrew example timeline instead
+  of referring to a missing, title-specific local fixture.
+
+### Unintentional differences (to fix)
+
+- None for this build-fixture correction.
+
+### Missing items
+
+- None: `cargo test --workspace --all-targets` can compile the harness test without an external
+  untracked configuration file.
+
+### Binary layout verification
+
+- N/A: the change only parses TOML developer-tool configuration.

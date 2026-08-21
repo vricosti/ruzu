@@ -1964,38 +1964,19 @@ mod tests {
     }
 
     #[test]
-    fn mk8d_profile_has_lr_then_thirteen_a_presses_at_the_requested_timecodes() {
-        let config: Config = toml::from_str(include_str!("../mk8d_input_20260816.toml")).unwrap();
+    fn example_homebrew_profile_has_lr_then_a_at_the_requested_timecodes() {
+        let config: Config = toml::from_str(include_str!("../example.toml")).unwrap();
         let events = config.input.unwrap().events;
-        assert_eq!(events.len(), 14);
+        assert_eq!(events.len(), 2);
         assert_eq!(events[0].at, "00:00:12.000");
         assert_eq!(events[0].buttons, [SwitchButton::L, SwitchButton::R]);
-        assert!(events[1..]
-            .iter()
-            .all(|event| event.buttons == [SwitchButton::A]));
+        assert_eq!(events[1].buttons, [SwitchButton::A]);
 
-        let times = events[1..]
+        let times = events
             .iter()
             .map(|event| parse_timecode(&event.at).unwrap().as_millis())
             .collect::<Vec<_>>();
-        assert_eq!(
-            times,
-            [
-                13_500, 15_000, 16_500, 18_000, 19_500, 21_000, 22_500, 24_000, 25_500, 27_000,
-                42_000, 44_000, 50_000,
-            ]
-        );
-        let gaps = times
-            .windows(2)
-            .map(|pair| pair[1] - pair[0])
-            .collect::<Vec<_>>();
-        assert_eq!(
-            gaps,
-            [
-                1_500, 1_500, 1_500, 1_500, 1_500, 1_500, 1_500, 1_500, 1_500, 15_000, 2_000,
-                6_000,
-            ]
-        );
+        assert_eq!(times, [12_000, 14_000]);
     }
 
     #[test]
