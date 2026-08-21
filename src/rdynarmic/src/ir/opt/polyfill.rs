@@ -294,21 +294,28 @@ mod tests {
     }
 
     #[test]
-    fn widening_multiply_polyfill_uses_extend_then_multiply() {
+    fn widening_multiply_polyfill_rewrites_all_signed_and_unsigned_widths() {
         let mut block = Block::new(LocationDescriptor(0));
         let n = block.append(Opcode::ZeroVector, &[]);
         let m = block.append(Opcode::ZeroVector, &[]);
-        let product = block.append(
+        let widening_opcodes = [
+            Opcode::VectorMultiplySignedWiden8,
             Opcode::VectorMultiplySignedWiden16,
-            &[Value::Inst(n), Value::Inst(m)],
-        );
-        block.append(
-            Opcode::A64SetQ,
-            &[
-                Value::ImmA64Vec(crate::frontend::a64::types::Vec::V0),
-                Value::Inst(product),
-            ],
-        );
+            Opcode::VectorMultiplySignedWiden32,
+            Opcode::VectorMultiplyUnsignedWiden8,
+            Opcode::VectorMultiplyUnsignedWiden16,
+            Opcode::VectorMultiplyUnsignedWiden32,
+        ];
+        for (index, opcode) in widening_opcodes.into_iter().enumerate() {
+            let product = block.append(opcode, &[Value::Inst(n), Value::Inst(m)]);
+            block.append(
+                Opcode::A64SetQ,
+                &[
+                    Value::ImmA64Vec(crate::frontend::a64::types::Vec::from_u32(index as u32)),
+                    Value::Inst(product),
+                ],
+            );
+        }
 
         polyfill(
             &mut block,
@@ -321,19 +328,28 @@ mod tests {
         assert!(!block
             .instructions
             .iter()
-            .any(|inst| inst.opcode == Opcode::VectorMultiplySignedWiden16));
-        assert_eq!(
-            block
-                .instructions
-                .iter()
-                .filter(|inst| inst.opcode == Opcode::VectorSignExtend16)
-                .count(),
-            2
-        );
-        assert!(block
-            .instructions
-            .iter()
-            .any(|inst| inst.opcode == Opcode::VectorMultiply32));
+            .any(|inst| widening_opcodes.contains(&inst.opcode)));
+        for opcode in [
+            Opcode::VectorSignExtend8,
+            Opcode::VectorSignExtend16,
+            Opcode::VectorSignExtend32,
+            Opcode::VectorZeroExtend8,
+            Opcode::VectorZeroExtend16,
+            Opcode::VectorZeroExtend32,
+            Opcode::VectorMultiply16,
+            Opcode::VectorMultiply32,
+            Opcode::VectorMultiply64,
+        ] {
+            assert_eq!(
+                block
+                    .instructions
+                    .iter()
+                    .filter(|inst| inst.opcode == opcode)
+                    .count(),
+                2,
+                "unexpected polyfill count for {opcode:?}"
+            );
+        }
     }
 
     #[test]

@@ -165,216 +165,61 @@ pub fn emit_vector_multiply64(
 }
 
 // ---------------------------------------------------------------------------
-// VectorMultiplySignedWiden — fallback (widening multiply)
+// VectorMultiplySignedWiden — eliminated by the mandatory x64 polyfill
 // ---------------------------------------------------------------------------
-
-extern "C" fn fallback_mul_signed_widen8(
-    result: *mut [u8; 16],
-    a: *const [u8; 16],
-    b: *const [u8; 16],
-) {
-    unsafe {
-        let va: [i8; 16] = std::mem::transmute(*a);
-        let vb: [i8; 16] = std::mem::transmute(*b);
-        let mut out = [0i16; 8];
-        for i in 0..8 {
-            out[i] = (va[i] as i16) * (vb[i] as i16);
-        }
-        *result = std::mem::transmute(out);
-    }
-}
-
-extern "C" fn fallback_mul_signed_widen16(
-    result: *mut [u8; 16],
-    a: *const [u8; 16],
-    b: *const [u8; 16],
-) {
-    unsafe {
-        let va: [i16; 8] = std::mem::transmute(*a);
-        let vb: [i16; 8] = std::mem::transmute(*b);
-        let mut out = [0i32; 4];
-        for i in 0..4 {
-            out[i] = (va[i] as i32) * (vb[i] as i32);
-        }
-        *result = std::mem::transmute(out);
-    }
-}
-
-extern "C" fn fallback_mul_signed_widen32(
-    result: *mut [u8; 16],
-    a: *const [u8; 16],
-    b: *const [u8; 16],
-) {
-    unsafe {
-        let va: [i32; 4] = std::mem::transmute(*a);
-        let vb: [i32; 4] = std::mem::transmute(*b);
-        let mut out = [0i64; 2];
-        for i in 0..2 {
-            out[i] = (va[i] as i64) * (vb[i] as i64);
-        }
-        *result = std::mem::transmute(out);
-    }
-}
 
 pub fn emit_vector_multiply_signed_widen8(
     _ctx: &EmitContext,
-    ra: &mut RegAlloc,
-    inst_ref: InstRef,
-    inst: &Inst,
+    _ra: &mut RegAlloc,
+    _inst_ref: InstRef,
+    _inst: &Inst,
 ) {
-    emit_two_arg_fallback(ra, inst_ref, inst, fallback_mul_signed_widen8 as usize);
+    unreachable!();
 }
-// VectorMultiplySignedWiden16: pmullw + pmulhw + punpcklwd
-// IR: result = {a[0]*b[0], a[1]*b[1], a[2]*b[2], a[3]*b[3]} as i32x4
 pub fn emit_vector_multiply_signed_widen16(
     _ctx: &EmitContext,
-    ra: &mut RegAlloc,
-    inst_ref: InstRef,
-    inst: &Inst,
+    _ra: &mut RegAlloc,
+    _inst_ref: InstRef,
+    _inst: &Inst,
 ) {
-    let mut args = ra.get_argument_info(inst_ref, &inst.args, inst.num_args());
-    let a = ra.use_xmm(&mut args[0]);
-    let b = ra.use_xmm(&mut args[1]);
-    let lo = ra.scratch_xmm();
-    let result = ra.scratch_xmm();
-    // lo = pmullw(a, b) — low 16 bits of each 16×16 product
-    ra.asm.movaps(lo, a).unwrap();
-    ra.asm.pmullw(lo, b).unwrap();
-    // hi = pmulhw(a, b) — high 16 bits of each 16×16 product
-    ra.asm.movaps(result, a).unwrap();
-    ra.asm.pmulhw(result, b).unwrap();
-    // Interleave low 4 words: punpcklwd(lo, hi) → {lo0,hi0,lo1,hi1,lo2,hi2,lo3,hi3}
-    // This gives us 4 packed 32-bit products
-    ra.asm.punpcklwd(lo, result).unwrap();
-    ra.asm.movaps(result, lo).unwrap();
-    ra.release(lo);
-    ra.define_value(inst_ref, result);
+    unreachable!();
 }
-// VectorMultiplySignedWiden32: SSE4.1 pmuldq
-// IR: result = {a[0]*b[0], a[1]*b[1]} as i64x2
-// pmuldq gives {a[0]*b[0], a[2]*b[2]} — need to shuffle a[1]→a[2], b[1]→b[2]
 pub fn emit_vector_multiply_signed_widen32(
     _ctx: &EmitContext,
-    ra: &mut RegAlloc,
-    inst_ref: InstRef,
-    inst: &Inst,
+    _ra: &mut RegAlloc,
+    _inst_ref: InstRef,
+    _inst: &Inst,
 ) {
-    let mut args = ra.get_argument_info(inst_ref, &inst.args, inst.num_args());
-    let a = ra.use_xmm(&mut args[0]);
-    let b = ra.use_xmm(&mut args[1]);
-    let result = ra.scratch_xmm();
-    let b_shuf = ra.scratch_xmm();
-    // Shuffle: move dword[1] to dword[2]: pshufd(_, _, 0b_01_01_00_00) = 0x50
-    // dword[0] stays at [0], dword[1] goes to [2]
-    ra.asm.pshufd(result, a, 0x50).unwrap(); // result = {a[0], a[0], a[1], a[1]}
-    ra.asm.pshufd(b_shuf, b, 0x50).unwrap(); // b_shuf = {b[0], b[0], b[1], b[1]}
-    ra.asm.pmuldq(result, b_shuf).unwrap(); // result = {a[0]*b[0], a[1]*b[1]}
-    ra.release(b_shuf);
-    ra.define_value(inst_ref, result);
+    unreachable!();
 }
 
 // ---------------------------------------------------------------------------
-// VectorMultiplyUnsignedWiden — fallback
+// VectorMultiplyUnsignedWiden — eliminated by the mandatory x64 polyfill
 // ---------------------------------------------------------------------------
-
-extern "C" fn fallback_mul_unsigned_widen8(
-    result: *mut [u8; 16],
-    a: *const [u8; 16],
-    b: *const [u8; 16],
-) {
-    unsafe {
-        let va: [u8; 16] = *a;
-        let vb: [u8; 16] = *b;
-        let mut out = [0u16; 8];
-        for i in 0..8 {
-            out[i] = (va[i] as u16) * (vb[i] as u16);
-        }
-        *result = std::mem::transmute(out);
-    }
-}
-
-extern "C" fn fallback_mul_unsigned_widen16(
-    result: *mut [u8; 16],
-    a: *const [u8; 16],
-    b: *const [u8; 16],
-) {
-    unsafe {
-        let va: [u16; 8] = std::mem::transmute(*a);
-        let vb: [u16; 8] = std::mem::transmute(*b);
-        let mut out = [0u32; 4];
-        for i in 0..4 {
-            out[i] = (va[i] as u32) * (vb[i] as u32);
-        }
-        *result = std::mem::transmute(out);
-    }
-}
-
-extern "C" fn fallback_mul_unsigned_widen32(
-    result: *mut [u8; 16],
-    a: *const [u8; 16],
-    b: *const [u8; 16],
-) {
-    unsafe {
-        let va: [u32; 4] = std::mem::transmute(*a);
-        let vb: [u32; 4] = std::mem::transmute(*b);
-        let mut out = [0u64; 2];
-        for i in 0..2 {
-            out[i] = (va[i] as u64) * (vb[i] as u64);
-        }
-        *result = std::mem::transmute(out);
-    }
-}
 
 pub fn emit_vector_multiply_unsigned_widen8(
     _ctx: &EmitContext,
-    ra: &mut RegAlloc,
-    inst_ref: InstRef,
-    inst: &Inst,
+    _ra: &mut RegAlloc,
+    _inst_ref: InstRef,
+    _inst: &Inst,
 ) {
-    emit_two_arg_fallback(ra, inst_ref, inst, fallback_mul_unsigned_widen8 as usize);
+    unreachable!();
 }
-// VectorMultiplyUnsignedWiden16: pmullw + pmulhuw + punpcklwd
 pub fn emit_vector_multiply_unsigned_widen16(
     _ctx: &EmitContext,
-    ra: &mut RegAlloc,
-    inst_ref: InstRef,
-    inst: &Inst,
+    _ra: &mut RegAlloc,
+    _inst_ref: InstRef,
+    _inst: &Inst,
 ) {
-    let mut args = ra.get_argument_info(inst_ref, &inst.args, inst.num_args());
-    let a = ra.use_xmm(&mut args[0]);
-    let b = ra.use_xmm(&mut args[1]);
-    let lo = ra.scratch_xmm();
-    let result = ra.scratch_xmm();
-    // lo = pmullw(a, b) — low 16 bits of each unsigned 16×16 product
-    ra.asm.movaps(lo, a).unwrap();
-    ra.asm.pmullw(lo, b).unwrap();
-    // hi = pmulhuw(a, b) — high 16 bits of each unsigned 16×16 product
-    ra.asm.movaps(result, a).unwrap();
-    ra.asm.pmulhuw(result, b).unwrap();
-    // Interleave: punpcklwd(lo, hi) → {lo0,hi0,lo1,hi1,lo2,hi2,lo3,hi3}
-    ra.asm.punpcklwd(lo, result).unwrap();
-    ra.asm.movaps(result, lo).unwrap();
-    ra.release(lo);
-    ra.define_value(inst_ref, result);
+    unreachable!();
 }
-// VectorMultiplyUnsignedWiden32: SSE2 pmuludq (same shuffle trick as signed)
 pub fn emit_vector_multiply_unsigned_widen32(
     _ctx: &EmitContext,
-    ra: &mut RegAlloc,
-    inst_ref: InstRef,
-    inst: &Inst,
+    _ra: &mut RegAlloc,
+    _inst_ref: InstRef,
+    _inst: &Inst,
 ) {
-    let mut args = ra.get_argument_info(inst_ref, &inst.args, inst.num_args());
-    let a = ra.use_xmm(&mut args[0]);
-    let b = ra.use_xmm(&mut args[1]);
-    let result = ra.scratch_xmm();
-    let b_shuf = ra.scratch_xmm();
-    // pshufd with 0x50: {d[0], d[0], d[1], d[1]}
-    ra.asm.pshufd(result, a, 0x50).unwrap();
-    ra.asm.pshufd(b_shuf, b, 0x50).unwrap();
-    ra.asm.pmuludq(result, b_shuf).unwrap();
-    ra.release(b_shuf);
-    ra.define_value(inst_ref, result);
+    unreachable!();
 }
 
 // ---------------------------------------------------------------------------

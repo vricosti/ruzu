@@ -4031,3 +4031,29 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 ### Binary layout verification
 
 - N/A: these methods emit JIT instructions and define no shared or serialized structures.
+
+## 2026-08-21 — `src/rdynarmic/src/ir/opt/polyfill.rs` and `backend/x64/emit_vector_multiply.rs` vs `src/dynarmic/src/dynarmic/ir/opt_passes.{h,cpp}` and `backend/x64/emit_x64_vector.cpp` (widening-multiply slice)
+
+### Intentional differences
+
+- Rust rebuilds its arena-backed instruction list while preserving the original SSA mapping;
+  Eden inserts replacement instructions before the current linked-list node and redirects its
+  uses. Both produce two sign/zero extensions followed by a multiply at twice the element width.
+- Rust's `unreachable!()` is the direct assertion equivalent of Eden's `UNREACHABLE()` macro.
+
+### Unintentional differences (to fix)
+
+- None in the focused slice. The x64 A32 and A64 pipelines enable widening-multiply polyfill
+  unconditionally, and the strengthened regression verifies all six signed/unsigned 8/16/32-bit
+  source opcodes are eliminated.
+- Removed the six x64 callback/SSE implementations that had no Eden counterpart. The matching x64
+  emitters now assert unreachable after legalization exactly like Eden.
+
+### Missing items
+
+- None for x64 widening-multiply legalization and emitter ownership. The ARM64 backend retains its
+  native widening emitters, matching Eden's separate ARM64 backend behavior.
+
+### Binary layout verification
+
+- N/A: the polyfill rewrites IR and the emitters define no shared or serialized structures.
