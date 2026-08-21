@@ -180,11 +180,73 @@ the Rust manager that have no direct C++ counterpart.
 
 ---
 
+## 6. Explicit GPU-thread shutdown before borrowed owners
+
+**Upstream.** `GPU::Impl` stores `renderer`, `gpu_thread`, and `scheduler`
+directly as members. C++ destroys members in reverse declaration order. In
+particular, `ThreadManager`'s `std::jthread` requests stop and joins before the
+earlier-declared renderer is destroyed. The scheduler has a trivial destructor
+and its in-place storage remains part of `GPU::Impl` until the enclosing object
+is released.
+
+**The port.** `Gpu::drop` explicitly invokes the idempotent
+`ThreadManager::shutdown` before Rust automatically drops the remaining fields.
+The operation requests stop, wakes the command queue, takes the `JoinHandle`,
+and joins it. `ThreadManager::drop` calls the same helper as a fallback.
+
+**Why.** Rust drops fields in declaration order, so the renderer would otherwise
+be destroyed before `gpu_thread`. In addition, Ruzu's scheduler is a
+`Box<Scheduler>` rather than an in-place member: dropping it frees the storage
+immediately. The GPU thread keeps raw pointers to both owners after
+`start_thread`; joining first prevents it from dereferencing freed storage.
+The previous order intermittently produced a `SlotVector` panic, allocator
+corruption, or a permanent join wait while closing software.
+
+**Cost.** GPU destruction performs one explicit stop/wake/join operation. The
+fallback destructor is idempotent because the joined handle has already been
+taken. This preserves Eden's observable lifetime contract while accounting for
+Rust's field order and boxed scheduler representation.
+
+---
+
+## 7. Retain AudioCore through delayed kernel-session finalization
+
+**Upstream.** `System::Impl::ShutdownMainProcess` resets `services`, then
+destroys `audio_core` before the GPU and CPU manager. Eden's kernel/service
+lifecycle has already released the audio-renderer sessions that need the
+AudioRenderSystemManager worker at that point.
+
+**The port.** Ruzu destroys `audio_core` only after CPU shutdown and
+`finalize_terminated_processes_after_cpu_shutdown` have dropped the remaining
+kernel sessions.
+
+**Why.** Rust retains `KSession` objects in the terminated-process table beyond
+the earlier service-manager reset. Dropping one of those sessions runs
+`AudioRenderer::finalize`; an active automatic renderer requests stop and waits
+for `AudioRenderSystemManager` to signal its terminate event. Destroying
+`audio_core` at Eden's earlier location stops that worker first and makes the
+wait permanent. Keeping AudioCore alive preserves the upstream requirement
+that the renderer worker outlive every session finalizer, despite the port's
+later session-release boundary.
+
+**Cost.** AudioCore, its render manager, ADSP, and sink handles remain allocated
+through CPU shutdown. They are still destroyed during the same
+`shutdown_main_process` call, immediately after the last delayed session is
+released.
+
+---
+
 ## Verification status of the above
 
-- `cargo test -p video_core --lib`: 1464 passed, 0 failed, including focused
+- `cargo test -p video_core`: 1468 passed, 0 failed, 1 ignored, including focused
   regressions for `BankBase::close`, `is_dead`, and `BankPool::can_recycle_front`
   in `src/video_core/src/query_cache/bank_base.rs`.
+- `cargo test -p audio_core`: 202 passed, 0 failed.
+- `cargo test -p ruzu`: 254 passed, 0 failed.
+- A release run of the SuperTuxKart homebrew completed Stop teardown with
+  `CpuManager: shutdown complete`, `AudioRenderSystemManager::stop`, then
+  `System: shutdown complete`; no GPU panic, allocator corruption, or blocked
+  audio terminate-event wait remained.
 - Successive samples reports are cumulative until `ResetCounter`, matching
   upstream `WriteCounter`; focused tests cover history snapshots and wide-range
   merging.

@@ -1669,3 +1669,75 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 ### Binary layout verification
 
 - N/A: this is a path-only structural migration and changes no guest-visible layout.
+
+## 2026-08-21 — `src/ruzu/src/homebrew_vfs.rs` vs Eden `src/core/file_sys/vfs/vfs_layered.{h,cpp}` and `src/core/hle/service/filesystem/filesystem.cpp`
+
+### Intentional differences
+
+- Ruzu's frontend-owned writable SDMC view now treats an NRO directly inside a directory named
+  `switch` as a conventional SD-card archive: the directory above `switch` becomes the writable
+  upper layer. This exposes asset directories shipped beside `switch` without host links or a
+  manual copy into the configured SDMC. Eden has no automatic host-package mount and continues to
+  open only its configured `SDMCFactory` root.
+- NROs in flat or per-application layouts retain the previous containing-directory root, and the
+  configured SDMC remains the fallback layer in both cases.
+
+### Unintentional differences (to fix)
+
+- None in the reviewed package-root selection slice.
+
+### Missing items
+
+- None for conventional `<package>/switch/application.nro` asset visibility.
+
+### Binary layout verification
+
+- N/A: the change selects a host `VirtualDir` root and does not alter serialized or guest ABI
+  structures.
+
+## 2026-08-21 — `src/video_core/src/gpu.rs` and `src/video_core/src/gpu_thread.rs` vs Eden `src/video_core/gpu.{h,cpp}` and `src/video_core/gpu_thread.{h,cpp}`
+
+### Intentional differences
+
+- Ruzu exposes an idempotent `ThreadManager::shutdown` helper because Rust field destruction runs
+  in declaration order. `Gpu::drop` invokes it explicitly to reproduce the relevant C++ reverse
+  member destruction contract: `GPU::Impl::gpu_thread` is stopped and joined while `renderer` is
+  still alive. Ruzu also stops the thread before freeing its boxed scheduler; Eden's scheduler is
+  stored in-place and has a trivial destructor, so its storage remains within `GPU::Impl` while
+  `gpu_thread` is destroyed.
+
+### Unintentional differences (to fix)
+
+- None in the reviewed GPU-thread lifetime slice. Previously, Rust could destroy renderer-owned
+  state before requesting GPU-thread stop, causing a shutdown join hang, `SlotVector` panic, or
+  allocator corruption.
+
+### Missing items
+
+- None for GPU-thread shutdown ordering.
+
+### Binary layout verification
+
+- N/A: the change affects host-thread lifecycle only.
+
+## 2026-08-21 — `src/core/src/core.rs` vs Eden `src/core/core.{h,cpp}` (`System::Impl::ShutdownMainProcess`)
+
+### Intentional differences
+
+- Eden destroys `audio_core` before `gpu_core` and `CpuManager::Shutdown`. Ruzu retains
+  `audio_core` until after `finalize_terminated_processes_after_cpu_shutdown`, because Rust kernel
+  sessions can keep `IAudioRenderer` alive in the terminated-process table. Its finalizer waits
+  for a signal from `AudioRenderSystemManager`; destroying `audio_core` at Eden's earlier point
+  stops that worker first and deadlocks shutdown.
+
+### Unintentional differences (to fix)
+
+- None in the reviewed shutdown slice.
+
+### Missing items
+
+- None for GPU shutdown and delayed Rust session finalization ordering.
+
+### Binary layout verification
+
+- N/A: the change affects host subsystem lifetime only.

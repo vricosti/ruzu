@@ -519,7 +519,7 @@ fn run_boot(
                 sdmc_root,
             ) {
                 log::info!(
-                    "Using the standalone NRO directory as the writable SDMC layer for {}",
+                    "Using the standalone NRO package root as the writable SDMC layer for {}",
                     filepath
                 );
                 filesystem_controller.set_sdmc_open_override(Some(homebrew_sdmc));

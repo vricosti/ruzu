@@ -183,6 +183,20 @@ pub struct Gpu {
     system: Mutex<SystemRef>,
 }
 
+impl Drop for Gpu {
+    fn drop(&mut self) {
+        // C++ destroys `GPU::Impl` members in reverse declaration order, so
+        // `gpu_thread` is stopped before `renderer`. Rust drops fields in
+        // declaration order and its scheduler is boxed rather than stored
+        // in-place; stop the thread while every raw pointer installed by
+        // `start_thread` still refers to live storage.
+        self.gpu_thread
+            .get_mut()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .shutdown();
+    }
+}
+
 #[derive(Default)]
 struct RequestSwapCounters {
     free_swap_counters: VecDeque<usize>,
