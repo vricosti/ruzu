@@ -22,9 +22,11 @@
 //! | `-u` / `--user`      | `user`                   |
 //! | `-v` / `--version`   | handled by clap          |
 
-use clap::Parser;
+use clap::{CommandFactory, Parser};
 use common::settings_enums::RendererBackend;
 use libc;
+use network::room::{StatusMessageTypes, DEFAULT_ROOM_PORT, NO_PREFERRED_IP};
+use network::room_member::{ChatEntry, RoomMemberError, RoomMemberState, StatusMessageEntry};
 use std::ffi::OsStr;
 
 pub mod emu_window;
@@ -69,7 +71,10 @@ fn resolve_renderer_backend(
 
 #[cfg(test)]
 mod tests {
-    use super::{resolve_renderer_backend, RendererBackend};
+    use super::{
+        parse_multiplayer_config, resolve_renderer_backend, MultiplayerConfig, RendererBackend,
+    };
+    use network::room::DEFAULT_ROOM_PORT;
 
     #[test]
     fn configured_renderer_is_used_without_cli_override() {
@@ -97,6 +102,61 @@ mod tests {
             resolve_renderer_backend(Some("GL"), RendererBackend::Vulkan),
             "opengl"
         );
+    }
+
+    #[test]
+    fn multiplayer_argument_matches_upstream_fields_and_default_port() {
+        assert_eq!(
+            parse_multiplayer_config("FreePlayer:secret@example.org:24872"),
+            Ok(MultiplayerConfig {
+                nickname: "FreePlayer".into(),
+                password: "secret".into(),
+                address: "example.org".into(),
+                port: 24872,
+            })
+        );
+        assert_eq!(
+            parse_multiplayer_config("Free Player@example.org")
+                .unwrap()
+                .port,
+            DEFAULT_ROOM_PORT
+        );
+    }
+
+    #[test]
+    fn multiplayer_port_preserves_upstream_base_zero_and_u16_cast() {
+        assert_eq!(
+            parse_multiplayer_config("FreePlayer@example.org:010")
+                .unwrap()
+                .port,
+            8
+        );
+        assert_eq!(
+            parse_multiplayer_config("FreePlayer@example.org:65537")
+                .unwrap()
+                .port,
+            1
+        );
+        assert_eq!(
+            parse_multiplayer_config("FreePlayer@example.org:09")
+                .unwrap()
+                .port,
+            0
+        );
+        assert_eq!(
+            parse_multiplayer_config(
+                "FreePlayer@example.org:999999999999999999999999999999999999999"
+            )
+            .unwrap()
+            .port,
+            u16::MAX
+        );
+    }
+
+    #[test]
+    fn multiplayer_argument_rejects_upstream_invalid_forms() {
+        assert!(parse_multiplayer_config("missing-address").is_err());
+        assert!(parse_multiplayer_config("invalid/name@example.org").is_err());
     }
 }
 
@@ -166,7 +226,7 @@ struct Args {
 }
 
 // ---------------------------------------------------------------------------
-// Network callback stubs
+// Network callbacks
 //
 // Maps to the static helpers `OnStateChanged`, `OnNetworkError`,
 // `OnMessageReceived`, `OnStatusMessageReceived` in `yuzu.cpp`.
@@ -175,90 +235,163 @@ struct Args {
 /// Called when the room-member connection state changes.
 ///
 /// Maps to C++ `static void OnStateChanged(const Network::RoomMember::State&)`.
-fn on_state_changed(state: u32) {
-    // Upstream: switch (state) { Idle, Joining, Joined, Moderator }
+fn on_state_changed(state: &RoomMemberState) {
     match state {
-        0 => log::debug!("Network: Network is idle"),
-        1 => log::debug!("Network: Connection sequence to room started"),
-        2 => log::debug!("Network: Successfully joined to the room"),
-        3 => log::debug!("Network: Successfully joined the room as a moderator"),
-        _ => {}
+        RoomMemberState::Idle => log::debug!("Network: Network is idle"),
+        RoomMemberState::Joining => {
+            log::debug!("Network: Connection sequence to room started")
+        }
+        RoomMemberState::Joined => log::debug!("Network: Successfully joined to the room"),
+        RoomMemberState::Moderator => {
+            log::debug!("Network: Successfully joined the room as a moderator")
+        }
+        RoomMemberState::Uninitialized => {}
     }
 }
 
 /// Called when a network error occurs. Logs the error and may exit.
 ///
 /// Maps to C++ `static void OnNetworkError(const Network::RoomMember::Error&)`.
-fn on_network_error(error: u32) {
-    // Upstream: switch (error) — fatal errors call exit(1)
+fn on_network_error(error: &RoomMemberError) {
     match error {
-        0 => log::debug!("Network: Lost connection to the room"),
-        1 => {
+        RoomMemberError::LostConnection => log::debug!("Network: Lost connection to the room"),
+        RoomMemberError::CouldNotConnect => {
             log::error!("Network: Error: Could not connect");
             std::process::exit(1);
         }
-        2 => {
+        RoomMemberError::NameCollision => {
             log::error!(
                 "Network: You tried to use the same nickname as another user \
                  that is connected to the Room"
             );
             std::process::exit(1);
         }
-        3 => {
+        RoomMemberError::IpCollision => {
             log::error!(
                 "Network: You tried to use the same fake IP-Address as another user \
                  that is connected to the Room"
             );
             std::process::exit(1);
         }
-        4 => {
+        RoomMemberError::WrongPassword => {
             log::error!("Network: Room replied with: Wrong password");
             std::process::exit(1);
         }
-        5 => {
+        RoomMemberError::WrongVersion => {
             log::error!(
                 "Network: You are using a different version than the room \
                  you are trying to connect to"
             );
             std::process::exit(1);
         }
-        6 => {
+        RoomMemberError::RoomIsFull => {
             log::error!("Network: The room is full");
             std::process::exit(1);
         }
-        7 => log::error!("Network: You have been kicked by the host"),
-        8 => log::error!("Network: You have been banned by the host"),
-        9 => log::error!("Network: UnknownError"),
-        10 => log::error!("Network: PermissionDenied"),
-        11 => log::error!("Network: NoSuchUser"),
-        _ => log::error!("Network: Unknown error code {}", error),
+        RoomMemberError::HostKicked => log::error!("Network: You have been kicked by the host"),
+        RoomMemberError::HostBanned => log::error!("Network: You have been banned by the host"),
+        RoomMemberError::UnknownError => log::error!("Network: UnknownError"),
+        RoomMemberError::PermissionDenied => log::error!("Network: PermissionDenied"),
+        RoomMemberError::NoSuchUser => log::error!("Network: NoSuchUser"),
     }
 }
 
 /// Called when a chat message is received from another room member.
 ///
 /// Maps to C++ `static void OnMessageReceived(const Network::ChatEntry&)`.
-fn on_message_received(nickname: &str, message: &str) {
-    println!("\n{}: {}\n", nickname, message);
+fn on_message_received(message: &ChatEntry) {
+    println!("\n{}: {}\n", message.nickname, message.message);
 }
 
 /// Called when a status message (join/leave/kick/ban) is received.
 ///
 /// Maps to C++ `static void OnStatusMessageReceived(const Network::StatusMessageEntry&)`.
-fn on_status_message_received(msg_type: u32, nickname: &str) {
-    // Upstream: Network::IdMemberJoin=1, IdMemberLeave=2, IdMemberKicked=3,
-    //           IdMemberBanned=4, IdAddressUnbanned=5
-    let message = match msg_type {
-        1 => Some(format!("{} has joined", nickname)),
-        2 => Some(format!("{} has left", nickname)),
-        3 => Some(format!("{} has been kicked", nickname)),
-        4 => Some(format!("{} has been banned", nickname)),
-        5 => Some(format!("{} has been unbanned", nickname)),
-        _ => None,
+fn on_status_message_received(status: &StatusMessageEntry) {
+    let message = match status.message_type {
+        StatusMessageTypes::IdMemberJoin => format!("{} has joined", status.nickname),
+        StatusMessageTypes::IdMemberLeave => format!("{} has left", status.nickname),
+        StatusMessageTypes::IdMemberKicked => format!("{} has been kicked", status.nickname),
+        StatusMessageTypes::IdMemberBanned => format!("{} has been banned", status.nickname),
+        StatusMessageTypes::IdAddressUnbanned => {
+            format!("{} has been unbanned", status.nickname)
+        }
     };
-    if let Some(msg) = message {
-        println!("\n* {}\n", msg);
+    println!("\n* {}\n", message);
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct MultiplayerConfig {
+    nickname: String,
+    password: String,
+    address: String,
+    port: u16,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MultiplayerParseError {
+    WrongFormat,
+    InvalidNickname,
+    EmptyAddress,
+}
+
+impl MultiplayerParseError {
+    fn message(self) -> &'static str {
+        match self {
+            Self::WrongFormat => "Wrong format for option --multiplayer",
+            Self::InvalidNickname => {
+                "Nickname is not valid. Must be 4 to 20 alphanumeric characters"
+            }
+            Self::EmptyAddress => "Address to room must not be empty",
+        }
     }
+}
+
+fn strtoul_base_zero_as_u16(value: &str) -> u16 {
+    let (digits, radix) = if value.len() > 1 && value.starts_with('0') {
+        (&value[1..], 8)
+    } else {
+        (value, 10)
+    };
+    let mut result = 0_u64;
+    for digit in digits.bytes() {
+        let value = match digit {
+            b'0'..=b'7' => u64::from(digit - b'0'),
+            b'8'..=b'9' if radix == 10 => u64::from(digit - b'0'),
+            _ => break,
+        };
+        result = result.saturating_mul(radix).saturating_add(value);
+    }
+    result as u16
+}
+
+fn parse_multiplayer_config(value: &str) -> Result<MultiplayerConfig, MultiplayerParseError> {
+    let format = regex::Regex::new(r"^([^:]+)(?::(.+))?@([^:]+)(?::([0-9]+))?$")
+        .expect("upstream multiplayer expression is valid");
+    let captures = format
+        .captures(value)
+        .ok_or(MultiplayerParseError::WrongFormat)?;
+    let nickname = captures[1].to_string();
+    let password = captures
+        .get(2)
+        .map_or_else(String::new, |value| value.as_str().to_string());
+    let address = captures[3].to_string();
+    let port = captures.get(4).map_or(DEFAULT_ROOM_PORT, |value| {
+        strtoul_base_zero_as_u16(value.as_str())
+    });
+    let nickname_format =
+        regex::Regex::new(r"^[a-zA-Z0-9._\- ]+$").expect("upstream nickname expression is valid");
+    if !nickname_format.is_match(&nickname) {
+        return Err(MultiplayerParseError::InvalidNickname);
+    }
+    if address.is_empty() {
+        return Err(MultiplayerParseError::EmptyAddress);
+    }
+    Ok(MultiplayerConfig {
+        nickname,
+        password,
+        address,
+        port,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -733,6 +866,18 @@ fn main() {
 
     // Parse CLI arguments (upstream: getopt_long loop).
     let args = Args::parse();
+    let multiplayer = args.multiplayer.as_deref().map(|value| {
+        parse_multiplayer_config(value).unwrap_or_else(|error| {
+            if error == MultiplayerParseError::WrongFormat {
+                println!("{}", error.message());
+                let _ = Args::command().print_help();
+                println!();
+            } else {
+                log::error!("{}", error.message());
+            }
+            std::process::exit(1);
+        })
+    });
 
     // Resolve game path from --game flag or positional argument.
     // Maps to C++ `filepath` variable.
@@ -1277,12 +1422,37 @@ fn main() {
         std::process::exit(-1);
     }
 
-    // Multiplayer callbacks are wired here when Network::RoomMember is ported.
-    if let Some(ref mp) = args.multiplayer {
-        log::warn!(
-            "Multiplayer '{}' requested but Network::RoomMember not yet ported; ignoring",
-            mp
+    let mut multiplayer_network = None;
+    if let Some(multiplayer) = multiplayer {
+        let mut room_network = network::network::RoomNetwork::new();
+        if !room_network.init() {
+            log::error!("Network: initialization failed");
+            std::process::exit(1);
+        }
+        let Some(member) = room_network.get_room_member().upgrade() else {
+            log::error!("Network: Could not access RoomMember");
+            std::process::exit(1);
+        };
+        member.bind_on_chat_message_received(on_message_received);
+        member.bind_on_status_message_received(on_status_message_received);
+        member.bind_on_state_changed(on_state_changed);
+        member.bind_on_error(on_network_error);
+        log::debug!(
+            "Network: Start connection to {}:{} with nickname {}",
+            multiplayer.address,
+            multiplayer.port,
+            multiplayer.nickname
         );
+        member.join(
+            &multiplayer.nickname,
+            &multiplayer.address,
+            multiplayer.port,
+            0,
+            &NO_PREFERRED_IP,
+            &multiplayer.password,
+            "",
+        );
+        multiplayer_network = Some(room_network);
     }
 
     // Upstream loads and fully builds the disk pipeline cache before starting
@@ -1416,6 +1586,10 @@ fn main() {
     log::info!("Shutdown phase: system.shutdown_main_process() begin");
     system.shutdown_main_process();
     log::info!("Shutdown phase: system.shutdown_main_process() end");
+
+    if let Some(mut room_network) = multiplayer_network {
+        room_network.shutdown();
+    }
 
     // Force-exit the process. Some background threads (CPU core idle loops,
     // audio ADSP, CoreTiming timer) block on condvars that aren't cleanly

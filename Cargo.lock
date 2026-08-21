@@ -2022,10 +2022,12 @@ dependencies = [
  "input_common",
  "libc",
  "log",
+ "network",
  "objc",
  "parking_lot",
  "raw-window-handle 0.6.2",
  "rdynarmic",
+ "regex",
  "sdl3",
  "video_core",
 ]

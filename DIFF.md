@@ -4180,3 +4180,33 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 ### Binary layout verification
 
 - N/A: neither configuration class is serialized by raw object layout.
+
+## 2026-08-21 — `src/ruzu_cmd/src/main.rs` vs `src/yuzu_cmd/yuzu.cpp` (multiplayer CLI slice)
+
+### Intentional differences
+
+- Rust stores the parsed nickname, password, address, and port in one `MultiplayerConfig` value;
+  Eden keeps the same four values as separate `SDL_AppInit` locals.
+- Rust owns a `RoomNetwork` for the duration of the optional multiplayer session and shuts it down
+  before process exit. Eden accesses module-global weak room handles; its CLI source does not call
+  `Network::Init()` itself even though `GetRoomMember()` requires that global initialization. The
+  explicit Rust owner is required by the target network API and makes the intended Eden join path
+  reachable without changing callback or join ordering.
+- Rust passes an empty authentication token because the target `RoomMember::join` includes the
+  newer token parameter; Eden's focused CLI call predates that parameter.
+- The Rust status-message enum contains only Eden's five recognized message kinds, so the C++
+  switch's unknown-value/default empty-message branch is unrepresentable.
+
+### Unintentional differences (to fix)
+
+- None in the focused slice. The command-line expression, default/base-zero port conversion,
+  nickname and address validation, callback messages and fatal-error policy, callback binding
+  order, and post-load `Join` arguments match Eden.
+
+### Missing items
+
+- None for the `--multiplayer` parser, four CLI callbacks, binding, and room join lifecycle.
+
+### Binary layout verification
+
+- N/A: the frontend passes typed network values and does not serialize these values by raw layout.

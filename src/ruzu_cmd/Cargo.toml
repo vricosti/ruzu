@@ -20,6 +20,7 @@ hid_core = { path = "../hid_core" }
 video_core = { workspace = true }
 input_common = { workspace = true }
 frontend_common = { workspace = true }
+network = { workspace = true }
 parking_lot.workspace = true
 gl = { workspace = true }
 ash = { workspace = true }
@@ -29,6 +30,7 @@ log = { workspace = true }
 env_logger = { workspace = true }
 rdynarmic = { workspace = true }
 libc = { workspace = true }
+regex = "1"
 sdl3.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
