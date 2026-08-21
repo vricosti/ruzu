@@ -14,6 +14,25 @@ pub fn show_message<P: IsA<gtk::Window>>(parent: Option<&P>, message: &str, deta
     show_message_with_type(parent, message, detail, MessageType::Info, false);
 }
 
+/// Show a modal informational message and run `callback` once it is closed.
+pub fn show_message_then<P: IsA<gtk::Window>>(
+    parent: Option<&P>,
+    message: &str,
+    detail: &str,
+    callback: impl FnOnce() + 'static,
+) {
+    let message = crate::i18n::tr(message);
+    let detail = crate::i18n::tr(detail);
+    show_pretranslated_message_with_type_then(
+        parent,
+        &message,
+        &detail,
+        MessageType::Info,
+        false,
+        callback,
+    );
+}
+
 /// Show an informational message whose title and detail were already passed
 /// through the translation layer. This preserves dynamic values such as
 /// emulator names and filesystem paths from brand normalization.
@@ -44,11 +63,6 @@ pub fn show_pretranslated_error<P: IsA<gtk::Window>>(
     show_pretranslated_message_with_type(parent, message, detail, MessageType::Error, false);
 }
 
-/// Show a warning whose translated detail contains trusted Pango markup.
-pub fn show_warning_markup<P: IsA<gtk::Window>>(parent: Option<&P>, message: &str, detail: &str) {
-    show_message_with_type(parent, message, detail, MessageType::Warning, true);
-}
-
 fn show_message_with_type<P: IsA<gtk::Window>>(
     parent: Option<&P>,
     message: &str,
@@ -74,6 +88,24 @@ fn show_pretranslated_message_with_type<P: IsA<gtk::Window>>(
     message_type: MessageType,
     detail_uses_markup: bool,
 ) {
+    show_pretranslated_message_with_type_then(
+        parent,
+        message,
+        detail,
+        message_type,
+        detail_uses_markup,
+        || {},
+    );
+}
+
+fn show_pretranslated_message_with_type_then<P: IsA<gtk::Window>>(
+    parent: Option<&P>,
+    message: &str,
+    detail: &str,
+    message_type: MessageType,
+    detail_uses_markup: bool,
+    callback: impl FnOnce() + 'static,
+) {
     let detail = if detail_uses_markup {
         // Qt rich text uses HTML line breaks; GtkLabel consumes Pango markup.
         detail.replace("<br>", "\n").replace("<br/>", "\n")
@@ -91,7 +123,13 @@ fn show_pretranslated_message_with_type<P: IsA<gtk::Window>>(
     if let Some(parent) = parent {
         dialog.set_transient_for(Some(parent));
     }
-    dialog.connect_response(|dialog, _| dialog.close());
+    let callback = RefCell::new(Some(callback));
+    dialog.connect_response(move |dialog, _| {
+        dialog.close();
+        if let Some(callback) = callback.borrow_mut().take() {
+            callback();
+        }
+    });
     dialog.present();
 }
 
@@ -124,10 +162,10 @@ pub fn ask_question<P: IsA<gtk::Window>>(
 
     let callback = RefCell::new(Some(callback));
     dialog.connect_response(move |dialog, response| {
+        dialog.close();
         if let Some(callback) = callback.borrow_mut().take() {
             callback(response == ResponseType::Accept);
         }
-        dialog.close();
     });
     dialog.present();
 }

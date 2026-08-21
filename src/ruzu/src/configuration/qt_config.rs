@@ -18,7 +18,7 @@
 // never written to afterwards.
 
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use common::fs::path_util::{get_ruzu_path, RuzuPath};
 use common::settings_input::{
@@ -32,6 +32,9 @@ use crate::uisettings::{self, GameDir};
 
 /// Key prefix for every game-directory setting.
 const GAMEDIRS_PREFIX: &str = "Paths\\gamedirs\\";
+
+/// Key prefix for upstream `Settings::values.external_content_dirs`.
+const EXTERNAL_CONTENT_DIRS_PREFIX: &str = "Paths\\external_content_dirs\\";
 
 /// Upstream `QtConfig::ReadUIGamelistValues` opens the `UiGameList` category and
 /// reads a `favorites` array of `program_id` entries. `TranslateCategory` renders
@@ -197,6 +200,26 @@ pub fn load_view_values() {
             "showStatusBar",
             *values.show_status_bar.get_default(),
         ));
+        values.enable_gamemode.set_value(read_ui_bool_setting(
+            &ui,
+            "enable_gamemode",
+            *values.enable_gamemode.get_default(),
+        ));
+        #[cfg(unix)]
+        {
+            values.gui_force_x11.set_value(read_ui_bool_setting(
+                &ui,
+                "gui_force_x11",
+                *values.gui_force_x11.get_default(),
+            ));
+            values
+                .gui_hide_backend_warning
+                .set_value(read_ui_bool_setting(
+                    &ui,
+                    "gui_hide_backend_warning",
+                    *values.gui_hide_backend_warning.get_default(),
+                ));
+        }
     });
 }
 
@@ -309,8 +332,8 @@ pub fn save_multiplayer_values() -> io::Result<()> {
     std::fs::write(path, contents)
 }
 
-/// Persist the five checkable `View` actions through upstream
-/// `QtConfig::SaveUIValues`'s generic `Category::Ui` writer.
+/// Persist frontend UI values through upstream `QtConfig::SaveUIValues`'s
+/// generic `Category::Ui` / `Category::UiGeneral` writer.
 pub fn save_view_values() -> io::Result<()> {
     let path = config_path();
     let mut contents = std::fs::read_to_string(&path).unwrap_or_default();
@@ -340,6 +363,27 @@ pub fn save_view_values() -> io::Result<()> {
                 "showStatusBar",
                 *values.show_status_bar.get_value(),
                 *values.show_status_bar.get_default(),
+            ),
+            (
+                "enable_gamemode",
+                *values.enable_gamemode.get_value(),
+                *values.enable_gamemode.get_default(),
+            ),
+        ] {
+            contents =
+                replace_section_setting(&contents, "UI", key, &value.to_string(), value == default);
+        }
+        #[cfg(unix)]
+        for (key, value, default) in [
+            (
+                "gui_force_x11",
+                *values.gui_force_x11.get_value(),
+                *values.gui_force_x11.get_default(),
+            ),
+            (
+                "gui_hide_backend_warning",
+                *values.gui_hide_backend_warning.get_value(),
+                *values.gui_hide_backend_warning.get_default(),
             ),
         ] {
             contents =
@@ -499,6 +543,143 @@ pub fn load_game_dirs() -> Vec<GameDir> {
         Ok(contents) => parse_game_dirs(&contents),
         Err(_) => Vec::new(),
     }
+}
+
+/// Read `Settings::values.external_content_dirs` from the QSettings array
+/// owned by upstream `QtConfig::ReadUIValues`.
+pub fn load_external_content_dirs() {
+    let directories = match std::fs::read_to_string(config_path()) {
+        Ok(contents) => parse_external_content_dirs(&contents),
+        Err(_) => Vec::new(),
+    };
+    common::settings::values_mut().external_content_dirs = directories;
+}
+
+/// Persist `Settings::values.external_content_dirs` through upstream
+/// `QtConfig::SaveUIValues`'s `external_content_dirs` array.
+pub fn save_external_content_dirs(directories: &[String]) -> io::Result<()> {
+    let path = config_path();
+    let contents = std::fs::read_to_string(&path).unwrap_or_default();
+    let updated = replace_external_content_dirs(&contents, directories);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, updated)
+}
+
+pub fn parse_external_content_dirs(contents: &str) -> Vec<String> {
+    use std::collections::BTreeMap;
+
+    let mut size: Option<u32> = None;
+    let mut directories = BTreeMap::new();
+    for line in contents.lines() {
+        let line = line.trim();
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let Some(rest) = key.strip_prefix(EXTERNAL_CONTENT_DIRS_PREFIX) else {
+            continue;
+        };
+        let Some((index, field)) = rest.split_once('\\') else {
+            if rest == "size" {
+                size = value.trim().parse().ok();
+            }
+            continue;
+        };
+        let Ok(index) = index.parse::<u32>() else {
+            continue;
+        };
+        if field == "path" && !value.is_empty() {
+            directories.insert(index, value.to_string());
+        }
+    }
+    directories
+        .into_iter()
+        .filter(|(index, _)| size.is_none_or(|size| *index <= size))
+        .map(|(_, path)| path)
+        .collect()
+}
+
+fn replace_external_content_dirs(contents: &str, directories: &[String]) -> String {
+    let had_trailing_newline = contents.is_empty() || contents.ends_with('\n');
+    let is_external_dir_line = |line: &str| {
+        line.trim()
+            .split_once('=')
+            .is_some_and(|(key, _)| key.starts_with(EXTERNAL_CONTENT_DIRS_PREFIX))
+    };
+
+    let mut out = Vec::new();
+    let mut block_written = false;
+    for line in contents.lines() {
+        if is_external_dir_line(line) {
+            if !block_written {
+                out.extend(render_external_content_dirs(directories));
+                block_written = true;
+            }
+            continue;
+        }
+        out.push(line.to_string());
+    }
+    if !block_written {
+        if !out.iter().any(|line| line.trim() == UI_SECTION) {
+            if !out.is_empty() {
+                out.push(String::new());
+            }
+            out.push(UI_SECTION.to_string());
+        }
+        out.extend(render_external_content_dirs(directories));
+    }
+
+    let mut text = out.join("\n");
+    if had_trailing_newline && !text.is_empty() {
+        text.push('\n');
+    }
+    text
+}
+
+fn render_external_content_dirs(directories: &[String]) -> Vec<String> {
+    let mut lines = Vec::with_capacity(directories.len() + 1);
+    lines.push(format!(
+        "{EXTERNAL_CONTENT_DIRS_PREFIX}size={}",
+        directories.len()
+    ));
+    for (position, path) in directories.iter().enumerate() {
+        lines.push(format!(
+            "{EXTERNAL_CONTENT_DIRS_PREFIX}{}\\path={path}",
+            position + 1
+        ));
+    }
+    lines
+}
+
+/// Read game-directory paths from another yuzu-schema frontend config without
+/// loading any of its other settings.
+pub fn load_game_dirs_from(path: &Path) -> io::Result<Vec<GameDir>> {
+    std::fs::read_to_string(path).map(|contents| parse_game_dirs(&contents))
+}
+
+/// Merge only the source frontend's configured game-directory paths into
+/// Ruzu. Existing Ruzu entries win when the same path is already present.
+pub fn import_game_dirs_from(path: &Path) -> io::Result<usize> {
+    let source = load_game_dirs_from(path)?;
+    let (merged, imported) = merge_game_dirs(load_game_dirs(), source);
+    save_game_dirs(&merged)?;
+    Ok(imported)
+}
+
+fn merge_game_dirs(mut existing: Vec<GameDir>, source: Vec<GameDir>) -> (Vec<GameDir>, usize) {
+    let mut imported = 0;
+    for directory in source {
+        if existing
+            .iter()
+            .any(|current| current.path == directory.path)
+        {
+            continue;
+        }
+        existing.push(directory);
+        imported += 1;
+    }
+    (existing, imported)
 }
 
 /// Persist `dirs` back into ruzu's config — upstream `Config::SaveUIValues`.
@@ -1278,6 +1459,28 @@ mod tests {
     }
 
     #[test]
+    fn linux_backend_preferences_use_upstream_ui_keys() {
+        let updated = replace_section_setting("", "UI", "gui_force_x11", "true", false);
+        let updated =
+            replace_section_setting(&updated, "UI", "gui_hide_backend_warning", "true", false);
+        let values = parse_section_values(&updated, "UI");
+        assert!(read_ui_bool_setting(&values, "gui_force_x11", false));
+        assert!(read_ui_bool_setting(
+            &values,
+            "gui_hide_backend_warning",
+            false
+        ));
+    }
+
+    #[test]
+    fn gamemode_uses_current_upstream_ui_general_key() {
+        let updated = replace_section_setting("", "UI", "enable_gamemode", "false", false);
+        let values = parse_section_values(&updated, "UI");
+        assert!(!read_ui_bool_setting(&values, "enable_gamemode", true));
+        assert!(!updated.contains("[Linux]"));
+    }
+
+    #[test]
     fn favorites_expanded_uses_upstream_game_list_key() {
         let key = "UIGameList\\favorites_expanded";
         let updated = replace_section_setting("", "UI", key, "false", false);
@@ -1566,6 +1769,46 @@ mod tests {
         let dirs = vec![dir("/games/a", true), dir("/games/b", false)];
         let written = replace_game_dirs("[UI]\n", &dirs);
         assert_eq!(parse_game_dirs(&written), dirs);
+    }
+
+    #[test]
+    fn external_content_directories_round_trip_with_upstream_array_shape() {
+        let directories = vec![
+            "/updates/homebrew/".to_string(),
+            "/dlc/open-source-title/".to_string(),
+        ];
+        let written = replace_external_content_dirs("[UI]\nUnrelated=value\n", &directories);
+        assert_eq!(parse_external_content_dirs(&written), directories);
+        assert!(written.contains("Paths\\external_content_dirs\\1\\path=/updates/homebrew/"));
+        assert!(written.contains("Paths\\external_content_dirs\\2\\path=/dlc/open-source-title/"));
+        assert!(written.contains("Unrelated=value"));
+    }
+
+    #[test]
+    fn external_content_array_ignores_stale_entries_past_size() {
+        let contents = concat!(
+            "[UI]\n",
+            "Paths\\external_content_dirs\\size=1\n",
+            "Paths\\external_content_dirs\\1\\path=/updates/homebrew/\n",
+            "Paths\\external_content_dirs\\2\\path=/stale/\n",
+        );
+        assert_eq!(
+            parse_external_content_dirs(contents),
+            vec!["/updates/homebrew/".to_string()]
+        );
+    }
+
+    #[test]
+    fn game_directory_import_merges_by_path_and_preserves_ruzu_values() {
+        let existing = vec![dir("/games/homebrew", false)];
+        let source = vec![
+            dir("/games/homebrew", true),
+            dir("/games/homebrew-extra", true),
+        ];
+        let (merged, imported) = merge_game_dirs(existing.clone(), source);
+        assert_eq!(imported, 1);
+        assert_eq!(merged[0], existing[0]);
+        assert_eq!(merged[1], dir("/games/homebrew-extra", true));
     }
 
     #[test]

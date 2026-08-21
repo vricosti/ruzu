@@ -423,6 +423,55 @@ mod tests {
     }
 
     #[test]
+    fn french_startup_dialogs_are_fully_translated() {
+        let _guard = test_lock();
+        set_language("fr");
+        for source in [
+            "User Data Migration",
+            "Ruzu found data from another emulator. Choose the source, the data, and how Ruzu should use it.",
+            "Source data is never moved or deleted. Copy is the recommended default; shared links make both emulators use the same directories. Shader caches are never migrated.",
+            "Source emulator",
+            "Migration method",
+            "Copy from (recommended)",
+            "Share with (symbolic link / junction point)",
+            "No migration",
+            "Firmware",
+            "Keys",
+            "Game directories",
+            "Import only the configured game folder paths. Game files are not copied or shared.",
+            "Firmware, keys, and configured game directories are offered. Game files, save data, settings, updates, DLC, SD card data, mods, and shader caches remain unchanged.",
+            "System",
+            "Next",
+            "Force X11 as Graphics Backend",
+            "External Content",
+            "Add directories to scan for DLCs and Updates without installing to NAND",
+            "Add Directory",
+            "Remove Selected",
+            "Select External Content Directory...",
+            "Directory Already Added",
+            "This directory is already in the list.",
+            "From Folder",
+            "From ZIP",
+            "Select Dumped Firmware ZIP",
+            "Zipped Archives (*.zip)",
+            "Firmware extraction failed",
+            "Firmware cleanup failed",
+            "Decryption keys are missing. Install them now?",
+            "No",
+            "Yes",
+            "Wayland Detected!",
+            "Wayland is known to have significant performance issues and mysterious bugs.\nIt's recommended to use X11 instead.\n\nWould you like to force it for future launches?",
+            "Use X11",
+            "Continue with Wayland",
+            "Don't show again",
+            "Restart Required",
+            "Restart Ruzu to apply the X11 backend.",
+        ] {
+            assert_ne!(tr(source), source, "missing French translation: {source}");
+        }
+    }
+
+    #[test]
     fn multiplayer_menu_uses_edens_french_translations() {
         let _guard = test_lock();
         set_language("fr");

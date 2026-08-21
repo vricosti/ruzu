@@ -242,7 +242,7 @@ released.
   regressions for `BankBase::close`, `is_dead`, and `BankPool::can_recycle_front`
   in `src/video_core/src/query_cache/bank_base.rs`.
 - `cargo test -p audio_core`: 202 passed, 0 failed.
-- `cargo test -p ruzu`: 254 passed, 0 failed.
+- `cargo test -p ruzu`: 257 passed, 0 failed.
 - A release run of the SuperTuxKart homebrew completed Stop teardown with
   `CpuManager: shutdown complete`, `AudioRenderSystemManager::stop`, then
   `System: shutdown complete`; no GPU panic, allocator corruption, or blocked
@@ -283,3 +283,27 @@ that succeeds but an application that cannot start on another Windows machine.
 staging every DLL in the vcpkg triplet's runtime `bin` directory. A later
 dependency-closure pass may reduce the package, but it must retain dynamically
 loaded GTK modules and cannot rely only on PE import tables.
+
+---
+
+## 9. Select the Linux display backend before GTK initialization
+
+**Upstream.** Eden stores `gui_force_x11` in `gui_config.ini` because Qt must
+read it before constructing `QApplication`. When enabled and no explicit
+`QT_QPA_PLATFORM` is present, Eden selects `xcb`. A separate UI setting controls
+whether the Wayland warning is shown again.
+
+**The port.** Ruzu mirrors the early file and key in `gui_settings.rs`. When the
+preference is enabled and `GDK_BACKEND` was not explicitly set, startup selects
+the GTK `x11` backend before constructing `gtk::Application`. The Wayland
+dialog writes both the regular UI settings and the early startup file.
+
+**Why.** GTK chooses its display backend during initialization; changing the
+setting after the main window exists cannot replace the live Wayland display.
+Keeping the early preference separate also respects an explicit environment
+override, matching Eden's precedence rule.
+
+**Cost.** Selecting X11 requires a restart and a working X server or XWayland.
+Choosing to continue with Wayland leaves the launcher usable, but Ruzu's
+embedded Linux render window still requires the separately tracked native
+Wayland child-surface implementation.

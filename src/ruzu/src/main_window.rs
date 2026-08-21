@@ -75,7 +75,7 @@ const STATUS_BAR_UPDATE_TIMEOUT_MS: u64 = 500;
 
 const QUICKSTART_URL: &str = "https://github.com/vricosti/ruzu-emu/blob/main/docs/quickstart.md";
 const MISSING_KEYS_TITLE: &str = "Derivation Components Missing";
-const MISSING_KEYS_DETAIL: &str = "Encryption keys are missing. <br>Please follow <a href='https://github.com/vricosti/ruzu-emu/blob/main/docs/quickstart.md'>the ruzu quickstart guide</a> to install your keys and firmware, then add your games.";
+const MISSING_KEYS_DETAIL: &str = "Decryption keys are missing. Install them now?";
 
 /// Upstream `StartGameType` from `yuzu/main.h`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -702,8 +702,10 @@ mod startup_prerequisite_tests {
         assert!(should_warn_about_missing_keys(false));
         assert!(!should_warn_about_missing_keys(true));
         assert!(!MISSING_KEYS_DETAIL.contains("yuzu"));
-        assert!(MISSING_KEYS_DETAIL.contains(QUICKSTART_URL));
-        assert!(include_str!("../../../docs/quickstart.md").contains("Install decryption keys"));
+        assert_eq!(
+            MISSING_KEYS_DETAIL,
+            "Decryption keys are missing. Install them now?"
+        );
     }
 }
 
@@ -818,6 +820,18 @@ mod tools_menu_tests {
         assert!(migration < screenshot);
         assert!(MENU_UI[controller..migration].contains("</section>\n      <section>"));
         assert_eq!(MENU_UI.matches("app.migration_tool").count(), 1);
+    }
+
+    #[test]
+    fn firmware_menu_exposes_folder_and_zip_sources() {
+        for action in ["install_firmware_folder", "install_firmware_zip"] {
+            assert!(MENU_ACTION_NAMES.contains(&action));
+            assert_eq!(MENU_UI.matches(&format!("app.{action}")).count(), 1);
+        }
+        let firmware = MENU_UI.find(">Install Firmware</attribute>").unwrap();
+        let folder = MENU_UI.find(">From Folder</attribute>").unwrap();
+        let zip = MENU_UI.find(">From ZIP</attribute>").unwrap();
+        assert!(firmware < folder && folder < zip);
     }
 }
 
@@ -1345,7 +1359,8 @@ impl GMainWindow {
             }};
         }
         window_action!("install_keys", on_install_decryption_keys);
-        window_action!("install_firmware", on_install_firmware);
+        window_action!("install_firmware_folder", on_install_firmware);
+        window_action!("install_firmware_zip", on_install_firmware_from_zip);
         window_action!("verify_installed_contents", on_verify_installed_contents);
         window_action!("load_amiibo", on_load_amiibo);
         window_action!("load_album", on_album);
@@ -1877,15 +1892,120 @@ impl GMainWindow {
     ///
     /// Missing firmware by itself does not produce a startup warning upstream;
     /// it only hides the firmware version and disables firmware applets.
-    fn on_check_firmware_decryption(&self) {
+    fn on_check_firmware_decryption(self: &Rc<Self>) {
         if should_warn_about_missing_keys(frontend_common::content_manager::are_keys_present()) {
-            crate::gtk_compat::show_warning_markup(
+            crate::gtk_compat::ask_question(
                 Some(&self.window),
                 MISSING_KEYS_TITLE,
                 MISSING_KEYS_DETAIL,
+                "No",
+                "Yes",
+                glib::clone!(
+                    #[weak(rename_to = this)]
+                    self,
+                    move |install| {
+                        if install {
+                            this.on_install_decryption_keys_then(glib::clone!(
+                                #[weak(rename_to = this)]
+                                this,
+                                move || this.on_check_graphics_backend()
+                            ));
+                        } else {
+                            this.on_check_graphics_backend();
+                        }
+                    }
+                ),
             );
+        } else {
+            self.on_check_graphics_backend();
         }
     }
+
+    /// Eden's `MainWindow::OnCheckGraphicsBackend`, adapted to GTK/GDK.
+    #[cfg(target_os = "linux")]
+    fn on_check_graphics_backend(self: &Rc<Self>) {
+        if !display_uses_wayland()
+            || crate::uisettings::with(|values| *values.gui_hide_backend_warning.get_value())
+        {
+            return;
+        }
+
+        let dialog = gtk::Dialog::builder()
+            .title(&crate::i18n::tr("Wayland Detected!"))
+            .transient_for(&self.window)
+            .modal(true)
+            .default_width(540)
+            .build();
+        let continue_button = dialog.add_button(
+            &crate::i18n::tr("Continue with Wayland"),
+            gtk::ResponseType::Cancel,
+        );
+        let use_x11_button =
+            dialog.add_button(&crate::i18n::tr("Use X11"), gtk::ResponseType::Accept);
+        for button in [&continue_button, &use_x11_button] {
+            button.set_margin_bottom(8);
+        }
+        use_x11_button.set_margin_end(8);
+        dialog.set_default_response(gtk::ResponseType::Accept);
+
+        let content = dialog.content_area();
+        content.set_spacing(12);
+        content.set_margin_top(16);
+        content.set_margin_bottom(12);
+        content.set_margin_start(16);
+        content.set_margin_end(16);
+        let warning = gtk::Label::new(Some(&crate::i18n::tr(
+            "Wayland is known to have significant performance issues and mysterious bugs.\nIt's recommended to use X11 instead.\n\nWould you like to force it for future launches?",
+        )));
+        warning.set_xalign(0.0);
+        warning.set_wrap(true);
+        content.append(&warning);
+        let hide_warning = gtk::CheckButton::with_label(&crate::i18n::tr("Don't show again"));
+        content.append(&hide_warning);
+
+        dialog.connect_response(glib::clone!(
+            #[weak(rename_to = this)]
+            self,
+            #[weak]
+            hide_warning,
+            move |dialog, response| {
+                dialog.close();
+                let force_x11 = response == gtk::ResponseType::Accept;
+                crate::uisettings::with_mut(|values| {
+                    values
+                        .gui_hide_backend_warning
+                        .set_value(hide_warning.is_active());
+                    if force_x11 {
+                        values.gui_force_x11.set_value(true);
+                    }
+                });
+                if let Err(error) = crate::configuration::qt_config::save_view_values() {
+                    log::warn!("Could not persist the Linux backend warning settings: {error}");
+                }
+                if !force_x11 {
+                    return;
+                }
+                if let Err(error) = crate::gui_settings::set_force_x11(true) {
+                    log::error!("Could not persist the X11 startup backend: {error}");
+                    crate::gtk_compat::show_error(
+                        Some(&this.window),
+                        "Error",
+                        "Ruzu could not save the X11 startup preference.",
+                    );
+                    return;
+                }
+                crate::gtk_compat::show_message(
+                    Some(&this.window),
+                    "Restart Required",
+                    "Restart Ruzu to apply the X11 backend.",
+                );
+            }
+        ));
+        dialog.present();
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn on_check_graphics_backend(self: &Rc<Self>) {}
 
     /// Upstream `GMainWindow::OnOpenQuickstartGuide`.
     fn on_open_quickstart_guide(&self) {
@@ -1967,10 +2087,11 @@ impl GMainWindow {
         completion: &crate::user_data_migration::MigrationCompletion,
     ) {
         log::info!(
-            "Migrated {} verified tree(s), {} file(s), and {} byte(s) from {}",
+            "Migrated {} verified tree(s), {} file(s), {} byte(s), and {} game directory path(s) from {}",
             completion.report.trees,
             completion.report.files,
             completion.report.bytes,
+            completion.report.game_directories,
             completion.emulator.name
         );
 
@@ -2010,6 +2131,7 @@ impl GMainWindow {
             self.retranslate();
             crate::configuration::qt_config::load_view_values();
             crate::configuration::qt_config::load_multiplayer_values();
+            crate::configuration::qt_config::load_external_content_dirs();
             let favorited_ids = crate::configuration::qt_config::load_favorited_ids();
             crate::uisettings::with_mut(|values| values.favorited_ids = favorited_ids);
             crate::configuration::qt_config::load_favorites_expanded();
@@ -2023,6 +2145,15 @@ impl GMainWindow {
             update_ui_theme();
         }
 
+        if completion.selection.game_directories && !completion.selection.configuration {
+            let game_dirs = crate::configuration::qt_config::load_game_dirs();
+            log::info!(
+                "Migrated {} configured game directory path(s)",
+                game_dirs.len()
+            );
+            crate::uisettings::with_mut(|values| values.game_dirs = game_dirs);
+        }
+
         if completion.selection.keys {
             ruzu_core::crypto::key_manager::KeyManager::instance()
                 .lock()
@@ -2032,6 +2163,7 @@ impl GMainWindow {
 
         self.status_bar.refresh();
         let reload_game_list = completion.selection.configuration
+            || completion.selection.game_directories
             || completion.selection.keys
             || completion.selection.nand
             || completion.selection.sdmc
@@ -2051,9 +2183,14 @@ impl GMainWindow {
     /// manager, and rescans the game list so titles that were undecryptable
     /// appear.
     fn on_install_decryption_keys(self: &Rc<Self>) {
+        self.on_install_decryption_keys_then(|| {});
+    }
+
+    fn on_install_decryption_keys_then(self: &Rc<Self>, completion: impl FnOnce() + 'static) {
         // Upstream refuses while emulation is running.
         if self.session.borrow().is_some() {
             log::info!("Install Decryption Keys ignored: emulation is running");
+            completion();
             return;
         }
 
@@ -2075,18 +2212,26 @@ impl GMainWindow {
                         Some(file) => file,
                         None => {
                             log::info!("Install Decryption Keys cancelled");
+                            completion();
                             return;
                         }
                     };
-                    let Some(prod_keys) = file.path() else { return };
-                    this.install_decryption_keys_from(&prod_keys);
+                    let Some(prod_keys) = file.path() else {
+                        completion();
+                        return;
+                    };
+                    this.install_decryption_keys_from_then(&prod_keys, completion);
                 }
             ),
         );
     }
 
     /// Install the selected key file and the adjacent optional key files.
-    fn install_decryption_keys_from(self: &Rc<Self>, prod_keys: &std::path::Path) {
+    fn install_decryption_keys_from_then(
+        self: &Rc<Self>,
+        prod_keys: &std::path::Path,
+        completion: impl FnOnce() + 'static,
+    ) {
         use frontend_common::firmware_manager::{install_keys, KeyInstallResult};
 
         let result = install_keys(prod_keys, "keys");
@@ -2105,10 +2250,11 @@ impl GMainWindow {
                 "Decryption Keys failed to initialize. Check that your dumping tools are up to date and re-dump keys."
             }
         };
-        match result {
-            KeyInstallResult::Success => self.alert("Decryption Keys install succeeded", message),
-            _ => self.alert("Decryption Keys install failed", message),
-        }
+        let title = match result {
+            KeyInstallResult::Success => "Decryption Keys install succeeded",
+            _ => "Decryption Keys install failed",
+        };
+        self.alert_then(title, message, completion);
     }
 
     /// Upstream `GMainWindow::OnInstallFirmware`.
@@ -2116,18 +2262,7 @@ impl GMainWindow {
     /// Clears `nand/system/Contents/registered` and copies the dumped firmware
     /// NCAs into it.
     fn on_install_firmware(self: &Rc<Self>) {
-        if self.session.borrow().is_some() {
-            log::info!("Install Firmware ignored: emulation is running");
-            return;
-        }
-
-        // Upstream checks for keys first: firmware NCAs cannot be read without
-        // them, so installing would produce an unusable NAND.
-        if !frontend_common::content_manager::are_keys_present() {
-            self.alert(
-                "Keys not installed",
-                "Install decryption keys and restart ruzu before attempting to install firmware.",
-            );
+        if !self.can_install_firmware() {
             return;
         }
 
@@ -2140,30 +2275,87 @@ impl GMainWindow {
                 move |result| {
                     let Some(folder) = result else { return };
                     let Some(path) = folder.path() else { return };
-                    this.install_firmware_from(&path);
+                    this.install_firmware_from(&path, false);
                 }
             ),
         );
     }
 
+    /// Upstream `GMainWindow::OnInstallFirmwareFromZIP` /
+    /// `QtCommon::Content::InstallFirmwareZip`.
+    fn on_install_firmware_from_zip(self: &Rc<Self>) {
+        if !self.can_install_firmware() {
+            return;
+        }
+
+        let filter = gtk::FileFilter::new();
+        filter.set_name(Some(&crate::i18n::tr("Zipped Archives (*.zip)")));
+        filter.add_pattern("*.zip");
+        crate::gtk_compat::open_file(
+            Some(&self.window),
+            "Select Dumped Firmware ZIP",
+            std::slice::from_ref(&filter),
+            Some(&filter),
+            glib::clone!(
+                #[weak(rename_to = this)]
+                self,
+                move |selected| {
+                    let Some(path) = selected.and_then(|file| file.path()) else {
+                        return;
+                    };
+                    let extracted = match crate::util::content::unzip_firmware_to_tmp(&path) {
+                        Ok(extracted) => extracted,
+                        Err(error) => {
+                            let _ = crate::util::content::cleanup_firmware_tmp();
+                            this.alert("Firmware extraction failed", &error);
+                            return;
+                        }
+                    };
+                    // ZIP dumps may contain an extra top-level directory, so
+                    // upstream alone enables recursive discovery for this path.
+                    this.install_firmware_from(&extracted, true);
+                    if let Err(error) = crate::util::content::cleanup_firmware_tmp() {
+                        let detail = crate::i18n::tr_args(
+                            "Failed to clean up extracted firmware cache.\nCheck write permissions in the system temp directory and try again.\nOS reported error: %1",
+                            &[error.to_string()],
+                        );
+                        this.alert("Firmware cleanup failed", &detail);
+                    }
+                }
+            ),
+        );
+    }
+
+    fn can_install_firmware(&self) -> bool {
+        if self.session.borrow().is_some() {
+            log::info!("Install Firmware ignored: emulation is running");
+            return false;
+        }
+        // Upstream checks for keys first: firmware NCAs cannot be read without
+        // them, so installing would produce an unusable NAND.
+        if !frontend_common::content_manager::are_keys_present() {
+            self.alert(
+                "Keys not installed",
+                "Install decryption keys and restart ruzu before attempting to install firmware.",
+            );
+            return false;
+        }
+        true
+    }
+
     /// Replace the installed firmware with the NCAs found in `source`.
-    fn install_firmware_from(self: &Rc<Self>, source: &std::path::Path) {
+    fn install_firmware_from(self: &Rc<Self>, source: &std::path::Path, recursive: bool) {
         log::info!("Installing firmware from {}", source.display());
 
         // Check for a reasonable number of .nca files — upstream does not
         // hardcode names, it just looks for some.
-        let mut ncas: Vec<std::path::PathBuf> = match std::fs::read_dir(source) {
-            Ok(entries) => entries
-                .filter_map(Result::ok)
-                .map(|e| e.path())
-                .filter(|p| p.extension().is_some_and(|ext| ext == "nca"))
-                .collect(),
+        let ncas = match crate::util::content::firmware_ncas(source, recursive) {
+            Ok(ncas) => ncas,
             Err(e) => {
                 log::error!("Could not read {}: {e}", source.display());
                 return;
             }
         };
-        ncas.sort();
 
         if ncas.is_empty() {
             self.alert(
@@ -2202,6 +2394,7 @@ impl GMainWindow {
         );
 
         let progress = ProgressWindow::new(&self.window, "Installing Firmware...");
+        progress.set_fraction(0.2);
         for (index, nca) in ncas.iter().enumerate() {
             let Some(name) = nca.file_name() else {
                 continue;
@@ -2218,22 +2411,45 @@ impl GMainWindow {
                 );
                 return;
             }
-            progress.set_fraction((index + 1) as f64 / ncas.len() as f64);
+            progress.set_fraction(0.2 + ((index + 1) as f64 / ncas.len() as f64) * 0.7);
         }
-        progress.close();
 
         log::info!("Installed {} firmware NCA(s)", ncas.len());
-        // Upstream then verifies the freshly installed firmware; that runs here
-        // as the separate Tools ▸ Verify Installed Contents action rather than
-        // automatically, so a slow scan does not block the install dialog.
-        self.alert(
-            "Firmware install succeeded",
-            &format!(
-                "Installed {} firmware file(s).\n\n\
-                 Run Tools ▸ Verify Installed Contents to check their integrity.",
-                ncas.len()
-            ),
+        // Recreate the filesystem registries, then verify only System NAND,
+        // matching Eden's post-copy integrity pass.
+        let vfs = ruzu_core::file_sys::vfs::vfs_real::RealVfsFilesystem::new();
+        let mut filesystem =
+            ruzu_core::hle::service::filesystem::filesystem::FileSystemController::new();
+        filesystem.create_factories(vfs, false);
+        let failed = frontend_common::content_manager::verify_installed_contents(
+            &filesystem,
+            &|total, processed| {
+                if total > 0 {
+                    progress.set_fraction(0.9 + (processed as f64 / total as f64) * 0.1);
+                }
+                false
+            },
+            true,
         );
+        progress.close();
+        if !failed.is_empty() {
+            let detail = crate::i18n::tr_args(
+                "Verification failed for the following files:\n\n%1",
+                &[failed.join("\n")],
+            );
+            self.alert("Firmware integrity verification failed!", &detail);
+            return;
+        }
+
+        self.status_bar.refresh();
+        if let Some(app) = self.window.application() {
+            update_menu_state(&app, false, true);
+        }
+        let detail = crate::i18n::tr_args(
+            "Installed and verified %1 firmware file(s).",
+            &[ncas.len().to_string()],
+        );
+        self.alert("Firmware install succeeded", &detail);
     }
 
     /// Upstream `GMainWindow::OnVerifyInstalledContents`.
@@ -2696,6 +2912,10 @@ impl GMainWindow {
     /// upstream handlers.
     fn alert(&self, message: &str, detail: &str) {
         crate::gtk_compat::show_message(Some(&self.window), message, detail);
+    }
+
+    fn alert_then(&self, message: &str, detail: &str, completion: impl FnOnce() + 'static) {
+        crate::gtk_compat::show_message_then(Some(&self.window), message, detail, completion);
     }
 
     /// Upstream `GMainWindow::OnConfigure`: build and show the configuration
@@ -4549,7 +4769,8 @@ const MENU_ACTION_NAMES: &[&str] = &[
     "reset_window_size_1080",
     // Tools
     "install_keys",
-    "install_firmware",
+    "install_firmware_folder",
+    "install_firmware_zip",
     "verify_installed_contents",
     "load_cabinet_nickname_owner",
     "load_cabinet_eraser",
@@ -4636,7 +4857,8 @@ pub fn update_menu_state(app: &Application, emulation_running: bool, is_paused: 
         set_enabled(name, emulation_running);
     }
 
-    set_enabled("install_firmware", !emulation_running);
+    set_enabled("install_firmware_folder", !emulation_running);
+    set_enabled("install_firmware_zip", !emulation_running);
     set_enabled("install_keys", !emulation_running);
     set_enabled("migration_tool", !emulation_running);
 
@@ -4813,10 +5035,19 @@ const MENU_UI: &str = r##"<?xml version="1.0" encoding="UTF-8"?>
           <attribute name="label" translatable="yes">Install Decryption Keys</attribute>
           <attribute name="action">app.install_keys</attribute>
         </item>
-        <item>
+        <submenu>
           <attribute name="label" translatable="yes">Install Firmware</attribute>
-          <attribute name="action">app.install_firmware</attribute>
-        </item>
+          <section>
+            <item>
+              <attribute name="label" translatable="yes">From Folder</attribute>
+              <attribute name="action">app.install_firmware_folder</attribute>
+            </item>
+            <item>
+              <attribute name="label" translatable="yes">From ZIP</attribute>
+              <attribute name="action">app.install_firmware_zip</attribute>
+            </item>
+          </section>
+        </submenu>
         <item>
           <attribute name="label" translatable="yes">_Verify Installed Contents</attribute>
           <attribute name="action">app.verify_installed_contents</attribute>

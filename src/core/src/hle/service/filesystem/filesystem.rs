@@ -13,8 +13,8 @@ use crate::file_sys::card_image::XCI;
 use crate::file_sys::errors;
 use crate::file_sys::fs_filesystem::{DirectoryEntryType, OpenMode};
 use crate::file_sys::registered_cache::{
-    ContentProvider, ContentProviderUnion, ContentProviderUnionSlot, PlaceholderCache,
-    RegisteredCache,
+    ContentProvider, ContentProviderUnion, ContentProviderUnionSlot, ExternalContentProvider,
+    PlaceholderCache, RegisteredCache,
 };
 use crate::file_sys::romfs_factory::{RomFSFactory, StorageId};
 use crate::file_sys::savedata_factory::SaveDataFactory;
@@ -74,6 +74,9 @@ pub struct FileSystemController {
     /// SDMC factory for SD card content and mod roots.
     /// Upstream: `std::unique_ptr<FileSys::SDMCFactory> sdmc_factory`.
     sdmc_factory: Option<SdmcFactory>,
+    /// Content discovered in the user-configured external update/DLC roots.
+    /// Upstream: `std::unique_ptr<FileSys::ExternalContentProvider> external_provider`.
+    external_provider: Option<ExternalContentProvider>,
     /// Frontend-owned per-launch view returned by `OpenSDMC`.
     ///
     /// Eden always returns `sdmc_factory->Open()`. Ruzu uses this optional
@@ -97,6 +100,7 @@ impl FileSystemController {
             bis_factory: None,
             vfs: None,
             sdmc_factory: None,
+            external_provider: None,
             sdmc_open_override: None,
             content_provider: None,
             gamecard: None,
@@ -162,6 +166,11 @@ impl FileSystemController {
         &self,
     ) -> Option<&crate::file_sys::registered_cache::RegisteredCache> {
         self.bis_factory.as_ref()?.get_user_nand_contents()
+    }
+
+    /// Port of upstream `FileSystemController::GetExternalContentProvider`.
+    pub fn get_external_content_provider(&self) -> Option<&ExternalContentProvider> {
+        self.external_provider.as_ref()
     }
 
     /// Get the System NAND content directory.
@@ -554,7 +563,7 @@ impl FileSystemController {
         self.bis_factory.as_ref()?.get_bcat_directory(title_id)
     }
 
-    /// Port of upstream `FileSystemController::CreateFactories` (filesystem.cpp:685-713).
+    /// Port of upstream `FileSystemController::CreateFactories`.
     pub fn create_factories(
         &mut self,
         vfs: Arc<crate::file_sys::vfs::vfs_real::RealVfsFilesystem>,
@@ -568,12 +577,14 @@ impl FileSystemController {
         if overwrite {
             self.bis_factory = None;
             self.sdmc_factory = None;
+            self.external_provider = None;
             self.sdmc_open_override = None;
             if let Some(provider) = self.content_provider.as_ref() {
                 let mut provider = provider.lock().unwrap();
                 provider.clear_slot(ContentProviderUnionSlot::SysNAND);
                 provider.clear_slot(ContentProviderUnionSlot::UserNAND);
                 provider.clear_slot(ContentProviderUnionSlot::SDMC);
+                provider.clear_slot(ContentProviderUnionSlot::External);
             }
         }
 
@@ -627,6 +638,36 @@ impl FileSystemController {
             self.sdmc_factory = Some(SdmcFactory::new(sd_directory, sd_load_directory));
         }
 
+        if self.external_provider.is_none() {
+            let configured_dirs = common::settings::values().external_content_dirs.clone();
+            log::debug!(
+                "Initializing ExternalContentProvider with {} configured directories",
+                configured_dirs.len()
+            );
+            let mut external_dirs = Vec::new();
+            for dir_path in configured_dirs {
+                if dir_path.is_empty() {
+                    continue;
+                }
+                log::debug!("Attempting to open external content directory: {dir_path}");
+                if !std::path::Path::new(&dir_path).is_dir() {
+                    log::error!("Failed to open external content directory: {dir_path}");
+                    continue;
+                }
+                if let Some(directory) = vfs.arc_open_directory(&dir_path, OpenMode::READ) {
+                    external_dirs.push(directory);
+                    log::debug!("Successfully opened external content directory: {dir_path}");
+                } else {
+                    log::error!("Failed to open external content directory: {dir_path}");
+                }
+            }
+            log::debug!(
+                "Creating ExternalContentProvider with {} opened directories",
+                external_dirs.len()
+            );
+            self.external_provider = Some(ExternalContentProvider::new(external_dirs));
+        }
+
         if let Some(provider) = self.content_provider.as_ref() {
             let mut provider = provider.lock().unwrap();
             if let Some(cache) = self
@@ -662,6 +703,15 @@ impl FileSystemController {
                     provider.set_slot(
                         ContentProviderUnionSlot::SDMC,
                         (cache as *const dyn ContentProvider).cast_mut(),
+                    );
+                }
+            }
+            if let Some(external_provider) = self.external_provider.as_mut() {
+                unsafe {
+                    provider.set_slot(
+                        ContentProviderUnionSlot::External,
+                        (external_provider as *mut ExternalContentProvider)
+                            as *mut dyn ContentProvider,
                     );
                 }
             }
@@ -821,6 +871,9 @@ mod tests {
         assert!(provider.has_slot(ContentProviderUnionSlot::SysNAND));
         assert!(provider.has_slot(ContentProviderUnionSlot::UserNAND));
         assert!(provider.has_slot(ContentProviderUnionSlot::SDMC));
+        assert!(provider.has_slot(ContentProviderUnionSlot::External));
+        drop(provider);
+        assert!(controller.get_external_content_provider().is_some());
 
         set_ruzu_path(RuzuPath::NANDDir, &old_nand);
         set_ruzu_path(RuzuPath::LoadDir, &old_load);
@@ -908,6 +961,7 @@ mod tests {
         assert!(provider.has_slot(ContentProviderUnionSlot::SysNAND));
         assert!(provider.has_slot(ContentProviderUnionSlot::UserNAND));
         assert!(provider.has_slot(ContentProviderUnionSlot::SDMC));
+        assert!(provider.has_slot(ContentProviderUnionSlot::External));
 
         set_ruzu_path(RuzuPath::NANDDir, &old_nand);
         set_ruzu_path(RuzuPath::LoadDir, &old_load);

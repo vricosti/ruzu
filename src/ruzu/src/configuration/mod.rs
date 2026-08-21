@@ -36,7 +36,6 @@ pub mod configure_input_advanced;
 pub mod configure_input_per_game;
 pub mod configure_input_player;
 pub mod configure_input_profile_dialog;
-pub mod configure_linux_tab;
 pub mod configure_motion_touch;
 pub mod configure_mouse_panning;
 pub mod configure_network;

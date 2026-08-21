@@ -18,7 +18,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 
-use common::settings_common::Setting;
+use common::settings_common::{Setting, SwitchableSetting};
 use common::settings_enums::{Category, ConfirmStop};
 
 /// Upstream `UISettings::values.is_game_list_reload_pending`.
@@ -80,6 +80,7 @@ pub struct Values {
     pub hide_mouse: Setting<bool>,
     pub controller_applet_disabled: Setting<bool>,
     pub select_user_on_boot: Setting<bool>,
+    pub enable_gamemode: SwitchableSetting<bool>,
 
     /// Interface language, as a locale string ("" = use the system language).
     pub language: Setting<String>,
@@ -87,6 +88,10 @@ pub struct Values {
     pub theme: Setting<String>,
     /// Mirror the log to a console window — upstream `show_console`.
     pub show_console: Setting<bool>,
+    #[cfg(unix)]
+    pub gui_force_x11: Setting<bool>,
+    #[cfg(unix)]
+    pub gui_hide_backend_warning: Setting<bool>,
 
     // ── Screenshots ─────────────────────────────────────────────────────
     pub enable_screenshot_save_as: Setting<bool>,
@@ -138,10 +143,19 @@ impl Default for Values {
             hide_mouse: Setting::new(true, "hideInactiveMouse", Ui),
             controller_applet_disabled: Setting::new(false, "disableControllerApplet", Ui),
             select_user_on_boot: Setting::new(false, "select_user_on_boot", Ui),
+            enable_gamemode: SwitchableSetting::new(
+                !cfg!(target_env = "msvc"),
+                "enable_gamemode",
+                UiGeneral,
+            ),
 
             language: Setting::new(String::new(), "language", Paths),
             theme: Setting::new(String::from("Default Colorful"), "theme", Ui),
             show_console: Setting::new(false, "showConsole", Ui),
+            #[cfg(unix)]
+            gui_force_x11: Setting::new(false, "gui_force_x11", UiGeneral),
+            #[cfg(unix)]
+            gui_hide_backend_warning: Setting::new(false, "gui_hide_backend_warning", UiGeneral),
 
             enable_screenshot_save_as: Setting::new(true, "enable_screenshot_save_as", Screenshots),
             screenshot_path: Setting::new(String::new(), "screenshot_path", Screenshots),

@@ -1961,10 +1961,10 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 - `RegisteredCache::install_entry_xci` returns `ErrorMetaFailed` if an XCI has no secure-partition
   NSP. Eden dereferences the returned pointer without a null check; the valid-XCI path and install
   ordering are otherwise identical.
-- `src/core/src/hle/service/filesystem/filesystem.rs` keeps the existing frontend-owned
-  `FrontendManual` provider for configured game directories. Therefore Eden's concrete
-  `FileSystemController::GetExternalContentProvider` accessor has no Rust counterpart; Ruzu's
-  excluded GUI frontend populates the content-provider union directly.
+- `src/core/src/hle/service/filesystem/filesystem.rs` retains Ruzu's separate frontend-owned
+  `FrontendManual` provider for content discovered inside ordinary game directories, alongside
+  the newly ported engine-owned `ExternalContentProvider` for explicitly configured external
+  update/DLC directories.
 - `FileSystemController` stores Ruzu's concrete `Arc<RealVfsFilesystem>` rather than Eden's
   abstract VFS reference. BIS partition-storage behavior and result ordering remain the same.
 - `src/core/src/core.rs::get_game_file_from_path` uses Rust host-path detection for extracted
@@ -1988,10 +1988,9 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
   `InstallEntry` overloads and `IterateAllMetadata` are now present.
 - None among the eight reviewed NCM interfaces: the same 12 commands have concrete handlers in
   Eden and Ruzu, and all remaining commands are registered stubs on both sides.
-- `FileSystemController::GetExternalContentProvider` remains intentionally absent for the
-  frontend-provider ownership reason above. The other methods called out by the review — BIS
-  partition access, the standalone save-data controller, image-directory access and placeholder
-  wrappers — are now present in their upstream-owned controller file.
+- `FileSystemController::GetExternalContentProvider`, BIS partition access, the standalone
+  save-data controller, image-directory access and placeholder wrappers are now present in their
+  upstream-owned controller file.
 
 ### Binary layout verification
 
@@ -2113,3 +2112,129 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 - PASS: `dist/ruzu.ico` has a Windows ICO header and seven image sizes from 16 through 256 pixels.
 - PASS: the XML manifest parses successfully and uses resource ID 1/type 24, the standard
   `CREATEPROCESS_MANIFEST_RESOURCE_ID` application-manifest slot.
+
+## 2026-08-21 — `src/ruzu/src/{main.rs,main_window.rs,gui_settings.rs,uisettings.rs,configuration/qt_config.rs}` vs Eden `src/{yuzu/main.cpp,yuzu/main_window.cpp,qt_common/gui_settings.cpp,qt_common/config/uisettings.h}`
+
+### Intentional differences
+
+- GTK dialogs are asynchronous, so Ruzu chains migration, the missing-key question, key
+  installation and the Wayland check through completion callbacks. Eden obtains the same ordering
+  from blocking `QMessageBox::exec()` and its synchronous file chooser.
+- `GDK_BACKEND=x11` is Ruzu's GTK equivalent of Eden's `QT_QPA_PLATFORM=xcb`. Both are set before
+  constructing the toolkit application, only when the persisted preference is enabled and no
+  explicit backend environment override is present.
+- `gui_settings.rs` lives in the Ruzu frontend crate because Ruzu has no `qt_common` crate. It keeps
+  the upstream filename (`gui_config.ini`), key (`gui_force_x11`) and method ownership together.
+- The restart text substitutes the Ruzu product name for Eden. The Wayland warning text, choices,
+  default X11 action and “Don't show again” behavior otherwise match upstream.
+
+### Unintentional differences (to fix)
+
+- None in the reviewed missing-key and Linux-backend startup slice.
+
+### Missing items
+
+- None for detection, warning suppression, X11 preference persistence or early backend selection.
+
+### Binary layout verification
+
+- N/A: these frontend settings are textual INI booleans and no raw structure is serialized.
+
+## 2026-08-21 — `src/ruzu/src/user_data_migration.rs` vs Eden `src/yuzu/user_data_migration.{h,cpp}`
+
+### Intentional differences
+
+- Ruzu's migration policy remains the previously documented non-destructive, selective GTK flow.
+  The first page now exposes `No migration` as a method instead of a separate `Start Fresh`
+  response, clears and disables Firmware/Keys for that method, and has a single `Next` action.
+- Completing `No migration` records the explicit one-time prompt marker and resumes the normal
+  startup prerequisite chain, which presents Eden's missing-key question when appropriate.
+
+### Unintentional differences (to fix)
+
+- None in the requested first-page interaction.
+
+### Missing items
+
+- Per-game migration remains hidden as documented by the existing implementation.
+
+### Binary layout verification
+
+- N/A: the changes affect GTK state and the existing text marker only.
+
+## 2026-08-21 — external-content settings and `FileSystemController` vs Eden
+
+### Intentional differences
+
+- `src/ruzu/src/configuration/configure_general.rs` uses a GTK `ListBox` and asynchronous native
+  folder chooser in place of Qt's `QListWidget` and blocking `QFileDialog`; list order, duplicate
+  rejection, native trailing separator and apply-time comparison are preserved.
+- `RealVfsFilesystem::arc_open_directory` currently constructs a VFS directory even for a missing
+  host path. `FileSystemController::create_factories` therefore performs `Path::is_dir` before the
+  VFS call to reproduce Eden's null result for an invalid configured directory.
+- Ruzu requests its existing game-list worker rebuild directly after applying a changed directory
+  list. This is the GTK equivalent of Eden's `ExternalContentDirsChanged` signal followed by
+  `OnGameListRefresh`.
+
+### Unintentional differences (to fix)
+
+- None in the implemented persistence, explicit refresh or engine registration path.
+
+### Missing items
+
+- Eden installs a `QFileSystemWatcher` on external-content roots so later host filesystem changes
+  trigger a metadata reset automatically. Ruzu currently detects those changes on the toolbar
+  refresh or the next game-list rebuild; it has no directory watcher yet.
+
+### Binary layout verification
+
+- N/A: external paths use a textual QSettings-compatible array. The provider registration adds no
+  guest-visible raw structure.
+
+## 2026-08-21 — `src/ruzu/src/util/content.rs` and firmware menu vs Eden `src/qt_common/util/content.{h,cpp}` / `src/yuzu/main_window.cpp`
+
+### Intentional differences
+
+- GTK file selection is asynchronous. Once a source is returned, both paths converge on the same
+  synchronous copy and firmware-only integrity verification routine, preserving Eden's ordering.
+- Ruzu uses the Rust `zip` crate instead of `JlCompress`; `ZipFile::enclosed_name` additionally
+  rejects entries that escape the fixed `ruzu/firmware` temporary root.
+- The success message reports the number of verified NCA files. Eden reports the installed
+  firmware display version, whose frontend lookup still depends on Ruzu's not-yet-faithful
+  installed SystemVersion reader.
+
+### Unintentional differences (to fix)
+
+- None in source selection, direct-versus-recursive NCA discovery, extraction cleanup, copy order
+  or firmware-only integrity verification.
+
+### Missing items
+
+- Displaying the installed firmware version requires replacing Ruzu's hardcoded
+  `get_firmware_version_impl` with Eden's SystemVersion archive lookup; that prerequisite is
+  outside this frontend menu slice.
+
+### Binary layout verification
+
+- N/A: ZIP extraction and firmware copying operate on files, not raw-copied payload structures.
+
+## 2026-08-21 — `UISettings::enable_gamemode` ownership vs Eden `src/qt_common/config/uisettings.h`
+
+### Intentional differences
+
+- None. The obsolete standalone Rust `configure_linux_tab.rs` owner was removed because current
+  Eden exposes Gamemode and X11 as `UiGeneral` settings in `ConfigureGeneral`.
+
+### Unintentional differences (to fix)
+
+- None in ownership, platform default or row ordering: the MSVC default is false, other targets
+  default true, and Gamemode follows the profile prompt.
+
+### Missing items
+
+- Ruzu does not yet have Eden's `qt_common/gamemode.cpp` DBus activation owner; this pre-existing
+  runtime integration gap is separate from the corrected setting ownership and UI placement.
+
+### Binary layout verification
+
+- N/A: the value is a textual frontend boolean.

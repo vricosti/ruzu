@@ -24,6 +24,8 @@ mod emu_window;
 mod file_menu;
 mod game_list;
 mod gtk_compat;
+#[cfg(target_os = "linux")]
+mod gui_settings;
 mod homebrew_vfs;
 mod i18n;
 mod loading_screen;
@@ -80,25 +82,24 @@ pub(crate) fn retranslate_application() {
 #[cfg(target_os = "linux")]
 fn linux_gdk_backend_override(
     current_backend: Option<&str>,
-    x11_display_available: bool,
+    force_x11: bool,
 ) -> Option<&'static str> {
-    if x11_display_available && current_backend != Some("x11") {
+    // Eden respects an explicit backend environment override. The persisted
+    // preference is applied only when the caller did not already choose one.
+    if force_x11 && current_backend.is_none() {
         Some("x11")
     } else {
         None
     }
 }
 
-/// GTK4 cannot expose a native Wayland child surface for the embedded renderer.
-/// Until that path is ported, use XWayland whenever an X11 display is
-/// available so every launcher boot path can create the same child window.
+/// Apply the early backend preference before GTK initializes, mirroring
+/// Eden's `GraphicsBackend::GetForceX11()` startup path.
 #[cfg(target_os = "linux")]
 fn configure_linux_gdk_backend() -> bool {
     let current_backend = std::env::var("GDK_BACKEND").ok();
-    let x11_display_available = std::env::var_os("DISPLAY").is_some();
-    let Some(backend) =
-        linux_gdk_backend_override(current_backend.as_deref(), x11_display_available)
-    else {
+    let force_x11 = crate::gui_settings::get_force_x11();
+    let Some(backend) = linux_gdk_backend_override(current_backend.as_deref(), force_x11) else {
         return false;
     };
     std::env::set_var("GDK_BACKEND", backend);
@@ -129,6 +130,7 @@ fn main() -> glib::ExitCode {
     let game_dirs = configuration::qt_config::load_game_dirs();
     log::info!("Loaded {} configured game directory(ies)", game_dirs.len());
     uisettings::with_mut(|v| v.game_dirs = game_dirs);
+    configuration::qt_config::load_external_content_dirs();
 
     // Upstream `Config::ReadUIGamelistValues` reads the favorites array in the same
     // pass that fills `game_dirs`.
@@ -210,17 +212,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn linux_launcher_uses_x11_when_xwayland_is_available() {
-        assert_eq!(
-            linux_gdk_backend_override(Some("wayland"), true),
-            Some("x11")
-        );
+    fn linux_launcher_uses_x11_when_the_persisted_preference_is_enabled() {
         assert_eq!(linux_gdk_backend_override(None, true), Some("x11"));
         assert_eq!(linux_gdk_backend_override(Some("x11"), true), None);
+        assert_eq!(linux_gdk_backend_override(Some("wayland"), true), None);
     }
 
     #[test]
-    fn linux_launcher_keeps_wayland_without_an_x11_display() {
+    fn linux_launcher_keeps_the_default_backend_without_the_preference() {
+        assert_eq!(linux_gdk_backend_override(None, false), None);
         assert_eq!(linux_gdk_backend_override(Some("wayland"), false), None);
     }
 }

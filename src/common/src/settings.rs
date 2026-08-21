@@ -257,9 +257,6 @@ pub struct Values {
     pub current_user: Setting<i32>,
     pub use_docked_mode: SwitchableSetting<ConsoleMode>,
 
-    // ── Linux ───────────────────────────────────────────────────────────
-    pub enable_gamemode: SwitchableSetting<bool>,
-
     // ── Controls ────────────────────────────────────────────────────────
     pub players: InputSetting<[PlayerInput; 10]>,
 
@@ -315,6 +312,10 @@ pub struct Values {
     pub gamecard_current_game: Setting<bool>,
     pub gamecard_path: Setting<String>,
     pub ext_content_from_game_dirs: Setting<bool>,
+    /// Host directories scanned recursively for update and DLC containers.
+    /// Upstream stores this outside the generic setting linkage and serializes
+    /// it as the `Paths\\external_content_dirs` QSettings array.
+    pub external_content_dirs: Vec<String>,
 
     // ── Debugging ───────────────────────────────────────────────────────
     pub record_frame_times: bool,
@@ -550,7 +551,6 @@ impl Values {
                 gamecard_path,
                 ext_content_from_game_dirs,
             ),
-            Category::Linux => visit!(enable_gamemode),
             Category::Controls => visit!(
                 disable_wgi_xinput,
                 enable_raw_input,
@@ -1298,9 +1298,6 @@ impl Default for Values {
                 true,
             ),
 
-            // Linux
-            enable_gamemode: SwitchableSetting::new(true, "enable_gamemode", Linux),
-
             // Controls
             players: InputSetting::new(),
 
@@ -1429,6 +1426,7 @@ impl Default for Values {
                 "ext_content_from_game_dirs",
                 DataStorage,
             ),
+            external_content_dirs: Vec::new(),
 
             // Debugging
             record_frame_times: false,
@@ -1873,7 +1871,6 @@ pub fn restore_global_state(values: &mut Values, is_powered_on: bool) {
     values.offline_web_applet_mode.set_global(true);
     values.enable_overlay.set_global(true);
     values.airplane_mode.set_global(true);
-    values.enable_gamemode.set_global(true);
     values.vibration_enabled.set_global(true);
     values.enable_accurate_vibrations.set_global(true);
     values.motion_enabled.set_global(true);

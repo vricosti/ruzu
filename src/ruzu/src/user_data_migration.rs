@@ -44,12 +44,14 @@ enum PromptMode {
 struct SystemWidgets {
     firmware: gtk::CheckButton,
     keys: gtk::CheckButton,
+    game_directories: gtk::CheckButton,
 }
 
 #[derive(Clone)]
 struct StrategyWidgets {
     copy: gtk::CheckButton,
     share: gtk::CheckButton,
+    no_migration: gtk::CheckButton,
 }
 
 /// Discover legacy installations and show the one-time migration dialog.
@@ -95,16 +97,13 @@ fn show_dialog<P: IsA<gtk::Window>>(
         .default_width(760)
         .default_height(420)
         .build();
-    let start_fresh_button =
-        dialog.add_button(&crate::i18n::tr("Start Fresh"), ResponseType::Cancel);
-    let review_button = dialog.add_button(
-        &crate::i18n::tr("Review Migration"),
+    let next_button = dialog.add_button(
+        &crate::i18n::tr("Next"),
         ResponseType::Other(EMULATOR_RESPONSE_BASE),
     );
-    for button in [&start_fresh_button, &review_button] {
-        button.set_margin_bottom(DIALOG_ACTION_MARGIN);
-    }
-    review_button.set_margin_end(DIALOG_ACTION_MARGIN);
+    next_button.set_margin_bottom(DIALOG_ACTION_MARGIN);
+    next_button.set_margin_end(DIALOG_ACTION_MARGIN);
+    dialog.set_default_response(ResponseType::Other(EMULATOR_RESPONSE_BASE));
 
     let content = dialog.content_area();
     content.set_spacing(12);
@@ -147,7 +146,9 @@ fn show_dialog<P: IsA<gtk::Window>>(
     method_label.add_css_class("heading");
     let copy = migration_check("Copy from (recommended)", true);
     let share = migration_check("Share with (symbolic link / junction point)", false);
+    let no_migration = migration_check("No migration", false);
     share.set_group(Some(&copy));
+    no_migration.set_group(Some(&copy));
     copy.set_tooltip_text(Some(&crate::i18n::tr(
         "Create an independent verified copy for Ruzu.",
     )));
@@ -157,6 +158,7 @@ fn show_dialog<P: IsA<gtk::Window>>(
     method_box.append(&method_label);
     method_box.append(&copy);
     method_box.append(&share);
+    method_box.append(&no_migration);
     content.append(&method_box);
 
     let expert_notebook = gtk::Notebook::new();
@@ -169,11 +171,15 @@ fn show_dialog<P: IsA<gtk::Window>>(
     system_box.set_margin_end(8);
     let firmware = migration_check("Firmware", true);
     let keys = migration_check("Keys", true);
-    for check in [&firmware, &keys] {
+    let game_directories = migration_check("Game directories", true);
+    game_directories.set_tooltip_text(Some(&crate::i18n::tr(
+        "Import only the configured game folder paths. Game files are not copied or shared.",
+    )));
+    for check in [&firmware, &keys, &game_directories] {
         system_box.append(check);
     }
     let system_note = gtk::Label::new(Some(&crate::i18n::tr(
-        "Only firmware and keys are offered for now. Save data, settings, updates, DLC, SD card data, mods, and shader caches remain unchanged.",
+        "Firmware, keys, and configured game directories are offered. Game files, save data, settings, updates, DLC, SD card data, mods, and shader caches remain unchanged.",
     )));
     system_note.set_xalign(0.0);
     system_note.set_wrap(true);
@@ -188,8 +194,32 @@ fn show_dialog<P: IsA<gtk::Window>>(
     // without changing the verified copy format.
     content.append(&expert_notebook);
 
-    let system_widgets = SystemWidgets { firmware, keys };
-    let strategy_widgets = StrategyWidgets { copy, share };
+    let system_widgets = SystemWidgets {
+        firmware,
+        keys,
+        game_directories,
+    };
+    no_migration.connect_toggled({
+        let system_widgets = system_widgets.clone();
+        move |button| {
+            let migration_enabled = !button.is_active();
+            if !migration_enabled {
+                system_widgets.firmware.set_active(false);
+                system_widgets.keys.set_active(false);
+                system_widgets.game_directories.set_active(false);
+            }
+            system_widgets.firmware.set_sensitive(migration_enabled);
+            system_widgets.keys.set_sensitive(migration_enabled);
+            system_widgets
+                .game_directories
+                .set_sensitive(migration_enabled);
+        }
+    });
+    let strategy_widgets = StrategyWidgets {
+        copy,
+        share,
+        no_migration,
+    };
 
     let callback: Rc<RefCell<Option<CompletionCallback>>> =
         Rc::new(RefCell::new(Some(Box::new(callback))));
@@ -212,6 +242,18 @@ fn show_dialog<P: IsA<gtk::Window>>(
                 }
                 return;
             };
+
+            if strategy_widgets.no_migration.is_active() {
+                if mode == PromptMode::Startup {
+                    mark_migration_prompt_seen();
+                }
+                dialog.close();
+                if let Some(callback) = callback.borrow_mut().take() {
+                    callback(None);
+                }
+                return;
+            }
+
             let Some(index) = source_combo
                 .active()
                 .map(|index| index as usize)
@@ -290,11 +332,13 @@ fn system_selection(system: &SystemWidgets) -> MigrationSelection {
     MigrationSelection {
         firmware: system.firmware.is_active(),
         keys: system.keys.is_active(),
+        game_directories: system.game_directories.is_active(),
         ..MigrationSelection::default()
     }
 }
 
 fn selected_strategy(strategy: &StrategyWidgets) -> MigrationStrategy {
+    debug_assert!(!strategy.no_migration.is_active());
     if strategy.share.is_active() {
         MigrationStrategy::Link
     } else {
@@ -338,6 +382,9 @@ fn start_worker(
     let spinner = gtk::Spinner::new();
     spinner.start();
     let progress_text = match strategy {
+        _ if selection.game_directories && !selection.tree_data_selected() => {
+            "Importing game directories..."
+        }
         MigrationStrategy::Copy => "Copying and verifying data. This may take a while...",
         MigrationStrategy::Link => "Creating and verifying shared links...",
     };
@@ -349,7 +396,19 @@ fn start_worker(
 
     let (sender, receiver) = mpsc::channel();
     std::thread::spawn(move || {
-        let result = crate::migration_worker::process(&plan);
+        let result = (|| {
+            let mut report = if plan.selection.tree_data_selected() {
+                crate::migration_worker::process(&plan)?
+            } else {
+                MigrationReport::default()
+            };
+            if plan.selection.game_directories {
+                report.game_directories = crate::configuration::qt_config::import_game_dirs_from(
+                    &plan.source_config_dir.join("qt-config.ini"),
+                )?;
+            }
+            Ok(report)
+        })();
         let _ = sender.send(result);
     });
 
@@ -368,7 +427,7 @@ fn start_worker(
         match result {
             Ok(report) => {
                 mark_migration_prompt_seen();
-                let success = migration_success_text(strategy, report, emulator.name);
+                let success = migration_success_text(strategy, report, emulator.name, &selection);
                 crate::gtk_compat::show_pretranslated_message(
                     message_parent.as_ref(),
                     &crate::i18n::tr("Migration"),
@@ -384,14 +443,14 @@ fn start_worker(
             }
             Err(error) => {
                 log::error!("Migration from {} failed: {error}", emulator.name);
-                let detail = migration_error_text(strategy, &error.to_string());
+                let detail = migration_error_text(strategy, &selection, &error.to_string());
                 crate::gtk_compat::show_pretranslated_error(
                     message_parent.as_ref(),
                     &crate::i18n::tr("Migration Failed"),
                     &detail,
                 );
                 // The migration dialog was hidden while the worker ran. Show
-                // it again so the user can retry or explicitly start fresh.
+                // it again so the user can retry or choose no migration.
                 // Closing it here can emit a Cancel response and incorrectly
                 // persist the one-time prompt marker after a failed copy.
                 migration_dialog.present();
@@ -405,13 +464,37 @@ fn migration_success_text(
     strategy: MigrationStrategy,
     report: MigrationReport,
     source_name: &str,
+    selection: &MigrationSelection,
 ) -> String {
+    if selection.game_directories && !selection.tree_data_selected() {
+        return crate::i18n::tr_args(
+            "Game directories were imported successfully (%1 new paths). Game files were not copied.",
+            &[report.game_directories.to_string()],
+        );
+    }
     match strategy {
+        MigrationStrategy::Copy if selection.game_directories => crate::i18n::tr_args(
+            "Data was copied and verified successfully (%1 files, %2 bytes), and %3 new game directory paths were imported. The original %4 data was left unchanged.",
+            &[
+                report.files.to_string(),
+                report.bytes.to_string(),
+                report.game_directories.to_string(),
+                source_name.to_owned(),
+            ],
+        ),
         MigrationStrategy::Copy => crate::i18n::tr_args(
             "Data was copied and verified successfully (%1 files, %2 bytes). The original %3 data was left unchanged.",
             &[
                 report.files.to_string(),
                 report.bytes.to_string(),
+                source_name.to_owned(),
+            ],
+        ),
+        MigrationStrategy::Link if selection.game_directories => crate::i18n::tr_args(
+            "Shared links were created successfully (%1 directories), and %2 new game directory paths were imported. Ruzu and %3 now use the same selected linked data.",
+            &[
+                report.trees.to_string(),
+                report.game_directories.to_string(),
                 source_name.to_owned(),
             ],
         ),
@@ -422,8 +505,15 @@ fn migration_success_text(
     }
 }
 
-fn migration_error_text(strategy: MigrationStrategy, error: &str) -> String {
+fn migration_error_text(
+    strategy: MigrationStrategy,
+    selection: &MigrationSelection,
+    error: &str,
+) -> String {
     let operation = match strategy {
+        _ if selection.game_directories && !selection.tree_data_selected() => {
+            crate::i18n::tr("game-directory import")
+        }
         MigrationStrategy::Copy => crate::i18n::tr("verified copy"),
         MigrationStrategy::Link => crate::i18n::tr("shared-link setup"),
     };
@@ -481,6 +571,9 @@ fn selected_data_text(plan: &MigrationPlan) -> String {
     if plan.selection.keys {
         selected.push(crate::i18n::tr("keys"));
     }
+    if plan.selection.game_directories {
+        selected.push(crate::i18n::tr("game directories (paths only)"));
+    }
     if plan.selection.configuration {
         selected.push(crate::i18n::tr("configuration and game folders"));
     }
@@ -521,7 +614,7 @@ fn show_migration_confirmation(
         .build();
     let back_button = confirmation.add_button(&crate::i18n::tr("Back"), ResponseType::Cancel);
     let accept_label = match plan.strategy {
-        MigrationStrategy::Copy => "Copy and Verify",
+        MigrationStrategy::Copy => "OK",
         MigrationStrategy::Link => "Create Shared Links",
     };
     let accept_button =
@@ -764,6 +857,7 @@ mod tests {
             MigrationSelection {
                 firmware: true,
                 configuration: true,
+                game_directories: true,
                 nand: true,
                 sdmc: true,
                 keys: true,
@@ -798,8 +892,13 @@ mod tests {
                 trees: 2,
                 files: 3,
                 bytes: 4,
+                ..MigrationReport::default()
             },
             "Yuzu",
+            &MigrationSelection {
+                firmware: true,
+                ..MigrationSelection::default()
+            },
         );
         let link = migration_success_text(
             MigrationStrategy::Link,
@@ -807,14 +906,37 @@ mod tests {
                 trees: 2,
                 files: 0,
                 bytes: 0,
+                ..MigrationReport::default()
             },
             "Yuzu",
+            &MigrationSelection {
+                keys: true,
+                ..MigrationSelection::default()
+            },
         );
 
         assert!(copy.contains("Yuzu"));
         assert!(!copy.contains("original Ruzu"));
         assert!(link.contains("Yuzu"));
         assert!(link.contains("Ruzu"));
+    }
+
+    #[test]
+    fn game_directory_only_success_does_not_claim_roms_were_copied() {
+        let message = migration_success_text(
+            MigrationStrategy::Copy,
+            MigrationReport {
+                game_directories: 2,
+                ..MigrationReport::default()
+            },
+            "Yuzu",
+            &MigrationSelection {
+                game_directories: true,
+                ..MigrationSelection::default()
+            },
+        );
+        assert!(message.contains("2 new paths"));
+        assert!(message.contains("Game files were not copied"));
     }
 
     #[test]

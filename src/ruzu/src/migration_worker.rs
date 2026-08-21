@@ -67,6 +67,9 @@ pub enum MigrationStrategy {
 pub struct MigrationSelection {
     pub firmware: bool,
     pub configuration: bool,
+    /// Import only the source frontend's configured game-folder paths. The
+    /// frontend owns the INI merge; no ROM directory or full config is copied.
+    pub game_directories: bool,
     pub nand: bool,
     pub sdmc: bool,
     pub keys: bool,
@@ -76,6 +79,12 @@ pub struct MigrationSelection {
 
 impl MigrationSelection {
     pub fn any(&self) -> bool {
+        self.tree_data_selected() || self.game_directories
+    }
+
+    /// Whether the filesystem worker has a whole directory tree to process.
+    /// Game-directory paths are merged selectively by the frontend.
+    pub fn tree_data_selected(&self) -> bool {
         self.firmware
             || self.configuration
             || self.nand
@@ -147,6 +156,7 @@ pub struct MigrationReport {
     pub trees: usize,
     pub files: u64,
     pub bytes: u64,
+    pub game_directories: usize,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -1069,6 +1079,16 @@ mod tests {
             fs::read(plan.source_user_dir.join("keys/prod.keys")).unwrap(),
             b"secret"
         );
+    }
+
+    #[test]
+    fn game_directory_paths_are_a_frontend_selection_not_a_worker_tree() {
+        let selection = MigrationSelection {
+            game_directories: true,
+            ..MigrationSelection::default()
+        };
+        assert!(selection.any());
+        assert!(!selection.tree_data_selected());
     }
 
     #[test]
