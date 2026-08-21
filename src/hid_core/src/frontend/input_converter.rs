@@ -8,8 +8,8 @@
 //! analog properties, battery levels, etc.
 
 use common::input::{
-    AnalogProperties, ButtonStatus, CallbackStatus, CameraStatus, InputType, MotionStatus,
-    NfcStatus, StickStatus, TouchStatus, TriggerStatus,
+    AnalogProperties, AnalogStatus, ButtonStatus, CallbackStatus, CameraStatus, InputType,
+    MotionStatus, NfcStatus, StickStatus, TouchStatus, TriggerStatus,
 };
 
 /// Sanitizes an analog value by applying deadzone, range, offset and invert properties.
@@ -229,6 +229,37 @@ pub fn transform_to_trigger(callback: &CallbackStatus) -> TriggerStatus {
         status.analog.value = 1.0 + status.analog.value;
     }
     status.analog.value = status.analog.value.clamp(0.0, 1.0);
+    status
+}
+
+/// Converts callback data to a normalized analog status.
+///
+/// Port of upstream `TransformToAnalog`.
+pub fn transform_to_analog(callback: &CallbackStatus) -> AnalogStatus {
+    let mut status = AnalogStatus::default();
+    if callback.input_type == InputType::Analog {
+        status.properties = callback.analog_status.properties;
+        status.raw_value = callback.analog_status.raw_value;
+    } else {
+        log::error!(
+            "Conversion from input type {:?} to analog not implemented",
+            callback.input_type
+        );
+    }
+
+    let properties = status.properties;
+    sanitize_analog(
+        &mut status.raw_value,
+        &mut status.value,
+        properties.deadzone,
+        properties.range,
+        properties.offset,
+        properties.inverted,
+        false,
+    );
+    if properties.inverted {
+        status.value = -status.value;
+    }
     status
 }
 
@@ -464,4 +495,41 @@ pub fn transform_to_nfc(callback: &CallbackStatus) -> NfcStatus {
         callback.input_type
     );
     NfcStatus::default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn transform_to_analog_preserves_upstream_inversion_order() {
+        let mut callback = CallbackStatus {
+            input_type: InputType::Analog,
+            ..Default::default()
+        };
+        callback.analog_status.raw_value = 0.5;
+        callback.analog_status.properties.inverted = true;
+
+        let status = transform_to_analog(&callback);
+
+        assert_eq!(status.raw_value, 0.5);
+        assert_eq!(status.value, 0.5);
+        assert!(status.properties.inverted);
+    }
+
+    #[test]
+    fn transform_to_analog_applies_deadzone_without_clamping() {
+        let mut callback = CallbackStatus {
+            input_type: InputType::Analog,
+            ..Default::default()
+        };
+        callback.analog_status.raw_value = 2.0;
+        callback.analog_status.properties.range = 0.5;
+
+        assert_eq!(transform_to_analog(&callback).value, 4.0);
+
+        callback.analog_status.raw_value = 0.1;
+        callback.analog_status.properties.deadzone = 0.2;
+        assert_eq!(transform_to_analog(&callback).value, 0.0);
+    }
 }

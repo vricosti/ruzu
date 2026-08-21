@@ -2555,3 +2555,24 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 
 - N/A: the regression test verifies bounded byte-copy and normalized output behavior; no struct
   layout changed.
+
+## 2026-08-21 — `src/hid_core/src/frontend/input_converter.rs` vs Eden `src/hid_core/frontend/input_converter.{h,cpp}` analog conversion
+
+### Intentional differences
+
+- None beyond Rust's direct return value and `log` facade.
+
+### Unintentional differences (to fix)
+
+- None. `transform_to_analog` now accepts only `InputType::Analog`, copies properties and raw
+  value, sanitizes without clamping, then applies Eden's second inversion step in the same order.
+
+### Missing items
+
+- None for `TransformToAnalog`; it unblocks the upstream-owned mouse-wheel path in
+  `EmulatedDevices`.
+
+### Binary layout verification
+
+- N/A: `AnalogStatus` is host-side callback state. Tests cover the non-clamped range, deadzone,
+  copied properties, and Eden's deliberately preserved inversion ordering.
