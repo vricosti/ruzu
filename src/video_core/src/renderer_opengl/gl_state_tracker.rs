@@ -698,6 +698,7 @@ impl StateTracker {
         }
     }
 
+    #[cfg(test)]
     fn active_flags(&self) -> &DirtyFlags {
         match self.channel_flags {
             Some(flags) => unsafe { flags.as_ref() },

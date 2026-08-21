@@ -490,7 +490,7 @@ impl StateTracker {
         is_dirty
     }
 
-    fn exchange_check<T: PartialEq + Copy>(&mut self, old: &mut T, new: T) -> bool {
+    fn exchange_check<T: PartialEq + Copy>(old: &mut T, new: T) -> bool {
         let result = *old != new;
         *old = new;
         result
@@ -551,51 +551,38 @@ impl StateTracker {
 
     /// Port of `StateTracker::TouchStencilSide`.
     pub fn touch_stencil_side(&mut self, two_sided_stencil_new: bool) -> bool {
-        let changed = self.two_sided_stencil != two_sided_stencil_new;
-        self.two_sided_stencil = two_sided_stencil_new;
-        changed || self.stencil_reset
+        Self::exchange_check(&mut self.two_sided_stencil, two_sided_stencil_new)
+            || self.stencil_reset
     }
 
     /// Port of `StateTracker::CheckStencilReferenceFront`.
     pub fn check_stencil_reference_front(&mut self, new_value: u32) -> bool {
-        let changed = self.front.reference != new_value;
-        self.front.reference = new_value;
-        changed || self.stencil_reset
+        Self::exchange_check(&mut self.front.reference, new_value) || self.stencil_reset
     }
 
     /// Port of `StateTracker::CheckStencilReferenceBack`.
     pub fn check_stencil_reference_back(&mut self, new_value: u32) -> bool {
-        let changed = self.back.reference != new_value;
-        self.back.reference = new_value;
-        changed || self.stencil_reset
+        Self::exchange_check(&mut self.back.reference, new_value) || self.stencil_reset
     }
 
     /// Port of `StateTracker::CheckStencilWriteMaskFront`.
     pub fn check_stencil_write_mask_front(&mut self, new_value: u32) -> bool {
-        let changed = self.front.write_mask != new_value;
-        self.front.write_mask = new_value;
-        changed || self.stencil_reset
+        Self::exchange_check(&mut self.front.write_mask, new_value) || self.stencil_reset
     }
 
     /// Port of `StateTracker::CheckStencilWriteMaskBack`.
     pub fn check_stencil_write_mask_back(&mut self, new_value: u32) -> bool {
-        let changed = self.back.write_mask != new_value;
-        self.back.write_mask = new_value;
-        changed || self.stencil_reset
+        Self::exchange_check(&mut self.back.write_mask, new_value) || self.stencil_reset
     }
 
     /// Port of `StateTracker::CheckStencilCompareMaskFront`.
     pub fn check_stencil_compare_mask_front(&mut self, new_value: u32) -> bool {
-        let changed = self.front.compare_mask != new_value;
-        self.front.compare_mask = new_value;
-        changed || self.stencil_reset
+        Self::exchange_check(&mut self.front.compare_mask, new_value) || self.stencil_reset
     }
 
     /// Port of `StateTracker::CheckStencilCompareMaskBack`.
     pub fn check_stencil_compare_mask_back(&mut self, new_value: u32) -> bool {
-        let changed = self.back.compare_mask != new_value;
-        self.back.compare_mask = new_value;
-        changed || self.stencil_reset
+        Self::exchange_check(&mut self.back.compare_mask, new_value) || self.stencil_reset
     }
 
     /// Port of `StateTracker::ClearStencilReset`.
