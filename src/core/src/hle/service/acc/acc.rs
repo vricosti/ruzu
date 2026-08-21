@@ -254,10 +254,10 @@ impl Interface {
         &self,
         profile_manager: &mut ProfileManager,
     ) -> (ResultCode, u128) {
-        // Upstream: generates a random UUID and creates a new user with name "yuzu"
+        // Upstream generates a random UUID and creates a branded default user.
         let uuid = generate_random_uuid();
         let mut username = [0u8; super::profile_manager::PROFILE_USERNAME_SIZE];
-        let name = b"yuzu";
+        let name = b"ruzu";
         username[..name.len()].copy_from_slice(name);
         profile_manager.create_new_user(uuid, &username);
         log::info!(

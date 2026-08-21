@@ -149,7 +149,7 @@ impl ProfileManager {
         manager.parse_user_save_file();
         if manager.user_count == 0 {
             let mut username = [0u8; PROFILE_USERNAME_SIZE];
-            username[..4].copy_from_slice(b"yuzu");
+            username[..4].copy_from_slice(b"ruzu");
             let _ = manager.create_new_user(UUID::make_random().as_u128(), &username);
             manager.write_user_save_file();
         }
@@ -526,7 +526,7 @@ mod tests {
         assert_ne!(user, 0);
 
         let mut expected_name = [0u8; PROFILE_USERNAME_SIZE];
-        expected_name[..4].copy_from_slice(b"yuzu");
+        expected_name[..4].copy_from_slice(b"ruzu");
         assert_eq!(
             manager.get_profile_base(Some(0)).unwrap().username,
             expected_name

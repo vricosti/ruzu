@@ -2061,3 +2061,55 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 
 - PASS: IPC outputs retain Eden's `u64` size/read count and `u32` error code widths. Download data
   is copied as bytes into the caller-provided output buffer; no host struct is raw-copied.
+
+## 2026-08-21 — `src/core/src/hle/service/acc/{profile_manager.rs,acc.rs}` vs Eden `src/core/hle/service/acc/{profile_manager.cpp,acc.cpp}`
+
+### Intentional differences
+
+- Eden creates the automatic first user and the `BeginUserRegistration` user with the branded
+  name `Eden`; Ruzu uses the direct product-name adaptation `ruzu`. Existing saved profiles are
+  parsed without renaming, so a user-selected or migrated name is never overwritten.
+
+### Unintentional differences (to fix)
+
+- None in the reviewed default-profile creation paths: both paths generate a random non-null UUID,
+  construct a fixed-size zero-padded profile name, create the user, and preserve upstream ordering.
+
+### Missing items
+
+- None for default profile naming or `BeginUserRegistration` naming.
+
+### Binary layout verification
+
+- PASS: `ProfileUsername` remains 32 bytes. The four ASCII bytes `ruzu` are followed by 28
+  deterministic zero bytes, matching the upstream fixed-size payload contract.
+
+## 2026-08-21 — `dist` Windows packaging vs Eden `dist/{installer.nsi,yuzu.manifest,eden.ico}`
+
+### Intentional differences
+
+- Ruzu stages its Rust executables and the dynamic `x64-windows-ruzu` vcpkg GTK/GLib runtime;
+  Eden's installer consumes an already binplaced Qt directory. `package-windows.ps1` owns that
+  extra staging step because Ruzu has no CMake/binplace packaging stage.
+- The application installs to `%LOCALAPPDATA%\Programs\Ruzu`, keeping executable files separate
+  from Ruzu's `%APPDATA%\ruzu` user data. Uninstalling therefore removes the program directory but
+  deliberately preserves keys, firmware, saves, configuration and caches.
+- File types are registered through the `Ruzu.SwitchFile` OpenWith ProgID instead of taking over
+  each extension's default handler. Uninstall removes only Ruzu's own registry values.
+- The Ruzu manifest fixes the malformed long-path namespace in the source manifest and embeds it,
+  together with the Ruzu icon, through the Rust crate's Windows resource build step.
+
+### Unintentional differences (to fix)
+
+- None found by static validation of the adapted installer, manifest and resource definition.
+
+### Missing items
+
+- The installer has not yet been executed on a native Windows host; MSVC resource compilation,
+  vcpkg runtime staging, NSIS generation, install, launch and uninstall still require that test.
+
+### Binary layout verification
+
+- PASS: `dist/ruzu.ico` has a Windows ICO header and seven image sizes from 16 through 256 pixels.
+- PASS: the XML manifest parses successfully and uses resource ID 1/type 24, the standard
+  `CREATEPROCESS_MANIFEST_RESOURCE_ID` application-manifest slot.

@@ -1,0 +1,7 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+#define IDI_RUZU 1
+#define RT_MANIFEST 24
+
+IDI_RUZU ICON "../../dist/ruzu.ico"
+1 RT_MANIFEST "../../dist/ruzu.manifest"

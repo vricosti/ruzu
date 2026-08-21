@@ -258,3 +258,28 @@ released.
   `~/Dev/emulators/eden/src/video_core/renderer_vulkan/vk_query_cache.cpp`. A run
   on a title that issues occlusion queries is still owed before treating this as
   settled.
+
+---
+
+## 8. Stage the Windows GTK runtime before invoking NSIS
+
+**Upstream.** Eden's Windows installer consumes a preassembled `bin` directory.
+Its CMake/binplace pipeline has already copied the Qt runtime beside the Eden
+executables before `makensis` runs.
+
+**The port.** `dist/package-windows.ps1` builds both Rust frontends and creates a
+self-contained staging directory under `target\package`. It copies the dynamic
+DLL set from the dedicated `x64-windows-ruzu` vcpkg triplet, plus GLib schemas,
+GTK data and runtime-loaded GTK/GDK modules, before invoking the adapted NSIS
+definition. SDL3 remains statically linked, consistently with the workspace
+dependency configuration.
+
+**Why.** Cargo links Ruzu correctly on the build host but does not deploy native
+GTK, FFmpeg or OpenSSL DLLs and their non-DLL runtime data. Passing only
+`target\release` to Eden's installer shape would therefore produce an installer
+that succeeds but an application that cannot start on another Windows machine.
+
+**Cost.** The first package favors completeness over minimum installer size by
+staging every DLL in the vcpkg triplet's runtime `bin` directory. A later
+dependency-closure pass may reduce the package, but it must retain dynamically
+loaded GTK modules and cannot rely only on PE import tables.

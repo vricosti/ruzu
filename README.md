@@ -196,6 +196,19 @@ MoltenVK under `Contents/Frameworks`, matching the upstream macOS bundle
 layout. Set `MOLTENVK_LIBRARY=/path/to/libMoltenVK.dylib` to package a specific
 MoltenVK build instead of the Homebrew installation.
 
+On Windows, first run `setup.bat` from an x64 Native Tools command prompt, then
+install [NSIS 3](https://nsis.sourceforge.io/Download) and build the portable
+runtime directory plus installer with:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\dist\package-windows.ps1
+```
+
+The script builds both `ruzu.exe` and `ruzu-cmd.exe`, stages the dynamic
+`x64-windows-ruzu` vcpkg DLLs and GTK/GLib runtime data, then writes the package
+and installer under `target\package`. Use `-StageOnly` to produce only the
+self-contained directory, or `-SkipBuild` to package existing release binaries.
+
 There is also a headless command-line frontend:
 
 ```sh

@@ -8,6 +8,8 @@
 // `gtk::Application`, install the menu bar into the native macOS menu bar on
 // `startup`, build the main window on `activate`, and enter the GTK event loop.
 
+#![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
+
 use std::cell::RefCell;
 use std::rc::Rc;
 
