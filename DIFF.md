@@ -3777,3 +3777,48 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 ### Binary layout verification
 
 - N/A: the change only parses TOML developer-tool configuration.
+
+## 2026-08-21 — `externals/rxbyak/src/{encode.rs,platform/unix.rs}` vs Eden x64 Xbyak consumers under `src/common/x64` and `src/dynarmic`
+
+### Intentional differences
+
+- `rxbyak` is Ruzu's Rust replacement for Eden's external Xbyak dependency, so it has no direct
+  file counterpart in Eden's `src/` tree. Platform allocation retains Eden/Dynarmic's writable-then-
+  executable lifecycle and adds `MAP_JIT` only on macOS.
+- The orphaned `emit_evex_leg` APX encoder was removed. No rxbyak instruction called it, no APX
+  instruction was generated, and Eden's current Dynarmic consumers do not emit APX; retaining the
+  unreachable partial capability only produced dead code.
+
+### Unintentional differences (to fix)
+
+- None in this warning-only slice. General rxbyak/Xbyak instruction parity is outside this focused
+  allocation and unreachable-APX audit.
+
+### Missing items
+
+- Full Intel APX instruction generation remains unsupported rather than being represented by one
+  unreachable prefix helper.
+
+### Binary layout verification
+
+- N/A: executable mapping flags and instruction-emitter methods define no serialized structure.
+
+## 2026-08-21 — `externals/rxbyak/tests/common/mod.rs` vs Eden test infrastructure
+
+### Intentional differences
+
+- Eden has no Rust integration-test crate counterpart. Each rxbyak integration-test binary imports
+  the same shared operand tables and NASM helpers but deliberately uses only the subset relevant to
+  its instruction family, so `dead_code` is allowed only inside that shared test module.
+
+### Unintentional differences (to fix)
+
+- None.
+
+### Missing items
+
+- None in this test-harness warning slice.
+
+### Binary layout verification
+
+- N/A: this changes only warning policy for test helpers.
