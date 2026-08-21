@@ -4735,3 +4735,12 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
   owner file, while Eden spells it as a private `SDLDriver` method. Ruzu's unused second copy was
   removed along with three stale parameter-package builders; the active owner-local builders are
   the ones called by `build_param_for_binding` and preserve Eden's `invert` key and value rules.
+
+## 2026-08-22 — `src/input_common/src/drivers/udp_client.rs` vs `src/input_common/drivers/udp_client.h` and `.cpp`
+
+### Intentional differences
+
+- Eden retains `PadData::pad_index` and a `DeviceStatus` containing a mutex plus optional touch
+  calibration, but no UDP implementation reads them. Ruzu omits that dead per-pad state; active
+  touch calibration continues to come from `Settings::touch_device` in `on_pad_data`, as it does
+  in Eden.
