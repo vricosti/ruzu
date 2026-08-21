@@ -1910,7 +1910,7 @@ impl<P: TextureCacheParams> TextureCacheBase<P> {
         dirty_access: &mut impl RenderTargetDirtyFlagAccess,
         gpu_to_cpu: &mut impl FnMut(GPUVAddr, u64) -> Option<u64>,
     ) -> bool {
-        let mut scale_rating = 0u32;
+        let mut scale_rating: u32;
         let mut rescaled;
         let mut color_images = [None; NUM_RT];
         let mut depth_image = None;
