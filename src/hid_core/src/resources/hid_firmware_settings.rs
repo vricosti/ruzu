@@ -3,17 +3,11 @@
 
 //! Port of hid_core/resources/hid_firmware_settings.h and hid_firmware_settings.cpp
 
-/// FirmwareSetting placeholder for firmware update failure state
-#[derive(Debug, Clone, Copy, Default)]
-pub struct FirmwareSetting {
-    pub raw: u32,
-}
+/// Per-stage firmware update failure state.
+pub type FirmwareSetting = [u8; 4];
 
-/// FeaturesPerId placeholder for per-id feature disable flags
-#[derive(Debug, Clone, Copy, Default)]
-pub struct FeaturesPerId {
-    pub raw: u32,
-}
+/// Per-controller feature-disable flags.
+pub type FeaturesPerId = [bool; 0xA8];
 
 /// PlatformConfig from nn::settings::system
 #[derive(Debug, Clone, Copy, Default)]
@@ -56,7 +50,6 @@ pub struct HidFirmwareSettings {
     is_future_devices_emulated: bool,
     is_mcu_hardware_error_emulated: bool,
     is_rail_enabled: bool,
-    is_firmware_update_failure_emulated: bool,
     is_firmware_update_failure: FirmwareSetting,
     is_ble_disabled: bool,
     is_dscale_disabled: bool,
@@ -76,13 +69,12 @@ impl HidFirmwareSettings {
             is_future_devices_emulated: false,
             is_mcu_hardware_error_emulated: false,
             is_rail_enabled: true,
-            is_firmware_update_failure_emulated: false,
-            is_firmware_update_failure: FirmwareSetting::default(),
+            is_firmware_update_failure: [0; 4],
             is_ble_disabled: false,
             is_dscale_disabled: false,
             is_handheld_forced: false,
             is_touch_firmware_auto_update_disabled: false,
-            features_per_id_disabled: FeaturesPerId::default(),
+            features_per_id_disabled: [false; 0xA8],
             platform_config: PlatformConfig::default(),
         };
         settings.load_settings(true);
@@ -103,8 +95,8 @@ impl HidFirmwareSettings {
         // we use sensible defaults matching typical emulator configuration.
         // The defaults are already set in the constructor.
 
-        self.is_firmware_update_failure = FirmwareSetting::default();
-        self.features_per_id_disabled = FeaturesPerId::default();
+        self.is_firmware_update_failure = [0; 4];
+        self.features_per_id_disabled = [false; 0xA8];
 
         self.is_initialized = true;
     }
@@ -165,5 +157,20 @@ impl HidFirmwareSettings {
 impl Default for HidFirmwareSettings {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn firmware_setting_shapes_match_upstream() {
+        assert_eq!(std::mem::size_of::<FirmwareSetting>(), 4);
+        assert_eq!(std::mem::size_of::<FeaturesPerId>(), 0xA8);
+
+        let settings = HidFirmwareSettings::new();
+        assert_eq!(settings.get_firmware_update_failure(), [0; 4]);
+        assert_eq!(settings.features_disabled_per_id(), [false; 0xA8]);
     }
 }

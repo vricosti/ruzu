@@ -1,5 +1,23 @@
 # Porting State
 
+## 2026-08-22 — abstracted-pad warning slice
+
+- Status: interrupted while implementing the missing prerequisite.
+- Interrupted slice: consume the retained holder and handler state in
+  `hid_core/resources/abstracted_pad` instead of suppressing its `dead_code` warnings.
+- Exact missing prerequisite: Ruzu's `NpadAbstractedPadHolder` retains only copied assignment
+  metadata, while Eden retains live `IAbstractedPad*` objects and wires the holder plus the applet
+  resource into every handler through `AbstractPad::SetExternals`. Ruzu therefore cannot port the
+  holder queries, MCU selection, property updates, or button/six-axis shared-memory writes without
+  first restoring that ownership and external-resource graph.
+- Required prerequisite work: represent live abstract-pad ownership with stable Rust shared
+  owners, restore `AbstractPad::set_externals` and each upstream-owned handler setter, then port
+  `NpadAbstractedPadHolder::{RemoveAbstractPadByAssignmentStyle,GetAbstractedPads}` before
+  resuming the warning-producing handlers.
+- Resume condition: holder mutations preserve live pad identity, focused holder tests cover Eden's
+  registration/removal ordering, and the handlers can query the holder without copying stale pad
+  state.
+
 ## 2026-08-21 — SMAA creation-helper warning slice
 
 - Status: completed and verified.

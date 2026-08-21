@@ -4564,3 +4564,28 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 - Messages used only by Eden's unported host-room dialog are not retained in Ruzu's client-only
   `ErrorManager`. Eden's unused `NO_INTERNET` and `GENERIC_ERROR` constants are omitted as dead
   frontend code.
+
+## 2026-08-22 — `src/hid_core/src/resources/hid_firmware_settings.rs` vs `src/hid_core/resources/hid_firmware_settings.h` and `.cpp`
+
+### Intentional differences
+
+- Eden retains and loads `is_firmware_update_failure_emulated`, but never reads it when answering
+  any HID query. Ruzu omits that dead state while retaining the separate four-byte
+  `FirmwareSetting` returned by `GetFirmwareUpdateFailure`.
+- `hid_core` is independent from Ruzu's `core` crate, so this owner currently initializes Eden's
+  normal defaults instead of holding an `ISystemSettingsServer` service pointer. The returned
+  firmware-failure and per-ID feature containers now preserve Eden's exact 4-byte and 0xA8-byte
+  shapes rather than the previous placeholder `u32` wrappers.
+
+## 2026-08-22 — `src/hid_core/src/hidbus/hidbus_base.rs` vs `src/hid_core/hidbus/hidbus_base.h` and `.cpp`
+
+### Intentional differences
+
+- Ruzu stores the transfer-memory address as a raw `u64`; Eden's `ProcessAddress` is the same
+  address-width value with a C++ strong type.
+
+### Missing items
+
+- The base still lacks Eden's service-context-owned asynchronous command event. Its activation
+  callbacks are consequently dispatched by the concrete Rust device owner rather than through
+  C++ virtual calls in `HidbusBase`.

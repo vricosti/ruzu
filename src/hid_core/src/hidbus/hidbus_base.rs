@@ -15,16 +15,28 @@ pub enum JoyPollingMode {
     ButtonOnly = 2,
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy)]
 #[repr(C)]
 pub struct DataAccessorHeader {
-    pub result: u32, // Result
+    pub result: ResultCode,
     pub _padding: u32,
     pub unused: [u8; 0x18],
     pub latest_entry: u64,
     pub total_entries: u64,
 }
 const _: () = assert!(std::mem::size_of::<DataAccessorHeader>() == 0x30);
+
+impl Default for DataAccessorHeader {
+    fn default() -> Self {
+        Self {
+            result: ResultCode(u32::MAX),
+            _padding: 0,
+            unused: [0; 0x18],
+            latest_entry: 0,
+            total_entries: 0,
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy)]
 #[repr(C)]
@@ -70,6 +82,81 @@ impl Default for JoyButtonOnlyPollingData {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+#[repr(C)]
+pub struct JoyDisableSixAxisPollingEntry {
+    pub sampling_number: u64,
+    pub polling_data: JoyDisableSixAxisPollingData,
+}
+const _: () = assert!(std::mem::size_of::<JoyDisableSixAxisPollingEntry>() == 0x38);
+
+#[derive(Debug, Clone, Copy, Default)]
+#[repr(C)]
+pub struct JoyEnableSixAxisPollingEntry {
+    pub sampling_number: u64,
+    pub polling_data: JoyEnableSixAxisPollingData,
+}
+const _: () = assert!(std::mem::size_of::<JoyEnableSixAxisPollingEntry>() == 0x20);
+
+#[derive(Debug, Clone, Copy, Default)]
+#[repr(C)]
+pub struct JoyButtonOnlyPollingEntry {
+    pub sampling_number: u64,
+    pub polling_data: JoyButtonOnlyPollingData,
+}
+const _: () = assert!(std::mem::size_of::<JoyButtonOnlyPollingEntry>() == 0x40);
+
+#[derive(Debug, Clone, Copy)]
+#[repr(C)]
+pub struct JoyDisableSixAxisDataAccessor {
+    pub header: DataAccessorHeader,
+    pub entries: [JoyDisableSixAxisPollingEntry; 0xB],
+}
+const _: () = assert!(std::mem::size_of::<JoyDisableSixAxisDataAccessor>() == 0x298);
+
+impl Default for JoyDisableSixAxisDataAccessor {
+    fn default() -> Self {
+        Self {
+            header: DataAccessorHeader::default(),
+            entries: [JoyDisableSixAxisPollingEntry::default(); 0xB],
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+#[repr(C)]
+pub struct JoyEnableSixAxisDataAccessor {
+    pub header: DataAccessorHeader,
+    pub entries: [JoyEnableSixAxisPollingEntry; 0xB],
+}
+const _: () = assert!(std::mem::size_of::<JoyEnableSixAxisDataAccessor>() == 0x190);
+
+impl Default for JoyEnableSixAxisDataAccessor {
+    fn default() -> Self {
+        Self {
+            header: DataAccessorHeader::default(),
+            entries: [JoyEnableSixAxisPollingEntry::default(); 0xB],
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+#[repr(C)]
+pub struct ButtonOnlyPollingDataAccessor {
+    pub header: DataAccessorHeader,
+    pub entries: [JoyButtonOnlyPollingEntry; 0xB],
+}
+const _: () = assert!(std::mem::size_of::<ButtonOnlyPollingDataAccessor>() == 0x2F0);
+
+impl Default for ButtonOnlyPollingDataAccessor {
+    fn default() -> Self {
+        Self {
+            header: DataAccessorHeader::default(),
+            entries: [JoyButtonOnlyPollingEntry::default(); 0xB],
+        }
+    }
+}
+
 /// Base trait for hidbus devices
 pub trait HidbusDevice {
     fn activate_device(&mut self);
@@ -102,6 +189,9 @@ pub struct HidbusBase {
     pub device_enabled: bool,
     pub polling_mode_enabled: bool,
     pub polling_mode: JoyPollingMode,
+    pub disable_sixaxis_data: JoyDisableSixAxisDataAccessor,
+    pub enable_sixaxis_data: JoyEnableSixAxisDataAccessor,
+    pub button_only_data: ButtonOnlyPollingDataAccessor,
     pub transfer_memory: u64,
 }
 
@@ -112,6 +202,9 @@ impl HidbusBase {
             device_enabled: false,
             polling_mode_enabled: false,
             polling_mode: JoyPollingMode::default(),
+            disable_sixaxis_data: JoyDisableSixAxisDataAccessor::default(),
+            enable_sixaxis_data: JoyEnableSixAxisDataAccessor::default(),
+            button_only_data: ButtonOnlyPollingDataAccessor::default(),
             transfer_memory: 0,
         }
     }
@@ -161,5 +254,21 @@ impl HidbusBase {
 impl Default for HidbusBase {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn polling_accessor_defaults_match_upstream() {
+        let base = HidbusBase::new();
+        assert_eq!(base.disable_sixaxis_data.header.result.raw(), u32::MAX);
+        assert_eq!(base.enable_sixaxis_data.header.result.raw(), u32::MAX);
+        assert_eq!(base.button_only_data.header.result.raw(), u32::MAX);
+        assert_eq!(base.disable_sixaxis_data.entries.len(), 0xB);
+        assert_eq!(base.enable_sixaxis_data.entries.len(), 0xB);
+        assert_eq!(base.button_only_data.entries.len(), 0xB);
     }
 }
