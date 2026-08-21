@@ -1741,3 +1741,81 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 ### Binary layout verification
 
 - N/A: the change affects host subsystem lifetime only.
+
+## 2026-08-21 — `src/common/src/settings.rs` vs Eden `src/common/settings.h` (`dd12266c`)
+
+### Intentional differences
+
+- Rust uses `cfg!(target_os = "windows")` for the setting's persistence flag instead of Eden's
+  `_WIN32` preprocessor branch. The resulting platform behavior is identical.
+- `enable_raw_input` was added to Ruzu's category visitor alongside the new setting. Its existing
+  Rust declaration had incorrectly disabled persistence on every platform, while Eden persists it
+  on Windows through the same settings linkage used by `disable_wgi_xinput`.
+
+### Unintentional differences (to fix)
+
+- None in the reviewed WGI/XInput settings slice.
+
+### Missing items
+
+- None for the `disable_wgi_xinput` setting introduced by Eden commit `dd12266c`.
+
+### Binary layout verification
+
+- N/A: these are host configuration values and are not copied into a guest-visible binary payload.
+
+## 2026-08-21 — `src/input_common/src/drivers/sdl_driver.rs` vs Eden `src/input_common/drivers/sdl_driver.cpp` (`dd12266c`)
+
+### Intentional differences
+
+- Rust constructs temporary `CString` values before calling the SDL3 C API; Eden passes the SDL
+  hint macros directly. Both set `SDL_JOYSTICK_RAWINPUT_CORRELATE_XINPUT` and `SDL_JOYSTICK_WGI`
+  to `0` with `SDL_HINT_OVERRIDE`, only on Windows and only when the setting is enabled.
+
+### Unintentional differences (to fix)
+
+- None in the reviewed WGI/XInput SDL hint slice.
+
+### Missing items
+
+- None for the SDL behavior introduced by Eden commit `dd12266c`.
+
+### Binary layout verification
+
+- N/A: SDL hints alter host input-backend selection and serialize no guest data.
+
+## 2026-08-21 — `src/ruzu/src/configuration/configure_input_advanced.rs` vs Eden `src/yuzu/configuration/configure_input_advanced.{cpp,ui}` (`dd12266c`)
+
+### Intentional differences
+
+- The excluded Qt frontend's `QCheckBox` is represented by Ruzu's GTK `CheckButton`; the label,
+  tooltip, initial setting value, apply behavior, and Windows-only visibility match Eden.
+
+### Unintentional differences (to fix)
+
+- None in the reviewed WGI/XInput configuration-widget slice.
+
+### Missing items
+
+- None for the advanced-input control introduced by Eden commit `dd12266c`.
+
+### Binary layout verification
+
+- N/A: this is host GUI state only.
+## 2026-08-21 — `src/core/src/hle/kernel/svc/svc_synchronization.rs` vs Eden `src/core/hle/kernel/svc/svc_synchronization.cpp` (`7731b5bc`)
+
+### Intentional differences
+
+- None in the `ResetSignal` logging-level slice.
+
+### Unintentional differences (to fix)
+
+- None. `ResetSignal` now logs routine calls at trace level, matching Eden's demotion from debug.
+
+### Missing items
+
+- None for this upstream commit.
+
+### Binary layout verification
+
+- N/A: the change affects host logging only.
