@@ -270,15 +270,12 @@ fn decode_trit_block(
     m[4] = bits.read_bits(n_bits_per_value as usize);
     big_t |= (bits.read_bit() as u32) << 7;
 
-    let mut c: u32;
-
     let tb = Bits::new(big_t);
-    if tb.bits(2, 4) == 7 {
-        c = (tb.bits(5, 7) << 2) | tb.bits(0, 1);
+    let c = if tb.bits(2, 4) == 7 {
         t[4] = 2;
         t[3] = 2;
+        (tb.bits(5, 7) << 2) | tb.bits(0, 1)
     } else {
-        c = tb.bits(0, 4);
         if tb.bits(5, 6) == 3 {
             t[4] = 2;
             t[3] = tb.bit(7);
@@ -286,7 +283,8 @@ fn decode_trit_block(
             t[4] = tb.bit(7);
             t[3] = tb.bits(5, 6);
         }
-    }
+        tb.bits(0, 4)
+    };
 
     let cb = Bits::new(c);
     if cb.bits(0, 1) == 3 {
@@ -1553,8 +1551,6 @@ fn decompress_block(
     }
 
     // Determine partitions, partition index, and color endpoint modes
-    let mut plane_idx = u32::MAX;
-    let mut partition_index = 0u32;
     let mut color_endpoint_mode = [0u32; 4];
 
     // Define color data.
@@ -1562,14 +1558,12 @@ fn decompress_block(
     let mut color_endpoint_stream = OutputBitStream::new(&mut color_endpoint_data, 16 * 8, 0);
 
     // Read extra config data...
-    let mut base_cem = 0u32;
-    if n_partitions == 1 {
+    let (partition_index, base_cem) = if n_partitions == 1 {
         color_endpoint_mode[0] = strm.read_bits(4);
-        partition_index = 0;
+        (0, 0)
     } else {
-        partition_index = strm.read_bits(10);
-        base_cem = strm.read_bits(6);
-    }
+        (strm.read_bits(10), strm.read_bits(6))
+    };
     let base_mode = base_cem & 3;
 
     // Remaining bits are color endpoint data...
@@ -1602,7 +1596,7 @@ fn decompress_block(
     }
 
     // Read the plane selection bits
-    plane_idx = strm.read_bits(plane_selector_bits as usize);
+    let plane_idx = strm.read_bits(plane_selector_bits as usize);
 
     // Read the rest of the CEM
     if base_mode != 0 {
