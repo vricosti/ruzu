@@ -3,10 +3,14 @@
 
 //! Port of hid_core/resources/abstracted_pad/abstract_mcu_handler.h and abstract_mcu_handler.cpp
 
+use std::sync::Arc;
+
 use common::ResultCode;
+use parking_lot::Mutex;
 
 use crate::hid_result;
-use crate::resources::npad::npad_types::IAbstractedPad;
+use crate::resources::abstracted_pad::abstract_pad_holder::AbstractPadRef;
+use crate::resources::abstracted_pad::abstract_properties_handler::NpadAbstractPropertiesHandler;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[repr(u32)]
@@ -19,18 +23,21 @@ pub enum NpadMcuState {
 
 struct NpadMcuHolder {
     state: NpadMcuState,
+    abstracted_pad: Option<AbstractPadRef>,
 }
 
 impl Default for NpadMcuHolder {
     fn default() -> Self {
         Self {
             state: NpadMcuState::None,
+            abstracted_pad: None,
         }
     }
 }
 
 /// Handles Npad MCU request from HID interfaces
 pub struct NpadAbstractMcuHandler {
+    properties_handler: Option<Arc<Mutex<NpadAbstractPropertiesHandler>>>,
     ref_counter: i32,
     mcu_holder: [NpadMcuHolder; 2],
 }
@@ -38,6 +45,7 @@ pub struct NpadAbstractMcuHandler {
 impl Default for NpadAbstractMcuHandler {
     fn default() -> Self {
         Self {
+            properties_handler: None,
             ref_counter: 0,
             mcu_holder: Default::default(),
         }
@@ -47,6 +55,10 @@ impl Default for NpadAbstractMcuHandler {
 impl NpadAbstractMcuHandler {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn set_properties_handler(&mut self, handler: Arc<Mutex<NpadAbstractPropertiesHandler>>) {
+        self.properties_handler = Some(handler);
     }
 
     pub fn increment_ref_counter(&mut self) -> ResultCode {
@@ -66,11 +78,49 @@ impl NpadAbstractMcuHandler {
     }
 
     pub fn update_mcu_state(&mut self) {
-        // Upstream iterates over properties_handler->GetAbstractedPads() and:
-        // - If pad is connected and has_left_joy_rail_bus, sets mcu_holder[0] to Available
-        // - If pad is connected and has left/right six_axis_sensor, sets mcu_holder[1] to Available
-        // Without full pad infrastructure, reset holders
-        self.mcu_holder = Default::default();
+        let Some(properties_handler) = &self.properties_handler else {
+            self.mcu_holder = Default::default();
+            return;
+        };
+        let abstract_pads = properties_handler.lock().get_abstracted_pads();
+        if abstract_pads.is_empty() {
+            self.mcu_holder = Default::default();
+            return;
+        }
+
+        for abstract_pad in abstract_pads {
+            let pad = abstract_pad.lock();
+            if !pad.internal_flags.is_connected() {
+                continue;
+            }
+            if !pad.disabled_feature_set.has_left_joy_rail_bus() {
+                if !pad.disabled_feature_set.has_left_joy_six_axis_sensor()
+                    && !pad.disabled_feature_set.has_right_joy_six_axis_sensor()
+                {
+                    continue;
+                }
+                if self.mcu_holder[1].state != NpadMcuState::Active {
+                    self.mcu_holder[1].state = NpadMcuState::Available;
+                }
+                self.mcu_holder[1].abstracted_pad = Some(Arc::clone(&abstract_pad));
+                continue;
+            }
+            if self.mcu_holder[0].state != NpadMcuState::Active {
+                self.mcu_holder[0].state = NpadMcuState::Available;
+            }
+            self.mcu_holder[0].abstracted_pad = Some(Arc::clone(&abstract_pad));
+        }
+    }
+
+    pub fn get_abstracted_pad(&self, mcu_index: u32) -> Result<AbstractPadRef, ResultCode> {
+        let holder = &self.mcu_holder[mcu_index as usize];
+        if holder.state == NpadMcuState::None {
+            return Err(hid_result::RESULT_MCU_IS_NOT_READY);
+        }
+        holder
+            .abstracted_pad
+            .clone()
+            .ok_or(hid_result::RESULT_MCU_IS_NOT_READY)
     }
 
     pub fn get_mcu_state(&self, mcu_index: u32) -> NpadMcuState {

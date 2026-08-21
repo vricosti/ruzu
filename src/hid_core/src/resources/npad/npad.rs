@@ -297,6 +297,9 @@ impl NPad {
 
     /// Port of NPad::SetNpadExternals.
     pub fn set_npad_externals(&mut self, holder: AppletResourceHolder) {
+        for abstracted_pad in &mut self.abstracted_pads {
+            abstracted_pad.set_applet_resource(holder.applet_resource.clone());
+        }
         self.applet_resource_holder = holder;
     }
 
@@ -351,6 +354,7 @@ impl NPad {
         };
         let mut applet_resource = applet_resource.lock();
         let mut last_active_controller = None;
+        let mut abstracted_pad_updates = [false; MAX_SUPPORTED_NPAD_ID_TYPES];
 
         for aruid_index in 0..ARUID_INDEX_MAX {
             let (assigned, aruid, enable_input) = {
@@ -476,11 +480,10 @@ impl NPad {
                     self.npad_resource
                         .signal_style_set_update_event(aruid, npad_id);
                     Self::write_empty_entry(npad);
-                    // Defer the HIDCore update until the emulated-controller guard is
-                    // released. HIDCore methods acquire controller guards in the
-                    // opposite order, so locking it here would create an ABBA deadlock.
+                    // Defer shared-owner updates until both the controller and applet-resource
+                    // guards are released. Their handlers traverse AppletResource themselves.
                     last_active_controller = Some(npad_id);
-                    self.abstracted_pads[hid_util::npad_id_type_to_index(npad_id)].update();
+                    abstracted_pad_updates[hid_util::npad_id_type_to_index(npad_id)] = true;
                 } else {
                     if events
                         & (controller_trigger_bit(ControllerTriggerType::Battery)
@@ -645,6 +648,13 @@ impl NPad {
         }
 
         drop(applet_resource);
+        for (abstracted_pad, needs_update) in
+            self.abstracted_pads.iter_mut().zip(abstracted_pad_updates)
+        {
+            if needs_update {
+                abstracted_pad.update();
+            }
+        }
         if let (Some(hid_core), Some(npad_id)) = (self.hid_core.as_ref(), last_active_controller) {
             hid_core.lock().set_last_active_controller(npad_id);
         }

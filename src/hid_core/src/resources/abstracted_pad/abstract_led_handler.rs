@@ -14,7 +14,6 @@ pub struct NpadAbstractLedHandler {
     led_blinking: LedPattern,
     left_pattern: LedPattern,
     right_pattern: LedPattern,
-    led_interval: u64,
 }
 
 impl Default for NpadAbstractLedHandler {
@@ -24,7 +23,6 @@ impl Default for NpadAbstractLedHandler {
             led_blinking: LedPattern::new(0, 0, 0, 0),
             left_pattern: LedPattern::new(0, 0, 0, 0),
             right_pattern: LedPattern::new(0, 0, 0, 0),
-            led_interval: 0,
         }
     }
 }

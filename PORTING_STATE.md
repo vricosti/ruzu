@@ -2,7 +2,7 @@
 
 ## 2026-08-22 — abstracted-pad warning slice
 
-- Status: interrupted while implementing the missing prerequisite.
+- Status: completed and verified for the warning-producing ownership slice.
 - Interrupted slice: consume the retained holder and handler state in
   `hid_core/resources/abstracted_pad` instead of suppressing its `dead_code` warnings.
 - Exact missing prerequisite: Ruzu's `NpadAbstractedPadHolder` retains only copied assignment
@@ -17,6 +17,15 @@
 - Resume condition: holder mutations preserve live pad identity, focused holder tests cover Eden's
   registration/removal ordering, and the handlers can query the holder without copying stale pad
   state.
+- Prerequisite result: the holder now retains stable `Arc<Mutex<IAbstractedPad>>` owners, ports
+  assignment-style removal and pad enumeration, and preserves mutations made after registration.
+  `AbstractPad` shares that holder with its properties handler, while the MCU handler shares the
+  properties owner and selects the same live rail/six-axis pads as Eden.
+- Resumed result: property and MCU queries are active; button and six-axis handlers traverse the
+  applet resource in Eden's ARUID and helper-call order; battery state is selected from live pads
+  and published to Npad shared memory. `NPad::on_update` defers the shared-owner callback until its
+  applet lock is released, avoiding recursive locking. `cargo check -p hid_core` reports no
+  `hid_core` warning and all 70 crate tests pass.
 
 ## 2026-08-21 — SMAA creation-helper warning slice
 

@@ -4615,3 +4615,62 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
   accessor to the configured transfer-memory address after calling the device update.
 - Command completion still lacks Eden's service-context-owned asynchronous event, as recorded for
   `hidbus_base.rs`.
+
+## 2026-08-22 — `src/hid_core/src/resources/abstracted_pad/abstract_pad_holder.rs` vs `src/hid_core/resources/abstracted_pad/abstract_pad_holder.h` and `.cpp`
+
+### Intentional differences
+
+- Rust retains each live `IAbstractedPad` through `Arc<Mutex<_>>` instead of Eden's non-owning raw
+  pointer. Enumeration clones the shared owner, preserving pad identity and subsequent state
+  changes while preventing a dangling pointer.
+- The Rust span adapter reports the number of entries actually copied when a destination is too
+  short. Eden assumes its caller always supplies the five-element buffer used throughout HID.
+- Eden's `AbstractAssignmentHolder` duplicates each pad's `interface_type`, but no Eden method
+  reads that cached copy; Ruzu omits it and reads the live pad when interface data is needed.
+
+## 2026-08-22 — abstract-pad ownership across `abstract_pad.rs`, `abstract_properties_handler.rs`, and `abstract_mcu_handler.rs`
+
+### Intentional differences
+
+- Rust shares the holder and properties handler with `Arc<Mutex<_>>` instead of storing sibling raw
+  pointers configured after construction. The same live objects remain owned by `AbstractPad`, and
+  each method stays in its upstream file owner.
+- Eden retains property-cache fields that its current `UpdateDeviceType`, `UpdateDeviceColor`,
+  `UpdateFooterAttributes`, and `UpdateDeviceProperties` TODO bodies never populate or consume.
+  Ruzu omits those dead fields while retaining `applet_ui_type`, which its public getters read.
+
+### Missing items
+
+- `AbstractPad::SetExternals` still lacks the dedicated six-axis resource, Palma resource,
+  vibration resource, and HID-core connections. The shared applet resource is now connected to the
+  button and six-axis handlers; its other consumers remain to be ported.
+
+## 2026-08-22 — abstract button, six-axis, and LED handler warning state
+
+### Intentional differences
+
+- Rust passes the shared `AppletResource` and properties owners into the button and six-axis
+  handlers with `Arc<Mutex<_>>`. Their ARUID traversal, Npad entry selection, and upstream helper
+  call order are restored without sibling raw pointers.
+- `NPad::on_update` defers `AbstractPad::Update` until after releasing its controller and applet
+  resource guards. Eden's raw-pointer graph can call it inline; the deferred Rust call preserves
+  the same update set while avoiding recursive acquisition of the shared applet mutex.
+- Eden's `gc_sampling_number`, `gc_trigger_state`, and `led_interval` are never read or updated by
+  their owning implementations. Ruzu omits this dead state; the live button and LED pattern state
+  remains unchanged.
+
+### Missing items
+
+- Eden's button path augments `style_tag.system_ext` from `SharedNpadResource`. Ruzu's
+  `NpadResource` is not yet a shared external of `AbstractPad`; this currently has no output effect
+  because all seven style-specific button writers are also TODO bodies in Eden.
+- The Palma, vibration, dedicated six-axis resource, and remaining applet-resource consumers are
+  not yet connected through `AbstractPad::set_applet_resource`.
+
+## 2026-08-22 — `src/hid_core/src/resources/abstracted_pad/abstract_battery_handler.rs` vs `src/hid_core/resources/abstracted_pad/abstract_battery_handler.h` and `.cpp`
+
+### Intentional differences
+
+- Rust shares the holder, properties handler, and applet resource with `Arc<Mutex<_>>`; battery
+  selection, low-battery flag clearing, change detection, and shared-memory publication otherwise
+  preserve Eden's ordering and assignment-style rules.

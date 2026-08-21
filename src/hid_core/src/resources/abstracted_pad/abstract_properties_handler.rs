@@ -3,46 +3,34 @@
 
 //! Port of hid_core/resources/abstracted_pad/abstract_properties_handler.h and abstract_properties_handler.cpp
 
+use std::sync::Arc;
+
 use common::ResultCode;
+use parking_lot::Mutex;
 
 use crate::hid_result;
 use crate::hid_types::*;
 use crate::hid_util;
+use crate::resources::abstracted_pad::abstract_pad_holder::{
+    AbstractPadRef, NpadAbstractedPadHolder,
+};
 use crate::resources::npad::npad_types::*;
 
 /// Handles Npad properties request from HID interfaces
 pub struct NpadAbstractPropertiesHandler {
+    abstract_pad_holder: Option<Arc<Mutex<NpadAbstractedPadHolder>>>,
     npad_id_type: NpadIdType,
     ref_counter: i32,
-    device_type: DeviceIndex,
     applet_ui_type: AppletDetailedUiType,
-    applet_ui_attributes: AppletFooterUiAttributes,
-    is_vertical: bool,
-    is_horizontal: bool,
-    use_plus: bool,
-    use_minus: bool,
-    has_directional_buttons: bool,
-    fullkey_color: ColorProperties,
-    left_color: ColorProperties,
-    right_color: ColorProperties,
 }
 
 impl Default for NpadAbstractPropertiesHandler {
     fn default() -> Self {
         Self {
+            abstract_pad_holder: None,
             npad_id_type: NpadIdType::Invalid,
             ref_counter: 0,
-            device_type: DeviceIndex::None,
             applet_ui_type: AppletDetailedUiType::default(),
-            applet_ui_attributes: AppletFooterUiAttributes::default(),
-            is_vertical: false,
-            is_horizontal: false,
-            use_plus: false,
-            use_minus: false,
-            has_directional_buttons: false,
-            fullkey_color: ColorProperties::default(),
-            left_color: ColorProperties::default(),
-            right_color: ColorProperties::default(),
         }
     }
 }
@@ -50,6 +38,10 @@ impl Default for NpadAbstractPropertiesHandler {
 impl NpadAbstractPropertiesHandler {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn set_abstract_pad_holder(&mut self, holder: Arc<Mutex<NpadAbstractedPadHolder>>) {
+        self.abstract_pad_holder = Some(holder);
     }
 
     pub fn set_npad_id(&mut self, npad_id: NpadIdType) {
@@ -109,18 +101,57 @@ impl NpadAbstractPropertiesHandler {
     }
 
     pub fn get_fullkey_interface_type(&self) -> NpadInterfaceType {
-        // Upstream iterates abstract pads looking for connected Fullkey type
+        for abstract_pad in self.get_abstracted_pads() {
+            let abstract_pad = abstract_pad.lock();
+            if !abstract_pad.internal_flags.is_connected() {
+                continue;
+            }
+            if abstract_pad.device_type != NpadStyleIndex::Fullkey {
+                continue;
+            }
+            if abstract_pad.interface_type as u8 >= NpadInterfaceType::Embedded as u8 {
+                continue;
+            }
+            return abstract_pad.interface_type;
+        }
         NpadInterfaceType::None
     }
 
     pub fn get_interface_type(&self) -> NpadInterfaceType {
-        // Upstream iterates abstract pads looking for connected pad with identification_code
+        for abstract_pad in self.get_abstracted_pads() {
+            let abstract_pad = abstract_pad.lock();
+            if !abstract_pad.internal_flags.is_connected() {
+                continue;
+            }
+            if !abstract_pad.disabled_feature_set.has_identification_code() {
+                continue;
+            }
+            if abstract_pad.interface_type as u8 >= NpadInterfaceType::Embedded as u8 {
+                continue;
+            }
+            return abstract_pad.interface_type;
+        }
         NpadInterfaceType::None
     }
 
     pub fn get_style_set(&self, _aruid: u64) -> NpadStyleSet {
         // Upstream TODO: not yet implemented in C++ upstream
         NpadStyleSet::NONE
+    }
+
+    pub fn get_abstracted_pads_with_style_tag(&self, _style: NpadStyleTag) -> Vec<AbstractPadRef> {
+        let Some(holder) = &self.abstract_pad_holder else {
+            return Vec::new();
+        };
+        let mut pads: [Option<AbstractPadRef>; 5] = std::array::from_fn(|_| None);
+        let count = holder.lock().get_abstracted_pads(&mut pads) as usize;
+        pads.into_iter().take(count).flatten().collect()
+    }
+
+    pub fn get_abstracted_pads(&self) -> Vec<AbstractPadRef> {
+        self.get_abstracted_pads_with_style_tag(NpadStyleTag {
+            raw: self.get_style_set(0),
+        })
     }
 
     pub fn get_applet_footer_ui_type(&self) -> AppletFooterUiType {
@@ -132,7 +163,16 @@ impl NpadAbstractPropertiesHandler {
     }
 
     pub fn get_npad_interface_type(&self) -> NpadInterfaceType {
-        // Upstream iterates abstract pads looking for connected pad
+        for abstract_pad in self.get_abstracted_pads() {
+            let abstract_pad = abstract_pad.lock();
+            if !abstract_pad.internal_flags.is_connected() {
+                continue;
+            }
+            if abstract_pad.interface_type as u8 >= NpadInterfaceType::Embedded as u8 {
+                continue;
+            }
+            return abstract_pad.interface_type;
+        }
         NpadInterfaceType::None
     }
 
@@ -140,12 +180,40 @@ impl NpadAbstractPropertiesHandler {
         if self.applet_ui_type.footer != AppletFooterUiType::SwitchProController {
             return Err(hid_result::RESULT_NPAD_IS_NOT_PRO_CONTROLLER);
         }
-        // Upstream iterates abstract pads looking for connected pad
+        for abstract_pad in self.get_abstracted_pads() {
+            if abstract_pad.lock().internal_flags.is_connected() {
+                return Ok((NpadColor::default(), NpadColor::default()));
+            }
+        }
         Err(hid_result::RESULT_NPAD_IS_NOT_PRO_CONTROLLER)
     }
 
     pub fn get_npad_left_right_interface_type(&self) -> (NpadInterfaceType, NpadInterfaceType) {
-        // Upstream iterates abstract pads checking assignment_style
-        (NpadInterfaceType::None, NpadInterfaceType::None)
+        let mut left = NpadInterfaceType::None;
+        let mut right = NpadInterfaceType::None;
+        for abstract_pad in self.get_abstracted_pads() {
+            let abstract_pad = abstract_pad.lock();
+            if !abstract_pad.internal_flags.is_connected() {
+                continue;
+            }
+            if abstract_pad.assignment_style.is_external_left_assigned()
+                && abstract_pad.assignment_style.is_handheld_left_assigned()
+            {
+                if abstract_pad.interface_type as u8 > NpadInterfaceType::Embedded as u8 {
+                    continue;
+                }
+                left = abstract_pad.interface_type;
+                continue;
+            }
+            if abstract_pad.assignment_style.is_external_right_assigned()
+                && abstract_pad.assignment_style.is_handheld_right_assigned()
+            {
+                if abstract_pad.interface_type as u8 > NpadInterfaceType::Embedded as u8 {
+                    continue;
+                }
+                right = abstract_pad.interface_type;
+            }
+        }
+        (left, right)
     }
 }

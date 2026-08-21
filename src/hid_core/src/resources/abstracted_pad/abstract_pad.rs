@@ -3,7 +3,10 @@
 
 //! Port of hid_core/resources/abstracted_pad/abstract_pad.h and abstract_pad.cpp
 
+use std::sync::Arc;
+
 use common::ResultCode;
+use parking_lot::Mutex;
 
 use crate::hid_result;
 use crate::hid_types::*;
@@ -18,12 +21,13 @@ use crate::resources::abstracted_pad::abstract_palma_handler::NpadAbstractPalmaH
 use crate::resources::abstracted_pad::abstract_properties_handler::NpadAbstractPropertiesHandler;
 use crate::resources::abstracted_pad::abstract_sixaxis_handler::NpadAbstractSixAxisHandler;
 use crate::resources::abstracted_pad::abstract_vibration_handler::NpadAbstractVibrationHandler;
+use crate::resources::applet_resource::AppletResource;
 use crate::resources::npad::npad_types::MAX_SUPPORTED_NPAD_ID_TYPES;
 
 /// Handles Npad request from HID interfaces
 pub struct AbstractPad {
-    abstract_pad_holder: NpadAbstractedPadHolder,
-    properties_handler: NpadAbstractPropertiesHandler,
+    abstract_pad_holder: Arc<Mutex<NpadAbstractedPadHolder>>,
+    properties_handler: Arc<Mutex<NpadAbstractPropertiesHandler>>,
     led_handler: NpadAbstractLedHandler,
     ir_sensor_handler: NpadAbstractIrSensorHandler,
     nfc_handler: NpadAbstractNfcHandler,
@@ -39,17 +43,38 @@ pub struct AbstractPad {
 
 impl Default for AbstractPad {
     fn default() -> Self {
+        let abstract_pad_holder = Arc::new(Mutex::new(NpadAbstractedPadHolder::default()));
+        let properties_handler = Arc::new(Mutex::new(NpadAbstractPropertiesHandler::default()));
+        properties_handler
+            .lock()
+            .set_abstract_pad_holder(Arc::clone(&abstract_pad_holder));
+        let mut mcu_handler = NpadAbstractMcuHandler::default();
+        mcu_handler.set_properties_handler(Arc::clone(&properties_handler));
+        let mut sixaxis_handler = NpadAbstractSixAxisHandler::default();
+        sixaxis_handler.set_externals(None, Arc::clone(&properties_handler));
+        let mut button_handler = NpadAbstractButtonHandler::default();
+        button_handler.set_externals(
+            None,
+            Arc::clone(&abstract_pad_holder),
+            Arc::clone(&properties_handler),
+        );
+        let mut battery_handler = NpadAbstractBatteryHandler::default();
+        battery_handler.set_externals(
+            None,
+            Arc::clone(&abstract_pad_holder),
+            Arc::clone(&properties_handler),
+        );
         Self {
-            abstract_pad_holder: NpadAbstractedPadHolder::default(),
-            properties_handler: NpadAbstractPropertiesHandler::default(),
+            abstract_pad_holder,
+            properties_handler,
             led_handler: NpadAbstractLedHandler::default(),
             ir_sensor_handler: NpadAbstractIrSensorHandler::default(),
             nfc_handler: NpadAbstractNfcHandler::default(),
-            mcu_handler: NpadAbstractMcuHandler::default(),
+            mcu_handler,
             vibration_handler: NpadAbstractVibrationHandler::default(),
-            sixaxis_handler: NpadAbstractSixAxisHandler::default(),
-            button_handler: NpadAbstractButtonHandler::default(),
-            battery_handler: NpadAbstractBatteryHandler::default(),
+            sixaxis_handler,
+            button_handler,
+            battery_handler,
             palma_handler: NpadAbstractPalmaHandler::default(),
             ref_counter: 0,
             interface_type: NpadInterfaceType::None,
@@ -63,7 +88,24 @@ impl AbstractPad {
     }
 
     pub fn set_npad_id(&mut self, npad_id: NpadIdType) {
-        self.properties_handler.set_npad_id(npad_id);
+        self.properties_handler.lock().set_npad_id(npad_id);
+    }
+
+    pub fn set_applet_resource(&mut self, applet_resource: Option<Arc<Mutex<AppletResource>>>) {
+        self.sixaxis_handler.set_externals(
+            applet_resource.clone(),
+            Arc::clone(&self.properties_handler),
+        );
+        self.button_handler.set_externals(
+            applet_resource.clone(),
+            Arc::clone(&self.abstract_pad_holder),
+            Arc::clone(&self.properties_handler),
+        );
+        self.battery_handler.set_externals(
+            applet_resource,
+            Arc::clone(&self.abstract_pad_holder),
+            Arc::clone(&self.properties_handler),
+        );
     }
 
     pub fn activate(&mut self) -> ResultCode {
@@ -81,7 +123,7 @@ impl AbstractPad {
 
         if result.is_success() {
             stage += 1;
-            result = self.properties_handler.increment_ref_counter();
+            result = self.properties_handler.lock().increment_ref_counter();
         }
         if result.is_success() {
             stage += 1;
@@ -151,7 +193,7 @@ impl AbstractPad {
             self.led_handler.decrement_ref_counter();
         }
         if stage > 1 {
-            self.properties_handler.decrement_ref_counter();
+            self.properties_handler.lock().decrement_ref_counter();
         }
 
         result
@@ -171,7 +213,7 @@ impl AbstractPad {
         self.ir_sensor_handler.decrement_ref_counter();
         self.mcu_handler.decrement_ref_counter();
         self.led_handler.decrement_ref_counter();
-        self.properties_handler.decrement_ref_counter();
+        self.properties_handler.lock().decrement_ref_counter();
         self.palma_handler.decrement_ref_counter();
 
         ResultCode::SUCCESS
@@ -185,19 +227,20 @@ impl AbstractPad {
     }
 
     pub fn get_last_active_npad(&self) -> NpadIdType {
-        self.properties_handler.get_npad_id()
+        self.properties_handler.lock().get_npad_id()
     }
 
     pub fn update_interface_type(&mut self) {
-        if self.interface_type != self.properties_handler.get_interface_type() {
+        let interface_type = self.properties_handler.lock().get_interface_type();
+        if self.interface_type != interface_type {
             self.update();
         }
         self.battery_handler.update_battery_state();
     }
 
     pub fn update(&mut self) {
-        self.properties_handler.update_device_type();
-        let npad_id = self.properties_handler.get_npad_id();
+        self.properties_handler.lock().update_device_type();
+        let npad_id = self.properties_handler.lock().get_npad_id();
         self.led_handler.set_npad_led_handler_led_pattern(npad_id);
         self.vibration_handler.update_vibration_state();
         self.sixaxis_handler.update_six_axis_state();
@@ -208,9 +251,11 @@ impl AbstractPad {
         self.battery_handler.update_battery_state();
         self.button_handler.enable_center_clamp();
 
-        self.interface_type = self.properties_handler.get_interface_type();
+        self.interface_type = self.properties_handler.lock().get_interface_type();
 
-        self.properties_handler.update_all_device_properties();
+        self.properties_handler
+            .lock()
+            .update_all_device_properties();
         self.battery_handler.update_core_battery_state();
         self.button_handler.update_core_battery_state();
     }
@@ -224,15 +269,95 @@ impl AbstractPad {
     pub fn enable_applet_to_get_input(&mut self, aruid: u64) {
         self.button_handler.update_button_state(aruid);
         self.sixaxis_handler.update_six_axis_state_for_aruid(aruid);
+        self.battery_handler.update_battery_state_for_aruid(aruid);
     }
 
-    pub fn properties_handler(&self) -> &NpadAbstractPropertiesHandler {
-        &self.properties_handler
+    pub fn abstract_pad_holder(&self) -> Arc<Mutex<NpadAbstractedPadHolder>> {
+        Arc::clone(&self.abstract_pad_holder)
     }
 
-    pub fn properties_handler_mut(&mut self) -> &mut NpadAbstractPropertiesHandler {
-        &mut self.properties_handler
+    pub fn properties_handler(&self) -> Arc<Mutex<NpadAbstractPropertiesHandler>> {
+        Arc::clone(&self.properties_handler)
+    }
+
+    pub fn mcu_handler(&self) -> &NpadAbstractMcuHandler {
+        &self.mcu_handler
+    }
+
+    pub fn mcu_handler_mut(&mut self) -> &mut NpadAbstractMcuHandler {
+        &mut self.mcu_handler
+    }
+
+    pub fn battery_handler(&self) -> &NpadAbstractBatteryHandler {
+        &self.battery_handler
+    }
+
+    pub fn battery_handler_mut(&mut self) -> &mut NpadAbstractBatteryHandler {
+        &mut self.battery_handler
     }
 }
 
 pub type FullAbstractPad = [AbstractPad; MAX_SUPPORTED_NPAD_ID_TYPES];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::resources::abstracted_pad::abstract_mcu_handler::NpadMcuState;
+    use crate::resources::npad::npad_types::{AssignmentStyle, IAbstractedPad};
+
+    #[test]
+    fn externals_share_live_pads_between_properties_and_mcu_handlers() {
+        let mut abstract_pad = AbstractPad::new();
+        let physical_pad = Arc::new(Mutex::new(IAbstractedPad {
+            controller_id: 7,
+            device_type: NpadStyleIndex::Fullkey,
+            interface_type: NpadInterfaceType::Bluetooth,
+            assignment_style: AssignmentStyle { raw: 1 },
+            ..IAbstractedPad::default()
+        }));
+        {
+            let mut physical_pad_state = physical_pad.lock();
+            physical_pad_state.internal_flags.set_is_connected(true);
+            physical_pad_state.disabled_feature_set.raw = (1 << 9) | (1 << 18) | (1 << 22);
+            physical_pad_state.power_info = NpadPowerInfo {
+                is_powered: true,
+                is_charging: false,
+                battery_level: NpadBatteryLevel::Low,
+                ..NpadPowerInfo::default()
+            };
+        }
+        assert!(abstract_pad
+            .abstract_pad_holder()
+            .lock()
+            .register_abstract_pad(Arc::clone(&physical_pad))
+            .is_success());
+
+        assert_eq!(
+            abstract_pad
+                .properties_handler()
+                .lock()
+                .get_interface_type(),
+            NpadInterfaceType::Bluetooth
+        );
+        abstract_pad.mcu_handler_mut().update_mcu_state();
+        assert_eq!(
+            abstract_pad.mcu_handler().get_mcu_state(0),
+            NpadMcuState::Available
+        );
+        assert!(Arc::ptr_eq(
+            &abstract_pad.mcu_handler().get_abstracted_pad(0).unwrap(),
+            &physical_pad
+        ));
+
+        assert!(abstract_pad.activate().is_success());
+        abstract_pad.battery_handler_mut().update_battery_state();
+        assert_eq!(
+            abstract_pad
+                .battery_handler()
+                .get_dual_battery()
+                .battery_level,
+            NpadBatteryLevel::Low
+        );
+        assert!(abstract_pad.battery_handler().has_battery());
+    }
+}
