@@ -2045,6 +2045,7 @@ impl KProcess {
         metadata: &ProgramMetadata,
         code_size: u64,
         aslr_space_start: u64,
+        aslr_space_offset: u64,
         is_hbl: bool,
     ) -> u32 {
         // Create a resource limit for the process (upstream lines 1156-1159).
@@ -2069,9 +2070,8 @@ impl KProcess {
             super::k_resource_limit::create_resource_limit_for_process(physical_memory_size),
         ));
 
-        // Declare flags and code address (upstream lines 1167-1168).
+        // Declare flags (upstream lines 1200-1202).
         let mut flags = CreateProcessFlag::empty();
-        let mut code_address: u64 = 0;
 
         // Determine if we are an application (upstream lines 1170-1174).
         if pool == k_memory_manager::Pool::Application {
@@ -2083,30 +2083,30 @@ impl KProcess {
             flags |= CreateProcessFlag::IS_64_BIT;
         }
 
-        // Set the address space type and code address (upstream lines 1182-1204).
+        // Set the address space type and code address (upstream lines 1215-1237).
         log::info!(
             "[NPDM] address_space_type = {:?} is_64bit = {}",
             metadata.get_address_space_type(),
             metadata.is_64_bit_program()
         );
-        match metadata.get_address_space_type() {
+        let code_address = match metadata.get_address_space_type() {
             ProgramAddressSpaceType::Is39Bit => {
                 flags |= CreateProcessFlag::ADDRESS_SPACE_64_BIT;
-                code_address = 0x8000_0000;
+                0x8000_0000 + aslr_space_offset
             }
             ProgramAddressSpaceType::Is36Bit => {
                 flags |= CreateProcessFlag::ADDRESS_SPACE_64_BIT_DEPRECATED;
-                code_address = 0x0800_0000;
+                0x0800_0000 + aslr_space_offset
             }
             ProgramAddressSpaceType::Is32Bit => {
                 flags |= CreateProcessFlag::ADDRESS_SPACE_32_BIT;
-                code_address = 0x0020_0000;
+                0x0020_0000 + aslr_space_offset
             }
             ProgramAddressSpaceType::Is32BitNoMap => {
                 flags |= CreateProcessFlag::ADDRESS_SPACE_32_BIT_WITHOUT_ALIAS;
-                code_address = 0x0020_0000;
+                0x0020_0000 + aslr_space_offset
             }
-        }
+        };
 
         // Build parameters (upstream lines 1206-1215).
         let code_num_pages = code_size / PAGE_SIZE as u64;
@@ -3649,6 +3649,7 @@ mod tests {
 
     #[test]
     fn load_from_metadata_sets_process_owned_entrypoint_and_launch_properties() {
+        let _kernel = kernel_with_application_pool_for_test(0x8000);
         let mut metadata = ProgramMetadata::new();
         metadata.load_manual(
             false,
@@ -3663,10 +3664,10 @@ mod tests {
         );
 
         let mut process = KProcess::new();
-        let result = process.load_from_metadata(&metadata, 0x120000, 0, false);
+        let result = process.load_from_metadata(&metadata, 0x120000, 0, 0x0034_5000, false);
 
         assert_eq!(result, RESULT_SUCCESS.get_inner_value());
-        assert_eq!(process.get_entry_point().get(), 0x0020_0000);
+        assert_eq!(process.get_entry_point().get(), 0x0054_5000);
         assert_eq!(process.get_program_id(), 0x05AA_0000_0000_0001);
         assert_eq!(process.get_ideal_core_id(), 1);
         // main_thread_stack_size is set later by run(), not by load_from_metadata.
@@ -3693,7 +3694,7 @@ mod tests {
         );
 
         let mut process = KProcess::new();
-        let result = process.load_from_metadata(&metadata, 0x120000, 0, false);
+        let result = process.load_from_metadata(&metadata, 0x120000, 0, 0, false);
 
         assert_eq!(result, RESULT_SUCCESS.get_inner_value());
         let system_resource = process

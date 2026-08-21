@@ -333,17 +333,29 @@ impl AppLoader for AppLoaderDeconstructedRomDirectory {
             }
         }
 
+        // TODO: this is bad form of ASLR, it sucks
+        let aslr_offset = {
+            let settings = common::settings::values();
+            let random = if *settings.rng_seed_enabled.get_value() {
+                u64::from(*settings.rng_seed.get_value())
+            } else {
+                common::random::random64(0)
+            };
+            (random << 12) & 0xFFF000
+        };
+
         // ====================================================================
         // Process setup
         // ====================================================================
-        // Upstream: process.LoadFromMetadata(metadata, code_size, aslr_space_start, is_hbl)
+        // Upstream: process.LoadFromMetadata(metadata, code_size, fastmem_base, aslr_offset)
         // This single call handles everything: InitializeForProcess (creates page table,
         // block manager, address space layout), maps code region, sets permissions,
         // initializes capabilities, assigns process ID, creates PLR.
         let process_setup_result = process.load_from_metadata(
             &metadata,
             code_size,
-            0, // aslr_space_start — upstream passes this from KProcess::Create
+            0, // fastmem_base; Ruzu does not yet integrate Eden's NCE direct mapping
+            aslr_offset,
             self.is_hbl,
         );
         if process_setup_result != RESULT_SUCCESS.get_inner_value() {

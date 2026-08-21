@@ -400,10 +400,20 @@ impl AppLoaderNro {
 
         // Upstream: NCE patcher (HAS_NCE path). NCE patching is not yet integrated.
 
+        // TODO: this is bad form of ASLR, it sucks
+        let aslr_offset = {
+            let settings = common::settings::values();
+            let random = if *settings.rng_seed_enabled.get_value() {
+                u64::from(*settings.rng_seed.get_value())
+            } else {
+                common::random::random64(0)
+            };
+            (random << 12) & 0xFFF000
+        };
+
         // Setup the process code layout.
-        // Upstream: process.LoadFromMetadata(FileSys::ProgramMetadata::GetDefault(), image_size, fastmem_base, false)
         let metadata = ProgramMetadata::get_default();
-        let result = process.load_from_metadata(&metadata, image_size, 0, false);
+        let result = process.load_from_metadata(&metadata, image_size, 0, aslr_offset, false);
         if result != 0 {
             return false;
         }

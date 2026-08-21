@@ -2631,3 +2631,94 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 
 - N/A: no payload struct is serialized. A focused test verifies the MT19937 reference sequence and
   another verifies that `random64` preserves Eden's zero upper 32 bits.
+
+## 2026-08-21 — `src/core/src/hle/kernel/k_process.rs` vs Eden `src/core/hle/kernel/k_process.{h,cpp}` ASLR load offset
+
+### Intentional differences
+
+- Ruzu retains its `is_hbl` argument and assignment because this frontend state is currently owned
+  by `KProcess`; it follows the upstream parameters without changing their order.
+- The Rust `match` returns the selected address directly instead of declaring a zero-valued local
+  and assigning it in every switch arm. Flag mutation and address selection remain in the upstream
+  order.
+
+### Unintentional differences (to fix)
+
+- None in the reviewed address-selection path. Every address-space base now includes
+  `aslr_space_offset`, then adds `aslr_space_start` when constructing the process parameters.
+
+### Missing items
+
+- `load_from_metadata` still uses pool-size constants because its Rust signature does not yet carry
+  Eden's `KernelCore` reference.
+- Eden calls `InitializeInterfaces` before returning; Ruzu still creates the ARM interfaces later
+  from `System::load`.
+
+### Binary layout verification
+
+- N/A: no serialized layout changed. The focused regression initializes the kernel slab allocator,
+  loads a synthetic homebrew process with a nonzero page-aligned offset, and verifies its exact
+  entrypoint.
+
+## 2026-08-21 — `src/core/src/loader/deconstructed_rom_directory.rs` vs Eden `src/core/loader/deconstructed_rom_directory.{h,cpp}` ASLR load offset
+
+### Intentional differences
+
+- The additional Ruzu `is_hbl` state is forwarded after Eden's five load parameters; it does not
+  alter the upstream ASLR calculation.
+
+### Unintentional differences (to fix)
+
+- None in the reviewed ASLR calculation. The selected seed is shifted by 12, masked with
+  `0xfff000`, and passed to `KProcess` after the fast-memory base exactly as in Eden.
+
+### Missing items
+
+- Eden's NCE patch collection, patch-section size, and direct-mapped fast-memory base are not yet
+  integrated, so the corresponding argument remains zero on Ruzu's current backends.
+
+### Binary layout verification
+
+- N/A: this slice passes scalar addresses only.
+
+## 2026-08-21 — `src/core/src/loader/kip.rs` vs Eden `src/core/loader/kip.{h,cpp}` ASLR load offset
+
+### Intentional differences
+
+- Rust keeps the loader's virtual file because the `AppLoader` trait has no C++-style base-class
+  file member; loader ownership is otherwise unchanged.
+- Ruzu's internal `is_hbl = false` argument follows Eden's load parameters.
+
+### Unintentional differences (to fix)
+
+- None in the reviewed ASLR path. Seed selection, shift, mask, zero fast-memory base, and argument
+  ordering now match Eden.
+
+### Missing items
+
+- None in the reviewed ASLR path.
+
+### Binary layout verification
+
+- N/A: this slice passes scalar addresses only.
+
+## 2026-08-21 — `src/core/src/loader/nro.rs` vs Eden `src/core/loader/nro.{h,cpp}` ASLR load offset
+
+### Intentional differences
+
+- Ruzu's internal `is_hbl = false` argument follows Eden's load parameters.
+
+### Unintentional differences (to fix)
+
+- None in the reviewed ASLR calculation. The offset is generated after determining `image_size`
+  and before process setup, with Eden's exact shift and mask.
+
+### Missing items
+
+- Eden's NCE patching, patch relocation, and direct-mapped fast-memory base remain unintegrated; the
+  fast-memory argument therefore remains zero.
+
+### Binary layout verification
+
+- PASS: the existing compile-time assertions still verify the affected NRO, MOD, and asset header
+  sizes; this scalar ASLR change does not alter them.

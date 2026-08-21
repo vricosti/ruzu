@@ -179,13 +179,24 @@ impl AppLoader for AppLoaderKip {
         program_image.resize(bss_total as usize, 0);
         code_set.data_segment_mut().size += kip.get_bss_size();
 
+        // TODO: this is bad form of ASLR, it sucks
+        let aslr_offset = {
+            let settings = common::settings::values();
+            let random = if *settings.rng_seed_enabled.get_value() {
+                u64::from(*settings.rng_seed.get_value())
+            } else {
+                common::random::random64(0)
+            };
+            (random << 12) & 0xFFF000
+        };
+
         // Setup the process code layout.
-        // Upstream: process.LoadFromMetadata(FileSys::ProgramMetadata::GetDefault(), program_image.size(), 0, false)
         let default_metadata = ProgramMetadata::get_default();
         let process_result = process.load_from_metadata(
             &default_metadata,
             program_image.len() as u64,
-            0,     // fastmem_base
+            0, // fastmem_base
+            aslr_offset,
             false, // is_hbl
         );
         if process_result != crate::hle::result::RESULT_SUCCESS.get_inner_value() {
