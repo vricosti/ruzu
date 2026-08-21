@@ -28,7 +28,7 @@ pub mod vfp;
 
 use crate::frontend::a32::decoder::{decode_arm, ArmInstId};
 use crate::frontend::a32::decoder_thumb16::{decode_thumb16, Thumb16InstId};
-use crate::frontend::a32::decoder_thumb32::{decode_thumb32, Thumb32InstId};
+use crate::frontend::a32::decoder_thumb32::decode_thumb32;
 use crate::frontend::a32::types::Exception;
 use crate::ir::a32_emitter::A32IREmitter;
 use crate::ir::block::Block;

@@ -3412,3 +3412,33 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 ### Binary layout verification
 
 - N/A: the test executes guest instructions but changes no serialized guest structure.
+
+## 2026-08-21 — `src/rdynarmic/src/frontend/a32/translate/{data_processing.rs,mod.rs}` vs Eden `src/dynarmic/src/dynarmic/frontend/A32/translate/impl/{data_processing.cpp,a32_translate_impl.h}`
+
+### Intentional differences
+
+- Ruzu extracts instruction fields from `DecodedArm` and performs ARM condition handling at the
+  block-translation boundary; Eden's generated decoder passes typed fields to individual visitor
+  methods, each of which calls `ArmConditionPassed`.
+- Rust inserts an identity `Or32` before `GetNZFromOp` when MOV/MVN yields a non-instruction
+  `Value`; Eden's typed IR can attach `NZFrom` directly. This preserves the associated-pseudo-op
+  contract used by both Rust backends.
+- `translate/mod.rs` imports only `decode_thumb32`; Eden's visitor declarations do not require a
+  Rust instruction-ID type import, and the removed `Thumb32InstId` import had no behavior.
+
+### Unintentional differences (to fix)
+
+- The pre-existing `classify`/`dp_emit` dispatcher consolidates Eden's 48 separately owned
+  immediate, immediate-shift, and register-shift methods. The audited paths now preserve Eden's
+  helper choice, carry reads, PC validation, state-update ordering, and BIC `AndNot` operation,
+  but the method-boundary flattening still needs to be unwound for strict structural parity.
+
+### Missing items
+
+- No decoded ARM data-processing operation is missing from this file. Exact one-method-per-Eden-
+  visitor structure remains the structural work identified above.
+
+### Binary layout verification
+
+- N/A: these translators construct internal SSA operations and serialize no guest-visible
+  payload.

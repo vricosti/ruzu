@@ -81,28 +81,24 @@ pub fn arm_dp_imm(ir: &mut A32IREmitter, inst: &DecodedArm) -> bool {
         return true;
     };
 
-    // Upstream: carry_in is needed for:
-    // 1. Logic ops with S=1 — always, because SetCpsrNZC needs the C value.
-    //    When rotate!=0, C comes from the barrel shifter rotation.
-    //    When rotate==0, C is the old carry (carry_in from CPSR).
-    // 2. ADC/SBC/RSC — always need carry for the computation.
+    // Upstream uses ArmExpandImm_C for every logical immediate operation,
+    // even when S is clear, and plain ArmExpandImm for arithmetic operations.
     let is_logic_cat = match cat {
         DpCategory::TwoOp => !matches!(op, DpOp::Add | DpOp::Sub | DpOp::Rsb),
         DpCategory::MovOp | DpCategory::MvnOp | DpCategory::TestOp => true,
         _ => false,
     };
-    let needs_carry = (s && is_logic_cat) || matches!(cat, DpCategory::TwoOpCarry);
-    let carry_in = if needs_carry {
-        ir.get_c_flag()
+    let (imm_val, carry) = if is_logic_cat {
+        let carry_in = ir.get_c_flag();
+        let (imm_val, carry_bit) = arm_expand_imm_c(rotate, imm8, false);
+        let carry = if rotate == 0 {
+            carry_in
+        } else {
+            ir.ir().imm1(carry_bit)
+        };
+        (imm_val, carry)
     } else {
-        Value::ImmU1(false) // dummy, won't be used
-    };
-
-    let (imm_val, carry_bit) = arm_expand_imm_c(rotate, imm8, false);
-    let carry = if rotate == 0 {
-        carry_in
-    } else {
-        ir.ir().imm1(carry_bit)
+        (arm_expand_imm(rotate, imm8), Value::ImmU1(false))
     };
     let operand2 = Value::ImmU32(imm_val);
 
@@ -160,10 +156,20 @@ pub fn arm_dp_rsr(ir: &mut A32IREmitter, inst: &DecodedArm) -> bool {
         return true;
     };
 
-    let carry_in = ir.get_c_flag();
-    let rm_val = ir.get_register(rm);
+    let writes_rd = matches!(
+        cat,
+        DpCategory::TwoOp | DpCategory::TwoOpCarry | DpCategory::MovOp | DpCategory::MvnOp
+    );
+    let reads_rn = !matches!(cat, DpCategory::MovOp | DpCategory::MvnOp);
+    if rm == Reg::PC || rs == Reg::PC || (reads_rn && rn == Reg::PC) || (writes_rd && rd == Reg::PC)
+    {
+        return super::unpredictable_instruction(ir);
+    }
+
     let rs_val = ir.get_register(rs);
     let rs_amount = ir.ir().least_significant_byte(rs_val);
+    let carry_in = ir.get_c_flag();
+    let rm_val = ir.get_register(rm);
     let (shifted, carry) = emit_reg_shift(ir, rm_val, shift_type, rs_amount, carry_in);
 
     let operand1 = if matches!(cat, DpCategory::MovOp | DpCategory::MvnOp) {
@@ -176,7 +182,8 @@ pub fn arm_dp_rsr(ir: &mut A32IREmitter, inst: &DecodedArm) -> bool {
 }
 
 /// Emit the ALU operation, flags update, and result write.
-/// Matches upstream's per-instruction handling but factored for reuse.
+/// The shared dispatcher is pre-existing structural parity debt; its ordering
+/// follows the corresponding upstream per-instruction methods.
 fn dp_emit(
     ir: &mut A32IREmitter,
     op: DpOp,
@@ -208,12 +215,24 @@ fn dp_emit(
         }
         DpOp::Orr => ir.ir().or_32(operand1, operand2),
         DpOp::Mov => operand2,
-        DpOp::Bic => {
-            let not_op2 = ir.ir().not_32(operand2);
-            ir.ir().and_32(operand1, not_op2)
-        }
+        DpOp::Bic => ir.ir().and_not_32(operand1, operand2),
         DpOp::Mvn => ir.ir().not_32(operand2),
     };
+
+    // Upstream handles PC destinations immediately after computing the result,
+    // before any flag update or general-register write.
+    let writes_rd = matches!(
+        cat,
+        DpCategory::TwoOp | DpCategory::TwoOpCarry | DpCategory::MovOp | DpCategory::MvnOp
+    );
+    if writes_rd && rd == Reg::R15 {
+        if s {
+            return super::unpredictable_instruction(ir);
+        }
+        ir.alu_write_pc(result);
+        ir.set_term(Terminal::ReturnToDispatch);
+        return false;
+    }
 
     // Update flags. Upstream: arithmetic ops set NZCV, logic ops set NZC.
     let update_flags = s || matches!(cat, DpCategory::TestOp | DpCategory::CompareOp);
@@ -244,18 +263,138 @@ fn dp_emit(
     }
 
     // Write result to Rd (test/compare instructions don't write).
-    let writes_rd = matches!(
-        cat,
-        DpCategory::TwoOp | DpCategory::TwoOpCarry | DpCategory::MovOp | DpCategory::MvnOp
-    );
     if writes_rd {
-        if rd == Reg::R15 {
-            ir.alu_write_pc(result);
-            ir.set_term(Terminal::ReturnToDispatch);
-            return false;
-        }
         ir.set_register(rd, result);
     }
 
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ir::block::Block;
+    use crate::ir::location::LocationDescriptor;
+    use crate::ir::opcode::Opcode;
+
+    fn immediate_opcodes(raw: u32, id: ArmInstId) -> Vec<Opcode> {
+        let mut block = Block::new(LocationDescriptor(0));
+        {
+            let mut ir = A32IREmitter::new(&mut block);
+            assert!(arm_dp_imm(&mut ir, &DecodedArm { raw, id }));
+        }
+        block.instructions.iter().map(|inst| inst.opcode).collect()
+    }
+
+    #[test]
+    fn immediate_expansion_matches_upstream_carry_reads() {
+        let add = immediate_opcodes(0xe280_1001, ArmInstId::ADD_imm);
+        assert!(!add.contains(&Opcode::A32GetCFlag));
+
+        let adc = immediate_opcodes(0xe2a0_1001, ArmInstId::ADC_imm);
+        assert_eq!(
+            adc.iter()
+                .filter(|opcode| **opcode == Opcode::A32GetCFlag)
+                .count(),
+            1
+        );
+        let register_read = adc
+            .iter()
+            .position(|opcode| *opcode == Opcode::A32GetRegister)
+            .expect("ADC register read");
+        let carry_read = adc
+            .iter()
+            .position(|opcode| *opcode == Opcode::A32GetCFlag)
+            .expect("ADC carry read");
+        assert!(register_read < carry_read);
+
+        let and = immediate_opcodes(0xe200_1001, ArmInstId::AND_imm);
+        assert_eq!(and.first(), Some(&Opcode::A32GetCFlag));
+        assert_eq!(
+            and.iter()
+                .filter(|opcode| **opcode == Opcode::A32GetCFlag)
+                .count(),
+            1
+        );
+
+        let bic = immediate_opcodes(0xe3c0_1001, ArmInstId::BIC_imm);
+        assert!(bic.contains(&Opcode::AndNot32));
+        assert!(!bic.contains(&Opcode::Not32));
+    }
+
+    #[test]
+    fn invalid_pc_destinations_preserve_upstream_unpredictable_ordering() {
+        let location = crate::ir::location::A32LocationDescriptor::at(0x1000);
+        let mut block = Block::new(location.to_location());
+        {
+            let mut ir = A32IREmitter::with_location(&mut block, location);
+            assert!(!arm_dp_imm(
+                &mut ir,
+                &DecodedArm {
+                    raw: 0xe290_f001,
+                    id: ArmInstId::ADD_imm,
+                },
+            ));
+        }
+        assert!(!block
+            .instructions
+            .iter()
+            .any(|inst| inst.opcode == Opcode::A32BXWritePC));
+        assert!(!block
+            .instructions
+            .iter()
+            .any(|inst| { matches!(inst.opcode, Opcode::A32SetCpsrNZC | Opcode::A32SetCpsrNZCV) }));
+
+        let mut block = Block::new(location.to_location());
+        {
+            let mut ir = A32IREmitter::with_location(&mut block, location);
+            assert!(!arm_dp_rsr(
+                &mut ir,
+                &DecodedArm {
+                    raw: 0xe0a0_f211,
+                    id: ArmInstId::ADC_rsr,
+                },
+            ));
+        }
+        assert!(!block
+            .instructions
+            .iter()
+            .any(|inst| inst.opcode == Opcode::A32GetRegister));
+    }
+
+    #[test]
+    fn register_shift_reads_match_upstream_ordering() {
+        let mut block = Block::new(LocationDescriptor(0));
+        {
+            let mut ir = A32IREmitter::new(&mut block);
+            assert!(arm_dp_rsr(
+                &mut ir,
+                &DecodedArm {
+                    raw: 0xe0a0_1213,
+                    id: ArmInstId::ADC_rsr,
+                },
+            ));
+        }
+
+        let opcodes: Vec<_> = block.instructions.iter().map(|inst| inst.opcode).collect();
+        assert_eq!(
+            &opcodes[..4],
+            &[
+                Opcode::A32GetRegister,
+                Opcode::LeastSignificantByte,
+                Opcode::A32GetCFlag,
+                Opcode::A32GetRegister,
+            ]
+        );
+
+        let operand_read = opcodes
+            .iter()
+            .rposition(|opcode| *opcode == Opcode::A32GetRegister)
+            .expect("ADC operand register read");
+        let arithmetic_carry = opcodes
+            .iter()
+            .rposition(|opcode| *opcode == Opcode::A32GetCFlag)
+            .expect("ADC arithmetic carry read");
+        assert!(operand_read < arithmetic_carry);
+    }
 }
