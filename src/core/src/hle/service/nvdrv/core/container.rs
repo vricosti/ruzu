@@ -13,7 +13,6 @@ use super::nvmap::NvMap;
 use super::syncpoint_manager::SyncpointManager;
 use crate::core::SystemRef;
 use crate::hle::kernel::k_memory_block::KMemoryState;
-use crate::hle::kernel::k_process::KProcess;
 use crate::hle::kernel::k_process::ProcessLock;
 
 const INVALID_ASID: u32 = u32::MAX;

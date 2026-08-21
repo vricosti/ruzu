@@ -8,7 +8,7 @@
 
 use super::mii_result::{
     RESULT_INVALID_DATABASE_CHECKSUM, RESULT_INVALID_DATABASE_LENGTH,
-    RESULT_INVALID_DATABASE_SIGNATURE, RESULT_INVALID_DATABASE_VERSION, RESULT_NOT_FOUND,
+    RESULT_INVALID_DATABASE_SIGNATURE, RESULT_INVALID_DATABASE_VERSION,
     RESULT_NOT_UPDATED,
 };
 use super::mii_types::DatabaseSessionMetadata;
@@ -179,6 +179,7 @@ const _: () = assert!(core::mem::size_of::<NintendoFigurineDatabase>() == 0x1A98
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::hle::service::mii::mii_result::RESULT_NOT_FOUND;
     use crate::hle::service::mii::mii_types::DatabaseSessionMetadata;
 
     #[test]

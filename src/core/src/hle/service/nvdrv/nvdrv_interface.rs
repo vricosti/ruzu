@@ -11,7 +11,6 @@ use std::sync::{Arc, Mutex};
 use super::core::container::SessionId;
 use super::nvdata::*;
 use super::nvdrv::Module;
-use crate::hle::kernel::k_process::KProcess;
 use crate::hle::kernel::k_process::ProcessLock;
 use crate::hle::kernel::k_scheduler::KScheduler;
 use crate::hle::kernel::svc_common::PseudoHandle;

@@ -8,7 +8,6 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
 use crate::core::SystemRef;
-use crate::hle::kernel::k_process::KProcess;
 use crate::hle::kernel::k_process::ProcessLock;
 use crate::hle::result::{ErrorModule, ResultCode, RESULT_SUCCESS};
 use crate::hle::service::am::am_types::AppletIdentityInfo;

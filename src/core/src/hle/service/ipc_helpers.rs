@@ -11,8 +11,7 @@
 //! - RequestParser: parses IPC requests
 
 use crate::hle::ipc;
-use crate::hle::kernel::k_process::ProcessLock;
-use crate::hle::result::{ErrorModule, ResultCode, RESULT_SUCCESS};
+use crate::hle::result::{ErrorModule, ResultCode};
 use crate::hle::service::hle_ipc::HLERequestContext;
 
 /// Result code indicating a session has been closed.
@@ -581,7 +580,7 @@ mod tests {
     use crate::device_memory::DeviceMemory;
     use crate::hle::kernel::k_process::{KProcess, ProcessLock};
     use crate::hle::kernel::k_thread::{KThread, KThreadLock};
-    use crate::hle::result::ResultCode;
+    use crate::hle::result::{ResultCode, RESULT_SUCCESS};
     use crate::hle::service::hle_ipc::{SessionRequestHandler, SessionRequestManager};
     use crate::memory::memory::Memory;
     use common::page_table::{PageTable, PageType};

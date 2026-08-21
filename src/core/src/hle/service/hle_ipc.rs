@@ -63,7 +63,6 @@ impl KAutoObjectRef {
         }
     }
 }
-use crate::hle::kernel::k_process::ProcessLock;
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 use crate::hle::service::sm::sm::ServiceManager;
 

@@ -10,7 +10,6 @@ use std::sync::Arc;
 use super::bcat_types::DirectoryName;
 use super::delivery_cache_directory_service::IDeliveryCacheDirectoryService;
 use super::delivery_cache_file_service::IDeliveryCacheFileService;
-use crate::file_sys::vfs::vfs::VfsDirectory;
 use crate::file_sys::vfs::vfs_types::VirtualDir;
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};

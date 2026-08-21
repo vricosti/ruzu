@@ -10,7 +10,6 @@ use std::ptr::NonNull;
 use std::sync::{Arc, Mutex};
 
 use crate::hle::kernel::k_port::KPort;
-use crate::hle::kernel::k_process::KProcess;
 use crate::hle::kernel::k_readable_event::KReadableEvent;
 use crate::hle::kernel::k_server_session::KServerSession;
 

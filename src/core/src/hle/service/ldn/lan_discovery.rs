@@ -15,7 +15,6 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-use super::ldn_results::*;
 use super::ldn_types::*;
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 

@@ -5,7 +5,7 @@
 //! Port of zuyu/src/core/hle/service/am/service/application_creator.cpp
 
 use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Mutex, Weak};
 
 use crate::hle::result::ResultCode;
 use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};

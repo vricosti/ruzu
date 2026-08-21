@@ -20,7 +20,6 @@ use std::sync::{Arc, Condvar, Mutex};
 use common::math_util::Rectangle;
 
 use crate::hle::kernel::k_event::KEvent;
-use crate::hle::kernel::k_process::KProcess;
 use crate::hle::kernel::k_readable_event::KReadableEvent;
 use crate::hle::kernel::k_scheduler::KScheduler;
 use crate::hle::service::kernel_helpers::ServiceContext;
@@ -1655,6 +1654,7 @@ mod tests {
     use common::math_util::Rectangle;
 
     use crate::hle::service::kernel_helpers::ServiceContext;
+    use crate::hle::kernel::k_process::KProcess;
     use crate::hle::service::nvdrv::core::container::Container;
 
     use super::super::buffer_item::BufferItem;

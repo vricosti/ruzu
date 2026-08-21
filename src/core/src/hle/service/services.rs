@@ -23,7 +23,7 @@ use std::sync::{Arc, Mutex};
 use crate::hle::service::server_manager::ServerManager;
 use crate::hle::service::sm::sm::ServiceManager;
 
-use crate::hle::service::hle_ipc::{SessionRequestHandlerFactory, SessionRequestHandlerPtr};
+use crate::hle::service::hle_ipc::SessionRequestHandlerFactory;
 
 /// Generic stub service that accepts any IPC command and returns success.
 ///

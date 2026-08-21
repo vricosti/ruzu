@@ -15,7 +15,6 @@
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
 
 use crate::hle::ipc;
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
@@ -303,7 +302,7 @@ mod tests {
     use crate::core::SystemRef;
     use crate::hle::service::hle_ipc::SessionRequestManager;
     use crate::hle::service::server_manager::ServerManager;
-    use std::sync::{mpsc, Arc};
+    use std::sync::{mpsc, Arc, Mutex};
     use std::time::Duration;
 
     struct TestService {

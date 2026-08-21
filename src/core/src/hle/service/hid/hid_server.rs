@@ -734,7 +734,7 @@ impl IHidServer {
             rm.get_touch_resource(),
             rm.get_touch_driver(),
         ) {
-            let mut screen = touch_screen.lock();
+            let screen = touch_screen.lock();
             let mut resource = touch_resource.lock();
             let mut driver = touch_driver.lock();
 
@@ -1518,7 +1518,7 @@ impl IHidServer {
             rm.get_touch_resource(),
             rm.get_touch_driver(),
         ) {
-            let mut gesture = gesture.lock();
+            let gesture = gesture.lock();
             let mut resource = touch_resource.lock();
             let mut driver = touch_driver.lock();
 

@@ -7,7 +7,6 @@ use std::sync::{Arc, Mutex, Weak};
 
 use crate::core::{AudioInBufferWire, AudioInSession};
 use crate::hle::kernel::k_event::KEvent;
-use crate::hle::kernel::k_process::KProcess;
 use crate::hle::kernel::k_process::ProcessLock;
 use crate::hle::kernel::k_readable_event::KReadableEvent;
 use crate::hle::kernel::kernel::KernelCore;
@@ -368,6 +367,7 @@ impl IAudioIn {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::hle::kernel::k_process::KProcess;
 
     struct TestAudioInSession;
 

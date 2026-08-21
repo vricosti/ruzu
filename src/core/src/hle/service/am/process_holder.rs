@@ -6,7 +6,6 @@
 
 use std::sync::{Arc, Mutex};
 
-use crate::hle::kernel::k_process::KProcess;
 use crate::hle::service::os::multi_wait_holder::MultiWaitHolder;
 
 use super::applet::Applet;

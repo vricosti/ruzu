@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 
 use super::clocks::steady_clock_core::{self, SteadyClockCoreImpl};
 use super::common::SteadyClockTimePoint;
-use super::errors::{RESULT_CLOCK_UNINITIALIZED, RESULT_NOT_IMPLEMENTED, RESULT_PERMISSION_DENIED};
+use super::errors::{RESULT_CLOCK_UNINITIALIZED, RESULT_PERMISSION_DENIED};
 use super::manager::TimeManager;
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};

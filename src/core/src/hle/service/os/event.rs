@@ -9,7 +9,6 @@
 use std::sync::{Arc, Condvar, Mutex, Weak};
 
 use crate::hle::kernel::k_event::KEvent;
-use crate::hle::kernel::k_process::KProcess;
 use crate::hle::kernel::k_process::ProcessLock;
 use crate::hle::kernel::k_readable_event::KReadableEvent;
 use crate::hle::service::hle_ipc::{HLERequestContext, Handle};
@@ -304,6 +303,7 @@ impl Default for Event {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::hle::kernel::k_process::KProcess;
 
     #[test]
     fn clear_bridges_to_kernel_readable_event() {

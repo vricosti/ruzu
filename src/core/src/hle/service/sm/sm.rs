@@ -20,7 +20,6 @@ use std::sync::{Arc, Mutex, Weak};
 use crate::core::SystemRef;
 use crate::hle::kernel::k_event::KEvent;
 use crate::hle::kernel::k_port::KPort;
-use crate::hle::kernel::k_process::KProcess;
 use crate::hle::kernel::k_process::ProcessLock;
 use crate::hle::kernel::k_scheduler::KScheduler;
 use crate::hle::kernel::svc::svc_results::RESULT_INVALID_STATE;

@@ -13,7 +13,6 @@ use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
 use crate::hle::service::ipc_helpers::{RequestParser, ResponseBuilder};
 use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
 
-use super::clocks::steady_clock_core::SteadyClockCoreImpl;
 use super::common::{
     get_span_between_time_points, ClockSnapshot, StaticServiceSetupInfo, SteadyClockTimePoint,
     SystemClockContext, TimeType,

@@ -12,7 +12,6 @@ use super::applet::Applet;
 use super::applet_data_broker::AppletDataBroker;
 use super::window_system::WindowSystem;
 use crate::core::SystemRef;
-use crate::hle::kernel::k_process::KProcess;
 use crate::hle::kernel::k_process::ProcessLock;
 use crate::hle::service::am::process_creation::create_process;
 use crate::hle::service::os::process::Process;
@@ -639,6 +638,7 @@ impl AppletManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::hle::kernel::k_process::KProcess;
     use std::sync::Arc;
     use std::time::Duration;
 

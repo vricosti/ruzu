@@ -15,6 +15,6 @@ pub type SlotsType = [BufferSlot; NUM_BUFFER_SLOTS];
 
 /// Helper to create default-initialized slots array.
 pub fn new_slots() -> Box<SlotsType> {
-    let mut slots: Box<SlotsType> = Box::new(std::array::from_fn(|_| BufferSlot::default()));
+    let slots: Box<SlotsType> = Box::new(std::array::from_fn(|_| BufferSlot::default()));
     slots
 }

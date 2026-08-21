@@ -14,7 +14,6 @@ use sha2::{Digest, Sha256};
 use super::ro_nro_utils;
 use super::ro_results;
 use super::ro_types::{ModuleId, NroHeader, NrrHeader, NrrKind};
-use crate::hle::kernel::k_process::KProcess;
 use crate::hle::kernel::k_process::ProcessLock;
 use crate::hle::kernel::svc_common::PseudoHandle;
 use crate::hle::result::ResultCode;
@@ -1114,6 +1113,7 @@ mod tests {
     use super::*;
     use crate::core::{System, SystemRef};
     use crate::hle::ipc;
+    use crate::hle::kernel::k_process::KProcess;
     use crate::hle::kernel::k_thread::{KThread, KThreadLock};
     use crate::hle::kernel::kernel::ScopedKernelForTest;
 

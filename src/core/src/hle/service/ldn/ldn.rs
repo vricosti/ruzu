@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 use crate::hle::service::hle_ipc::{
-    HLERequestContext, SessionRequestHandler, SessionRequestHandlerPtr,
+    HLERequestContext, SessionRequestHandler,
 };
 use crate::hle::service::ipc_helpers::{RequestParser, ResponseBuilder};
 use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};

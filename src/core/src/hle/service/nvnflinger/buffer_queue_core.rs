@@ -29,7 +29,6 @@ use super::buffer_slot::BufferState;
 use super::consumer_listener::IConsumerListener;
 use super::pixel_format::PixelFormat;
 use super::producer_listener::IProducerListener;
-use super::status::Status;
 use super::ui::fence::Fence;
 use super::window::NativeWindowApi;
 

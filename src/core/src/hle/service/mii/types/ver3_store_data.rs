@@ -9,8 +9,8 @@
 use super::raw_data;
 use super::store_data::StoreData;
 use crate::hle::service::mii::mii_types::{
-    BeardType, CommonColor, EyeType, EyebrowType, FacelineMake, FacelineType, FacelineWrinkle,
-    FavoriteColor, FontRegion, Gender, GlassType, HairFlip, HairType, MoleType, MouthType,
+    BeardType, EyeType, EyebrowType, FacelineMake, FacelineType, FacelineWrinkle,
+    FavoriteColor, Gender, HairType, MoleType, MouthType,
     MustacheType, Nickname, NoseType, MAX_BUILD, MAX_EYEBROW_ASPECT, MAX_EYEBROW_ROTATE,
     MAX_EYEBROW_SCALE, MAX_EYEBROW_X, MAX_EYEBROW_Y, MAX_EYE_ASPECT, MAX_EYE_ROTATE, MAX_EYE_SCALE,
     MAX_EYE_X, MAX_EYE_Y, MAX_GLASS_SCALE, MAX_GLASS_Y, MAX_HEIGHT, MAX_MOLE_SCALE, MAX_MOLE_X,

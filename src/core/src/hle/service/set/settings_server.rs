@@ -10,7 +10,7 @@ use std::collections::BTreeMap;
 
 use super::key_code_map::*;
 use super::settings_types::{
-    KeyboardLayout, Language, LanguageCode, AVAILABLE_LANGUAGE_CODES, LANGUAGE_TO_LAYOUT,
+    KeyboardLayout, LanguageCode, AVAILABLE_LANGUAGE_CODES, LANGUAGE_TO_LAYOUT,
 };
 use crate::hle::result::{ErrorModule, ResultCode, RESULT_SUCCESS};
 use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};

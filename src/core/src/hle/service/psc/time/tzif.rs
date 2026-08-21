@@ -11,7 +11,6 @@
 //! Used by the PSC time service to convert between POSIX timestamps and
 //! calendar time with timezone support.
 
-use super::common::{CalendarAdditionalInfo, CalendarTime};
 
 // Constants matching upstream tz.cpp
 const TZ_MAX_TIMES: usize = 1000;

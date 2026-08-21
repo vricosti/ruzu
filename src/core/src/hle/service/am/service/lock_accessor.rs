@@ -8,7 +8,6 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, Weak};
 
 use crate::hle::kernel::k_event::KEvent;
-use crate::hle::kernel::k_process::KProcess;
 use crate::hle::kernel::k_process::ProcessLock;
 use crate::hle::kernel::k_readable_event::KReadableEvent;
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
@@ -187,6 +186,7 @@ impl ServiceFramework for ILockAccessor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::hle::kernel::k_process::KProcess;
     use crate::hle::kernel::k_scheduler::KScheduler;
 
     #[test]

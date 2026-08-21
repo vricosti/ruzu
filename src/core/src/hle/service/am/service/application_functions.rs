@@ -5,7 +5,7 @@
 //! Port of zuyu/src/core/hle/service/am/service/application_functions.cpp
 
 use crate::hle::service::am::am_types::{
-    GamePlayRecordingState, LaunchParameterKind, ProgramSpecifyKind, WindowOriginMode,
+    GamePlayRecordingState, LaunchParameterKind, ProgramSpecifyKind,
 };
 use std::collections::BTreeMap;
 use std::sync::Arc;

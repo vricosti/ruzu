@@ -14,7 +14,6 @@
 use super::factory_settings_server::IFactorySettingsServer;
 use super::firmware_debug_settings_server::IFirmwareDebugSettingsServer;
 use super::settings_server::ISettingsServer;
-use super::system_settings_server::ISystemSettingsServer;
 
 /// Registers "set", "set:cal", "set:fd", "set:sys" services.
 ///
