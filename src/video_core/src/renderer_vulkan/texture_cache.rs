@@ -4512,11 +4512,6 @@ impl TextureCache {
         Ok(self.base.get_framebuffer()?.render_target_framebuffer())
     }
 
-    fn image_up_to_date(&self, image_id: ImageId) -> bool {
-        let base = &self.base.slot_images[image_id];
-        !base.flags.contains(ImageFlagBits::CPU_MODIFIED) && base.backend.is_some()
-    }
-
     fn backend_image(&self, image_id: ImageId) -> Option<&Image> {
         self.base
             .slot_images

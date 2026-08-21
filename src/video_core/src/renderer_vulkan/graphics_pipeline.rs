@@ -2641,23 +2641,6 @@ fn graphics_pipeline_key_cache_hash(key: &GraphicsPipelineKey) -> u64 {
     key.hash_value()
 }
 
-/// Port of `CastAttributeType` in `vk_pipeline_cache.cpp`.
-fn cast_attribute_type(attrib: &crate::engines::maxwell_3d::VertexAttribInfo) -> AttributeType {
-    if attrib.constant {
-        return AttributeType::Disabled;
-    }
-    match attrib.attrib_type {
-        VertexAttribType::Invalid => AttributeType::Disabled,
-        VertexAttribType::SNorm | VertexAttribType::UNorm | VertexAttribType::Float => {
-            AttributeType::Float
-        }
-        VertexAttribType::SInt => AttributeType::SignedInt,
-        VertexAttribType::UInt => AttributeType::UnsignedInt,
-        VertexAttribType::UScaled => AttributeType::UnsignedScaled,
-        VertexAttribType::SScaled => AttributeType::SignedScaled,
-    }
-}
-
 fn cast_attribute_type_from_state(
     attrib: super::fixed_pipeline_state::VertexAttribute,
 ) -> AttributeType {

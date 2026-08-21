@@ -1444,6 +1444,7 @@ impl<P: TextureCacheParams> TextureCacheBase<P> {
     /// Port of `TextureCache<P>::FindOrInsertImage` (texture_cache.h:1140-1146).
     /// Looks up an existing image that can satisfy `info` at `gpu_addr`;
     /// on miss, inserts a fresh `ImageBase` keyed by that address.
+    #[cfg(test)]
     pub(crate) fn find_or_insert_image(
         &mut self,
         info: &super::image_info::ImageInfo,
@@ -1460,6 +1461,7 @@ impl<P: TextureCacheParams> TextureCacheBase<P> {
     /// Upstream first translates the requested GPU range to a CPU/device
     /// address and returns the null image on translation failure. Candidate
     /// reuse is then restricted to images registered in that CPU region.
+    #[cfg(test)]
     pub(crate) fn find_image(
         &mut self,
         info: &super::image_info::ImageInfo,
@@ -1478,6 +1480,7 @@ impl<P: TextureCacheParams> TextureCacheBase<P> {
     /// flags supplied by the caller. Upstream `TextureCache<P>::FindImage`
     /// derives these from `runtime.HasBrokenTextureViewFormats()` and
     /// `runtime.HasNativeBgr()` before calling `IsSubresource`.
+    #[cfg(test)]
     pub(crate) fn find_image_with_caps(
         &mut self,
         info: &super::image_info::ImageInfo,
@@ -1571,6 +1574,7 @@ impl<P: TextureCacheParams> TextureCacheBase<P> {
     /// info, ...)` upload glue. Resolves the CPU/device address in the same
     /// order as upstream: direct GPU translation, range translation, then a
     /// virtual-invalid fake CPU range.
+    #[cfg(test)]
     pub(crate) fn insert_image(
         &mut self,
         info: &super::image_info::ImageInfo,

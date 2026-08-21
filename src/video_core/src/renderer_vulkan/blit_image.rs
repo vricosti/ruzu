@@ -165,30 +165,6 @@ pub enum Filter {
     Bilinear = 1,
 }
 
-// ---------------------------------------------------------------------------
-// Helper: compute push constants from region
-// ---------------------------------------------------------------------------
-
-/// Port of `PushConstants` construction from regions.
-fn compute_push_constants(src_region: &Region2D, dst_region: &Region2D) -> PushConstants {
-    let src_width = (src_region.end.x - src_region.start.x) as f32;
-    let src_height = (src_region.end.y - src_region.start.y) as f32;
-    let dst_width = (dst_region.end.x - dst_region.start.x) as f32;
-    let dst_height = (dst_region.end.y - dst_region.start.y) as f32;
-
-    if dst_width == 0.0 || dst_height == 0.0 {
-        return PushConstants::default();
-    }
-
-    PushConstants {
-        tex_scale: [src_width / dst_width, src_height / dst_height],
-        tex_offset: [
-            src_region.start.x as f32 / dst_width,
-            src_region.start.y as f32 / dst_height,
-        ],
-    }
-}
-
 fn update_one_texture_descriptor_set(
     device: &ash::Device,
     descriptor_set: vk::DescriptorSet,

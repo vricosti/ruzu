@@ -145,7 +145,9 @@ const REMAP_COMPONENTS: u32 = 0x1C2;
 const DST_PARAMS: u32 = 0x1C3;
 const SRC_PARAMS: u32 = 0x1CA;
 
+#[cfg(test)]
 const LAUNCH_DATA_TRANSFER_TYPE_MASK: u32 = 0x3;
+#[cfg(test)]
 const LAUNCH_DATA_TRANSFER_NON_PIPELINED: u32 = 2;
 const LAUNCH_SEMAPHORE_TYPE_SHIFT: u32 = 3;
 const LAUNCH_SEMAPHORE_TYPE_MASK: u32 = 0x3;
@@ -272,6 +274,7 @@ impl MaxwellDMA {
         self.regs[LAUNCH_DMA as usize]
     }
 
+    #[cfg(test)]
     fn launch_data_transfer_type(&self) -> u32 {
         self.launch_dma() & LAUNCH_DATA_TRANSFER_TYPE_MASK
     }

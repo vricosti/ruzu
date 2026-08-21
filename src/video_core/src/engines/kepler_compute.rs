@@ -16,6 +16,7 @@ use super::engine_upload;
 use super::{ClassId, Engine, PendingWrite};
 use crate::memory_manager::MemoryManager;
 use crate::rasterizer_interface::{RasterizerHandle, RasterizerInterface};
+#[cfg(test)]
 use crate::textures::texture::{TicEntry, TscEntry};
 
 // ── Register offset constants (method addresses) ────────────────────────────
@@ -489,6 +490,7 @@ impl KeplerCompute {
     }
 
     /// Port of upstream `KeplerCompute::GetTICEntry`.
+    #[cfg(test)]
     fn get_tic_entry(&self, tic_index: u32) -> TicEntry {
         let tic_address_gpu =
             self.tic_address() + tic_index as u64 * std::mem::size_of::<TicEntry>() as u64;
@@ -500,6 +502,7 @@ impl KeplerCompute {
     }
 
     /// Port of upstream `KeplerCompute::GetTSCEntry`.
+    #[cfg(test)]
     fn get_tsc_entry(&self, tsc_index: u32) -> TscEntry {
         let tsc_address_gpu =
             self.tsc_address() + tsc_index as u64 * std::mem::size_of::<TscEntry>() as u64;

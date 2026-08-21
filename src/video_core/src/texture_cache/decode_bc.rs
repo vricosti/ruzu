@@ -416,6 +416,7 @@ fn decompress_color_blocks(
     }
 }
 
+#[cfg(test)]
 fn decode_bc1_block(block: &[u8; 8]) -> [u8; 64] {
     decode_bc_color_block(block, true, false)
 }

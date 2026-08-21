@@ -688,8 +688,12 @@ impl TextureCacheParams for CommonTextureCacheParams {
 const TARGET_THRESHOLD: i64 = 4 * 1024 * 1024 * 1024; // 4 GiB
 const DEFAULT_EXPECTED_MEMORY: i64 = 1024 * 1024 * 1024 + 125 * 1024 * 1024; // 1 GiB + 125 MiB
 const DEFAULT_CRITICAL_MEMORY: i64 = 1024 * 1024 * 1024 + 625 * 1024 * 1024; // 1 GiB + 625 MiB
+                                                                             // Preserved from upstream even though Eden does not currently consume it.
+#[allow(dead_code)]
 const GC_EMERGENCY_COUNTS: usize = 2;
 pub(crate) const TICKS_TO_DESTROY: usize = 8;
+// Preserved from upstream even though Eden does not currently consume it.
+#[allow(dead_code)]
 const UNSET_CHANNEL: usize = usize::MAX;
 
 /// The main texture cache.

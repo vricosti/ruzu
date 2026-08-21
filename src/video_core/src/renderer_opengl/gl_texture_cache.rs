@@ -26,7 +26,7 @@ use crate::framebuffer_config::FramebufferConfig;
 use crate::renderer_base::GuestMemoryWriter;
 use crate::shader_environment::TextureType;
 use crate::surface::{PixelFormat, SurfaceType};
-use crate::texture_cache::image_base::{ImageBase, ImageFlagBits, ImageMapView};
+use crate::texture_cache::image_base::{ImageBase, ImageFlagBits};
 use crate::texture_cache::image_info::ImageInfo;
 use crate::texture_cache::image_view_base::{ImageViewBase, ImageViewFlagBits};
 use crate::texture_cache::image_view_info::{ImageViewInfo, SwizzleSource};
@@ -3175,13 +3175,6 @@ impl TextureCache {
             .flatten()
     }
 
-    fn backend_image_mut(&mut self, image_id: ImageId) -> Option<&mut Image> {
-        if !self.base.slot_images.contains(image_id) {
-            return None;
-        }
-        self.base.slot_images[image_id].backend.as_mut()
-    }
-
     fn backend_image_pair_mut(
         &mut self,
         dst_id: ImageId,
@@ -3267,10 +3260,6 @@ impl TextureCache {
         image_id: ImageId,
     ) -> bool {
         base.slot_images.contains(image_id)
-    }
-
-    fn base_image_view_exists(&self, image_view_id: ImageViewId) -> bool {
-        self.base.slot_image_views.contains(image_view_id)
     }
 
     fn find_or_insert_image_from_info_with_options_and_finish(
@@ -4169,75 +4158,6 @@ impl TextureCache {
         self.base.mark_modification_by_id(dst_id);
 
         true
-    }
-
-    fn find_or_insert_mapped_image(
-        &mut self,
-        info: &ImageInfo,
-        gpu_addr: u64,
-        cpu_addr: u64,
-    ) -> ImageId {
-        if let Some((id, _)) = self.base.slot_images.iter().find(|(_, image)| {
-            image.gpu_addr == gpu_addr
-                && image.cpu_addr == cpu_addr
-                && image.info.size == info.size
-                && image.info.format == info.format
-        }) {
-            return id;
-        }
-        let image_id = self
-            .base
-            .slot_images
-            .insert(ImageBase::new(info.clone(), gpu_addr, cpu_addr).into());
-        let image_size = self.base.slot_images[image_id].guest_size_bytes as usize;
-        let map_id = self
-            .base
-            .slot_map_views
-            .insert(ImageMapView::new(gpu_addr, cpu_addr, image_size, image_id));
-        self.base.slot_images[image_id].map_view_id = map_id;
-        self.base.register_image(image_id);
-        image_id
-    }
-
-    fn find_mapped_image_with_options(
-        &self,
-        info: &ImageInfo,
-        gpu_addr: u64,
-        options: RelaxedOptions,
-    ) -> Option<ImageId> {
-        let broken_views = self.base.has_broken_texture_view_formats
-            || options.contains(RelaxedOptions::FORCE_BROKEN_VIEWS);
-        let native_bgr = self.base.has_native_bgr;
-        self.base
-            .slot_images
-            .iter()
-            .filter_map(|(id, image)| {
-                if image.flags.contains(ImageFlagBits::REMAPPED) {
-                    return None;
-                }
-                crate::texture_cache::util::is_subresource(
-                    info,
-                    image,
-                    gpu_addr,
-                    options,
-                    broken_views,
-                    native_bgr,
-                )
-                .then_some((id, image.modification_tick))
-            })
-            .max_by_key(|(_, tick)| *tick)
-            .map(|(id, _)| id)
-    }
-
-    fn find_or_insert_mapped_image_with_options(
-        &mut self,
-        info: &ImageInfo,
-        gpu_addr: u64,
-        cpu_addr: u64,
-        options: RelaxedOptions,
-    ) -> ImageId {
-        self.find_mapped_image_with_options(info, gpu_addr, options)
-            .unwrap_or_else(|| self.find_or_insert_mapped_image(info, gpu_addr, cpu_addr))
     }
 
     fn ensure_color_view_for_range(

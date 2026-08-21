@@ -42,10 +42,9 @@ use crate::engines::draw_manager::{
     DrawMode, DrawState, IndexBuffer, Maxwell3DDrawRegisters, Maxwell3DDrawView, VertexBuffer,
 };
 use crate::engines::kepler_compute::DispatchCall;
-use crate::engines::maxwell_3d::{
-    BlendEquation, BlendFactor, ComparisonOp, CullFace, DrawCall, FrontFace, PrimitiveTopology,
-    VertexAttribType, NUM_VIEWPORTS,
-};
+#[cfg(test)]
+use crate::engines::maxwell_3d::{BlendEquation, BlendFactor, ComparisonOp, CullFace, FrontFace};
+use crate::engines::maxwell_3d::{DrawCall, PrimitiveTopology, VertexAttribType, NUM_VIEWPORTS};
 use crate::engines::maxwell_dma::{dma, AccelerateDMAInterface};
 use crate::engines::Framebuffer;
 use crate::fence_manager::FenceManager as GenericFenceManager;
@@ -3978,6 +3977,7 @@ impl Drop for RasterizerVulkan {
 
 // ── State mapping helpers (reused from old renderer.rs) ────────────────────
 
+#[cfg(test)]
 pub(crate) fn map_topology(topo: PrimitiveTopology) -> vk::PrimitiveTopology {
     match topo {
         PrimitiveTopology::Points => vk::PrimitiveTopology::POINT_LIST,
@@ -3990,6 +3990,7 @@ pub(crate) fn map_topology(topo: PrimitiveTopology) -> vk::PrimitiveTopology {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn map_cull_mode(
     rasterizer: &crate::engines::maxwell_3d::RasterizerInfo,
 ) -> vk::CullModeFlags {
@@ -4003,6 +4004,7 @@ pub(crate) fn map_cull_mode(
     }
 }
 
+#[cfg(test)]
 pub(crate) fn map_front_face(ff: FrontFace) -> vk::FrontFace {
     match ff {
         FrontFace::CW => vk::FrontFace::CLOCKWISE,
@@ -4010,6 +4012,7 @@ pub(crate) fn map_front_face(ff: FrontFace) -> vk::FrontFace {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn map_compare_op(op: ComparisonOp) -> vk::CompareOp {
     match op {
         ComparisonOp::Never => vk::CompareOp::NEVER,
@@ -4023,6 +4026,7 @@ pub(crate) fn map_compare_op(op: ComparisonOp) -> vk::CompareOp {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn map_blend_factor(factor: BlendFactor) -> vk::BlendFactor {
     match factor {
         BlendFactor::Zero => vk::BlendFactor::ZERO,
@@ -4047,6 +4051,7 @@ pub(crate) fn map_blend_factor(factor: BlendFactor) -> vk::BlendFactor {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn map_blend_equation(eq: BlendEquation) -> vk::BlendOp {
     match eq {
         BlendEquation::Add => vk::BlendOp::ADD,
@@ -4352,6 +4357,7 @@ fn create_fallback_sampler(device: &ash::Device) -> Result<vk::Sampler, Renderer
     }
 }
 
+#[cfg(test)]
 fn null_buffer_descriptor(
     has_null_descriptor: bool,
     fallback_buffer: vk::Buffer,
