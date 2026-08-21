@@ -31,6 +31,10 @@ use crate::backend::arm64::emit_arm64_a64_memory::{
     emit_a64_clear_exclusive, emit_a64_exclusive_read_memory, emit_a64_exclusive_write_memory,
     emit_a64_read_memory, emit_a64_write_memory,
 };
+use crate::backend::arm64::emit_arm64_cryptography::{
+    emit_aes_decrypt_single_round, emit_aes_encrypt_single_round, emit_aes_inverse_mix_columns,
+    emit_aes_mix_columns,
+};
 use crate::backend::arm64::emit_arm64_data_processing::{
     emit_add32, emit_add64, emit_and32, emit_and64, emit_and_not32, emit_and_not64,
     emit_arithmetic_shift_right32, emit_arithmetic_shift_right64,
@@ -722,6 +726,10 @@ fn emit_ir_instruction(
         }
         Opcode::SignedSaturation => emit_signed_saturation(code, ctx, inst_ref),
         Opcode::UnsignedSaturation => emit_unsigned_saturation(code, ctx, inst_ref),
+        Opcode::AESDecryptSingleRound => emit_aes_decrypt_single_round(code, ctx, inst_ref),
+        Opcode::AESEncryptSingleRound => emit_aes_encrypt_single_round(code, ctx, inst_ref),
+        Opcode::AESInverseMixColumns => emit_aes_inverse_mix_columns(code, ctx, inst_ref),
+        Opcode::AESMixColumns => emit_aes_mix_columns(code, ctx, inst_ref),
         Opcode::VectorSignedSaturatedAdd8
         | Opcode::VectorSignedSaturatedAdd16
         | Opcode::VectorSignedSaturatedAdd32
@@ -2446,6 +2454,28 @@ mod tests {
             Opcode::FPVectorAbs16,
             Opcode::FPVectorAbs32,
             Opcode::FPVectorAbs64,
+        ] {
+            let mut block = return_to_dispatch_block();
+            let input = block.append(Opcode::A64GetQ, &[Value::ImmA64Vec(A64Vec::V0)]);
+            block.append(opcode, &[Value::Inst(input)]);
+            let mut code = BlockOfCode::with_size(4096).unwrap();
+
+            emit_arm64(
+                &mut code,
+                block,
+                EmitConfig::from_a64_config(&config(false)),
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn emit_arm64_routes_aes_to_cryptography_owner() {
+        for opcode in [
+            Opcode::AESDecryptSingleRound,
+            Opcode::AESEncryptSingleRound,
+            Opcode::AESInverseMixColumns,
+            Opcode::AESMixColumns,
         ] {
             let mut block = return_to_dispatch_block();
             let input = block.append(Opcode::A64GetQ, &[Value::ImmA64Vec(A64Vec::V0)]);

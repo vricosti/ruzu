@@ -2106,6 +2106,26 @@ pub fn movi_d_imm0(rd: u8) -> u32 {
     0x2f00_e400 | reg5(rd)
 }
 
+/// `aese vD.16b, vN.16b`.
+pub fn aese_v16b(rd: u8, rn: u8) -> u32 {
+    0x4e28_4800 | (reg5(rn) << 5) | reg5(rd)
+}
+
+/// `aesd vD.16b, vN.16b`.
+pub fn aesd_v16b(rd: u8, rn: u8) -> u32 {
+    0x4e28_5800 | (reg5(rn) << 5) | reg5(rd)
+}
+
+/// `aesmc vD.16b, vN.16b`.
+pub fn aesmc_v16b(rd: u8, rn: u8) -> u32 {
+    0x4e28_6800 | (reg5(rn) << 5) | reg5(rd)
+}
+
+/// `aesimc vD.16b, vN.16b`.
+pub fn aesimc_v16b(rd: u8, rn: u8) -> u32 {
+    0x4e28_7800 | (reg5(rn) << 5) | reg5(rd)
+}
+
 /// `movi vD.16b, #imm`.
 pub fn movi_v16b_imm(rd: u8, imm: u8) -> u32 {
     match imm {
@@ -2941,6 +2961,10 @@ mod tests {
         assert_eq!(movk_w(16, 0x1234, 16), 0x72a2_4690);
         assert_eq!(movz_x(0, 0x1234, 0), 0xd282_4680);
         assert_eq!(movk_x(0, 0xabcd, 16), 0xf2b5_79a0);
+        assert_eq!(aese_v16b(16, 17), 0x4e28_4a30);
+        assert_eq!(aesd_v16b(16, 17), 0x4e28_5a30);
+        assert_eq!(aesmc_v16b(16, 17), 0x4e28_6a30);
+        assert_eq!(aesimc_v16b(16, 17), 0x4e28_7a30);
         assert_eq!(sub_sp_imm(224), 0xd103_83ff);
         assert_eq!(sub_sp_imm(1184), 0xd112_83ff);
         assert_eq!(sub_x_imm(26, 26, 7), 0xd100_1f5a);

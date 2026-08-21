@@ -4262,3 +4262,27 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 ### Binary layout verification
 
 - N/A: this change only removes an unused import.
+## 2026-08-21 — `src/rdynarmic/src/backend/arm64/emit_arm64_cryptography.rs` vs Eden `src/dynarmic/src/dynarmic/backend/arm64/emit_arm64_cryptography.cpp` (AES operations)
+
+### Intentional differences
+
+- Rust emits the four AArch64 instruction words through the local `inst.rs` encoder rather than
+  Oaknut. Register allocation, realization, and instruction ordering remain identical.
+- The two single-round operations share a mechanical Rust helper, as do the two mix-column
+  operations; each helper preserves the corresponding upstream method body and state ownership.
+
+### Unintentional differences (to fix)
+
+- None in `AESDecryptSingleRound`, `AESEncryptSingleRound`, `AESInverseMixColumns`, or
+  `AESMixColumns`.
+
+### Missing items
+
+- The CRC32, SHA-256, and SM4 opcode owners from the same upstream file are not yet ported to the
+  ARM64 backend.
+
+### Binary layout verification
+
+- N/A: this slice emits host instructions and introduces no serialized or raw-copied payload.
+  Focused tests verify the four exact AArch64 instruction encodings and dispatch all four IR
+  opcodes through the cryptography owner.

@@ -19,6 +19,7 @@ pub mod emit_arm64_a32_coprocessor;
 pub mod emit_arm64_a32_memory;
 pub mod emit_arm64_a64;
 pub mod emit_arm64_a64_memory;
+pub mod emit_arm64_cryptography;
 pub mod emit_arm64_data_processing;
 pub mod emit_arm64_floating_point;
 pub mod emit_arm64_memory;
