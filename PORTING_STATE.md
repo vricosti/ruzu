@@ -1,5 +1,21 @@
 # Porting State
 
+## 2026-08-22 — GameCube Adapter warning slice
+
+- Status: interrupted pending the USB transport prerequisite.
+- Interrupted slice: consume the retained `GCAdapter` endpoint, payload, controller-origin,
+  vibration, and retry state instead of suppressing its `dead_code` warnings.
+- Exact missing prerequisite: Ruzu has no libusb dependency or equivalents of Eden's
+  `LibUSBContext` and `LibUSBDeviceHandle`; `InputSubsystemImpl` also never constructs or
+  registers `GCAdapter`. The retained parsing methods therefore have no producer thread and the
+  adapter cannot function.
+- Required prerequisite work: add the cross-platform libusb owner, port device discovery,
+  interface claiming, endpoint discovery, interrupt input/output and stoppable scan/input thread
+  lifetimes, then register the engine under the same feature boundary in `main_common.rs`.
+- Resume condition: enabling the `input_common/libusb` feature produces a live registered adapter
+  on Eden's supported desktop targets, while the default build excludes the unfinished driver in
+  the same way Eden excludes `gc_adapter.cpp` when `ENABLE_LIBUSB` is off.
+
 ## 2026-08-22 — abstracted-pad warning slice
 
 - Status: completed and verified for the warning-producing ownership slice.

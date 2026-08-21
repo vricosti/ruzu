@@ -9,6 +9,15 @@
 #[cfg(target_os = "android")]
 pub mod android;
 pub mod camera;
+#[cfg(all(
+    feature = "libusb",
+    any(
+        target_os = "windows",
+        target_os = "linux",
+        target_os = "freebsd",
+        target_os = "macos"
+    )
+))]
 pub mod gc_adapter;
 pub mod joycon;
 pub mod keyboard;

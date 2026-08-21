@@ -3,6 +3,13 @@ name = "input_common"
 version.workspace = true
 edition.workspace = true
 
+[features]
+default = []
+# Mirrors Eden's ENABLE_LIBUSB compilation boundary. The USB transport and
+# InputSubsystem registration must be ported before this can be enabled by a
+# frontend build.
+libusb = []
+
 [dependencies]
 common.workspace = true
 log.workspace = true

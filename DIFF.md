@@ -4687,3 +4687,17 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 - The Android driver still lacks Eden's JNI device registry, vibration worker, and JNI-backed
   device mapping. Keeping the owner-local constants behind the same platform boundary avoids
   treating that unported Android behavior as dead Linux code.
+
+## 2026-08-22 — `src/input_common/src/drivers/mod.rs` and `Cargo.toml` vs `src/input_common/CMakeLists.txt` (`ENABLE_LIBUSB`)
+
+### Intentional differences
+
+- Ruzu names the opt-in Cargo feature `libusb`; Eden uses the CMake option `ENABLE_LIBUSB`. Both
+  keep the GameCube adapter source outside builds that do not provide its USB transport.
+
+### Missing items
+
+- The feature is not enabled by any frontend because the Rust port still lacks Eden's libusb
+  context/device owners, scan/input threads, and `InputSubsystem::Impl` registration. That
+  prerequisite is recorded in `PORTING_STATE.md`; the unfinished adapter is no longer compiled as
+  if it were a functional default driver.
