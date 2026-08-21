@@ -4847,6 +4847,27 @@ impl Maxwell3D {
 
     // ── Upstream ProcessQueryGet / ProcessQueryCondition / etc ───────────
 
+    /// Upstream: `Maxwell3D::StampQueryResult`.
+    fn stamp_query_result(&mut self, payload: u64, long_query: bool) -> bool {
+        let Some(memory_manager) = self.memory_manager.as_ref() else {
+            return false;
+        };
+        let sequence_address = self.report_semaphore_address();
+        let mut memory_manager = memory_manager.lock();
+        if long_query {
+            let gpu_ticks = self
+                .gpu_ticks_getter
+                .as_ref()
+                .map(|getter| getter())
+                .unwrap_or(0);
+            memory_manager.write::<u64>(sequence_address + 8, gpu_ticks);
+            memory_manager.write::<u64>(sequence_address, payload);
+        } else {
+            memory_manager.write::<u32>(sequence_address, payload as u32);
+        }
+        true
+    }
+
     /// Handle report semaphore query. Matches upstream `ProcessQueryGet`.
     fn process_query_get(&mut self) {
         let query_word = self.regs[(REPORT_SEMAPHORE_BASE + 3) as usize];
@@ -4883,24 +4904,20 @@ impl Maxwell3D {
                 });
 
                 if !queried {
-                    let gpu_ticks = self
-                        .gpu_ticks_getter
-                        .as_ref()
-                        .map(|getter| getter())
-                        .unwrap_or(0);
-                    let data = if short_query {
-                        payload.to_le_bytes().to_vec()
-                    } else {
-                        let mut buf = Vec::with_capacity(16);
-                        buf.extend_from_slice(&(payload as u64).to_le_bytes());
-                        buf.extend_from_slice(&gpu_ticks.to_le_bytes());
-                        buf
-                    };
-                    let wrote_through_owner =
-                        self.memory_manager.as_ref().is_some_and(|memory_manager| {
-                            memory_manager.lock().write_block_unsafe(gpu_va, &data)
-                        });
-                    if !wrote_through_owner {
+                    if !self.stamp_query_result(payload as u64, !short_query) {
+                        let gpu_ticks = self
+                            .gpu_ticks_getter
+                            .as_ref()
+                            .map(|getter| getter())
+                            .unwrap_or(0);
+                        let data = if short_query {
+                            payload.to_le_bytes().to_vec()
+                        } else {
+                            let mut buf = Vec::with_capacity(16);
+                            buf.extend_from_slice(&(payload as u64).to_le_bytes());
+                            buf.extend_from_slice(&gpu_ticks.to_le_bytes());
+                            buf
+                        };
                         self.pending_semaphore_writes
                             .push(PendingWrite { gpu_va, data });
                     }

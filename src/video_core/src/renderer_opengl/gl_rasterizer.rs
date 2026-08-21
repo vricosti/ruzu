@@ -2235,16 +2235,16 @@ impl RasterizerOpenGL {
         gpu_ticks_getter: Option<Arc<dyn Fn() -> u64 + Send + Sync>>,
     ) -> Box<dyn FnOnce() + Send> {
         Box::new(move || {
-            let mm = mm.lock();
+            let mut mm = mm.lock();
             if has_timeout {
                 let gpu_ticks = gpu_ticks_getter
                     .as_ref()
                     .expect("timestamped OpenGL queries require the GPU tick getter")(
                 );
-                mm.write_block_unsafe(gpu_addr + 8, &gpu_ticks.to_le_bytes());
-                mm.write_block_unsafe(gpu_addr, &(payload as u64).to_le_bytes());
+                mm.write::<u64>(gpu_addr + 8, gpu_ticks);
+                mm.write::<u64>(gpu_addr, payload as u64);
             } else {
-                mm.write_block_unsafe(gpu_addr, &payload.to_le_bytes());
+                mm.write::<u32>(gpu_addr, payload);
             }
         })
     }

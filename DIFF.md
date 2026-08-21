@@ -4485,3 +4485,14 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
   memory and scratch allocation explicitly. This lets Rust borrow the scratch allocation and the
   backend runtime independently; their ownership, continuity checks, fallback read, and callers
   otherwise match Eden.
+
+## 2026-08-22 — scalar query writes in `memory_manager.rs`, `engines/maxwell_3d.rs`, and `renderer_opengl/gl_rasterizer.rs`
+
+### Intentional differences
+
+- `Maxwell3D::stamp_query_result` returns whether its optional memory-manager owner exists. The
+  reduced command-engine fixture queues the same payload for its external guest-memory writer when
+  that owner is absent; Eden's production `Maxwell3D` always has a `MemoryManager&`.
+- An unmapped scalar `MemoryManager::read`/`write` logs and returns the upstream fallback value or
+  performs no write. Eden logs through its configurable fail-soft `ASSERT(false)` before reaching
+  the same fallback, while Ruzu has no equivalent global fail-soft assertion controller.
