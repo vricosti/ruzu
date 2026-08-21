@@ -3628,3 +3628,33 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 ### Binary layout verification
 
 - N/A: this storage object and its owned work buffer are not serialized.
+
+## 2026-08-21 — `src/core/src/file_sys/ips_layer.rs` vs Eden `src/core/file_sys/{ips_layer.h,ips_layer.cpp}`
+
+### Intentional differences
+
+- Rust `VirtualFile` arguments are non-nullable, so Eden's null-input branches in `PatchIPS` and
+  `IPSwitchCompiler::Apply` have no direct representation.
+- Patch text is decoded with `from_utf8_lossy` before applying the same ASCII-oriented grammar;
+  Eden stores arbitrary input bytes in a `std::string`. Valid IPSwitch syntax is ASCII, while this
+  avoids unchecked string indexing over invalid UTF-8.
+- Rust uses `BTreeMap` for Eden's ordered `std::map` and an owned `VectorVfsFile` behind `Arc` for
+  the equivalent patched result.
+- The `IPSwitchPatch::name` field was removed. Eden initializes it from `last_comment` but never
+  reads it; patch names remain available in the parse log without retaining dead per-patch state.
+- `parse_integer_auto` expresses the valid signed decimal/octal/hexadecimal forms accepted by
+  Eden's `std::strtoll(..., 0)` without calling a platform C runtime parser.
+
+### Unintentional differences (to fix)
+
+- None in the audited IPS/IPS32 record application and IPSwitch parsing paths. Inner patch comments
+  are now skipped, offset shifts accept C-style base prefixes, and signed shifts use wrapping
+  unsigned addition before the final `u32` narrowing, matching Eden's bit pattern.
+
+### Missing items
+
+- None for this file's public API.
+
+### Binary layout verification
+
+- N/A: patch records are parsed into owned containers and are not serialized as native structs.

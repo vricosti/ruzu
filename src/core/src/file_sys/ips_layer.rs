@@ -10,7 +10,6 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use super::vfs::vfs::VfsFile;
 use super::vfs::vfs_types::VirtualFile;
 use super::vfs::vfs_vector::VectorVfsFile;
 
@@ -159,9 +158,8 @@ const ESCAPE_MAP: &[(&str, &str)] = &[
     ("\\?", "?"),
 ];
 
-/// A single IPSwitch patch (a named set of offset->bytes records).
+/// A single IPSwitch patch (a set of offset-to-bytes records).
 struct IpSwitchPatch {
-    name: String,
     enabled: bool,
     records: BTreeMap<u32, Vec<u8>>,
 }
@@ -192,6 +190,36 @@ fn escape_string_sequences(mut input: String) -> String {
         }
     }
     input
+}
+
+/// Parse an integer using the base-prefix rules of C's `strtoll(..., 0)`.
+fn parse_integer_auto(input: &str) -> i64 {
+    let input = input.trim();
+    let (negative, digits) = input
+        .strip_prefix('-')
+        .map_or((false, input), |digits| (true, digits));
+    let digits = digits.strip_prefix('+').unwrap_or(digits);
+    let (radix, digits) = if let Some(digits) = digits
+        .strip_prefix("0x")
+        .or_else(|| digits.strip_prefix("0X"))
+    {
+        (16, digits)
+    } else if digits.len() > 1 && digits.starts_with('0') {
+        (8, &digits[1..])
+    } else {
+        (10, digits)
+    };
+
+    i64::from_str_radix(digits, radix)
+        .ok()
+        .and_then(|value| {
+            if negative {
+                value.checked_neg()
+            } else {
+                Some(value)
+            }
+        })
+        .unwrap_or(0)
 }
 
 /// Parse a hex string into bytes. If `little_endian` is true, reverse the
@@ -249,7 +277,7 @@ impl IpSwitchCompiler {
 
     fn parse_flag(&mut self, line: &str) {
         if let Some(rest) = line.strip_prefix("@flag offset_shift ") {
-            self.offset_shift = rest.trim().parse::<i64>().unwrap_or(0);
+            self.offset_shift = parse_integer_auto(rest);
         } else if line.starts_with("@little-endian") {
             self.is_little_endian = true;
         } else if line.starts_with("@big-endian") {
@@ -299,9 +327,7 @@ impl IpSwitchCompiler {
 
             if !starts_with(&line, "//") {
                 if let Some(ci) = comment_index {
-                    if ci + 2 < line.len() {
-                        self.last_comment = line[ci + 2..].to_string();
-                    }
+                    self.last_comment = line[ci + 2..].to_string();
                     line = line[..ci].to_string();
                 }
             }
@@ -319,10 +345,7 @@ impl IpSwitchCompiler {
                 );
             } else if starts_with(&line, "//") {
                 let comment = &line[2..];
-                let trimmed = comment.trim_start();
-                if !trimmed.is_empty() {
-                    self.last_comment = trimmed.to_string();
-                }
+                self.last_comment = comment.trim_start().to_string();
             } else if starts_with(&line, "@enabled") || starts_with(&line, "@disabled") {
                 let enabled = starts_with(&line, "@enabled");
                 if i == 0 {
@@ -337,7 +360,6 @@ impl IpSwitchCompiler {
                 );
 
                 let mut patch = IpSwitchPatch {
-                    name: self.last_comment.clone(),
                     enabled,
                     records: BTreeMap::new(),
                 };
@@ -349,6 +371,10 @@ impl IpSwitchCompiler {
                     }
                     i += 1;
                     let patch_line = &lines[i];
+
+                    if starts_with(patch_line, "//") || starts_with(patch_line, "#") {
+                        continue;
+                    }
 
                     if starts_with(patch_line, "@enabled") || starts_with(patch_line, "@disabled") {
                         i -= 1;
@@ -366,29 +392,27 @@ impl IpSwitchCompiler {
                     }
 
                     let offset_str = &patch_line[..8];
-                    let mut offset = u64::from_str_radix(offset_str, 16).unwrap_or(0);
-                    offset = (offset as i64 + self.offset_shift) as u64;
+                    let offset = u64::from_str_radix(offset_str, 16)
+                        .unwrap_or(0)
+                        .wrapping_add(self.offset_shift as u64);
 
                     let replace: Vec<u8>;
                     if patch_line.len() > 9 && patch_line.as_bytes()[9] == b'"' {
                         // String replacement
                         let rest = &patch_line[10..];
-                        let mut end_idx = None;
                         let mut search_from = 0;
-                        loop {
+                        let end = loop {
                             if let Some(pos) = rest[search_from..].find('"') {
                                 let actual = search_from + pos;
                                 if actual > 0 && rest.as_bytes()[actual - 1] == b'\\' {
                                     search_from = actual + 1;
                                     continue;
                                 }
-                                end_idx = Some(actual);
-                                break;
+                                break actual;
                             } else {
                                 return;
                             }
-                        }
-                        let end = end_idx.unwrap();
+                        };
                         let value = rest[..end].to_string();
                         let value = escape_string_sequences(value);
                         replace = value.into_bytes();
@@ -513,5 +537,25 @@ mod tests {
             escape_string_sequences("tab\\there".to_string()),
             "tab\there"
         );
+    }
+
+    #[test]
+    fn ipswitch_accepts_prefixed_offset_shift_and_comments_inside_patch() {
+        let patch_text: VirtualFile = Arc::new(VectorVfsFile::new(
+            b"// Free homebrew patch\n@enabled\n@flag offset_shift 0x2\n// keep parsing\n# keep parsing too\n00000000 AA\n@stop\n".to_vec(),
+            "synthetic.pchtxt".to_string(),
+            None,
+        ));
+        let source: VirtualFile = Arc::new(VectorVfsFile::new(
+            vec![0; 4],
+            "homebrew.bin".to_string(),
+            None,
+        ));
+
+        let compiler = IpSwitchCompiler::new(patch_text);
+        let patched = compiler.apply(&source).unwrap();
+
+        assert!(compiler.is_valid());
+        assert_eq!(patched.read_all_bytes(), vec![0, 0, 0xAA, 0]);
     }
 }
