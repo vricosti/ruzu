@@ -232,8 +232,7 @@ mod tests {
         crate::ir::opt::identity_removal::identity_removal(&mut block);
 
         // The GetX should have been replaced; SetX(R2, ...) should now have ImmU64(42)
-        let set_r2 = &block.instructions[0]; // after identity removal, indices shift
-                                             // Find the live SetX(R2, ...) instruction
+        // Find the live SetX(R2, ...) instruction after identity removal shifts indices.
         let set_r2 = block
             .instructions
             .iter()

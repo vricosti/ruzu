@@ -3864,3 +3864,24 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 ### Binary layout verification
 
 - N/A: translator dispatch and IR construction serialize no raw payload.
+
+## 2026-08-21 — `src/rdynarmic/src/{bin/a32_diff.rs,ir/opt/a64_get_set_elimination.rs,jit.rs}` warning audit vs Eden developer/test infrastructure
+
+### Intentional differences
+
+- `a32_diff` is a Ruzu-specific differential tool with no Eden source counterpart; removing its
+  write-only CPSR divergence flag preserves its diagnostics and resynchronization behavior.
+- AArch64-only mock callback builders are compiled only on AArch64, matching the architecture guard
+  already applied to their sole tests.
+
+### Unintentional differences (to fix)
+
+- None in this developer/test-only slice.
+
+### Missing items
+
+- None.
+
+### Binary layout verification
+
+- N/A: only local diagnostics and test builders changed.

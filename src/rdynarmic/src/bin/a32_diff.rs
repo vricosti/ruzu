@@ -489,10 +489,9 @@ fn main() {
 
         // Compare registers
         let mut reg_diverged = false;
-        let mut cpsr_diverged = false;
         for i in 0..16 {
             if rd_regs[i] != or_regs[i] {
-                if !reg_diverged && !cpsr_diverged {
+                if !reg_diverged {
                     eprintln!("\n!!! DIVERGENCE at step {} !!!", step);
                     eprintln!("  PC (rdynarmic) = {:#010x}", rd_regs[15]);
                     eprintln!("  PC (oracle)    = {:#010x}", or_regs[15]);
@@ -507,13 +506,12 @@ fn main() {
 
         // Compare CPSR (only NZCV bits for now — bit 28-31)
         if (rd_cpsr ^ or_cpsr) & 0xF0000000 != 0 {
-            if !reg_diverged && !cpsr_diverged {
+            if !reg_diverged {
                 eprintln!(
                     "\n[CPSR-only divergence at step {} PC={:#010x}]: rdynarmic={:#010x} oracle={:#010x} (continuing — likely harmless if next flag-setting insn overwrites)",
                     step, rd_regs[15], rd_cpsr, or_cpsr
                 );
             }
-            cpsr_diverged = true;
             // Force oracle and rdynarmic CPSR in sync to keep diff going — we
             // tolerate lazy-flag-format differences between backends.
             jit.set_cpsr(or_cpsr);

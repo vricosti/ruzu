@@ -4239,6 +4239,7 @@ mod tests {
             }
         }
 
+        #[cfg(target_arch = "aarch64")]
         fn with_cntpct(base_addr: u64, code: &[u32], cntpct: u64) -> Self {
             let mut callbacks = Self::new(base_addr, code);
             callbacks.cntpct = cntpct;
@@ -4266,6 +4267,7 @@ mod tests {
             }
         }
 
+        #[cfg(target_arch = "aarch64")]
         fn with_memory_read_address_sink(mut self, sink: Arc<AtomicU64>) -> Self {
             self.memory_read_address_sink = Some(sink);
             self
