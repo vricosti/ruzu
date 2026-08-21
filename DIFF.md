@@ -4197,20 +4197,6 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 - The Rust status-message enum contains only Eden's five recognized message kinds, so the C++
   switch's unknown-value/default empty-message branch is unrepresentable.
 
-### Unintentional differences (to fix)
-
-- None in the focused slice. The command-line expression, default/base-zero port conversion,
-  nickname and address validation, callback messages and fatal-error policy, callback binding
-  order, and post-load `Join` arguments match Eden.
-
-### Missing items
-
-- None for the `--multiplayer` parser, four CLI callbacks, binding, and room join lifecycle.
-
-### Binary layout verification
-
-- N/A: the frontend passes typed network values and does not serialize these values by raw layout.
-
 ## 2026-08-21 — `src/network/src/announce_multiplayer_session.rs` vs `src/network/announce_multiplayer_session.h` and `.cpp`
 
 ### Intentional differences
@@ -4230,38 +4216,6 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 - Rust computes the remaining duration before calling `Event::wait_for`; Eden passes the equivalent
   absolute `steady_clock` deadline to `WaitUntil`.
 
-### Unintentional differences (to fix)
-
-- None in this slice. Room validation, backend data ordering, verify-UID propagation, immediate
-  first update, 15-second cadence, error callbacks, 404 re-registration, stop/delete ordering,
-  running-state definition, and credential-update guard now match Eden.
-
-### Missing items
-
-- None in `AnnounceMultiplayerSession`'s declared API or worker lifecycle.
-
-### Binary layout verification
-
-- N/A: announcement state is host-only and is submitted through the typed backend interface.
-
-## 2026-08-21 — `src/network/src/room_member.rs` vs `src/network/room_member.h` (default join-argument import audit)
-
-### Intentional differences
-
-- Rust has no default function arguments, so callers pass `NO_PREFERRED_IP` explicitly to `join`
-  and `send_join_request`; the constant remains owned by `room.rs`, matching Eden's `room.h`.
-
-### Unintentional differences (to fix)
-
-- None. The unused local import was dead code and did not provide Eden's declaration-level default.
-
-### Missing items
-
-- None in the preferred-address argument behavior.
-
-### Binary layout verification
-
-- N/A: this change only removes an unused import.
 ## 2026-08-21 — `src/rdynarmic/src/backend/arm64/emit_arm64_cryptography.rs` vs Eden `src/dynarmic/src/dynarmic/backend/arm64/emit_arm64_cryptography.cpp` (AES operations)
 
 ### Intentional differences
@@ -4281,12 +4235,6 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 - The CRC32, SHA-256, and SM4 opcode owners from the same upstream file are not yet ported to the
   ARM64 backend.
 
-### Binary layout verification
-
-- N/A: this slice emits host instructions and introduces no serialized or raw-copied payload.
-  Focused tests verify the four exact AArch64 instruction encodings and dispatch all four IR
-  opcodes through the cryptography owner.
-
 ## 2026-08-21 — `src/web_service/src/announce_room_json.rs` vs `src/web_service/announce_room_json.h` and `.cpp`
 
 ### Intentional differences
@@ -4302,20 +4250,6 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 - The Rust backend methods take `&mut self` through the `Backend` trait instead of relying on C++
   object mutability.
 
-### Unintentional differences (to fix)
-
-- None in this slice. Member/room field names and omission rules, signed-to-unsigned numeric casts,
-  registration payload and response state, player-only update payload, room-list parsing,
-  room-ID paths, and asynchronous deletion now match Eden.
-
-### Missing items
-
-- None in `RoomJson`'s declared backend API and JSON conversion behavior.
-
-### Binary layout verification
-
-- N/A: rooms are serialized as named JSON fields rather than by raw object layout.
-
 ## 2026-08-21 — `src/web_service/src/verify_login.rs` vs `src/web_service/verify_login.h` and `.cpp`
 
 ### Intentional differences
@@ -4323,15 +4257,23 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 - Rust uses `serde_json` and panics on malformed JSON where Eden's nlohmann parse propagates an
   exception.
 
+## 2026-08-21 — `src/video_core/src/vulkan_common/vulkan_memory_allocator.rs` vs `src/video_core/vulkan_common/vulkan_memory_allocator.h` and `.cpp`
+
+### Intentional differences
+
+- Rust stores the VMA allocator in `Arc<Mutex<_>>` because the target creates VMA with external
+  synchronization; Eden stores its opaque `VmaAllocator` handle directly.
+- Rust names Eden's const `Map()` overload `map_read` and requires mutable access while it may cache
+  the mapped pointer. The mutable `map`, `unmap`, byte-span length, and cached-pointer lifecycle are
+  otherwise shared.
+- Allocation failures return `VulkanError` through `Result`; Eden propagates `vk::Check` exceptions.
+- `buffer_image_granularity` is retained with a local dead-code annotation because current Eden
+  still owns and initializes that device limit without reading it.
+
 ### Unintentional differences (to fix)
 
-- None. An empty response fails, a missing `username` succeeds only for an empty requested name,
-  and a present value must equal the requested username.
-
-### Missing items
-
-- None in `VerifyLogin`.
-
-### Binary layout verification
-
-- N/A: profile data is parsed from JSON.
+- Eden reports `MemoryCommit`, image, and buffer allocations/deallocations through `GPULogger` when
+  GPU memory tracking is active. Ruzu does not yet have the corresponding GPU logging subsystem.
+- Ruzu's raw-handle `create_image`, `create_buffer`, and `create_mapped_buffer` compatibility paths
+  still use dedicated Vulkan allocations. Eden returns owning VMA-backed `vk::Image`/`vk::Buffer`
+  wrappers; `create_owned_buffer` already uses VMA but the remaining callers have not all migrated.
