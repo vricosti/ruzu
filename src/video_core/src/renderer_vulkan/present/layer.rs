@@ -668,8 +668,8 @@ impl Layer {
                 Box::new(Fxaa::new(
                     self.device.clone(),
                     allocator,
-                    extent,
                     self.image_count,
+                    extent,
                 ))
             }
             AntiAliasingSetting::Smaa => {
