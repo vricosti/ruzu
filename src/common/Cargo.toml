@@ -14,6 +14,7 @@ libc = "0.2"
 parking_lot.workspace = true
 context.workspace = true
 toml.workspace = true
+fastrand.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 winapi = { version = "0.3", features = ["libloaderapi"] }

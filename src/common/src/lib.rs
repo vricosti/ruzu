@@ -17,6 +17,7 @@ pub mod math_util;
 pub mod overflow;
 pub mod point;
 pub mod quaternion;
+pub mod random;
 pub mod stream;
 pub mod swap;
 pub mod typed_address;

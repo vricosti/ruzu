@@ -2607,3 +2607,27 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 - PASS: the existing compile-time assertions retain `KeyboardKey` at `0x20`,
   `KeyboardModifier`/`MouseButton` at `0x4`, and `AnalogStickState` at `0x8`; focused tests verify
   the corresponding bit and numeric projections.
+
+## 2026-08-21 — `src/common/src/random.rs` vs Eden `src/common/random.{h,cpp}`
+
+### Intentional differences
+
+- Rust represents `std::mt19937` with the local `Mt19937` type implementing the standard engine's
+  state transition and tempering exactly.
+- `fastrand` supplies the process-global host entropy in place of C++ `std::random_device`; both
+  are cross-platform, nondeterministic host random sources and the upstream seed parameters remain
+  intentionally ignored.
+
+### Unintentional differences (to fix)
+
+- None. `random32`, `random64`, and `get_mt19937` retain Eden's ownership and behavior, including
+  the 32-bit `random_device::result_type` widened to `u64` by `random64`.
+
+### Missing items
+
+- None in the reviewed files.
+
+### Binary layout verification
+
+- N/A: no payload struct is serialized. A focused test verifies the MT19937 reference sequence and
+  another verifies that `random64` preserves Eden's zero upper 32 bits.
