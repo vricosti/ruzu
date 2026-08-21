@@ -6,13 +6,17 @@
 //! NIM, NIM_ECA, NIM_SHP, NTC, and related sub-services.
 
 use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
 
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 use crate::hle::service::hle_ipc::{
     HLERequestContext, SessionRequestHandler, SessionRequestHandlerPtr,
 };
 use crate::hle::service::ipc_helpers::{RequestParser, ResponseBuilder};
+use crate::hle::service::kernel_helpers::ServiceContext;
+use crate::hle::service::os::event::Event;
 use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
 
 /// IPC command IDs for IShopServiceAsync.
@@ -413,27 +417,205 @@ impl ServiceFramework for NIM {
     }
 }
 
-/// IShopServiceAsync -- all commands nullptr in upstream.
+struct ShopWorker {
+    stop_requested: Arc<AtomicBool>,
+    handle: JoinHandle<()>,
+}
+
+/// IShopServiceAsync.
 ///
 /// Corresponds to `IShopServiceAsync` in upstream nim.cpp.
 pub struct IShopServiceAsync {
     handlers: BTreeMap<u32, FunctionInfo>,
     handlers_tipc: BTreeMap<u32, FunctionInfo>,
+    service_context: ServiceContext,
+    completion_event_handle: u32,
+    worker: Mutex<Option<ShopWorker>>,
+    error_code: Arc<AtomicU32>,
+    download_data: Arc<Mutex<Vec<u8>>>,
 }
 
 impl IShopServiceAsync {
     pub fn new() -> Self {
+        let mut service_context = ServiceContext::new("IShopServiceAsync".to_string());
+        let completion_event_handle =
+            service_context.create_event("IShopServiceAsync:Completion".to_string());
         Self {
             handlers: build_handler_map(&[
-                (shop_async_commands::CANCEL, None, "Cancel"),
-                (shop_async_commands::GET_SIZE, None, "GetSize"),
-                (shop_async_commands::READ, None, "Read"),
-                (shop_async_commands::GET_ERROR_CODE, None, "GetErrorCode"),
-                (shop_async_commands::REQUEST, None, "Request"),
-                (shop_async_commands::PREPARE, None, "Prepare"),
+                (
+                    shop_async_commands::CANCEL,
+                    Some(Self::cancel_handler),
+                    "Cancel",
+                ),
+                (
+                    shop_async_commands::GET_SIZE,
+                    Some(Self::get_size_handler),
+                    "GetSize",
+                ),
+                (shop_async_commands::READ, Some(Self::read_handler), "Read"),
+                (
+                    shop_async_commands::GET_ERROR_CODE,
+                    Some(Self::get_error_code_handler),
+                    "GetErrorCode",
+                ),
+                (
+                    shop_async_commands::REQUEST,
+                    Some(Self::request_handler),
+                    "Request",
+                ),
+                (
+                    shop_async_commands::PREPARE,
+                    Some(Self::prepare_handler),
+                    "Prepare",
+                ),
             ]),
             handlers_tipc: BTreeMap::new(),
+            service_context,
+            completion_event_handle,
+            worker: Mutex::new(None),
+            error_code: Arc::new(AtomicU32::new(0)),
+            download_data: Arc::new(Mutex::new(Vec::new())),
         }
+    }
+
+    fn completion_event(&self) -> Option<Arc<Event>> {
+        self.service_context.get_event(self.completion_event_handle)
+    }
+
+    fn cancel_impl(&self) {
+        let worker = self.worker.lock().unwrap().take();
+        if let Some(worker) = worker {
+            worker.stop_requested.store(true, Ordering::Release);
+            let _ = worker.handle.join();
+        }
+    }
+
+    fn cancel(&self) {
+        log::debug!("IShopServiceAsync::Cancel called");
+        self.cancel_impl();
+    }
+
+    fn get_size(&self) -> u64 {
+        log::debug!("IShopServiceAsync::GetSize called");
+        self.download_data.lock().unwrap().len() as u64
+    }
+
+    fn read(&self, offset: u64, output_size: usize) -> Vec<u8> {
+        let data = self.download_data.lock().unwrap();
+        let Ok(offset) = usize::try_from(offset) else {
+            return Vec::new();
+        };
+        if offset >= data.len() {
+            return Vec::new();
+        }
+        let actual_read = output_size.min(data.len() - offset);
+        data[offset..offset + actual_read].to_vec()
+    }
+
+    fn get_error_code(&self) -> u32 {
+        log::debug!("IShopServiceAsync::GetErrorCode called");
+        self.error_code.load(Ordering::Acquire)
+    }
+
+    fn request(&self) {
+        log::debug!("(STUBBED) IShopServiceAsync::Request called");
+        self.cancel_impl();
+
+        self.error_code.store(0, Ordering::Release);
+        if let Some(event) = self.completion_event() {
+            event.clear();
+        }
+        self.download_data.lock().unwrap().clear();
+
+        let stop_requested = Arc::new(AtomicBool::new(false));
+        let thread_stop_requested = Arc::clone(&stop_requested);
+        let error_code = Arc::clone(&self.error_code);
+        let download_data = Arc::clone(&self.download_data);
+        let completion_event = self.completion_event();
+        let handle = std::thread::spawn(move || {
+            if thread_stop_requested.load(Ordering::Acquire) {
+                error_code.store(1, Ordering::Release);
+            } else {
+                // Dummy JSON response, else the caller rejects the request.
+                *download_data.lock().unwrap() = b"{}".to_vec();
+                error_code.store(0, Ordering::Release);
+            }
+            if let Some(event) = completion_event {
+                event.signal();
+            }
+        });
+        *self.worker.lock().unwrap() = Some(ShopWorker {
+            stop_requested,
+            handle,
+        });
+    }
+
+    fn prepare(&self, path: &[u8], _post: &[u8]) {
+        log::debug!("IShopServiceAsync::Prepare called");
+        if !path.is_empty() {
+            log::info!(
+                "IShopServiceAsync: preparing request for URL: {}",
+                String::from_utf8_lossy(path)
+            );
+        }
+    }
+
+    fn cancel_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let this = unsafe { &*(this as *const dyn ServiceFramework as *const Self) };
+        this.cancel();
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+    }
+
+    fn get_size_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let this = unsafe { &*(this as *const dyn ServiceFramework as *const Self) };
+        let size = this.get_size();
+        let mut rb = ResponseBuilder::new(ctx, 4, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_u64(size);
+    }
+
+    fn read_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let this = unsafe { &*(this as *const dyn ServiceFramework as *const Self) };
+        let mut rp = RequestParser::new(ctx);
+        let offset = rp.pop_u64();
+        let data = this.read(offset, ctx.get_write_buffer_size(0));
+        let actual_read = ctx.write_buffer(&data, 0) as u64;
+        let mut rb = ResponseBuilder::new(ctx, 4, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_u64(actual_read);
+    }
+
+    fn get_error_code_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let this = unsafe { &*(this as *const dyn ServiceFramework as *const Self) };
+        let error_code = this.get_error_code();
+        let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_u32(error_code);
+    }
+
+    fn request_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let this = unsafe { &*(this as *const dyn ServiceFramework as *const Self) };
+        this.request();
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+    }
+
+    fn prepare_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let this = unsafe { &*(this as *const dyn ServiceFramework as *const Self) };
+        let path = ctx.read_buffer(0);
+        let post = ctx.read_buffer(1);
+        this.prepare(&path, &post);
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+    }
+}
+
+impl Drop for IShopServiceAsync {
+    fn drop(&mut self) {
+        self.cancel_impl();
+        self.service_context
+            .close_event(self.completion_event_handle);
     }
 }
 
@@ -485,15 +667,22 @@ impl IShopServiceAccessor {
     ///
     /// Corresponds to `IShopServiceAccessor::CreateAsyncInterface` in upstream nim.cpp.
     pub fn create_async_interface(&self) -> IShopServiceAsync {
-        log::warn!("(STUBBED) IShopServiceAccessor::create_async_interface called");
+        log::debug!("IShopServiceAccessor::CreateAsyncInterface called");
         IShopServiceAsync::new()
     }
 
     fn create_async_interface_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         let this = unsafe { &*(this as *const dyn ServiceFramework as *const Self) };
-        let mut rb = ResponseBuilder::new(ctx, 2, 0, 1);
+        let async_interface = Arc::new(this.create_async_interface());
+        let event_handle = async_interface
+            .completion_event()
+            .and_then(|event| event.copy_handle(ctx))
+            .unwrap_or(0);
+
+        let mut rb = ResponseBuilder::new(ctx, 2, 1, 1);
         rb.push_result(RESULT_SUCCESS);
-        rb.push_ipc_interface(Arc::new(this.create_async_interface()));
+        rb.push_copy_objects(event_handle);
+        rb.push_ipc_interface(async_interface);
     }
 }
 
@@ -551,9 +740,10 @@ impl IShopServiceAccessServer {
 
     fn create_accessor_interface_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         let this = unsafe { &*(this as *const dyn ServiceFramework as *const Self) };
+        let interface = Arc::new(this.create_accessor_interface());
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 1);
         rb.push_result(RESULT_SUCCESS);
-        rb.push_ipc_interface(Arc::new(this.create_accessor_interface()));
+        rb.push_ipc_interface(interface);
     }
 }
 
@@ -1267,7 +1457,79 @@ pub fn loop_process(system: crate::core::SystemRef) {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
+
+    #[test]
+    fn shop_async_table_matches_upstream() {
+        let service = IShopServiceAsync::new();
+        assert_eq!(
+            service.handlers().keys().copied().collect::<Vec<_>>(),
+            [0, 1, 2, 3, 4, 5]
+        );
+        assert_eq!(service.service_name(), "IShopServiceAsync");
+    }
+
+    #[test]
+    fn request_completes_with_dummy_json_and_signals_event() {
+        let service = IShopServiceAsync::new();
+        let completion_event = service.completion_event().unwrap();
+
+        service.request();
+
+        assert!(completion_event.wait_timeout(Duration::from_secs(1)));
+        service.cancel_impl();
+        assert_eq!(service.get_error_code(), 0);
+        assert_eq!(service.get_size(), 2);
+        assert_eq!(service.read(0, 8), b"{}");
+        assert_eq!(service.read(1, 8), b"}");
+        assert!(service.read(2, 8).is_empty());
+    }
+
+    #[test]
+    fn request_resets_previous_data_and_completion_event() {
+        let service = IShopServiceAsync::new();
+        let completion_event = service.completion_event().unwrap();
+
+        service.request();
+        assert!(completion_event.wait_timeout(Duration::from_secs(1)));
+        service.cancel_impl();
+        service
+            .download_data
+            .lock()
+            .unwrap()
+            .extend_from_slice(b"old");
+
+        service.request();
+        assert!(completion_event.wait_timeout(Duration::from_secs(1)));
+        service.cancel_impl();
+        assert_eq!(&*service.download_data.lock().unwrap(), b"{}");
+    }
+
+    #[test]
+    fn accessor_chain_tables_expose_async_interface() {
+        assert_eq!(
+            IShopServiceAccessor::new()
+                .handlers()
+                .keys()
+                .copied()
+                .collect::<Vec<_>>(),
+            [0]
+        );
+        assert_eq!(
+            IShopServiceAccessServer::new()
+                .handlers()
+                .keys()
+                .copied()
+                .collect::<Vec<_>>(),
+            [0]
+        );
+        assert_eq!(
+            NimEca::new().handlers().keys().copied().collect::<Vec<_>>(),
+            [0, 1, 2, 3, 4, 5]
+        );
+    }
 
     #[test]
     fn ecas_table_matches_upstream() {
