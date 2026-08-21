@@ -151,71 +151,65 @@ pub fn emit_vector_set_element64(
 }
 
 // ---------------------------------------------------------------------------
-// VectorBroadcast — fallback
+// VectorBroadcast
 // ---------------------------------------------------------------------------
 
-macro_rules! define_broadcast {
-    ($name:ident, $ty:ty, $count:expr) => {
-        extern "C" fn $name(result: *mut [u8; 16], a: *const [u8; 16]) {
-            unsafe {
-                let va: [$ty; $count] = std::mem::transmute(*a);
-                let val = va[0];
-                let out = [val; $count];
-                *result = std::mem::transmute(out);
-            }
-        }
-    };
-}
-
-define_broadcast!(fallback_broadcast8, u8, 16);
-define_broadcast!(fallback_broadcast16, u16, 8);
-define_broadcast!(fallback_broadcast32, u32, 4);
-define_broadcast!(fallback_broadcast64, u64, 2);
-
-// Broadcast8: pshufb with all-zero mask (broadcasts byte[0] to all 16 lanes)
 pub fn emit_vector_broadcast8(
-    _ctx: &EmitContext,
+    ctx: &EmitContext,
     ra: &mut RegAlloc,
     inst_ref: InstRef,
     inst: &Inst,
 ) {
     let mut args = ra.get_argument_info(inst_ref, &inst.args, inst.num_args());
     let result = ra.use_scratch_xmm(&mut args[0]);
-    let pool = ra.constant_pool.as_mut().expect("constant pool required");
-    let zero_mask = pool.get_constant(0, 0); // all-zero shuffle mask = broadcast byte[0]
-    ra.asm
-        .pshufb(result, rxbyak::xmmword_ptr(zero_mask))
-        .unwrap();
+    if ctx.has_host_feature(HostFeature::AVX2) {
+        ra.asm.vpbroadcastb(result, result).unwrap();
+    } else if ctx.has_host_feature(HostFeature::SSSE3) {
+        let zero = ra.scratch_xmm();
+        ra.asm.pxor(zero, zero).unwrap();
+        ra.asm.pshufb(result, zero).unwrap();
+        ra.release(zero);
+    } else {
+        ra.asm.punpcklbw(result, result).unwrap();
+        ra.asm.pshuflw(result, result, 0).unwrap();
+        ra.asm.punpcklqdq(result, result).unwrap();
+    }
     ra.define_value(inst_ref, result);
 }
-// Broadcast16: pshuflw with 0x00 (broadcast word[0] to low 4 words), then punpcklqdq
+
 pub fn emit_vector_broadcast16(
-    _ctx: &EmitContext,
+    ctx: &EmitContext,
     ra: &mut RegAlloc,
     inst_ref: InstRef,
     inst: &Inst,
 ) {
     let mut args = ra.get_argument_info(inst_ref, &inst.args, inst.num_args());
     let result = ra.use_scratch_xmm(&mut args[0]);
-    ra.asm.pshuflw(result, result, 0x00).unwrap(); // broadcast word[0] to low 4 words
-    ra.asm.punpcklqdq(result, result).unwrap(); // copy low 64 to high 64
+    if ctx.has_host_feature(HostFeature::AVX2) {
+        ra.asm.vpbroadcastw(result, result).unwrap();
+    } else {
+        ra.asm.pshuflw(result, result, 0).unwrap();
+        ra.asm.punpcklqdq(result, result).unwrap();
+    }
     ra.define_value(inst_ref, result);
 }
-// Broadcast32: pshufd with 0x00 (broadcast dword[0] to all 4 lanes)
+
 pub fn emit_vector_broadcast32(
-    _ctx: &EmitContext,
+    ctx: &EmitContext,
     ra: &mut RegAlloc,
     inst_ref: InstRef,
     inst: &Inst,
 ) {
     let mut args = ra.get_argument_info(inst_ref, &inst.args, inst.num_args());
-    let src = ra.use_xmm(&mut args[0]);
-    let result = ra.scratch_xmm();
-    ra.asm.pshufd(result, src, 0x00).unwrap();
-    ra.release(src);
+    let result = ra.use_scratch_xmm(&mut args[0]);
+    if ctx.has_host_feature(HostFeature::AVX2) {
+        ra.asm.vpbroadcastd(result, result).unwrap();
+    } else {
+        ra.asm.pshufd(result, result, 0).unwrap();
+    }
     ra.define_value(inst_ref, result);
 }
-// Broadcast64: punpcklqdq to duplicate low qword
+
 pub fn emit_vector_broadcast64(
     ctx: &EmitContext,
     ra: &mut RegAlloc,
@@ -224,92 +218,42 @@ pub fn emit_vector_broadcast64(
 ) {
     let mut args = ra.get_argument_info(inst_ref, &inst.args, inst.num_args());
     let result = ra.use_scratch_xmm(&mut args[0]);
-    ra.asm.punpcklqdq(result, result).unwrap();
-    // RUZU_BCAST64_MARK_XMM13=1 — set xmm13 = all FFs immediately after
-    // BCAST64 emit. If xmm13 != all FFs at the W128 callback, BCAST64
-    // emit's code did not execute (block jumped past it).
-    if std::env::var("RUZU_BCAST64_MARK_XMM13").is_ok() {
-        ra.asm.db(0x66).unwrap();
-        ra.asm.db(0x45).unwrap();
-        ra.asm.db(0x0F).unwrap();
-        ra.asm.db(0x74).unwrap();
-        ra.asm.db(0xED).unwrap();
-    }
-    // RUZU_BCAST64_MIRROR_XMM12=1 — copy result xmm into xmm12 right
-    // after the BCAST64 emit. At the W128 callback, xmm12 should still
-    // hold the BCAST64 result. Diff vs xmm1 reveals whether xmm1
-    // specifically gets modified vs ambient XMM clobber.
-    if std::env::var("RUZU_BCAST64_MIRROR_XMM12").is_ok() {
-        // movaps xmm12, <result>
-        ra.asm.movaps(rxbyak::XMM12, result).unwrap();
-    }
-    // RUZU_ASSERT_BCAST64_ZERO=1 — emit `ptest result, result; je +2; ud2`
-    // right after the broadcast emit, ONLY when the source is ImmU64(0).
-    // RUZU_ASSERT_BCAST64_ZERO_PC=0xPC — restrict to specific blocks.
-    if std::env::var("RUZU_ASSERT_BCAST64_ZERO").is_ok()
-        && matches!(inst.args[0], crate::ir::Value::ImmU64(0))
-    {
-        let pc_filter_ok = match std::env::var("RUZU_ASSERT_BCAST64_ZERO_PC") {
-            Ok(spec) => {
-                let block_pc = ctx.arch.extract_pc(ctx.location);
-                let pcs: Vec<u64> = spec
-                    .split(',')
-                    .filter_map(|p| u64::from_str_radix(p.trim().trim_start_matches("0x"), 16).ok())
-                    .collect();
-                pcs.contains(&block_pc)
-            }
-            Err(_) => true,
-        };
-        if pc_filter_ok {
-            ra.asm.ptest(result, result).unwrap();
-            ra.asm.db(0x74).unwrap();
-            ra.asm.db(0x02).unwrap();
-            ra.asm.ud2().unwrap();
-        }
+    if ctx.has_host_feature(HostFeature::AVX2) {
+        ra.asm.vpbroadcastq(result, result).unwrap();
+    } else {
+        ra.asm.punpcklqdq(result, result).unwrap();
     }
     ra.define_value(inst_ref, result);
 }
 
 // ---------------------------------------------------------------------------
-// VectorBroadcastLower — broadcast element 0 to lower half only
+// VectorBroadcastLower
 // ---------------------------------------------------------------------------
 
-macro_rules! define_broadcast_lower {
-    ($name:ident, $ty:ty, $count:expr, $half:expr) => {
-        extern "C" fn $name(result: *mut [u8; 16], a: *const [u8; 16]) {
-            unsafe {
-                let va: [$ty; $count] = std::mem::transmute(*a);
-                let val = va[0];
-                let mut out = [0 as $ty; $count];
-                for i in 0..$half {
-                    out[i] = val;
-                }
-                *result = std::mem::transmute(out);
-            }
-        }
-    };
-}
-
-define_broadcast_lower!(fallback_broadcast_lower8, u8, 16, 8);
-define_broadcast_lower!(fallback_broadcast_lower16, u16, 8, 4);
-define_broadcast_lower!(fallback_broadcast_lower32, u32, 4, 2);
-
-// BroadcastLower8: pshufb to broadcast byte[0] to lower 8 bytes, zero upper
 pub fn emit_vector_broadcast_lower8(
-    _ctx: &EmitContext,
+    ctx: &EmitContext,
     ra: &mut RegAlloc,
     inst_ref: InstRef,
     inst: &Inst,
 ) {
     let mut args = ra.get_argument_info(inst_ref, &inst.args, inst.num_args());
     let result = ra.use_scratch_xmm(&mut args[0]);
-    let pool = ra.constant_pool.as_mut().expect("constant pool required");
-    // Mask: bytes 0-7 = 0x00 (select byte[0]), bytes 8-15 = 0x80 (zero)
-    let mask = pool.get_constant(0x00_00_00_00_00_00_00_00u64, 0x80_80_80_80_80_80_80_80u64);
-    ra.asm.pshufb(result, rxbyak::xmmword_ptr(mask)).unwrap();
+    if ctx.has_host_feature(HostFeature::AVX2) {
+        ra.asm.vpbroadcastb(result, result).unwrap();
+        ra.asm.movq(result, result).unwrap();
+    } else if ctx.has_host_feature(HostFeature::SSSE3) {
+        let zero = ra.scratch_xmm();
+        ra.asm.pxor(zero, zero).unwrap();
+        ra.asm.pshufb(result, zero).unwrap();
+        ra.asm.movq(result, result).unwrap();
+        ra.release(zero);
+    } else {
+        ra.asm.punpcklbw(result, result).unwrap();
+        ra.asm.pshuflw(result, result, 0).unwrap();
+    }
     ra.define_value(inst_ref, result);
 }
-// BroadcastLower16: pshuflw with 0x00 then movq to zero upper
+
 pub fn emit_vector_broadcast_lower16(
     _ctx: &EmitContext,
     ra: &mut RegAlloc,
@@ -317,15 +261,11 @@ pub fn emit_vector_broadcast_lower16(
     inst: &Inst,
 ) {
     let mut args = ra.get_argument_info(inst_ref, &inst.args, inst.num_args());
-    let src = ra.use_xmm(&mut args[0]);
-    let result = ra.scratch_xmm();
-    ra.asm.pshuflw(result, src, 0x00).unwrap();
-    // Zero upper 64 bits
-    ra.asm.movq(result, result).unwrap();
-    ra.release(src);
+    let result = ra.use_scratch_xmm(&mut args[0]);
+    ra.asm.pshuflw(result, result, 0).unwrap();
     ra.define_value(inst_ref, result);
 }
-// BroadcastLower32: pshufd with 0x00, then movq to zero upper
+
 pub fn emit_vector_broadcast_lower32(
     _ctx: &EmitContext,
     ra: &mut RegAlloc,
@@ -333,11 +273,8 @@ pub fn emit_vector_broadcast_lower32(
     inst: &Inst,
 ) {
     let mut args = ra.get_argument_info(inst_ref, &inst.args, inst.num_args());
-    let src = ra.use_xmm(&mut args[0]);
-    let result = ra.scratch_xmm();
-    ra.asm.pshufd(result, src, 0x00).unwrap();
-    ra.asm.movq(result, result).unwrap(); // zero upper 64 bits
-    ra.release(src);
+    let result = ra.use_scratch_xmm(&mut args[0]);
+    ra.asm.pshuflw(result, result, 0b0100_0100).unwrap();
     ra.define_value(inst_ref, result);
 }
 
@@ -477,41 +414,9 @@ pub fn emit_vector_interleave_upper64(
 }
 
 // ---------------------------------------------------------------------------
-// VectorDeinterleaveEven/Odd — fallback
+// VectorDeinterleaveEven/Odd
 // ---------------------------------------------------------------------------
 
-macro_rules! define_deinterleave {
-    ($name:ident, $ty:ty, $count:expr, $even:expr) => {
-        extern "C" fn $name(result: *mut [u8; 16], a: *const [u8; 16], b: *const [u8; 16]) {
-            unsafe {
-                let va: [$ty; $count] = std::mem::transmute(*a);
-                let vb: [$ty; $count] = std::mem::transmute(*b);
-                let mut out = [0 as $ty; $count];
-                let half = $count / 2;
-                let start = if $even { 0 } else { 1 };
-                for i in 0..half {
-                    out[i] = va[i * 2 + start];
-                }
-                for i in 0..half {
-                    out[half + i] = vb[i * 2 + start];
-                }
-                *result = std::mem::transmute(out);
-            }
-        }
-    };
-}
-
-define_deinterleave!(fallback_deinterleave_even8, u8, 16, true);
-define_deinterleave!(fallback_deinterleave_even16, u16, 8, true);
-define_deinterleave!(fallback_deinterleave_even32, u32, 4, true);
-define_deinterleave!(fallback_deinterleave_even64, u64, 2, true);
-define_deinterleave!(fallback_deinterleave_odd8, u8, 16, false);
-define_deinterleave!(fallback_deinterleave_odd16, u16, 8, false);
-define_deinterleave!(fallback_deinterleave_odd32, u32, 4, false);
-define_deinterleave!(fallback_deinterleave_odd64, u64, 2, false);
-
-// DeinterleaveEven8: pshufb to extract even bytes from each, then combine
-// even bytes of [a0,a1,a2,...,a15] = [a0,a2,a4,...,a14] in lower 8 bytes
 pub fn emit_vector_deinterleave_even8(
     _ctx: &EmitContext,
     ra: &mut RegAlloc,
@@ -519,42 +424,48 @@ pub fn emit_vector_deinterleave_even8(
     inst: &Inst,
 ) {
     let mut args = ra.get_argument_info(inst_ref, &inst.args, inst.num_args());
-    let result = ra.use_scratch_xmm(&mut args[0]); // a
-    let b = ra.use_scratch_xmm(&mut args[1]);
-    let pool = ra.constant_pool.as_mut().expect("constant pool required");
-    // Shuffle mask: pick bytes 0,2,4,6,8,10,12,14 then 0x80 for rest
-    let even_mask = pool.get_constant(
-        0x0E_0C_0A_08_06_04_02_00u64, // bytes 0-7: even indices
-        0x80_80_80_80_80_80_80_80u64, // bytes 8-15: zero
-    );
-    ra.asm
-        .pshufb(result, rxbyak::xmmword_ptr(even_mask))
-        .unwrap(); // a evens in low 8
-    ra.asm.pshufb(b, rxbyak::xmmword_ptr(even_mask)).unwrap(); // b evens in low 8
-    ra.asm.punpcklqdq(result, b).unwrap(); // combine: a_evens | b_evens
+    let result = ra.use_scratch_xmm(&mut args[0]);
+    let rhs = ra.use_scratch_xmm(&mut args[1]);
+    let mask = ra.scratch_xmm();
+    let constant = ra
+        .constant_pool
+        .as_mut()
+        .expect("constant pool required")
+        .get_constant(0x00ff_00ff_00ff_00ff, 0x00ff_00ff_00ff_00ff);
+    ra.asm.movdqa(mask, rxbyak::xmmword_ptr(constant)).unwrap();
+    ra.asm.pand(result, mask).unwrap();
+    ra.asm.pand(rhs, mask).unwrap();
+    ra.asm.packuswb(result, rhs).unwrap();
+    ra.release(mask);
     ra.define_value(inst_ref, result);
 }
-// DeinterleaveEven16: extract even words using pshufb
+
 pub fn emit_vector_deinterleave_even16(
-    _ctx: &EmitContext,
+    ctx: &EmitContext,
     ra: &mut RegAlloc,
     inst_ref: InstRef,
     inst: &Inst,
 ) {
     let mut args = ra.get_argument_info(inst_ref, &inst.args, inst.num_args());
     let result = ra.use_scratch_xmm(&mut args[0]);
-    let b = ra.use_scratch_xmm(&mut args[1]);
-    let pool = ra.constant_pool.as_mut().expect("constant pool required");
-    // Pick words 0,2,4,6 (bytes 0-1,4-5,8-9,12-13)
-    let even_mask = pool.get_constant(0x0D_0C_09_08_05_04_01_00u64, 0x80_80_80_80_80_80_80_80u64);
-    ra.asm
-        .pshufb(result, rxbyak::xmmword_ptr(even_mask))
-        .unwrap();
-    ra.asm.pshufb(b, rxbyak::xmmword_ptr(even_mask)).unwrap();
-    ra.asm.punpcklqdq(result, b).unwrap();
+    let rhs = ra.use_scratch_xmm(&mut args[1]);
+    if ctx.has_host_feature(HostFeature::SSE41) {
+        let zero = ra.scratch_xmm();
+        ra.asm.pxor(zero, zero).unwrap();
+        ra.asm.pblendw(result, zero, 0b1010_1010).unwrap();
+        ra.asm.pblendw(rhs, zero, 0b1010_1010).unwrap();
+        ra.asm.packusdw(result, rhs).unwrap();
+        ra.release(zero);
+    } else {
+        ra.asm.pslld_imm(result, 16).unwrap();
+        ra.asm.psrad_imm(result, 16).unwrap();
+        ra.asm.pslld_imm(rhs, 16).unwrap();
+        ra.asm.psrad_imm(rhs, 16).unwrap();
+        ra.asm.packssdw(result, rhs).unwrap();
+    }
     ra.define_value(inst_ref, result);
 }
-// DeinterleaveEven32: shufps to pick dwords 0,2 from each
+
 pub fn emit_vector_deinterleave_even32(
     _ctx: &EmitContext,
     ra: &mut RegAlloc,
@@ -562,13 +473,12 @@ pub fn emit_vector_deinterleave_even32(
     inst: &Inst,
 ) {
     let mut args = ra.get_argument_info(inst_ref, &inst.args, inst.num_args());
-    let result = ra.use_scratch_xmm(&mut args[0]); // a
-    let b = ra.use_xmm(&mut args[1]);
-    // shufps(a, b, 0b_10_00_10_00) = {a[0], a[2], b[0], b[2]}
-    ra.asm.shufps(result, b, 0x88).unwrap();
+    let result = ra.use_scratch_xmm(&mut args[0]);
+    let rhs = ra.use_xmm(&mut args[1]);
+    ra.asm.shufps(result, rhs, 0b1000_1000).unwrap();
     ra.define_value(inst_ref, result);
 }
-// DeinterleaveEven64: shufpd to pick qwords 0 from each
+
 pub fn emit_vector_deinterleave_even64(
     _ctx: &EmitContext,
     ra: &mut RegAlloc,
@@ -576,13 +486,12 @@ pub fn emit_vector_deinterleave_even64(
     inst: &Inst,
 ) {
     let mut args = ra.get_argument_info(inst_ref, &inst.args, inst.num_args());
-    let result = ra.use_scratch_xmm(&mut args[0]); // a
-    let b = ra.use_xmm(&mut args[1]);
-    // shufpd(a, b, 0b_00) = {a[0], b[0]}
-    ra.asm.shufpd(result, b, 0x00).unwrap();
+    let result = ra.use_scratch_xmm(&mut args[0]);
+    let rhs = ra.use_xmm(&mut args[1]);
+    ra.asm.shufpd(result, rhs, 0).unwrap();
     ra.define_value(inst_ref, result);
 }
-// DeinterleaveOdd8: pshufb to extract odd bytes
+
 pub fn emit_vector_deinterleave_odd8(
     _ctx: &EmitContext,
     ra: &mut RegAlloc,
@@ -591,17 +500,13 @@ pub fn emit_vector_deinterleave_odd8(
 ) {
     let mut args = ra.get_argument_info(inst_ref, &inst.args, inst.num_args());
     let result = ra.use_scratch_xmm(&mut args[0]);
-    let b = ra.use_scratch_xmm(&mut args[1]);
-    let pool = ra.constant_pool.as_mut().expect("constant pool required");
-    let odd_mask = pool.get_constant(0x0F_0D_0B_09_07_05_03_01u64, 0x80_80_80_80_80_80_80_80u64);
-    ra.asm
-        .pshufb(result, rxbyak::xmmword_ptr(odd_mask))
-        .unwrap();
-    ra.asm.pshufb(b, rxbyak::xmmword_ptr(odd_mask)).unwrap();
-    ra.asm.punpcklqdq(result, b).unwrap();
+    let rhs = ra.use_scratch_xmm(&mut args[1]);
+    ra.asm.psraw_imm(result, 8).unwrap();
+    ra.asm.psraw_imm(rhs, 8).unwrap();
+    ra.asm.packsswb(result, rhs).unwrap();
     ra.define_value(inst_ref, result);
 }
-// DeinterleaveOdd16: extract odd words
+
 pub fn emit_vector_deinterleave_odd16(
     _ctx: &EmitContext,
     ra: &mut RegAlloc,
@@ -610,17 +515,13 @@ pub fn emit_vector_deinterleave_odd16(
 ) {
     let mut args = ra.get_argument_info(inst_ref, &inst.args, inst.num_args());
     let result = ra.use_scratch_xmm(&mut args[0]);
-    let b = ra.use_scratch_xmm(&mut args[1]);
-    let pool = ra.constant_pool.as_mut().expect("constant pool required");
-    let odd_mask = pool.get_constant(0x0F_0E_0B_0A_07_06_03_02u64, 0x80_80_80_80_80_80_80_80u64);
-    ra.asm
-        .pshufb(result, rxbyak::xmmword_ptr(odd_mask))
-        .unwrap();
-    ra.asm.pshufb(b, rxbyak::xmmword_ptr(odd_mask)).unwrap();
-    ra.asm.punpcklqdq(result, b).unwrap();
+    let rhs = ra.use_scratch_xmm(&mut args[1]);
+    ra.asm.psrad_imm(result, 16).unwrap();
+    ra.asm.psrad_imm(rhs, 16).unwrap();
+    ra.asm.packssdw(result, rhs).unwrap();
     ra.define_value(inst_ref, result);
 }
-// DeinterleaveOdd32: shufps to pick dwords 1,3 from each
+
 pub fn emit_vector_deinterleave_odd32(
     _ctx: &EmitContext,
     ra: &mut RegAlloc,
@@ -629,12 +530,11 @@ pub fn emit_vector_deinterleave_odd32(
 ) {
     let mut args = ra.get_argument_info(inst_ref, &inst.args, inst.num_args());
     let result = ra.use_scratch_xmm(&mut args[0]);
-    let b = ra.use_xmm(&mut args[1]);
-    // shufps(a, b, 0b_11_01_11_01) = {a[1], a[3], b[1], b[3]}
-    ra.asm.shufps(result, b, 0xDD).unwrap();
+    let rhs = ra.use_xmm(&mut args[1]);
+    ra.asm.shufps(result, rhs, 0b1101_1101).unwrap();
     ra.define_value(inst_ref, result);
 }
-// DeinterleaveOdd64: shufpd to pick qwords 1 from each
+
 pub fn emit_vector_deinterleave_odd64(
     _ctx: &EmitContext,
     ra: &mut RegAlloc,
@@ -643,137 +543,177 @@ pub fn emit_vector_deinterleave_odd64(
 ) {
     let mut args = ra.get_argument_info(inst_ref, &inst.args, inst.num_args());
     let result = ra.use_scratch_xmm(&mut args[0]);
-    let b = ra.use_xmm(&mut args[1]);
-    // shufpd(a, b, 0b_11) = {a[1], b[1]}
-    ra.asm.shufpd(result, b, 0x03).unwrap();
+    let rhs = ra.use_xmm(&mut args[1]);
+    ra.asm.shufpd(result, rhs, 0b11).unwrap();
     ra.define_value(inst_ref, result);
 }
 
 // ---------------------------------------------------------------------------
-// VectorDeinterleaveEvenLower/OddLower — operates on lower 64 bits only
-// For D-register (64-bit) paired operations (VPMAX, VPMIN, etc.)
+// VectorDeinterleaveEvenLower/OddLower
 // ---------------------------------------------------------------------------
 
-macro_rules! define_deinterleave_lower {
-    ($name:ident, $ty:ty, $count:expr, $even:expr) => {
-        extern "C" fn $name(result: *mut [u8; 16], a: *const [u8; 16], b: *const [u8; 16]) {
-            unsafe {
-                // Only lower 64 bits of each input matter
-                let va: [$ty; $count] = {
-                    let bytes: [u8; 16] = *a;
-                    let mut lower = [0u8; 16];
-                    lower[..8].copy_from_slice(&bytes[..8]);
-                    std::mem::transmute(lower)
-                };
-                let vb: [$ty; $count] = {
-                    let bytes: [u8; 16] = *b;
-                    let mut lower = [0u8; 16];
-                    lower[..8].copy_from_slice(&bytes[..8]);
-                    std::mem::transmute(lower)
-                };
-                let half = $count / 2; // elements in lower 64 bits
-                let start = if $even { 0 } else { 1 };
-                let mut out = [0 as $ty; $count];
-                // Deinterleave from lower half of a
-                let quarter = half / 2;
-                for i in 0..quarter {
-                    out[i] = va[i * 2 + start];
-                }
-                // Deinterleave from lower half of b
-                for i in 0..quarter {
-                    out[quarter + i] = vb[i * 2 + start];
-                }
-                // Upper half is zero
-                *result = std::mem::transmute(out);
-            }
-        }
-    };
-}
-
-define_deinterleave_lower!(fallback_deinterleave_even_lower8, u8, 16, true);
-define_deinterleave_lower!(fallback_deinterleave_even_lower16, u16, 8, true);
-define_deinterleave_lower!(fallback_deinterleave_even_lower32, u32, 4, true);
-define_deinterleave_lower!(fallback_deinterleave_odd_lower8, u8, 16, false);
-define_deinterleave_lower!(fallback_deinterleave_odd_lower16, u16, 8, false);
-define_deinterleave_lower!(fallback_deinterleave_odd_lower32, u32, 4, false);
-
 pub fn emit_vector_deinterleave_even_lower8(
-    _ctx: &EmitContext,
+    ctx: &EmitContext,
     ra: &mut RegAlloc,
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_two_arg_fallback(
-        ra,
-        inst_ref,
-        inst,
-        fallback_deinterleave_even_lower8 as usize,
-    );
+    let mut args = ra.get_argument_info(inst_ref, &inst.args, inst.num_args());
+    let result = ra.use_scratch_xmm(&mut args[0]);
+    if ctx.has_host_feature(HostFeature::SSSE3) {
+        let rhs = ra.use_xmm(&mut args[1]);
+        let mask = ra
+            .constant_pool
+            .as_mut()
+            .expect("constant pool required")
+            .get_constant(0x0d09_0501_0c08_0400, 0x8080_8080_8080_8080);
+        ra.asm.punpcklbw(result, rhs).unwrap();
+        ra.asm.pshufb(result, rxbyak::xmmword_ptr(mask)).unwrap();
+    } else {
+        let rhs = ra.use_scratch_xmm(&mut args[1]);
+        let mask = ra.scratch_xmm();
+        let constant = ra
+            .constant_pool
+            .as_mut()
+            .expect("constant pool required")
+            .get_constant(0x00ff_00ff_00ff_00ff, 0x00ff_00ff_00ff_00ff);
+        ra.asm.movdqa(mask, rxbyak::xmmword_ptr(constant)).unwrap();
+        ra.asm.pand(result, mask).unwrap();
+        ra.asm.pand(rhs, mask).unwrap();
+        ra.asm.packuswb(result, rhs).unwrap();
+        ra.asm.pshufd(result, result, 0b1101_1000).unwrap();
+        ra.asm.movq(result, result).unwrap();
+        ra.release(mask);
+    }
+    ra.define_value(inst_ref, result);
 }
+
 pub fn emit_vector_deinterleave_even_lower16(
-    _ctx: &EmitContext,
+    ctx: &EmitContext,
     ra: &mut RegAlloc,
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_two_arg_fallback(
-        ra,
-        inst_ref,
-        inst,
-        fallback_deinterleave_even_lower16 as usize,
-    );
+    let mut args = ra.get_argument_info(inst_ref, &inst.args, inst.num_args());
+    let result = ra.use_scratch_xmm(&mut args[0]);
+    if ctx.has_host_feature(HostFeature::SSSE3) {
+        let rhs = ra.use_xmm(&mut args[1]);
+        let mask = ra
+            .constant_pool
+            .as_mut()
+            .expect("constant pool required")
+            .get_constant(0x0b0a_0302_0908_0100, 0x8080_8080_8080_8080);
+        ra.asm.punpcklwd(result, rhs).unwrap();
+        ra.asm.pshufb(result, rxbyak::xmmword_ptr(mask)).unwrap();
+    } else {
+        let rhs = ra.use_scratch_xmm(&mut args[1]);
+        ra.asm.pslld_imm(result, 16).unwrap();
+        ra.asm.psrad_imm(result, 16).unwrap();
+        ra.asm.pslld_imm(rhs, 16).unwrap();
+        ra.asm.psrad_imm(rhs, 16).unwrap();
+        ra.asm.packssdw(result, rhs).unwrap();
+        ra.asm.pshufd(result, result, 0b1101_1000).unwrap();
+        ra.asm.movq(result, result).unwrap();
+    }
+    ra.define_value(inst_ref, result);
 }
+
 pub fn emit_vector_deinterleave_even_lower32(
-    _ctx: &EmitContext,
+    ctx: &EmitContext,
     ra: &mut RegAlloc,
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_two_arg_fallback(
-        ra,
-        inst_ref,
-        inst,
-        fallback_deinterleave_even_lower32 as usize,
-    );
+    let mut args = ra.get_argument_info(inst_ref, &inst.args, inst.num_args());
+    let result = ra.use_scratch_xmm(&mut args[0]);
+    let rhs = ra.use_xmm(&mut args[1]);
+    if ctx.has_host_feature(HostFeature::SSE41) {
+        ra.asm.insertps(result, rhs, 0b0001_1100).unwrap();
+    } else {
+        ra.asm.unpcklps(result, rhs).unwrap();
+        ra.asm.movq(result, result).unwrap();
+    }
+    ra.define_value(inst_ref, result);
 }
+
 pub fn emit_vector_deinterleave_odd_lower8(
-    _ctx: &EmitContext,
+    ctx: &EmitContext,
     ra: &mut RegAlloc,
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_two_arg_fallback(
-        ra,
-        inst_ref,
-        inst,
-        fallback_deinterleave_odd_lower8 as usize,
-    );
+    let mut args = ra.get_argument_info(inst_ref, &inst.args, inst.num_args());
+    let result = ra.use_scratch_xmm(&mut args[0]);
+    if ctx.has_host_feature(HostFeature::SSSE3) {
+        let rhs = ra.use_xmm(&mut args[1]);
+        let mask = ra
+            .constant_pool
+            .as_mut()
+            .expect("constant pool required")
+            .get_constant(0x0f0b_0703_0e0a_0602, 0x8080_8080_8080_8080);
+        ra.asm.punpcklbw(result, rhs).unwrap();
+        ra.asm.pshufb(result, rxbyak::xmmword_ptr(mask)).unwrap();
+    } else {
+        let rhs = ra.use_scratch_xmm(&mut args[1]);
+        ra.asm.psraw_imm(result, 8).unwrap();
+        ra.asm.psraw_imm(rhs, 8).unwrap();
+        ra.asm.packsswb(result, rhs).unwrap();
+        ra.asm.pshufd(result, result, 0b1101_1000).unwrap();
+        ra.asm.movq(result, result).unwrap();
+    }
+    ra.define_value(inst_ref, result);
 }
+
 pub fn emit_vector_deinterleave_odd_lower16(
-    _ctx: &EmitContext,
+    ctx: &EmitContext,
     ra: &mut RegAlloc,
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_two_arg_fallback(
-        ra,
-        inst_ref,
-        inst,
-        fallback_deinterleave_odd_lower16 as usize,
-    );
+    let mut args = ra.get_argument_info(inst_ref, &inst.args, inst.num_args());
+    let result = ra.use_scratch_xmm(&mut args[0]);
+    if ctx.has_host_feature(HostFeature::SSSE3) {
+        let rhs = ra.use_xmm(&mut args[1]);
+        let mask = ra
+            .constant_pool
+            .as_mut()
+            .expect("constant pool required")
+            .get_constant(0x0f0e_0706_0d0c_0504, 0x8080_8080_8080_8080);
+        ra.asm.punpcklwd(result, rhs).unwrap();
+        ra.asm.pshufb(result, rxbyak::xmmword_ptr(mask)).unwrap();
+    } else {
+        let rhs = ra.use_scratch_xmm(&mut args[1]);
+        ra.asm.psrad_imm(result, 16).unwrap();
+        ra.asm.psrad_imm(rhs, 16).unwrap();
+        ra.asm.packssdw(result, rhs).unwrap();
+        ra.asm.pshufd(result, result, 0b1101_1000).unwrap();
+        ra.asm.movq(result, result).unwrap();
+    }
+    ra.define_value(inst_ref, result);
 }
+
 pub fn emit_vector_deinterleave_odd_lower32(
-    _ctx: &EmitContext,
+    ctx: &EmitContext,
     ra: &mut RegAlloc,
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_two_arg_fallback(
-        ra,
-        inst_ref,
-        inst,
-        fallback_deinterleave_odd_lower32 as usize,
-    );
+    let mut args = ra.get_argument_info(inst_ref, &inst.args, inst.num_args());
+    if ctx.has_host_feature(HostFeature::SSE41) {
+        let lhs = ra.use_xmm(&mut args[0]);
+        let result = ra.use_scratch_xmm(&mut args[1]);
+        ra.asm.insertps(result, lhs, 0b0100_1100).unwrap();
+        ra.define_value(inst_ref, result);
+    } else {
+        let result = ra.use_scratch_xmm(&mut args[0]);
+        let rhs = ra.use_xmm(&mut args[1]);
+        let zero = ra.scratch_xmm();
+        ra.asm.xorps(zero, zero).unwrap();
+        ra.asm.unpcklps(result, rhs).unwrap();
+        ra.asm.unpckhpd(result, zero).unwrap();
+        ra.release(zero);
+        ra.define_value(inst_ref, result);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1138,6 +1078,93 @@ pub fn emit_vector_zero_extend64(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backend::x64::callback::Callback;
+    use crate::backend::x64::emit_context::{EmitCallbacks, EmitConfig};
+    use crate::ir::location::LocationDescriptor;
+    use crate::ir::opcode::Opcode;
+    use crate::ir::value::Value;
+    use rxbyak::CodeAssembler;
+
+    struct NoopCallback;
+
+    impl Callback for NoopCallback {
+        fn emit_call(
+            &self,
+            _code: &mut CodeAssembler,
+            _setup: &dyn Fn(&mut CodeAssembler, &[rxbyak::Reg]) -> rxbyak::Result<()>,
+        ) -> rxbyak::Result<()> {
+            unreachable!("callback emission is not used in this unit test");
+        }
+
+        fn emit_call_with_return_pointer(
+            &self,
+            _code: &mut CodeAssembler,
+            _setup: &dyn Fn(&mut CodeAssembler, rxbyak::Reg, &[rxbyak::Reg]) -> rxbyak::Result<()>,
+        ) -> rxbyak::Result<()> {
+            unreachable!("callback emission is not used in this unit test");
+        }
+    }
+
+    fn dummy_emit_config() -> EmitConfig {
+        fn cb() -> Box<dyn Callback> {
+            Box::new(NoopCallback)
+        }
+
+        EmitConfig {
+            callbacks: EmitCallbacks {
+                memory_read_8: cb(),
+                memory_read_16: cb(),
+                memory_read_32: cb(),
+                memory_read_64: cb(),
+                memory_read_128: cb(),
+                memory_write_8: cb(),
+                memory_write_16: cb(),
+                memory_write_32: cb(),
+                memory_write_64: cb(),
+                memory_write_128: cb(),
+                call_supervisor: cb(),
+                interpreter_fallback: cb(),
+                exception_raised: cb(),
+                data_cache_operation: cb(),
+                instruction_cache_operation: cb(),
+                add_ticks: cb(),
+                get_ticks_remaining: cb(),
+                exclusive_clear: cb(),
+                exclusive_read_8: cb(),
+                exclusive_read_16: cb(),
+                exclusive_read_32: cb(),
+                exclusive_read_64: cb(),
+                exclusive_read_128: cb(),
+                get_cntpct: cb(),
+                exclusive_write_8: cb(),
+                exclusive_write_16: cb(),
+                exclusive_write_32: cb(),
+                exclusive_write_64: cb(),
+                exclusive_write_128: cb(),
+            },
+            raw_exclusive_write_callbacks: None,
+            enable_cycle_counting: false,
+            memory: crate::backend::x64::emit_context::MemoryEmitConfig::default(),
+            global_monitor: None,
+            cntfrq_el0: 600_000_000,
+        }
+    }
+
+    fn emit_broadcast8_with_features(host_features: HostFeature) -> Vec<u8> {
+        let mut asm = CodeAssembler::new(4096).unwrap();
+        let mut ra = RegAlloc::new_default(&mut asm, vec![(1, 8), (0, 128)]);
+        let source = ra.scratch_gpr();
+        ra.define_value(InstRef(0), source);
+        ra.end_of_alloc_scope();
+
+        let config = dummy_emit_config();
+        let mut ctx = EmitContext::new(LocationDescriptor::new(0), &config);
+        ctx.host_features = host_features;
+        let inst = Inst::new(Opcode::VectorBroadcast8, &[Value::Inst(InstRef(0))]);
+        emit_vector_broadcast8(&ctx, &mut ra, InstRef(1), &inst);
+        ra.end_of_alloc_scope();
+        ra.asm.code().to_vec()
+    }
 
     #[test]
     fn test_fn_signatures() {
@@ -1167,5 +1194,44 @@ mod tests {
         assert_eq!(whole_vector_rotate_shuffle_imm(32), 0b00_11_10_01);
         assert_eq!(whole_vector_rotate_shuffle_imm(64), 0b01_00_11_10);
         assert_eq!(whole_vector_rotate_shuffle_imm(96), 0b10_01_00_11);
+    }
+
+    #[test]
+    fn broadcast8_selects_edens_host_feature_paths() {
+        let avx2 = emit_broadcast8_with_features(HostFeature::AVX2);
+        let ssse3 = emit_broadcast8_with_features(HostFeature::SSSE3);
+        let sse2 = emit_broadcast8_with_features(HostFeature::empty());
+
+        assert!(avx2
+            .windows(4)
+            .any(|bytes| bytes[0] == 0xc4 && bytes[3] == 0x78));
+        assert!(ssse3
+            .windows(3)
+            .any(|bytes| bytes[..2] == [0x0f, 0x38] && bytes[2] == 0x00));
+        assert!(!sse2
+            .windows(3)
+            .any(|bytes| bytes[..2] == [0x0f, 0x38] && bytes[2] == 0x00));
+        assert!(sse2.windows(2).any(|bytes| bytes == [0x0f, 0x60]));
+    }
+
+    #[test]
+    fn broadcast_lower32_uses_edens_pshuflw_control() {
+        let mut asm = CodeAssembler::new(4096).unwrap();
+        let mut ra = RegAlloc::new_default(&mut asm, vec![(1, 32), (0, 128)]);
+        let source = ra.scratch_gpr();
+        ra.define_value(InstRef(0), source);
+        ra.end_of_alloc_scope();
+
+        let config = dummy_emit_config();
+        let ctx = EmitContext::new(LocationDescriptor::new(0), &config);
+        let inst = Inst::new(Opcode::VectorBroadcastLower32, &[Value::Inst(InstRef(0))]);
+        emit_vector_broadcast_lower32(&ctx, &mut ra, InstRef(1), &inst);
+        ra.end_of_alloc_scope();
+
+        assert!(ra.asm.code().windows(4).any(|bytes| bytes[0] == 0xf2
+            && bytes[1] == 0x0f
+            && bytes[2] == 0x70
+            && bytes[3] & 0xc0 == 0xc0));
+        assert_eq!(ra.asm.code().last(), Some(&0b0100_0100));
     }
 }

@@ -3929,3 +3929,30 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 ### Binary layout verification
 
 - N/A: JIT instruction emission changes no shared state layout or serialized payload.
+
+## 2026-08-21 — `src/rdynarmic/src/backend/x64/emit_vector_arrangement.rs` vs `src/dynarmic/src/dynarmic/backend/x64/emit_x64.h` and `emit_x64_vector.cpp` (broadcast/deinterleave slice)
+
+### Intentional differences
+
+- Rust explicitly releases temporary register-allocation locks; Eden releases its scoped register
+  wrappers on scope exit. The emitted instruction order is unchanged.
+- The focused regression tests provide no-op callback objects because Rust's `EmitContext` owns a
+  complete callback configuration even though these vector emitters only query host features.
+
+### Unintentional differences (to fix)
+
+- None in the focused slice. Broadcast emitters now select Eden's AVX2, SSSE3, and SSE2 paths;
+  lower broadcasts preserve Eden's upper-lane behavior. Full and lower even/odd deinterleave
+  emitters now use Eden's SSE4.1, SSSE3, and SSE2 instruction sequences instead of generic host
+  calls or unconditional `pshufb` implementations.
+- Removed the `RUZU_BCAST64_*` diagnostic machine-code injection. It had no Eden equivalent and
+  could reserve or overwrite architectural host XMM registers outside the register allocator.
+
+### Missing items
+
+- Other vector-arrangement emitters remain under separate parity slices; none of the broadcast or
+  deinterleave methods audited here are missing.
+
+### Binary layout verification
+
+- N/A: these methods emit JIT instructions and define no shared or serialized structures.
