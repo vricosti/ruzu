@@ -3323,3 +3323,24 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 ### Binary layout verification
 
 - N/A: routing declarations do not define a serialized layout.
+
+## 2026-08-21 — `src/rdynarmic/src/frontend/a32/translate/helpers.rs` vs Eden `src/dynarmic/src/dynarmic/frontend/A32/translate/impl/common.h`
+
+### Intentional differences
+
+- Rust returns the untyped internal `Value` enum where Eden's helper signatures distinguish U16
+  and U32 at compile time; the emitted opcode metadata retains those types.
+
+### Unintentional differences (to fix)
+
+- None in `pack_2x16_to_1x32` or `most_significant_half`: masks, shift amounts, carry input, and
+  operation ordering match Eden exactly.
+
+### Missing items
+
+- None for the two common helpers required by the scalar saturation translator slice. Other
+  pre-existing helpers in `common.h` were not re-audited or claimed by this prerequisite.
+
+### Binary layout verification
+
+- N/A: these helpers construct internal SSA operations and serialize no guest-visible payload.

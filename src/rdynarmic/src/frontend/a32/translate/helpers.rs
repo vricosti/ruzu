@@ -2,6 +2,25 @@ use crate::frontend::a32::types::ShiftType;
 use crate::ir::a32_emitter::A32IREmitter;
 use crate::ir::value::Value;
 
+/// Pack the low 16 bits of `lo` and `hi` into one 32-bit value.
+/// Upstream: `translate/impl/common.h::Pack2x16To1x32`.
+pub fn pack_2x16_to_1x32(ir: &mut A32IREmitter, lo: Value, hi: Value) -> Value {
+    let lo = ir.ir().and_32(lo, Value::ImmU32(0xffff));
+    let hi = ir
+        .ir()
+        .logical_shift_left_32(hi, Value::ImmU8(16), Value::ImmU1(false));
+    ir.ir().or_32(lo, hi)
+}
+
+/// Extract the upper halfword from a 32-bit value.
+/// Upstream: `translate/impl/common.h::MostSignificantHalf`.
+pub fn most_significant_half(ir: &mut A32IREmitter, value: Value) -> Value {
+    let shifted = ir
+        .ir()
+        .logical_shift_right_32(value, Value::ImmU8(16), Value::ImmU1(false));
+    ir.ir().least_significant_half(shifted)
+}
+
 /// Apply an immediate shift to a register value, returning (result, carry_out).
 pub fn emit_imm_shift(
     ir: &mut A32IREmitter,
@@ -101,4 +120,43 @@ pub fn get_address(
     }
 
     address
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ir::block::Block;
+    use crate::ir::location::LocationDescriptor;
+    use crate::ir::opcode::Opcode;
+
+    #[test]
+    fn common_halfword_helpers_preserve_upstream_ir_order() {
+        let mut block = Block::new(LocationDescriptor(0));
+        let mut ir = A32IREmitter::new(&mut block);
+
+        let packed = pack_2x16_to_1x32(
+            &mut ir,
+            Value::ImmU32(0xaaaa_5555),
+            Value::ImmU32(0xbbbb_6666),
+        );
+        let upper = most_significant_half(&mut ir, Value::ImmU32(0x1234_5678));
+
+        assert_eq!(block.get(packed.inst_ref()).opcode, Opcode::Or32);
+        assert_eq!(
+            block.get(upper.inst_ref()).opcode,
+            Opcode::LeastSignificantHalf
+        );
+        assert_eq!(
+            block.get(crate::ir::value::InstRef(0)).opcode,
+            Opcode::And32
+        );
+        assert_eq!(
+            block.get(crate::ir::value::InstRef(1)).opcode,
+            Opcode::LogicalShiftLeft32
+        );
+        assert_eq!(
+            block.get(crate::ir::value::InstRef(3)).opcode,
+            Opcode::LogicalShiftRight32
+        );
+    }
 }
