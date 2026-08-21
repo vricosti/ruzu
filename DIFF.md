@@ -2282,3 +2282,28 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 
 - PASS: `ApplicationLanguage` remains `repr(u8)` with Polish 16, Thai 17 and Count 18.
 - PASS: `LanguageCode` remains `repr(u64)` with Eden's exact little-endian `pl` and `th` values.
+
+## 2026-08-21 — `src/common/src/logging/backend.rs` vs Eden `src/common/logging.{h,cpp}`
+
+### Intentional differences
+
+- Ruzu sends entries through a background Rust channel, while current Eden writes synchronously to
+  each backend. This existing threading difference is outside this dead-code cleanup slice.
+- Ruzu shares the active color-console flag with the logging thread through `Arc<AtomicBool>`;
+  Eden stores the equivalent atomic flag directly in `ColorConsoleBackend`.
+
+### Unintentional differences (to fix)
+
+- None in the reviewed state ownership. The abandoned Rust `LoggerImpl`, duplicate
+  `ColorConsoleBackend`, unused stacktrace hook, and redundant `LoggerState::color_console_enabled`
+  were removed. The live file backend and `LoggerState` remain the only active owners.
+
+### Missing items
+
+- Eden's platform-specific Windows debugger and Android logcat backends remain platform-deferred.
+- Eden's `log_flush_line`, `extended_logging`, and username-censoring behavior is not part of this
+  cleanup and still requires a dedicated parity pass.
+
+### Binary layout verification
+
+- N/A: logging state is host-only and is not serialized or exposed to guest memory.

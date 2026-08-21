@@ -23,38 +23,6 @@ use super::types::{Class, Level};
 trait Backend: Send {
     fn write(&mut self, entry: &Entry);
     fn flush(&mut self);
-    fn enable_for_stacktrace(&mut self);
-}
-
-/// Backend that writes to stderr with color.
-struct ColorConsoleBackend {
-    enabled: bool,
-}
-
-impl ColorConsoleBackend {
-    fn new() -> Self {
-        Self { enabled: false }
-    }
-
-    fn set_enabled(&mut self, enabled: bool) {
-        self.enabled = enabled;
-    }
-}
-
-impl Backend for ColorConsoleBackend {
-    fn write(&mut self, entry: &Entry) {
-        if self.enabled {
-            print_colored_message(entry);
-        }
-    }
-
-    fn flush(&mut self) {
-        // stderr shouldn't be buffered
-    }
-
-    fn enable_for_stacktrace(&mut self) {
-        self.enabled = true;
-    }
 }
 
 /// Backend that writes to a file.
@@ -112,20 +80,6 @@ impl Backend for FileBackend {
             let _ = file.flush();
         }
     }
-
-    fn enable_for_stacktrace(&mut self) {
-        self.enabled = true;
-        self.bytes_written = 0;
-    }
-}
-
-/// Static state as a singleton, matching the C++ Impl.
-struct LoggerImpl {
-    filter: Filter,
-    color_console_backend: ColorConsoleBackend,
-    file_backend: FileBackend,
-    time_origin: Instant,
-    sender: mpsc::Sender<Entry>,
 }
 
 static LOGGER_INITIALIZED: AtomicBool = AtomicBool::new(false);
@@ -161,7 +115,6 @@ struct LoggerState {
     filter: Filter,
     sender: mpsc::Sender<Entry>,
     time_origin: Instant,
-    color_console_enabled: AtomicBool,
     thread_handle: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -222,7 +175,6 @@ pub fn initialize(log_dir: Option<PathBuf>, filter_string: Option<&str>) {
         filter,
         sender,
         time_origin,
-        color_console_enabled: AtomicBool::new(false),
         thread_handle: Some(thread_handle),
     });
 
