@@ -599,41 +599,8 @@ pub fn emit_vector_paired_add64(
 }
 
 // ---------------------------------------------------------------------------
-// VectorPairedAddSignedWiden — fallback
+// VectorPairedAddSignedWiden
 // ---------------------------------------------------------------------------
-
-extern "C" fn fallback_paired_add_signed_widen8(result: *mut [u8; 16], a: *const [u8; 16]) {
-    unsafe {
-        let va: [i8; 16] = std::mem::transmute(*a);
-        let mut out = [0i16; 8];
-        for i in 0..8 {
-            out[i] = (va[i * 2] as i16) + (va[i * 2 + 1] as i16);
-        }
-        *result = std::mem::transmute(out);
-    }
-}
-
-extern "C" fn fallback_paired_add_signed_widen16(result: *mut [u8; 16], a: *const [u8; 16]) {
-    unsafe {
-        let va: [i16; 8] = std::mem::transmute(*a);
-        let mut out = [0i32; 4];
-        for i in 0..4 {
-            out[i] = (va[i * 2] as i32) + (va[i * 2 + 1] as i32);
-        }
-        *result = std::mem::transmute(out);
-    }
-}
-
-extern "C" fn fallback_paired_add_signed_widen32(result: *mut [u8; 16], a: *const [u8; 16]) {
-    unsafe {
-        let va: [i32; 4] = std::mem::transmute(*a);
-        let mut out = [0i64; 2];
-        for i in 0..2 {
-            out[i] = (va[i * 2] as i64) + (va[i * 2 + 1] as i64);
-        }
-        *result = std::mem::transmute(out);
-    }
-}
 
 pub fn emit_vector_paired_add_signed_widen8(
     _ctx: &EmitContext,
@@ -641,14 +608,17 @@ pub fn emit_vector_paired_add_signed_widen8(
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_one_arg_fallback(
-        ra,
-        inst_ref,
-        inst,
-        fallback_paired_add_signed_widen8 as usize,
-    );
+    let mut args = ra.get_argument_info(inst_ref, &inst.args, inst.num_args());
+    let a = ra.use_scratch_xmm(&mut args[0]);
+    let c = ra.scratch_xmm();
+    ra.asm.movdqa(c, a).unwrap();
+    ra.asm.psllw_imm(a, 8).unwrap();
+    ra.asm.psraw_imm(c, 8).unwrap();
+    ra.asm.psraw_imm(a, 8).unwrap();
+    ra.asm.paddw(a, c).unwrap();
+    ra.release(c);
+    ra.define_value(inst_ref, a);
 }
-// PairedAddSignedWiden16: pmaddwd(a, ones) — multiply each word by 1, add pairs → i32
 pub fn emit_vector_paired_add_signed_widen16(
     _ctx: &EmitContext,
     ra: &mut RegAlloc,
@@ -656,66 +626,64 @@ pub fn emit_vector_paired_add_signed_widen16(
     inst: &Inst,
 ) {
     let mut args = ra.get_argument_info(inst_ref, &inst.args, inst.num_args());
-    let result = ra.use_scratch_xmm(&mut args[0]);
-    let pool = ra.constant_pool.as_mut().expect("constant pool required");
-    let ones = pool.get_constant(0x0001_0001_0001_0001u64, 0x0001_0001_0001_0001u64);
-    ra.asm.pmaddwd(result, rxbyak::xmmword_ptr(ones)).unwrap();
-    ra.define_value(inst_ref, result);
+    let a = ra.use_scratch_xmm(&mut args[0]);
+    let c = ra.scratch_xmm();
+    ra.asm.movdqa(c, a).unwrap();
+    ra.asm.pslld_imm(a, 16).unwrap();
+    ra.asm.psrad_imm(c, 16).unwrap();
+    ra.asm.psrad_imm(a, 16).unwrap();
+    ra.asm.paddd(a, c).unwrap();
+    ra.release(c);
+    ra.define_value(inst_ref, a);
 }
 pub fn emit_vector_paired_add_signed_widen32(
-    _ctx: &EmitContext,
+    ctx: &EmitContext,
     ra: &mut RegAlloc,
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_one_arg_fallback(
-        ra,
-        inst_ref,
-        inst,
-        fallback_paired_add_signed_widen32 as usize,
-    );
+    let mut args = ra.get_argument_info(inst_ref, &inst.args, inst.num_args());
+    let a = ra.use_scratch_xmm(&mut args[0]);
+    if ctx.has_host_feature(HostFeature::AVX512_ORTHO) {
+        let c = ra.scratch_xmm();
+        ra.asm.vpsraq_imm(c, a, 32).unwrap();
+        ra.asm.vpsllq_imm(a, a, 32).unwrap();
+        ra.asm.vpsraq_imm(a, a, 32).unwrap();
+        ra.asm.vpaddq(a, a, c).unwrap();
+        ra.release(c);
+    } else {
+        let tmp1 = ra.scratch_xmm();
+        let tmp2 = ra.scratch_xmm();
+        let c = ra.scratch_xmm();
+        let sign_addr = ra
+            .constant_pool
+            .as_mut()
+            .expect("constant pool required")
+            .get_constant(0x8000_0000_0000_0000, 0x8000_0000_0000_0000);
+        ra.asm.movdqa(c, a).unwrap();
+        ra.asm.psllq_imm(a, 32).unwrap();
+        ra.asm.movdqa(tmp1, rxbyak::xmmword_ptr(sign_addr)).unwrap();
+        ra.asm.movdqa(tmp2, tmp1).unwrap();
+        ra.asm.pand(tmp1, a).unwrap();
+        ra.asm.pand(tmp2, c).unwrap();
+        ra.asm.psrlq_imm(a, 32).unwrap();
+        ra.asm.psrlq_imm(c, 32).unwrap();
+        ra.asm.psrad_imm(tmp1, 31).unwrap();
+        ra.asm.psrad_imm(tmp2, 31).unwrap();
+        ra.asm.por(a, tmp1).unwrap();
+        ra.asm.por(c, tmp2).unwrap();
+        ra.asm.paddq(a, c).unwrap();
+        ra.release(tmp1);
+        ra.release(tmp2);
+        ra.release(c);
+    }
+    ra.define_value(inst_ref, a);
 }
 
 // ---------------------------------------------------------------------------
-// VectorPairedAddUnsignedWiden — fallback
+// VectorPairedAddUnsignedWiden
 // ---------------------------------------------------------------------------
 
-extern "C" fn fallback_paired_add_unsigned_widen8(result: *mut [u8; 16], a: *const [u8; 16]) {
-    unsafe {
-        let va: [u8; 16] = *a;
-        let mut out = [0u16; 8];
-        for i in 0..8 {
-            out[i] = (va[i * 2] as u16) + (va[i * 2 + 1] as u16);
-        }
-        *result = std::mem::transmute(out);
-    }
-}
-
-extern "C" fn fallback_paired_add_unsigned_widen16(result: *mut [u8; 16], a: *const [u8; 16]) {
-    unsafe {
-        let va: [u16; 8] = std::mem::transmute(*a);
-        let mut out = [0u32; 4];
-        for i in 0..4 {
-            out[i] = (va[i * 2] as u32) + (va[i * 2 + 1] as u32);
-        }
-        *result = std::mem::transmute(out);
-    }
-}
-
-extern "C" fn fallback_paired_add_unsigned_widen32(result: *mut [u8; 16], a: *const [u8; 16]) {
-    unsafe {
-        let va: [u32; 4] = std::mem::transmute(*a);
-        let mut out = [0u64; 2];
-        for i in 0..2 {
-            out[i] = (va[i * 2] as u64) + (va[i * 2 + 1] as u64);
-        }
-        *result = std::mem::transmute(out);
-    }
-}
-
-// PairedAddUnsignedWiden8: pmaddubsw(a, ones) — treat a as unsigned, ones as signed 1
-// pmaddubsw: result[i] = saturate(a[2i]*b[2i] + a[2i+1]*b[2i+1]) unsigned*signed→signed16
-// With b=1: result[i] = a[2i] + a[2i+1] (unsigned sum fits in signed 16-bit since max = 510)
 pub fn emit_vector_paired_add_unsigned_widen8(
     _ctx: &EmitContext,
     ra: &mut RegAlloc,
@@ -723,11 +691,15 @@ pub fn emit_vector_paired_add_unsigned_widen8(
     inst: &Inst,
 ) {
     let mut args = ra.get_argument_info(inst_ref, &inst.args, inst.num_args());
-    let result = ra.use_scratch_xmm(&mut args[0]);
-    let pool = ra.constant_pool.as_mut().expect("constant pool required");
-    let ones = pool.get_constant(0x01_01_01_01_01_01_01_01u64, 0x01_01_01_01_01_01_01_01u64);
-    ra.asm.pmaddubsw(result, rxbyak::xmmword_ptr(ones)).unwrap();
-    ra.define_value(inst_ref, result);
+    let a = ra.use_scratch_xmm(&mut args[0]);
+    let c = ra.scratch_xmm();
+    ra.asm.movdqa(c, a).unwrap();
+    ra.asm.psllw_imm(a, 8).unwrap();
+    ra.asm.psrlw_imm(c, 8).unwrap();
+    ra.asm.psrlw_imm(a, 8).unwrap();
+    ra.asm.paddw(a, c).unwrap();
+    ra.release(c);
+    ra.define_value(inst_ref, a);
 }
 pub fn emit_vector_paired_add_unsigned_widen16(
     _ctx: &EmitContext,
@@ -735,12 +707,16 @@ pub fn emit_vector_paired_add_unsigned_widen16(
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_one_arg_fallback(
-        ra,
-        inst_ref,
-        inst,
-        fallback_paired_add_unsigned_widen16 as usize,
-    );
+    let mut args = ra.get_argument_info(inst_ref, &inst.args, inst.num_args());
+    let a = ra.use_scratch_xmm(&mut args[0]);
+    let c = ra.scratch_xmm();
+    ra.asm.movdqa(c, a).unwrap();
+    ra.asm.pslld_imm(a, 16).unwrap();
+    ra.asm.psrld_imm(c, 16).unwrap();
+    ra.asm.psrld_imm(a, 16).unwrap();
+    ra.asm.paddd(a, c).unwrap();
+    ra.release(c);
+    ra.define_value(inst_ref, a);
 }
 pub fn emit_vector_paired_add_unsigned_widen32(
     _ctx: &EmitContext,
@@ -748,12 +724,16 @@ pub fn emit_vector_paired_add_unsigned_widen32(
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_one_arg_fallback(
-        ra,
-        inst_ref,
-        inst,
-        fallback_paired_add_unsigned_widen32 as usize,
-    );
+    let mut args = ra.get_argument_info(inst_ref, &inst.args, inst.num_args());
+    let a = ra.use_scratch_xmm(&mut args[0]);
+    let c = ra.scratch_xmm();
+    ra.asm.movdqa(c, a).unwrap();
+    ra.asm.psllq_imm(a, 32).unwrap();
+    ra.asm.psrlq_imm(c, 32).unwrap();
+    ra.asm.psrlq_imm(a, 32).unwrap();
+    ra.asm.paddq(a, c).unwrap();
+    ra.release(c);
+    ra.define_value(inst_ref, a);
 }
 
 // ---------------------------------------------------------------------------

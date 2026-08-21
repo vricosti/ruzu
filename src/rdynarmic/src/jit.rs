@@ -10305,6 +10305,89 @@ mod tests {
 
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     #[test]
+    fn test_a64_saddlp_and_uaddlp_all_element_sizes() {
+        fn vector_pair(bytes: [u8; 16]) -> (u64, u64) {
+            (
+                u64::from_le_bytes(bytes[..8].try_into().unwrap()),
+                u64::from_le_bytes(bytes[8..].try_into().unwrap()),
+            )
+        }
+
+        fn paired_add_widen(source: [u8; 16], element_bytes: usize, signed: bool) -> [u8; 16] {
+            let mut result = [0u8; 16];
+            let output_bytes = element_bytes * 2;
+            for pair in 0..16 / output_bytes {
+                let input_offset = pair * output_bytes;
+                let mut lhs_bytes = [0u8; 8];
+                let mut rhs_bytes = [0u8; 8];
+                lhs_bytes[..element_bytes]
+                    .copy_from_slice(&source[input_offset..input_offset + element_bytes]);
+                rhs_bytes[..element_bytes].copy_from_slice(
+                    &source[input_offset + element_bytes..input_offset + output_bytes],
+                );
+                let output_offset = pair * output_bytes;
+                if signed {
+                    let shift = 64 - element_bytes * 8;
+                    let lhs = ((u64::from_le_bytes(lhs_bytes) << shift) as i64) >> shift;
+                    let rhs = ((u64::from_le_bytes(rhs_bytes) << shift) as i64) >> shift;
+                    result[output_offset..output_offset + output_bytes]
+                        .copy_from_slice(&lhs.wrapping_add(rhs).to_le_bytes()[..output_bytes]);
+                } else {
+                    let lhs = u64::from_le_bytes(lhs_bytes);
+                    let rhs = u64::from_le_bytes(rhs_bytes);
+                    result[output_offset..output_offset + output_bytes]
+                        .copy_from_slice(&lhs.wrapping_add(rhs).to_le_bytes()[..output_bytes]);
+                }
+            }
+            result
+        }
+
+        let source = [
+            0x80, 0x7f, 0xff, 0x02, 0x34, 0x12, 0xcc, 0xed, 0x78, 0x56, 0x88, 0xa9, 0xef, 0xcd,
+            0x11, 0x32,
+        ];
+        let code: &[u32] = &[
+            0x4E20_2A80, // saddlp v0.8h, v20.16b
+            0x4E60_2A81, // saddlp v1.4s, v20.8h
+            0x4EA0_2A82, // saddlp v2.2d, v20.4s
+            0x6E20_2A83, // uaddlp v3.8h, v20.16b
+            0x6E60_2A84, // uaddlp v4.4s, v20.8h
+            0x6EA0_2A85, // uaddlp v5.2d, v20.4s
+            0xD400_0001, // svc #0
+        ];
+        let jit = run_a64_alu(code, |j| {
+            let (low, high) = vector_pair(source);
+            j.set_vector(20, low, high);
+        });
+
+        assert_eq!(
+            jit.get_vector(0),
+            vector_pair(paired_add_widen(source, 1, true))
+        );
+        assert_eq!(
+            jit.get_vector(1),
+            vector_pair(paired_add_widen(source, 2, true))
+        );
+        assert_eq!(
+            jit.get_vector(2),
+            vector_pair(paired_add_widen(source, 4, true))
+        );
+        assert_eq!(
+            jit.get_vector(3),
+            vector_pair(paired_add_widen(source, 1, false))
+        );
+        assert_eq!(
+            jit.get_vector(4),
+            vector_pair(paired_add_widen(source, 2, false))
+        );
+        assert_eq!(
+            jit.get_vector(5),
+            vector_pair(paired_add_widen(source, 4, false))
+        );
+    }
+
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[test]
     fn test_a64_sqadd_v1_8h_saturates_and_sets_qc() {
         let code: &[u32] = &[
             0x4E61_0CE1, // sqadd v1.8h, v7.8h, v1.8h

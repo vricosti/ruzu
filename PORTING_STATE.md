@@ -564,3 +564,7 @@
 - Prerequisite result: `vpsllq_imm` and `vpsraq_imm` now preserve Xbyak 7.35.2's exact encoding
   flags. XMM/YMM/ZMM and extended-register forms match NASM byte-for-byte, and the complete
   rxbyak test suite plus its all-target check pass.
+- Resumed result: all six signed/unsigned 8/16/32-bit widening paired-add emitters now use Eden's
+  native instruction sequences, including its AVX-512 and baseline SSE2 branches for signed
+  32-bit lanes. The all-width JIT regression passes and `rdynarmic` reports only the intentionally
+  ignored opcode naming warnings.

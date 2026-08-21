@@ -4110,3 +4110,30 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 
 - PASS: XMM, YMM, ZMM, ordinary-register, and extended-register encodings match NASM
   byte-for-byte; the complete rxbyak test suite passes.
+
+## 2026-08-21 — `src/rdynarmic/src/backend/x64/emit_vector_multiply.rs` vs `src/dynarmic/src/dynarmic/backend/x64/emit_x64.h` and `emit_x64_vector.cpp` (widening paired-add slice)
+
+### Intentional differences
+
+- Rust explicitly releases temporary register-allocation locks; Eden releases its scoped register
+  wrappers on scope exit. The emitted instruction and value-definition ordering is preserved.
+- Rust materializes Eden's `code.Const(xword, ...)` through the emitter-owned constant pool and
+  passes the resulting XMM memory operand to `movdqa`.
+
+### Unintentional differences (to fix)
+
+- None in the focused slice. Signed and unsigned 8/16/32-bit widening paired adds now retain
+  Eden's exact native instruction sequences. Signed 32-bit widening selects the same
+  `AVX512_Ortho` path and preserves the same baseline SSE2 sign-extension construction.
+- Removed all six scalar callbacks plus the two alternative `pmaddwd`/`pmaddubsw` implementations.
+  They had no Eden counterpart and bypassed its emitter structure.
+
+### Missing items
+
+- None among `VectorPairedAddSignedWiden8/16/32` and
+  `VectorPairedAddUnsignedWiden8/16/32`.
+
+### Binary layout verification
+
+- N/A: these methods emit JIT instructions and define no shared or serialized structures. The
+  AVX/EVEX prerequisite encodings are independently verified in the preceding rxbyak entry.
