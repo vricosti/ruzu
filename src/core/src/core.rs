@@ -1691,6 +1691,7 @@ impl System {
             .map(|process| (process.get_program_id(), process.is_64bit()))
         {
             self.set_runtime_program_id(program_id);
+            common::settings::set_current_program_id(program_id);
             self.set_runtime_64bit(is_64bit);
             let launch = self.content_provider.as_ref().map_or_else(
                 || ApplicationLaunchProperty {

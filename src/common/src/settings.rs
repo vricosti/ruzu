@@ -6,7 +6,7 @@
 //! helper functions matching the C++ free functions in `Settings` namespace.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{LazyLock, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use log::{info, warn};
@@ -51,6 +51,7 @@ impl Region {
 // `LazyLock<RwLock<Values>>` to satisfy Rust's thread-safety requirements.
 
 static VALUES: LazyLock<RwLock<Values>> = LazyLock::new(|| RwLock::new(Values::default()));
+static CURRENT_PROGRAM_ID: AtomicU64 = AtomicU64::new(0);
 
 /// Obtain a read-only reference to the global settings.
 /// Equivalent to reading `Settings::values` in C++.
@@ -62,6 +63,20 @@ pub fn values() -> RwLockReadGuard<'static, Values> {
 /// Equivalent to writing `Settings::values.field = …` in C++.
 pub fn values_mut() -> RwLockWriteGuard<'static, Values> {
     VALUES.write().expect("Settings::values lock poisoned")
+}
+
+/// Exposes the currently running program ID to dump sites and other global readers.
+///
+/// Matches Eden `Settings::SetCurrentProgramID`.
+pub fn set_current_program_id(program_id: u64) {
+    CURRENT_PROGRAM_ID.store(program_id, Ordering::Relaxed);
+}
+
+/// Returns the program ID published by the current application load.
+///
+/// Matches Eden `Settings::GetCurrentProgramID`.
+pub fn get_current_program_id() -> u64 {
+    CURRENT_PROGRAM_ID.load(Ordering::Relaxed)
 }
 
 // ── ResolutionScalingInfo ───────────────────────────────────────────────────
@@ -2220,5 +2235,16 @@ mod tests {
             AppletMode::LLE
         );
         assert_eq!(*values.swkbd_applet_mode.get_value(), AppletMode::HLE);
+    }
+
+    #[test]
+    fn current_program_id_round_trips_for_global_dump_readers() {
+        const HOMEBREW_PROGRAM_ID: u64 = 0x0000_0000_4842_5257;
+        let previous = get_current_program_id();
+
+        set_current_program_id(HOMEBREW_PROGRAM_ID);
+        assert_eq!(get_current_program_id(), HOMEBREW_PROGRAM_ID);
+
+        set_current_program_id(previous);
     }
 }

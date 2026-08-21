@@ -2374,3 +2374,25 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 ### Binary layout verification
 
 - N/A: credentials are host strings and are not raw guest payloads.
+
+## 2026-08-21 — current program ID in `src/common/src/settings.rs` / `src/core/src/core.rs` vs Eden `src/common/settings.{h,cpp}` / `src/core/core.cpp`
+
+### Intentional differences
+
+- Ruzu stores the process-global ID in `AtomicU64` because Rust global mutable state must be
+  synchronized. Eden uses a plain file-local `u64`; relaxed atomic operations preserve the same
+  value semantics without adding ordering to unrelated emulator state.
+
+### Unintentional differences (to fix)
+
+- None. `set_current_program_id` and `get_current_program_id` now belong to `settings.rs`, and
+  `System::load` publishes the loaded process ID immediately after updating its runtime ID, at the
+  corresponding point in Eden's application-load flow.
+
+### Missing items
+
+- None for this settings prerequisite.
+
+### Binary layout verification
+
+- N/A: this is host-global scalar state and is not serialized or copied to guest memory.
