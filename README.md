@@ -105,7 +105,7 @@ adding a RISC-V backend to rdynarmic. That work is not implemented yet.
 Results from [the compatibility
 report](https://github.com/vricosti/ruzu-emu) of 18 August 2026. Each platform
 started from a clean image with neither build dependencies nor a Rust toolchain
-installed; `setup.sh` installed them, and the validation command was
+installed; `build.sh` installed them, and the validation command was
 `cargo build --locked --bin ruzu`.
 
 | Platform | Package manager | GTK | Rust | Result |
@@ -121,9 +121,9 @@ installed; `setup.sh` installed them, and the validation command was
 | FreeBSD 15.1-RELEASE | pkg | 4.20.4 | 1.97.1 (rustup) | OK |
 | NetBSD 10.1 | pkgin | 4.22.4 | 1.97.1 (rustup) | OK |
 | OpenBSD 7.9 | pkg_add | 4.22.3 | 1.94.1 (native package) | OK |
-| macOS Tahoe 26 | Homebrew | — | rustup | Not yet run — Homebrew support is implemented in `setup.sh`, pending validation on real Apple hardware |
+| macOS Tahoe 26 | Homebrew | — | rustup | Not yet run — Homebrew support is implemented in `build.sh`, pending validation on real Apple hardware |
 
-NetBSD needs two steps that `setup.sh` cannot take on its own, because they
+NetBSD needs two steps that `build.sh` cannot take on its own, because they
 provision the package manager and X11 themselves: install `pkgin` with
 `pkg_add`, and unpack the `xbase`, `xcomp` and `xfont` base sets. pkgsrc
 publishes no X11 packages for NetBSD.
@@ -139,7 +139,7 @@ firmware, see the [ruzu quickstart guide](docs/quickstart.md).
   validated with 1.97.1).
 - **GTK 4.6** or newer, plus Vulkan headers, OpenSSL, FFmpeg, glslang, CMake and
   a C/C++ toolchain. SDL3 is compiled statically from source by Cargo;
-  `setup.sh` installs the remaining platform packages.
+  `build.sh` installs the remaining platform packages.
 
 ### Clone
 
@@ -157,18 +157,28 @@ Already cloned without them?
 git submodule update --init --recursive
 ```
 
-### Install dependencies
+### Build
 
 From the root of the clone:
 
 ```sh
-./setup.sh
+./build.sh
 ```
 
-`setup.sh` dispatches to `scripts/setup-linux.sh`, `scripts/setup-bsd.sh` or
-`scripts/setup-macos.sh` based on `uname -s`. It is idempotent, and it asks
-separately before installing system packages and before installing Rust — it
-will not install either without confirmation.
+`build.sh` dispatches to `scripts/build-linux.sh`, `scripts/build-bsd.sh` or
+`scripts/build-macos.sh` based on `uname -s`. Each one checks the platform
+dependencies, then compiles the workspace in release. The dependency step is
+idempotent, and it asks separately before installing system packages and before
+installing Rust — it will not install either without confirmation. On macOS the
+build finishes by packaging `target/release/ruzu.app`, which is what carries the
+Info.plist, the icon and the bundled MoltenVK.
+
+```sh
+./build.sh --debug            # debug profile instead of release
+./build.sh --deps-only        # only check and install dependencies
+./build.sh --skip-deps        # build without re-checking the dependencies
+./build.sh -- --bin ruzu-cmd  # everything after `--` goes to cargo
+```
 
 ### Build and run
 
@@ -251,7 +261,7 @@ cargo build --locked --bin ruzu -j 1
 ```
 
 rustup publishes no OpenBSD host toolchain, so install the native `rust`
-package there; `setup.sh` refuses to substitute something else silently.
+package there; `build.sh` refuses to substitute something else silently.
 
 ## Legal
 

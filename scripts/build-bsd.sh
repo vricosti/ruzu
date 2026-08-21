@@ -1,11 +1,11 @@
 #!/bin/sh
-# Install the tools and native libraries required to build ruzu on BSD.
+# Install the tools and native libraries ruzu needs on BSD, then build it.
 set -eu
 
 PLATFORM_SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 PROJECT_DIR=$(CDPATH= cd -- "${PLATFORM_SCRIPT_DIR}/.." && pwd)
-# shellcheck source=setup-common.sh
-. "${PLATFORM_SCRIPT_DIR}/setup-common.sh"
+# shellcheck source=build-common.sh
+. "${PLATFORM_SCRIPT_DIR}/build-common.sh"
 
 case "$(uname -s)" in
     FreeBSD)
@@ -115,4 +115,4 @@ EOF
     fi
 }
 
-run_setup
+run_pipeline "$@"

@@ -31,8 +31,19 @@ if command -v brew >/dev/null 2>&1; then
     export PKG_CONFIG_PATH="$joined_pkg_config_path${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
 fi
 
+# The build pipeline has already compiled the workspace; standalone runs still
+# need cargo, so this is opt-out rather than removed.
+skip_build=false
+for arg in "$@"; do
+    case "$arg" in
+        --no-build) skip_build=true ;;
+    esac
+done
+
 cd "$repo_root"
-cargo build --locked --release --bin ruzu
+if [[ "$skip_build" != true ]]; then
+    cargo build --locked --release --bin ruzu
+fi
 
 if [[ ! -x "$binary" ]]; then
     echo "Cargo did not produce $binary." >&2
@@ -86,7 +97,7 @@ fi
 
 if [[ -z "$moltenvk" || ! -f "$moltenvk" ]]; then
     echo "MoltenVK was not found." >&2
-    echo "Build Eden, install it with scripts/setup-macos.sh, or set MOLTENVK_LIBRARY." >&2
+    echo "Build Eden, install it with scripts/build-macos.sh, or set MOLTENVK_LIBRARY." >&2
     exit 1
 fi
 install -m 755 "$moltenvk" "$frameworks/libMoltenVK.dylib"
