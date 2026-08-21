@@ -282,8 +282,8 @@ impl<T: IntrusiveRedBlackTreeNodeAccess> IntrusiveRedBlackTree<T> {
     pub fn iter(&self) -> Iter<'_, T> {
         Iter {
             nodes: &self.nodes,
-            head: &self.head,
-            current: tree::rb_min(&self.head, &self.nodes),
+            front: tree::rb_min(&self.head, &self.nodes),
+            back: tree::rb_max(&self.head, &self.nodes),
         }
     }
 
@@ -308,35 +308,48 @@ impl<T: IntrusiveRedBlackTreeNodeAccess> Default for IntrusiveRedBlackTree<T> {
 /// `IntrusiveRedBlackTree::Iterator` in C++.
 pub struct Iter<'a, T> {
     nodes: &'a [T],
-    head: &'a RBHead,
-    current: usize,
+    front: usize,
+    back: usize,
 }
 
 impl<'a, T: IntrusiveRedBlackTreeNodeAccess> Iterator for Iter<'a, T> {
     type Item = (usize, &'a T);
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.current == NONE {
+        if self.front == NONE {
             return None;
         }
-        let idx = self.current;
-        self.current = tree::rb_next(self.nodes, self.current);
+        let idx = self.front;
+        if self.front == self.back {
+            self.front = NONE;
+            self.back = NONE;
+        } else {
+            self.front = tree::rb_next(self.nodes, self.front);
+        }
         Some((idx, &self.nodes[idx]))
     }
 }
 
 impl<'a, T: IntrusiveRedBlackTreeNodeAccess> DoubleEndedIterator for Iter<'a, T> {
     fn next_back(&mut self) -> Option<Self::Item> {
-        // For a proper double-ended iterator we'd need to track the back cursor.
-        // This is a simplified implementation — for full bidirectional iteration,
-        // use `prev()` manually or iterate in reverse from `back_index()`.
-        None
+        if self.back == NONE {
+            return None;
+        }
+        let idx = self.back;
+        if self.front == self.back {
+            self.front = NONE;
+            self.back = NONE;
+        } else {
+            self.back = tree::rb_prev(self.nodes, self.back);
+        }
+        Some((idx, &self.nodes[idx]))
     }
 }
 
 /// Mutable iterator that yields `(index, &mut T)` pairs.
 pub struct IterMut<'a, T> {
-    current: usize,
+    front: usize,
+    back: usize,
     /// We store pointers to avoid borrow checker issues with simultaneous
     /// arena access and tree navigation.
     nodes_ptr: *mut T,
@@ -347,9 +360,9 @@ pub struct IterMut<'a, T> {
 impl<T: IntrusiveRedBlackTreeNodeAccess> IntrusiveRedBlackTree<T> {
     /// Returns a mutable iterator over the tree in sorted order.
     pub fn iter_mut(&mut self) -> IterMut<'_, T> {
-        let current = tree::rb_min(&self.head, &self.nodes);
         IterMut {
-            current,
+            front: tree::rb_min(&self.head, &self.nodes),
+            back: tree::rb_max(&self.head, &self.nodes),
             nodes_ptr: self.nodes.as_mut_ptr(),
             nodes_len: self.nodes.len(),
             _phantom: std::marker::PhantomData,
@@ -361,16 +374,44 @@ impl<'a, T: IntrusiveRedBlackTreeNodeAccess> Iterator for IterMut<'a, T> {
     type Item = (usize, &'a mut T);
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.current == NONE {
+        if self.front == NONE {
             return None;
         }
-        let idx = self.current;
+        let idx = self.front;
         // Safety: we only yield each index once during iteration,
         // and the caller holds a mutable borrow on the tree.
         let node = unsafe {
             assert!(idx < self.nodes_len);
             let slice = std::slice::from_raw_parts(self.nodes_ptr, self.nodes_len);
-            self.current = tree::rb_next(slice, idx);
+            if self.front == self.back {
+                self.front = NONE;
+                self.back = NONE;
+            } else {
+                self.front = tree::rb_next(slice, idx);
+            }
+            &mut *self.nodes_ptr.add(idx)
+        };
+        Some((idx, node))
+    }
+}
+
+impl<'a, T: IntrusiveRedBlackTreeNodeAccess> DoubleEndedIterator for IterMut<'a, T> {
+    fn next_back(&mut self) -> Option<Self::Item> {
+        if self.back == NONE {
+            return None;
+        }
+        let idx = self.back;
+        // Safety: front/back cursors never yield the same index twice, and the
+        // caller holds the mutable tree borrow for the iterator's lifetime.
+        let node = unsafe {
+            assert!(idx < self.nodes_len);
+            let slice = std::slice::from_raw_parts(self.nodes_ptr, self.nodes_len);
+            if self.front == self.back {
+                self.front = NONE;
+                self.back = NONE;
+            } else {
+                self.back = tree::rb_prev(slice, idx);
+            }
             &mut *self.nodes_ptr.add(idx)
         };
         Some((idx, node))
@@ -386,10 +427,10 @@ pub trait IntrusiveRedBlackTreeBaseNode: IntrusiveRedBlackTreeNodeAccess {
     where
         Self: Sized,
     {
-        // Find our own index first by scanning. In practice, callers should
-        // use the tree's `prev()` method with a known index instead.
-        // This exists for API parity with the C++ base node class.
-        NONE
+        nodes
+            .iter()
+            .position(|node| std::ptr::eq(node, self))
+            .map_or(NONE, |index| tree::rb_prev(nodes, index))
     }
 
     /// Get the in-order successor, returning `NONE` if at the end.
@@ -397,7 +438,10 @@ pub trait IntrusiveRedBlackTreeBaseNode: IntrusiveRedBlackTreeNodeAccess {
     where
         Self: Sized,
     {
-        NONE
+        nodes
+            .iter()
+            .position(|node| std::ptr::eq(node, self))
+            .map_or(NONE, |index| tree::rb_next(nodes, index))
     }
 }
 
@@ -429,6 +473,8 @@ mod tests {
         }
     }
 
+    impl IntrusiveRedBlackTreeBaseNode for TestItem {}
+
     fn cmp_items(a: &TestItem, b: &TestItem) -> i32 {
         if a.value < b.value {
             -1
@@ -456,11 +502,11 @@ mod tests {
         assert!(tree.empty());
 
         // Insert some items
-        let idx0 = tree.insert(TestItem::new(10), cmp_items);
-        let idx1 = tree.insert(TestItem::new(5), cmp_items);
-        let idx2 = tree.insert(TestItem::new(15), cmp_items);
-        let idx3 = tree.insert(TestItem::new(3), cmp_items);
-        let idx4 = tree.insert(TestItem::new(7), cmp_items);
+        tree.insert(TestItem::new(10), cmp_items);
+        tree.insert(TestItem::new(5), cmp_items);
+        tree.insert(TestItem::new(15), cmp_items);
+        tree.insert(TestItem::new(3), cmp_items);
+        tree.insert(TestItem::new(7), cmp_items);
 
         assert!(!tree.empty());
         assert_eq!(tree.len(), 5);
@@ -482,6 +528,46 @@ mod tests {
 
         let values: Vec<i32> = tree.iter().map(|(_, item)| item.value).collect();
         assert_eq!(values, vec![3, 5, 7, 10, 15]);
+    }
+
+    #[test]
+    fn test_bidirectional_iteration() {
+        let mut tree: IntrusiveRedBlackTree<TestItem> = IntrusiveRedBlackTree::new();
+
+        tree.insert(TestItem::new(10), cmp_items);
+        tree.insert(TestItem::new(5), cmp_items);
+        tree.insert(TestItem::new(15), cmp_items);
+        tree.insert(TestItem::new(3), cmp_items);
+        tree.insert(TestItem::new(7), cmp_items);
+
+        let reverse: Vec<i32> = tree.iter().rev().map(|(_, item)| item.value).collect();
+        assert_eq!(reverse, vec![15, 10, 7, 5, 3]);
+
+        let mut mixed = tree.iter();
+        assert_eq!(mixed.next().map(|(_, item)| item.value), Some(3));
+        assert_eq!(mixed.next_back().map(|(_, item)| item.value), Some(15));
+        assert_eq!(mixed.next().map(|(_, item)| item.value), Some(5));
+        assert_eq!(mixed.next_back().map(|(_, item)| item.value), Some(10));
+        assert_eq!(mixed.next().map(|(_, item)| item.value), Some(7));
+        assert!(mixed.next_back().is_none());
+    }
+
+    #[test]
+    fn test_mutable_reverse_iteration_and_base_node_neighbors() {
+        let mut tree: IntrusiveRedBlackTree<TestItem> = IntrusiveRedBlackTree::new();
+
+        tree.insert(TestItem::new(10), cmp_items);
+        tree.insert(TestItem::new(5), cmp_items);
+        tree.insert(TestItem::new(15), cmp_items);
+
+        let reverse: Vec<i32> = tree.iter_mut().rev().map(|(_, item)| item.value).collect();
+        assert_eq!(reverse, vec![15, 10, 5]);
+
+        let middle = tree.find_key(&10, key_cmp);
+        let previous = tree.nodes()[middle].get_prev_index(tree.nodes());
+        let next = tree.nodes()[middle].get_next_index(tree.nodes());
+        assert_eq!(tree.get(previous).map(|item| item.value), Some(5));
+        assert_eq!(tree.get(next).map(|item| item.value), Some(15));
     }
 
     #[test]

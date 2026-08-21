@@ -2722,3 +2722,28 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 
 - PASS: the existing compile-time assertions still verify the affected NRO, MOD, and asset header
   sizes; this scalar ASLR change does not alter them.
+
+## 2026-08-21 — `src/common/src/intrusive_red_black_tree.rs` vs Eden `src/common/intrusive_red_black_tree.h` bidirectional iteration
+
+### Intentional differences
+
+- Pointer-based C++ iterator positions are represented by arena indices. Rust's immutable and
+  mutable double-ended iterators therefore retain explicit front and back indices so mixed forward
+  and reverse traversal cannot yield a node twice.
+- `IntrusiveRedBlackTreeBaseNode` locates `self` in the arena before following its embedded node
+  links; this linear lookup replaces the parent-pointer cast that Rust's arena representation
+  cannot express safely.
+
+### Unintentional differences (to fix)
+
+- None. Immutable and mutable iterators now support reverse traversal, and base-node predecessor
+  and successor accessors now follow the tree links instead of always returning `NONE`.
+
+### Missing items
+
+- None in the reviewed bidirectional iterator and base-node neighbor methods.
+
+### Binary layout verification
+
+- N/A: Ruzu deliberately uses indices rather than serializing Eden's host pointers. Focused tests
+  cover forward, reverse, mixed, mutable, predecessor, and successor traversal without duplicates.
