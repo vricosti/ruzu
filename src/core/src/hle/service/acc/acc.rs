@@ -228,6 +228,12 @@ impl Interface {
         (RESULT_SUCCESS, false)
     }
 
+    /// Port of upstream `Module::Interface::GetPinCodeLength`.
+    pub fn get_pin_code_length(&self) -> (ResultCode, u32) {
+        log::warn!("(STUBBED) Account::GetPinCodeLength called");
+        (RESULT_SUCCESS, 0)
+    }
+
     pub fn list_open_context_stored_users(
         &self,
         profile_manager: &ProfileManager,
@@ -920,10 +926,1250 @@ pub fn new_iprofile_editor(
     ))
 }
 
+pub struct AccAA {
+    pub interface: Interface,
+    handlers: BTreeMap<u32, FunctionInfo>,
+    handlers_tipc: BTreeMap<u32, FunctionInfo>,
+}
+
+impl AccAA {
+    /// Matches upstream `AccAA(shared_ptr<Module>, shared_ptr<ProfileManager>, System&)`.
+    pub fn new(
+        module: std::sync::Arc<Module>,
+        profile_manager: std::sync::Arc<std::sync::Mutex<ProfileManager>>,
+        system: crate::core::SystemRef,
+    ) -> Self {
+        let handlers = build_handler_map(&[
+            (0, None, "EnsureCacheAsync"),
+            (1, None, "LoadCache"),
+            (2, None, "GetDeviceAccountId"),
+            (50, None, "RegisterNotificationTokenAsync"),
+            (51, None, "UnregisterNotificationTokenAsync"),
+        ]);
+
+        Self {
+            interface: Interface::new(module, profile_manager, system, "acc:aa"),
+            handlers,
+            handlers_tipc: BTreeMap::new(),
+        }
+    }
+}
+
+impl SessionRequestHandler for AccAA {
+    fn handle_sync_request(&self, ctx: &mut HLERequestContext) -> ResultCode {
+        ServiceFramework::handle_sync_request_impl(self, ctx)
+    }
+
+    fn service_name(&self) -> &str {
+        "acc:aa"
+    }
+}
+
+impl ServiceFramework for AccAA {
+    fn get_service_name(&self) -> &str {
+        "acc:aa"
+    }
+
+    fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers
+    }
+
+    fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers_tipc
+    }
+}
+pub struct AccSU {
+    pub interface: Interface,
+    handlers: BTreeMap<u32, FunctionInfo>,
+    handlers_tipc: BTreeMap<u32, FunctionInfo>,
+}
+
+impl AccSU {
+    /// Matches upstream `AccSU(shared_ptr<Module>, shared_ptr<ProfileManager>, System&)`.
+    pub fn new(
+        module: std::sync::Arc<Module>,
+        profile_manager: std::sync::Arc<std::sync::Mutex<ProfileManager>>,
+        system: crate::core::SystemRef,
+    ) -> Self {
+        let handlers = build_handler_map(&[
+            (0, Some(AccSU::get_user_count_handler), "GetUserCount"),
+            (
+                1,
+                Some(AccSU::get_user_existence_handler),
+                "GetUserExistence",
+            ),
+            (2, Some(AccSU::list_all_users_handler), "ListAllUsers"),
+            (3, Some(AccSU::list_open_users_handler), "ListOpenUsers"),
+            (
+                4,
+                Some(AccSU::get_last_opened_user_handler),
+                "GetLastOpenedUser",
+            ),
+            (5, Some(AccSU::get_profile_handler), "GetProfile"),
+            (6, None, "GetProfileDigest"),
+            (
+                50,
+                Some(AccSU::is_user_registration_request_permitted_handler),
+                "IsUserRegistrationRequestPermitted",
+            ),
+            (
+                51,
+                Some(AccSU::try_select_user_without_interaction_handler),
+                "TrySelectUserWithoutInteractionDeprecated",
+            ),
+            (
+                52,
+                Some(AccSU::try_select_user_without_interaction_handler),
+                "TrySelectUserWithoutInteraction",
+            ),
+            (
+                60,
+                Some(AccSU::list_open_context_stored_users_handler),
+                "ListOpenContextStoredUsers",
+            ),
+            (99, None, "DebugActivateOpenContextRetention"),
+            (100, None, "GetUserRegistrationNotifier"),
+            (101, None, "GetUserStateChangeNotifier"),
+            (102, None, "GetBaasAccountManagerForSystemService"),
+            (103, None, "GetBaasUserAvailabilityChangeNotifier"),
+            (104, None, "GetProfileUpdateNotifier"),
+            (105, None, "CheckNetworkServiceAvailabilityAsync"),
+            (106, None, "GetProfileSyncNotifier"),
+            (
+                110,
+                Some(AccSU::store_save_data_thumbnail_handler),
+                "StoreSaveDataThumbnail",
+            ),
+            (111, None, "ClearSaveDataThumbnail"),
+            (112, None, "LoadSaveDataThumbnail"),
+            (113, None, "GetSaveDataThumbnailExistence"),
+            (120, None, "ListOpenUsersInApplication"),
+            (130, None, "ActivateOpenContextRetention"),
+            (
+                140,
+                Some(AccSU::list_qualified_users_handler),
+                "ListQualifiedUsers",
+            ),
+            (150, None, "AuthenticateApplicationAsync"),
+            (
+                151,
+                None,
+                "EnsureSignedDeviceIdentifierCacheForNintendoAccountAsync",
+            ),
+            (
+                152,
+                None,
+                "LoadSignedDeviceIdentifierCacheForNintendoAccount",
+            ),
+            (190, None, "GetUserLastOpenedApplication"),
+            (191, None, "ActivateOpenContextHolder"),
+            (
+                200,
+                Some(AccSU::begin_user_registration_handler),
+                "BeginUserRegistration",
+            ),
+            (
+                201,
+                Some(AccSU::complete_user_registration_handler),
+                "CompleteUserRegistration",
+            ),
+            (202, None, "CancelUserRegistration"),
+            (203, None, "DeleteUser"),
+            (204, None, "SetUserPosition"),
+            (
+                205,
+                Some(AccSU::get_profile_editor_handler),
+                "GetProfileEditor",
+            ),
+            (206, None, "CompleteUserRegistrationForcibly"),
+            (210, None, "CreateFloatingRegistrationRequest"),
+            (
+                211,
+                None,
+                "CreateProcedureToRegisterUserWithNintendoAccount",
+            ),
+            (
+                212,
+                None,
+                "ResumeProcedureToRegisterUserWithNintendoAccount",
+            ),
+            (230, None, "AuthenticateServiceAsync"),
+            (250, None, "GetBaasAccountAdministrator"),
+            (290, None, "ProxyProcedureForGuestLoginWithNintendoAccount"),
+            (
+                291,
+                None,
+                "ProxyProcedureForFloatingRegistrationWithNintendoAccount",
+            ),
+            (299, None, "SuspendBackgroundDaemon"),
+            (400, None, "SetPinCode"),
+            (
+                401,
+                Some(AccSU::get_pin_code_length_handler),
+                "GetPinCodeLength",
+            ),
+            (402, None, "GetPinCode"),
+            (403, None, "GetPinCodeParity"),
+            (404, None, "VerifyPinCode"),
+            (405, None, "IsPinCodeVerificationForbidden"),
+            (410, None, "GetPinCodeErrorCount"),
+            (411, None, "ResetPinCodeErrorCount"),
+            (412, None, "IncrementPinCodeErrorCount"),
+            (900, None, "SetUserUnqualifiedForDebug"),
+            (901, None, "UnsetUserUnqualifiedForDebug"),
+            (902, None, "ListUsersUnqualifiedForDebug"),
+            (910, None, "RefreshFirmwareSettingsForDebug"),
+            (997, None, "DebugInvalidateTokenCacheForUser"),
+            (998, None, "DebugSetUserStateClose"),
+            (999, None, "DebugSetUserStateOpen"),
+        ]);
+
+        Self {
+            interface: Interface::new(module, profile_manager, system, "acc:su"),
+            handlers,
+            handlers_tipc: BTreeMap::new(),
+        }
+    }
+
+    fn get_user_count_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let svc = unsafe { &*(this as *const dyn ServiceFramework as *const AccSU) };
+        let pm = svc.interface.profile_manager.lock().unwrap();
+        let (_rc, count) = svc.interface.get_user_count(&pm);
+        let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_u32(count);
+    }
+
+    fn get_pin_code_length_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let svc = unsafe { &*(this as *const dyn ServiceFramework as *const AccSU) };
+        let (result, length) = svc.interface.get_pin_code_length();
+        let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
+        rb.push_result(result);
+        rb.push_u32(length);
+    }
+
+    fn get_user_existence_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let svc = unsafe { &*(this as *const dyn ServiceFramework as *const AccSU) };
+        let mut rp = RequestParser::new(ctx);
+        let uuid = rp.pop_raw::<u128>();
+        let pm = svc.interface.profile_manager.lock().unwrap();
+        let (_rc, exists) = svc.interface.get_user_existence(&pm, uuid);
+        let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_bool(exists);
+    }
+
+    fn list_all_users_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let svc = unsafe { &*(this as *const dyn ServiceFramework as *const AccSU) };
+        let pm = svc.interface.profile_manager.lock().unwrap();
+        let (_rc, users) = svc.interface.list_all_users(&pm);
+        let user_bytes = unsafe {
+            std::slice::from_raw_parts(users.as_ptr() as *const u8, std::mem::size_of_val(&users))
+        };
+        ctx.write_buffer(user_bytes, 0);
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+    }
+
+    fn list_open_users_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let svc = unsafe { &*(this as *const dyn ServiceFramework as *const AccSU) };
+        let pm = svc.interface.profile_manager.lock().unwrap();
+        let (_rc, users) = svc.interface.list_open_users(&pm);
+        let user_bytes = unsafe {
+            std::slice::from_raw_parts(users.as_ptr() as *const u8, std::mem::size_of_val(&users))
+        };
+        ctx.write_buffer(user_bytes, 0);
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+    }
+
+    fn get_last_opened_user_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let svc = unsafe { &*(this as *const dyn ServiceFramework as *const AccSU) };
+        let pm = svc.interface.profile_manager.lock().unwrap();
+        let (_rc, uuid) = svc.interface.get_last_opened_user(&pm);
+        let mut rb = ResponseBuilder::new(ctx, 6, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_raw(&uuid);
+    }
+
+    fn get_profile_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let svc = unsafe { &*(this as *const dyn ServiceFramework as *const AccSU) };
+        let mut rp = RequestParser::new(ctx);
+        let uuid = rp.pop_raw::<u128>();
+        let (_rc, iprofile) = svc.interface.get_profile(uuid);
+
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 1);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_ipc_interface(iprofile);
+    }
+
+    fn is_user_registration_request_permitted_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        let svc = unsafe { &*(this as *const dyn ServiceFramework as *const AccSU) };
+        let (_rc, permitted) = svc.interface.is_user_registration_request_permitted();
+        let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_bool(permitted);
+    }
+
+    fn try_select_user_without_interaction_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        let svc = unsafe { &*(this as *const dyn ServiceFramework as *const AccSU) };
+        let pm = svc.interface.profile_manager.lock().unwrap();
+        let (_rc, uuid) = svc.interface.try_select_user_without_interaction(&pm);
+        let mut rb = ResponseBuilder::new(ctx, 6, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_raw(&uuid);
+    }
+
+    fn store_save_data_thumbnail_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let svc = unsafe { &*(this as *const dyn ServiceFramework as *const AccSU) };
+        let mut rp = RequestParser::new(ctx);
+        let uuid = rp.pop_raw::<u128>();
+        let title_id = rp.pop_u64();
+        svc.interface
+            .store_save_data_thumbnail_system(ctx, uuid, title_id);
+    }
+
+    fn list_open_context_stored_users_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        let svc = unsafe { &*(this as *const dyn ServiceFramework as *const AccSU) };
+        let pm = svc.interface.profile_manager.lock().unwrap();
+        let (_rc, users) = svc.interface.list_open_context_stored_users(&pm);
+        let user_bytes = unsafe {
+            std::slice::from_raw_parts(users.as_ptr() as *const u8, std::mem::size_of_val(&users))
+        };
+        ctx.write_buffer(user_bytes, 0);
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+    }
+
+    fn list_qualified_users_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let svc = unsafe { &*(this as *const dyn ServiceFramework as *const AccSU) };
+        let pm = svc.interface.profile_manager.lock().unwrap();
+        let (_rc, users) = svc.interface.list_qualified_users(&pm);
+        let user_bytes = unsafe {
+            std::slice::from_raw_parts(users.as_ptr() as *const u8, std::mem::size_of_val(&users))
+        };
+        ctx.write_buffer(user_bytes, 0);
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+    }
+
+    fn begin_user_registration_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let svc = unsafe { &mut *(std::ptr::addr_of!(*this).cast::<AccSU>().cast_mut()) };
+        let mut pm = svc.interface.profile_manager.lock().unwrap();
+        let (_rc, uuid) = svc.interface.begin_user_registration(&mut pm);
+        let mut rb = ResponseBuilder::new(ctx, 6, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_raw(&uuid);
+    }
+
+    fn complete_user_registration_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        let svc = unsafe { &mut *(std::ptr::addr_of!(*this).cast::<AccSU>().cast_mut()) };
+        let mut rp = RequestParser::new(ctx);
+        let uuid = rp.pop_raw::<u128>();
+        let mut pm = svc.interface.profile_manager.lock().unwrap();
+        let rc = svc.interface.complete_user_registration(&mut pm, uuid);
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(rc);
+    }
+
+    fn get_profile_editor_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let svc = unsafe { &*(this as *const dyn ServiceFramework as *const AccSU) };
+        let mut rp = RequestParser::new(ctx);
+        let uuid = rp.pop_raw::<u128>();
+        let (_rc, editor) = svc.interface.get_profile_editor(uuid);
+
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 1);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_ipc_interface(editor);
+    }
+}
+
+impl SessionRequestHandler for AccSU {
+    fn handle_sync_request(&self, ctx: &mut HLERequestContext) -> ResultCode {
+        ServiceFramework::handle_sync_request_impl(self, ctx)
+    }
+
+    fn service_name(&self) -> &str {
+        "acc:su"
+    }
+}
+
+impl ServiceFramework for AccSU {
+    fn get_service_name(&self) -> &str {
+        "acc:su"
+    }
+
+    fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers
+    }
+
+    fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers_tipc
+    }
+}
+
+pub struct AccU0 {
+    pub interface: Interface,
+    handlers: BTreeMap<u32, FunctionInfo>,
+    handlers_tipc: BTreeMap<u32, FunctionInfo>,
+}
+
+impl AccU0 {
+    /// Matches upstream `ACC_U0(shared_ptr<Module>, shared_ptr<ProfileManager>, System&)`.
+    pub fn new(
+        module: std::sync::Arc<Module>,
+        profile_manager: std::sync::Arc<std::sync::Mutex<ProfileManager>>,
+        system: crate::core::SystemRef,
+    ) -> Self {
+        let handlers = build_handler_map(&[
+            (0, Some(AccU0::get_user_count_handler), "GetUserCount"),
+            (
+                1,
+                Some(AccU0::get_user_existence_handler),
+                "GetUserExistence",
+            ),
+            (2, Some(AccU0::list_all_users_handler), "ListAllUsers"),
+            (3, Some(AccU0::list_open_users_handler), "ListOpenUsers"),
+            (
+                4,
+                Some(AccU0::get_last_opened_user_handler),
+                "GetLastOpenedUser",
+            ),
+            (5, Some(AccU0::get_profile_handler), "GetProfile"),
+            (6, None, "GetProfileDigest"),
+            (
+                50,
+                Some(AccU0::is_user_registration_request_permitted_handler),
+                "IsUserRegistrationRequestPermitted",
+            ),
+            (
+                51,
+                Some(AccU0::try_select_user_without_interaction_handler),
+                "TrySelectUserWithoutInteractionDeprecated",
+            ),
+            (
+                52,
+                Some(AccU0::try_select_user_without_interaction_handler),
+                "TrySelectUserWithoutInteraction",
+            ),
+            (
+                60,
+                Some(AccU0::list_open_context_stored_users_handler),
+                "ListOpenContextStoredUsers",
+            ),
+            (99, None, "DebugActivateOpenContextRetention"),
+            (
+                100,
+                Some(AccU0::initialize_application_info_handler),
+                "InitializeApplicationInfo",
+            ),
+            (
+                101,
+                Some(AccU0::get_baas_account_manager_for_application_handler),
+                "GetBaasAccountManagerForApplication",
+            ),
+            (102, None, "AuthenticateApplicationAsync"),
+            (103, None, "CheckNetworkServiceAvailabilityAsync"),
+            (
+                110,
+                Some(AccU0::store_save_data_thumbnail_handler),
+                "StoreSaveDataThumbnail",
+            ),
+            (111, None, "ClearSaveDataThumbnail"),
+            (120, None, "CreateGuestLoginRequest"),
+            (130, None, "LoadOpenContext"),
+            (
+                131,
+                Some(AccU0::list_open_context_stored_users_handler),
+                "ListOpenContextStoredUsers",
+            ),
+            (
+                140,
+                Some(AccU0::initialize_application_info_restricted_handler),
+                "InitializeApplicationInfoRestricted",
+            ),
+            (
+                141,
+                Some(AccU0::list_qualified_users_handler),
+                "ListQualifiedUsers",
+            ),
+            (
+                150,
+                Some(AccU0::is_user_account_switch_locked_handler),
+                "IsUserAccountSwitchLocked",
+            ),
+            (
+                160,
+                Some(AccU0::initialize_application_info_v2_handler),
+                "InitializeApplicationInfoV2",
+            ),
+        ]);
+
+        Self {
+            interface: Interface::new(module, profile_manager, system, "acc:u0"),
+            handlers,
+            handlers_tipc: BTreeMap::new(),
+        }
+    }
+
+    fn get_user_count_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let svc = unsafe { &*(this as *const dyn ServiceFramework as *const AccU0) };
+        let pm = svc.interface.profile_manager.lock().unwrap();
+        let (_rc, count) = svc.interface.get_user_count(&pm);
+        let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_u32(count);
+    }
+
+    fn get_user_existence_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let svc = unsafe { &*(this as *const dyn ServiceFramework as *const AccU0) };
+        let mut rp = RequestParser::new(ctx);
+        let uuid = rp.pop_raw::<u128>();
+        let pm = svc.interface.profile_manager.lock().unwrap();
+        let (_rc, exists) = svc.interface.get_user_existence(&pm, uuid);
+        let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_bool(exists);
+    }
+
+    fn list_all_users_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let svc = unsafe { &*(this as *const dyn ServiceFramework as *const AccU0) };
+        let pm = svc.interface.profile_manager.lock().unwrap();
+        let (_rc, users) = svc.interface.list_all_users(&pm);
+        let user_bytes = unsafe {
+            std::slice::from_raw_parts(users.as_ptr() as *const u8, std::mem::size_of_val(&users))
+        };
+        ctx.write_buffer(user_bytes, 0);
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+    }
+
+    fn list_open_users_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let svc = unsafe { &*(this as *const dyn ServiceFramework as *const AccU0) };
+        let pm = svc.interface.profile_manager.lock().unwrap();
+        let (_rc, users) = svc.interface.list_open_users(&pm);
+        let user_bytes = unsafe {
+            std::slice::from_raw_parts(users.as_ptr() as *const u8, std::mem::size_of_val(&users))
+        };
+        ctx.write_buffer(user_bytes, 0);
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+    }
+
+    fn get_last_opened_user_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let svc = unsafe { &*(this as *const dyn ServiceFramework as *const AccU0) };
+        let pm = svc.interface.profile_manager.lock().unwrap();
+        let (_rc, uuid) = svc.interface.get_last_opened_user(&pm);
+        let mut rb = ResponseBuilder::new(ctx, 6, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_raw(&uuid);
+    }
+
+    fn get_profile_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let svc = unsafe { &*(this as *const dyn ServiceFramework as *const AccU0) };
+        let mut rp = RequestParser::new(ctx);
+        let uuid = rp.pop_raw::<u128>();
+        let (_rc, iprofile) = svc.interface.get_profile(uuid);
+
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 1);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_ipc_interface(iprofile);
+    }
+
+    fn is_user_registration_request_permitted_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        let svc = unsafe { &*(this as *const dyn ServiceFramework as *const AccU0) };
+        let (_rc, permitted) = svc.interface.is_user_registration_request_permitted();
+        let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_bool(permitted);
+    }
+
+    fn try_select_user_without_interaction_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        let svc = unsafe { &*(this as *const dyn ServiceFramework as *const AccU0) };
+        let pm = svc.interface.profile_manager.lock().unwrap();
+        let (_rc, uuid) = svc.interface.try_select_user_without_interaction(&pm);
+        let mut rb = ResponseBuilder::new(ctx, 6, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_raw(&uuid);
+    }
+
+    fn list_open_context_stored_users_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        let svc = unsafe { &*(this as *const dyn ServiceFramework as *const AccU0) };
+        let pm = svc.interface.profile_manager.lock().unwrap();
+        let (_rc, users) = svc.interface.list_open_context_stored_users(&pm);
+        let user_bytes = unsafe {
+            std::slice::from_raw_parts(users.as_ptr() as *const u8, std::mem::size_of_val(&users))
+        };
+        ctx.write_buffer(user_bytes, 0);
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+    }
+
+    fn initialize_application_info_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        let svc = unsafe { &mut *(std::ptr::addr_of!(*this).cast::<AccU0>().cast_mut()) };
+        let rc = svc.interface.initialize_application_info();
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(rc);
+    }
+
+    fn initialize_application_info_restricted_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        let svc = unsafe { &mut *(std::ptr::addr_of!(*this).cast::<AccU0>().cast_mut()) };
+        let rc = svc.interface.initialize_application_info_restricted();
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(rc);
+    }
+
+    fn get_baas_account_manager_for_application_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        let svc = unsafe { &*(this as *const dyn ServiceFramework as *const AccU0) };
+        let (rc, object) = svc.interface.get_baas_account_manager_for_application();
+
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 1);
+        rb.push_result(rc);
+        rb.push_ipc_interface(object);
+    }
+
+    fn store_save_data_thumbnail_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let svc = unsafe { &*(this as *const dyn ServiceFramework as *const AccU0) };
+        let mut rp = RequestParser::new(ctx);
+        let uuid = rp.pop_raw::<u128>();
+        svc.interface
+            .store_save_data_thumbnail_application(ctx, uuid);
+    }
+
+    fn list_qualified_users_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let svc = unsafe { &*(this as *const dyn ServiceFramework as *const AccU0) };
+        let pm = svc.interface.profile_manager.lock().unwrap();
+        let (_rc, users) = svc.interface.list_qualified_users(&pm);
+        let user_bytes = unsafe {
+            std::slice::from_raw_parts(users.as_ptr() as *const u8, std::mem::size_of_val(&users))
+        };
+        ctx.write_buffer(user_bytes, 0);
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+    }
+
+    fn is_user_account_switch_locked_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        let svc = unsafe { &*(this as *const dyn ServiceFramework as *const AccU0) };
+        let (_rc, locked) = svc.interface.is_user_account_switch_locked();
+        let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_bool(locked);
+    }
+
+    fn initialize_application_info_v2_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        let svc = unsafe { &mut *(std::ptr::addr_of!(*this).cast::<AccU0>().cast_mut()) };
+        let rc = svc.interface.initialize_application_info_v2();
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(rc);
+    }
+}
+
+impl SessionRequestHandler for AccU0 {
+    fn handle_sync_request(&self, ctx: &mut HLERequestContext) -> ResultCode {
+        ServiceFramework::handle_sync_request_impl(self, ctx)
+    }
+
+    fn service_name(&self) -> &str {
+        "acc:u0"
+    }
+}
+
+impl ServiceFramework for AccU0 {
+    fn get_service_name(&self) -> &str {
+        "acc:u0"
+    }
+
+    fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers
+    }
+
+    fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers_tipc
+    }
+}
+pub struct AccU1 {
+    pub interface: Interface,
+    handlers: BTreeMap<u32, FunctionInfo>,
+    handlers_tipc: BTreeMap<u32, FunctionInfo>,
+}
+
+impl AccU1 {
+    /// Matches upstream `AccU1(shared_ptr<Module>, shared_ptr<ProfileManager>, System&)`.
+    pub fn new(
+        module: std::sync::Arc<Module>,
+        profile_manager: std::sync::Arc<std::sync::Mutex<ProfileManager>>,
+        system: crate::core::SystemRef,
+    ) -> Self {
+        let handlers = build_handler_map(&[
+            (0, Some(AccU1::get_user_count_handler), "GetUserCount"),
+            (
+                1,
+                Some(AccU1::get_user_existence_handler),
+                "GetUserExistence",
+            ),
+            (2, Some(AccU1::list_all_users_handler), "ListAllUsers"),
+            (3, Some(AccU1::list_open_users_handler), "ListOpenUsers"),
+            (
+                4,
+                Some(AccU1::get_last_opened_user_handler),
+                "GetLastOpenedUser",
+            ),
+            (5, Some(AccU1::get_profile_handler), "GetProfile"),
+            (6, None, "GetProfileDigest"),
+            (
+                50,
+                Some(AccU1::is_user_registration_request_permitted_handler),
+                "IsUserRegistrationRequestPermitted",
+            ),
+            (
+                51,
+                Some(AccU1::try_select_user_without_interaction_handler),
+                "TrySelectUserWithoutInteraction",
+            ),
+            (
+                60,
+                Some(AccU1::list_open_context_stored_users_handler),
+                "ListOpenContextStoredUsers",
+            ),
+            (99, None, "DebugActivateOpenContextRetention"),
+            (100, None, "GetUserRegistrationNotifier"),
+            (101, None, "GetUserStateChangeNotifier"),
+            (102, None, "GetBaasAccountManagerForSystemService"),
+            (103, None, "GetBaasUserAvailabilityChangeNotifier"),
+            (104, None, "GetProfileUpdateNotifier"),
+            (105, None, "CheckNetworkServiceAvailabilityAsync"),
+            (106, None, "GetProfileSyncNotifier"),
+            (
+                110,
+                Some(AccU1::store_save_data_thumbnail_handler),
+                "StoreSaveDataThumbnail",
+            ),
+            (111, None, "ClearSaveDataThumbnail"),
+            (112, None, "LoadSaveDataThumbnail"),
+            (113, None, "GetSaveDataThumbnailExistence"),
+            (120, None, "ListOpenUsersInApplication"),
+            (130, None, "ActivateOpenContextRetention"),
+            (
+                140,
+                Some(AccU1::list_qualified_users_handler),
+                "ListQualifiedUsers",
+            ),
+            (150, None, "AuthenticateApplicationAsync"),
+            (
+                151,
+                None,
+                "EnsureSignedDeviceIdentifierCacheForNintendoAccountAsync",
+            ),
+            (
+                152,
+                None,
+                "LoadSignedDeviceIdentifierCacheForNintendoAccount",
+            ),
+            (190, None, "GetUserLastOpenedApplication"),
+            (191, None, "ActivateOpenContextHolder"),
+            (
+                401,
+                Some(AccU1::get_pin_code_length_handler),
+                "GetPinCodeLength",
+            ),
+            (402, None, "GetPinCode"),
+            (997, None, "DebugInvalidateTokenCacheForUser"),
+            (998, None, "DebugSetUserStateClose"),
+            (999, None, "DebugSetUserStateOpen"),
+        ]);
+
+        Self {
+            interface: Interface::new(module, profile_manager, system, "acc:u1"),
+            handlers,
+            handlers_tipc: BTreeMap::new(),
+        }
+    }
+
+    fn get_user_count_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let svc = unsafe { &*(this as *const dyn ServiceFramework as *const AccU1) };
+        let pm = svc.interface.profile_manager.lock().unwrap();
+        let (_rc, count) = svc.interface.get_user_count(&pm);
+        let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_u32(count);
+    }
+
+    fn get_pin_code_length_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let svc = unsafe { &*(this as *const dyn ServiceFramework as *const AccU1) };
+        let (result, length) = svc.interface.get_pin_code_length();
+        let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
+        rb.push_result(result);
+        rb.push_u32(length);
+    }
+
+    fn get_user_existence_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let svc = unsafe { &*(this as *const dyn ServiceFramework as *const AccU1) };
+        let mut rp = RequestParser::new(ctx);
+        let uuid = rp.pop_raw::<u128>();
+        let pm = svc.interface.profile_manager.lock().unwrap();
+        let (_rc, exists) = svc.interface.get_user_existence(&pm, uuid);
+        let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_bool(exists);
+    }
+
+    fn list_all_users_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let svc = unsafe { &*(this as *const dyn ServiceFramework as *const AccU1) };
+        let pm = svc.interface.profile_manager.lock().unwrap();
+        let (_rc, users) = svc.interface.list_all_users(&pm);
+        let user_bytes = unsafe {
+            std::slice::from_raw_parts(users.as_ptr() as *const u8, std::mem::size_of_val(&users))
+        };
+        ctx.write_buffer(user_bytes, 0);
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+    }
+
+    fn list_open_users_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let svc = unsafe { &*(this as *const dyn ServiceFramework as *const AccU1) };
+        let pm = svc.interface.profile_manager.lock().unwrap();
+        let (_rc, users) = svc.interface.list_open_users(&pm);
+        let user_bytes = unsafe {
+            std::slice::from_raw_parts(users.as_ptr() as *const u8, std::mem::size_of_val(&users))
+        };
+        ctx.write_buffer(user_bytes, 0);
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+    }
+
+    fn get_last_opened_user_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let svc = unsafe { &*(this as *const dyn ServiceFramework as *const AccU1) };
+        let pm = svc.interface.profile_manager.lock().unwrap();
+        let (_rc, uuid) = svc.interface.get_last_opened_user(&pm);
+        let mut rb = ResponseBuilder::new(ctx, 6, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_raw(&uuid);
+    }
+
+    fn get_profile_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let svc = unsafe { &*(this as *const dyn ServiceFramework as *const AccU1) };
+        let mut rp = RequestParser::new(ctx);
+        let uuid = rp.pop_raw::<u128>();
+        let (_rc, iprofile) = svc.interface.get_profile(uuid);
+
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 1);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_ipc_interface(iprofile);
+    }
+
+    fn is_user_registration_request_permitted_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        let svc = unsafe { &*(this as *const dyn ServiceFramework as *const AccU1) };
+        let (_rc, permitted) = svc.interface.is_user_registration_request_permitted();
+        let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_bool(permitted);
+    }
+
+    fn try_select_user_without_interaction_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        let svc = unsafe { &*(this as *const dyn ServiceFramework as *const AccU1) };
+        let pm = svc.interface.profile_manager.lock().unwrap();
+        let (_rc, uuid) = svc.interface.try_select_user_without_interaction(&pm);
+        let mut rb = ResponseBuilder::new(ctx, 6, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_raw(&uuid);
+    }
+
+    fn store_save_data_thumbnail_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let svc = unsafe { &*(this as *const dyn ServiceFramework as *const AccU1) };
+        let mut rp = RequestParser::new(ctx);
+        let uuid = rp.pop_raw::<u128>();
+        svc.interface
+            .store_save_data_thumbnail_application(ctx, uuid);
+    }
+
+    fn list_open_context_stored_users_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        let svc = unsafe { &*(this as *const dyn ServiceFramework as *const AccU1) };
+        let pm = svc.interface.profile_manager.lock().unwrap();
+        let (_rc, users) = svc.interface.list_open_context_stored_users(&pm);
+        let user_bytes = unsafe {
+            std::slice::from_raw_parts(users.as_ptr() as *const u8, std::mem::size_of_val(&users))
+        };
+        ctx.write_buffer(user_bytes, 0);
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+    }
+
+    fn list_qualified_users_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let svc = unsafe { &*(this as *const dyn ServiceFramework as *const AccU1) };
+        let pm = svc.interface.profile_manager.lock().unwrap();
+        let (_rc, users) = svc.interface.list_qualified_users(&pm);
+        let user_bytes = unsafe {
+            std::slice::from_raw_parts(users.as_ptr() as *const u8, std::mem::size_of_val(&users))
+        };
+        ctx.write_buffer(user_bytes, 0);
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+    }
+}
+
+impl SessionRequestHandler for AccU1 {
+    fn handle_sync_request(&self, ctx: &mut HLERequestContext) -> ResultCode {
+        ServiceFramework::handle_sync_request_impl(self, ctx)
+    }
+
+    fn service_name(&self) -> &str {
+        "acc:u1"
+    }
+}
+
+impl ServiceFramework for AccU1 {
+    fn get_service_name(&self) -> &str {
+        "acc:u1"
+    }
+
+    fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers
+    }
+
+    fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers_tipc
+    }
+}
+
+macro_rules! account_stub_service {
+    ($type_name:ident, $service_name:literal, [$(($id:expr, $name:literal)),* $(,)?]) => {
+        pub struct $type_name {
+            _interface: Interface,
+            handlers: BTreeMap<u32, FunctionInfo>,
+            handlers_tipc: BTreeMap<u32, FunctionInfo>,
+        }
+
+        impl $type_name {
+            pub fn new(
+                module: Arc<Module>,
+                profile_manager: Arc<Mutex<ProfileManager>>,
+                system: crate::core::SystemRef,
+            ) -> Self {
+                Self {
+                    _interface: Interface::new(module, profile_manager, system, $service_name),
+                    handlers: build_handler_map(&[$(($id, None, $name)),*]),
+                    handlers_tipc: BTreeMap::new(),
+                }
+            }
+        }
+
+        impl SessionRequestHandler for $type_name {
+            fn handle_sync_request(&self, ctx: &mut HLERequestContext) -> ResultCode {
+                ServiceFramework::handle_sync_request_impl(self, ctx)
+            }
+            fn service_name(&self) -> &str {
+                $service_name
+            }
+        }
+
+        impl ServiceFramework for $type_name {
+            fn get_service_name(&self) -> &str {
+                $service_name
+            }
+            fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> {
+                &self.handlers
+            }
+            fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
+                &self.handlers_tipc
+            }
+        }
+    };
+}
+
+account_stub_service!(
+    AccE,
+    "acc:e",
+    [
+        (0, "GetUserCount"),
+        (1, "GetUserExistence"),
+        (2, "ListAllUsers"),
+        (3, "ListOpenUsers"),
+        (4, "GetLastOpenedUser"),
+        (5, "GetProfile"),
+        (6, "GetProfileDigest"),
+        (50, "IsUserRegistrationRequestPermitted"),
+        (51, "TrySelectUserWithoutInteractionDeprecated"),
+        (52, "TrySelectUserWithoutInteraction"),
+        (99, "DebugActivateOpenContextRetention"),
+        (100, "GetUserRegistrationNotifier"),
+        (101, "GetUserStateChangeNotifier"),
+        (102, "GetBaasAccountManagerForSystemService"),
+        (103, "GetBaasUserAvailabilityChangeNotifier"),
+        (104, "GetProfileUpdateNotifier"),
+        (105, "CheckNetworkServiceAvailabilityAsync"),
+        (106, "GetProfileSyncNotifier"),
+        (110, "StoreSaveDataThumbnail"),
+        (111, "ClearSaveDataThumbnail"),
+        (112, "LoadSaveDataThumbnail"),
+        (113, "GetSaveDataThumbnailExistence"),
+        (120, "ListOpenUsersInApplication"),
+        (130, "ActivateOpenContextRetention"),
+        (140, "ListQualifiedUsers"),
+        (
+            151,
+            "EnsureSignedDeviceIdentifierCacheForNintendoAccountAsync"
+        ),
+        (152, "LoadSignedDeviceIdentifierCacheForNintendoAccount"),
+        (170, "GetNasOp2MembershipStateChangeNotifier"),
+        (191, "UpdateNotificationReceiverInfo"),
+        (200, "BeginUserRegistration"),
+        (201, "CompleteUserRegistration"),
+        (202, "CancelUserRegistration"),
+        (203, "DeleteUser"),
+        (204, "SetUserPosition"),
+        (205, "GetProfileEditor"),
+        (206, "CompleteUserRegistrationForcibly"),
+        (210, "CreateFloatingRegistrationRequest"),
+        (211, "CreateProcedureToRegisterUserWithNintendoAccount"),
+        (212, "ResumeProcedureToRegisterUserWithNintendoAccount"),
+        (213, "CreateProcedureToCreateUserWithNintendoAccount"),
+        (214, "ResumeProcedureToCreateUserWithNintendoAccount"),
+        (
+            215,
+            "ResumeProcedureToCreateUserWithNintendoAccountAfterApplyResponse"
+        ),
+        (230, "AuthenticateServiceAsync"),
+        (250, "GetBaasAccountAdministrator"),
+        (251, "SynchronizeNetworkServiceAccountsSnapshotAsync"),
+        (290, "ProxyProcedureForGuestLoginWithNintendoAccount"),
+        (
+            291,
+            "ProxyProcedureForFloatingRegistrationWithNintendoAccount"
+        ),
+        (
+            292,
+            "ProxyProcedureForDeviceMigrationAuthenticatingOperatingUser"
+        ),
+        (293, "ProxyProcedureForDeviceMigrationDownload"),
+        (299, "SuspendBackgroundDaemon"),
+        (350, "CreateDeviceMigrationUserExportRequest"),
+        (351, "UploadNasCredential"),
+        (352, "CreateDeviceMigrationUserImportRequest"),
+        (353, "DeleteUserMigrationSaveData"),
+        (400, "SetPinCode"),
+        (401, "GetPinCodeLength"),
+        (402, "GetPinCode"),
+        (403, "GetPinCodeParity"),
+        (404, "VerifyPinCode"),
+        (405, "IsPinCodeVerificationForbidden"),
+        (410, "GetPinCodeErrorCount"),
+        (411, "ResetPinCodeErrorCount"),
+        (412, "IncrementPinCodeErrorCount"),
+        (413, "SetPinCodeErrorCount"),
+        (420, "SetStartPenaltyTime"),
+        (421, "GetStartPenaltyTime"),
+        (900, "SetUserUnqualifiedForDebug"),
+        (901, "UnsetUserUnqualifiedForDebug"),
+        (902, "ListUsersUnqualifiedForDebug"),
+        (910, "RefreshFirmwareSettingsForDebug"),
+        (997, "DebugInvalidateTokenCacheForUser"),
+        (998, "DebugSetUserStateClose"),
+        (999, "DebugSetUserStateOpen"),
+        (1000, "CreateIAccountEntityServiceForApplication"),
+        (1100, "CreateIUserStateManager"),
+        (10050, "IsUserRegistrationRequestPermittedForAccountPolicy"),
+        (
+            10105,
+            "CheckNetworkServiceAvailabilityAsyncForAccountPolicy"
+        ),
+    ]
+);
+
+account_stub_service!(
+    AccEU1,
+    "acc:e:u1",
+    [
+        (0, "GetUserCount"),
+        (1, "GetUserExistence"),
+        (2, "ListAllUsers"),
+        (3, "ListOpenUsers"),
+        (4, "GetLastOpenedUser"),
+        (5, "GetProfile"),
+        (6, "GetProfileDigest"),
+        (50, "IsUserRegistrationRequestPermitted"),
+        (51, "TrySelectUserWithoutInteractionDeprecated"),
+        (99, "DebugActivateOpenContextRetention"),
+        (100, "GetUserRegistrationNotifier"),
+        (101, "GetUserStateChangeNotifier"),
+        (102, "GetBaasAccountManagerForSystemService"),
+        (103, "GetBaasUserAvailabilityChangeNotifier"),
+        (104, "GetProfileUpdateNotifier"),
+        (105, "CheckNetworkServiceAvailabilityAsync"),
+        (106, "GetProfileSyncNotifier"),
+        (110, "StoreSaveDataThumbnail"),
+        (111, "ClearSaveDataThumbnail"),
+        (112, "LoadSaveDataThumbnail"),
+        (113, "GetSaveDataThumbnailExistence"),
+        (120, "ListOpenUsersInApplication"),
+        (130, "ActivateOpenContextRetention"),
+        (140, "ListQualifiedUsers"),
+        (
+            151,
+            "EnsureSignedDeviceIdentifierCacheForNintendoAccountAsync"
+        ),
+        (152, "LoadSignedDeviceIdentifierCacheForNintendoAccount"),
+        (170, "GetNasOp2MembershipStateChangeNotifier"),
+        (191, "UpdateNotificationReceiverInfo"),
+        (997, "DebugInvalidateTokenCacheForUser"),
+        (998, "DebugSetUserStateClose"),
+        (999, "DebugSetUserStateOpen"),
+    ]
+);
+
+account_stub_service!(
+    AccEU2,
+    "acc:e:u2",
+    [
+        (0, "GetUserCount"),
+        (1, "GetUserExistence"),
+        (2, "ListAllUsers"),
+        (3, "ListOpenUsers"),
+        (4, "GetLastOpenedUser"),
+        (5, "GetProfile"),
+        (6, "GetProfileDigest"),
+        (50, "#IsUserRegistrationRequestPermitted"),
+        (51, "TrySelectUserWithoutInteractionDeprecated"),
+        (52, "TrySelectUserWithoutInteraction"),
+        (99, "DebugActivateOpenContextRetention"),
+        (100, "GetUserRegistrationNotifier"),
+        (101, "GetUserStateChangeNotifier"),
+        (102, "GetBaasAccountManagerForSystemService"),
+        (103, "GetBaasUserAvailabilityChangeNotifier"),
+        (104, "GetProfileUpdateNotifier"),
+        (105, "CheckNetworkServiceAvailabilityAsync"),
+        (106, "GetProfileSyncNotifier"),
+        (110, "StoreSaveDataThumbnail"),
+        (111, "ClearSaveDataThumbnail"),
+        (112, "LoadSaveDataThumbnail"),
+        (113, "GetSaveDataThumbnailExistence"),
+        (120, "ListOpenUsersInApplication"),
+        (130, "ActivateOpenContextRetention"),
+        (140, "ListQualifiedUsers"),
+        (
+            151,
+            "EnsureSignedDeviceIdentifierCacheForNintendoAccountAsync"
+        ),
+        (152, "LoadSignedDeviceIdentifierCacheForNintendoAccount"),
+        (170, "GetNasOp2MembershipStateChangeNotifier"),
+        (191, "UpdateNotificationReceiverInfo"),
+        (205, "GetProfileEditor"),
+        (401, "GetPinCodeLength"),
+        (402, "GetPinCode"),
+        (403, "GetPinCodeParity"),
+        (404, "VerifyPinCode"),
+        (405, "IsPinCodeVerificationForbidden"),
+        (997, "DebugInvalidateTokenCacheForUser"),
+        (998, "DebugSetUserStateClose"),
+        (999, "DebugSetUserStateOpen"),
+    ]
+);
+
+pub struct Dauth0 {
+    handlers: BTreeMap<u32, FunctionInfo>,
+    handlers_tipc: BTreeMap<u32, FunctionInfo>,
+}
+
+impl Dauth0 {
+    pub fn new() -> Self {
+        Self {
+            handlers: build_handler_map(&[
+                (0, None, "EnsureAuthenticationTokenCacheAsync"),
+                (1, None, "LoadAuthenticationTokenCache"),
+                (2, None, "InvalidateAuthenticationTokenCache"),
+                (3, None, "IsDeviceAuthenticationTokenCacheAvailable"),
+                (10, None, "EnsureEdgeTokenCacheAsync"),
+                (11, None, "LoadEdgeTokenCache"),
+                (12, None, "InvalidateEdgeTokenCache"),
+                (13, None, "IsEdgeTokenCacheAvailable"),
+                (20, None, "EnsureApplicationAuthenticationCacheAsync"),
+                (21, None, "LoadApplicationAuthenticationTokenCache"),
+                (22, None, "LoadApplicationNetworkServiceClientConfigCache"),
+                (23, None, "IsApplicationAuthenticationCacheAvailable"),
+                (24, None, "InvalidateApplicationAuthenticationCache"),
+                (30, None, "EnsureGameCardAuthenticationCacheAsync"),
+                (31, None, "LoadGameCardAuthenticationTokenCache"),
+                (32, None, "IsGameCardAuthenticationCacheAvailable"),
+                (33, None, "InvalidateGameCardAuthenticationCache"),
+                (1000, None, "GetInactiveElicenseUsedEvent"),
+                (9000, None, "ImportVirtualClientCertificate"),
+                (9010, None, "DeleteVirtualClientCertificate"),
+            ]),
+            handlers_tipc: BTreeMap::new(),
+        }
+    }
+}
+
+impl SessionRequestHandler for Dauth0 {
+    fn handle_sync_request(&self, ctx: &mut HLERequestContext) -> ResultCode {
+        ServiceFramework::handle_sync_request_impl(self, ctx)
+    }
+    fn service_name(&self) -> &str {
+        "dauth:0"
+    }
+}
+
+impl ServiceFramework for Dauth0 {
+    fn get_service_name(&self) -> &str {
+        "dauth:0"
+    }
+    fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers
+    }
+    fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers_tipc
+    }
+}
+
 /// Registers account services with the server manager.
 ///
 /// Corresponds to `LoopProcess` in upstream `acc.cpp`.
-/// Services registered: acc:u0, acc:u1, acc:su, acc:aa
+/// Services registered: acc:aa, acc:su, acc:u0, acc:u1, acc:e, acc:e:u1,
+/// acc:e:u2, dauth:0.
 pub fn loop_process(system: crate::core::SystemRef) {
     use crate::hle::service::hle_ipc::SessionRequestHandlerPtr;
     use crate::hle::service::server_manager::ServerManager;
@@ -953,7 +2199,7 @@ pub fn loop_process(system: crate::core::SystemRef) {
             server_manager.register_named_service(
                 "acc:aa",
                 Box::new(move || -> SessionRequestHandlerPtr {
-                    Arc::new(super::acc_aa::AccAA::new(m.clone(), pm.clone(), system))
+                    Arc::new(AccAA::new(m.clone(), pm.clone(), system))
                 }),
                 64,
             );
@@ -969,7 +2215,7 @@ pub fn loop_process(system: crate::core::SystemRef) {
             server_manager.register_named_service(
                 "acc:su",
                 Box::new(move || -> SessionRequestHandlerPtr {
-                    Arc::new(super::acc_su::AccSU::new(m.clone(), pm.clone(), system))
+                    Arc::new(AccSU::new(m.clone(), pm.clone(), system))
                 }),
                 64,
             );
@@ -985,7 +2231,7 @@ pub fn loop_process(system: crate::core::SystemRef) {
             server_manager.register_named_service(
                 "acc:u0",
                 Box::new(move || -> SessionRequestHandlerPtr {
-                    Arc::new(super::acc_u0::AccU0::new(m.clone(), pm.clone(), system))
+                    Arc::new(AccU0::new(m.clone(), pm.clone(), system))
                 }),
                 64,
             );
@@ -1001,11 +2247,54 @@ pub fn loop_process(system: crate::core::SystemRef) {
             server_manager.register_named_service(
                 "acc:u1",
                 Box::new(move || -> SessionRequestHandlerPtr {
-                    Arc::new(super::acc_u1::AccU1::new(m.clone(), pm.clone(), system))
+                    Arc::new(AccU1::new(m.clone(), pm.clone(), system))
                 }),
                 64,
             );
         }
+
+        for (name, factory) in [
+            ("acc:e", {
+                let module = Arc::clone(&module);
+                let profile_manager = Arc::clone(&profile_manager);
+                Box::new(move || -> SessionRequestHandlerPtr {
+                    Arc::new(AccE::new(
+                        Arc::clone(&module),
+                        Arc::clone(&profile_manager),
+                        system,
+                    ))
+                }) as Box<dyn Fn() -> SessionRequestHandlerPtr + Send + Sync>
+            }),
+            ("acc:e:u1", {
+                let module = Arc::clone(&module);
+                let profile_manager = Arc::clone(&profile_manager);
+                Box::new(move || -> SessionRequestHandlerPtr {
+                    Arc::new(AccEU1::new(
+                        Arc::clone(&module),
+                        Arc::clone(&profile_manager),
+                        system,
+                    ))
+                })
+            }),
+            ("acc:e:u2", {
+                let module = Arc::clone(&module);
+                let profile_manager = Arc::clone(&profile_manager);
+                Box::new(move || -> SessionRequestHandlerPtr {
+                    Arc::new(AccEU2::new(
+                        Arc::clone(&module),
+                        Arc::clone(&profile_manager),
+                        system,
+                    ))
+                })
+            }),
+        ] {
+            server_manager.register_named_service(name, factory, 64);
+        }
+        server_manager.register_named_service(
+            "dauth:0",
+            Box::new(|| -> SessionRequestHandlerPtr { Arc::new(Dauth0::new()) }),
+            64,
+        );
     }
     if trace_boot {
         log::info!("ACC::loop_process: registered acc:u1");

@@ -184,6 +184,134 @@ impl ServiceFramework for BpcR {
     }
 }
 
+pub struct BpcC {
+    handlers: BTreeMap<u32, FunctionInfo>,
+    handlers_tipc: BTreeMap<u32, FunctionInfo>,
+}
+
+impl BpcC {
+    pub fn new() -> Self {
+        Self {
+            handlers: build_handler_map(&[
+                (0, None, "ShutdownSystem"),
+                (1, None, "RebootSystem"),
+                (2, None, "GetWakeupReason"),
+                (3, None, "GetShutdownReason"),
+                (4, None, "GetAcOk"),
+                (5, None, "GetPowerEvent"),
+            ]),
+            handlers_tipc: BTreeMap::new(),
+        }
+    }
+}
+
+impl SessionRequestHandler for BpcC {
+    fn handle_sync_request(&self, ctx: &mut HLERequestContext) -> ResultCode {
+        ServiceFramework::handle_sync_request_impl(self, ctx)
+    }
+
+    fn service_name(&self) -> &str {
+        "bpc:c"
+    }
+}
+
+impl ServiceFramework for BpcC {
+    fn get_service_name(&self) -> &str {
+        "bpc:c"
+    }
+
+    fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers
+    }
+
+    fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers_tipc
+    }
+}
+
+pub struct BpcB {
+    handlers: BTreeMap<u32, FunctionInfo>,
+    handlers_tipc: BTreeMap<u32, FunctionInfo>,
+}
+
+impl BpcB {
+    pub fn new() -> Self {
+        Self {
+            handlers: build_handler_map(&[
+                (0, None, "GetSleepButtonState"),
+                (1, None, "GetPowerButtonEvent"),
+            ]),
+            handlers_tipc: BTreeMap::new(),
+        }
+    }
+}
+
+impl SessionRequestHandler for BpcB {
+    fn handle_sync_request(&self, ctx: &mut HLERequestContext) -> ResultCode {
+        ServiceFramework::handle_sync_request_impl(self, ctx)
+    }
+
+    fn service_name(&self) -> &str {
+        "bpc:b"
+    }
+}
+
+impl ServiceFramework for BpcB {
+    fn get_service_name(&self) -> &str {
+        "bpc:b"
+    }
+
+    fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers
+    }
+
+    fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers_tipc
+    }
+}
+
+pub struct BpcW {
+    handlers: BTreeMap<u32, FunctionInfo>,
+    handlers_tipc: BTreeMap<u32, FunctionInfo>,
+}
+
+impl BpcW {
+    pub fn new() -> Self {
+        Self {
+            handlers: build_handler_map(&[
+                (0, None, "CreateWakeupTimer"),
+                (1, None, "CancelWakeupTimer"),
+                (2, None, "EnableWakeupTimerOnDevice"),
+            ]),
+            handlers_tipc: BTreeMap::new(),
+        }
+    }
+}
+
+impl SessionRequestHandler for BpcW {
+    fn handle_sync_request(&self, ctx: &mut HLERequestContext) -> ResultCode {
+        ServiceFramework::handle_sync_request_impl(self, ctx)
+    }
+
+    fn service_name(&self) -> &str {
+        "bpc:w"
+    }
+}
+
+impl ServiceFramework for BpcW {
+    fn get_service_name(&self) -> &str {
+        "bpc:w"
+    }
+
+    fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers
+    }
+
+    fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers_tipc
+    }
+}
+
 /// Registers "bpc" and "bpc:r" services.
 ///
 /// Corresponds to `LoopProcess` in upstream `bpc.cpp`:
@@ -205,6 +333,33 @@ pub fn loop_process(system: crate::core::SystemRef) {
             Box::new(|| -> SessionRequestHandlerPtr { std::sync::Arc::new(BpcR::new()) }),
             64,
         );
+        server_manager.register_named_service(
+            "bpc:c",
+            Box::new(|| -> SessionRequestHandlerPtr { std::sync::Arc::new(BpcC::new()) }),
+            64,
+        );
+        server_manager.register_named_service(
+            "bpc:b",
+            Box::new(|| -> SessionRequestHandlerPtr { std::sync::Arc::new(BpcB::new()) }),
+            64,
+        );
+        server_manager.register_named_service(
+            "bpc:w",
+            Box::new(|| -> SessionRequestHandlerPtr { std::sync::Arc::new(BpcW::new()) }),
+            64,
+        );
     }
     crate::hle::service::server_manager::ServerManager::run_server_shared(server_manager);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn homebrew_service_tables_match_upstream() {
+        assert_eq!(BpcC::new().handlers().len(), 6);
+        assert_eq!(BpcB::new().handlers().len(), 2);
+        assert_eq!(BpcW::new().handlers().len(), 3);
+    }
 }

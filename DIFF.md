@@ -1819,3 +1819,209 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 ### Binary layout verification
 
 - N/A: the change affects host logging only.
+## 2026-08-21 — `src/core/src/hle/service/acc/acc.rs` vs Eden `src/core/hle/service/acc/acc.cpp`
+
+### Intentional differences
+
+- Eden commit `a41a98028a` moved `acc:aa`, `acc:su`, `acc:u0`, and `acc:u1` into `acc.cpp` and
+  deleted their dedicated source/header pairs. Ruzu now mirrors that ownership: the corresponding
+  Rust implementations live in `acc.rs`, while `acc_aa.rs`, `acc_su.rs`, `acc_u0.rs`, and
+  `acc_u1.rs` and their declarations in `acc/mod.rs` are removed.
+- Rust uses a local macro only for the repeated, data-only service-framework plumbing. Each
+  service name and command table remains declared in `acc.rs` beside its Eden counterpart.
+- `Arc<Mutex<_>>`, `ResultCode`, and Rust enums replace C++ shared pointers, exceptions/results,
+  and enum classes without changing service ownership or command behavior.
+
+### Unintentional differences (to fix)
+
+- None in the reviewed `a41a98028a` ACC consolidation and new `acc:e`, `acc:e:u1`, `acc:e:u2`, and
+  `dauth:0` service-table slice.
+
+### Missing items
+
+- None introduced by this port. Pre-existing unimplemented ACC commands remain registered as
+  stubs exactly where the Rust service framework represents Eden's null handlers.
+
+### Binary layout verification
+
+- PASS: user IDs, pin-code lengths, IPC scalar widths, and existing raw profile payload types are
+  unchanged; this slice adds no new raw-copied structure.
+
+## 2026-08-21 — `src/core/src/hle/service/{apm,audio,bpc,caps,es,friend,glue,grc,hid,lm,mnpp,ncm,ngc,nim,ns,nvdrv,olsc,pcie,pcv,psc,ptm,ro,tma,usb,wlan}` vs Eden commit `a41a98028a` service files
+
+### Intentional differences
+
+- `apm/apm_controller.rs`, `apm/apm_interface.rs`, and
+  `am/service/common_state_getter.rs` retain Eden's APM ownership and update ordering. Transparent
+  raw wrappers preserve unknown `PerformanceMode`, `PerformanceConfiguration`, and `CpuBoostMode`
+  bit patterns instead of rejecting or normalizing values during Rust conversion.
+- `audio/audio.rs` and `audio/audio_renderer_manager.rs` mirror Eden's applet/debug service tables
+  and invalid-process-handle behavior. The unusual upstream registration of `audren:d` through
+  `IAudioInManager` is preserved literally.
+- `bpc/bpc.rs`, `caps/caps.rs`, `caps/caps_manager.rs`, `es/es.rs`, `friend/friend.rs`,
+  `friend/friend_interface.rs`, `glue/ectx.rs`, `glue/glue.rs`, `grc/grc.rs`, `hid/hid.rs`,
+  `hid/hid_system_server.rs`, `lm/lm.rs`, `ncm/ncm.rs`, `ngc/ngc.rs`, `nim/nim.rs`, `ns/ns.rs`,
+  `ns/query_service.rs`, `nvdrv/mod.rs`, `nvdrv/nvdrv.rs`, `olsc/olsc.rs`, `pcie/pcie.rs`,
+  `pcv/pcv.rs`, `psc/psc.rs`, `psc/time/service_manager.rs`, `ptm/ptm.rs`, `ro/ro.rs`, and
+  `usb/usb.rs` keep the new service names, command IDs, command labels, and registration order from
+  their same-named Eden `.cpp` owners.
+- Eden's `mnpp_app` rename/split is mirrored by deleting `mnpp/mnpp_app.rs`, adding
+  `mnpp/mnpp.rs`, and updating `mnpp/mod.rs`. The new Eden-owned modules are mirrored by
+  `tma/mod.rs`, `tma/tma.rs`, `wlan/mod.rs`, and `wlan/wlan.rs`; `hle/service/mod.rs` only declares
+  those modules.
+- Firmware-gated service registration reads the installed firmware through Ruzu's existing
+  `set::system_settings_server::get_firmware_version_impl` owner. Eden obtains the same major
+  version through `FrontendCommon::FirmwareManager`, which is unavailable in the excluded Qt
+  frontend and would violate crate ownership if copied into these service modules.
+- `services.rs` preserves Eden's service-thread ownership while adapting `unique_ptr` and thread
+  launch to Rust's existing server-manager lifecycle.
+
+### Unintentional differences (to fix)
+
+- None in the reviewed command-table and registration slice. Eden's changes to `mii.cpp` and
+  `glue/notif.cpp` are formatting-only, and its `spl.cpp` change only relocates explicit default
+  destructor definitions; Rust requires no corresponding behavioral change.
+
+### Missing items
+
+- None introduced by this port. Commands represented by null handlers upstream remain named Rust
+  stubs and deliberately return the service framework's unimplemented result.
+
+### Binary layout verification
+
+- PASS: the port adds service dispatch tables and scalar IPC replies only. Existing `repr(C)`
+  payload declarations are unchanged, and empty CAPS/PSC responses return Eden's error before any
+  payload serialization.
+
+## 2026-08-21 — `src/core/src/hle/service/hle_ipc.rs` and `src/core/src/hle/service/sockets/{bsd,sfdnsres,sockets}.rs` vs Eden `src/core/hle/service/hle_ipc.h` and `src/core/hle/service/sockets/*.{h,cpp}`
+
+### Intentional differences
+
+- `hle_ipc.rs` represents Eden's missing copy/move handle as numeric handle `0`; checked slice
+  access replaces C++ pointer/index access and prevents the same out-of-range crash.
+- `sockets/bsd.rs` retains Eden's `Bsd` ownership for `is_user`, `SocketExempt`, and BSD command
+  dispatch. Rust wrapper service types for `bsd:nu` and the additional socket services delegate to
+  the same owner rather than duplicating BSD state.
+- `sockets/sfdnsres.rs` and `sockets/sockets.rs` preserve Eden's service names, command IDs, and
+  user/system split. Rust `Arc<Mutex<_>>` replaces C++ shared ownership for the shared network
+  interface.
+
+### Unintentional differences (to fix)
+
+- None in the reviewed `a41a98028a` handle-safety and socket-service slice.
+
+### Missing items
+
+- None introduced by this port; null upstream socket handlers remain explicit stubs.
+
+### Binary layout verification
+
+- PASS: BSD request/reply integer widths and handle values are unchanged; no socket ABI structure
+  was added or reordered.
+
+## 2026-08-21 — `src/hid_core/src/resources/npad/{npad,npad_resource}.rs` vs Eden `src/hid_core/resources/npad/{npad,npad_resource}.cpp`
+
+### Intentional differences
+
+- `NPadResource::get_index_from_aruid` returns `Option<usize>` instead of Eden's sentinel
+  `AruidIndexMax`. Invalid unregister requests now return before clearing state, preserving Eden's
+  new guard exactly.
+- `NPad::activate` returns success after logging an invalid ARUID because the following upstream
+  null-data check also returns before the fallback index is consumed. `NPad::unregister` uses
+  index zero only for the temporary controller cleanup, then calls the guarded resource owner,
+  matching Eden's fallback and lifecycle ordering.
+
+### Unintentional differences (to fix)
+
+- None in the reviewed NPad ARUID guard slice.
+
+### Missing items
+
+- Eden also adds a null `shared_memory_format` guard to
+  `abstracted_pad/abstract_battery_handler.cpp`. Ruzu's pre-existing abstract battery handler does
+  not yet own or dereference an applet resource at all, so that crash path is already absent and
+  this commit requires no executable Rust change there. Full abstract-battery integration remains
+  pre-existing parity work, not a shortcut added by this port.
+
+### Binary layout verification
+
+- PASS: controller state and shared-memory payload declarations are unchanged. The added regression
+  test verifies that unregistering an unknown ARUID cannot clear the first registered resource.
+
+## 2026-08-21 — corrective audit of Eden `a41a98028a` homebrew-service prerequisites
+
+### Intentional differences
+
+- `src/core/src/file_sys/registered_cache.rs` stores Eden's
+  `ContentProviderParsingFunction` and `VfsCopyFunction` as Rust `Fn` trait objects. The install
+  callback accepts non-`'static` captures, preserving the flexibility of upstream `std::function`.
+- The pre-existing Rust cache indexes remain `BTreeMap`s instead of Eden's
+  `ankerl::unordered_dense::map`s. This makes enumeration deterministic but does not alter lookup,
+  filtering or ownership; changing the container is outside this corrective method slice.
+- `RegisteredCache::install_entry_xci` returns `ErrorMetaFailed` if an XCI has no secure-partition
+  NSP. Eden dereferences the returned pointer without a null check; the valid-XCI path and install
+  ordering are otherwise identical.
+- `src/core/src/hle/service/filesystem/filesystem.rs` keeps the existing frontend-owned
+  `FrontendManual` provider for configured game directories. Therefore Eden's concrete
+  `FileSystemController::GetExternalContentProvider` accessor has no Rust counterpart; Ruzu's
+  excluded GUI frontend populates the content-provider union directly.
+- `FileSystemController` stores Ruzu's concrete `Arc<RealVfsFilesystem>` rather than Eden's
+  abstract VFS reference. BIS partition-storage behavior and result ordering remain the same.
+- `src/core/src/core.rs::get_game_file_from_path` uses Rust host-path detection for extracted
+  directories and the existing Rust VFS concatenation owner. It otherwise preserves Eden's
+  `00` through `0F` scan order, early stop, directory name and `/main` fallback.
+- If game-file opening fails, Rust logs the failure and does not call `set_game_card`; Eden passes
+  the null VFS handle into `SetGameCard`. Valid current-game and configured-image paths preserve
+  Eden's branch ordering, including applying the empty-path check only to the configured path.
+
+### Unintentional differences (to fix)
+
+- None in the re-reviewed NCM command/handler slice, registered-cache install/iteration/rights-ID
+  slice, SDMC parsing path, filesystem-controller wrappers, or game-file opening path.
+- This entry supersedes the broader “none” claim in the earlier `a41a98028a` service entry:
+  subsequent line-by-line review found and fixed missing NCM prerequisites, NAX parsing,
+  metadata filtering, registered installation and game-card setup.
+
+### Missing items
+
+- None among the 31 reviewed `PlaceholderCache`/`RegisteredCache` methods: `GetRightsID`, all four
+  `InstallEntry` overloads and `IterateAllMetadata` are now present.
+- None among the eight reviewed NCM interfaces: the same 12 commands have concrete handlers in
+  Eden and Ruzu, and all remaining commands are registered stubs on both sides.
+- `FileSystemController::GetExternalContentProvider` remains intentionally absent for the
+  frontend-provider ownership reason above. The other methods called out by the review — BIS
+  partition access, the standalone save-data controller, image-directory access and placeholder
+  wrappers — are now present in their upstream-owned controller file.
+
+### Binary layout verification
+
+- PASS: `ContentMetaKey` remains `repr(C)` and 0x10 bytes; padding is ignored when matching keys,
+  as upstream does.
+- PASS: `CNMTHeader`, `OptionalHeader` and `ContentRecord` remain deterministically initialized
+  `repr(C)` payloads of 0x20, 0x10 and 0x38 bytes respectively. The new install path serializes the
+  same fields and hashes the same first 1 MiB as Eden.
+- N/A: filesystem controller accessors and `GetGameFileFromPath` add no guest-visible raw payload.
+
+## 2026-08-21 — explicit service declarations vs Eden `a41a98028a` service owners
+
+### Intentional differences
+
+- Rust service-framework trait boilerplate remains implemented with the existing mechanical
+  `impl_service_framework!` helper. It does not declare commands, own behavior or combine upstream
+  files.
+
+### Unintentional differences (to fix)
+
+- None in the reviewed stub-service ownership slice. The port-local `define_stub_service!` macro
+  has been removed from `audio`, `nvdrv`, `usb`, `psc`, `sockets`, `ptm`, `glue/ectx`, `wlan` and
+  `bpc`; each upstream service type and command table is now explicit in its corresponding Rust
+  owner.
+
+### Missing items
+
+- None introduced by expanding these declarations. Null Eden handlers remain explicit Rust
+  unimplemented handlers with the same command IDs and labels.
+
+### Binary layout verification
+
+- N/A: this ownership correction changes declarations only and adds no raw-copied structure.

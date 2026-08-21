@@ -86,6 +86,90 @@ impl ServiceFramework for EctxAW {
     }
 }
 
+pub struct EctxW {
+    handlers: BTreeMap<u32, FunctionInfo>,
+    handlers_tipc: BTreeMap<u32, FunctionInfo>,
+}
+
+impl EctxW {
+    pub fn new() -> Self {
+        Self {
+            handlers: build_handler_map(&[
+                (0, None, "CreateContextRegistrar"),
+                (1, None, "CommitContext"),
+                (2, None, "RemoveContext"),
+            ]),
+            handlers_tipc: BTreeMap::new(),
+        }
+    }
+}
+
+impl SessionRequestHandler for EctxW {
+    fn handle_sync_request(&self, ctx: &mut HLERequestContext) -> ResultCode {
+        ServiceFramework::handle_sync_request_impl(self, ctx)
+    }
+
+    fn service_name(&self) -> &str {
+        "ectx:w"
+    }
+}
+
+impl ServiceFramework for EctxW {
+    fn get_service_name(&self) -> &str {
+        "ectx:w"
+    }
+
+    fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers
+    }
+
+    fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers_tipc
+    }
+}
+
+pub struct EctxR {
+    handlers: BTreeMap<u32, FunctionInfo>,
+    handlers_tipc: BTreeMap<u32, FunctionInfo>,
+}
+
+impl EctxR {
+    pub fn new() -> Self {
+        Self {
+            handlers: build_handler_map(&[
+                (0, None, "GetContextInfo"),
+                (1, None, "PullContext"),
+                (2, None, "ListContextDescriptorWithResultForDebug"),
+            ]),
+            handlers_tipc: BTreeMap::new(),
+        }
+    }
+}
+
+impl SessionRequestHandler for EctxR {
+    fn handle_sync_request(&self, ctx: &mut HLERequestContext) -> ResultCode {
+        ServiceFramework::handle_sync_request_impl(self, ctx)
+    }
+
+    fn service_name(&self) -> &str {
+        "ectx:r"
+    }
+}
+
+impl ServiceFramework for EctxR {
+    fn get_service_name(&self) -> &str {
+        "ectx:r"
+    }
+
+    fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers
+    }
+
+    fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers_tipc
+    }
+}
+
 /// IContextRegistrar: nn::err::context::IContextRegistrar.
 ///
 /// Defined in upstream `ectx.cpp`.
@@ -170,6 +254,12 @@ mod tests {
         assert!(service.handlers[&ectx_aw_commands::COMMIT_CONTEXT]
             .handler_callback
             .is_none());
+    }
+
+    #[test]
+    fn writer_and_reader_tables_match_upstream() {
+        assert_eq!(EctxW::new().handlers.len(), 3);
+        assert_eq!(EctxR::new().handlers.len(), 3);
     }
 
     #[test]

@@ -4,15 +4,19 @@
 // Ported from: core/file_sys/registered_cache.h / .cpp
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use super::card_image::XCI;
 use super::content_archive::{NCAContentType, NCA};
 use super::control_metadata::NACP;
-use super::nca_metadata::{ContentRecord, ContentRecordType, TitleType, CNMT};
+use super::nca_metadata::{
+    CNMTHeader, ContentRecord, ContentRecordType, OptionalHeader, TitleType, CNMT,
+    EMPTY_META_CONTENT_RECORD,
+};
 use super::partition_filesystem::ResultStatus;
 use super::romfs::extract_romfs;
 use super::submission_package::NSP;
-use super::vfs::vfs::VfsDirectory;
+use super::vfs::vfs::{VfsDirectory, VfsFile};
 use super::vfs::vfs_concat::ConcatenatedVfsFile;
 use super::vfs::vfs_types::{VirtualDir, VirtualFile};
 
@@ -134,6 +138,13 @@ fn get_cnmt_name(title_type: TitleType, title_id: u64) -> String {
 
 /// NCA ID — first 16 bytes of SHA-256 over the entire file.
 pub type NcaId = [u8; 0x10];
+
+/// Rust counterpart of upstream `ContentProviderParsingFunction`.
+type ContentProviderParsingFunction =
+    Box<dyn Fn(&VirtualFile, &NcaId) -> Option<VirtualFile> + Send + Sync>;
+
+/// Rust counterpart of upstream `VfsCopyFunction`.
+pub type VfsCopyFunction<'a> = dyn Fn(&dyn VfsFile, &dyn VfsFile, usize) -> bool + Send + Sync + 'a;
 
 /// Result of an install operation.
 /// Corresponds to upstream `InstallResult`.
@@ -362,6 +373,45 @@ impl PlaceholderCache {
         file.write(data, data.len(), offset as usize) == data.len()
     }
 
+    /// Install a completed placeholder into a registered content cache.
+    /// Corresponds to upstream `PlaceholderCache::Register`.
+    pub fn register(
+        &self,
+        cache: &mut RegisteredCache,
+        placeholder: &NcaId,
+        install: &NcaId,
+    ) -> bool {
+        let path = get_relative_path_from_nca_id(placeholder, false, true, false);
+        let Some(file) = self.dir.get_file_relative(&path) else {
+            return false;
+        };
+
+        let nca = NCA::new(file, None);
+        if cache.raw_install_nca(&nca, &super::vfs::vfs::vfs_raw_copy, false, Some(*install))
+            != InstallResult::Success
+        {
+            return false;
+        }
+
+        self.delete_placeholder(placeholder)
+    }
+
+    /// Return the non-zero rights ID of a valid placeholder NCA.
+    /// Corresponds to upstream `PlaceholderCache::GetRightsID`.
+    pub fn get_rights_id(&self, id: &NcaId) -> Option<[u8; 0x10]> {
+        let path = get_relative_path_from_nca_id(id, false, true, false);
+        let file = self.dir.get_file_relative(&path)?;
+        let nca = NCA::new(file, None);
+        if nca.get_status() != ResultStatus::Success
+            && nca.get_status() != ResultStatus::ErrorMissingBKTRBaseRomFS
+        {
+            return None;
+        }
+
+        let rights_id = nca.get_rights_id();
+        (rights_id != [0; 0x10]).then_some(rights_id)
+    }
+
     /// Get the size of a placeholder file.
     /// Corresponds to upstream `PlaceholderCache::Size`.
     pub fn size(&self, id: &NcaId) -> u64 {
@@ -449,6 +499,8 @@ impl PlaceholderCache {
 /// Corresponds to upstream `RegisteredCache`.
 pub struct RegisteredCache {
     dir: VirtualDir,
+    /// Conversion from stored bytes to the raw NCA view. SDMC uses NAX decryption.
+    parser: ContentProviderParsingFunction,
     /// maps tid -> NcaID of meta
     meta_id: BTreeMap<u64, NcaId>,
     /// maps tid -> CNMT parsed from meta NCAs
@@ -459,8 +511,17 @@ pub struct RegisteredCache {
 
 impl RegisteredCache {
     pub fn new(dir: VirtualDir) -> Self {
+        Self::new_with_parser(dir, |file, _id| Some(Arc::clone(file)))
+    }
+
+    /// Construct with the same per-storage parsing callback as upstream.
+    pub fn new_with_parser<F>(dir: VirtualDir, parser: F) -> Self
+    where
+        F: Fn(&VirtualFile, &NcaId) -> Option<VirtualFile> + Send + Sync + 'static,
+    {
         let mut cache = Self {
             dir,
+            parser: Box::new(parser),
             meta_id: BTreeMap::new(),
             meta: BTreeMap::new(),
             yuzu_meta: BTreeMap::new(),
@@ -525,7 +586,10 @@ impl RegisteredCache {
                 None => continue,
             };
 
-            let nca = NCA::new(file, None);
+            let Some(parsed_file) = (self.parser)(&file, id) else {
+                continue;
+            };
+            let nca = NCA::new(parsed_file, None);
             if nca.get_status() != super::partition_filesystem::ResultStatus::Success
                 || nca.get_type() != NCAContentType::Meta
             {
@@ -635,6 +699,32 @@ impl RegisteredCache {
         check_map_for_content_record(&self.meta, title_id, record_type)
     }
 
+    /// Apply `proc` and `filter` to the same metadata records, in the same
+    /// order, as upstream `RegisteredCache::IterateAllMetadata`.
+    fn iterate_all_metadata<T, P, F>(&self, out: &mut Vec<T>, proc: P, filter: F)
+    where
+        P: Fn(&CNMT, &ContentRecord) -> T,
+        F: Fn(&CNMT, &ContentRecord) -> bool,
+    {
+        for cnmt in self.meta.values() {
+            if filter(cnmt, &EMPTY_META_CONTENT_RECORD) {
+                out.push(proc(cnmt, &EMPTY_META_CONTENT_RECORD));
+            }
+            for record in cnmt.get_content_records() {
+                if self.get_file_at_id(&record.nca_id).is_some() && filter(cnmt, record) {
+                    out.push(proc(cnmt, record));
+                }
+            }
+        }
+        for cnmt in self.yuzu_meta.values() {
+            for record in cnmt.get_content_records() {
+                if self.get_file_at_id(&record.nca_id).is_some() && filter(cnmt, record) {
+                    out.push(proc(cnmt, record));
+                }
+            }
+        }
+    }
+
     /// Accumulate CNMTs from the yuzu_meta directory.
     /// Corresponds to upstream `RegisteredCache::AccumulateYuzuMeta`.
     fn accumulate_yuzu_meta(&mut self) {
@@ -713,6 +803,222 @@ impl RegisteredCache {
         }
 
         removed_data
+    }
+
+    /// Install all content from an XCI's secure partition.
+    /// Corresponds to upstream `RegisteredCache::InstallEntry(const XCI&)`.
+    pub fn install_entry_xci(
+        &mut self,
+        xci: &XCI,
+        overwrite_if_exists: bool,
+        copy: &VfsCopyFunction<'_>,
+    ) -> InstallResult {
+        let Some(nsp) = xci.get_secure_partition_nsp() else {
+            return InstallResult::ErrorMetaFailed;
+        };
+        self.install_entry_nsp(&nsp, overwrite_if_exists, copy)
+    }
+
+    /// Install all content described by the NSP's metadata NCA.
+    /// Corresponds to upstream `RegisteredCache::InstallEntry(const NSP&)`.
+    pub fn install_entry_nsp(
+        &mut self,
+        nsp: &NSP,
+        overwrite_if_exists: bool,
+        copy: &VfsCopyFunction<'_>,
+    ) -> InstallResult {
+        let ncas = nsp.get_ncas_collapsed();
+        let Some(meta_nca) = ncas
+            .iter()
+            .find(|nca| nca.get_type() == NCAContentType::Meta)
+        else {
+            log::error!(
+                "The file you are attempting to install does not have a metadata NCA and is therefore malformed. Check your encryption keys."
+            );
+            return InstallResult::ErrorMetaFailed;
+        };
+
+        let meta_name = meta_nca.get_name();
+        let meta_id = hex_string_to_nca_id(meta_name.get(..32).unwrap_or(""));
+        let subdirectories = meta_nca.get_subdirectories();
+        if subdirectories.is_empty() {
+            log::error!(
+                "The file you are attempting to install does not contain a section0 within the metadata NCA and is therefore malformed. Verify that the file is valid."
+            );
+            return InstallResult::ErrorMetaFailed;
+        }
+        let cnmt_files = subdirectories[0].get_files();
+        if cnmt_files.is_empty() {
+            log::error!(
+                "The file you are attempting to install does not contain a CNMT within the metadata NCA and is therefore malformed. Verify that the file is valid."
+            );
+            return InstallResult::ErrorMetaFailed;
+        }
+        let cnmt = CNMT::from_file(&cnmt_files[0]);
+        let title_id = cnmt.get_title_id();
+        if title_id == get_base_title_id(title_id) && cnmt.get_title_version() == 0 {
+            return InstallResult::ErrorBaseInstall;
+        }
+
+        let replaced_existing = self.remove_existing_entry(title_id);
+        let meta_result = self.raw_install_nca(meta_nca, copy, overwrite_if_exists, Some(meta_id));
+        if meta_result != InstallResult::Success {
+            return meta_result;
+        }
+
+        for record in cnmt.get_content_records() {
+            if record.record_type == ContentRecordType::DeltaFragment {
+                continue;
+            }
+            let filename = format!("{}.nca", nca_id_to_hex(&record.nca_id, false));
+            let Some(file) = nsp.get_file(&filename) else {
+                return InstallResult::ErrorCopyFailed;
+            };
+            let nca = NCA::new(file, None);
+            let result = if nca.get_status() == ResultStatus::ErrorMissingBKTRBaseRomFS
+                && nca.get_title_id() != title_id
+            {
+                self.install_entry_nca_with_record(
+                    &nca,
+                    cnmt.get_header(),
+                    record,
+                    overwrite_if_exists,
+                    copy,
+                )
+            } else {
+                self.raw_install_nca(&nca, copy, overwrite_if_exists, Some(record.nca_id))
+            };
+            if result != InstallResult::Success {
+                return result;
+            }
+        }
+
+        self.refresh();
+        if replaced_existing {
+            InstallResult::OverwriteExisting
+        } else {
+            InstallResult::Success
+        }
+    }
+
+    /// Install a standalone NCA and synthesize its yuzu_meta CNMT.
+    /// Corresponds to upstream `RegisteredCache::InstallEntry(const NCA&, TitleType)`.
+    pub fn install_entry_nca(
+        &mut self,
+        nca: &NCA,
+        title_type: TitleType,
+        overwrite_if_exists: bool,
+        copy: &VfsCopyFunction<'_>,
+    ) -> InstallResult {
+        let mut header = CNMTHeader::default();
+        header.title_id = nca.get_title_id();
+        header.title_type = title_type as u8;
+        header.table_offset = 0x10;
+        header.number_content_entries = 1;
+
+        use sha2::{Digest, Sha256};
+        let mut record = ContentRecord::default();
+        record.record_type = get_cr_type_from_nca_type(nca.get_type() as u8);
+        let data = nca.get_base_file().read_bytes(0x10_0000, 0);
+        record.hash.copy_from_slice(&Sha256::digest(&data));
+        record.nca_id.copy_from_slice(&record.hash[..0x10]);
+        let cnmt = CNMT::from_parts(header, OptionalHeader::default(), vec![record], Vec::new());
+        if !self.raw_install_yuzu_meta(&cnmt) {
+            return InstallResult::ErrorMetaFailed;
+        }
+        self.raw_install_nca(nca, copy, overwrite_if_exists, Some(record.nca_id))
+    }
+
+    /// Install a multiprogram patch NCA using the base CNMT record.
+    /// Corresponds to upstream `RegisteredCache::InstallEntry(const NCA&, const CNMTHeader&, ...)`.
+    pub fn install_entry_nca_with_record(
+        &mut self,
+        nca: &NCA,
+        base_header: &CNMTHeader,
+        base_record: &ContentRecord,
+        overwrite_if_exists: bool,
+        copy: &VfsCopyFunction<'_>,
+    ) -> InstallResult {
+        let mut header = CNMTHeader::default();
+        header.title_id = nca.get_title_id();
+        header.title_version = base_header.title_version;
+        header.title_type = base_header.title_type;
+        header.table_offset = 0x10;
+        header.number_content_entries = 1;
+        let cnmt = CNMT::from_parts(
+            header,
+            OptionalHeader::default(),
+            vec![*base_record],
+            Vec::new(),
+        );
+        if !self.raw_install_yuzu_meta(&cnmt) {
+            return InstallResult::ErrorMetaFailed;
+        }
+        self.raw_install_nca(nca, copy, overwrite_if_exists, Some(base_record.nca_id))
+    }
+
+    /// Delete an NCA by its content ID.
+    /// Corresponds to upstream `RegisteredCache::Delete`.
+    pub fn delete(&self, id: &NcaId) -> bool {
+        let path = get_relative_path_from_nca_id(id, false, true, false);
+        if let Some(file) = self.dir.get_file_relative(&path) {
+            return file
+                .get_containing_directory()
+                .is_some_and(|parent| parent.delete_file(&file.get_name()));
+        }
+        if let Some(directory) = self.dir.get_directory_relative(&path) {
+            return directory
+                .get_parent_directory()
+                .is_some_and(|parent| parent.delete_subdirectory_recursive(&directory.get_name()));
+        }
+        true
+    }
+
+    /// Raw-copy an NCA into the registered layout.
+    /// Corresponds to upstream `RegisteredCache::RawInstallNCA`.
+    fn raw_install_nca(
+        &mut self,
+        nca: &NCA,
+        copy: &VfsCopyFunction<'_>,
+        overwrite_if_exists: bool,
+        override_id: Option<NcaId>,
+    ) -> InstallResult {
+        let input = nca.get_base_file();
+        let id = if let Some(id) = override_id {
+            id
+        } else {
+            use sha2::{Digest, Sha256};
+            let data = input.read_bytes(0x10_0000, 0);
+            let hash = Sha256::digest(&data);
+            let mut id = [0u8; 0x10];
+            id.copy_from_slice(&hash[..0x10]);
+            id
+        };
+
+        let path = get_relative_path_from_nca_id(&id, false, true, false);
+        let existing = self.get_file_at_id(&id);
+        if existing.is_some() && !overwrite_if_exists {
+            log::warn!("Attempting to overwrite existing NCA. Skipping...");
+            return InstallResult::ErrorAlreadyExists;
+        }
+
+        if let Some(existing) = existing {
+            log::warn!("Overwriting existing NCA...");
+            if let Some(containing_directory) = existing.get_containing_directory() {
+                // Upstream deliberately ignores the deletion result and lets the
+                // subsequent CreateFileRelative/copy decide whether installation fails.
+                containing_directory.delete_file(&existing.get_name());
+            }
+        }
+
+        let Some(output) = self.dir.create_file_relative(&path) else {
+            return InstallResult::ErrorCopyFailed;
+        };
+        if copy(input.as_ref(), output.as_ref(), VFS_RC_LARGE_COPY_BLOCK) {
+            InstallResult::Success
+        } else {
+            InstallResult::ErrorCopyFailed
+        }
     }
 
     /// Install a raw CNMT into the yuzu_meta directory.
@@ -804,9 +1110,8 @@ impl ContentProvider for RegisteredCache {
 
     fn get_entry_raw(&self, title_id: u64, record_type: ContentRecordType) -> Option<VirtualFile> {
         let id = self.get_nca_id_from_metadata(title_id, record_type)?;
-        // In full implementation, this would apply the parsing function.
-        // For now, return the raw file.
-        self.get_file_at_id(&id)
+        let file = self.get_file_at_id(&id)?;
+        (self.parser)(&file, &id)
     }
 
     fn list_entries_filter(
@@ -816,49 +1121,18 @@ impl ContentProvider for RegisteredCache {
         title_id: Option<u64>,
     ) -> Vec<ContentProviderEntry> {
         let mut out = Vec::new();
-
-        // Iterate over all metadata
-        let iterate = |map: &BTreeMap<u64, CNMT>, out: &mut Vec<ContentProviderEntry>| {
-            for cnmt in map.values() {
-                if let Some(tt) = title_type {
-                    if tt != cnmt.get_type() {
-                        continue;
-                    }
-                }
-                if let Some(tid) = title_id {
-                    if tid != cnmt.get_title_id() {
-                        continue;
-                    }
-                }
-
-                // Add meta record itself
-                if record_type.is_none() || record_type == Some(ContentRecordType::Meta) {
-                    out.push(ContentProviderEntry {
-                        title_id: cnmt.get_title_id(),
-                        record_type: ContentRecordType::Meta,
-                    });
-                }
-
-                // Add content records
-                for rec in cnmt.get_content_records() {
-                    if let Some(rt) = record_type {
-                        if rt != rec.record_type {
-                            continue;
-                        }
-                    }
-                    out.push(ContentProviderEntry {
-                        title_id: cnmt.get_title_id(),
-                        record_type: rec.record_type,
-                    });
-                }
-            }
-        };
-
-        iterate(&self.meta, &mut out);
-        iterate(&self.yuzu_meta, &mut out);
-
-        out.sort();
-        out.dedup();
+        self.iterate_all_metadata(
+            &mut out,
+            |cnmt, record| ContentProviderEntry {
+                title_id: cnmt.get_title_id(),
+                record_type: record.record_type,
+            },
+            |cnmt, record| {
+                title_type.is_none_or(|expected| expected == cnmt.get_type())
+                    && record_type.is_none_or(|expected| expected == record.record_type)
+                    && title_id.is_none_or(|expected| expected == cnmt.get_title_id())
+            },
+        );
         out
     }
 }
@@ -1558,6 +1832,159 @@ impl ContentProvider for ExternalContentProvider {
 impl Default for ExternalContentProvider {
     fn default() -> Self {
         Self::new(Vec::new())
+    }
+}
+
+#[cfg(test)]
+mod registered_cache_install_tests {
+    use std::fs;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use super::*;
+    use crate::file_sys::fs_filesystem::OpenMode;
+    use crate::file_sys::vfs::vfs_real::RealVfsFilesystem;
+    use crate::file_sys::vfs::vfs_vector::VectorVfsFile;
+
+    #[test]
+    fn register_moves_placeholder_to_registered_layout_and_delete_removes_it() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let base = std::env::temp_dir().join(format!("ruzu-registered-cache-{unique}"));
+        let placeholder_path = base.join("placehld");
+        let registered_path = base.join("registered");
+        fs::create_dir_all(&placeholder_path).unwrap();
+        fs::create_dir_all(&registered_path).unwrap();
+
+        let vfs = RealVfsFilesystem::new();
+        let placeholder_dir = vfs
+            .arc_open_directory(placeholder_path.to_str().unwrap(), OpenMode::READ_WRITE)
+            .unwrap();
+        let registered_dir = vfs
+            .arc_open_directory(registered_path.to_str().unwrap(), OpenMode::READ_WRITE)
+            .unwrap();
+        let placeholder_cache = PlaceholderCache::new(placeholder_dir);
+        let mut registered_cache = RegisteredCache::new(Arc::clone(&registered_dir));
+        let placeholder_id = [0x11; 0x10];
+        let content_id = [0x22; 0x10];
+        let payload = vec![0x5a; 0x4000];
+
+        assert!(placeholder_cache.create(&placeholder_id, payload.len() as u64));
+        assert!(placeholder_cache.write(&placeholder_id, 0, &payload));
+        assert_eq!(placeholder_cache.get_rights_id(&placeholder_id), None);
+        assert!(placeholder_cache.register(&mut registered_cache, &placeholder_id, &content_id,));
+        assert!(!placeholder_cache.exists(&placeholder_id));
+        assert_eq!(
+            registered_cache
+                .get_file_at_id(&content_id)
+                .unwrap()
+                .read_all_bytes(),
+            payload
+        );
+
+        let existing_record = ContentRecord {
+            nca_id: content_id,
+            record_type: ContentRecordType::Program,
+            ..ContentRecord::default()
+        };
+        let missing_record = ContentRecord {
+            nca_id: [0x33; 0x10],
+            record_type: ContentRecordType::Data,
+            ..ContentRecord::default()
+        };
+        let mut installed_header = crate::file_sys::nca_metadata::CNMTHeader::default();
+        installed_header.title_id = 0x0500_0000_0000_1000;
+        installed_header.title_type = TitleType::Application as u8;
+        registered_cache.meta.insert(
+            installed_header.title_id,
+            CNMT::from_parts(
+                installed_header,
+                crate::file_sys::nca_metadata::OptionalHeader::default(),
+                vec![existing_record, missing_record],
+                Vec::new(),
+            ),
+        );
+        let mut yuzu_header = installed_header;
+        yuzu_header.title_id += 1;
+        registered_cache.yuzu_meta.insert(
+            yuzu_header.title_id,
+            CNMT::from_parts(
+                yuzu_header,
+                crate::file_sys::nca_metadata::OptionalHeader::default(),
+                vec![existing_record],
+                Vec::new(),
+            ),
+        );
+
+        let entries = registered_cache.list_entries_filter(None, None, None);
+        assert_eq!(entries.len(), 3);
+        assert!(entries.contains(&ContentProviderEntry {
+            title_id: installed_header.title_id,
+            record_type: ContentRecordType::Meta,
+        }));
+        assert!(entries.contains(&ContentProviderEntry {
+            title_id: installed_header.title_id,
+            record_type: ContentRecordType::Program,
+        }));
+        assert!(entries.contains(&ContentProviderEntry {
+            title_id: yuzu_header.title_id,
+            record_type: ContentRecordType::Program,
+        }));
+        assert!(!entries.contains(&ContentProviderEntry {
+            title_id: installed_header.title_id,
+            record_type: ContentRecordType::Data,
+        }));
+        assert!(!entries.contains(&ContentProviderEntry {
+            title_id: yuzu_header.title_id,
+            record_type: ContentRecordType::Meta,
+        }));
+
+        let parser_calls = Arc::new(AtomicUsize::new(0));
+        let parser_calls_for_callback = Arc::clone(&parser_calls);
+        let mut parsed_cache =
+            RegisteredCache::new_with_parser(Arc::clone(&registered_dir), move |file, _id| {
+                parser_calls_for_callback.fetch_add(1, Ordering::Relaxed);
+                Some(Arc::clone(file))
+            });
+        parser_calls.store(0, Ordering::Relaxed);
+        parsed_cache.meta.insert(
+            installed_header.title_id,
+            CNMT::from_parts(
+                installed_header,
+                OptionalHeader::default(),
+                vec![existing_record],
+                Vec::new(),
+            ),
+        );
+        assert!(parsed_cache
+            .get_entry_raw(installed_header.title_id, ContentRecordType::Program)
+            .is_some());
+        assert_eq!(parser_calls.load(Ordering::Relaxed), 1);
+
+        assert!(registered_cache.delete(&content_id));
+        assert!(registered_cache.get_file_at_id(&content_id).is_none());
+        assert!(registered_cache.delete(&content_id));
+
+        let copy_calls = AtomicUsize::new(0);
+        let input: VirtualFile = Arc::new(VectorVfsFile::new(
+            vec![0x7a; 0x2000],
+            "libnx-homebrew.nca".to_owned(),
+            None,
+        ));
+        let nca = NCA::new(input, None);
+        let copy = |source: &dyn VfsFile, destination: &dyn VfsFile, block_size: usize| {
+            copy_calls.fetch_add(1, Ordering::Relaxed);
+            super::super::vfs::vfs::vfs_raw_copy(source, destination, block_size)
+        };
+        assert_eq!(
+            registered_cache.install_entry_nca(&nca, TitleType::Application, false, &copy),
+            InstallResult::Success
+        );
+        assert_eq!(copy_calls.load(Ordering::Relaxed), 1);
+
+        fs::remove_dir_all(base).unwrap();
     }
 }
 

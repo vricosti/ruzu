@@ -1064,9 +1064,49 @@ pub fn loop_process(system: crate::core::SystemRef) {
             }),
             16,
         );
+        server_manager.register_named_service(
+            "ro:dmnt",
+            Box::new(|| -> SessionRequestHandlerPtr { Arc::new(IDebugMonitorInterface::new()) }),
+            16,
+        );
     }
 
     ServerManager::run_server_shared(server_manager);
+}
+
+pub struct IDebugMonitorInterface {
+    handlers: BTreeMap<u32, FunctionInfo>,
+    handlers_tipc: BTreeMap<u32, FunctionInfo>,
+}
+
+impl IDebugMonitorInterface {
+    pub fn new() -> Self {
+        Self {
+            handlers: build_handler_map(&[(0, None, "GetProcessModuleInfo")]),
+            handlers_tipc: BTreeMap::new(),
+        }
+    }
+}
+
+impl SessionRequestHandler for IDebugMonitorInterface {
+    fn handle_sync_request(&self, ctx: &mut HLERequestContext) -> ResultCode {
+        ServiceFramework::handle_sync_request_impl(self, ctx)
+    }
+    fn service_name(&self) -> &str {
+        "ro:dmnt"
+    }
+}
+
+impl ServiceFramework for IDebugMonitorInterface {
+    fn get_service_name(&self) -> &str {
+        "ro:dmnt"
+    }
+    fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers
+    }
+    fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers_tipc
+    }
 }
 
 #[cfg(test)]
@@ -1085,6 +1125,11 @@ mod tests {
         for command in [0, 1, 2, 3, 4, 10] {
             assert!(service.handlers[&command].handler_callback.is_some());
         }
+    }
+
+    #[test]
+    fn debug_monitor_table_matches_upstream() {
+        assert_eq!(IDebugMonitorInterface::new().handlers.len(), 1);
     }
 
     #[test]

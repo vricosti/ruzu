@@ -6,9 +6,142 @@
 //!
 //! Socket service registration and common types.
 
-use super::bsd::{Bsd, BsdCfg};
+use super::bsd::{Bsd, BsdCfg, BsdNu};
 use super::nsd::Nsd;
-use super::sfdnsres::Sfdnsres;
+use super::sfdnsres::{DnsPriv, Sfdnsres};
+use std::collections::BTreeMap;
+
+use crate::hle::result::ResultCode;
+use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
+use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
+
+pub struct EthcC {
+    handlers: BTreeMap<u32, FunctionInfo>,
+    handlers_tipc: BTreeMap<u32, FunctionInfo>,
+}
+
+impl EthcC {
+    pub fn new() -> Self {
+        Self {
+            handlers: build_handler_map(&[
+                (0, None, "Initialize"),
+                (1, None, "Cancel"),
+                (2, None, "GetResult"),
+                (3, None, "GetMediaList"),
+                (4, None, "SetMediaType"),
+                (5, None, "GetMediaType"),
+                (6, None, "GetMacAddress"),
+            ]),
+            handlers_tipc: BTreeMap::new(),
+        }
+    }
+}
+
+impl SessionRequestHandler for EthcC {
+    fn handle_sync_request(&self, ctx: &mut HLERequestContext) -> ResultCode {
+        ServiceFramework::handle_sync_request_impl(self, ctx)
+    }
+
+    fn service_name(&self) -> &str {
+        "ethc:c"
+    }
+}
+
+impl ServiceFramework for EthcC {
+    fn get_service_name(&self) -> &str {
+        "ethc:c"
+    }
+
+    fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers
+    }
+
+    fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers_tipc
+    }
+}
+
+pub struct EthcI {
+    handlers: BTreeMap<u32, FunctionInfo>,
+    handlers_tipc: BTreeMap<u32, FunctionInfo>,
+}
+
+impl EthcI {
+    pub fn new() -> Self {
+        Self {
+            handlers: build_handler_map(&[
+                (0, None, "GetReadableHandle"),
+                (1, None, "Cancel"),
+                (2, None, "GetResult"),
+                (3, None, "GetInterfaceList"),
+                (4, None, "GetInterfaceCount"),
+            ]),
+            handlers_tipc: BTreeMap::new(),
+        }
+    }
+}
+
+impl SessionRequestHandler for EthcI {
+    fn handle_sync_request(&self, ctx: &mut HLERequestContext) -> ResultCode {
+        ServiceFramework::handle_sync_request_impl(self, ctx)
+    }
+
+    fn service_name(&self) -> &str {
+        "ethc:i"
+    }
+}
+
+impl ServiceFramework for EthcI {
+    fn get_service_name(&self) -> &str {
+        "ethc:i"
+    }
+
+    fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers
+    }
+
+    fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers_tipc
+    }
+}
+
+pub struct ISfDriverServiceCreator {
+    handlers: BTreeMap<u32, FunctionInfo>,
+    handlers_tipc: BTreeMap<u32, FunctionInfo>,
+}
+
+impl ISfDriverServiceCreator {
+    pub fn new() -> Self {
+        Self {
+            handlers: build_handler_map(&[(0, None, "CreateDriverService")]),
+            handlers_tipc: BTreeMap::new(),
+        }
+    }
+}
+
+impl SessionRequestHandler for ISfDriverServiceCreator {
+    fn handle_sync_request(&self, ctx: &mut HLERequestContext) -> ResultCode {
+        ServiceFramework::handle_sync_request_impl(self, ctx)
+    }
+
+    fn service_name(&self) -> &str {
+        "eth:nd"
+    }
+}
+
+impl ServiceFramework for ISfDriverServiceCreator {
+    fn get_service_name(&self) -> &str {
+        "eth:nd"
+    }
+
+    fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers
+    }
+
+    fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers_tipc
+    }
+}
 
 /// Errno values matching upstream.
 ///
@@ -244,16 +377,34 @@ pub fn loop_process(system: crate::core::SystemRef) {
 
     {
         let mut server_manager = server_manager.lock().unwrap();
-        let bsd_s: SessionRequestHandlerPtr = Arc::new(Mutex::new(Bsd::new(true)));
-        let bsd_u: SessionRequestHandlerPtr = Arc::new(Mutex::new(Bsd::new(false)));
-        let bsdcfg: SessionRequestHandlerPtr = Arc::new(BsdCfg::new());
+        let bsd_s: SessionRequestHandlerPtr = Arc::new(Mutex::new(Bsd::new("bsd:s", false)));
+        let bsd_u: SessionRequestHandlerPtr = Arc::new(Mutex::new(Bsd::new("bsd:u", true)));
+        let bsd_a: SessionRequestHandlerPtr = Arc::new(Mutex::new(Bsd::new("bsd:a", true)));
+        let bsd_nu: SessionRequestHandlerPtr = Arc::new(BsdNu::new());
+        let bsdcfg: SessionRequestHandlerPtr = Arc::new(BsdCfg::new("bsdcfg"));
+        let ifcfg: SessionRequestHandlerPtr = Arc::new(BsdCfg::new("ifcfg"));
         let nsd_a: SessionRequestHandlerPtr = Arc::new(Nsd::new("nsd:a"));
         let nsd_u: SessionRequestHandlerPtr = Arc::new(Nsd::new("nsd:u"));
         let sfdnsres: SessionRequestHandlerPtr = Arc::new(Sfdnsres::new());
 
+        server_manager.register_named_service("ethc:c", Box::new(|| Arc::new(EthcC::new())), 64);
+        server_manager.register_named_service("ethc:i", Box::new(|| Arc::new(EthcI::new())), 64);
         server_manager.register_named_service_handler("bsd:s", bsd_s, 64);
         server_manager.register_named_service_handler("bsd:u", bsd_u, 64);
+        server_manager.register_named_service_handler("bsd:a", bsd_a, 64);
+        server_manager.register_named_service_handler("bsd:nu", bsd_nu, 64);
         server_manager.register_named_service_handler("bsdcfg", bsdcfg, 64);
+        server_manager.register_named_service_handler("ifcfg", ifcfg, 64);
+        server_manager.register_named_service(
+            "dns:priv",
+            Box::new(|| Arc::new(DnsPriv::new())),
+            64,
+        );
+        server_manager.register_named_service(
+            "eth:nd",
+            Box::new(|| Arc::new(ISfDriverServiceCreator::new())),
+            64,
+        );
         server_manager.register_named_service_handler("nsd:a", nsd_a, 64);
         server_manager.register_named_service_handler("nsd:u", nsd_u, 64);
         server_manager.register_named_service_handler("sfdnsres", sfdnsres, 64);

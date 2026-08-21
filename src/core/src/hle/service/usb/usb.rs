@@ -14,6 +14,123 @@ use crate::hle::service::hle_ipc::{
 use crate::hle::service::ipc_helpers::ResponseBuilder;
 use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
 
+pub struct IPdManufactureManager {
+    handlers: BTreeMap<u32, FunctionInfo>,
+    handlers_tipc: BTreeMap<u32, FunctionInfo>,
+}
+
+impl IPdManufactureManager {
+    pub fn new() -> Self {
+        Self {
+            handlers: build_handler_map(&[(0, None, "OpenManufactureSession")]),
+            handlers_tipc: BTreeMap::new(),
+        }
+    }
+}
+
+impl SessionRequestHandler for IPdManufactureManager {
+    fn handle_sync_request(&self, ctx: &mut HLERequestContext) -> ResultCode {
+        ServiceFramework::handle_sync_request_impl(self, ctx)
+    }
+
+    fn service_name(&self) -> &str {
+        "usb:pd:m"
+    }
+}
+
+impl ServiceFramework for IPdManufactureManager {
+    fn get_service_name(&self) -> &str {
+        "usb:pd:m"
+    }
+
+    fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers
+    }
+
+    fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers_tipc
+    }
+}
+
+pub struct IQdbManager {
+    handlers: BTreeMap<u32, FunctionInfo>,
+    handlers_tipc: BTreeMap<u32, FunctionInfo>,
+}
+
+impl IQdbManager {
+    pub fn new() -> Self {
+        Self {
+            handlers: build_handler_map(&[(0, None, "ImportQuirkDevices"), (1, None, "HasQuirk")]),
+            handlers_tipc: BTreeMap::new(),
+        }
+    }
+}
+
+impl SessionRequestHandler for IQdbManager {
+    fn handle_sync_request(&self, ctx: &mut HLERequestContext) -> ResultCode {
+        ServiceFramework::handle_sync_request_impl(self, ctx)
+    }
+
+    fn service_name(&self) -> &str {
+        "usb:qdb"
+    }
+}
+
+impl ServiceFramework for IQdbManager {
+    fn get_service_name(&self) -> &str {
+        "usb:qdb"
+    }
+
+    fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers
+    }
+
+    fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers_tipc
+    }
+}
+
+pub struct IPmObserverService {
+    handlers: BTreeMap<u32, FunctionInfo>,
+    handlers_tipc: BTreeMap<u32, FunctionInfo>,
+}
+
+impl IPmObserverService {
+    pub fn new() -> Self {
+        Self {
+            handlers: build_handler_map(&[
+                (0, None, "GetTopologyChangeEvent"),
+                (1, None, "GetFlattenedTopology"),
+            ]),
+            handlers_tipc: BTreeMap::new(),
+        }
+    }
+}
+
+impl SessionRequestHandler for IPmObserverService {
+    fn handle_sync_request(&self, ctx: &mut HLERequestContext) -> ResultCode {
+        ServiceFramework::handle_sync_request_impl(self, ctx)
+    }
+
+    fn service_name(&self) -> &str {
+        "usb:obsv"
+    }
+}
+
+impl ServiceFramework for IPmObserverService {
+    fn get_service_name(&self) -> &str {
+        "usb:obsv"
+    }
+
+    fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers
+    }
+
+    fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers_tipc
+    }
+}
+
 /// IPC command IDs for IDsInterface
 pub mod ds_interface_commands {
     pub const ADD_ENDPOINT: u32 = 0;
@@ -612,6 +729,41 @@ pub fn loop_process(system: crate::core::SystemRef) {
             Box::new(|| -> SessionRequestHandlerPtr { std::sync::Arc::new(IPmMainService::new()) }),
             16,
         );
+        server_manager.register_named_service(
+            "usb:pd:m",
+            Box::new(|| -> SessionRequestHandlerPtr {
+                std::sync::Arc::new(IPdManufactureManager::new())
+            }),
+            16,
+        );
+        let firmware_major =
+            crate::hle::service::set::system_settings_server::get_firmware_version_impl(
+                crate::hle::service::set::settings_types::GetFirmwareVersionType::Version1,
+            )
+            .major;
+        if firmware_major >= 7 {
+            server_manager.register_named_service(
+                "usb:qdb",
+                Box::new(|| -> SessionRequestHandlerPtr {
+                    std::sync::Arc::new(IQdbManager::new())
+                }),
+                16,
+            );
+        }
+        if crate::hle::service::set::system_settings_server::get_firmware_version_impl(
+            crate::hle::service::set::settings_types::GetFirmwareVersionType::Version1,
+        )
+        .major
+            >= 8
+        {
+            server_manager.register_named_service(
+                "usb:obsv",
+                Box::new(|| -> SessionRequestHandlerPtr {
+                    std::sync::Arc::new(IPmObserverService::new())
+                }),
+                16,
+            );
+        }
     }
 
     ServerManager::run_server_shared(server_manager);
@@ -628,6 +780,9 @@ mod tests {
         assert_eq!(IPdManager::new().handlers.len(), 1);
         assert_eq!(IPdCradleManager::new().handlers.len(), 1);
         assert_eq!(IPmMainService::new().handlers.len(), 6);
+        assert_eq!(IPdManufactureManager::new().handlers.len(), 1);
+        assert_eq!(IQdbManager::new().handlers.len(), 2);
+        assert_eq!(IPmObserverService::new().handlers.len(), 2);
     }
 
     #[test]

@@ -962,11 +962,11 @@ impl HLERequestContext {
     }
 
     pub fn get_copy_handle(&self, index: usize) -> Handle {
-        self.incoming_copy_handles[index]
+        self.incoming_copy_handles.get(index).copied().unwrap_or(0)
     }
 
     pub fn get_move_handle(&self, index: usize) -> Handle {
-        self.incoming_move_handles[index]
+        self.incoming_move_handles.get(index).copied().unwrap_or(0)
     }
 
     pub fn add_move_object(&mut self, obj: KAutoObjectRef) {

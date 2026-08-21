@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //
 // Ported from: core/file_sys/sdmc_factory.h / .cpp
-// Status: COMPLETE (structural parity; NAX decryption callback stubbed)
+// Status: COMPLETE (structural parity, including NAX decryption callback)
 //
 // File system interface to the SD Card archive. Provides access to SD card
 // content directories, registered caches, placeholder caches, and image
@@ -11,6 +11,7 @@
 use super::registered_cache::{PlaceholderCache, RegisteredCache};
 use super::vfs::vfs::get_or_create_directory_relative;
 use super::vfs::vfs_types::VirtualDir;
+use super::xts_archive::Nax;
 
 /// Total size reported for the SD card: 1 TiB.
 ///
@@ -38,10 +39,9 @@ impl SdmcFactory {
         let contents_dir =
             get_or_create_directory_relative(sd_dir.as_ref(), "/Nintendo/Contents/registered");
         let contents = contents_dir.map(|dir| {
-            // In upstream, a NAX decryption callback is passed here:
-            //   [](const VirtualFile& file, const NcaID& id) { return NAX{file, id}.GetDecrypted(); }
-            // For now, create without the callback.
-            Box::new(RegisteredCache::new(dir))
+            Box::new(RegisteredCache::new_with_parser(dir, |file, id| {
+                Nax::with_nca_id(file.clone(), *id).get_decrypted()
+            }))
         });
 
         let placeholder_dir =
@@ -89,6 +89,12 @@ impl SdmcFactory {
     /// Corresponds to upstream `SDMCFactory::GetSDMCContents`.
     pub fn get_sdmc_contents(&self) -> Option<&RegisteredCache> {
         self.contents.as_deref()
+    }
+
+    /// Mutable Rust counterpart used where upstream returns a non-const cache
+    /// pointer from a const factory accessor.
+    pub fn get_sdmc_contents_mut(&mut self) -> Option<&mut RegisteredCache> {
+        self.contents.as_deref_mut()
     }
 
     /// Get the placeholder cache for SD card contents.

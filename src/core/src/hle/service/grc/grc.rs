@@ -54,6 +54,49 @@ impl ServiceFramework for GRC {
     }
 }
 
+/// Debug GRC endpoint added by upstream for homebrew SDK compatibility.
+pub struct GrcD {
+    handlers: BTreeMap<u32, FunctionInfo>,
+    handlers_tipc: BTreeMap<u32, FunctionInfo>,
+}
+
+impl GrcD {
+    pub fn new() -> Self {
+        Self {
+            handlers: build_handler_map(&[
+                (1, None, "Initialize"),
+                (2, None, "Transfer"),
+                (3, None, "Cmd3"),
+            ]),
+            handlers_tipc: BTreeMap::new(),
+        }
+    }
+}
+
+impl SessionRequestHandler for GrcD {
+    fn handle_sync_request(&self, ctx: &mut HLERequestContext) -> ResultCode {
+        ServiceFramework::handle_sync_request_impl(self, ctx)
+    }
+
+    fn service_name(&self) -> &str {
+        "grc:d"
+    }
+}
+
+impl ServiceFramework for GrcD {
+    fn get_service_name(&self) -> &str {
+        "grc:d"
+    }
+
+    fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers
+    }
+
+    fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers_tipc
+    }
+}
+
 /// Registers "grc:c" service.
 ///
 /// Corresponds to `LoopProcess` in upstream `grc.cpp`:
@@ -72,7 +115,26 @@ pub fn loop_process(system: crate::core::SystemRef) {
             Box::new(|| -> SessionRequestHandlerPtr { std::sync::Arc::new(GRC::new()) }),
             16,
         );
+        server_manager.register_named_service(
+            "grc:d",
+            Box::new(|| -> SessionRequestHandlerPtr { std::sync::Arc::new(GrcD::new()) }),
+            16,
+        );
     }
 
     ServerManager::run_server_shared(server_manager);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn debug_service_table_matches_upstream() {
+        let service = GrcD::new();
+        assert_eq!(
+            service.handlers().keys().copied().collect::<Vec<_>>(),
+            [1, 2, 3]
+        );
+    }
 }

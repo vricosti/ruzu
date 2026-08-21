@@ -5,7 +5,7 @@
 //! Port of zuyu/src/core/hle/service/nvdrv/nvdrv.h
 //! Port of zuyu/src/core/hle/service/nvdrv/nvdrv.cpp
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 
 use super::core::container::{Container, SessionId};
@@ -25,6 +25,9 @@ use crate::hle::kernel::k_process::KProcess;
 use crate::hle::kernel::k_process::ProcessLock;
 use crate::hle::kernel::k_readable_event::KReadableEvent;
 use crate::hle::kernel::k_scheduler::KScheduler;
+use crate::hle::result::ResultCode;
+use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
+use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
 
 fn should_trace_ioctl_summary() -> bool {
     std::env::var_os("RUZU_NVDRV_TRACE").is_some()
@@ -421,4 +424,184 @@ impl Module {
     pub fn get_nvmap_device(&self, fd: DeviceFD) -> Option<Arc<NvMapDevice>> {
         self.nvmap_files.lock().unwrap().get(&fd).cloned()
     }
+}
+
+pub struct NvgemC {
+    handlers: BTreeMap<u32, FunctionInfo>,
+    handlers_tipc: BTreeMap<u32, FunctionInfo>,
+}
+
+impl NvgemC {
+    pub fn new() -> Self {
+        Self {
+            handlers: build_handler_map(&[
+                (0, None, "Initialize"),
+                (1, None, "GetEventHandle"),
+                (2, None, "ControlNotification"),
+                (3, None, "SetNotificationPerm"),
+                (4, None, "SetCoreDumpPerm"),
+                (5, None, "GetAruid"),
+                (6, None, "Reset"),
+                (7, None, "GetAruid2"),
+            ]),
+            handlers_tipc: BTreeMap::new(),
+        }
+    }
+}
+
+impl SessionRequestHandler for NvgemC {
+    fn handle_sync_request(&self, ctx: &mut HLERequestContext) -> ResultCode {
+        ServiceFramework::handle_sync_request_impl(self, ctx)
+    }
+
+    fn service_name(&self) -> &str {
+        "nvgem:c"
+    }
+}
+
+impl ServiceFramework for NvgemC {
+    fn get_service_name(&self) -> &str {
+        "nvgem:c"
+    }
+
+    fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers
+    }
+
+    fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers_tipc
+    }
+}
+
+pub struct NvgemCd {
+    handlers: BTreeMap<u32, FunctionInfo>,
+    handlers_tipc: BTreeMap<u32, FunctionInfo>,
+}
+
+impl NvgemCd {
+    pub fn new() -> Self {
+        Self {
+            handlers: build_handler_map(&[
+                (0, None, "Initialize"),
+                (1, None, "GetAruid"),
+                (2, None, "ReadNextBlock"),
+                (3, None, "GetNextBlockSize"),
+                (4, None, "ReadNextBlock2"),
+            ]),
+            handlers_tipc: BTreeMap::new(),
+        }
+    }
+}
+
+impl SessionRequestHandler for NvgemCd {
+    fn handle_sync_request(&self, ctx: &mut HLERequestContext) -> ResultCode {
+        ServiceFramework::handle_sync_request_impl(self, ctx)
+    }
+
+    fn service_name(&self) -> &str {
+        "nvgem:cd"
+    }
+}
+
+impl ServiceFramework for NvgemCd {
+    fn get_service_name(&self) -> &str {
+        "nvgem:cd"
+    }
+
+    fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers
+    }
+
+    fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers_tipc
+    }
+}
+
+pub struct NvdbgD {
+    handlers: BTreeMap<u32, FunctionInfo>,
+    handlers_tipc: BTreeMap<u32, FunctionInfo>,
+}
+
+impl NvdbgD {
+    pub fn new() -> Self {
+        Self {
+            handlers: build_handler_map(&[
+                (0, None, "Open"),
+                (1, None, "Ioctl"),
+                (2, None, "Close"),
+                (4, None, "QueryEvent"),
+                (9, None, "DumpStatus"),
+                (10, None, "InitializeDevtools"),
+                (11, None, "Ioctl2"),
+                (12, None, "Ioctl3"),
+                (13, None, "SetConfiguration"),
+            ]),
+            handlers_tipc: BTreeMap::new(),
+        }
+    }
+}
+
+impl SessionRequestHandler for NvdbgD {
+    fn handle_sync_request(&self, ctx: &mut HLERequestContext) -> ResultCode {
+        ServiceFramework::handle_sync_request_impl(self, ctx)
+    }
+
+    fn service_name(&self) -> &str {
+        "nvdbg:d"
+    }
+}
+
+impl ServiceFramework for NvdbgD {
+    fn get_service_name(&self) -> &str {
+        "nvdbg:d"
+    }
+
+    fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers
+    }
+
+    fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers_tipc
+    }
+}
+
+/// Launches Nvidia services. Ownership matches Eden `nvdrv.cpp::LoopProcess`.
+pub fn loop_process(system: crate::core::SystemRef) {
+    use super::nvdrv_interface::NvdrvService;
+    use super::nvmemp::Nvmemp;
+
+    let server_manager = crate::hle::service::server_manager::ServerManager::new_shared(system);
+    let module = Module::new(system);
+    {
+        let mut server_manager = server_manager.lock().unwrap();
+        for name in ["nvdrv", "nvdrv:a", "nvdrv:s", "nvdrv:t"] {
+            let service_name = name.to_owned();
+            let module = Arc::clone(&module);
+            server_manager.register_named_service(
+                name,
+                Box::new(move || Arc::new(NvdrvService::new(Arc::clone(&module), &service_name))),
+                64,
+            );
+        }
+        server_manager.register_named_service("nvgem:c", Box::new(|| Arc::new(NvgemC::new())), 64);
+        server_manager.register_named_service(
+            "nvgem:cd",
+            Box::new(|| Arc::new(NvgemCd::new())),
+            64,
+        );
+        let firmware_major =
+            crate::hle::service::set::system_settings_server::get_firmware_version_impl(
+                crate::hle::service::set::settings_types::GetFirmwareVersionType::Version1,
+            )
+            .major;
+        if firmware_major >= 10 {
+            server_manager.register_named_service(
+                "nvdbg:d",
+                Box::new(|| Arc::new(NvdbgD::new())),
+                64,
+            );
+        }
+        server_manager.register_named_service("nvmemp", Box::new(|| Arc::new(Nvmemp::new())), 64);
+    }
+    crate::hle::service::server_manager::ServerManager::run_server_shared(server_manager);
 }

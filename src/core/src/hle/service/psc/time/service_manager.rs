@@ -347,6 +347,9 @@ impl TimeServiceManager {
         time_point: &SteadyClockTimePoint,
         rule_buffer: &[u8],
     ) -> ResultCode {
+        if rule_buffer.is_empty() {
+            return crate::hle::result::RESULT_UNKNOWN;
+        }
         let mut time = self.time.lock().unwrap();
         let _ = time.time_zone.parse_binary(name, rule_buffer);
         time.time_zone.set_time_point(time_point);

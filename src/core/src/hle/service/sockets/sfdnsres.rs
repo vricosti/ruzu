@@ -584,3 +584,37 @@ impl ServiceFramework for Sfdnsres {
         &self.handlers_tipc
     }
 }
+
+pub struct DnsPriv {
+    handlers: BTreeMap<u32, FunctionInfo>,
+    handlers_tipc: BTreeMap<u32, FunctionInfo>,
+}
+
+impl DnsPriv {
+    pub fn new() -> Self {
+        Self {
+            handlers: build_handler_map(&[(0, None, "Cmd0"), (1, None, "Cmd1"), (2, None, "Cmd2")]),
+            handlers_tipc: BTreeMap::new(),
+        }
+    }
+}
+
+impl SessionRequestHandler for DnsPriv {
+    fn handle_sync_request(&self, ctx: &mut HLERequestContext) -> ResultCode {
+        ServiceFramework::handle_sync_request_impl(self, ctx)
+    }
+    fn service_name(&self) -> &str {
+        "dns:priv"
+    }
+}
+impl ServiceFramework for DnsPriv {
+    fn get_service_name(&self) -> &str {
+        "dns:priv"
+    }
+    fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers
+    }
+    fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers_tipc
+    }
+}

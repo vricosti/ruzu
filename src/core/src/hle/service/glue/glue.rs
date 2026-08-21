@@ -50,7 +50,11 @@ pub fn loop_process(service_manager: &Arc<Mutex<ServiceManager>>, system: crate:
         register_stub(&mut server_manager, "bgtc:sc");
 
         // Error Context
-        use crate::hle::service::glue::ectx::EctxAW;
+        use crate::hle::service::glue::ectx::{EctxAW, EctxR, EctxW};
+        let factory: SessionRequestHandlerFactory = Box::new(|| Arc::new(EctxW::new()));
+        server_manager.register_named_service("ectx:w", factory, 64);
+        let factory: SessionRequestHandlerFactory = Box::new(|| Arc::new(EctxR::new()));
+        server_manager.register_named_service("ectx:r", factory, 64);
         let factory: SessionRequestHandlerFactory = Box::new(|| Arc::new(EctxAW::new()));
         server_manager.register_named_service("ectx:aw", factory, 64);
 

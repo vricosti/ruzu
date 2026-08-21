@@ -117,11 +117,23 @@ impl BisFactory {
         self.sysnand_cache.as_deref()
     }
 
+    /// Mutable Rust counterpart used where upstream returns a non-const cache
+    /// pointer from a const factory accessor.
+    pub fn get_system_nand_contents_mut(&mut self) -> Option<&mut RegisteredCache> {
+        self.sysnand_cache.as_deref_mut()
+    }
+
     /// Get the user NAND registered cache.
     ///
     /// Corresponds to upstream `BISFactory::GetUserNANDContents`.
     pub fn get_user_nand_contents(&self) -> Option<&RegisteredCache> {
         self.usrnand_cache.as_deref()
+    }
+
+    /// Mutable Rust counterpart used where upstream returns a non-const cache
+    /// pointer from a const factory accessor.
+    pub fn get_user_nand_contents_mut(&mut self) -> Option<&mut RegisteredCache> {
+        self.usrnand_cache.as_deref_mut()
     }
 
     /// Get the system NAND placeholder cache.

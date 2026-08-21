@@ -12,6 +12,60 @@
 //!   pdm:qry                                       -> IQueryService
 //!   pl:s, pl:u                                    -> IPlatformServiceManager
 
+use std::collections::BTreeMap;
+
+use crate::hle::result::ResultCode;
+use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
+use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
+
+pub struct INotifyService {
+    handlers: BTreeMap<u32, FunctionInfo>,
+    handlers_tipc: BTreeMap<u32, FunctionInfo>,
+}
+
+impl INotifyService {
+    pub fn new() -> Self {
+        Self {
+            handlers: build_handler_map(&[
+                (0, None, "NotifyAppletEvent"),
+                (2, None, "NotifyOperationModeChangeEvent"),
+                (3, None, "NotifyPowerStateChangeEvent"),
+                (4, None, "NotifyClearAllEvent"),
+                (5, None, "NotifyEventForDebug"),
+                (6, None, "SuspendUserAccountEventService"),
+                (7, None, "ResumeUserAccountEventService"),
+                (8, None, "NotifyLibraryAppletEvent"),
+                (9, None, "Cmd9"),
+                (20, None, "Cmd20"),
+                (30, None, "Cmd30"),
+                (100, None, "Cmd100"),
+                (101, None, "Cmd101"),
+            ]),
+            handlers_tipc: BTreeMap::new(),
+        }
+    }
+}
+
+impl SessionRequestHandler for INotifyService {
+    fn handle_sync_request(&self, ctx: &mut HLERequestContext) -> ResultCode {
+        ServiceFramework::handle_sync_request_impl(self, ctx)
+    }
+    fn service_name(&self) -> &str {
+        "pdm:ntfy"
+    }
+}
+impl ServiceFramework for INotifyService {
+    fn get_service_name(&self) -> &str {
+        "pdm:ntfy"
+    }
+    fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers
+    }
+    fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers_tipc
+    }
+}
+
 /// Service names registered by NS LoopProcess.
 ///
 /// Corresponds to the registrations in upstream ns.cpp `LoopProcess`.
@@ -81,6 +135,11 @@ pub fn loop_process(system: crate::core::SystemRef) {
             Box::new(|| -> SessionRequestHandlerPtr {
                 Arc::new(super::query_service::IQueryService::new())
             }),
+            64,
+        );
+        server_manager.register_named_service(
+            "pdm:ntfy",
+            Box::new(|| -> SessionRequestHandlerPtr { Arc::new(INotifyService::new()) }),
             64,
         );
 

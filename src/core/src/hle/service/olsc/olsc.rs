@@ -6,9 +6,50 @@
 //!
 //! LoopProcess: Registers "olsc:u" and "olsc:s" services.
 
+use std::collections::BTreeMap;
+
+use crate::hle::result::ResultCode;
+use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
+use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
+
 /// Service names registered by OLSC.
 pub const SERVICE_NAME_APPLICATION: &str = "olsc:u";
 pub const SERVICE_NAME_SYSTEM: &str = "olsc:s";
+pub const SERVICE_NAME_PROFILE_BG_AGENT: &str = "spbg:sp";
+
+pub struct ISProfileBgAgentForSystemProcess {
+    handlers: BTreeMap<u32, FunctionInfo>,
+    handlers_tipc: BTreeMap<u32, FunctionInfo>,
+}
+
+impl ISProfileBgAgentForSystemProcess {
+    pub fn new() -> Self {
+        Self {
+            handlers: build_handler_map(&[(100, None, "OpenBgAgentController")]),
+            handlers_tipc: BTreeMap::new(),
+        }
+    }
+}
+
+impl SessionRequestHandler for ISProfileBgAgentForSystemProcess {
+    fn handle_sync_request(&self, ctx: &mut HLERequestContext) -> ResultCode {
+        ServiceFramework::handle_sync_request_impl(self, ctx)
+    }
+    fn service_name(&self) -> &str {
+        SERVICE_NAME_PROFILE_BG_AGENT
+    }
+}
+impl ServiceFramework for ISProfileBgAgentForSystemProcess {
+    fn get_service_name(&self) -> &str {
+        SERVICE_NAME_PROFILE_BG_AGENT
+    }
+    fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers
+    }
+    fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers_tipc
+    }
+}
 
 /// Entry point for the OLSC service module.
 ///
@@ -38,6 +79,13 @@ pub fn loop_process(system: crate::core::SystemRef) {
                 std::sync::Arc::new(
                     crate::hle::service::olsc::olsc_service_for_system_service::IOlscServiceForSystemService::new(system),
                 )
+            }),
+            16,
+        );
+        server_manager.register_named_service(
+            SERVICE_NAME_PROFILE_BG_AGENT,
+            Box::new(|| -> SessionRequestHandlerPtr {
+                std::sync::Arc::new(ISProfileBgAgentForSystemProcess::new())
             }),
             16,
         );

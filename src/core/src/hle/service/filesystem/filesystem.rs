@@ -8,10 +8,13 @@ use std::sync::{Arc, Mutex};
 use common::fs::path_util::{self, DirectorySeparator};
 use common::ResultCode;
 
+use crate::file_sys::bis_factory::BisPartitionId;
+use crate::file_sys::card_image::XCI;
 use crate::file_sys::errors;
 use crate::file_sys::fs_filesystem::{DirectoryEntryType, OpenMode};
 use crate::file_sys::registered_cache::{
-    ContentProvider, ContentProviderUnion, ContentProviderUnionSlot,
+    ContentProvider, ContentProviderUnion, ContentProviderUnionSlot, PlaceholderCache,
+    RegisteredCache,
 };
 use crate::file_sys::romfs_factory::{RomFSFactory, StorageId};
 use crate::file_sys::savedata_factory::SaveDataFactory;
@@ -80,9 +83,11 @@ pub struct FileSystemController {
     sdmc_open_override: Option<VirtualDir>,
     /// Shared content provider union owned by System.
     content_provider: Option<Arc<Mutex<ContentProviderUnion>>>,
-    // gamecard: Option<XCI>,
-    // gamecard_registered: Option<RegisteredCache>,
-    // gamecard_placeholder: Option<PlaceholderCache>,
+    /// Parsed game-card image and the two cache views built from its pseudo-directory.
+    /// Upstream: `gamecard`, `gamecard_registered`, `gamecard_placeholder`.
+    gamecard: Option<XCI>,
+    gamecard_registered: Option<RegisteredCache>,
+    gamecard_placeholder: Option<PlaceholderCache>,
 }
 
 impl FileSystemController {
@@ -94,6 +99,9 @@ impl FileSystemController {
             sdmc_factory: None,
             sdmc_open_override: None,
             content_provider: None,
+            gamecard: None,
+            gamecard_registered: None,
+            gamecard_placeholder: None,
         }
     }
 
@@ -109,6 +117,35 @@ impl FileSystemController {
     /// Set the BIS factory (called during system initialization).
     pub fn set_bis_factory(&mut self, factory: crate::file_sys::bis_factory::BisFactory) {
         self.bis_factory = Some(factory);
+    }
+
+    /// Port of upstream `FileSystemController::SetGameCard`.
+    pub fn set_game_card(&mut self, file: VirtualFile) {
+        let mut gamecard = XCI::new(file, 0, 0);
+        let directory = gamecard.concatenated_pseudo_directory();
+        self.gamecard_registered = Some(RegisteredCache::new(Arc::clone(&directory)));
+        self.gamecard_placeholder = Some(PlaceholderCache::new(directory));
+        self.gamecard = Some(gamecard);
+    }
+
+    /// Port of upstream `FileSystemController::GetGameCard`.
+    pub fn get_game_card(&self) -> Option<&XCI> {
+        self.gamecard.as_ref()
+    }
+
+    /// Port of upstream `FileSystemController::GetGameCardContents`.
+    pub fn get_game_card_contents(&self) -> Option<&RegisteredCache> {
+        self.gamecard_registered.as_ref()
+    }
+
+    /// Mutable Rust counterpart used where upstream returns a mutable pointer.
+    pub fn get_game_card_contents_mut(&mut self) -> Option<&mut RegisteredCache> {
+        self.gamecard_registered.as_mut()
+    }
+
+    /// Port of upstream `FileSystemController::GetGameCardPlaceholder`.
+    pub fn get_game_card_placeholder(&self) -> Option<&PlaceholderCache> {
+        self.gamecard_placeholder.as_ref()
     }
 
     /// Get the System NAND RegisteredCache.
@@ -151,12 +188,96 @@ impl FileSystemController {
         self.sdmc_factory.as_ref()?.get_sdmc_contents()
     }
 
+    /// Port of upstream `FileSystemController::GetSystemNANDPlaceholder`.
+    pub fn get_system_nand_placeholder(&self) -> Option<&PlaceholderCache> {
+        log::trace!("Opening System NAND Placeholder");
+        self.bis_factory.as_ref()?.get_system_nand_placeholder()
+    }
+
+    /// Port of upstream `FileSystemController::GetUserNANDPlaceholder`.
+    pub fn get_user_nand_placeholder(&self) -> Option<&PlaceholderCache> {
+        log::trace!("Opening User NAND Placeholder");
+        self.bis_factory.as_ref()?.get_user_nand_placeholder()
+    }
+
+    /// Port of upstream `FileSystemController::GetSDMCPlaceholder`.
+    pub fn get_sdmc_placeholder(&self) -> Option<&PlaceholderCache> {
+        log::trace!("Opening SDMC Placeholder");
+        self.sdmc_factory.as_ref()?.get_sdmc_placeholder()
+    }
+
+    /// Port of upstream `FileSystemController::GetRegisteredCacheForStorage`.
+    pub fn get_registered_cache_for_storage(
+        &mut self,
+        id: StorageId,
+    ) -> Option<&mut RegisteredCache> {
+        match id {
+            StorageId::None | StorageId::Host => {
+                log::error!(
+                    "FileSystemController::GetRegisteredCacheForStorage unimplemented for {:?}",
+                    id
+                );
+                None
+            }
+            StorageId::GameCard => self.get_game_card_contents_mut(),
+            StorageId::NandSystem => self.bis_factory.as_mut()?.get_system_nand_contents_mut(),
+            StorageId::NandUser => self.bis_factory.as_mut()?.get_user_nand_contents_mut(),
+            StorageId::SdCard => self.sdmc_factory.as_mut()?.get_sdmc_contents_mut(),
+        }
+    }
+
+    /// Port of upstream `FileSystemController::GetPlaceholderCacheForStorage`.
+    pub fn get_placeholder_cache_for_storage(&self, id: StorageId) -> Option<&PlaceholderCache> {
+        match id {
+            StorageId::None | StorageId::Host => {
+                log::error!(
+                    "FileSystemController::GetPlaceholderCacheForStorage unimplemented for {:?}",
+                    id
+                );
+                None
+            }
+            StorageId::GameCard => self.get_game_card_placeholder(),
+            StorageId::NandSystem => self.get_system_nand_placeholder(),
+            StorageId::NandUser => self.get_user_nand_placeholder(),
+            StorageId::SdCard => self.get_sdmc_placeholder(),
+        }
+    }
+
     /// Get the SDMC content directory.
     /// Upstream: `FileSystemController::GetSDMCContentDirectory()`.
     pub fn get_sdmc_content_directory(
         &self,
     ) -> Option<crate::file_sys::vfs::vfs_types::VirtualDir> {
         self.sdmc_factory.as_ref()?.get_sdmc_content_directory()
+    }
+
+    /// Port of upstream `FileSystemController::GetNANDImageDirectory`.
+    pub fn get_nand_image_directory(&self) -> Option<VirtualDir> {
+        log::trace!("Opening NAND image directory");
+        self.bis_factory.as_ref()?.get_image_directory()
+    }
+
+    /// Port of upstream `FileSystemController::GetSDMCImageDirectory`.
+    pub fn get_sdmc_image_directory(&self) -> Option<VirtualDir> {
+        log::trace!("Opening SDMC image directory");
+        self.sdmc_factory.as_ref()?.get_image_directory()
+    }
+
+    /// Port of upstream `FileSystemController::GetContentDirectory`.
+    pub fn get_content_directory(&self, id: ContentStorageId) -> Option<VirtualDir> {
+        match id {
+            ContentStorageId::System => self.get_system_nand_content_directory(),
+            ContentStorageId::User => self.get_user_nand_content_directory(),
+            ContentStorageId::SdCard => self.get_sdmc_content_directory(),
+        }
+    }
+
+    /// Port of upstream `FileSystemController::GetImageDirectory`.
+    pub fn get_image_directory(&self, id: ImageDirectoryId) -> Option<VirtualDir> {
+        match id {
+            ImageDirectoryId::Nand => self.get_nand_image_directory(),
+            ImageDirectoryId::SdCard => self.get_sdmc_image_directory(),
+        }
     }
 
     /// Port of upstream `FileSystemController::OpenSDMC` (filesystem.cpp:359-372).
@@ -181,6 +302,46 @@ impl FileSystemController {
             sdmc.get_full_path()
         );
         Ok(sdmc)
+    }
+
+    /// Port of upstream `FileSystemController::OpenSaveDataController`.
+    pub fn open_save_data_controller(&self) -> super::save_data_controller::SaveDataController {
+        match self.create_save_data_factory(0) {
+            Some(factory) => super::save_data_controller::SaveDataController::with_factory(factory),
+            None => super::save_data_controller::SaveDataController::new(),
+        }
+    }
+
+    /// Port of upstream `FileSystemController::OpenBISPartition`.
+    pub fn open_bis_partition(&self, id: BisPartitionId) -> Result<VirtualDir, ResultCode> {
+        log::trace!("Opening BIS Partition with id={:08X}", id as u32);
+        let factory = self
+            .bis_factory
+            .as_ref()
+            .ok_or(errors::RESULT_TARGET_NOT_FOUND)?;
+        factory
+            .open_partition(id)
+            .ok_or(errors::RESULT_INVALID_ARGUMENT)
+    }
+
+    /// Port of upstream `FileSystemController::OpenBISPartitionStorage`.
+    pub fn open_bis_partition_storage(
+        &self,
+        id: BisPartitionId,
+    ) -> Result<VirtualFile, ResultCode> {
+        log::trace!("Opening BIS Partition Storage with id={:08X}", id as u32);
+        let factory = self
+            .bis_factory
+            .as_ref()
+            .ok_or(errors::RESULT_TARGET_NOT_FOUND)?;
+        let filesystem = self
+            .vfs
+            .as_ref()
+            .cloned()
+            .ok_or(errors::RESULT_TARGET_NOT_FOUND)?;
+        factory
+            .open_partition_storage(id, filesystem)
+            .ok_or(errors::RESULT_INVALID_ARGUMENT)
     }
 
     /// Install a frontend-owned SDMC view for the current launch.
@@ -514,9 +675,10 @@ impl FileSystemController {
 
 #[cfg(test)]
 mod tests {
-    use super::FileSystemController;
+    use super::{ContentStorageId, FileSystemController, ImageDirectoryId};
+    use crate::file_sys::bis_factory::BisPartitionId;
     use crate::file_sys::registered_cache::{ContentProviderUnion, ContentProviderUnionSlot};
-    use crate::file_sys::romfs_factory::RomFSFactory;
+    use crate::file_sys::romfs_factory::{RomFSFactory, StorageId};
     use crate::file_sys::vfs::vfs_types::{VirtualDir, VirtualFile};
     use crate::file_sys::vfs::vfs_vector::{VectorVfsDirectory, VectorVfsFile};
     use common::fs::path_util::{get_ruzu_path, set_ruzu_path, RuzuPath};
@@ -612,9 +774,49 @@ mod tests {
         assert!(controller.get_system_nand_contents().is_some());
         assert!(controller.get_user_nand_contents().is_some());
         assert!(controller.get_sdmc_contents().is_some());
+        assert!(controller
+            .get_placeholder_cache_for_storage(StorageId::NandSystem)
+            .is_some());
+        assert!(controller
+            .get_placeholder_cache_for_storage(StorageId::NandUser)
+            .is_some());
+        assert!(controller
+            .get_placeholder_cache_for_storage(StorageId::SdCard)
+            .is_some());
+        assert!(controller
+            .get_registered_cache_for_storage(StorageId::NandSystem)
+            .is_some());
+        assert!(controller
+            .get_registered_cache_for_storage(StorageId::NandUser)
+            .is_some());
+        assert!(controller
+            .get_registered_cache_for_storage(StorageId::SdCard)
+            .is_some());
         assert!(controller.get_system_nand_content_directory().is_some());
         assert!(controller.get_user_nand_content_directory().is_some());
         assert!(controller.get_sdmc_content_directory().is_some());
+        assert!(controller.get_system_nand_placeholder().is_some());
+        assert!(controller.get_user_nand_placeholder().is_some());
+        assert!(controller.get_sdmc_placeholder().is_some());
+        assert!(controller
+            .get_content_directory(ContentStorageId::System)
+            .is_some());
+        assert!(controller
+            .get_content_directory(ContentStorageId::User)
+            .is_some());
+        assert!(controller
+            .get_content_directory(ContentStorageId::SdCard)
+            .is_some());
+        assert!(controller
+            .get_image_directory(ImageDirectoryId::Nand)
+            .is_some());
+        assert!(controller
+            .get_image_directory(ImageDirectoryId::SdCard)
+            .is_some());
+        assert!(controller
+            .open_bis_partition(BisPartitionId::System)
+            .is_ok());
+        let _save_data_controller = controller.open_save_data_controller();
         let provider = provider.lock().unwrap();
         assert!(provider.has_slot(ContentProviderUnionSlot::SysNAND));
         assert!(provider.has_slot(ContentProviderUnionSlot::UserNAND));
@@ -626,6 +828,28 @@ mod tests {
         set_ruzu_path(RuzuPath::SDMCDir, &old_sdmc);
 
         let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn set_game_card_builds_both_upstream_cache_views() {
+        let mut controller = FileSystemController::new();
+        let image: VirtualFile = Arc::new(VectorVfsFile::new(
+            vec![0; 0x200],
+            "homebrew-test.xci".to_owned(),
+            None,
+        ));
+
+        controller.set_game_card(image);
+
+        assert!(controller.get_game_card().is_some());
+        assert!(controller.get_game_card_contents().is_some());
+        assert!(controller.get_game_card_placeholder().is_some());
+        assert!(controller
+            .get_registered_cache_for_storage(StorageId::GameCard)
+            .is_some());
+        assert!(controller
+            .get_placeholder_cache_for_storage(StorageId::GameCard)
+            .is_some());
     }
 
     #[test]

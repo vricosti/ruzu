@@ -144,16 +144,17 @@ pub struct Bsd {
     handlers: BTreeMap<u32, FunctionInfo>,
     handlers_tipc: BTreeMap<u32, FunctionInfo>,
     file_descriptors: [Option<FileDescriptor>; MAX_FD],
-    is_privileged: bool,
+    name: &'static str,
+    is_user: bool,
 }
 
 impl Bsd {
-    pub fn new(is_privileged: bool) -> Self {
+    pub fn new(name: &'static str, is_user: bool) -> Self {
         let handlers = build_handler_map(&[
             (0, Some(Bsd::register_client_handler), "RegisterClient"),
             (1, Some(Bsd::start_monitoring_handler), "StartMonitoring"),
             (2, Some(Bsd::socket_handler), "Socket"),
-            (3, None, "SocketExempt"),
+            (3, Some(Bsd::socket_exempt_handler), "SocketExempt"),
             (4, None, "Open"),
             (5, Some(Bsd::select_handler), "Select"),
             (6, Some(Bsd::poll_handler), "Poll"),
@@ -190,13 +191,14 @@ impl Bsd {
             handlers,
             handlers_tipc: BTreeMap::new(),
             file_descriptors: std::array::from_fn(|_| None),
-            is_privileged,
+            name,
+            is_user,
         }
     }
 
     /// Returns whether this is a privileged (bsd:s) instance.
     pub fn is_privileged(&self) -> bool {
-        self.is_privileged
+        !self.is_user
     }
 
     // --- Internal implementation methods ---
@@ -246,10 +248,10 @@ impl Bsd {
         mut ty: Type,
         protocol: Protocol,
     ) -> (i32, Errno) {
-        if ty == Type::SEQPACKET {
-            log::warn!("SOCK_SEQPACKET errno management unimplemented");
-        } else if ty == Type::RAW && (domain != Domain::INET || protocol != Protocol::ICMP) {
-            log::warn!("SOCK_RAW errno management unimplemented");
+        if self.is_user && (ty == Type::SEQPACKET || ty == Type::RAW) {
+            if !(ty == Type::RAW && domain == Domain::INET && protocol == Protocol::ICMP) {
+                return (-1, Errno::INVAL);
+            }
         }
 
         // Check and strip unknown flag (bit 29)
@@ -1020,6 +1022,24 @@ impl Bsd {
         rb.push_u32(bsd_errno as u32);
     }
 
+    fn socket_exempt_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let bsd = unsafe { &mut *(std::ptr::addr_of!(*this).cast::<Bsd>().cast_mut()) };
+        let mut rp = RequestParser::new(ctx);
+        let domain = rp.pop_u32();
+        let ty = rp.pop_u32();
+        let protocol = rp.pop_u32();
+
+        let (fd, mut bsd_errno) = bsd.socket_impl(Domain(domain), Type(ty), Protocol(protocol));
+        if bsd_errno == Errno::SUCCESS {
+            bsd_errno = bsd.shutdown_impl(fd, 0);
+        }
+
+        let mut rb = ResponseBuilder::new(ctx, 4, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_i32(fd);
+        rb.push_u32(bsd_errno as u32);
+    }
+
     fn select_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         log::debug!("(STUBBED) BSD::Select called");
         let mut rb = ResponseBuilder::new(ctx, 4, 0, 0);
@@ -1278,9 +1298,13 @@ impl Bsd {
         let fd = rp.pop_i32();
         let _reserved = rp.pop_u64();
 
-        let (ret, bsd_errno) = match bsd.duplicate_socket_impl(fd) {
-            Ok(new_fd) => (new_fd, Errno::SUCCESS),
-            Err(err) => (0, err),
+        let (ret, bsd_errno) = if bsd.is_user {
+            (0, Errno::INVAL)
+        } else {
+            match bsd.duplicate_socket_impl(fd) {
+                Ok(new_fd) => (new_fd, Errno::SUCCESS),
+                Err(err) => (0, err),
+            }
         };
 
         let mut rb = ResponseBuilder::new(ctx, 4, 0, 0);
@@ -1308,11 +1332,7 @@ impl SessionRequestHandler for Bsd {
     }
 
     fn service_name(&self) -> &str {
-        if self.is_privileged {
-            "bsd:s"
-        } else {
-            "bsd:u"
-        }
+        self.name
     }
 
     fn as_any(&self) -> &dyn std::any::Any {
@@ -1327,11 +1347,7 @@ impl SessionRequestHandler for std::sync::Mutex<Bsd> {
     }
 
     fn service_name(&self) -> &str {
-        if self.lock().unwrap().is_privileged() {
-            "bsd:s"
-        } else {
-            "bsd:u"
-        }
+        self.lock().unwrap().name
     }
 
     fn as_any(&self) -> &dyn std::any::Any {
@@ -1341,11 +1357,7 @@ impl SessionRequestHandler for std::sync::Mutex<Bsd> {
 
 impl ServiceFramework for Bsd {
     fn get_service_name(&self) -> &str {
-        if self.is_privileged {
-            "bsd:s"
-        } else {
-            "bsd:u"
-        }
+        &self.name
     }
 
     fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> {
@@ -1362,12 +1374,13 @@ impl ServiceFramework for Bsd {
 /// Corresponds to `BSDCFG` in upstream bsd.h / bsd.cpp.
 /// All commands are nullptr (unimplemented) in upstream.
 pub struct BsdCfg {
+    name: String,
     handlers: BTreeMap<u32, FunctionInfo>,
     handlers_tipc: BTreeMap<u32, FunctionInfo>,
 }
 
 impl BsdCfg {
-    pub fn new() -> Self {
+    pub fn new(name: &str) -> Self {
         let handlers = build_handler_map(&[
             (0, None, "SetIfUp"),
             (1, None, "SetIfUpWithEvent"),
@@ -1388,6 +1401,7 @@ impl BsdCfg {
         ]);
 
         Self {
+            name: name.to_owned(),
             handlers,
             handlers_tipc: BTreeMap::new(),
         }
@@ -1400,19 +1414,53 @@ impl SessionRequestHandler for BsdCfg {
     }
 
     fn service_name(&self) -> &str {
-        "bsdcfg"
+        &self.name
     }
 }
 
 impl ServiceFramework for BsdCfg {
     fn get_service_name(&self) -> &str {
-        "bsdcfg"
+        &self.name
     }
 
     fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> {
         &self.handlers
     }
 
+    fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers_tipc
+    }
+}
+
+pub struct BsdNu {
+    handlers: BTreeMap<u32, FunctionInfo>,
+    handlers_tipc: BTreeMap<u32, FunctionInfo>,
+}
+
+impl BsdNu {
+    pub fn new() -> Self {
+        Self {
+            handlers: build_handler_map(&[(0, None, "CreateUserService")]),
+            handlers_tipc: BTreeMap::new(),
+        }
+    }
+}
+
+impl SessionRequestHandler for BsdNu {
+    fn handle_sync_request(&self, ctx: &mut HLERequestContext) -> ResultCode {
+        ServiceFramework::handle_sync_request_impl(self, ctx)
+    }
+    fn service_name(&self) -> &str {
+        "bsd:nu"
+    }
+}
+impl ServiceFramework for BsdNu {
+    fn get_service_name(&self) -> &str {
+        "bsd:nu"
+    }
+    fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers
+    }
     fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
         &self.handlers_tipc
     }
@@ -1433,7 +1481,7 @@ mod tests {
 
     #[test]
     fn unknown_set_sock_opt_name_reaches_upstream_default_case() {
-        let mut bsd = Bsd::new(false);
+        let mut bsd = Bsd::new("bsd:u", true);
         let (fd, errno) = bsd.socket_impl(Domain::INET, Type::DGRAM, Protocol::UDP);
         assert_eq!(errno, Errno::SUCCESS);
         assert!(fd >= 0);
@@ -1448,7 +1496,7 @@ mod tests {
 
     #[test]
     fn shared_bsd_handler_exposes_one_descriptor_table() {
-        let handler: SessionRequestHandlerPtr = Arc::new(Mutex::new(Bsd::new(false)));
+        let handler: SessionRequestHandlerPtr = Arc::new(Mutex::new(Bsd::new("bsd:u", true)));
         let first = handler
             .as_any()
             .downcast_ref::<Mutex<Bsd>>()
