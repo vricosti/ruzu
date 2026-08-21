@@ -4726,3 +4726,12 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
   otherwise follow Eden's `NotifyChanged` path.
 - Eden's `last_mouse_position` is initialized and assigned but never read. Ruzu omits this dead
   host-only field while retaining the live origin, stick, motion, wheel, and button state.
+
+## 2026-08-22 — `src/input_common/src/drivers/sdl_driver.rs` duplicate mapping helpers
+
+### Intentional differences
+
+- The pure dual-controller side-selection predicate is a module-local Rust function in the same
+  owner file, while Eden spells it as a private `SDLDriver` method. Ruzu's unused second copy was
+  removed along with three stale parameter-package builders; the active owner-local builders are
+  the ones called by `build_param_for_binding` and preserve Eden's `invert` key and value rules.
