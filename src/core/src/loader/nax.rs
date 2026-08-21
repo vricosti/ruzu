@@ -40,7 +40,7 @@ fn identify_type_impl(nax: &Nax) -> FileType {
 ///
 /// Maps to upstream `Loader::AppLoader_NAX`.
 pub struct AppLoaderNax {
-    file: VirtualFile,
+    _file: VirtualFile,
     is_loaded: bool,
     nax: Nax,
     nca_loader: Option<AppLoaderNca>,
@@ -67,11 +67,33 @@ impl AppLoaderNax {
         let nax = Nax::new(file.clone());
         let nca_loader = nax.get_decrypted().map(AppLoaderNca::new);
         Self {
-            file,
+            _file: file,
             is_loaded: false,
             nax,
             nca_loader,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::file_sys::vfs::vfs_vector::VectorVfsFile;
+    use std::sync::Arc;
+
+    #[test]
+    fn loader_retains_its_base_file_in_addition_to_nax() {
+        let file: VirtualFile = Arc::new(VectorVfsFile::new(
+            Vec::new(),
+            "free-homebrew.nax".to_string(),
+            None,
+        ));
+        let observer = file.clone();
+        let loader = AppLoaderNax::new(file);
+
+        assert_eq!(Arc::strong_count(&observer), 3);
+        drop(loader);
+        assert_eq!(Arc::strong_count(&observer), 1);
     }
 }
 

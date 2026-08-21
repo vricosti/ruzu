@@ -3736,3 +3736,23 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 ### Binary layout verification
 
 - N/A: loader ownership state is not serialized.
+
+## 2026-08-21 — `src/core/src/loader/nax.rs` loader file ownership vs Eden `src/core/loader/{loader.h,nax.h,nax.cpp}`
+
+### Intentional differences
+
+- As for KIP, Rust's trait cannot own Eden `AppLoader::file`; `AppLoaderNax::_file` retains that
+  base-class ownership directly while `Nax` separately retains its own backing-file reference.
+
+### Unintentional differences (to fix)
+
+- None in this ownership-only slice; NAX parsing and delegated NCA loading were not changed.
+
+### Missing items
+
+- None for base-file lifetime. The regression distinguishes the loader's reference from `Nax`'s
+  own reference and verifies both disappear when the loader is dropped.
+
+### Binary layout verification
+
+- N/A: loader reference ownership is not serialized.
