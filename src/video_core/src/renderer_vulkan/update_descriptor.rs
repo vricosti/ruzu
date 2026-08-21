@@ -83,6 +83,9 @@ impl Default for DescriptorUpdateEntry {
 /// retrieve the entries written since the last `acquire()` call. Vulkan
 /// consumes that raw payload through a descriptor update template.
 pub struct UpdateDescriptorQueue {
+    // Current Eden retains the Device reference but does not read it after
+    // construction. Keep the same owner edge for structural parity.
+    #[allow(dead_code)]
     device: DeviceReference,
 
     /// Current frame index in the ring buffer.

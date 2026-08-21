@@ -764,6 +764,9 @@ impl VicMethod {
 pub struct Vic {
     id: i32,
     nvdec_id: i32,
+    // Current Eden retains the VIC syncpoint from construction without
+    // reading it in ProcessMethod or Execute.
+    #[allow(dead_code)]
     syncpoint: u32,
     regs: VicRegisters,
     frame_queue: Arc<FrameQueue>,
