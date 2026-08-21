@@ -1991,20 +1991,13 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
         }
 
         let mut binding_index = 0u32;
-        let mut bits = mask;
-        let mut idx: u32 = 0;
-        while bits != 0 {
-            let skip = bits.trailing_zeros();
-            idx += skip;
-            bits >>= skip;
+        Self::for_each_enabled_bit(mask, |idx| {
             let needs_bind = ((dirty >> idx) & 1) != 0;
             self.bind_host_graphics_uniform_buffer(stage, idx, binding_index, needs_bind);
             if P::NEEDS_BIND_UNIFORM_INDEX {
                 binding_index += 1;
             }
-            idx += 1;
-            bits >>= 1;
-        }
+        });
     }
 
     /// Upstream: `BufferCache<P>::BindHostGraphicsUniformBuffer`
@@ -2075,10 +2068,14 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
                             self.runtime
                                 .bind_fast_uniform_buffer(stage, binding_index, size);
                         }
-                        let mut buf = vec![0u8; size as usize];
-                        dm.read_block_unsafe(device_addr, &mut buf);
+                        let span = Self::immediate_buffer_with_data(
+                            dm.as_ref(),
+                            &mut self.immediate_buffer_alloc,
+                            device_addr,
+                            size as usize,
+                        );
                         self.runtime
-                            .push_fast_uniform_buffer(stage, binding_index, &buf);
+                            .push_fast_uniform_buffer(stage, binding_index, span);
                         fast_buffer_bound = true;
                     }
                 } else {
@@ -2204,22 +2201,8 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
         let bindings: Vec<Binding> = cs.storage_buffers[stage].to_vec();
 
         let mut binding_index = 0u32;
-        let mut bits = mask;
-        let mut idx: u32 = 0;
-        while bits != 0 {
-            let skip = bits.trailing_zeros();
-            idx += skip;
-            bits >>= skip;
-
+        Self::for_each_enabled_bit(mask, |idx| {
             let binding = bindings[idx as usize];
-            if !binding.buffer_id.is_valid() || binding.buffer_id == NULL_BUFFER_ID {
-                idx += 1;
-                bits >>= 1;
-                if P::NEEDS_BIND_STORAGE_INDEX {
-                    binding_index += 1;
-                }
-                continue;
-            }
             self.touch_buffer(binding.buffer_id);
             self.synchronize_buffer(binding.buffer_id, binding.device_addr, binding.size);
 
@@ -2243,10 +2226,7 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
             if P::NEEDS_BIND_STORAGE_INDEX {
                 binding_index += 1;
             }
-
-            idx += 1;
-            bits >>= 1;
-        }
+        });
     }
 
     fn bind_host_graphics_texture_buffers(&mut self, stage: usize) {
@@ -2258,13 +2238,7 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
         let image_mask = cs.image_texture_buffers[stage];
         let bindings: Vec<TextureBufferBinding> = cs.texture_buffers[stage].to_vec();
 
-        let mut bits = mask;
-        let mut idx: u32 = 0;
-        while bits != 0 {
-            let skip = bits.trailing_zeros();
-            idx += skip;
-            bits >>= skip;
-
+        Self::for_each_enabled_bit(mask, |idx| {
             let binding = bindings[idx as usize];
             self.synchronize_buffer(binding.buffer_id, binding.device_addr, binding.size);
 
@@ -2284,10 +2258,7 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
                 self.runtime
                     .bind_texture_buffer(buffer, offset, binding.size, binding.format);
             }
-
-            idx += 1;
-            bits >>= 1;
-        }
+        });
     }
 
     fn bind_host_transform_feedback_buffers(&mut self) {
@@ -2355,13 +2326,7 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
         let bindings = cs.compute_uniform_buffers;
 
         let mut binding_index = 0u32;
-        let mut bits = mask;
-        let mut idx: u32 = 0;
-        while bits != 0 {
-            let skip = bits.trailing_zeros();
-            idx += skip;
-            bits >>= skip;
-
+        Self::for_each_enabled_bit(mask, |idx| {
             let binding = bindings[idx as usize];
             self.touch_buffer(binding.buffer_id);
             // SAFETY: SetComputeUniformBufferState receives the address-stable
@@ -2390,9 +2355,7 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
                     false
                 };
                 if streamed {
-                    idx += 1;
-                    bits >>= 1;
-                    continue;
+                    return;
                 }
             }
             self.synchronize_buffer(binding.buffer_id, binding.device_addr, size);
@@ -2410,10 +2373,7 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
             if P::NEEDS_BIND_UNIFORM_INDEX {
                 binding_index += 1;
             }
-
-            idx += 1;
-            bits >>= 1;
-        }
+        });
     }
 
     fn bind_host_compute_storage_buffers(&mut self) {
@@ -2425,22 +2385,8 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
         let bindings: Vec<Binding> = cs.compute_storage_buffers.to_vec();
 
         let mut binding_index = 0u32;
-        let mut bits = mask;
-        let mut idx: u32 = 0;
-        while bits != 0 {
-            let skip = bits.trailing_zeros();
-            idx += skip;
-            bits >>= skip;
-
+        Self::for_each_enabled_bit(mask, |idx| {
             let binding = bindings[idx as usize];
-            if !binding.buffer_id.is_valid() || binding.buffer_id == NULL_BUFFER_ID {
-                idx += 1;
-                bits >>= 1;
-                if P::NEEDS_BIND_STORAGE_INDEX {
-                    binding_index += 1;
-                }
-                continue;
-            }
             self.touch_buffer(binding.buffer_id);
             self.synchronize_buffer(binding.buffer_id, binding.device_addr, binding.size);
 
@@ -2476,10 +2422,7 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
             if P::NEEDS_BIND_STORAGE_INDEX {
                 binding_index += 1;
             }
-
-            idx += 1;
-            bits >>= 1;
-        }
+        });
     }
 
     fn bind_host_compute_texture_buffers(&mut self) {
@@ -2491,13 +2434,7 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
         let image_mask = cs.image_compute_texture_buffers;
         let bindings: Vec<TextureBufferBinding> = cs.compute_texture_buffers.to_vec();
 
-        let mut bits = mask;
-        let mut idx: u32 = 0;
-        while bits != 0 {
-            let skip = bits.trailing_zeros();
-            idx += skip;
-            bits >>= skip;
-
+        Self::for_each_enabled_bit(mask, |idx| {
             let binding = bindings[idx as usize];
             self.synchronize_buffer(binding.buffer_id, binding.device_addr, binding.size);
 
@@ -2517,10 +2454,7 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
                 self.runtime
                     .bind_texture_buffer(buffer, offset, binding.size, binding.format);
             }
-
-            idx += 1;
-            bits >>= 1;
-        }
+        });
     }
 
     /// Upstream: `BufferCache<P>::DoUpdateGraphicsBuffers`
@@ -2956,20 +2890,12 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
         };
         let mask = cs.enabled_uniform_buffer_masks[stage];
 
-        let mut bits = mask;
-        let mut idx: u32 = 0;
-        while bits != 0 {
-            let skip = bits.trailing_zeros();
-            idx += skip;
-            bits >>= skip;
-
+        Self::for_each_enabled_bit(mask, |idx| {
             if let Some(cs) = self.channel_caches.current_channel_state() {
                 let binding = cs.uniform_buffers[stage][idx as usize];
                 // If already resolved, skip.
                 if binding.buffer_id.is_valid() && binding.buffer_id != NULL_BUFFER_ID {
-                    idx += 1;
-                    bits >>= 1;
-                    continue;
+                    return;
                 }
             }
 
@@ -2985,16 +2911,13 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
                 let b = cs.uniform_buffers[stage][idx as usize];
                 (b.device_addr, b.size)
             } else {
-                break;
+                return;
             };
             let buffer_id = self.find_buffer(device_addr, size);
             if let Some(cs) = self.channel_caches.current_channel_state_mut() {
                 cs.uniform_buffers[stage][idx as usize].buffer_id = buffer_id;
             }
-
-            idx += 1;
-            bits >>= 1;
-        }
+        });
     }
 
     /// Upstream: `BufferCache<P>::UpdateStorageBuffers`
@@ -3004,28 +2927,19 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
         };
         let mask = cs.enabled_storage_buffers[stage];
 
-        let mut bits = mask;
-        let mut idx: u32 = 0;
-        while bits != 0 {
-            let skip = bits.trailing_zeros();
-            idx += skip;
-            bits >>= skip;
-
+        Self::for_each_enabled_bit(mask, |idx| {
             let (device_addr, size) = if let Some(cs) = self.channel_caches.current_channel_state()
             {
                 let b = cs.storage_buffers[stage][idx as usize];
                 (b.device_addr, b.size)
             } else {
-                break;
+                return;
             };
             let buffer_id = self.find_buffer(device_addr, size);
             if let Some(cs) = self.channel_caches.current_channel_state_mut() {
                 cs.storage_buffers[stage][idx as usize].buffer_id = buffer_id;
             }
-
-            idx += 1;
-            bits >>= 1;
-        }
+        });
     }
 
     /// Upstream: `BufferCache<P>::UpdateTextureBuffers`
@@ -3035,28 +2949,19 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
         };
         let mask = cs.enabled_texture_buffers[stage];
 
-        let mut bits = mask;
-        let mut idx: u32 = 0;
-        while bits != 0 {
-            let skip = bits.trailing_zeros();
-            idx += skip;
-            bits >>= skip;
-
+        Self::for_each_enabled_bit(mask, |idx| {
             let (device_addr, size) = if let Some(cs) = self.channel_caches.current_channel_state()
             {
                 let b = cs.texture_buffers[stage][idx as usize];
                 (b.device_addr, b.size)
             } else {
-                break;
+                return;
             };
             let buffer_id = self.find_buffer(device_addr, size);
             if let Some(cs) = self.channel_caches.current_channel_state_mut() {
                 cs.texture_buffers[stage][idx as usize].buffer_id = buffer_id;
             }
-
-            idx += 1;
-            bits >>= 1;
-        }
+        });
     }
 
     /// Upstream: `BufferCache<P>::UpdateTransformFeedbackBuffers`
@@ -3113,13 +3018,7 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
         };
         let mask = cs.enabled_compute_uniform_buffer_mask;
 
-        let mut bits = mask;
-        let mut idx: u32 = 0;
-        while bits != 0 {
-            let skip = bits.trailing_zeros();
-            idx += skip;
-            bits >>= skip;
-
+        Self::for_each_enabled_bit(mask, |idx| {
             // Upstream: binding = NULL_BINDING;
             //   if (((launch_desc.const_buffer_enable_mask >> index) & 1) != 0) {
             //       const auto& cbuf = launch_desc.const_buffer_config[index];
@@ -3151,10 +3050,7 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
             if let Some(cs) = self.channel_caches.current_channel_state_mut() {
                 cs.compute_uniform_buffers[idx as usize] = binding;
             }
-
-            idx += 1;
-            bits >>= 1;
-        }
+        });
     }
 
     /// Upstream: `BufferCache<P>::UpdateComputeStorageBuffers`
@@ -3164,28 +3060,19 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
         };
         let mask = cs.enabled_compute_storage_buffers;
 
-        let mut bits = mask;
-        let mut idx: u32 = 0;
-        while bits != 0 {
-            let skip = bits.trailing_zeros();
-            idx += skip;
-            bits >>= skip;
-
+        Self::for_each_enabled_bit(mask, |idx| {
             let (device_addr, size) = if let Some(cs) = self.channel_caches.current_channel_state()
             {
                 let b = cs.compute_storage_buffers[idx as usize];
                 (b.device_addr, b.size)
             } else {
-                break;
+                return;
             };
             let buffer_id = self.find_buffer(device_addr, size);
             if let Some(cs) = self.channel_caches.current_channel_state_mut() {
                 cs.compute_storage_buffers[idx as usize].buffer_id = buffer_id;
             }
-
-            idx += 1;
-            bits >>= 1;
-        }
+        });
     }
 
     /// Upstream: `BufferCache<P>::UpdateComputeTextureBuffers`
@@ -3195,28 +3082,19 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
         };
         let mask = cs.enabled_compute_texture_buffers;
 
-        let mut bits = mask;
-        let mut idx: u32 = 0;
-        while bits != 0 {
-            let skip = bits.trailing_zeros();
-            idx += skip;
-            bits >>= skip;
-
+        Self::for_each_enabled_bit(mask, |idx| {
             let (device_addr, size) = if let Some(cs) = self.channel_caches.current_channel_state()
             {
                 let b = cs.compute_texture_buffers[idx as usize];
                 (b.device_addr, b.size)
             } else {
-                break;
+                return;
             };
             let buffer_id = self.find_buffer(device_addr, size);
             if let Some(cs) = self.channel_caches.current_channel_state_mut() {
                 cs.compute_texture_buffers[idx as usize].buffer_id = buffer_id;
             }
-
-            idx += 1;
-            bits >>= 1;
-        }
+        });
     }
 
     /// Mark a buffer region as GPU-written.
@@ -3567,9 +3445,6 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
         }
         for copy in copies {
             let device_addr = self.slot_buffers[_buffer_id].cpu_addr() + copy.dst_offset;
-            if self.immediate_buffer_alloc.len() < largest_copy as usize {
-                self.immediate_buffer_alloc.resize(largest_copy as usize, 0);
-            }
             if Self::is_range_granular(device_addr, copy.size as usize) {
                 if let Some(ptr) = self
                     .device_memory
@@ -3589,14 +3464,11 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
                 self.download_buffer_memory_range(_buffer_id, device_addr, copy.size);
             }
             if let Some(ref dm) = self.device_memory {
-                dm.read_block_unsafe(
-                    device_addr,
-                    &mut self.immediate_buffer_alloc[..copy.size as usize],
-                );
-                self.slot_buffers[_buffer_id].immediate_upload(
-                    copy.dst_offset,
-                    &self.immediate_buffer_alloc[..copy.size as usize],
-                );
+                let immediate_buffer =
+                    Self::immediate_buffer(&mut self.immediate_buffer_alloc, largest_copy as usize);
+                dm.read_block_unsafe(device_addr, &mut immediate_buffer[..copy.size as usize]);
+                self.slot_buffers[_buffer_id]
+                    .immediate_upload(copy.dst_offset, &immediate_buffer[..copy.size as usize]);
             }
         }
     }
@@ -3742,21 +3614,19 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
             }
         } else {
             // Immediate download path.
-            // Ensure immediate buffer is large enough before borrowing device_memory.
-            if self.immediate_buffer_alloc.len() < largest_copy as usize {
-                self.immediate_buffer_alloc.resize(largest_copy as usize, 0);
-            }
             if let Some(ref dm) = self.device_memory {
+                let immediate_buffer =
+                    Self::immediate_buffer(&mut self.immediate_buffer_alloc, largest_copy as usize);
                 for copy in &copies {
                     self.slot_buffers[buffer_id].immediate_download(
                         copy.src_offset,
-                        &mut self.immediate_buffer_alloc[..copy.size as usize],
+                        &mut immediate_buffer[..copy.size as usize],
                     );
                     let copy_device_addr =
                         self.slot_buffers[buffer_id].cpu_addr() + copy.src_offset;
                     dm.write_block_unsafe(
                         copy_device_addr,
-                        &self.immediate_buffer_alloc[..copy.size as usize],
+                        &immediate_buffer[..copy.size as usize],
                     );
                 }
             }
@@ -4022,29 +3892,37 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
     /// Get an immediate buffer slice backed by device memory at `device_addr`.
     ///
     /// Upstream: `BufferCache<P>::ImmediateBufferWithData`
-    fn immediate_buffer_with_data(&mut self, device_addr: VAddr, size: usize) -> &[u8] {
-        // Upstream: if IsRangeGranular, use direct pointer; else ReadBlockUnsafe.
-        // Since we can't return a raw pointer from device_memory.get_pointer (lifetime issue),
-        // we always read into the immediate buffer.
-        if let Some(ref dm) = self.device_memory {
-            if self.immediate_buffer_alloc.len() < size {
-                self.immediate_buffer_alloc.resize(size, 0);
+    fn immediate_buffer_with_data<'a>(
+        device_memory: &'a dyn DeviceMemoryAccess,
+        immediate_buffer_alloc: &'a mut Vec<u8>,
+        device_addr: VAddr,
+        size: usize,
+    ) -> &'a [u8] {
+        if let Some(base_pointer) = device_memory.get_pointer(device_addr) {
+            let contiguous = Self::is_range_granular(device_addr, size)
+                || device_memory
+                    .get_pointer(device_addr.wrapping_add(size as u64))
+                    .is_some_and(|end_pointer| base_pointer.wrapping_add(size) == end_pointer);
+            if contiguous {
+                // SAFETY: `get_pointer` exposes the guest-memory backing for
+                // this range, and the same page/continuity checks as Eden's
+                // `ImmediateBufferWithData` prove all `size` bytes contiguous.
+                return unsafe { std::slice::from_raw_parts(base_pointer, size) };
             }
-            dm.read_block_unsafe(device_addr, &mut self.immediate_buffer_alloc[..size]);
-            &self.immediate_buffer_alloc[..size]
-        } else {
-            &[]
         }
+        let span = Self::immediate_buffer(immediate_buffer_alloc, size);
+        device_memory.read_block_unsafe(device_addr, span);
+        span
     }
 
     /// Ensure `immediate_buffer_alloc` has at least `wanted_capacity` bytes and return a slice.
     ///
     /// Upstream: `BufferCache<P>::ImmediateBuffer`
-    fn immediate_buffer(&mut self, wanted_capacity: usize) -> &mut [u8] {
-        if self.immediate_buffer_alloc.len() < wanted_capacity {
-            self.immediate_buffer_alloc.resize(wanted_capacity, 0u8);
+    fn immediate_buffer(immediate_buffer_alloc: &mut Vec<u8>, wanted_capacity: usize) -> &mut [u8] {
+        if immediate_buffer_alloc.len() < wanted_capacity {
+            immediate_buffer_alloc.resize(wanted_capacity, 0u8);
         }
-        &mut self.immediate_buffer_alloc[..wanted_capacity]
+        &mut immediate_buffer_alloc[..wanted_capacity]
     }
 
     /// Return true if a fast uniform buffer is currently bound at `(stage, binding_index)`.
@@ -4213,6 +4091,28 @@ mod tests {
             let end = start + src.len();
             self.bytes.lock()[start..end].copy_from_slice(src);
         }
+    }
+
+    struct ImmediateDeviceMemory {
+        bytes: Vec<u8>,
+        expose_pointer: bool,
+    }
+
+    impl DeviceMemoryAccess for ImmediateDeviceMemory {
+        fn get_pointer(&self, device_addr: u64) -> Option<*const u8> {
+            let offset = usize::try_from(device_addr).ok()?;
+            if !self.expose_pointer || offset > self.bytes.len() {
+                return None;
+            }
+            Some(self.bytes.as_ptr().wrapping_add(offset))
+        }
+
+        fn read_block_unsafe(&self, device_addr: u64, dst: &mut [u8]) {
+            let start = device_addr as usize;
+            dst.copy_from_slice(&self.bytes[start..start + dst.len()]);
+        }
+
+        fn write_block_unsafe(&self, _device_addr: u64, _src: &[u8]) {}
     }
 
     fn bind_test_channel(cache: &mut BufferCache<TestParams, DummyTracker>, bind_id: i32) {
@@ -4423,6 +4323,40 @@ mod tests {
             bits.push(idx);
         });
         assert_eq!(bits, vec![0, 2, 5, 7]);
+    }
+
+    #[test]
+    fn immediate_buffer_uses_contiguous_guest_memory_across_page_boundary() {
+        let memory = ImmediateDeviceMemory {
+            bytes: (0..0x1020).map(|value| value as u8).collect(),
+            expose_pointer: true,
+        };
+        let mut allocation = Vec::new();
+        let span = BufferCache::<TestParams, DummyTracker>::immediate_buffer_with_data(
+            &memory,
+            &mut allocation,
+            0xff0,
+            0x20,
+        );
+        assert_eq!(span, &memory.bytes[0xff0..0x1010]);
+        assert!(allocation.is_empty());
+    }
+
+    #[test]
+    fn immediate_buffer_reads_non_contiguous_guest_memory_into_scratch() {
+        let memory = ImmediateDeviceMemory {
+            bytes: (0..64).map(|value| value as u8).collect(),
+            expose_pointer: false,
+        };
+        let mut allocation = Vec::new();
+        let span = BufferCache::<TestParams, DummyTracker>::immediate_buffer_with_data(
+            &memory,
+            &mut allocation,
+            7,
+            13,
+        );
+        assert_eq!(span, &memory.bytes[7..20]);
+        assert_eq!(allocation.len(), 13);
     }
 
     #[test]

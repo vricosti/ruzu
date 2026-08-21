@@ -4476,3 +4476,12 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 
 - Eden additionally forwards validation messages to `GPU::Logging::GPULogger` when Vulkan-call
   logging is active. Ruzu does not yet have that GPU logging subsystem.
+
+## 2026-08-22 — `src/video_core/src/buffer_cache/buffer_cache.rs` vs `src/video_core/buffer_cache/buffer_cache_base.h` and `buffer_cache.h`
+
+### Intentional differences
+
+- `ImmediateBufferWithData` and `ImmediateBuffer` are associated functions receiving the device
+  memory and scratch allocation explicitly. This lets Rust borrow the scratch allocation and the
+  backend runtime independently; their ownership, continuity checks, fallback read, and callers
+  otherwise match Eden.
