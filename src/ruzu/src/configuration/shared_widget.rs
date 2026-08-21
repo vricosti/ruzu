@@ -275,27 +275,9 @@ pub fn align_label_columns(rows: &[&gtk::Box]) -> gtk::SizeGroup {
     group
 }
 
-/// Index of `needle` in `haystack`, or 0. Used to map a stored enum value onto
-/// its combo-box row without panicking on values the UI doesn't list.
-pub fn index_of<T: PartialEq>(haystack: &[T], needle: &T) -> u32 {
-    haystack.iter().position(|item| item == needle).unwrap_or(0) as u32
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn index_of_finds_the_entry() {
-        let items = ["a", "b", "c"];
-        assert_eq!(index_of(&items, &"b"), 1);
-    }
-
-    #[test]
-    fn index_of_falls_back_to_zero_for_unknown_values() {
-        let items = ["a", "b"];
-        assert_eq!(index_of(&items, &"z"), 0);
-    }
 
     #[test]
     fn reversed_slider_feedback_matches_edens_fsr_presentation() {

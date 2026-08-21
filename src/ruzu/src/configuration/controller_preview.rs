@@ -263,9 +263,6 @@ enum Direction {
     Right,
     Down,
     Left,
-    /// Upstream's `Direction::None` — used by `DrawRoundButton` callers that
-    /// want no press displacement.
-    None,
 }
 
 /// Render `controller_type` onto `cr`, centred at `center`.
@@ -525,7 +522,6 @@ fn arrow_button(
             Direction::Right => (-ay, ax),
             Direction::Down => (ax, -ay),
             Direction::Left => (ay, ax),
-            Direction::None => (ax, ay),
         };
         let (x, y) = (center.0 + dx, center.1 + dy);
         if index == 0 {
@@ -543,7 +539,6 @@ fn arrow_button(
         Direction::Right => (20.0 * size, 0.0),
         Direction::Down => (0.0, 20.0 * size),
         Direction::Left => (-20.0 * size, 0.0),
-        Direction::None => (0.0, 0.0),
     };
     arrow(
         cr,
@@ -1117,7 +1112,6 @@ fn arrow(
             Direction::Right => (-ay, ax),
             Direction::Down => (ax, -ay),
             Direction::Left => (ay, ax),
-            Direction::None => (ax, ay),
         };
         let (x, y) = (center.0 + dx, center.1 + dy);
         if index == 0 {
@@ -2938,7 +2932,7 @@ mod tests {
         for (controller, name) in ALL_TYPES {
             let (_, surface) = render(*controller);
             let mut file = std::fs::File::create(format!("{dir}/{name}.png")).unwrap();
-            let mut surface = surface;
+            let surface = surface;
             surface.write_to_png(&mut file).unwrap();
         }
     }

@@ -17,7 +17,7 @@
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::rc::Rc;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex};
 
 use gtk::prelude::*;
 use gtk::{gio, glib, Application, ApplicationWindow};
@@ -271,6 +271,8 @@ pub struct GMainWindow {
 
 /// Handles needed to resize the embedded render surface on window resize.
 struct RenderHandles {
+    /// GTK render-window state kept alive for the full emulation session.
+    emu_window: crate::emu_window::GtkEmuWindow,
     /// macOS: child `NSWindow*`; Linux: X11 `Window`; Windows: child `HWND`.
     child_window: usize,
     /// macOS: the `CAMetalLayer*`.
@@ -282,9 +284,6 @@ struct RenderHandles {
     /// Linux: colormap paired with the GLX-compatible visual.
     #[cfg(target_os = "linux")]
     colormap: usize,
-    /// Shared frame layout the renderer reads; updated so the frame is rendered
-    /// at the new native resolution on resize (upstream `OnFramebufferSizeChanged`).
-    framebuffer_layout: Arc<RwLock<FramebufferLayout>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -1169,6 +1168,30 @@ impl GMainWindow {
             ));
         }
 
+        // Keep the renderer's visibility state synchronized with the GTK
+        // toplevel, matching `GRenderWindow::IsShown()` while minimized or
+        // unmapped. The render owner may not exist during the initial map.
+        this.window.connect_map(glib::clone!(
+            #[weak(rename_to = this)]
+            this,
+            move |_| {
+                let render = this.render.borrow();
+                if let Some(handles) = render.as_ref() {
+                    handles.emu_window.set_shown(true);
+                }
+            }
+        ));
+        this.window.connect_unmap(glib::clone!(
+            #[weak(rename_to = this)]
+            this,
+            move |_| {
+                let render = this.render.borrow();
+                if let Some(handles) = render.as_ref() {
+                    handles.emu_window.set_shown(false);
+                }
+            }
+        ));
+
         // Keep the embedded render surface sized to the central stack as the
         // window is resized. GTK4 has no widget `size-allocate` signal, so poll
         // the stack size on the frame clock and act only on change.
@@ -1801,7 +1824,8 @@ impl GMainWindow {
         }
 
         let render = self.render.borrow();
-        let layout = render.as_ref()?.framebuffer_layout.read().ok()?;
+        let layout_owner = render.as_ref()?.emu_window.framebuffer_layout();
+        let layout = layout_owner.read().ok()?;
         map_render_pointer(local_x, local_y, width, height, &layout)
     }
 
@@ -2741,7 +2765,8 @@ impl GMainWindow {
                 .borrow()
                 .as_ref()
                 .map(|render| {
-                    let current = render.framebuffer_layout.read().unwrap();
+                    let layout_owner = render.emu_window.framebuffer_layout();
+                    let current = layout_owner.read().unwrap();
                     (height as f64 * current.width as f64 / current.height as f64).round() as u32
                 })
                 .unwrap_or(height * 16 / 9),
@@ -3162,9 +3187,9 @@ impl GMainWindow {
         // Remember the render handles so the surface can be resized with the
         // window.
         *self.render.borrow_mut() = Some(RenderHandles {
+            emu_window: emu,
             child_window: layer.child_window as usize,
             metal_layer: layer.metal_layer as usize,
-            framebuffer_layout: Arc::clone(&framebuffer_layout),
         });
         self.render_size
             .set((self.stack.width(), self.stack.height()));
@@ -3350,16 +3375,17 @@ impl GMainWindow {
             render_surface: embedded.window as usize,
             render_surface_scale: embedded.scale,
         };
-        let emu = GtkEmuWindow::from_window_info(window_info.clone(), embedded.drawable_size);
+        let emu = GtkEmuWindow::from_window_info(window_info, embedded.drawable_size);
+        let window_info = emu.window_info().clone();
         let drawable_size = emu.drawable_size();
         let shown_state = emu.shown_state();
         let framebuffer_layout = emu.framebuffer_layout();
 
         *self.render.borrow_mut() = Some(RenderHandles {
+            emu_window: emu,
             display: embedded.display as usize,
             child_window: embedded.window as usize,
             colormap: embedded.colormap,
-            framebuffer_layout: Arc::clone(&framebuffer_layout),
         });
         self.render_size
             .set((self.stack.width(), self.stack.height()));
@@ -3536,14 +3562,15 @@ impl GMainWindow {
             render_surface: embedded.window as usize,
             render_surface_scale: embedded.scale,
         };
-        let emu = GtkEmuWindow::from_window_info(window_info.clone(), embedded.drawable_size);
+        let emu = GtkEmuWindow::from_window_info(window_info, embedded.drawable_size);
+        let window_info = emu.window_info().clone();
         let drawable_size = emu.drawable_size();
         let shown_state = emu.shown_state();
         let framebuffer_layout = emu.framebuffer_layout();
 
         *self.render.borrow_mut() = Some(RenderHandles {
+            emu_window: emu,
             child_window: embedded.window as usize,
-            framebuffer_layout: Arc::clone(&framebuffer_layout),
         });
         self.render_size
             .set((self.stack.width(), self.stack.height()));
@@ -3661,8 +3688,8 @@ impl GMainWindow {
         if w <= 0 || h <= 0 || self.render_size.get() == (w, h) {
             return;
         }
-        let render = self.render.borrow();
-        let Some(handles) = render.as_ref() else {
+        let mut render = self.render.borrow_mut();
+        let Some(handles) = render.as_mut() else {
             self.render_size.set((w, h));
             return;
         };
@@ -3686,7 +3713,7 @@ impl GMainWindow {
             handles.metal_layer as *mut _,
             gr,
         ) {
-            *handles.framebuffer_layout.write().unwrap() = default_frame_layout(dw, dh);
+            handles.emu_window.update_framebuffer_layout(dw, dh);
         }
     }
 
@@ -3698,8 +3725,8 @@ impl GMainWindow {
         if w <= 0 || h <= 0 || self.render_size.get() == (w, h) {
             return;
         }
-        let render = self.render.borrow();
-        let Some(handles) = render.as_ref() else {
+        let mut render = self.render.borrow_mut();
+        let Some(handles) = render.as_mut() else {
             self.render_size.set((w, h));
             return;
         };
@@ -3719,7 +3746,7 @@ impl GMainWindow {
             handles.child_window as u64,
             gr,
         ) {
-            *handles.framebuffer_layout.write().unwrap() = default_frame_layout(dw, dh);
+            handles.emu_window.update_framebuffer_layout(dw, dh);
         }
     }
 
@@ -3731,8 +3758,8 @@ impl GMainWindow {
         if width <= 0 || height <= 0 || self.render_size.get() == (width, height) {
             return;
         }
-        let render = self.render.borrow();
-        let Some(handles) = render.as_ref() else {
+        let mut render = self.render.borrow_mut();
+        let Some(handles) = render.as_mut() else {
             self.render_size.set((width, height));
             return;
         };
@@ -3753,8 +3780,9 @@ impl GMainWindow {
                 gtk_rect,
             )
         {
-            *handles.framebuffer_layout.write().unwrap() =
-                default_frame_layout(drawable_width, drawable_height);
+            handles
+                .emu_window
+                .update_framebuffer_layout(drawable_width, drawable_height);
         }
     }
 

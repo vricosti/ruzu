@@ -4529,3 +4529,18 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
   `frontend/maxwell/` directory.
 - Part of Eden's `frontend/maxwell/translate_program.cpp` driver still lives in Ruzu's
   `pipeline_cache.rs`; its compile/cache callers and translation ownership need to be separated.
+
+## 2026-08-22 — GTK configuration helpers and render-window lifecycle vs Eden Qt frontend
+
+### Intentional differences
+
+- `days_from_civil` is compiled on non-Unix hosts (and in tests) only. Unix production builds use
+  `libc::mktime`, matching Qt's local-time conversion without carrying the portable fallback as
+  dead code.
+- Cairo's Joy-Con SL/SR buttons use the direction-free `round_button` primitive directly, so the
+  Qt-only `Direction::None` sentinel is not part of the Rust direction enum.
+- Ruzu has one console-mode label table for the status control. Eden reuses its configuration map
+  there; Ruzu's system page is a handheld-mode checkbox and therefore has no second table consumer.
+- `GtkEmuWindow` is retained by `RenderHandles` for the full session. GTK map/unmap signals update
+  its shared visibility flag, and platform resize paths call its framebuffer-layout method; this is
+  the GTK ownership counterpart of Eden's persistent `GRenderWindow`.

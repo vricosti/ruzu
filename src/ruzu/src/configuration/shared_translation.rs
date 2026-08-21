@@ -291,11 +291,6 @@ pub const MEMORY_LAYOUT: &[(MemoryLayout, &str)] = &[
     (MemoryLayout::Memory12Gb, "12GB DRAM (Unsafe)"),
 ];
 
-pub const CONSOLE_MODE: &[(ConsoleMode, &str)] = &[
-    (ConsoleMode::Docked, "Docked"),
-    (ConsoleMode::Handheld, "Handheld"),
-];
-
 // Exact status-bar context-menu maps from
 // `qt_common/config/shared_translation.h`. These deliberately remain separate
 // from the configuration combobox tables above: upstream uses shorter labels
@@ -359,7 +354,6 @@ mod tests {
         // NVDEC and marks it "(Default)".
         assert_eq!(NVDEC_EMULATION[2].1, "GPU Video Decoding (Default)");
         assert_eq!(RESOLUTION_SETUP[3].1, "1X (720p/1080p)");
-        assert_eq!(CONSOLE_MODE[0].1, "Docked");
         assert_eq!(MEMORY_LAYOUT[2].1, "8GB DRAM");
         assert_eq!(MEMORY_LAYOUT[3].0, MemoryLayout::Memory10Gb);
         assert_eq!(MEMORY_LAYOUT[4].0, MemoryLayout::Memory12Gb);
@@ -410,14 +404,6 @@ mod tests {
     fn labels_extracts_the_display_column() {
         let l = labels(CPU_BACKEND);
         assert_eq!(l, vec!["Dynarmic", "NCE"]);
-    }
-
-    #[test]
-    fn console_mode_table_order_differs_from_enum_order() {
-        // Upstream lists Docked first in the UI even though the enum declares
-        // Handheld first — a real ordering divergence worth pinning down.
-        assert_eq!(CONSOLE_MODE[0].0, ConsoleMode::Docked);
-        assert_eq!(CONSOLE_MODE[1].0, ConsoleMode::Handheld);
     }
 
     #[test]
