@@ -4371,3 +4371,13 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 - The native C shim retains Eden's `DecoderContext::m_decoder` codec pointer inside
   `RuzuFfmpegDecoder`; the Rust wrapper therefore does not duplicate that codec or hold a
   self-referential borrow into `DecodeApi::decoder`.
+
+## 2026-08-21 — `src/video_core/src/renderer_vulkan/present/fsr.rs` vs `src/video_core/renderer_vulkan/present/fsr.h` and `.cpp`
+
+### Intentional differences
+
+- `CreateImages` borrows `MemoryAllocator` for the call instead of retaining Eden's allocator
+  reference in `FSR`; retaining a borrow would make the owning Rust `Layer` self-referential.
+- `CreateShaders` receives the already-queried float16 capability because the local raw
+  `ash::Device` does not own Eden's `Device::IsFloat16Supported` capability state. Shader
+  selection and construction order otherwise match Eden.
