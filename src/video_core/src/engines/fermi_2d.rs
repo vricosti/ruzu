@@ -21,10 +21,9 @@ use std::sync::Arc;
 
 // Destination surface descriptor (0x80..0x89)
 const DST_FORMAT: u32 = 0x80;
+#[cfg(test)]
 const DST_LINEAR: u32 = 0x81;
-const DST_BLOCK_DIMENSIONS: u32 = 0x82;
 const DST_DEPTH: u32 = 0x83;
-const DST_LAYER: u32 = 0x84;
 const DST_PITCH: u32 = 0x85;
 const DST_WIDTH: u32 = 0x86;
 const DST_HEIGHT: u32 = 0x87;
@@ -33,9 +32,12 @@ const DST_ADDR_LOW: u32 = 0x89;
 
 // Source surface descriptor (0x8C..0x95)
 const SRC_FORMAT: u32 = 0x8C;
+#[cfg(test)]
 const SRC_LINEAR: u32 = 0x8D;
+#[cfg(test)]
 const SRC_BLOCK_DIMENSIONS: u32 = 0x8E;
 const SRC_DEPTH: u32 = 0x8F;
+#[cfg(test)]
 const SRC_LAYER: u32 = 0x90;
 const SRC_PITCH: u32 = 0x91;
 const SRC_WIDTH: u32 = 0x92;
@@ -44,21 +46,33 @@ const SRC_ADDR_HIGH: u32 = 0x94;
 const SRC_ADDR_LOW: u32 = 0x95;
 
 // General blit state
+#[cfg(test)]
 const OPERATION: u32 = 0xAB;
-const CLIP_ENABLE: u32 = 0xA4;
 
 // pixels_from_memory (0x220..0x237)
+#[cfg(test)]
 const PIXELS_FROM_MEMORY_SAMPLE_MODE: u32 = 0x223;
+#[cfg(test)]
 const PIXELS_FROM_MEMORY_DST_X0: u32 = 0x22C;
+#[cfg(test)]
 const PIXELS_FROM_MEMORY_DST_Y0: u32 = 0x22D;
+#[cfg(test)]
 const PIXELS_FROM_MEMORY_DST_WIDTH: u32 = 0x22E;
+#[cfg(test)]
 const PIXELS_FROM_MEMORY_DST_HEIGHT: u32 = 0x22F;
+#[cfg(test)]
 const PIXELS_FROM_MEMORY_DU_DX_LOW: u32 = 0x230;
+#[cfg(test)]
 const PIXELS_FROM_MEMORY_DU_DX_HIGH: u32 = 0x231;
+#[cfg(test)]
 const PIXELS_FROM_MEMORY_DV_DY_LOW: u32 = 0x232;
+#[cfg(test)]
 const PIXELS_FROM_MEMORY_DV_DY_HIGH: u32 = 0x233;
+#[cfg(test)]
 const PIXELS_FROM_MEMORY_SRC_X0_LOW: u32 = 0x234;
+#[cfg(test)]
 const PIXELS_FROM_MEMORY_SRC_X0_HIGH: u32 = 0x235;
+#[cfg(test)]
 const PIXELS_FROM_MEMORY_SRC_Y0_LOW: u32 = 0x236;
 const PIXELS_FROM_MEMORY_SRC_Y0_HIGH: u32 = 0x237;
 
@@ -284,6 +298,7 @@ struct BlockDimensionsRaw {
     raw: u32,
 }
 
+#[cfg(test)]
 impl BlockDimensionsRaw {
     fn block_width(self) -> u32 {
         self.raw & 0xF
@@ -342,6 +357,7 @@ impl SampleModeRaw {
 #[repr(transparent)]
 struct BlockShapeRaw(u32);
 
+#[cfg(test)]
 impl BlockShapeRaw {
     fn get(self) -> u32 {
         self.0 & 0x7
@@ -352,6 +368,7 @@ impl BlockShapeRaw {
 #[repr(transparent)]
 struct CorralSizeRaw(u32);
 
+#[cfg(test)]
 impl CorralSizeRaw {
     fn get(self) -> u32 {
         self.0 & 0x1F
@@ -362,6 +379,7 @@ impl CorralSizeRaw {
 #[repr(transparent)]
 struct SafeOverlapRaw(u32);
 
+#[cfg(test)]
 impl SafeOverlapRaw {
     fn get(self) -> bool {
         (self.0 & 1) != 0
@@ -372,6 +390,7 @@ impl SafeOverlapRaw {
 #[repr(transparent)]
 struct NotifyTypeRaw(u32);
 
+#[cfg(test)]
 impl NotifyTypeRaw {
     fn get(self) -> NotifyType {
         match self.0 {
@@ -385,6 +404,7 @@ impl NotifyTypeRaw {
 #[repr(transparent)]
 struct CpuIndexWrapRaw(u32);
 
+#[cfg(test)]
 impl CpuIndexWrapRaw {
     fn get(self) -> CpuIndexWrap {
         match self.0 {
@@ -398,6 +418,7 @@ impl CpuIndexWrapRaw {
 #[repr(transparent)]
 struct Kind2dCheckEnableRaw(u32);
 
+#[cfg(test)]
 impl Kind2dCheckEnableRaw {
     fn get(self) -> u32 {
         self.0
@@ -408,6 +429,7 @@ impl Kind2dCheckEnableRaw {
 #[repr(transparent)]
 struct SectorPromotionRaw(u32);
 
+#[cfg(test)]
 impl SectorPromotionRaw {
     fn get(self) -> SectorPromotion {
         match self.0 {
@@ -423,6 +445,7 @@ impl SectorPromotionRaw {
 #[repr(transparent)]
 struct NumTpcsRaw(u32);
 
+#[cfg(test)]
 impl NumTpcsRaw {
     fn get(self) -> NumTpcs {
         match self.0 {
@@ -436,6 +459,7 @@ impl NumTpcsRaw {
 #[repr(transparent)]
 struct RenderEnableModeRaw(u32);
 
+#[cfg(test)]
 impl RenderEnableModeRaw {
     fn get(self) -> RenderEnableMode {
         match self.0 {
@@ -452,6 +476,7 @@ impl RenderEnableModeRaw {
 #[repr(transparent)]
 struct ColorKeyFormatRaw(u32);
 
+#[cfg(test)]
 impl ColorKeyFormatRaw {
     fn get(self) -> ColorKeyFormat {
         match self.0 & 0x7 {
@@ -480,6 +505,7 @@ impl BoolBitRaw {
 #[repr(transparent)]
 struct RopRaw(u32);
 
+#[cfg(test)]
 impl RopRaw {
     fn get(self) -> u32 {
         self.0 & 0xFF
@@ -490,6 +516,7 @@ impl RopRaw {
 #[repr(transparent)]
 struct Beta1Raw(u32);
 
+#[cfg(test)]
 impl Beta1Raw {
     fn get(self) -> u32 {
         self.0
@@ -519,6 +546,7 @@ impl OperationRaw {
 #[repr(transparent)]
 struct PatternSelectRaw(u32);
 
+#[cfg(test)]
 impl PatternSelectRaw {
     fn get(self) -> PatternSelect {
         match self.0 & 0x3 {
@@ -534,6 +562,7 @@ impl PatternSelectRaw {
 #[repr(transparent)]
 struct MonochromePatternColorFormatRaw(u32);
 
+#[cfg(test)]
 impl MonochromePatternColorFormatRaw {
     fn get(self) -> MonochromePatternColorFormat {
         match self.0 & 0x7 {
@@ -551,6 +580,7 @@ impl MonochromePatternColorFormatRaw {
 #[repr(transparent)]
 struct MonochromePatternFormatRaw(u32);
 
+#[cfg(test)]
 impl MonochromePatternFormatRaw {
     fn get(self) -> MonochromePatternFormat {
         match self.0 & 1 {
@@ -564,6 +594,7 @@ impl MonochromePatternFormatRaw {
 #[repr(transparent)]
 struct BigEndianControlRaw(u32);
 
+#[cfg(test)]
 impl BigEndianControlRaw {
     fn get(self) -> u32 {
         self.0
@@ -592,14 +623,17 @@ unsafe impl Zeroable for PixelsFromMemory {}
 unsafe impl Pod for PixelsFromMemory {}
 
 impl PixelsFromMemory {
+    #[cfg(test)]
     fn block_shape(&self) -> u32 {
         self.block_shape.get()
     }
 
+    #[cfg(test)]
     fn corral_size(&self) -> u32 {
         self.corral_size.get()
     }
 
+    #[cfg(test)]
     fn safe_overlap(&self) -> bool {
         self.safe_overlap.get()
     }
@@ -651,6 +685,7 @@ struct Beta4Raw {
     raw: u32,
 }
 
+#[cfg(test)]
 impl Beta4Raw {
     fn b(self) -> u32 {
         self.raw & 0xFF
@@ -678,6 +713,7 @@ struct PatternOffsetRaw {
     raw: u32,
 }
 
+#[cfg(test)]
 impl PatternOffsetRaw {
     fn x(self) -> u32 {
         self.raw & 0x3F
@@ -702,6 +738,7 @@ struct MonochromePatternRaw {
     pattern1: u32,
 }
 
+#[cfg(test)]
 impl MonochromePatternRaw {
     fn color_format(self) -> MonochromePatternColorFormat {
         self.color_format.get()
@@ -740,6 +777,7 @@ struct ColorPatternRaw {
     y8: [u32; 0x10],
 }
 
+#[cfg(test)]
 impl ColorPatternRaw {
     fn x8r8g8b8(self, index: usize) -> u32 {
         self.x8r8g8b8[index]
@@ -779,6 +817,7 @@ struct PointRaw {
     y: u32,
 }
 
+#[cfg(test)]
 impl PointRaw {
     fn x(self) -> u32 {
         self.x
@@ -805,6 +844,7 @@ struct RenderSolidRaw {
     prim_point: [PointRaw; 0x40],
 }
 
+#[cfg(test)]
 impl RenderSolidRaw {
     fn prim_mode(self) -> u32 {
         self.prim_mode
@@ -874,6 +914,7 @@ struct PixelsFromCpuRaw {
     data: u32,
 }
 
+#[cfg(test)]
 impl PixelsFromCpuRaw {
     fn data_type(self) -> u32 {
         self.data_type
@@ -1084,10 +1125,12 @@ impl Default for ActiveRegsRaw {
 }
 
 impl ActiveRegsRaw {
+    #[cfg(test)]
     fn render_enable_address(self) -> u64 {
         ((self.render_enable_addr_upper as u64) << 32) | self.render_enable_addr_lower as u64
     }
 
+    #[cfg(test)]
     fn render_enable_mode(self) -> RenderEnableMode {
         self.render_enable_mode.get()
     }
@@ -1096,10 +1139,12 @@ impl ActiveRegsRaw {
         self.clip_enable.get()
     }
 
+    #[cfg(test)]
     fn color_key_format(self) -> ColorKeyFormat {
         self.color_key_format.get()
     }
 
+    #[cfg(test)]
     fn color_key_enabled(self) -> bool {
         self.color_key_enable.get()
     }
@@ -1334,6 +1379,7 @@ impl Fermi2D {
         unsafe { std::slice::from_raw_parts_mut(ptr, ENGINE_REG_COUNT) }
     }
 
+    #[cfg(test)]
     fn upstream_reg_array(&self) -> &[u32; NUM_REGS_WORDS] {
         unsafe { &self.regs.regs.reg_array }
     }
@@ -1426,6 +1472,7 @@ impl Fermi2D {
         self.regs_head().active
     }
 
+    #[cfg(test)]
     fn regs_raw(&self) -> RegsRaw {
         *self.regs_head()
     }
