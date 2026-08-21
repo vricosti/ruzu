@@ -2875,3 +2875,29 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 ### Binary layout verification
 
 - N/A: this slice only changes test assertions and removes an unused production import.
+
+## 2026-08-21 — `src/common/src/dynamic_library.rs` vs Eden `src/common/dynamic_library.{h,cpp}`
+
+### Intentional differences
+
+- Rust's owned `DynamicLibrary` value is non-copyable by default and transfers ownership through
+  ordinary moves; `Drop` implements Eden's destructor cleanup.
+- `Option<i32>` represents Eden's `-1` major/minor sentinel in
+  `get_versioned_filename`.
+- Rust converts symbol and file names to `CString` and rejects embedded NUL bytes before calling
+  the platform loader; Eden receives pre-existing C strings.
+- `get_symbol<T>` returns `Option<T>` instead of assigning through an output pointer and returning
+  `bool`.
+
+### Unintentional differences (to fix)
+
+- None. `open` now matches Eden's ordering and replaces the stored handle without first calling
+  `close`; the previous pre-emptive cleanup was a Rust-only lifecycle change.
+
+### Missing items
+
+- None from the upstream `DynamicLibrary` interface.
+
+### Binary layout verification
+
+- N/A: the platform loader handle is host-only state and is never serialized.

@@ -1,13 +1,13 @@
 // SPDX-FileCopyrightText: 2019 Dolphin Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-//! Port of zuyu/src/common/dynamic_library.h and zuyu/src/common/dynamic_library.cpp
+//! Port of Eden `src/common/dynamic_library.h` and `src/common/dynamic_library.cpp`.
 //!
 //! Provides a platform-independent interface for loading a dynamic library
 //! and retrieving symbols. Uses `dlopen`/`dlsym` on Unix and
 //! `LoadLibraryA`/`GetProcAddress` on Windows.
 
-use std::ffi::{CStr, CString};
+use std::ffi::CString;
 use std::os::raw::c_void;
 
 /// Provides a platform-independent interface for loading a dynamic library
@@ -145,9 +145,6 @@ impl DynamicLibrary {
     /// Returns true if the library was loaded and can be used.
     /// Corresponds to `DynamicLibrary::Open`.
     pub fn open(&mut self, filename: &str) -> bool {
-        // Close any existing library first.
-        self.close();
-
         let c_filename = match CString::new(filename) {
             Ok(s) => s,
             Err(_) => return false,
