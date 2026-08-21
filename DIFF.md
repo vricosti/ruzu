@@ -2328,3 +2328,27 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 ### Binary layout verification
 
 - N/A: the removed component was host-only JSON state.
+
+## 2026-08-21 — dead-code cleanup in `src/common/src/heap_tracker.rs` vs Eden `src/common/heap_tracker.{h,cpp}`
+
+### Intentional differences
+
+- The active Ruzu implementation currently uses two safe `BTreeMap` indexes where Eden owns two
+  intrusive red-black trees over each `SeparateHeapMap`. This is an existing structural and
+  performance divergence and remains explicit parity debt.
+
+### Unintentional differences (to fix)
+
+- None introduced by this cleanup. The removed `SeparateHeapMap`, `AddrNode`, `TickNode`,
+  `HeapTrackerInner`, comparators, and partial `addr_tree` helpers formed a separate abandoned
+  implementation that was never constructed or referenced by the active `HeapTracker`.
+
+### Missing items
+
+- A future parity slice must replace the active `BTreeMap` representation with the same dual-tree
+  ownership model as Eden; retaining an unused partial tree beside it did not provide that parity.
+
+### Binary layout verification
+
+- N/A for the removed host-only structures. The active mapping records are not copied to guest
+  memory or serialized.
