@@ -1242,7 +1242,6 @@ impl PathFormatter {
         }
 
         // Handle relative path
-        let mut relative_len: usize = 0;
         if flags.is_relative_path_allowed() {
             if cur_pos >= dst_size {
                 return Err(RESULT_TOO_LONG_PATH);
@@ -1254,7 +1253,6 @@ impl PathFormatter {
                 let copy_len = (rel_buf.len() - 1).min(dst_size.saturating_sub(cur_pos));
                 dst[cur_pos..cur_pos + copy_len].copy_from_slice(&rel_buf[..copy_len]);
             }
-            relative_len = rlen;
             cur_pos += rlen;
             src = &src[rel_offset..];
 
@@ -1314,13 +1312,14 @@ impl PathFormatter {
 
         // Handle backslash replacement
         if backslash_contained && flags.is_windows_path_allowed() {
-            let src_len = strlen(src);
-            let mut replaced = vec![0u8; src_len + 1];
-            replaced[..src_len].copy_from_slice(&src[..src_len]);
-            replaced[src_len] = NULL_TERMINATOR;
+            let consumed = path.len() - src.len();
+            let replaced_src_len = path_len - consumed;
+            let mut replaced = vec![0u8; replaced_src_len];
+            let copy_len = strlen(src).min(replaced_src_len.saturating_sub(1));
+            replaced[..copy_len].copy_from_slice(&src[..copy_len]);
             replace(
                 &mut replaced,
-                src_len,
+                replaced_src_len,
                 ALTERNATE_DIRECTORY_SEPARATOR,
                 DIRECTORY_SEPARATOR,
             );
@@ -1351,4 +1350,22 @@ impl PathFormatter {
 /// Wrapper to avoid name collision with `is_windows_path` imported from module level.
 fn is_windows_path_fn(path: &[u8], allow_forward_slash_unc: bool) -> bool {
     is_windows_path(path, allow_forward_slash_unc)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn formatter_backslash_replacement_honors_source_buffer_length() {
+        let path = b"foo\\bar\0";
+        let mut output = [0u8; 16];
+        let mut flags = PathFlags::new();
+        flags.allow_relative_path();
+        flags.allow_windows_path();
+
+        PathFormatter::normalize(&mut output, 16, path, 5, &flags).unwrap();
+
+        assert_eq!(&output[..6], b"./foo\0");
+    }
 }

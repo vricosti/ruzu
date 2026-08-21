@@ -2529,3 +2529,29 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 - PASS: the existing compile-time assertion still verifies
   `ConsoleSixAxisSensorSharedMemoryFormat` is `0x20` bytes; the focused test verifies the exact
   fields projected by Eden's update.
+
+## 2026-08-21 — `src/core/src/file_sys/fs_path_utility.rs` vs Eden `src/core/file_sys/fs_path_utility.h` bounded backslash replacement
+
+### Intentional differences
+
+- Rust uses a zero-initialized `Vec<u8>` plus a bounded slice copy for Eden's temporary allocation
+  and `Strlcpy`; both reserve the caller-provided remaining buffer length and terminate the copied
+  source within that bound.
+
+### Unintentional differences (to fix)
+
+- None. The Windows-path backslash replacement now computes `replaced_src_len` from the supplied
+  `path_len` minus the consumed source prefix, rather than ignoring `path_len` and sizing from
+  `strlen(src)`. This matches Eden when the caller's source-buffer bound truncates the visible
+  string.
+- The Rust-only outer `relative_len` temporary was removed; `rlen` still advances `cur_pos` at the
+  exact point where Eden consumes `relative_len`.
+
+### Missing items
+
+- None in the reviewed `PathFormatter::Normalize` backslash-replacement branch.
+
+### Binary layout verification
+
+- N/A: the regression test verifies bounded byte-copy and normalized output behavior; no struct
+  layout changed.
