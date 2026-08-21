@@ -465,7 +465,6 @@ fn thumb32_blx_imm(ir: &mut A32IREmitter, inst: &DecodedThumb32) -> bool {
 
 fn thumb32_ldr(ir: &mut A32IREmitter, inst: &DecodedThumb32) -> bool {
     let rt = inst.rt();
-    let rn = inst.rn();
     let address = compute_thumb32_ls_address(ir, inst);
     let value = ir.read_memory_32(address, AccType::Normal);
     if rt == Reg::R15 {

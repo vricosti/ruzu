@@ -3885,3 +3885,25 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 ### Binary layout verification
 
 - N/A: only local diagnostics and test builders changed.
+
+## 2026-08-21 — `src/rdynarmic/src/frontend/a32/{decoder.rs,decoder_thumb32.rs,translate/thumb32.rs}` vs Eden `src/dynarmic/src/dynarmic/frontend/A32/{decoder,translate/impl}`
+
+### Intentional differences
+
+- Ruzu's handwritten decoder helpers replace Eden's generated instruction-pattern tables. Their
+  internal signatures now carry only the bitfields they actually inspect; decoded instruction
+  names and translation ownership remain unchanged.
+- Regression names describe the observed instruction sequence generically instead of referring to
+  a commercial title; opcodes, fixtures, and assertions are unchanged.
+
+### Unintentional differences (to fix)
+
+- None in this dead-local warning slice.
+
+### Missing items
+
+- The broader handwritten-decoder parity surface is outside this focused no-behavior-change audit.
+
+### Binary layout verification
+
+- N/A: decoder locals and helper parameters define no serialized structure.

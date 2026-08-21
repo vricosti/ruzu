@@ -784,7 +784,6 @@ fn decode_arm_unconditional(instr: u32) -> ArmInstId {
 
 fn decode_arm_dp_misc(instr: u32) -> ArmInstId {
     let op = (instr >> 20) & 0x1F;
-    let op2 = (instr >> 4) & 0xF;
     let bit7 = (instr >> 7) & 1;
     let bit4 = (instr >> 4) & 1;
 
@@ -827,7 +826,7 @@ fn decode_arm_dp_misc(instr: u32) -> ArmInstId {
 
     // Register-shifted register: bit4=1, bit7=0
     if bit4 == 1 && bit7 == 0 {
-        return decode_arm_dp_rsr(instr, op);
+        return decode_arm_dp_rsr(op);
     }
 
     // Register: bit4=0
@@ -856,7 +855,7 @@ fn decode_arm_dp_misc(instr: u32) -> ArmInstId {
     }
 }
 
-fn decode_arm_dp_rsr(instr: u32, op: u32) -> ArmInstId {
+fn decode_arm_dp_rsr(op: u32) -> ArmInstId {
     match op >> 1 {
         0b0000 => ArmInstId::AND_rsr,
         0b0001 => ArmInstId::EOR_rsr,
@@ -903,7 +902,6 @@ fn decode_arm_misc(instr: u32) -> ArmInstId {
         0b0111 => ArmInstId::BKPT,
         _ => {
             // MRS/MSR
-            let op = (instr >> 21) & 3;
             let bit20 = (instr >> 20) & 1;
             if op2 == 0 && bit20 == 0 {
                 if (instr >> 21) & 1 == 0 {
@@ -1988,7 +1986,7 @@ mod tests {
     }
 
     #[test]
-    fn test_decode_super_mario_party_narrowing_instructions() {
+    fn test_decode_observed_narrowing_instructions() {
         assert_eq!(decode_arm(0xF2E0_3830).id, ArmInstId::ASIMD_VSHRN);
         assert_eq!(decode_arm(0xF3FA_2220).id, ArmInstId::ASIMD_VMOVN);
     }

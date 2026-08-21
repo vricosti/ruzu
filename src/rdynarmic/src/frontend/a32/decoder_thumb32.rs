@@ -390,7 +390,7 @@ pub fn decode_thumb32(hw1: u16, hw2: u16) -> DecodedThumb32 {
         match op1 {
             0b01 => decode_thumb32_01(raw, op2, op),
             0b10 => decode_thumb32_10(raw, op2, op),
-            0b11 => decode_thumb32_11(raw, op2, op),
+            0b11 => decode_thumb32_11(raw, op2),
             _ => Thumb32InstId::Unknown,
         }
     };
@@ -431,7 +431,7 @@ fn decode_thumb32_10(raw: u32, op2: u32, op: u32) -> Thumb32InstId {
     }
 }
 
-fn decode_thumb32_11(raw: u32, op2: u32, op: u32) -> Thumb32InstId {
+fn decode_thumb32_11(raw: u32, op2: u32) -> Thumb32InstId {
     match op2 >> 3 {
         // Load/Store single
         0b0000..=0b0011 => decode_thumb32_ls_single(raw),

@@ -1748,7 +1748,7 @@ mod tests {
     }
 
     #[test]
-    fn test_super_mario_party_vshrn_vmovn_regression_sequence() {
+    fn test_vshrn_vmovn_regression_sequence() {
         let env = TestEnv::new(vec![
             0xF2E0_3830, // VSHRN.I64 D19, Q8, #32
             0xF3FA_2220, // VMOVN.I64 D18, Q8

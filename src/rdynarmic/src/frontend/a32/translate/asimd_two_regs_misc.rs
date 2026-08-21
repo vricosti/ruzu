@@ -42,7 +42,7 @@ mod tests {
     use crate::ir::opcode::Opcode;
 
     #[test]
-    fn super_mario_party_vmovn_i64_emits_narrow() {
+    fn observed_vmovn_i64_emits_narrow() {
         let loc = A32LocationDescriptor::at(0x2000);
         let mut block = Block::new(loc.to_location());
         let decoded = DecodedArm {

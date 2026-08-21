@@ -344,7 +344,7 @@ mod tests {
     }
 
     #[test]
-    fn super_mario_party_vshrn_i64_emits_shift_then_narrow() {
+    fn observed_vshrn_i64_emits_shift_then_narrow() {
         let opcodes = translate_with(
             DecodedArm {
                 raw: 0xF2E0_3830,
