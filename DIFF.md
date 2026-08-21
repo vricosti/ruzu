@@ -3518,3 +3518,29 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 ### Binary layout verification
 
 - N/A: block translation control flow defines no serialized guest structure.
+
+## 2026-08-21 — `src/rdynarmic/src/ir/opt/a32_get_set_elimination.rs` pending-C forwarding vs Eden `src/dynarmic/src/dynarmic/ir/{opt_passes.cpp,opt_passes.h}`
+
+### Intentional differences
+
+- Eden inserts `GetCFlagFromNZCV`, breaks from the switch, and lets reverse-iterator movement
+  revisit the shifted `A32SetCpsrNZCV`. Rust's indexed arena inserts before the set, adjusts the
+  pending use and set indices, and completes the same set handling in the current iteration. The
+  resulting instruction order and optimizer state are identical.
+- The Rust pass is split into its own ownership file instead of remaining a static section of
+  Eden's large `opt_passes.cpp`; this is an existing Rust module boundary for a named upstream
+  pass, and its comments now point to the actual current Eden owner.
+
+### Unintentional differences (to fix)
+
+- None in the re-audited pending-C/`A32SetCpsrNZCV` path. The removed boolean assignment was
+  overwritten by the complete `FlagInfo::set_not_required()` state before any read.
+
+### Missing items
+
+- None in this warning-driven path. The rest of `FlagsPass` and `RegisterPass` was not newly
+  claimed by this focused audit.
+
+### Binary layout verification
+
+- N/A: this optimizer rewrites internal SSA and defines no serialized structure.

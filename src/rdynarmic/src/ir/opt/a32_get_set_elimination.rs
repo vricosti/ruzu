@@ -15,7 +15,7 @@ pub fn a32_get_set_elimination(block: &mut Block) {
 // ---------------------------------------------------------------------------
 // FlagsPass — reverse iteration over flag operations
 // ---------------------------------------------------------------------------
-// Upstream: `a32_get_set_elimination_pass.cpp` lines 24-181
+// Upstream: `ir/opt_passes.cpp`, `FlagsPass`.
 
 struct FlagInfo {
     set_not_required: bool,
@@ -119,7 +119,6 @@ fn flags_pass(block: &mut Block) {
                         req.0 += 1;
                     }
                     block.replace_uses_with(req, Value::Inst(c));
-                    c_flag.has_value_request = false;
                     set_idx += 1;
                 }
 
@@ -243,7 +242,7 @@ fn get_recursive_opcode(block: &Block, value: Value) -> Option<Opcode> {
 // ---------------------------------------------------------------------------
 // RegisterPass — forward iteration over register Get/Set pairs
 // ---------------------------------------------------------------------------
-// Upstream: `a32_get_set_elimination_pass.cpp` lines 183-368
+// Upstream: `ir/opt_passes.cpp`, `RegisterPass`.
 
 struct RegInfo {
     register_value: Option<Value>,
