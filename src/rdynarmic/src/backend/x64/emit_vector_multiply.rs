@@ -415,33 +415,82 @@ pub fn emit_vector_polynomial_multiply_long64(
 }
 
 // ---------------------------------------------------------------------------
-// VectorPairedAdd — fallback
+// VectorPairedAddLower
 // ---------------------------------------------------------------------------
 
-macro_rules! define_paired_add {
-    ($name:ident, $ty:ty, $count:expr) => {
-        extern "C" fn $name(result: *mut [u8; 16], a: *const [u8; 16], b: *const [u8; 16]) {
-            unsafe {
-                let va: [$ty; $count] = std::mem::transmute(*a);
-                let vb: [$ty; $count] = std::mem::transmute(*b);
-                let mut out = [0 as $ty; $count];
-                let half = $count / 2;
-                for i in 0..half {
-                    out[i] = va[i * 2].wrapping_add(va[i * 2 + 1]);
-                }
-                for i in 0..half {
-                    out[half + i] = vb[i * 2].wrapping_add(vb[i * 2 + 1]);
-                }
-                *result = std::mem::transmute(out);
-            }
-        }
-    };
+pub fn emit_vector_paired_add_lower8(
+    _ctx: &EmitContext,
+    ra: &mut RegAlloc,
+    inst_ref: InstRef,
+    inst: &Inst,
+) {
+    let mut args = ra.get_argument_info(inst_ref, &inst.args, inst.num_args());
+    let a = ra.use_scratch_xmm(&mut args[0]);
+    let b = ra.use_xmm(&mut args[1]);
+    let tmp = ra.scratch_xmm();
+    ra.asm.punpcklqdq(a, b).unwrap();
+    ra.asm.movdqa(tmp, a).unwrap();
+    ra.asm.psllw_imm(a, 8).unwrap();
+    ra.asm.paddw(a, tmp).unwrap();
+    ra.asm.pxor(tmp, tmp).unwrap();
+    ra.asm.psrlw_imm(a, 8).unwrap();
+    ra.asm.packuswb(a, tmp).unwrap();
+    ra.release(tmp);
+    ra.define_value(inst_ref, a);
+}
+pub fn emit_vector_paired_add_lower16(
+    ctx: &EmitContext,
+    ra: &mut RegAlloc,
+    inst_ref: InstRef,
+    inst: &Inst,
+) {
+    let mut args = ra.get_argument_info(inst_ref, &inst.args, inst.num_args());
+    let a = ra.use_scratch_xmm(&mut args[0]);
+    let b = ra.use_xmm(&mut args[1]);
+    let tmp = ra.scratch_xmm();
+    ra.asm.punpcklqdq(a, b).unwrap();
+    if ctx.has_host_feature(HostFeature::SSSE3) {
+        ra.asm.pxor(tmp, tmp).unwrap();
+        ra.asm.phaddw(a, tmp).unwrap();
+    } else {
+        ra.asm.movdqa(tmp, a).unwrap();
+        ra.asm.pslld_imm(a, 16).unwrap();
+        ra.asm.paddd(a, tmp).unwrap();
+        ra.asm.pxor(tmp, tmp).unwrap();
+        ra.asm.psrad_imm(a, 16).unwrap();
+        ra.asm.packssdw(a, tmp).unwrap();
+    }
+    ra.release(tmp);
+    ra.define_value(inst_ref, a);
+}
+pub fn emit_vector_paired_add_lower32(
+    ctx: &EmitContext,
+    ra: &mut RegAlloc,
+    inst_ref: InstRef,
+    inst: &Inst,
+) {
+    let mut args = ra.get_argument_info(inst_ref, &inst.args, inst.num_args());
+    let a = ra.use_scratch_xmm(&mut args[0]);
+    let b = ra.use_xmm(&mut args[1]);
+    let tmp = ra.scratch_xmm();
+    ra.asm.punpcklqdq(a, b).unwrap();
+    if ctx.has_host_feature(HostFeature::SSSE3) {
+        ra.asm.pxor(tmp, tmp).unwrap();
+        ra.asm.phaddd(a, tmp).unwrap();
+    } else {
+        ra.asm.movdqa(tmp, a).unwrap();
+        ra.asm.psllq_imm(a, 32).unwrap();
+        ra.asm.paddq(a, tmp).unwrap();
+        ra.asm.psrlq_imm(a, 32).unwrap();
+        ra.asm.pshufd(a, a, 0b1101_1000).unwrap();
+    }
+    ra.release(tmp);
+    ra.define_value(inst_ref, a);
 }
 
-define_paired_add!(fallback_paired_add8, u8, 16);
-define_paired_add!(fallback_paired_add16, u16, 8);
-define_paired_add!(fallback_paired_add32, u32, 4);
-define_paired_add!(fallback_paired_add64, u64, 2);
+// ---------------------------------------------------------------------------
+// VectorPairedAdd
+// ---------------------------------------------------------------------------
 
 pub fn emit_vector_paired_add8(
     _ctx: &EmitContext,
@@ -449,18 +498,14 @@ pub fn emit_vector_paired_add8(
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    if std::env::var_os("RUZU_FORCE_PAIRED_ADD8_FALLBACK").is_some() {
-        emit_two_arg_fallback(ra, inst_ref, inst, fallback_paired_add8 as usize);
-        return;
-    }
     let mut args = ra.get_argument_info(inst_ref, &inst.args, inst.num_args());
     let a = ra.use_scratch_xmm(&mut args[0]);
     let b = ra.use_scratch_xmm(&mut args[1]);
     let c = ra.scratch_xmm();
     let d = ra.scratch_xmm();
 
-    ra.asm.movaps(c, a).unwrap();
-    ra.asm.movaps(d, b).unwrap();
+    ra.asm.movdqa(c, a).unwrap();
+    ra.asm.movdqa(d, b).unwrap();
     ra.asm.psllw_imm(a, 8).unwrap();
     ra.asm.psllw_imm(b, 8).unwrap();
     ra.asm.paddw(a, c).unwrap();
@@ -473,31 +518,67 @@ pub fn emit_vector_paired_add8(
     ra.release(d);
     ra.define_value(inst_ref, a);
 }
-// VectorPairedAdd16: SSSE3 phaddw (horizontal add packed words)
 pub fn emit_vector_paired_add16(
-    _ctx: &EmitContext,
+    ctx: &EmitContext,
     ra: &mut RegAlloc,
     inst_ref: InstRef,
     inst: &Inst,
 ) {
     let mut args = ra.get_argument_info(inst_ref, &inst.args, inst.num_args());
-    let result = ra.use_scratch_xmm(&mut args[0]);
-    let b = ra.use_xmm(&mut args[1]);
-    ra.asm.phaddw(result, b).unwrap();
-    ra.define_value(inst_ref, result);
+    if ctx.has_host_feature(HostFeature::SSSE3) {
+        let a = ra.use_scratch_xmm(&mut args[0]);
+        let b = ra.use_xmm(&mut args[1]);
+        ra.asm.phaddw(a, b).unwrap();
+        ra.define_value(inst_ref, a);
+    } else {
+        let a = ra.use_scratch_xmm(&mut args[0]);
+        let b = ra.use_scratch_xmm(&mut args[1]);
+        let c = ra.scratch_xmm();
+        let d = ra.scratch_xmm();
+        ra.asm.movdqa(c, a).unwrap();
+        ra.asm.movdqa(d, b).unwrap();
+        ra.asm.pslld_imm(a, 16).unwrap();
+        ra.asm.pslld_imm(b, 16).unwrap();
+        ra.asm.paddd(a, c).unwrap();
+        ra.asm.paddd(b, d).unwrap();
+        ra.asm.psrad_imm(a, 16).unwrap();
+        ra.asm.psrad_imm(b, 16).unwrap();
+        ra.asm.packssdw(a, b).unwrap();
+        ra.release(b);
+        ra.release(c);
+        ra.release(d);
+        ra.define_value(inst_ref, a);
+    }
 }
-// VectorPairedAdd32: SSSE3 phaddd (horizontal add packed dwords)
 pub fn emit_vector_paired_add32(
-    _ctx: &EmitContext,
+    ctx: &EmitContext,
     ra: &mut RegAlloc,
     inst_ref: InstRef,
     inst: &Inst,
 ) {
     let mut args = ra.get_argument_info(inst_ref, &inst.args, inst.num_args());
-    let result = ra.use_scratch_xmm(&mut args[0]);
-    let b = ra.use_xmm(&mut args[1]);
-    ra.asm.phaddd(result, b).unwrap();
-    ra.define_value(inst_ref, result);
+    if ctx.has_host_feature(HostFeature::SSSE3) {
+        let a = ra.use_scratch_xmm(&mut args[0]);
+        let b = ra.use_xmm(&mut args[1]);
+        ra.asm.phaddd(a, b).unwrap();
+        ra.define_value(inst_ref, a);
+    } else {
+        let a = ra.use_scratch_xmm(&mut args[0]);
+        let b = ra.use_scratch_xmm(&mut args[1]);
+        let c = ra.scratch_xmm();
+        let d = ra.scratch_xmm();
+        ra.asm.movdqa(c, a).unwrap();
+        ra.asm.movdqa(d, b).unwrap();
+        ra.asm.psllq_imm(a, 32).unwrap();
+        ra.asm.psllq_imm(b, 32).unwrap();
+        ra.asm.paddq(a, c).unwrap();
+        ra.asm.paddq(b, d).unwrap();
+        ra.asm.shufps(a, b, 0b1101_1101).unwrap();
+        ra.release(b);
+        ra.release(c);
+        ra.release(d);
+        ra.define_value(inst_ref, a);
+    }
 }
 pub fn emit_vector_paired_add64(
     _ctx: &EmitContext,
@@ -505,64 +586,16 @@ pub fn emit_vector_paired_add64(
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_two_arg_fallback(ra, inst_ref, inst, fallback_paired_add64 as usize);
-}
-
-// ---------------------------------------------------------------------------
-// VectorPairedAddLower — fallback (lower half only)
-// ---------------------------------------------------------------------------
-
-// D-form (64-bit) paired add. Mirrors upstream `LowerPairedOperation`:
-// pairs reduce HALF of each source vector (lower 64 bits) into HALF of the
-// destination, with upper destination lanes zeroed. For u8 (count=16):
-// range=4 pairs per input → 8 output lanes set, upper 8 zero.
-macro_rules! define_paired_add_lower {
-    ($name:ident, $ty:ty, $count:expr) => {
-        extern "C" fn $name(result: *mut [u8; 16], a: *const [u8; 16], b: *const [u8; 16]) {
-            unsafe {
-                let va: [$ty; $count] = std::mem::transmute(*a);
-                let vb: [$ty; $count] = std::mem::transmute(*b);
-                let mut out = [0 as $ty; $count];
-                let range = $count / 4;
-                for i in 0..range {
-                    out[i] = va[2 * i].wrapping_add(va[2 * i + 1]);
-                }
-                for i in 0..range {
-                    out[range + i] = vb[2 * i].wrapping_add(vb[2 * i + 1]);
-                }
-                *result = std::mem::transmute(out);
-            }
-        }
-    };
-}
-
-define_paired_add_lower!(fallback_paired_add_lower8, u8, 16);
-define_paired_add_lower!(fallback_paired_add_lower16, u16, 8);
-define_paired_add_lower!(fallback_paired_add_lower32, u32, 4);
-
-pub fn emit_vector_paired_add_lower8(
-    _ctx: &EmitContext,
-    ra: &mut RegAlloc,
-    inst_ref: InstRef,
-    inst: &Inst,
-) {
-    emit_two_arg_fallback(ra, inst_ref, inst, fallback_paired_add_lower8 as usize);
-}
-pub fn emit_vector_paired_add_lower16(
-    _ctx: &EmitContext,
-    ra: &mut RegAlloc,
-    inst_ref: InstRef,
-    inst: &Inst,
-) {
-    emit_two_arg_fallback(ra, inst_ref, inst, fallback_paired_add_lower16 as usize);
-}
-pub fn emit_vector_paired_add_lower32(
-    _ctx: &EmitContext,
-    ra: &mut RegAlloc,
-    inst_ref: InstRef,
-    inst: &Inst,
-) {
-    emit_two_arg_fallback(ra, inst_ref, inst, fallback_paired_add_lower32 as usize);
+    let mut args = ra.get_argument_info(inst_ref, &inst.args, inst.num_args());
+    let a = ra.use_scratch_xmm(&mut args[0]);
+    let b = ra.use_xmm(&mut args[1]);
+    let c = ra.scratch_xmm();
+    ra.asm.movdqa(c, a).unwrap();
+    ra.asm.punpcklqdq(a, b).unwrap();
+    ra.asm.punpckhqdq(c, b).unwrap();
+    ra.asm.paddq(a, c).unwrap();
+    ra.release(c);
+    ra.define_value(inst_ref, a);
 }
 
 // ---------------------------------------------------------------------------

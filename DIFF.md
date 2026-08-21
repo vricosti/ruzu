@@ -4057,3 +4057,29 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 ### Binary layout verification
 
 - N/A: the polyfill rewrites IR and the emitters define no shared or serialized structures.
+
+## 2026-08-21 — `src/rdynarmic/src/backend/x64/emit_vector_multiply.rs` vs `src/dynarmic/src/dynarmic/backend/x64/emit_x64_vector.cpp` (paired-add slice)
+
+### Intentional differences
+
+- Rust explicitly releases temporary register-allocation locks; Eden releases its scoped register
+  wrappers on scope exit. The emitted instruction ordering is otherwise preserved.
+- Eden declares emitter ownership through its opcode-driven emitter declaration machinery; Rust's
+  matching functions are dispatched explicitly from `backend/x64/emit.rs`.
+
+### Unintentional differences (to fix)
+
+- None in the focused slice. The 8/16/32/64-bit full-width emitters and the 8/16/32-bit lower
+  emitters now preserve Eden's exact SSE instruction sequences and SSSE3 feature branches.
+- Removed the scalar callback implementations and the Ruzu-only
+  `RUZU_FORCE_PAIRED_ADD8_FALLBACK` diagnostic branch. Eden emits these operations natively on
+  every supported x86-64 host.
+
+### Missing items
+
+- None among `VectorPairedAddLower8/16/32` and `VectorPairedAdd8/16/32/64`. The adjacent signed
+  and unsigned widening paired-add family is intentionally handled as the next auditable slice.
+
+### Binary layout verification
+
+- N/A: these methods emit JIT instructions and define no shared or serialized structures.

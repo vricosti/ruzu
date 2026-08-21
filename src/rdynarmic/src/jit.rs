@@ -10227,6 +10227,84 @@ mod tests {
 
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     #[test]
+    fn test_a64_addp_full_and_lower_all_element_sizes() {
+        fn vector_pair(bytes: [u8; 16]) -> (u64, u64) {
+            (
+                u64::from_le_bytes(bytes[..8].try_into().unwrap()),
+                u64::from_le_bytes(bytes[8..].try_into().unwrap()),
+            )
+        }
+
+        fn paired_add(a: [u8; 16], b: [u8; 16], element_bytes: usize, lower: bool) -> [u8; 16] {
+            let mut result = [0u8; 16];
+            let source_bytes = if lower { 8 } else { 16 };
+            let pairs_per_source = source_bytes / (element_bytes * 2);
+            for (source_index, source) in [a, b].into_iter().enumerate() {
+                for pair in 0..pairs_per_source {
+                    let input_offset = pair * element_bytes * 2;
+                    let output_offset = (source_index * pairs_per_source + pair) * element_bytes;
+                    let lhs = u64::from_le_bytes({
+                        let mut bytes = [0u8; 8];
+                        bytes[..element_bytes]
+                            .copy_from_slice(&source[input_offset..input_offset + element_bytes]);
+                        bytes
+                    });
+                    let rhs = u64::from_le_bytes({
+                        let mut bytes = [0u8; 8];
+                        bytes[..element_bytes].copy_from_slice(
+                            &source[input_offset + element_bytes..input_offset + element_bytes * 2],
+                        );
+                        bytes
+                    });
+                    let mask = if element_bytes == 8 {
+                        u64::MAX
+                    } else {
+                        (1u64 << (element_bytes * 8)) - 1
+                    };
+                    result[output_offset..output_offset + element_bytes].copy_from_slice(
+                        &(lhs.wrapping_add(rhs) & mask).to_le_bytes()[..element_bytes],
+                    );
+                }
+            }
+            result
+        }
+
+        let a = [
+            0xff, 0x02, 0x7f, 0x81, 0x34, 0x12, 0xcc, 0xed, 0x78, 0x56, 0x88, 0xa9, 0xef, 0xcd,
+            0x11, 0x32,
+        ];
+        let b = [
+            0x80, 0x80, 0x01, 0xfe, 0x01, 0x00, 0xff, 0xff, 0xff, 0xff, 0x01, 0x00, 0x40, 0xc0,
+            0xc0, 0x40,
+        ];
+        let code: &[u32] = &[
+            0x4E35_BE80, // addp v0.16b, v20.16b, v21.16b
+            0x4E75_BE81, // addp v1.8h, v20.8h, v21.8h
+            0x4EB5_BE82, // addp v2.4s, v20.4s, v21.4s
+            0x4EF5_BE83, // addp v3.2d, v20.2d, v21.2d
+            0x0E35_BE84, // addp v4.8b, v20.8b, v21.8b
+            0x0E75_BE85, // addp v5.4h, v20.4h, v21.4h
+            0x0EB5_BE86, // addp v6.2s, v20.2s, v21.2s
+            0xD400_0001, // svc #0
+        ];
+        let jit = run_a64_alu(code, |j| {
+            let (a_low, a_high) = vector_pair(a);
+            let (b_low, b_high) = vector_pair(b);
+            j.set_vector(20, a_low, a_high);
+            j.set_vector(21, b_low, b_high);
+        });
+
+        assert_eq!(jit.get_vector(0), vector_pair(paired_add(a, b, 1, false)));
+        assert_eq!(jit.get_vector(1), vector_pair(paired_add(a, b, 2, false)));
+        assert_eq!(jit.get_vector(2), vector_pair(paired_add(a, b, 4, false)));
+        assert_eq!(jit.get_vector(3), vector_pair(paired_add(a, b, 8, false)));
+        assert_eq!(jit.get_vector(4), vector_pair(paired_add(a, b, 1, true)));
+        assert_eq!(jit.get_vector(5), vector_pair(paired_add(a, b, 2, true)));
+        assert_eq!(jit.get_vector(6), vector_pair(paired_add(a, b, 4, true)));
+    }
+
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[test]
     fn test_a64_sqadd_v1_8h_saturates_and_sets_qc() {
         let code: &[u32] = &[
             0x4E61_0CE1, // sqadd v1.8h, v7.8h, v1.8h
