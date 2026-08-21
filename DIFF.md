@@ -4509,3 +4509,23 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 - The asynchronous compute-pipeline closure captures the shader hash by value because it is built
   before `ComputePipeline` exists. Eden captures `this` and reads the corresponding member; Ruzu
   retains that member for structural parity and annotates only its otherwise unread field.
+
+## 2026-08-22 — `shader_recompiler/frontend/structured_control_flow.rs` and translation driver vs Eden Maxwell frontend
+
+### Intentional differences
+
+- Eden stores executable statements and condition expressions in one tagged `Statement` union.
+  Rust uses separate `Statement` and `Expr` enums so every variant owns only valid initialized
+  data; the synthetic upstream `Function` node is represented by `GotoPass::root`. Removed enum
+  variants and `HasChildren` were therefore duplicate C++-layout remnants, not reachable states.
+- The slice-based compatibility translation entry point has no `Environment`, so its CFG ranges
+  are already instruction-slice indices and its shader stage is owned by `Program`. The unused
+  `base_offset` and duplicate `stage` materialization arguments were removed; the environment-based
+  path continues to pass `base_offset` to `build_cfg_from_env` where byte-addressed locations need it.
+
+### Unintentional differences (to fix)
+
+- The Maxwell frontend is still flattened under `frontend/` instead of mirroring Eden's
+  `frontend/maxwell/` directory.
+- Part of Eden's `frontend/maxwell/translate_program.cpp` driver still lives in Ruzu's
+  `pipeline_cache.rs`; its compile/cache callers and translation ownership need to be separated.

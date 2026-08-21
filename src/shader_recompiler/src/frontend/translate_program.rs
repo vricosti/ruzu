@@ -28,7 +28,7 @@ use std::collections::{BTreeMap, VecDeque};
 /// only instruction words and a stage, so it delegates to the currently ported
 /// CFG/structured-CF/translation/pass driver in `pipeline_cache.rs`.
 pub fn translate_program(instructions: &[u64], stage: crate::ir::types::ShaderStage) -> Program {
-    crate::pipeline_cache::translate_program_at_offset(instructions, stage, 0)
+    crate::pipeline_cache::translate_program(instructions, stage)
 }
 
 /// Remove CFG blocks that upstream identifies as unreachable after structured

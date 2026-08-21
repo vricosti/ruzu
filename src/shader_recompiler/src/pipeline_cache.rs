@@ -78,7 +78,6 @@ pub struct PipelineCache {
 fn translate_cfg_to_program(
     code: &[u64],
     stage: ShaderStage,
-    base_offset: u32,
     cfg_blocks: &[control_flow::CfgBlock],
     sph: Option<&ProgramHeader>,
 ) -> Program {
@@ -97,15 +96,7 @@ fn translate_cfg_to_program(
     // Upstream `GenerateBlocks` assigns `Block::order` while traversing the
     // abstract syntax list, not from the block owner's allocation index.
     crate::frontend::translate_program::regenerate_block_order_from_syntax(&mut program);
-    materialize_structured_actions(
-        &mut program,
-        &structured.actions,
-        cfg_blocks,
-        code,
-        stage,
-        base_offset,
-        sph,
-    );
+    materialize_structured_actions(&mut program, &structured.actions, cfg_blocks, code, sph);
     rebuild_syntax_successors(&mut program);
 
     if !program.blocks.is_empty() {
@@ -186,8 +177,6 @@ fn materialize_structured_actions(
     actions: &[StructuredAction],
     cfg_blocks: &[control_flow::CfgBlock],
     code: &[u64],
-    stage: ShaderStage,
-    base_offset: u32,
     sph: Option<&ProgramHeader>,
 ) {
     for action in actions {
@@ -499,7 +488,7 @@ pub fn compile_shader(
 
     // Step 2/3: Convert flat CFG to structured control flow and translate
     // Maxwell instructions into matching IR blocks.
-    let mut program = translate_cfg_to_program(code, stage, 0, &cfg_blocks, None);
+    let mut program = translate_cfg_to_program(code, stage, &cfg_blocks, None);
     log::trace!("  Syntax nodes: {}", program.syntax_list.len());
 
     // Step 4: Run optimization passes.
@@ -534,21 +523,19 @@ pub fn compile_shader(
 /// ported. It shares the same CFG, structured-control-flow, translation, and
 /// host-info-aware pass sequence as the GLSL/Vulkan compile paths instead of
 /// returning an empty placeholder program.
-pub fn translate_program_at_offset_with_host_info(
+pub fn translate_program_with_host_info(
     code: &[u64],
     stage: ShaderStage,
-    base_offset: u32,
     host_info: &crate::host_translate_info::HostTranslateInfo,
 ) -> Program {
-    translate_and_optimize_with_host_info(code, stage, base_offset, host_info)
+    translate_and_optimize_with_host_info(code, stage, host_info)
 }
 
 /// Translate a Maxwell shader binary into IR using default host capabilities.
-pub fn translate_program_at_offset(code: &[u64], stage: ShaderStage, base_offset: u32) -> Program {
-    translate_program_at_offset_with_host_info(
+pub fn translate_program(code: &[u64], stage: ShaderStage) -> Program {
+    translate_program_with_host_info(
         code,
         stage,
-        base_offset,
         &crate::host_translate_info::HostTranslateInfo::default(),
     )
 }
@@ -570,13 +557,7 @@ pub fn translate_program_from_env_with_host_info(
     normalized_host_info.apply_descriptor_limit_policy();
     let cfg_blocks = control_flow::build_cfg_from_env(env, base_offset, code.len());
     let sph = env.sph().clone();
-    let mut program = translate_cfg_to_program(
-        code,
-        env.shader_stage(),
-        base_offset,
-        &cfg_blocks,
-        Some(&sph),
-    );
+    let mut program = translate_cfg_to_program(code, env.shader_stage(), &cfg_blocks, Some(&sph));
     apply_environment_program_metadata(&mut program, env, &normalized_host_info);
     optimize_program_with_env(env, &mut program, &normalized_host_info, Some(&sph));
     collect_interpolation_info(&sph, &mut program);
@@ -616,7 +597,7 @@ pub fn compile_shader_glsl(
     );
 
     let cfg_blocks = control_flow::build_cfg(code);
-    let mut program = translate_cfg_to_program(code, stage, 0, &cfg_blocks, None);
+    let mut program = translate_cfg_to_program(code, stage, &cfg_blocks, None);
 
     optimize_program_without_env(
         &mut program,
@@ -891,7 +872,7 @@ fn emit_glsl_program_at_offset(
         base_offset
     );
     let cfg_blocks = control_flow::build_cfg(code);
-    let mut program = translate_cfg_to_program(code, stage, base_offset, &cfg_blocks, sph);
+    let mut program = translate_cfg_to_program(code, stage, &cfg_blocks, sph);
 
     optimize_program_without_env(&mut program, host_info, sph, texture_bound_buffer);
 
@@ -1044,13 +1025,12 @@ fn hash_runtime_info(info: &RuntimeInfo) -> u64 {
 fn translate_and_optimize_with_host_info(
     code: &[u64],
     stage: ShaderStage,
-    base_offset: u32,
     host_info: &crate::host_translate_info::HostTranslateInfo,
 ) -> Program {
     let mut normalized_host_info = host_info.clone();
     normalized_host_info.apply_descriptor_limit_policy();
     let cfg_blocks = control_flow::build_cfg(code);
-    let mut program = translate_cfg_to_program(code, stage, base_offset, &cfg_blocks, None);
+    let mut program = translate_cfg_to_program(code, stage, &cfg_blocks, None);
     optimize_program_without_env(&mut program, &normalized_host_info, None, None);
     program
 }
@@ -1269,7 +1249,6 @@ mod tests {
         let program = translate_cfg_to_program(
             &[0, 0x50B0_0000_0000_0000],
             ShaderStage::VertexB,
-            0,
             cfg_blocks.as_slice(),
             None,
         );
@@ -1301,7 +1280,7 @@ mod tests {
             indirect_branches: Vec::new(),
         }];
 
-        let program = translate_cfg_to_program(&[0], ShaderStage::VertexB, 0, &cfg_blocks, None);
+        let program = translate_cfg_to_program(&[0], ShaderStage::VertexB, &cfg_blocks, None);
         let entry_block = match program.syntax_list.first() {
             Some(SyntaxNode::Block(block)) => *block,
             _ => panic!("translation must start with an entry block"),
@@ -1334,7 +1313,7 @@ mod tests {
             indirect_branches: Vec::new(),
         }];
 
-        let program = translate_cfg_to_program(&[0], ShaderStage::Fragment, 0, &cfg_blocks, None);
+        let program = translate_cfg_to_program(&[0], ShaderStage::Fragment, &cfg_blocks, None);
 
         assert!(program.blocks.iter().any(|block| {
             block
@@ -1391,7 +1370,6 @@ mod tests {
         let program = translate_cfg_to_program(
             &[0, 0x50B0_0000_0000_0000, 0x50B0_0000_0000_0000],
             ShaderStage::VertexB,
-            0,
             cfg_blocks.as_slice(),
             None,
         );

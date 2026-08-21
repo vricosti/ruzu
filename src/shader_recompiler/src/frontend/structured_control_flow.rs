@@ -20,21 +20,8 @@ enum StatementType {
     Return,
     Kill,
     Unreachable,
-    Function,
-    Identity,
-    Not,
-    Or,
     SetVariable,
     SetIndirectBranchVariable,
-    Variable,
-    IndirectBranchCond,
-}
-
-fn has_children(statement_type: StatementType) -> bool {
-    matches!(
-        statement_type,
-        StatementType::If | StatementType::Loop | StatementType::Function
-    )
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -119,9 +106,6 @@ enum Statement {
     Return,
     Kill,
     Unreachable,
-    Function {
-        children: Vec<Statement>,
-    },
     SetVariable {
         id: u32,
         op: Expr,
@@ -144,7 +128,6 @@ impl Statement {
             Self::Return => StatementType::Return,
             Self::Kill => StatementType::Kill,
             Self::Unreachable => StatementType::Unreachable,
-            Self::Function { .. } => StatementType::Function,
             Self::SetVariable { .. } => StatementType::SetVariable,
             Self::SetIndirectBranchVariable { .. } => StatementType::SetIndirectBranchVariable,
         }
@@ -690,9 +673,9 @@ impl GotoPass {
         let mut tree = self.root.as_slice();
         for &index in path {
             tree = match tree.get(index) {
-                Some(Statement::If { children, .. })
-                | Some(Statement::Loop { children, .. })
-                | Some(Statement::Function { children }) => children.as_slice(),
+                Some(Statement::If { children, .. }) | Some(Statement::Loop { children, .. }) => {
+                    children.as_slice()
+                }
                 _ => &[],
             };
         }
@@ -710,9 +693,9 @@ fn tree_mut_at<'a>(tree: &'a mut Vec<Statement>, path: &[usize]) -> &'a mut Vec<
     }
     let (head, tail) = path.split_first().expect("non-empty path");
     match &mut tree[*head] {
-        Statement::If { children, .. }
-        | Statement::Loop { children, .. }
-        | Statement::Function { children } => tree_mut_at(children, tail),
+        Statement::If { children, .. } | Statement::Loop { children, .. } => {
+            tree_mut_at(children, tail)
+        }
         _ => panic!("path does not point to a statement with children"),
     }
 }
@@ -732,9 +715,7 @@ fn find_last_goto_in_tree(tree: &[Statement], parent: &mut Vec<usize>) -> Option
                     index,
                 });
             }
-            Statement::If { children, .. }
-            | Statement::Loop { children, .. }
-            | Statement::Function { children } => {
+            Statement::If { children, .. } | Statement::Loop { children, .. } => {
                 parent.push(index);
                 if let Some(path) = find_last_goto_in_tree(children, parent) {
                     result = Some(path);
@@ -760,9 +741,7 @@ fn find_label_in_tree(
             });
         }
         match statement {
-            Statement::If { children, .. }
-            | Statement::Loop { children, .. }
-            | Statement::Function { children } => {
+            Statement::If { children, .. } | Statement::Loop { children, .. } => {
                 parent.push(index);
                 if let Some(path) = find_label_in_tree(children, parent, label_id) {
                     return Some(path);
@@ -778,9 +757,9 @@ fn find_label_in_tree(
 fn contains_break(statement: &Statement) -> bool {
     match statement {
         Statement::Break { .. } => true,
-        Statement::If { children, .. }
-        | Statement::Loop { children, .. }
-        | Statement::Function { children } => children.iter().any(contains_break),
+        Statement::If { children, .. } | Statement::Loop { children, .. } => {
+            children.iter().any(contains_break)
+        }
         _ => false,
     }
 }
@@ -970,9 +949,6 @@ impl TranslatePass {
                     self.ensure_block(&mut current_block);
                     current_block = None;
                     self.syntax.push(SyntaxNode::Unreachable);
-                }
-                Statement::Function { children } => {
-                    self.visit(children, break_block, fallthrough_block)
                 }
             }
         }
@@ -1298,20 +1274,11 @@ mod tests {
         tree.iter()
             .map(|statement| match statement {
                 Statement::Goto { .. } => 1,
-                Statement::If { children, .. }
-                | Statement::Loop { children, .. }
-                | Statement::Function { children } => count_gotos(children),
+                Statement::If { children, .. } | Statement::Loop { children, .. } => {
+                    count_gotos(children)
+                }
                 _ => 0,
             })
             .sum()
-    }
-
-    #[test]
-    fn statement_type_child_classification_matches_upstream() {
-        assert!(has_children(StatementType::If));
-        assert!(has_children(StatementType::Loop));
-        assert!(has_children(StatementType::Function));
-        assert!(!has_children(StatementType::Code));
-        assert!(!has_children(StatementType::Goto));
     }
 }
