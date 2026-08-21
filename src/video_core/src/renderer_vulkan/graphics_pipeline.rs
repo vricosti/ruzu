@@ -1956,7 +1956,6 @@ impl GraphicsPipelineCache {
         let mut bindings = Bindings::default();
         let mut compiled_stages: [Option<CompiledShader>; NUM_VK_GRAPHICS_STAGES] =
             Default::default();
-        let mut previous_stage_info: Option<ShaderInfo> = None;
 
         let uses_vertex_a = environment_has_stage(environments, 0);
         let uses_vertex_b = environment_has_stage(environments, 1);
@@ -2034,7 +2033,7 @@ impl GraphicsPipelineCache {
             }
             compiled
         };
-        previous_stage_info = Some(vertex.info.clone());
+        let mut previous_stage_info = Some(vertex.info.clone());
         compiled_stages[0] = Some(vertex);
 
         for program_index in 2..NUM_PROGRAMS {
