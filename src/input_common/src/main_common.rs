@@ -32,26 +32,6 @@ use crate::input_mapping::MappingFactory;
 use crate::input_poller::{InputFactory, OutputFactory};
 use parking_lot::Mutex;
 
-/// The callback upstream builds in `RegisterEngine`:
-/// `MappingCallback{[this](const MappingData& data) { RegisterInput(data); }}`.
-fn mapping_callback(factory: &Arc<Mutex<MappingFactory>>) -> crate::input_engine::MappingCallback {
-    let factory = Arc::clone(factory);
-    crate::input_engine::MappingCallback {
-        on_data: Some(Box::new(move |data| factory.lock().register_input(data))),
-    }
-}
-
-/// Upstream `InputSubsystem::Impl::RegisterEngine`.
-fn register_engine(engine: Arc<Mutex<InputEngine>>, mapping_factory: &Arc<Mutex<MappingFactory>>) {
-    let name = {
-        let mut engine = engine.lock();
-        engine.set_mapping_callback(mapping_callback(mapping_factory));
-        engine.get_engine_name().to_string()
-    };
-    register_input_factory(&name, Arc::new(InputFactory::new(Arc::clone(&engine))));
-    register_output_factory(&name, Arc::new(OutputFactory::new(engine)));
-}
-
 /// Port of `Polling` namespace from main.h
 pub mod Polling {
     /// Type of input desired for mapping purposes.
@@ -158,6 +138,33 @@ impl InputSubsystemImpl {
         }
     }
 
+    /// The callback upstream builds in `RegisterEngine`:
+    /// `MappingCallback{[this](const MappingData& data) { RegisterInput(data); }}`.
+    fn mapping_callback(
+        mapping_factory: &Arc<Mutex<MappingFactory>>,
+    ) -> crate::input_engine::MappingCallback {
+        let mapping_factory = Arc::clone(mapping_factory);
+        crate::input_engine::MappingCallback {
+            on_data: Some(Box::new(move |data| {
+                Self::register_input(&mapping_factory, data)
+            })),
+        }
+    }
+
+    /// Port of `InputSubsystem::Impl::RegisterEngine`.
+    fn register_engine(
+        engine: Arc<Mutex<InputEngine>>,
+        mapping_factory: &Arc<Mutex<MappingFactory>>,
+    ) {
+        let name = {
+            let mut engine = engine.lock();
+            engine.set_mapping_callback(Self::mapping_callback(mapping_factory));
+            engine.get_engine_name().to_string()
+        };
+        register_input_factory(&name, Arc::new(InputFactory::new(Arc::clone(&engine))));
+        register_output_factory(&name, Arc::new(OutputFactory::new(engine)));
+    }
+
     /// Port of Impl::Initialize
     fn initialize(&mut self) {
         self.mapping_factory = Some(Arc::new(Mutex::new(MappingFactory::new())));
@@ -184,28 +191,28 @@ impl InputSubsystemImpl {
             self.touch_screen.as_ref().unwrap().engine(),
             self.udp_client.as_ref().unwrap().engine(),
         ] {
-            register_engine(engine, &mapping_factory);
+            Self::register_engine(engine, &mapping_factory);
         }
         let tas = Arc::new(Mutex::new(tas_input::Tas::new("tas".to_string())));
-        register_engine(tas.lock().engine(), &mapping_factory);
+        Self::register_engine(tas.lock().engine(), &mapping_factory);
         self.tas_input = Some(tas);
         let camera = Camera::new("camera".to_string());
-        register_engine(camera.engine(), &mapping_factory);
+        Self::register_engine(camera.engine(), &mapping_factory);
         self.camera = Some(camera);
         let virtual_amiibo = VirtualAmiibo::new("virtual_amiibo".to_string());
-        register_engine(virtual_amiibo.engine(), &mapping_factory);
+        Self::register_engine(virtual_amiibo.engine(), &mapping_factory);
         self.virtual_amiibo = Some(virtual_amiibo);
         let virtual_gamepad = VirtualGamepad::new("virtual_gamepad".to_string());
-        register_engine(virtual_gamepad.engine(), &mapping_factory);
+        Self::register_engine(virtual_gamepad.engine(), &mapping_factory);
         self.virtual_gamepad = Some(virtual_gamepad);
 
         // Upstream: `RegisterEngine("sdl", sdl);` under HAVE_SDL3.
         let sdl = SDLDriver::new("sdl".to_string());
         let sdl_engine = sdl.engine();
-        register_engine(sdl_engine, &mapping_factory);
+        Self::register_engine(sdl_engine, &mapping_factory);
         self.sdl = Some(sdl);
         let joycon = Joycons::new("joycon".to_string());
-        register_engine(joycon.engine(), &mapping_factory);
+        Self::register_engine(joycon.engine(), &mapping_factory);
         self.joycon = Some(joycon);
 
         register_input_factory("touch_from_button", Arc::new(TouchFromButton::new()));
@@ -323,10 +330,8 @@ impl InputSubsystemImpl {
     }
 
     /// Port of Impl::RegisterInput
-    fn register_input(&mut self, data: &MappingData) {
-        if let Some(ref mapping_factory) = self.mapping_factory {
-            mapping_factory.lock().register_input(data);
-        }
+    fn register_input(mapping_factory: &Arc<Mutex<MappingFactory>>, data: &MappingData) {
+        mapping_factory.lock().register_input(data);
     }
 
     /// Get the analog mapping for a device by finding the matching engine.
@@ -733,12 +738,12 @@ mod tests {
         update_engine
             .engine()
             .lock()
-            .set_mapping_callback(mapping_callback(&mapping_factory));
+            .set_mapping_callback(InputSubsystemImpl::mapping_callback(&mapping_factory));
         let keyboard = Keyboard::new("keyboard".to_string());
         keyboard
             .engine()
             .lock()
-            .set_mapping_callback(mapping_callback(&mapping_factory));
+            .set_mapping_callback(InputSubsystemImpl::mapping_callback(&mapping_factory));
 
         let mut imp = InputSubsystemImpl::new();
         imp.mapping_factory = Some(Arc::clone(&mapping_factory));

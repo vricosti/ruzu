@@ -2441,3 +2441,26 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 ### Binary layout verification
 
 - N/A: no guest-visible or serialized data changed.
+
+## 2026-08-21 — `src/input_common/src/main_common.rs` vs Eden `src/input_common/main.{h,cpp}` mapping callback ownership
+
+### Intentional differences
+
+- Rust's callback captures the shared `Arc<Mutex<MappingFactory>>` rather than a raw `this`
+  pointer. Consequently, the private `InputSubsystemImpl` methods receive that shared factory
+  explicitly; their ownership and call chain still mirror Eden's `Impl` methods.
+
+### Unintentional differences (to fix)
+
+- None. `mapping_callback`, `register_engine`, and `register_input` now belong to
+  `InputSubsystemImpl`, and every engine callback routes through `register_input` as Eden's
+  `RegisterEngine` lambda does.
+
+### Missing items
+
+- `GCAdapter` and Android registration remain the already documented platform-specific gaps in
+  this subsystem; they are not introduced by this callback correction.
+
+### Binary layout verification
+
+- N/A: this changes host callback ownership only.
