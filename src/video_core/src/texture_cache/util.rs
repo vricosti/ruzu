@@ -997,10 +997,6 @@ pub fn convert_image(
     }
 }
 
-fn stop_unimplemented_full_download_copies_tile_spacing(tile_width_spacing: u32) -> ! {
-    panic!("FullDownloadCopies: tile_width_spacing > 0 is unimplemented");
-}
-
 /// Port of `FullDownloadCopies`.
 pub fn full_download_copies(info: &ImageInfo) -> Vec<BufferImageCopy> {
     let size = info.size;
@@ -1022,7 +1018,10 @@ pub fn full_download_copies(info: &ImageInfo) -> Vec<BufferImageCopy> {
         }];
     }
     if info.tile_width_spacing > 0 {
-        stop_unimplemented_full_download_copies_tile_spacing(info.tile_width_spacing);
+        log::error!(
+            "FullDownloadCopies: tile_width_spacing={} is unimplemented",
+            info.tile_width_spacing
+        );
     }
     let num_layers = info.resources.layers;
     let num_levels = info.resources.levels;
@@ -1723,8 +1722,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "FullDownloadCopies: tile_width_spacing > 0 is unimplemented")]
-    fn full_download_copies_tile_width_spacing_is_fatal_like_upstream() {
+    fn full_download_copies_tile_width_spacing_reports_and_continues_like_upstream() {
         let info = ImageInfo {
             format: PixelFormat::A8B8G8R8Unorm,
             image_type: ImageType::E2D,
@@ -1753,7 +1751,12 @@ mod tests {
             is_sparse: false,
         };
 
-        let _ = full_download_copies(&info);
+        let copies = full_download_copies(&info);
+        assert_eq!(copies.len(), 1);
+        assert_eq!(copies[0].buffer_offset, 0);
+        assert_eq!(copies[0].buffer_size, 64 * 64 * 4);
+        assert_eq!(copies[0].buffer_row_length, 64);
+        assert_eq!(copies[0].buffer_image_height, 64);
     }
 
     #[test]
