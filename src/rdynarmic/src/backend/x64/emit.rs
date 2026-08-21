@@ -575,6 +575,9 @@ pub fn emit_block(ctx: &EmitContext, ra: &mut RegAlloc, block: &Block) -> BlockD
 
             // --- Saturated arithmetic ---
             Opcode::SignedSaturatedAdd8 => sat::emit_signed_saturated_add8(ctx, ra, inst_ref, inst),
+            Opcode::SignedSaturatedAddWithFlag32 => {
+                sat::emit_signed_saturated_add_with_flag32(ctx, ra, inst_ref, inst)
+            }
             Opcode::SignedSaturatedAdd16 => {
                 sat::emit_signed_saturated_add16(ctx, ra, inst_ref, inst)
             }
@@ -585,6 +588,9 @@ pub fn emit_block(ctx: &EmitContext, ra: &mut RegAlloc, block: &Block) -> BlockD
                 sat::emit_signed_saturated_add64(ctx, ra, inst_ref, inst)
             }
             Opcode::SignedSaturatedSub8 => sat::emit_signed_saturated_sub8(ctx, ra, inst_ref, inst),
+            Opcode::SignedSaturatedSubWithFlag32 => {
+                sat::emit_signed_saturated_sub_with_flag32(ctx, ra, inst_ref, inst)
+            }
             Opcode::SignedSaturatedSub16 => {
                 sat::emit_signed_saturated_sub16(ctx, ra, inst_ref, inst)
             }

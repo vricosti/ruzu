@@ -4,6 +4,12 @@ use crate::ir::opcode::Opcode;
 use crate::ir::terminal::Terminal;
 use crate::ir::value::Value;
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ResultAndOverflow {
+    pub result: Value,
+    pub overflow: Value,
+}
+
 /// Base IR emitter — the builder API for constructing IR blocks.
 /// Wraps a Block and appends instructions to it.
 pub struct IREmitter<'a> {
@@ -373,6 +379,48 @@ impl<'a> IREmitter<'a> {
 
     pub fn replicate_bit_64(&mut self, a: Value, bit: Value) -> Value {
         self.emit(Opcode::ReplicateBit64, &[a, bit])
+    }
+
+    // --- Saturated arithmetic ---
+
+    pub fn signed_saturated_add_with_flag(&mut self, a: Value, b: Value) -> ResultAndOverflow {
+        let result = self.emit(Opcode::SignedSaturatedAddWithFlag32, &[a, b]);
+        let overflow = self.get_overflow_from_op(result);
+        ResultAndOverflow { result, overflow }
+    }
+
+    pub fn signed_saturated_sub_with_flag(&mut self, a: Value, b: Value) -> ResultAndOverflow {
+        let result = self.emit(Opcode::SignedSaturatedSubWithFlag32, &[a, b]);
+        let overflow = self.get_overflow_from_op(result);
+        ResultAndOverflow { result, overflow }
+    }
+
+    pub fn signed_saturation(
+        &mut self,
+        a: Value,
+        bit_size_to_saturate_to: usize,
+    ) -> ResultAndOverflow {
+        assert!((1..=32).contains(&bit_size_to_saturate_to));
+        let result = self.emit(
+            Opcode::SignedSaturation,
+            &[a, Value::ImmU8(bit_size_to_saturate_to as u8)],
+        );
+        let overflow = self.get_overflow_from_op(result);
+        ResultAndOverflow { result, overflow }
+    }
+
+    pub fn unsigned_saturation(
+        &mut self,
+        a: Value,
+        bit_size_to_saturate_to: usize,
+    ) -> ResultAndOverflow {
+        assert!(bit_size_to_saturate_to <= 31);
+        let result = self.emit(
+            Opcode::UnsignedSaturation,
+            &[a, Value::ImmU8(bit_size_to_saturate_to as u8)],
+        );
+        let overflow = self.get_overflow_from_op(result);
+        ResultAndOverflow { result, overflow }
     }
 
     // --- Flags ---
@@ -2406,5 +2454,27 @@ mod tests {
             block.get(InstRef(3)).opcode,
             Opcode::VectorCountLeadingZeros32
         );
+    }
+
+    #[test]
+    fn scalar_saturation_helpers_link_overflow_pseudo_operations() {
+        let mut block = Block::new(LocationDescriptor(0));
+        {
+            let mut e = IREmitter::new(&mut block);
+            let signed = e.signed_saturation(Value::ImmU32(0x8000_0000), 16);
+            let unsigned = e.unsigned_saturation(Value::ImmU32(0xffff_ffff), 8);
+            let add = e.signed_saturated_add_with_flag(Value::ImmU32(1), Value::ImmU32(2));
+            let sub = e.signed_saturated_sub_with_flag(Value::ImmU32(3), Value::ImmU32(4));
+
+            for pair in [signed, unsigned, add, sub] {
+                let result = pair.result.inst_ref();
+                let overflow = pair.overflow.inst_ref();
+                assert_eq!(block.get(overflow).opcode, Opcode::GetOverflowFromOp);
+                assert_eq!(
+                    block.get_associated_pseudo_operation(result, Opcode::GetOverflowFromOp),
+                    Some(overflow)
+                );
+            }
+        }
     }
 }

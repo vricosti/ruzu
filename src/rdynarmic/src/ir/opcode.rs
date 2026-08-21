@@ -152,6 +152,8 @@ pub enum Opcode {
     MinSigned64,
     MinUnsigned32,
     MinUnsigned64,
+    SignedSaturatedAddWithFlag32,
+    SignedSaturatedSubWithFlag32,
     SignedSaturatedAdd8,
     SignedSaturatedAdd16,
     SignedSaturatedAdd32,
@@ -1230,6 +1232,8 @@ impl Opcode {
             MinUnsigned64 => OpcodeInfo { ret: U64, args: &[U64, U64] },
 
             // Saturated arithmetic
+            SignedSaturatedAddWithFlag32 => OpcodeInfo { ret: U32, args: &[U32, U32] },
+            SignedSaturatedSubWithFlag32 => OpcodeInfo { ret: U32, args: &[U32, U32] },
             SignedSaturatedAdd8 => OpcodeInfo { ret: U8, args: &[U8, U8] },
             SignedSaturatedAdd16 => OpcodeInfo { ret: U16, args: &[U16, U16] },
             SignedSaturatedAdd32 => OpcodeInfo { ret: U32, args: &[U32, U32] },

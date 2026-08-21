@@ -1,5 +1,26 @@
 # Porting State
 
+## 2026-08-21 — A32 scalar saturation warning slice
+
+- Status: prerequisite completed and verified; ready to resume the interrupted translator slice.
+- Interrupted slice: replace the incomplete `frontend/a32/translate/saturated.rs` SSAT/USAT
+  translation that ignored `sat_imm`, then remove the corresponding warning.
+- Exact missing prerequisite: Eden's translator calls `IREmitter::{SignedSaturation,
+  UnsignedSaturation,SignedSaturatedAddWithFlag,SignedSaturatedSubWithFlag}` and consumes their
+  `ResultAndOverflow`. Ruzu has the base saturation opcodes, but exposes none of those scalar IR
+  helpers and entirely lacks the two `WithFlag32` opcodes. Its x64 scalar saturation emitters also
+  write A64 FPSR.QC directly instead of defining Eden's associated overflow pseudo-operation, so
+  they cannot correctly update A32 CPSR.Q.
+- Required prerequisite work: port the scalar saturation IR API and the two WithFlag32 opcodes in
+  their upstream-owned IR files, then port their x64/arm64 backend handling before resuming
+  `saturated.rs`.
+- Resume condition: focused IR/backend tests verify saturated results and overflow values, both
+  host backends compile, and the prerequisite files have fresh upstream comparisons in `DIFF.md`.
+- Prerequisite result: the four scalar saturation helpers now produce Eden-compatible associated
+  overflow pseudo-operations. The x64 emitter no longer writes A64 FPSR.QC for these result/flag
+  operations, and the ARM64 emitter now owns the corresponding scalar saturation implementations.
+  Native x64 checks/tests and AArch64 checks plus QEMU routing/encoding tests pass.
+
 ## 2026-08-21 — Windows GNU 128-bit callback ABI cleanup
 
 - Status: completed and verified.

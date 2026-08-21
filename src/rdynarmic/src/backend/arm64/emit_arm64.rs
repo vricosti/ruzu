@@ -74,6 +74,10 @@ use crate::backend::arm64::emit_arm64_floating_point::{
     emit_fp_single_to_fixed_u64, emit_fp_single_to_half, emit_fp_sqrt32, emit_fp_sqrt64,
     emit_fp_sub32, emit_fp_sub64,
 };
+use crate::backend::arm64::emit_arm64_saturation::{
+    emit_signed_saturated_add_with_flag32, emit_signed_saturated_sub_with_flag32,
+    emit_signed_saturation, emit_unsigned_saturation,
+};
 use crate::backend::arm64::emit_arm64_vector::emit_vector_instruction;
 use crate::backend::arm64::emit_arm64_vector_floating_point::emit_fp_vector_instruction;
 use crate::backend::arm64::emit_arm64_vector_saturation::emit_vector_saturation_instruction;
@@ -710,6 +714,14 @@ fn emit_ir_instruction(
         | Opcode::ZeroExtendHalfToLong
         | Opcode::ZeroExtendWordToLong => emit_zero_extend(code, ctx, inst_ref),
         Opcode::ZeroExtendLongToQuad => emit_zero_extend_long_to_quad(code, ctx, inst_ref),
+        Opcode::SignedSaturatedAddWithFlag32 => {
+            emit_signed_saturated_add_with_flag32(code, ctx, inst_ref)
+        }
+        Opcode::SignedSaturatedSubWithFlag32 => {
+            emit_signed_saturated_sub_with_flag32(code, ctx, inst_ref)
+        }
+        Opcode::SignedSaturation => emit_signed_saturation(code, ctx, inst_ref),
+        Opcode::UnsignedSaturation => emit_unsigned_saturation(code, ctx, inst_ref),
         Opcode::VectorSignedSaturatedAdd8
         | Opcode::VectorSignedSaturatedAdd16
         | Opcode::VectorSignedSaturatedAdd32
@@ -2051,6 +2063,65 @@ mod tests {
         let mut block = Block::new(LocationDescriptor::new(0x4000));
         block.terminal = Terminal::ReturnToDispatch;
         block
+    }
+
+    #[test]
+    fn emit_arm64_routes_scalar_saturation_and_overflow_results() {
+        for opcode in [
+            Opcode::SignedSaturatedAddWithFlag32,
+            Opcode::SignedSaturatedSubWithFlag32,
+        ] {
+            let mut block = return_to_dispatch_block();
+            let a = block.append(Opcode::A64GetW, &[Value::ImmA64Reg(A64Reg::R0)]);
+            let b = block.append(Opcode::A64GetW, &[Value::ImmA64Reg(A64Reg::R1)]);
+            let result = block.append(opcode, &[Value::Inst(a), Value::Inst(b)]);
+            let overflow = block.append(Opcode::GetOverflowFromOp, &[Value::Inst(result)]);
+            block.append(
+                Opcode::A64SetW,
+                &[Value::ImmA64Reg(A64Reg::R2), Value::Inst(result)],
+            );
+            block.append(
+                Opcode::A64SetW,
+                &[Value::ImmA64Reg(A64Reg::R3), Value::Inst(overflow)],
+            );
+            block.rebuild_pseudo_op_links();
+
+            let mut code = BlockOfCode::with_size(4096).unwrap();
+            emit_arm64(
+                &mut code,
+                block,
+                EmitConfig::from_a64_config(&config(false)),
+            )
+            .unwrap();
+        }
+
+        for (opcode, bit_size) in [
+            (Opcode::SignedSaturation, 16),
+            (Opcode::SignedSaturation, 32),
+            (Opcode::UnsignedSaturation, 8),
+        ] {
+            let mut block = return_to_dispatch_block();
+            let operand = block.append(Opcode::A64GetW, &[Value::ImmA64Reg(A64Reg::R0)]);
+            let result = block.append(opcode, &[Value::Inst(operand), Value::ImmU8(bit_size)]);
+            let overflow = block.append(Opcode::GetOverflowFromOp, &[Value::Inst(result)]);
+            block.append(
+                Opcode::A64SetW,
+                &[Value::ImmA64Reg(A64Reg::R1), Value::Inst(result)],
+            );
+            block.append(
+                Opcode::A64SetW,
+                &[Value::ImmA64Reg(A64Reg::R2), Value::Inst(overflow)],
+            );
+            block.rebuild_pseudo_op_links();
+
+            let mut code = BlockOfCode::with_size(4096).unwrap();
+            emit_arm64(
+                &mut code,
+                block,
+                EmitConfig::from_a64_config(&config(false)),
+            )
+            .unwrap();
+        }
     }
 
     #[test]

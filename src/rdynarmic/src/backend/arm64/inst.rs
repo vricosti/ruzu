@@ -350,6 +350,11 @@ pub fn cmp_x_reg(rn: u8, rm: u8) -> u32 {
     0xeb00_001f | (reg5(rm) << 16) | (reg5(rn) << 5)
 }
 
+/// `cmp wN, wM`.
+pub fn cmp_w_reg(rn: u8, rm: u8) -> u32 {
+    0x6b00_001f | (reg5(rm) << 16) | (reg5(rn) << 5)
+}
+
 /// `add sp, sp, #imm`.
 pub fn add_sp_imm(imm: u32) -> u32 {
     0x9100_03ff | (imm12_unscaled(imm) << 10)
@@ -2965,6 +2970,7 @@ mod tests {
         assert_eq!(sbcs_x(1, 2, 3), 0xfa03_0041);
         assert_eq!(cmp_x_imm(26, 0), 0xf100_035f);
         assert_eq!(cmp_x_reg(0, 16), 0xeb10_001f);
+        assert_eq!(cmp_w_reg(16, 17), 0x6b11_021f);
         assert_eq!(add_sp_imm(1184), 0x9112_83ff);
         assert_eq!(add_x_imm(17, 17, 0x123), 0x9104_8e31);
         assert_eq!(

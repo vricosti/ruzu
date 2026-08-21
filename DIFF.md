@@ -3195,3 +3195,131 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 
 - PASS: `Pair128` is `repr(C)`, compile-time asserted to size 16/alignment 8, and every field is
   initialized before it crosses the trampoline boundary.
+
+## 2026-08-21 — `src/rdynarmic/src/ir/opcode.rs` vs Eden `src/dynarmic/src/dynarmic/ir/opcodes.inc`
+
+### Intentional differences
+
+- Rust represents Eden's generated opcode table as an enum plus an explicit `OpcodeInfo` match.
+
+### Unintentional differences (to fix)
+
+- None in the scalar result-and-overflow saturation opcode slice: both `WithFlag32` operations
+  have the same U32 inputs/result, while signed and unsigned saturation keep their U8 width input.
+
+### Missing items
+
+- None for the four scalar saturation opcodes reviewed in this slice.
+
+### Binary layout verification
+
+- N/A: these are internal IR opcode/type declarations and are not serialized guest payloads.
+
+## 2026-08-21 — `src/rdynarmic/src/ir/emitter.rs` vs Eden `src/dynarmic/src/dynarmic/ir/ir_emitter.h`
+
+### Intentional differences
+
+- Rust's `ResultAndOverflow` stores the untyped `Value` enum instead of Eden's templated result
+  type; opcode metadata enforces that every helper in this slice returns U32 plus U1.
+
+### Unintentional differences (to fix)
+
+- None in `signed_saturated_add_with_flag`, `signed_saturated_sub_with_flag`,
+  `signed_saturation`, or `unsigned_saturation`: validation, opcode arguments, and associated
+  overflow pseudo-operation ordering match Eden.
+
+### Missing items
+
+- None for the scalar saturation IR API reviewed in this slice.
+
+### Binary layout verification
+
+- N/A: `ResultAndOverflow` is an internal SSA builder result and is never copied to guest memory.
+
+## 2026-08-21 — `src/rdynarmic/src/backend/x64/emit_saturation.rs` vs Eden `src/dynarmic/src/dynarmic/backend/x64/emit_x64_saturation.cpp`
+
+### Intentional differences
+
+- Rust passes the presence of Eden's `has_overflow_inst` template parameter explicitly and uses
+  `Option<InstRef>` for the associated pseudo-operation.
+- `rxbyak` register-width conversions replace C++ Xbyak's `changeBit` views.
+
+### Unintentional differences (to fix)
+
+- None in the signed saturated add/sub, signed scalar saturation, or unsigned scalar saturation
+  methods reviewed here. In particular, `WithFlag32` exposes overflow without touching FPSR.QC,
+  ordinary signed saturated add/sub ORs the generated overflow byte into QC, and the 8-bit CMOV
+  uses a 32-bit operand exactly as Eden does.
+
+### Missing items
+
+- None for the scalar saturation prerequisite methods reviewed in this slice; unrelated methods
+  in the same pre-existing file were not claimed as re-audited.
+
+### Binary layout verification
+
+- N/A: emitted host instructions operate on internal SSA values and JIT state fields.
+
+## 2026-08-21 — `src/rdynarmic/src/backend/arm64/emit_arm64_saturation.rs` vs Eden `src/dynarmic/src/dynarmic/backend/arm64/emit_arm64_saturation.cpp`
+
+### Intentional differences
+
+- Ruzu's local ARM64 encoder has no EOR-immediate helper, so Eden's single
+  `EOR Wscratch0, Wscratch0, 0x80000000` is emitted as a MOVZ/MOVK into `Wscratch1` followed by
+  register EOR. The result and flags are identical.
+- Eden's explicit `UNREACHABLE` specializations for generic scalar/vector saturation opcodes fall
+  through Ruzu's common unsupported-opcode error if they survive required IR lowering; the four
+  reachable scalar result-and-overflow operations remain owned by this matching file.
+
+### Unintentional differences (to fix)
+
+- None in `SignedSaturatedAddWithFlag32`, `SignedSaturatedSubWithFlag32`, `SignedSaturation`, or
+  `UnsignedSaturation`: register realization, flag spilling, clamp ordering, and overflow creation
+  match Eden.
+
+### Missing items
+
+- None for the four reachable scalar saturation operations reviewed in this slice.
+
+### Binary layout verification
+
+- N/A: the emitted AArch64 instruction stream does not serialize a guest-visible structure.
+
+## 2026-08-21 — `src/rdynarmic/src/backend/arm64/inst.rs` vs Oaknut instructions used by Eden `emit_arm64_saturation.cpp`
+
+### Intentional differences
+
+- Ruzu encodes AArch64 instructions directly as `u32` words rather than calling Oaknut.
+
+### Unintentional differences (to fix)
+
+- None for the newly required `CMP Wn, Wm` encoding; its known machine word is covered by the
+  AArch64 encoding regression test.
+
+### Missing items
+
+- None for the instruction-encoding prerequisite in this slice.
+
+### Binary layout verification
+
+- PASS: `cmp w16, w17` encodes as `0x6b11021f`, verified under the AArch64 test target.
+
+## 2026-08-21 — `src/rdynarmic/src/backend/{x64/emit.rs,arm64/emit_arm64.rs,arm64/mod.rs}` vs Eden backend saturation emitter registration
+
+### Intentional differences
+
+- Rust dispatches opcodes through explicit `match` arms and declares the ARM64 source module in
+  `mod.rs`; Eden registers template specializations through its C++ emitter headers and build.
+
+### Unintentional differences (to fix)
+
+- None in this routing slice: all four scalar result-and-overflow saturation opcodes reach their
+  architecture-specific owner on x64 and ARM64.
+
+### Missing items
+
+- None introduced by the routing change.
+
+### Binary layout verification
+
+- N/A: routing declarations do not define a serialized layout.

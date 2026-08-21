@@ -1,7 +1,7 @@
-use rxbyak::dword_ptr;
 use rxbyak::JmpType;
 use rxbyak::RegExp;
 use rxbyak::R15;
+use rxbyak::{byte_ptr, dword_ptr};
 
 use crate::backend::x64::emit_context::EmitContext;
 use crate::backend::x64::jit_state::A64JitState;
@@ -25,65 +25,109 @@ fn set_qc_flag(ra: &mut RegAlloc) {
 // Signed saturated add: result = clamp(a + b, MIN, MAX), set QC on overflow
 // ---------------------------------------------------------------------------
 
-fn emit_signed_saturated_add(ra: &mut RegAlloc, inst_ref: InstRef, inst: &Inst, bitsize: usize) {
+fn emit_signed_saturated_add(
+    ra: &mut RegAlloc,
+    inst_ref: InstRef,
+    inst: &Inst,
+    bitsize: usize,
+    has_overflow_inst: bool,
+    overflow_inst: Option<InstRef>,
+) {
     let mut args = ra.get_argument_info(inst_ref, &inst.args, inst.num_args());
     let result = ra.use_scratch_gpr(&mut args[0]);
     let op2 = ra.use_gpr(&mut args[1]);
 
-    // Compute saturation value: sign bit of result → sat_val = MAX or MIN
+    // Compute saturation value: sign bit of result → sat_val = MAX or MIN.
     let sat_val = ra.scratch_gpr();
+    if bitsize < 64 {
+        let int_max = (1u64 << (bitsize - 1)) - 1;
+        ra.asm
+            .xor_(sat_val.cvt32().unwrap(), sat_val.cvt32().unwrap())
+            .unwrap();
+        ra.asm
+            .bt_imm(result.cvt32().unwrap(), (bitsize - 1) as u8)
+            .unwrap();
+        ra.asm
+            .adc(sat_val.cvt32().unwrap(), int_max as i32)
+            .unwrap();
+    } else {
+        ra.asm.mov(sat_val, i64::MAX).unwrap();
+        ra.asm.bt_imm(result, 63).unwrap();
+        ra.asm.adc(sat_val, 0i32).unwrap();
+    }
+
     match bitsize {
-        8 => {
-            ra.asm
-                .mov(sat_val.cvt32().unwrap(), result.cvt32().unwrap())
-                .unwrap();
-            ra.asm.sar(sat_val.cvt32().unwrap(), 7u8).unwrap(); // all 1s or 0s based on sign
-            ra.asm.xor_(sat_val.cvt8().unwrap(), 0x7Fi32).unwrap(); // MAX if positive, MIN if negative
-            ra.asm
-                .add(result.cvt8().unwrap(), op2.cvt8().unwrap())
-                .unwrap();
-        }
-        16 => {
-            ra.asm
-                .mov(sat_val.cvt32().unwrap(), result.cvt32().unwrap())
-                .unwrap();
-            ra.asm.sar(sat_val.cvt32().unwrap(), 15u8).unwrap();
-            ra.asm.xor_(sat_val.cvt16().unwrap(), 0x7FFFi32).unwrap();
-            ra.asm
-                .add(result.cvt16().unwrap(), op2.cvt16().unwrap())
-                .unwrap();
-        }
-        32 => {
-            // BT result, 31 → CF = sign, ADC sat_val, 0x7FFF_FFFE → 0x7FFF_FFFF or 0x8000_0000
-            ra.asm.bt_imm(result, 31).unwrap();
-            ra.asm
-                .mov(sat_val.cvt32().unwrap(), 0x7FFF_FFFEi32)
-                .unwrap();
-            ra.asm.adc(sat_val.cvt32().unwrap(), 0i32).unwrap();
-            ra.asm
-                .add(result.cvt32().unwrap(), op2.cvt32().unwrap())
-                .unwrap();
-        }
-        64 => {
-            ra.asm.bt_imm(result, 63).unwrap();
-            ra.asm.mov(sat_val, 0x7FFF_FFFF_FFFF_FFFEi64).unwrap();
-            ra.asm.adc(sat_val, 0i32).unwrap();
-            ra.asm.add(result, op2).unwrap();
-        }
+        8 => ra
+            .asm
+            .add(result.cvt8().unwrap(), op2.cvt8().unwrap())
+            .unwrap(),
+        16 => ra
+            .asm
+            .add(result.cvt16().unwrap(), op2.cvt16().unwrap())
+            .unwrap(),
+        32 => ra
+            .asm
+            .add(result.cvt32().unwrap(), op2.cvt32().unwrap())
+            .unwrap(),
+        64 => ra.asm.add(result, op2).unwrap(),
         _ => unreachable!(),
     }
 
-    // On overflow (OF=1), use the saturation value instead
-    ra.asm.cmovo(result, sat_val).unwrap();
+    // On overflow (OF=1), use the saturation value instead. x86 CMOV does
+    // not have an 8-bit form, matching upstream's 32-bit operation there.
+    if bitsize == 8 {
+        ra.asm
+            .cmovo(result.cvt32().unwrap(), sat_val.cvt32().unwrap())
+            .unwrap();
+    } else {
+        let result = match bitsize {
+            16 => result.cvt16().unwrap(),
+            32 => result.cvt32().unwrap(),
+            64 => result,
+            _ => unreachable!(),
+        };
+        let sat_val_width = match bitsize {
+            16 => sat_val.cvt16().unwrap(),
+            32 => sat_val.cvt32().unwrap(),
+            64 => sat_val,
+            _ => unreachable!(),
+        };
+        ra.asm.cmovo(result, sat_val_width).unwrap();
+    }
 
-    // Set QC flag if overflow occurred
-    let label_no_overflow = ra.asm.create_label();
-    ra.asm.jno(&label_no_overflow, JmpType::Near).unwrap();
-    set_qc_flag(ra);
-    ra.asm.bind(&label_no_overflow).unwrap();
+    ra.asm.seto(sat_val.cvt8().unwrap()).unwrap();
 
-    ra.release(sat_val);
+    if has_overflow_inst {
+        if let Some(overflow_inst) = overflow_inst {
+            ra.define_value(overflow_inst, sat_val);
+        } else {
+            ra.release(sat_val);
+        }
+    } else {
+        let offset = A64JitState::offset_of_fpsr_qc();
+        ra.asm
+            .or_(
+                byte_ptr(RegExp::from(R15) + offset as i32),
+                sat_val.cvt8().unwrap(),
+            )
+            .unwrap();
+        ra.release(sat_val);
+    }
+
     ra.define_value(inst_ref, result);
+}
+
+pub fn emit_signed_saturated_add_with_flag32(
+    ctx: &EmitContext,
+    ra: &mut RegAlloc,
+    inst_ref: InstRef,
+    inst: &Inst,
+) {
+    let overflow_inst = ctx.block.and_then(|block| {
+        block
+            .get_associated_pseudo_operation(inst_ref, crate::ir::opcode::Opcode::GetOverflowFromOp)
+    });
+    emit_signed_saturated_add(ra, inst_ref, inst, 32, true, overflow_inst);
 }
 
 pub fn emit_signed_saturated_add8(
@@ -92,7 +136,7 @@ pub fn emit_signed_saturated_add8(
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_signed_saturated_add(ra, inst_ref, inst, 8);
+    emit_signed_saturated_add(ra, inst_ref, inst, 8, false, None);
 }
 pub fn emit_signed_saturated_add16(
     _ctx: &EmitContext,
@@ -100,7 +144,7 @@ pub fn emit_signed_saturated_add16(
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_signed_saturated_add(ra, inst_ref, inst, 16);
+    emit_signed_saturated_add(ra, inst_ref, inst, 16, false, None);
 }
 pub fn emit_signed_saturated_add32(
     _ctx: &EmitContext,
@@ -108,7 +152,7 @@ pub fn emit_signed_saturated_add32(
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_signed_saturated_add(ra, inst_ref, inst, 32);
+    emit_signed_saturated_add(ra, inst_ref, inst, 32, false, None);
 }
 pub fn emit_signed_saturated_add64(
     _ctx: &EmitContext,
@@ -116,68 +160,113 @@ pub fn emit_signed_saturated_add64(
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_signed_saturated_add(ra, inst_ref, inst, 64);
+    emit_signed_saturated_add(ra, inst_ref, inst, 64, false, None);
 }
 
 // ---------------------------------------------------------------------------
 // Signed saturated sub: result = clamp(a - b, MIN, MAX), set QC on overflow
 // ---------------------------------------------------------------------------
 
-fn emit_signed_saturated_sub(ra: &mut RegAlloc, inst_ref: InstRef, inst: &Inst, bitsize: usize) {
+fn emit_signed_saturated_sub(
+    ra: &mut RegAlloc,
+    inst_ref: InstRef,
+    inst: &Inst,
+    bitsize: usize,
+    has_overflow_inst: bool,
+    overflow_inst: Option<InstRef>,
+) {
     let mut args = ra.get_argument_info(inst_ref, &inst.args, inst.num_args());
     let result = ra.use_scratch_gpr(&mut args[0]);
     let op2 = ra.use_gpr(&mut args[1]);
 
     let sat_val = ra.scratch_gpr();
+    if bitsize < 64 {
+        let int_max = (1u64 << (bitsize - 1)) - 1;
+        ra.asm
+            .xor_(sat_val.cvt32().unwrap(), sat_val.cvt32().unwrap())
+            .unwrap();
+        ra.asm
+            .bt_imm(result.cvt32().unwrap(), (bitsize - 1) as u8)
+            .unwrap();
+        ra.asm
+            .adc(sat_val.cvt32().unwrap(), int_max as i32)
+            .unwrap();
+    } else {
+        ra.asm.mov(sat_val, i64::MAX).unwrap();
+        ra.asm.bt_imm(result, 63).unwrap();
+        ra.asm.adc(sat_val, 0i32).unwrap();
+    }
+
     match bitsize {
-        8 => {
-            ra.asm
-                .mov(sat_val.cvt32().unwrap(), result.cvt32().unwrap())
-                .unwrap();
-            ra.asm.sar(sat_val.cvt32().unwrap(), 7u8).unwrap();
-            ra.asm.xor_(sat_val.cvt8().unwrap(), 0x7Fi32).unwrap();
-            ra.asm
-                .sub(result.cvt8().unwrap(), op2.cvt8().unwrap())
-                .unwrap();
-        }
-        16 => {
-            ra.asm
-                .mov(sat_val.cvt32().unwrap(), result.cvt32().unwrap())
-                .unwrap();
-            ra.asm.sar(sat_val.cvt32().unwrap(), 15u8).unwrap();
-            ra.asm.xor_(sat_val.cvt16().unwrap(), 0x7FFFi32).unwrap();
-            ra.asm
-                .sub(result.cvt16().unwrap(), op2.cvt16().unwrap())
-                .unwrap();
-        }
-        32 => {
-            ra.asm.bt_imm(result, 31).unwrap();
-            ra.asm
-                .mov(sat_val.cvt32().unwrap(), 0x7FFF_FFFEi32)
-                .unwrap();
-            ra.asm.adc(sat_val.cvt32().unwrap(), 0i32).unwrap();
-            ra.asm
-                .sub(result.cvt32().unwrap(), op2.cvt32().unwrap())
-                .unwrap();
-        }
-        64 => {
-            ra.asm.bt_imm(result, 63).unwrap();
-            ra.asm.mov(sat_val, 0x7FFF_FFFF_FFFF_FFFEi64).unwrap();
-            ra.asm.adc(sat_val, 0i32).unwrap();
-            ra.asm.sub(result, op2).unwrap();
-        }
+        8 => ra
+            .asm
+            .sub(result.cvt8().unwrap(), op2.cvt8().unwrap())
+            .unwrap(),
+        16 => ra
+            .asm
+            .sub(result.cvt16().unwrap(), op2.cvt16().unwrap())
+            .unwrap(),
+        32 => ra
+            .asm
+            .sub(result.cvt32().unwrap(), op2.cvt32().unwrap())
+            .unwrap(),
+        64 => ra.asm.sub(result, op2).unwrap(),
         _ => unreachable!(),
     }
 
-    ra.asm.cmovo(result, sat_val).unwrap();
+    if bitsize == 8 {
+        ra.asm
+            .cmovo(result.cvt32().unwrap(), sat_val.cvt32().unwrap())
+            .unwrap();
+    } else {
+        let result = match bitsize {
+            16 => result.cvt16().unwrap(),
+            32 => result.cvt32().unwrap(),
+            64 => result,
+            _ => unreachable!(),
+        };
+        let sat_val_width = match bitsize {
+            16 => sat_val.cvt16().unwrap(),
+            32 => sat_val.cvt32().unwrap(),
+            64 => sat_val,
+            _ => unreachable!(),
+        };
+        ra.asm.cmovo(result, sat_val_width).unwrap();
+    }
 
-    let label_no_overflow = ra.asm.create_label();
-    ra.asm.jno(&label_no_overflow, JmpType::Near).unwrap();
-    set_qc_flag(ra);
-    ra.asm.bind(&label_no_overflow).unwrap();
+    ra.asm.seto(sat_val.cvt8().unwrap()).unwrap();
 
-    ra.release(sat_val);
+    if has_overflow_inst {
+        if let Some(overflow_inst) = overflow_inst {
+            ra.define_value(overflow_inst, sat_val);
+        } else {
+            ra.release(sat_val);
+        }
+    } else {
+        let offset = A64JitState::offset_of_fpsr_qc();
+        ra.asm
+            .or_(
+                byte_ptr(RegExp::from(R15) + offset as i32),
+                sat_val.cvt8().unwrap(),
+            )
+            .unwrap();
+        ra.release(sat_val);
+    }
+
     ra.define_value(inst_ref, result);
+}
+
+pub fn emit_signed_saturated_sub_with_flag32(
+    ctx: &EmitContext,
+    ra: &mut RegAlloc,
+    inst_ref: InstRef,
+    inst: &Inst,
+) {
+    let overflow_inst = ctx.block.and_then(|block| {
+        block
+            .get_associated_pseudo_operation(inst_ref, crate::ir::opcode::Opcode::GetOverflowFromOp)
+    });
+    emit_signed_saturated_sub(ra, inst_ref, inst, 32, true, overflow_inst);
 }
 
 pub fn emit_signed_saturated_sub8(
@@ -186,7 +275,7 @@ pub fn emit_signed_saturated_sub8(
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_signed_saturated_sub(ra, inst_ref, inst, 8);
+    emit_signed_saturated_sub(ra, inst_ref, inst, 8, false, None);
 }
 pub fn emit_signed_saturated_sub16(
     _ctx: &EmitContext,
@@ -194,7 +283,7 @@ pub fn emit_signed_saturated_sub16(
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_signed_saturated_sub(ra, inst_ref, inst, 16);
+    emit_signed_saturated_sub(ra, inst_ref, inst, 16, false, None);
 }
 pub fn emit_signed_saturated_sub32(
     _ctx: &EmitContext,
@@ -202,7 +291,7 @@ pub fn emit_signed_saturated_sub32(
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_signed_saturated_sub(ra, inst_ref, inst, 32);
+    emit_signed_saturated_sub(ra, inst_ref, inst, 32, false, None);
 }
 pub fn emit_signed_saturated_sub64(
     _ctx: &EmitContext,
@@ -210,7 +299,7 @@ pub fn emit_signed_saturated_sub64(
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_signed_saturated_sub(ra, inst_ref, inst, 64);
+    emit_signed_saturated_sub(ra, inst_ref, inst, 64, false, None);
 }
 
 // ---------------------------------------------------------------------------
@@ -377,103 +466,118 @@ pub fn emit_unsigned_saturated_sub64(
 }
 
 // ---------------------------------------------------------------------------
-// SignedSaturation: clamp value to signed N-bit range, set QC
+// SignedSaturation: clamp value to signed N-bit range and expose overflow
 // Args: (value: U32, bit_width: U8)
 // ---------------------------------------------------------------------------
 
 pub fn emit_signed_saturation(
-    _ctx: &EmitContext,
+    ctx: &EmitContext,
     ra: &mut RegAlloc,
     inst_ref: InstRef,
     inst: &Inst,
 ) {
+    let overflow_inst = ctx.block.and_then(|block| {
+        block
+            .get_associated_pseudo_operation(inst_ref, crate::ir::opcode::Opcode::GetOverflowFromOp)
+    });
     let mut args = ra.get_argument_info(inst_ref, &inst.args, inst.num_args());
-    let result = ra.use_scratch_gpr(&mut args[0]);
     let n = args[1].get_immediate_u8();
+    assert!((1..=32).contains(&n));
 
-    // Signed N-bit range: [-(1 << (n-1)), (1 << (n-1)) - 1]
-    let max_val = (1i32 << (n - 1)) - 1;
-    let min_val = -(1i32 << (n - 1));
+    let source = ra.use_gpr(&mut args[0]);
+    let result = ra.scratch_gpr();
+    if n == 32 {
+        ra.asm
+            .mov(result.cvt32().unwrap(), source.cvt32().unwrap())
+            .unwrap();
+        if let Some(overflow_inst) = overflow_inst {
+            let overflow = ra.scratch_gpr();
+            ra.asm
+                .xor_(overflow.cvt32().unwrap(), overflow.cvt32().unwrap())
+                .unwrap();
+            ra.define_value(overflow_inst, overflow);
+        }
+        ra.define_value(inst_ref, result);
+        return;
+    }
 
-    // Compare and clamp
-    let temp = ra.scratch_gpr();
-    ra.asm.mov(temp.cvt32().unwrap(), max_val).unwrap();
-    ra.asm.cmp(result.cvt32().unwrap(), max_val).unwrap();
+    let mask = (1u32 << n) - 1;
+    let positive_saturated_value = (1u32 << (n - 1)) - 1;
+    let negative_saturated_value = 1u32 << (n - 1);
+    let overflow = ra.scratch_gpr();
 
-    let label_no_clamp_high = ra.asm.create_label();
-    ra.asm.jle(&label_no_clamp_high, JmpType::Near).unwrap();
     ra.asm
-        .mov(result.cvt32().unwrap(), temp.cvt32().unwrap())
+        .lea(
+            overflow.cvt32().unwrap(),
+            rxbyak::ptr(RegExp::from(source.cvt64().unwrap()) + negative_saturated_value as i32),
+        )
         .unwrap();
-    set_qc_flag(ra);
-    let label_done = ra.asm.create_label();
-    ra.asm.jmp(&label_done, JmpType::Near).unwrap();
+    ra.asm
+        .mov(result.cvt32().unwrap(), source.cvt32().unwrap())
+        .unwrap();
+    ra.asm.sar(result.cvt32().unwrap(), 31u8).unwrap();
+    ra.asm
+        .xor_(result.cvt32().unwrap(), positive_saturated_value as i32)
+        .unwrap();
+    ra.asm.cmp(overflow.cvt32().unwrap(), mask as i32).unwrap();
+    ra.asm
+        .cmovbe(result.cvt32().unwrap(), source.cvt32().unwrap())
+        .unwrap();
 
-    ra.asm.bind(&label_no_clamp_high).unwrap();
-    ra.asm.cmp(result.cvt32().unwrap(), min_val).unwrap();
-    let label_no_clamp_low = ra.asm.create_label();
-    ra.asm.jge(&label_no_clamp_low, JmpType::Near).unwrap();
-    ra.asm.mov(result.cvt32().unwrap(), min_val).unwrap();
-    set_qc_flag(ra);
-    ra.asm.jmp(&label_done, JmpType::Near).unwrap();
-
-    ra.asm.bind(&label_no_clamp_low).unwrap();
-    ra.asm.bind(&label_done).unwrap();
-
-    ra.release(temp);
+    if let Some(overflow_inst) = overflow_inst {
+        ra.asm.seta(overflow.cvt8().unwrap()).unwrap();
+        ra.define_value(overflow_inst, overflow);
+    } else {
+        ra.release(overflow);
+    }
     ra.define_value(inst_ref, result);
 }
 
 // ---------------------------------------------------------------------------
-// UnsignedSaturation: clamp value to unsigned N-bit range, set QC
+// UnsignedSaturation: clamp value to unsigned N-bit range and expose overflow
 // Args: (value: U32, bit_width: U8)
 // ---------------------------------------------------------------------------
 
 pub fn emit_unsigned_saturation(
-    _ctx: &EmitContext,
+    ctx: &EmitContext,
     ra: &mut RegAlloc,
     inst_ref: InstRef,
     inst: &Inst,
 ) {
+    let overflow_inst = ctx.block.and_then(|block| {
+        block
+            .get_associated_pseudo_operation(inst_ref, crate::ir::opcode::Opcode::GetOverflowFromOp)
+    });
     let mut args = ra.get_argument_info(inst_ref, &inst.args, inst.num_args());
-    let result = ra.use_scratch_gpr(&mut args[0]);
     let n = args[1].get_immediate_u8();
+    assert!(n <= 31);
 
-    // Unsigned N-bit range: [0, (1 << n) - 1]
-    let max_val = if n >= 32 { u32::MAX } else { (1u32 << n) - 1 };
-
-    // If negative (sign bit set), clamp to 0
-    let temp = ra.scratch_gpr();
+    let saturated_value = (1u32 << n) - 1;
+    let source = ra.use_gpr(&mut args[0]);
+    let result = ra.scratch_gpr();
+    let overflow = ra.scratch_gpr();
     ra.asm
-        .xor_(temp.cvt32().unwrap(), temp.cvt32().unwrap())
+        .xor_(overflow.cvt32().unwrap(), overflow.cvt32().unwrap())
         .unwrap();
     ra.asm
-        .test(result.cvt32().unwrap(), result.cvt32().unwrap())
+        .cmp(source.cvt32().unwrap(), saturated_value as i32)
         .unwrap();
-
-    // If signed negative, result = 0 and set QC
-    let label_not_neg = ra.asm.create_label();
-    ra.asm.jns(&label_not_neg, JmpType::Near).unwrap();
     ra.asm
-        .mov(result.cvt32().unwrap(), temp.cvt32().unwrap())
+        .mov(result.cvt32().unwrap(), saturated_value as i32)
         .unwrap();
-    set_qc_flag(ra);
-    let label_done = ra.asm.create_label();
-    ra.asm.jmp(&label_done, JmpType::Near).unwrap();
+    ra.asm
+        .cmovle(result.cvt32().unwrap(), overflow.cvt32().unwrap())
+        .unwrap();
+    ra.asm
+        .cmovbe(result.cvt32().unwrap(), source.cvt32().unwrap())
+        .unwrap();
 
-    ra.asm.bind(&label_not_neg).unwrap();
-    // If > max_val, clamp to max_val
-    ra.asm.cmp(result.cvt32().unwrap(), max_val as i32).unwrap();
-    let label_no_clamp = ra.asm.create_label();
-    ra.asm.jbe(&label_no_clamp, JmpType::Near).unwrap();
-    ra.asm.mov(result.cvt32().unwrap(), max_val as i32).unwrap();
-    set_qc_flag(ra);
-    ra.asm.jmp(&label_done, JmpType::Near).unwrap();
-
-    ra.asm.bind(&label_no_clamp).unwrap();
-    ra.asm.bind(&label_done).unwrap();
-
-    ra.release(temp);
+    if let Some(overflow_inst) = overflow_inst {
+        ra.asm.seta(overflow.cvt8().unwrap()).unwrap();
+        ra.define_value(overflow_inst, overflow);
+    } else {
+        ra.release(overflow);
+    }
     ra.define_value(inst_ref, result);
 }
 
@@ -576,7 +680,11 @@ mod tests {
     #[test]
     fn test_saturation_fn_signatures() {
         let _: fn(&EmitContext, &mut RegAlloc, InstRef, &Inst) = emit_signed_saturated_add8;
+        let _: fn(&EmitContext, &mut RegAlloc, InstRef, &Inst) =
+            emit_signed_saturated_add_with_flag32;
         let _: fn(&EmitContext, &mut RegAlloc, InstRef, &Inst) = emit_signed_saturated_add64;
+        let _: fn(&EmitContext, &mut RegAlloc, InstRef, &Inst) =
+            emit_signed_saturated_sub_with_flag32;
         let _: fn(&EmitContext, &mut RegAlloc, InstRef, &Inst) = emit_unsigned_saturated_sub32;
         let _: fn(&EmitContext, &mut RegAlloc, InstRef, &Inst) = emit_signed_saturation;
         let _: fn(&EmitContext, &mut RegAlloc, InstRef, &Inst) = emit_unsigned_saturation;
