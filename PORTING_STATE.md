@@ -544,3 +544,23 @@
 - Status: prerequisite implemented in rxbyak commit `b0a6181`; XMM, YMM, and extended-register
   encodings match NASM byte-for-byte and the rxbyak all-target check passes. The vector-basic slice
   can now resume.
+
+## 2026-08-21 — rdynarmic widening paired-add interrupted by AVX-512 prerequisite
+
+- Status: prerequisite completed and verified; the interrupted emitter slice can resume.
+- Interrupted slice: replace all six callback or non-upstream implementations of
+  `VectorPairedAdd{Signed,Unsigned}Widen{8,16,32}` with Eden's native x64 instruction sequences.
+- Exact missing prerequisite: Eden's signed 32-bit widening emitter selects an
+  `AVX512_Ortho` path containing `vpsraq xmm, xmm, 32`, `vpsllq xmm, xmm, 32`, and
+  `vpaddq xmm, xmm, xmm`. The local `rxbyak` generator already exposes `vpaddq` and the
+  register-count form of `vpsllq`, but does not expose the immediate `vpsllq` overload or the
+  EVEX-only immediate `vpsraq` form.
+- Required prerequisite work: add the two immediate assembler operations in `externals/rxbyak`, verify
+  their bytes against an independent assembler for ordinary and extended registers, run the
+  rxbyak test suite, and record the encoder comparison in `DIFF.md`.
+- Resume condition: the missing encoders pass byte-level tests and the nested rxbyak commit is
+  recorded by the parent repository. No SSE-only replacement is permitted because it would drop
+  Eden's host-feature branch.
+- Prerequisite result: `vpsllq_imm` and `vpsraq_imm` now preserve Xbyak 7.35.2's exact encoding
+  flags. XMM/YMM/ZMM and extended-register forms match NASM byte-for-byte, and the complete
+  rxbyak test suite plus its all-target check pass.

@@ -4083,3 +4083,30 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 ### Binary layout verification
 
 - N/A: these methods emit JIT instructions and define no shared or serialized structures.
+
+## 2026-08-21 — `externals/rxbyak/src/assembler.rs` vs Xbyak 7.35.2 `xbyak_mnemonic.h` (packed immediate qword shifts)
+
+### Intentional differences
+
+- Rust names immediate overloads `vpsllq_imm` and `vpsraq_imm` because Rust does not support the
+  C++ API's overloads distinguished only by the final operand type.
+- The existing Rust `vex_packed_shift_imm` helper corresponds to Xbyak's shared
+  `opAVX_X_X_XM` encoding path and receives the instruction flags explicitly.
+
+### Unintentional differences (to fix)
+
+- None in the focused slice. The qword logical-left and arithmetic-right immediate forms use the
+  same opcode extensions, opcodes, W bits, EVEX requirements, broadcast tuple flags, and memory
+  EVEX policy as Xbyak 7.35.2.
+- The pre-existing word and dword immediate forms now also retain Xbyak's EVEX flags, and the
+  common validator accepts equal-width ZMM operands instead of rejecting a supported form.
+
+### Missing items
+
+- None for the immediate `vpsllw`, `vpsrlw`, `vpsrld`, `vpsllq`, and `vpsraq` register forms.
+  Other packed-shift overloads were outside this prerequisite slice.
+
+### Binary layout verification
+
+- PASS: XMM, YMM, ZMM, ordinary-register, and extended-register encodings match NASM
+  byte-for-byte; the complete rxbyak test suite passes.
