@@ -18,7 +18,9 @@ use gtk::glib;
 use gtk::prelude::*;
 
 use network::room::StatusMessageTypes;
-use network::room_member::{ChatEntry, RoomMember, RoomMemberState, StatusMessageEntry};
+use network::room_member::{
+    ChatEntry, RoomMember, RoomMemberError, RoomMemberState, StatusMessageEntry,
+};
 
 /// Upstream `ChatRoom::MaxChatMessageLength`.
 const MAX_CHAT_MESSAGE_LENGTH: usize = 500;
@@ -29,6 +31,7 @@ enum RoomEvent {
     Status(StatusMessageEntry),
     Members(Vec<String>),
     Disconnected,
+    Error(RoomMemberError),
 }
 
 /// Upstream `ChatRoom::AppendStatusMessage` wording.
@@ -193,6 +196,12 @@ pub fn show(parent: &gtk::ApplicationWindow, room_member: Arc<RoomMember>) {
             }
         })
     };
+    let error_handle = {
+        let queue = Arc::clone(&queue);
+        room_member.bind_on_error(move |error| {
+            queue.lock().unwrap().push_back(RoomEvent::Error(*error));
+        })
+    };
 
     // Keep the handles so the close path can explicitly mirror upstream's
     // `RoomMember::Unbind`. A callback handle is an `Arc`; dropping our clone
@@ -202,6 +211,7 @@ pub fn show(parent: &gtk::ApplicationWindow, room_member: Arc<RoomMember>) {
         status_handle,
         info_handle,
         state_handle,
+        error_handle,
     ))));
 
     // Seed the member list with what is already known.
@@ -253,6 +263,12 @@ pub fn show(parent: &gtk::ApplicationWindow, room_member: Arc<RoomMember>) {
                             message.set_sensitive(false);
                             send.set_sensitive(false);
                         }
+                        RoomEvent::Error(error) => {
+                            super::message::ErrorManager::show_error(
+                                Some(dialog.upcast_ref()),
+                                super::message::ErrorManager::for_room_member_error(error),
+                            );
+                        }
                     }
                 }
                 glib::ControlFlow::Continue
@@ -261,11 +277,12 @@ pub fn show(parent: &gtk::ApplicationWindow, room_member: Arc<RoomMember>) {
     );
 
     dialog.connect_close_request(move |_| {
-        if let Some((chat, status, info, state)) = handles.borrow_mut().take() {
+        if let Some((chat, status, info, state, error)) = handles.borrow_mut().take() {
             room_member.unbind_on_chat_message_received(&chat);
             room_member.unbind_on_status_message_received(&status);
             room_member.unbind_on_room_information_changed(&info);
             room_member.unbind_on_state_changed(&state);
+            room_member.unbind_on_error(&error);
         }
         glib::Propagation::Proceed
     });

@@ -119,7 +119,10 @@ pub fn show(
             if ruzu_core::internal_network::network_interface::get_selected_network_interface()
                 .is_none()
             {
-                status.set_text("Select a network interface before connecting.");
+                super::message::ErrorManager::show_error(
+                    Some(dialog.upcast_ref()),
+                    &super::message::ErrorManager::NO_INTERFACE_SELECTED,
+                );
                 return;
             }
 
@@ -128,17 +131,24 @@ pub fn show(
             let password_text = password.text().to_string();
 
             if !is_valid_nickname(&nickname_text) {
-                status.set_text(
-                    "Nickname must be 4 to 20 alphanumeric characters, spaces, '-', '_' or '.'.",
+                super::message::ErrorManager::show_error(
+                    Some(dialog.upcast_ref()),
+                    &super::message::ErrorManager::USERNAME_NOT_VALID,
                 );
                 return;
             }
             if !is_valid_address(&address_text) {
-                status.set_text("Enter the room's address.");
+                super::message::ErrorManager::show_error(
+                    Some(dialog.upcast_ref()),
+                    &super::message::ErrorManager::IP_ADDRESS_NOT_VALID,
+                );
                 return;
             }
             let Some(port_value) = parse_port(&port.text()) else {
-                status.set_text("Port must be a number between 0 and 65535.");
+                super::message::ErrorManager::show_error(
+                    Some(dialog.upcast_ref()),
+                    &super::message::ErrorManager::PORT_NOT_VALID,
+                );
                 return;
             };
 
@@ -156,9 +166,13 @@ pub fn show(
 
             // Join blocks for up to CONNECTION_TIMEOUT_MS. Upstream runs it on
             // a QFuture for the same reason.
-            let (sender, receiver) = std::sync::mpsc::channel();
+            let (state_sender, state_receiver) = std::sync::mpsc::channel();
             let state_handle = room_member.bind_on_state_changed(move |state| {
-                let _ = sender.send(*state);
+                let _ = state_sender.send(*state);
+            });
+            let (error_sender, error_receiver) = std::sync::mpsc::channel();
+            let error_handle = room_member.bind_on_error(move |error| {
+                let _ = error_sender.send(*error);
             });
             {
                 let room_member: Arc<RoomMember> = Arc::clone(&room_member);
@@ -191,30 +205,48 @@ pub fn show(
                     on_joined,
                     #[strong]
                     room_member,
-                    move || match receiver.try_recv() {
-                        Ok(state) => {
-                            match state {
+                    move || {
+                        if let Ok(error) = error_receiver.try_recv() {
+                            room_member.unbind_on_state_changed(&state_handle);
+                            room_member.unbind_on_error(&error_handle);
+                            status.set_text("Could not connect to the room.");
+                            connect.set_sensitive(true);
+                            super::message::ErrorManager::show_error(
+                                Some(dialog.upcast_ref()),
+                                super::message::ErrorManager::for_room_member_error(error),
+                            );
+                            return glib::ControlFlow::Break;
+                        }
+
+                        match state_receiver.try_recv() {
+                            Ok(state) => match state {
                                 RoomMemberState::Joining => glib::ControlFlow::Continue,
                                 RoomMemberState::Joined | RoomMemberState::Moderator => {
                                     room_member.unbind_on_state_changed(&state_handle);
+                                    room_member.unbind_on_error(&error_handle);
                                     on_joined();
                                     dialog.close();
                                     glib::ControlFlow::Break
                                 }
                                 RoomMemberState::Idle | RoomMemberState::Uninitialized => {
-                                    room_member.unbind_on_state_changed(&state_handle);
                                     status.set_text("Could not connect to the room.");
-                                    connect.set_sensitive(true);
-                                    glib::ControlFlow::Break
+                                    glib::ControlFlow::Continue
                                 }
+                            },
+                            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                                glib::ControlFlow::Continue
                             }
-                        }
-                        Err(std::sync::mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
-                        Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                            room_member.unbind_on_state_changed(&state_handle);
-                            status.set_text("Could not connect to the room.");
-                            connect.set_sensitive(true);
-                            glib::ControlFlow::Break
+                            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                                room_member.unbind_on_state_changed(&state_handle);
+                                room_member.unbind_on_error(&error_handle);
+                                status.set_text("Could not connect to the room.");
+                                connect.set_sensitive(true);
+                                super::message::ErrorManager::show_error(
+                                    Some(dialog.upcast_ref()),
+                                    &super::message::ErrorManager::UNABLE_TO_CONNECT,
+                                );
+                                glib::ControlFlow::Break
+                            }
                         }
                     }
                 ),

@@ -289,9 +289,13 @@ fn begin_join(
 
     log::info!("Joining room at {address}:{port} as {nickname}");
     status.set_text("Connecting…");
-    let (sender, receiver) = std::sync::mpsc::channel();
+    let (state_sender, state_receiver) = std::sync::mpsc::channel();
     let state_handle = room_member.bind_on_state_changed(move |state| {
-        let _ = sender.send(*state);
+        let _ = state_sender.send(*state);
+    });
+    let (error_sender, error_receiver) = std::sync::mpsc::channel();
+    let error_handle = room_member.bind_on_error(move |error| {
+        let _ = error_sender.send(*error);
     });
     let worker_member = Arc::clone(&room_member);
     std::thread::Builder::new()
@@ -310,30 +314,35 @@ fn begin_join(
         })
         .expect("failed to spawn the LobbyJoin thread");
 
-    glib::timeout_add_local(
-        std::time::Duration::from_millis(100),
-        move || match receiver.try_recv() {
-            Ok(state) => match state {
-                RoomMemberState::Joining => glib::ControlFlow::Continue,
-                RoomMemberState::Joined | RoomMemberState::Moderator => {
-                    room_member.unbind_on_state_changed(&state_handle);
-                    on_joined();
-                    dialog.close();
-                    glib::ControlFlow::Break
-                }
-                RoomMemberState::Idle | RoomMemberState::Uninitialized => {
-                    room_member.unbind_on_state_changed(&state_handle);
-                    status.set_text("Could not join the room.");
-                    super::message::ErrorManager::show_error(
-                        Some(dialog.upcast_ref()),
-                        &super::message::ErrorManager::UNABLE_TO_CONNECT,
-                    );
-                    glib::ControlFlow::Break
-                }
-            },
+    glib::timeout_add_local(std::time::Duration::from_millis(100), move || {
+        if let Ok(error) = error_receiver.try_recv() {
+            room_member.unbind_on_state_changed(&state_handle);
+            room_member.unbind_on_error(&error_handle);
+            status.set_text("Could not join the room.");
+            super::message::ErrorManager::show_error(
+                Some(dialog.upcast_ref()),
+                super::message::ErrorManager::for_room_member_error(error),
+            );
+            return glib::ControlFlow::Break;
+        }
+
+        match state_receiver.try_recv() {
+            Ok(RoomMemberState::Joining) => glib::ControlFlow::Continue,
+            Ok(RoomMemberState::Joined | RoomMemberState::Moderator) => {
+                room_member.unbind_on_state_changed(&state_handle);
+                room_member.unbind_on_error(&error_handle);
+                on_joined();
+                dialog.close();
+                glib::ControlFlow::Break
+            }
+            Ok(RoomMemberState::Idle | RoomMemberState::Uninitialized) => {
+                status.set_text("Could not join the room.");
+                glib::ControlFlow::Continue
+            }
             Err(std::sync::mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
             Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                 room_member.unbind_on_state_changed(&state_handle);
+                room_member.unbind_on_error(&error_handle);
                 status.set_text("Could not join the room.");
                 super::message::ErrorManager::show_error(
                     Some(dialog.upcast_ref()),
@@ -341,8 +350,8 @@ fn begin_join(
                 );
                 glib::ControlFlow::Break
             }
-        },
-    );
+        }
+    });
 }
 
 /// Upstream `Lobby::PasswordPrompt`.

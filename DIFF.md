@@ -4553,3 +4553,14 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
   the same controller-owned snapshot during its existing 16 ms refresh and redraws only when the
   snapshot changes. Connection loss still clears all four LED bits, while both raw battery values
   and all of Eden's per-controller drawing positions are preserved.
+
+## 2026-08-22 — GTK multiplayer errors vs Eden MultiplayerState and ErrorManager
+
+### Intentional differences
+
+- Eden owns the `RoomMember::Error` callback in its persistent `MultiplayerState`; Ruzu binds the
+  same error stream in each active join/room dialog because its GTK frontend has no equivalent
+  persistent state widget. All twelve error variants use Eden's exact message mapping.
+- Messages used only by Eden's unported host-room dialog are not retained in Ruzu's client-only
+  `ErrorManager`. Eden's unused `NO_INTERNET` and `GENERIC_ERROR` constants are omitted as dead
+  frontend code.
