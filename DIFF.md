@@ -1741,3 +1741,40 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 ### Binary layout verification
 
 - N/A: the change affects host subsystem lifetime only.
+
+## 2026-08-21 — `src/core/src/hle/service/nim/nim.rs` vs Eden `src/core/hle/service/nim/nim.{h,cpp}` at `5c54abf353`
+
+### Intentional differences
+
+- Eden's `std::jthread` plus stop token is represented by a `JoinHandle` paired with a shared
+  `AtomicBool`. `cancel_impl` requests stop before joining, and `Drop` performs cancellation before
+  closing the completion event, preserving the upstream lifecycle order.
+- Eden stores service state directly because its IPC service object is mutable through C++ object
+  ownership. Rust uses `Mutex` for the worker and response bytes and `AtomicU32` for the error code,
+  allowing the same service object to satisfy `SessionRequestHandler: Send + Sync` without moving
+  ownership to another module.
+- `ServiceContext` owns the completion `Event`; its copy-handle bridge supplies the readable event
+  returned beside the new async IPC interface. This is Ruzu's existing equivalent of Eden's
+  `KEvent*`/`KReadableEvent*` ownership.
+- `Prepare` logs invalid UTF-8 paths lossily because Rust logging requires text. The original bytes
+  are otherwise unused, just as Eden ignores the POST buffer and does not execute a real request.
+- `nim:eca`, `IShopServiceAccessServer`, and `IShopServiceAccessor` were pre-existing direct-method
+  stubs on `main` but were not registered as dispatchable service frameworks. They are wired in
+  their existing `nim.rs` owner so Eden's new async implementation is reachable through the same
+  interface chain; unrelated `nim`, `nim:shp`, and `ntc` parity remains outside this commit.
+
+### Unintentional differences (to fix)
+
+- None in the reviewed async-shop slice: command IDs, cancellation/join ordering, buffer locking,
+  offset clamping, error-code updates, dummy `{}` response, event clearing/signaling, and returned
+  copy/move objects match Eden.
+
+### Missing items
+
+- `Request` remains deliberately stubbed to a two-byte JSON object, exactly as in Eden commit
+  `5c54abf353`; no network download is performed.
+
+### Binary layout verification
+
+- PASS: IPC outputs retain Eden's `u64` size/read count and `u32` error code widths. Download data
+  is copied as bytes into the caller-provided output buffer; no host struct is raw-copied.
