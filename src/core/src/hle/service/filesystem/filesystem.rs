@@ -67,16 +67,16 @@ pub struct FileSystemController {
     registrations: Mutex<BTreeMap<ProcessId, Registration>>,
     /// BIS factory for NAND system/user content.
     /// Upstream: `std::unique_ptr<FileSys::BISFactory> bis_factory`.
-    bis_factory: Option<crate::file_sys::bis_factory::BisFactory>,
+    bis_factory: Option<Box<crate::file_sys::bis_factory::BisFactory>>,
     /// Virtual filesystem reference for creating factories.
     /// Upstream: `Core::System::GetFilesystem()`.
     vfs: Option<Arc<crate::file_sys::vfs::vfs_real::RealVfsFilesystem>>,
     /// SDMC factory for SD card content and mod roots.
     /// Upstream: `std::unique_ptr<FileSys::SDMCFactory> sdmc_factory`.
-    sdmc_factory: Option<SdmcFactory>,
+    sdmc_factory: Option<Box<SdmcFactory>>,
     /// Content discovered in the user-configured external update/DLC roots.
     /// Upstream: `std::unique_ptr<FileSys::ExternalContentProvider> external_provider`.
-    external_provider: Option<ExternalContentProvider>,
+    external_provider: Option<Box<ExternalContentProvider>>,
     /// Frontend-owned per-launch view returned by `OpenSDMC`.
     ///
     /// Eden always returns `sdmc_factory->Open()`. Ruzu uses this optional
@@ -88,9 +88,9 @@ pub struct FileSystemController {
     content_provider: Option<Arc<Mutex<ContentProviderUnion>>>,
     /// Parsed game-card image and the two cache views built from its pseudo-directory.
     /// Upstream: `gamecard`, `gamecard_registered`, `gamecard_placeholder`.
-    gamecard: Option<XCI>,
-    gamecard_registered: Option<RegisteredCache>,
-    gamecard_placeholder: Option<PlaceholderCache>,
+    gamecard: Option<Box<XCI>>,
+    gamecard_registered: Option<Box<RegisteredCache>>,
+    gamecard_placeholder: Option<Box<PlaceholderCache>>,
 }
 
 impl FileSystemController {
@@ -120,36 +120,36 @@ impl FileSystemController {
 
     /// Set the BIS factory (called during system initialization).
     pub fn set_bis_factory(&mut self, factory: crate::file_sys::bis_factory::BisFactory) {
-        self.bis_factory = Some(factory);
+        self.bis_factory = Some(Box::new(factory));
     }
 
     /// Port of upstream `FileSystemController::SetGameCard`.
     pub fn set_game_card(&mut self, file: VirtualFile) {
         let mut gamecard = XCI::new(file, 0, 0);
         let directory = gamecard.concatenated_pseudo_directory();
-        self.gamecard_registered = Some(RegisteredCache::new(Arc::clone(&directory)));
-        self.gamecard_placeholder = Some(PlaceholderCache::new(directory));
-        self.gamecard = Some(gamecard);
+        self.gamecard_registered = Some(Box::new(RegisteredCache::new(Arc::clone(&directory))));
+        self.gamecard_placeholder = Some(Box::new(PlaceholderCache::new(directory)));
+        self.gamecard = Some(Box::new(gamecard));
     }
 
     /// Port of upstream `FileSystemController::GetGameCard`.
     pub fn get_game_card(&self) -> Option<&XCI> {
-        self.gamecard.as_ref()
+        self.gamecard.as_deref()
     }
 
     /// Port of upstream `FileSystemController::GetGameCardContents`.
     pub fn get_game_card_contents(&self) -> Option<&RegisteredCache> {
-        self.gamecard_registered.as_ref()
+        self.gamecard_registered.as_deref()
     }
 
     /// Mutable Rust counterpart used where upstream returns a mutable pointer.
     pub fn get_game_card_contents_mut(&mut self) -> Option<&mut RegisteredCache> {
-        self.gamecard_registered.as_mut()
+        self.gamecard_registered.as_deref_mut()
     }
 
     /// Port of upstream `FileSystemController::GetGameCardPlaceholder`.
     pub fn get_game_card_placeholder(&self) -> Option<&PlaceholderCache> {
-        self.gamecard_placeholder.as_ref()
+        self.gamecard_placeholder.as_deref()
     }
 
     /// Get the System NAND RegisteredCache.
@@ -170,7 +170,7 @@ impl FileSystemController {
 
     /// Port of upstream `FileSystemController::GetExternalContentProvider`.
     pub fn get_external_content_provider(&self) -> Option<&ExternalContentProvider> {
-        self.external_provider.as_ref()
+        self.external_provider.as_deref()
     }
 
     /// Get the System NAND content directory.
@@ -608,11 +608,11 @@ impl FileSystemController {
                     OpenMode::READ_WRITE,
                 ));
 
-            self.bis_factory = Some(crate::file_sys::bis_factory::BisFactory::new(
+            self.bis_factory = Some(Box::new(crate::file_sys::bis_factory::BisFactory::new(
                 nand_directory,
                 load_directory,
                 dump_directory,
-            ));
+            )));
         }
 
         if self.sdmc_factory.is_none() {
@@ -635,7 +635,7 @@ impl FileSystemController {
                     path_to_utf8_string(&sdmc_load_dir_path),
                     OpenMode::READ,
                 ));
-            self.sdmc_factory = Some(SdmcFactory::new(sd_directory, sd_load_directory));
+            self.sdmc_factory = Some(Box::new(SdmcFactory::new(sd_directory, sd_load_directory)));
         }
 
         if self.external_provider.is_none() {
@@ -665,7 +665,7 @@ impl FileSystemController {
                 "Creating ExternalContentProvider with {} opened directories",
                 external_dirs.len()
             );
-            self.external_provider = Some(ExternalContentProvider::new(external_dirs));
+            self.external_provider = Some(Box::new(ExternalContentProvider::new(external_dirs)));
         }
 
         if let Some(provider) = self.content_provider.as_ref() {
@@ -710,7 +710,7 @@ impl FileSystemController {
                 unsafe {
                     provider.set_slot(
                         ContentProviderUnionSlot::External,
-                        (external_provider as *mut ExternalContentProvider)
+                        (external_provider.as_mut() as *mut ExternalContentProvider)
                             as *mut dyn ContentProvider,
                     );
                 }
@@ -820,6 +820,33 @@ mod tests {
         let provider = Arc::new(Mutex::new(ContentProviderUnion::new()));
         controller.set_content_provider(provider.clone());
         controller.create_factories(vfs, false);
+
+        let system_cache_address = controller.get_system_nand_contents().unwrap() as *const _;
+        let user_cache_address = controller.get_user_nand_contents().unwrap() as *const _;
+        let sdmc_cache_address = controller.get_sdmc_contents().unwrap() as *const _;
+        let external_provider_address =
+            controller.get_external_content_provider().unwrap() as *const _;
+
+        // `CreateFactories` stores non-owning pointers to these providers in the
+        // union. Eden's unique_ptr ownership keeps their addresses stable when
+        // FileSystemController itself moves; the Rust ownership must do the same.
+        let mut controller = Box::new(controller);
+        assert_eq!(
+            controller.get_system_nand_contents().unwrap() as *const _,
+            system_cache_address
+        );
+        assert_eq!(
+            controller.get_user_nand_contents().unwrap() as *const _,
+            user_cache_address
+        );
+        assert_eq!(
+            controller.get_sdmc_contents().unwrap() as *const _,
+            sdmc_cache_address
+        );
+        assert_eq!(
+            controller.get_external_content_provider().unwrap() as *const _,
+            external_provider_address
+        );
 
         assert!(controller.get_system_nand_contents().is_some());
         assert!(controller.get_user_nand_contents().is_some());

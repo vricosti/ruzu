@@ -1225,6 +1225,14 @@ impl GMainWindow {
                     return glib::Propagation::Proceed;
                 }
 
+                // Upstream's QMessageBox confirmation is blocking and keeps
+                // its parent modal. The GTK compatibility dialog is
+                // asynchronous, so reject an overlapping close request while
+                // the Stop/Restart confirmation owns that decision.
+                if w.stop_confirmation_pending.get() {
+                    return glib::Propagation::Stop;
+                }
+
                 if w.close_confirmed.get() {
                     if let Some(session) = w.session.borrow_mut().as_mut() {
                         let _ = session.request_force_stop();
@@ -3822,6 +3830,11 @@ impl GMainWindow {
 
     /// Upstream `GMainWindow::OnStopGame` and `ConfirmShutdownGame`.
     fn on_stop_game(self: &Rc<Self>) {
+        // A modal close confirmation is the active upstream-equivalent
+        // decision. Do not open a second asynchronous confirmation over it.
+        if self.close_confirmation_pending.get() {
+            return;
+        }
         let Some(exit_locked) = self
             .session
             .borrow()
@@ -3873,6 +3886,9 @@ impl GMainWindow {
     /// the normal confirmed asynchronous shutdown, then boot it again after the
     /// emulation thread has completed teardown.
     fn on_restart_game(self: &Rc<Self>) {
+        if self.close_confirmation_pending.get() {
+            return;
+        }
         let Some((current_game_path, exit_locked)) =
             self.session.borrow().as_ref().and_then(|session| {
                 self.current_game_path

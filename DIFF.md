@@ -2768,3 +2768,51 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 ### Binary layout verification
 
 - N/A: the Rust wrapper is host-only state and is neither serialized nor copied to guest memory.
+
+## 2026-08-21 — `src/core/src/hle/service/filesystem/filesystem.rs` vs Eden `src/core/hle/service/filesystem/filesystem.{h,cpp}` provider ownership
+
+### Intentional differences
+
+- Ruzu registers providers through its shared `ContentProviderUnion` rather than Eden's
+  `Core::System::RegisterContentProvider`; both unions retain non-owning provider pointers.
+- Rust `Box<T>` replaces each upstream `std::unique_ptr<T>` and provides the same stable heap
+  address while `FileSystemController` itself is moved.
+
+### Unintentional differences (to fix)
+
+- None in the reviewed ownership slice. BIS, SDMC, external-content, game-card, registered-cache,
+  and placeholder-cache objects now have the stable allocation required by Eden's ownership model.
+  This prevents union slots from retaining dangling pointers after a controller move.
+
+### Missing items
+
+- None in the reviewed provider and game-card ownership slice.
+
+### Binary layout verification
+
+- N/A: these are host-side ownership objects. A focused regression moves a fully initialized
+  controller and verifies that all four union-provider addresses remain unchanged.
+
+## 2026-08-21 — `src/ruzu/src/{main_window,gtk_compat}.rs` vs Eden `src/yuzu/main_window.{h,cpp}` stop confirmation lifecycle
+
+### Intentional differences
+
+- Eden's `ConfirmShutdownGame` uses a blocking `QMessageBox`, while GTK4 confirmation is
+  asynchronous. Ruzu therefore retains a one-shot callback and explicit pending state until the
+  user responds or the dialog is dismissed.
+- Ruzu rejects overlapping Stop/Restart and window-close confirmations. This reproduces the
+  exclusivity that Eden receives automatically from its blocking modal dialog.
+
+### Unintentional differences (to fix)
+
+- None in the reviewed confirmation slice. Dismissing or destroying a GTK question now completes
+  it as a rejection, so `stop_confirmation_pending` and `close_confirmation_pending` cannot remain
+  latched after the dialog disappears.
+
+### Missing items
+
+- None in the reviewed `ConfirmShutdownGame` / `OnStopGame` confirmation lifecycle.
+
+### Binary layout verification
+
+- N/A: the change contains frontend-only callback and modal state.

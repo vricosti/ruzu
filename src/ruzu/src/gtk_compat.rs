@@ -5,9 +5,10 @@
 // frontend modules retain their actions and response handling.
 
 use std::cell::RefCell;
+use std::rc::Rc;
 
 use gtk::prelude::*;
-use gtk::{gio, ButtonsType, FileChooserAction, MessageType, ResponseType};
+use gtk::{gio, glib, ButtonsType, FileChooserAction, MessageType, ResponseType};
 
 /// Show a modal informational message using the GTK 4.0 MessageDialog API.
 pub fn show_message<P: IsA<gtk::Window>>(parent: Option<&P>, message: &str, detail: &str) {
@@ -160,14 +161,59 @@ pub fn ask_question<P: IsA<gtk::Window>>(
     dialog.add_button(&accept_label, ResponseType::Accept);
     dialog.set_default_response(ResponseType::Accept);
 
-    let callback = RefCell::new(Some(callback));
-    dialog.connect_response(move |dialog, response| {
-        dialog.close();
-        if let Some(callback) = callback.borrow_mut().take() {
-            callback(response == ResponseType::Accept);
+    let callback: Rc<RefCell<Option<Box<dyn FnOnce(bool)>>>> =
+        Rc::new(RefCell::new(Some(Box::new(callback))));
+    dialog.connect_response({
+        let callback = Rc::clone(&callback);
+        move |dialog, response| {
+            complete_question(&callback, response == ResponseType::Accept);
+            dialog.close();
         }
     });
+    dialog.connect_close_request(move |_| {
+        // QMessageBox::question returns the rejecting answer when its window is
+        // dismissed. GTK does not guarantee a `response` signal when a modal
+        // MessageDialog disappears with its parent, so complete the callback
+        // here as well. `complete_question` is one-shot, making the normal
+        // response-then-close path harmless.
+        complete_question(&callback, false);
+        glib::Propagation::Proceed
+    });
     dialog.present();
+}
+
+type QuestionCallback = Rc<RefCell<Option<Box<dyn FnOnce(bool)>>>>;
+
+fn complete_question(callback: &QuestionCallback, accepted: bool) {
+    if let Some(callback) = callback.borrow_mut().take() {
+        callback(accepted);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::Cell;
+
+    #[test]
+    fn question_completion_is_one_shot_when_response_closes_dialog() {
+        let calls = Rc::new(Cell::new(0));
+        let accepted = Rc::new(Cell::new(false));
+        let callback: QuestionCallback = Rc::new(RefCell::new(Some(Box::new({
+            let calls = Rc::clone(&calls);
+            let accepted = Rc::clone(&accepted);
+            move |value| {
+                calls.set(calls.get() + 1);
+                accepted.set(value);
+            }
+        }))));
+
+        complete_question(&callback, true);
+        complete_question(&callback, false);
+
+        assert_eq!(calls.get(), 1);
+        assert!(accepted.get());
+    }
 }
 
 /// Open a native file chooser and return the selected file, or `None` when
