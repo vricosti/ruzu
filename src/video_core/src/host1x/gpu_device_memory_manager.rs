@@ -559,7 +559,7 @@ impl SmmuReverseMappings {
 
     fn insert(&mut self, physical_page: u32, device_page: u64) {
         let device_page = device_page as u32;
-        let mut base = self.compressed_device_addr.get(physical_page);
+        let base = self.compressed_device_addr.get(physical_page);
         if base == 0 {
             self.compressed_device_addr.set(physical_page, device_page);
             return;
@@ -578,7 +578,7 @@ impl SmmuReverseMappings {
     }
 
     fn remove(&mut self, physical_page: u32, device_page: u64) {
-        let mut base = self.compressed_device_addr.get(physical_page);
+        let base = self.compressed_device_addr.get(physical_page);
         if base == 0 {
             return;
         }
