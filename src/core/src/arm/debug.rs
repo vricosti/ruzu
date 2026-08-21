@@ -5,7 +5,6 @@
 //! Debug utilities (thread naming, backtrace, module enumeration).
 
 use crate::arm::arm_interface::ThreadContext;
-use crate::arm::symbols;
 use crate::hardware_properties;
 use crate::hle::kernel::k_memory_block::{KMemoryPermission, KMemoryState};
 use std::collections::BTreeMap;

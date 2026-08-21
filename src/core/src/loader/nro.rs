@@ -17,7 +17,7 @@ use crate::hle::kernel::k_typed_address::KProcessAddress;
 use common::common_funcs::make_magic;
 
 use super::loader::{
-    AppLoader, FileType, FileTypeIdentifier, KProcess, LoadParameters, LoadResult, Modules,
+    AppLoader, FileType, FileTypeIdentifier, KProcess, LoadParameters, LoadResult,
     ResultStatus, System, NACP,
 };
 use super::nso::read_object;

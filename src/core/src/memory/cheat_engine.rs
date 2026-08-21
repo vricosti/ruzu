@@ -5,7 +5,7 @@
 //! Cheat engine for applying game cheats via the dmnt cheat VM.
 
 use super::dmnt_cheat_types::{
-    CheatDefinition, CheatEntry, CheatProcessMetadata, MemoryRegionExtents,
+    CheatEntry, CheatProcessMetadata, MemoryRegionExtents,
 };
 use super::dmnt_cheat_vm::{DmntCheatVm, VmCallbacks};
 use super::memory::Memory;

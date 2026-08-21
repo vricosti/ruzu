@@ -14,7 +14,7 @@ use common::common_funcs::make_magic;
 
 use super::loader::{
     AppLoader, FileType, FileTypeIdentifier, KProcess, LoadParameters, LoadResult, Modules,
-    ResultStatus, System, NACP,
+    ResultStatus, System,
 };
 
 // ============================================================================

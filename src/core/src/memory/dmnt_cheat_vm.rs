@@ -420,7 +420,7 @@ impl DmntCheatVm {
 
         // Execute opcodes until we run out
         while self.instruction_ptr < self.num_opcodes {
-            let mut opcode = match self.decode_next_opcode() {
+            let opcode = match self.decode_next_opcode() {
                 Some(op) => op,
                 None => break,
             };

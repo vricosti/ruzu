@@ -4753,3 +4753,12 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
   must remain alive because `InputFromButton::drop` unregisters its engine callback; Ruzu keeps the
   same lifetime as Eden's `unique_ptr` while leaving `force_update` limited to the five user
   inputs, exactly as upstream does.
+
+## 2026-08-22 — `src/core` mechanical warning cleanup
+
+### Intentional differences
+
+- Rust no longer imports types that the corresponding ported implementation does not reference,
+  no longer marks immutable bindings `mut`, and spells the inferred `BucketTree::Visitor` lifetime
+  explicitly. These are compile-time ownership and namespace details; variables whose unused state
+  may indicate missing Eden behavior were deliberately left unchanged for separate parity review.

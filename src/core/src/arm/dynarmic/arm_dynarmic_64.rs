@@ -2367,7 +2367,7 @@ impl ArmDynarmic64 {
         }
 
         let settings = common::settings::values();
-        let (mut optimizations, mut unsafe_optimizations, mut fastmem_address_space_bits) =
+        let (mut optimizations, mut unsafe_optimizations, fastmem_address_space_bits) =
             if *settings.cpu_debug_mode.get_value() {
                 (
                     OptimizationFlag::ALL_SAFE_OPTIMIZATIONS,

@@ -54,7 +54,7 @@ pub fn get_available_network_interfaces() -> Vec<NetworkInterface> {
 #[cfg(target_os = "linux")]
 fn get_available_network_interfaces_linux() -> Vec<NetworkInterface> {
     use std::ffi::CStr;
-    use std::io::BufRead;
+
 
     let mut result = Vec::new();
 

@@ -10,7 +10,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::{Arc, Mutex};
 
-use crate::file_sys::vfs::vfs_types::{VirtualDir, VirtualFile};
+use crate::file_sys::vfs::vfs_types::VirtualFile;
 use crate::hle::service::filesystem::filesystem::FileSystemController;
 
 // KProcess is re-exported from the kernel module below.

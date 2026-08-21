@@ -18,7 +18,7 @@ use crate::gpu_dirty_memory_manager::GpuDirtyMemoryManager;
 use crate::hardware_properties;
 use crate::hle::kernel::k_process::SharedProcessMemory;
 use crate::hle::kernel::k_scheduler::KScheduler;
-use crate::hle::kernel::k_thread::{KThread, KThreadLock};
+use crate::hle::kernel::k_thread::KThreadLock;
 use crate::hle::kernel::kernel::KernelCore;
 use crate::hle::service::am::am_types::{AppletId, AppletType};
 use crate::hle::service::am::applet_manager::{
@@ -2752,7 +2752,7 @@ impl System {
     /// Returns `(total_iterations, total_svc_count)`.
     pub fn run_main_loop(&mut self) -> (u32, u32) {
         use crate::arm::arm_interface::{
-            ArmInterface, HaltReason, KProcess as OpaqueKProcess, KThread as OpaqueKThread,
+            ArmInterface, HaltReason, KThread as OpaqueKThread,
             ThreadContext,
         };
         use crate::hle::kernel::physical_core::PhysicalCoreExecutionControl;
