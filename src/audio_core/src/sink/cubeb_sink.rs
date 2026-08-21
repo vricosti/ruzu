@@ -43,8 +43,6 @@ fn should_trace_cubeb_callback() -> bool {
 }
 
 struct CubebStream {
-    name: String,
-    stream_type: StreamType,
     handle: SinkStreamHandle,
     _backend: cubeb::Stream<i16>,
     #[cfg(windows)]
@@ -376,8 +374,6 @@ impl Sink for CubebSink {
                     }
                 }));
                 self.streams.push(CubebStream {
-                    name: name.to_string(),
-                    stream_type,
                     handle: handle.clone(),
                     _backend: backend,
                     #[cfg(windows)]

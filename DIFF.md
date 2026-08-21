@@ -2747,3 +2747,24 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 
 - N/A: Ruzu deliberately uses indices rather than serializing Eden's host pointers. Focused tests
   cover forward, reverse, mixed, mutable, predecessor, and successor traversal without duplicates.
+
+## 2026-08-21 — `src/audio_core/src/sink/cubeb_sink.rs` vs Eden `src/audio_core/sink/cubeb_sink.{h,cpp}` stream metadata ownership
+
+### Intentional differences
+
+- Rust keeps the Cubeb backend object beside a shared `SinkStreamHandle`; this replaces Eden's
+  `unique_ptr<CubebSinkStream>` ownership while keeping the stream metadata on `SinkStream`.
+
+### Unintentional differences (to fix)
+
+- None in the reviewed ownership slice. The duplicate `name` and `stream_type` fields were removed
+  from the Rust-only Cubeb wrapper; their canonical values remain on `SinkStream`, matching Eden's
+  `CubebSinkStream` inheritance from `SinkStream`.
+
+### Missing items
+
+- None in the reviewed ownership slice.
+
+### Binary layout verification
+
+- N/A: the Rust wrapper is host-only state and is neither serialized nor copied to guest memory.
