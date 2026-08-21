@@ -4674,3 +4674,16 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 - Rust shares the holder, properties handler, and applet resource with `Arc<Mutex<_>>`; battery
   selection, low-battery flag clearing, change detection, and shared-memory publication otherwise
   preserve Eden's ordering and assignment-style rules.
+
+## 2026-08-22 — `src/input_common/src/drivers/mod.rs` vs `src/input_common/CMakeLists.txt`
+
+### Intentional differences
+
+- Rust applies `cfg(target_os = "android")` to the Android driver module, which is the direct
+  counterpart of Eden adding `drivers/android.{h,cpp}` only inside `if (ANDROID)`.
+
+### Missing items
+
+- The Android driver still lacks Eden's JNI device registry, vibration worker, and JNI-backed
+  device mapping. Keeping the owner-local constants behind the same platform boundary avoids
+  treating that unported Android behavior as dead Linux code.

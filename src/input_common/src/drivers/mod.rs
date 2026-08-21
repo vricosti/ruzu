@@ -5,6 +5,8 @@
 //!
 //! Contains all input driver implementations.
 
+// Eden adds drivers/android.{h,cpp} to input_common only for Android builds.
+#[cfg(target_os = "android")]
 pub mod android;
 pub mod camera;
 pub mod gc_adapter;
