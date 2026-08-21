@@ -3656,7 +3656,7 @@ mod tests {
             0x2c,
             1,
             0x40000,
-            0x0100_1520_0002_2000,
+            0x05AA_0000_0000_0001,
             0,
             0,
             vec![],
@@ -3667,7 +3667,7 @@ mod tests {
 
         assert_eq!(result, RESULT_SUCCESS.get_inner_value());
         assert_eq!(process.get_entry_point().get(), 0x0020_0000);
-        assert_eq!(process.get_program_id(), 0x0100_1520_0002_2000);
+        assert_eq!(process.get_program_id(), 0x05AA_0000_0000_0001);
         assert_eq!(process.get_ideal_core_id(), 1);
         // main_thread_stack_size is set later by run(), not by load_from_metadata.
         // The metadata's stack size (0x40000) is stored internally and used when run() is called.

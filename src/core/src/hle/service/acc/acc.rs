@@ -1031,7 +1031,7 @@ mod tests {
     #[test]
     fn initialize_application_info_base_uses_arp_storage_type_without_retaining_property() {
         let mut system = crate::core::System::new();
-        let program_id = 0x0100_1520_0002_2000;
+        let program_id = 0x05AA_0000_0000_0001;
         system.set_runtime_program_id(program_id);
         system.arp_manager().lock().unwrap().register(
             program_id,
@@ -1061,7 +1061,7 @@ mod tests {
     #[test]
     fn initialize_application_info_base_repeats_while_upstream_property_is_not_retained() {
         let mut system = crate::core::System::new();
-        let program_id = 0x0100_1520_0002_2000;
+        let program_id = 0x05AA_0000_0000_0001;
         system.set_runtime_program_id(program_id);
         system.arp_manager().lock().unwrap().register(
             program_id,
