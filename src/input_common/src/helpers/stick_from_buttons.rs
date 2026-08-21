@@ -59,7 +59,9 @@ struct Stick {
     left: Box<dyn InputDevice>,
     right: Box<dyn InputDevice>,
     modifier: Box<dyn InputDevice>,
-    updater: Box<dyn InputDevice>,
+    // Ownership keeps the updater callback registered; dropping the device
+    // unregisters it from InputEngine.
+    _updater: Box<dyn InputDevice>,
     state: Arc<Mutex<StickState>>,
 }
 
@@ -356,7 +358,7 @@ impl Stick {
             left,
             right,
             modifier,
-            updater,
+            _updater: updater,
             state,
         }
     }

@@ -4744,3 +4744,12 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
   calibration, but no UDP implementation reads them. Ruzu omits that dead per-pad state; active
   touch calibration continues to come from `Settings::touch_device` in `on_pad_data`, as it does
   in Eden.
+
+## 2026-08-22 — `src/input_common/src/helpers/stick_from_buttons.rs` updater lifetime
+
+### Intentional differences
+
+- Rust names the stored updater device `_updater` to make its ownership-only role explicit. It
+  must remain alive because `InputFromButton::drop` unregisters its engine callback; Ruzu keeps the
+  same lifetime as Eden's `unique_ptr` while leaving `force_update` limited to the five user
+  inputs, exactly as upstream does.
