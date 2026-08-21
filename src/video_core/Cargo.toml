@@ -22,7 +22,7 @@ bitflags.workspace = true
 bytemuck.workspace = true
 libc = "0.2"
 smallvec = { version = "1", features = ["const_generics"] }
-rxbyak = { path = "../externals/rxbyak" }
+rxbyak = { path = "../../externals/rxbyak" }
 
 [build-dependencies]
 cc = "1"

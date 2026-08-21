@@ -5,7 +5,7 @@ SPDX-License-Identifier: GPL-3.0-or-later
 
 <h1 align="center">
   <br>
-  <a href="https://github.com/vricosti/ruzu-emu"><img src="./ruzu/assets/ruzu-rusty-lemon.png" alt="ruzu" width="200"></a>
+  <a href="https://github.com/vricosti/ruzu-emu"><img src="./src/ruzu/assets/ruzu-rusty-lemon.png" alt="ruzu" width="200"></a>
   <br>
   <b>ruzu</b>
   <br>

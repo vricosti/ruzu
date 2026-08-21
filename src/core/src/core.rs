@@ -1974,6 +1974,9 @@ impl System {
         if let Some(ref kernel) = self.kernel {
             kernel.finalize_terminated_processes_after_cpu_shutdown();
         }
+        // Rust retains service sessions in the terminated-process table until
+        // the post-CPU finalization above. Keep AudioCore's render manager
+        // alive so late AudioRenderer::finalize waits can still be signaled.
         self.audio_core = None;
         self.current_process_arc = None;
         self.current_process = None;

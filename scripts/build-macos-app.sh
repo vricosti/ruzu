@@ -10,8 +10,8 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 build_dir="$repo_root/target/release"
 binary="$build_dir/ruzu"
 app="$build_dir/ruzu.app"
-plist="$repo_root/ruzu/Info.plist"
-icon_source="$repo_root/ruzu/assets/ruzu-rusty-lemon.png"
+plist="$repo_root/src/ruzu/Info.plist"
+icon_source="$repo_root/src/ruzu/assets/ruzu-rusty-lemon.png"
 
 if command -v brew >/dev/null 2>&1; then
     brew_prefix="$(brew --prefix)"

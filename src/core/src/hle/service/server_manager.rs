@@ -1749,7 +1749,7 @@ impl ServerManager {
         // increments to `count == 2`, tripping the `count == 1` assertion
         // in `KScheduler::reschedule_current_hle_thread`. Audit of every
         // `system.current_thread()` / `system.current_process()` reader
-        // under `core/src/hle/service/` shows no handler-side code that
+        // under `src/core/src/hle/service/` shows no handler-side code that
         // actually depends on impersonation (only diagnostic logging in
         // `audio/audio_renderer.rs`), so removal is safe.
         let service_result = hle_ipc::complete_sync_request(&manager, &mut context);

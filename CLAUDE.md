@@ -12,7 +12,7 @@ applies even when the work is complete and tests pass.
 
 ## Purpose
 
-This document defines how a ChatGPT/Codex-style agent must port C++ code from `~/Dev/emulators/eden/src/` into `~/Dev/emulators/ruzu/`.
+This document defines how a ChatGPT/Codex-style agent must port C++ code from `~/Dev/emulators/eden/src/` into `~/Dev/emulators/ruzu/src/`.
 
 It is written as a handoff contract for another instance.
 
@@ -59,7 +59,7 @@ Always treat it as authoritative for:
 
 The Rust destination is:
 
-- `~/Dev/emulators/ruzu/`
+- `~/Dev/emulators/ruzu/src/`
 
 The Rust port should be judged against the C++ tree, not against whether the Rust design looks idiomatic in isolation.
 
@@ -487,7 +487,7 @@ That is the right mindset for finishing this port.
 
 The same porting philosophy applies to the companion projects:
 
-- **rdynarmic** (`~/Dev/emulators/ruzu/rdynarmic/`) — Rust port of the Dynarmic ARM JIT compiler, integrated into the ruzu workspace
+- **rdynarmic** (`~/Dev/emulators/ruzu/src/rdynarmic/`) — Rust port of the Dynarmic ARM JIT compiler, integrated into the ruzu workspace
   - Upstream: `~/Dev/emulators/eden/src/dynarmic/`
   - Must follow the same file structure, method ownership, and behavioral parity rules as ruzu
   - IR opcodes, emitter methods, backend emit handlers, and register allocator must match upstream naming and semantics
@@ -509,7 +509,7 @@ Each section below lists C++ files that have no meaningful Rust counterpart for 
 
 ### `audio_core` — `~/Dev/emulators/eden/src/audio_core`
 
-**Rust crate:** `audio_core` at `~/Dev/emulators/ruzu/audio_core`
+**Rust crate:** `audio_core` at `~/Dev/emulators/ruzu/src/audio_core`
 
 **Status:** Ported.
 
@@ -519,7 +519,7 @@ Each section below lists C++ files that have no meaningful Rust counterpart for 
 
 ### `common` — `~/Dev/emulators/eden/src/common`
 
-**Rust crate:** `common` at `~/Dev/emulators/ruzu/common`
+**Rust crate:** `common` at `~/Dev/emulators/ruzu/src/common`
 
 **Status:** Ported.
 
@@ -559,7 +559,7 @@ Each section below lists C++ files that have no meaningful Rust counterpart for 
 
 ### `core` — `~/Dev/emulators/eden/src/core`
 
-**Rust crate:** `core` at `~/Dev/emulators/ruzu/core`
+**Rust crate:** `core` at `~/Dev/emulators/ruzu/src/core`
 
 **Status:** Ported.
 
@@ -574,7 +574,7 @@ Each section below lists C++ files that have no meaningful Rust counterpart for 
 
 ### `video_core` — `~/Dev/emulators/eden/src/video_core`
 
-**Rust crate:** `video_core` at `~/Dev/emulators/ruzu/video_core`
+**Rust crate:** `video_core` at `~/Dev/emulators/ruzu/src/video_core`
 
 **Status:** In progress.
 

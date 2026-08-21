@@ -1,2 +1,2 @@
-video_core/src/renderer_vulkan/update_descriptor.rs text eol=lf
-rdynarmic/** text eol=lf
+src/video_core/src/renderer_vulkan/update_descriptor.rs text eol=lf
+src/rdynarmic/** text eol=lf

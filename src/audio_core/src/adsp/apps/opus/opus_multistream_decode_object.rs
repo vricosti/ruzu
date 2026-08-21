@@ -8,7 +8,7 @@ const OPUS_RESET_STATE: c_int = 4028;
 const OPUS_GET_FINAL_RANGE_REQUEST: c_int = 4031;
 const OPUS_MULTI_STREAM_DECODE_OBJECT_SIZE: u32 = 0x20;
 
-// Linkage against libopus is declared by `audio_core/build.rs`, which probes
+// Linkage against libopus is declared by `src/audio_core/build.rs`, which probes
 // pkg-config so the linker also learns where the library lives.
 unsafe extern "C" {
     fn opus_multistream_decoder_get_size(streams: c_int, coupled_streams: c_int) -> c_int;

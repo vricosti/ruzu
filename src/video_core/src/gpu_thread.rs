@@ -478,14 +478,25 @@ impl ThreadManager {
         self.stop.store(true, Ordering::Relaxed);
         self.state.notify_all();
     }
-}
 
-impl Drop for ThreadManager {
-    fn drop(&mut self) {
+    /// Stop and join the GPU thread while its borrowed renderer and scheduler
+    /// are still alive.
+    ///
+    /// Upstream gets the renderer ordering from C++ reverse member
+    /// destruction: `GPU::Impl::gpu_thread` is destroyed before `renderer`.
+    /// Rust drops fields in declaration order and frees its boxed scheduler,
+    /// so `Gpu::drop` calls this explicitly before either borrowed owner.
+    pub(crate) fn shutdown(&mut self) {
         self.request_stop();
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
+    }
+}
+
+impl Drop for ThreadManager {
+    fn drop(&mut self) {
+        self.shutdown();
     }
 }
 
@@ -580,5 +591,25 @@ fn run_thread(
             let _lock = state.write_lock.lock().unwrap();
             state.cv.notify_all();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shutdown_wakes_joins_and_is_idempotent() {
+        let mut manager = ThreadManager::new(SystemRef::null(), true);
+        let state = Arc::clone(&manager.state);
+        let stop = Arc::clone(&manager.stop);
+        manager.thread = Some(std::thread::spawn(move || {
+            let _ = state.pop_wait(&stop);
+        }));
+
+        manager.shutdown();
+        assert!(manager.thread.is_none());
+        manager.shutdown();
+        assert!(manager.thread.is_none());
     }
 }

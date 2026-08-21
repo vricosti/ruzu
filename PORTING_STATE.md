@@ -3,15 +3,15 @@
 ## 2026-08-05 — Controls Motion / Touch configuration
 
 - Status: completed and verified.
-- Interrupted slice: `ruzu/src/configuration/configure_motion_touch.rs`, the GTK
+- Interrupted slice: `src/ruzu/src/configuration/configure_motion_touch.rs`, the GTK
   counterpart of `yuzu/configuration/configure_motion_touch.{h,cpp,ui}`.
 - Confirmed behavior: the button currently only logs a message. Its upstream
   dialog owns Cemuhook UDP server management, communication testing, touchpad
   calibration, and touch-from-button map selection.
-- Missing prerequisite: `input_common/src/drivers/udp_client.rs` exposes
+- Missing prerequisite: `src/input_common/src/drivers/udp_client.rs` exposes
   `reload_sockets`, `CalibrationConfigurationJob`, and `test_communication`,
   but all three are non-functional stubs. In addition,
-  `input_common/src/helpers/udp_protocol.rs` validates responses but cannot
+  `src/input_common/src/helpers/udp_protocol.rs` validates responses but cannot
   serialize requests or decode response payloads for a socket owner.
 - Prerequisite result: the UDP socket lifecycle, request serialization,
   response decoding, communication test, and calibration job are implemented
@@ -24,7 +24,7 @@
 ## 2026-07-31 — Windows in-process game boot
 
 - Status: interrupted while implementing the missing prerequisite.
-- Interrupted slice: `ruzu/src/main_window.rs::boot_game`, the GTK counterpart
+- Interrupted slice: `src/ruzu/src/main_window.rs::boot_game`, the GTK counterpart
   of `GMainWindow::BootGame`.
 - Confirmed behavior: double-click activation reaches `boot_game`, but the
   non-macOS/non-Linux implementation is an explicit logging stub.
@@ -57,12 +57,12 @@
 ## 2026-07-31 — Windows game-list population
 
 - Status: completed and verified.
-- Interrupted slice: `ruzu/src/game_list.rs` directory selection, recursive
+- Interrupted slice: `src/ruzu/src/game_list.rs` directory selection, recursive
   scan, and metadata population.
 - Confirmed behavior: recursive enumeration finds all nine `.xci` / `.nsp`
   candidates below the configured directory, but loader validation classifies
   every candidate as `FileType::Error`.
-- Missing prerequisite: `core/src/crypto/key_manager.rs::resolve_keys_dir`
+- Missing prerequisite: `src/core/src/crypto/key_manager.rs::resolve_keys_dir`
   claims to search legacy yuzu locations but does not include yuzu's actual
   Windows `%APPDATA%\yuzu\keys` directory. The available `prod.keys` and
   `title.keys` are therefore not loaded.
@@ -81,7 +81,7 @@
 - Interrupted slice: full `cargo test -p rdynarmic --release` validation after
   aligning callback, unwind, SVC and FPSCR emission with upstream.
 - Exact missing prerequisite:
-  `rdynarmic/src/backend/x64/emit_exclusive_memory.rs` assumes every
+  `src/rdynarmic/src/backend/x64/emit_exclusive_memory.rs` assumes every
   128-bit exclusive-read callback returns a pair in `RAX:RDX`. That is the
   SysV return contract; MSVC uses a hidden return pointer, as represented by
   upstream `Callback::EmitCallWithReturnPointer`.

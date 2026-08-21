@@ -4,12 +4,16 @@
 //!
 //! Eden's core VFS has no writable layered-directory counterpart: its
 //! `LayeredVfsDirectory` deliberately rejects mutations. This frontend-owned
-//! view therefore keeps the NRO's containing directory as the writable,
-//! higher-priority layer and the configured SDMC as a fallback. It avoids
-//! platform-specific host symbolic links and Windows junction points while
-//! leaving the core content caches attached to the configured SDMC.
+//! view therefore keeps the NRO package's SD-card root as the writable,
+//! higher-priority layer and the configured SDMC as a fallback. For the
+//! conventional `<package>/switch/application.nro` layout, the package root
+//! is the directory above `switch`; otherwise it is the NRO's containing
+//! directory. This avoids platform-specific host symbolic links and Windows
+//! junction points while leaving the core content caches attached to the
+//! configured SDMC.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::OsStr;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -273,6 +277,20 @@ impl VfsDirectory for HomebrewSdmcDirectory {
     }
 }
 
+/// Resolve the host directory that represents the root of the homebrew SD-card package.
+///
+/// Homebrew archives commonly place an NRO directly in `switch/` and put large asset
+/// directories beside `switch/`. An NRO stored anywhere else keeps its containing directory as
+/// the root, preserving the flat and per-application layouts supported previously.
+fn homebrew_sdmc_root_path(executable_path: &Path) -> Option<&Path> {
+    let containing_directory = executable_path.parent()?;
+    if containing_directory.file_name() == Some(OsStr::new("switch")) {
+        containing_directory.parent().or(Some(containing_directory))
+    } else {
+        Some(containing_directory)
+    }
+}
+
 /// Build a per-launch SDMC view when `executable_path` identifies as an NRO.
 pub(crate) fn make_homebrew_sdmc_view(
     vfs: Arc<RealVfsFilesystem>,
@@ -285,7 +303,7 @@ pub(crate) fn make_homebrew_sdmc_view(
         return None;
     }
 
-    let homebrew_path = executable_path.parent()?;
+    let homebrew_path = homebrew_sdmc_root_path(&executable_path)?;
     if !homebrew_path.is_dir() {
         return None;
     }
@@ -381,6 +399,36 @@ mod tests {
                 .read_all_bytes(),
             b"fallback"
         );
+    }
+
+    #[test]
+    fn nro_directly_in_switch_uses_the_package_sd_card_root() {
+        let temporary = tempfile::tempdir().unwrap();
+        let package = temporary.path().join("package");
+        let switch = package.join("switch");
+        let assets = package.join("application-data");
+        let sdmc = temporary.path().join("sdmc");
+        fs::create_dir_all(&switch).unwrap();
+        fs::create_dir_all(&assets).unwrap();
+        fs::create_dir_all(&sdmc).unwrap();
+        fs::write(switch.join("application.nro"), nro_bytes()).unwrap();
+        fs::write(assets.join("asset.marker"), b"assets").unwrap();
+
+        let vfs = RealVfsFilesystem::new();
+        let view = make_homebrew_sdmc_view(
+            Arc::clone(&vfs),
+            &switch.join("application.nro"),
+            real_directory(vfs, &sdmc),
+        )
+        .unwrap();
+
+        assert_eq!(
+            view.get_file_relative("application-data/asset.marker")
+                .unwrap()
+                .read_all_bytes(),
+            b"assets"
+        );
+        assert!(view.get_file_relative("switch/application.nro").is_some());
     }
 
     #[test]
