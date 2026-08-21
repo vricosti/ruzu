@@ -27,7 +27,9 @@ pub enum ApplicationLanguage {
     TraditionalChinese = 13,
     SimplifiedChinese = 14,
     BrazilianPortuguese = 15,
-    Count = 16,
+    Polish = 16,
+    Thai = 17,
+    Count = 18,
 }
 
 pub const APPLICATION_LANGUAGE_COUNT: usize = ApplicationLanguage::Count as usize;
@@ -54,7 +56,9 @@ const PRIORITY_LIST_AMERICAN_ENGLISH: ApplicationLanguagePriorityList = [
     ApplicationLanguage::SimplifiedChinese,
     ApplicationLanguage::TraditionalChinese,
     ApplicationLanguage::Korean,
-    ApplicationLanguage::BrazilianPortuguese,
+    ApplicationLanguage::Polish,
+    ApplicationLanguage::Thai,
+    ApplicationLanguage::AmericanEnglish,
 ];
 
 const PRIORITY_LIST_BRITISH_ENGLISH: ApplicationLanguagePriorityList = [
@@ -73,7 +77,9 @@ const PRIORITY_LIST_BRITISH_ENGLISH: ApplicationLanguagePriorityList = [
     ApplicationLanguage::SimplifiedChinese,
     ApplicationLanguage::TraditionalChinese,
     ApplicationLanguage::Korean,
-    ApplicationLanguage::BrazilianPortuguese,
+    ApplicationLanguage::Polish,
+    ApplicationLanguage::Thai,
+    ApplicationLanguage::AmericanEnglish,
 ];
 
 const PRIORITY_LIST_JAPANESE: ApplicationLanguagePriorityList = [
@@ -92,7 +98,9 @@ const PRIORITY_LIST_JAPANESE: ApplicationLanguagePriorityList = [
     ApplicationLanguage::SimplifiedChinese,
     ApplicationLanguage::TraditionalChinese,
     ApplicationLanguage::Korean,
-    ApplicationLanguage::BrazilianPortuguese,
+    ApplicationLanguage::Polish,
+    ApplicationLanguage::Thai,
+    ApplicationLanguage::AmericanEnglish,
 ];
 
 const PRIORITY_LIST_FRENCH: ApplicationLanguagePriorityList = [
@@ -111,7 +119,9 @@ const PRIORITY_LIST_FRENCH: ApplicationLanguagePriorityList = [
     ApplicationLanguage::SimplifiedChinese,
     ApplicationLanguage::TraditionalChinese,
     ApplicationLanguage::Korean,
-    ApplicationLanguage::BrazilianPortuguese,
+    ApplicationLanguage::Polish,
+    ApplicationLanguage::Thai,
+    ApplicationLanguage::AmericanEnglish,
 ];
 
 const PRIORITY_LIST_GERMAN: ApplicationLanguagePriorityList = [
@@ -130,7 +140,9 @@ const PRIORITY_LIST_GERMAN: ApplicationLanguagePriorityList = [
     ApplicationLanguage::SimplifiedChinese,
     ApplicationLanguage::TraditionalChinese,
     ApplicationLanguage::Korean,
-    ApplicationLanguage::BrazilianPortuguese,
+    ApplicationLanguage::Polish,
+    ApplicationLanguage::Thai,
+    ApplicationLanguage::AmericanEnglish,
 ];
 
 const PRIORITY_LIST_LATIN_AMERICAN_SPANISH: ApplicationLanguagePriorityList = [
@@ -149,7 +161,9 @@ const PRIORITY_LIST_LATIN_AMERICAN_SPANISH: ApplicationLanguagePriorityList = [
     ApplicationLanguage::SimplifiedChinese,
     ApplicationLanguage::TraditionalChinese,
     ApplicationLanguage::Korean,
-    ApplicationLanguage::BrazilianPortuguese,
+    ApplicationLanguage::Polish,
+    ApplicationLanguage::Thai,
+    ApplicationLanguage::AmericanEnglish,
 ];
 
 const PRIORITY_LIST_SPANISH: ApplicationLanguagePriorityList = [
@@ -168,7 +182,9 @@ const PRIORITY_LIST_SPANISH: ApplicationLanguagePriorityList = [
     ApplicationLanguage::SimplifiedChinese,
     ApplicationLanguage::TraditionalChinese,
     ApplicationLanguage::Korean,
-    ApplicationLanguage::BrazilianPortuguese,
+    ApplicationLanguage::Polish,
+    ApplicationLanguage::Thai,
+    ApplicationLanguage::AmericanEnglish,
 ];
 
 const PRIORITY_LIST_ITALIAN: ApplicationLanguagePriorityList = [
@@ -187,7 +203,9 @@ const PRIORITY_LIST_ITALIAN: ApplicationLanguagePriorityList = [
     ApplicationLanguage::SimplifiedChinese,
     ApplicationLanguage::TraditionalChinese,
     ApplicationLanguage::Korean,
-    ApplicationLanguage::BrazilianPortuguese,
+    ApplicationLanguage::Polish,
+    ApplicationLanguage::Thai,
+    ApplicationLanguage::AmericanEnglish,
 ];
 
 const PRIORITY_LIST_DUTCH: ApplicationLanguagePriorityList = [
@@ -206,7 +224,9 @@ const PRIORITY_LIST_DUTCH: ApplicationLanguagePriorityList = [
     ApplicationLanguage::SimplifiedChinese,
     ApplicationLanguage::TraditionalChinese,
     ApplicationLanguage::Korean,
-    ApplicationLanguage::BrazilianPortuguese,
+    ApplicationLanguage::Polish,
+    ApplicationLanguage::Thai,
+    ApplicationLanguage::AmericanEnglish,
 ];
 
 const PRIORITY_LIST_CANADIAN_FRENCH: ApplicationLanguagePriorityList = [
@@ -225,7 +245,9 @@ const PRIORITY_LIST_CANADIAN_FRENCH: ApplicationLanguagePriorityList = [
     ApplicationLanguage::SimplifiedChinese,
     ApplicationLanguage::TraditionalChinese,
     ApplicationLanguage::Korean,
-    ApplicationLanguage::BrazilianPortuguese,
+    ApplicationLanguage::Polish,
+    ApplicationLanguage::Thai,
+    ApplicationLanguage::AmericanEnglish,
 ];
 
 const PRIORITY_LIST_PORTUGUESE: ApplicationLanguagePriorityList = [
@@ -244,7 +266,9 @@ const PRIORITY_LIST_PORTUGUESE: ApplicationLanguagePriorityList = [
     ApplicationLanguage::SimplifiedChinese,
     ApplicationLanguage::TraditionalChinese,
     ApplicationLanguage::Korean,
-    ApplicationLanguage::BrazilianPortuguese,
+    ApplicationLanguage::Polish,
+    ApplicationLanguage::Thai,
+    ApplicationLanguage::AmericanEnglish,
 ];
 
 const PRIORITY_LIST_RUSSIAN: ApplicationLanguagePriorityList = [
@@ -263,7 +287,9 @@ const PRIORITY_LIST_RUSSIAN: ApplicationLanguagePriorityList = [
     ApplicationLanguage::SimplifiedChinese,
     ApplicationLanguage::TraditionalChinese,
     ApplicationLanguage::Korean,
-    ApplicationLanguage::BrazilianPortuguese,
+    ApplicationLanguage::Polish,
+    ApplicationLanguage::Thai,
+    ApplicationLanguage::AmericanEnglish,
 ];
 
 const PRIORITY_LIST_KOREAN: ApplicationLanguagePriorityList = [
@@ -282,7 +308,9 @@ const PRIORITY_LIST_KOREAN: ApplicationLanguagePriorityList = [
     ApplicationLanguage::Japanese,
     ApplicationLanguage::SimplifiedChinese,
     ApplicationLanguage::TraditionalChinese,
-    ApplicationLanguage::BrazilianPortuguese,
+    ApplicationLanguage::Polish,
+    ApplicationLanguage::Thai,
+    ApplicationLanguage::AmericanEnglish,
 ];
 
 const PRIORITY_LIST_TRADITIONAL_CHINESE: ApplicationLanguagePriorityList = [
@@ -301,7 +329,9 @@ const PRIORITY_LIST_TRADITIONAL_CHINESE: ApplicationLanguagePriorityList = [
     ApplicationLanguage::Portuguese,
     ApplicationLanguage::Russian,
     ApplicationLanguage::Korean,
-    ApplicationLanguage::BrazilianPortuguese,
+    ApplicationLanguage::Polish,
+    ApplicationLanguage::Thai,
+    ApplicationLanguage::AmericanEnglish,
 ];
 
 const PRIORITY_LIST_SIMPLIFIED_CHINESE: ApplicationLanguagePriorityList = [
@@ -320,7 +350,9 @@ const PRIORITY_LIST_SIMPLIFIED_CHINESE: ApplicationLanguagePriorityList = [
     ApplicationLanguage::Portuguese,
     ApplicationLanguage::Russian,
     ApplicationLanguage::Korean,
-    ApplicationLanguage::BrazilianPortuguese,
+    ApplicationLanguage::Polish,
+    ApplicationLanguage::Thai,
+    ApplicationLanguage::AmericanEnglish,
 ];
 
 const PRIORITY_LIST_BRAZILIAN_PORTUGUESE: ApplicationLanguagePriorityList = [
@@ -340,6 +372,50 @@ const PRIORITY_LIST_BRAZILIAN_PORTUGUESE: ApplicationLanguagePriorityList = [
     ApplicationLanguage::Korean,
     ApplicationLanguage::SimplifiedChinese,
     ApplicationLanguage::TraditionalChinese,
+    ApplicationLanguage::Polish,
+    ApplicationLanguage::Thai,
+];
+
+const PRIORITY_LIST_THAI: ApplicationLanguagePriorityList = [
+    ApplicationLanguage::Thai,
+    ApplicationLanguage::AmericanEnglish,
+    ApplicationLanguage::BritishEnglish,
+    ApplicationLanguage::Japanese,
+    ApplicationLanguage::French,
+    ApplicationLanguage::German,
+    ApplicationLanguage::Spanish,
+    ApplicationLanguage::Italian,
+    ApplicationLanguage::Dutch,
+    ApplicationLanguage::CanadianFrench,
+    ApplicationLanguage::Russian,
+    ApplicationLanguage::Korean,
+    ApplicationLanguage::SimplifiedChinese,
+    ApplicationLanguage::TraditionalChinese,
+    ApplicationLanguage::Polish,
+    ApplicationLanguage::AmericanEnglish,
+    ApplicationLanguage::AmericanEnglish,
+    ApplicationLanguage::AmericanEnglish,
+];
+
+const PRIORITY_LIST_POLISH: ApplicationLanguagePriorityList = [
+    ApplicationLanguage::Polish,
+    ApplicationLanguage::AmericanEnglish,
+    ApplicationLanguage::BritishEnglish,
+    ApplicationLanguage::Japanese,
+    ApplicationLanguage::French,
+    ApplicationLanguage::German,
+    ApplicationLanguage::Spanish,
+    ApplicationLanguage::Italian,
+    ApplicationLanguage::Dutch,
+    ApplicationLanguage::CanadianFrench,
+    ApplicationLanguage::Russian,
+    ApplicationLanguage::Korean,
+    ApplicationLanguage::SimplifiedChinese,
+    ApplicationLanguage::TraditionalChinese,
+    ApplicationLanguage::AmericanEnglish,
+    ApplicationLanguage::AmericanEnglish,
+    ApplicationLanguage::AmericanEnglish,
+    ApplicationLanguage::AmericanEnglish,
 ];
 
 pub fn get_application_language_priority_list(
@@ -362,6 +438,8 @@ pub fn get_application_language_priority_list(
         ApplicationLanguage::TraditionalChinese => Some(&PRIORITY_LIST_TRADITIONAL_CHINESE),
         ApplicationLanguage::SimplifiedChinese => Some(&PRIORITY_LIST_SIMPLIFIED_CHINESE),
         ApplicationLanguage::BrazilianPortuguese => Some(&PRIORITY_LIST_BRAZILIAN_PORTUGUESE),
+        ApplicationLanguage::Polish => Some(&PRIORITY_LIST_POLISH),
+        ApplicationLanguage::Thai => Some(&PRIORITY_LIST_THAI),
         _ => None,
     }
 }
@@ -384,7 +462,8 @@ pub fn convert_to_application_language(language_code: LanguageCode) -> Option<Ap
         LanguageCode::ZhTw | LanguageCode::ZhHant => Some(ApplicationLanguage::TraditionalChinese),
         LanguageCode::ZhCn | LanguageCode::ZhHans => Some(ApplicationLanguage::SimplifiedChinese),
         LanguageCode::PtBr => Some(ApplicationLanguage::BrazilianPortuguese),
-        _ => None,
+        LanguageCode::Th => Some(ApplicationLanguage::Thai),
+        LanguageCode::Pl => Some(ApplicationLanguage::Polish),
     }
 }
 
@@ -406,6 +485,57 @@ pub fn convert_to_language_code(lang: ApplicationLanguage) -> Option<LanguageCod
         ApplicationLanguage::TraditionalChinese => Some(LanguageCode::ZhHant),
         ApplicationLanguage::SimplifiedChinese => Some(LanguageCode::ZhHans),
         ApplicationLanguage::BrazilianPortuguese => Some(LanguageCode::PtBr),
+        ApplicationLanguage::Thai => Some(LanguageCode::Th),
+        ApplicationLanguage::Polish => Some(LanguageCode::Pl),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn polish_and_thai_match_eden_language_codes() {
+        assert_eq!(
+            convert_to_application_language(LanguageCode::Pl),
+            Some(ApplicationLanguage::Polish)
+        );
+        assert_eq!(
+            convert_to_application_language(LanguageCode::Th),
+            Some(ApplicationLanguage::Thai)
+        );
+        assert_eq!(
+            convert_to_language_code(ApplicationLanguage::Polish),
+            Some(LanguageCode::Pl)
+        );
+        assert_eq!(
+            convert_to_language_code(ApplicationLanguage::Thai),
+            Some(LanguageCode::Th)
+        );
+    }
+
+    #[test]
+    fn priority_lists_preserve_edens_aggregate_initialization() {
+        assert_eq!(
+            get_application_language_priority_list(ApplicationLanguage::Thai)
+                .unwrap()
+                .len(),
+            APPLICATION_LANGUAGE_COUNT
+        );
+        assert_eq!(
+            get_application_language_priority_list(ApplicationLanguage::Polish)
+                .unwrap()
+                .len(),
+            APPLICATION_LANGUAGE_COUNT
+        );
+        assert_eq!(
+            PRIORITY_LIST_THAI[15..],
+            [ApplicationLanguage::AmericanEnglish; 3]
+        );
+        assert_eq!(
+            PRIORITY_LIST_POLISH[14..],
+            [ApplicationLanguage::AmericanEnglish; 4]
+        );
     }
 }

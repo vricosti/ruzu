@@ -2238,3 +2238,47 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 ### Binary layout verification
 
 - N/A: the value is a textual frontend boolean.
+
+## 2026-08-21 — `src/core/src/file_sys/fssystem/compression_configuration.rs` vs Eden `src/core/file_sys/fssystem/fssystem_compression_configuration.{h,cpp}`
+
+### Intentional differences
+
+- Ruzu calls the safe Rust `lz4_flex::decompress_into` API in place of Eden's
+  `Common::Compression::DecompressDataLZ4`; both require the decompressed byte count to equal the
+  requested destination size.
+
+### Unintentional differences (to fix)
+
+- None. The invalid `cfg(feature = "lz4")` gate was removed: `lz4_flex` is an unconditional core
+  dependency and NCA LZ4 decompression is now active in every build, matching Eden.
+
+### Missing items
+
+- None for the NCA decompressor selection or destination-size validation path.
+
+### Binary layout verification
+
+- N/A: compressed bytes are decoded into caller-owned byte slices; no Rust structure is copied as
+  a guest payload.
+
+## 2026-08-21 — `src/core/src/hle/service/ns/language.rs` and `src/core/src/hle/service/set/settings_types.rs` vs Eden `src/core/hle/service/ns/language.{h,cpp}` and `src/core/hle/service/set/settings_types.h`
+
+### Intentional differences
+
+- Eden's partially initialized fixed-size Thai and Polish priority arrays zero-initialize their
+  remaining enum slots. Rust arrays require every element explicitly, so Ruzu spells those zero
+  values as trailing `ApplicationLanguage::AmericanEnglish` entries.
+
+### Unintentional differences (to fix)
+
+- None. Polish and Thai enum values, language codes, conversions, priority-list selection, and
+  Eden's exact aggregate-initialization result are now present.
+
+### Missing items
+
+- None in the reviewed language enum/conversion/priority-list slice.
+
+### Binary layout verification
+
+- PASS: `ApplicationLanguage` remains `repr(u8)` with Polish 16, Thai 17 and Count 18.
+- PASS: `LanguageCode` remains `repr(u64)` with Eden's exact little-endian `pl` and `th` values.

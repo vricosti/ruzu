@@ -239,6 +239,8 @@ pub enum LanguageCode {
     ZhHans = 0x00736E61482D687A,
     ZhHant = 0x00746E61482D687A,
     PtBr = 0x00000052422D7470,
+    Pl = 0x000000000000706C,
+    Th = 0x0000000000006874,
 }
 
 /// nn::settings::system::NotificationVolume

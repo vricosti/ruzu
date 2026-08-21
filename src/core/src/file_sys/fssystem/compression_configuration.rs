@@ -16,26 +16,10 @@ use common::ResultCode;
 ///
 /// Corresponds to upstream `DecompressLz4`.
 fn decompress_lz4(dst: &mut [u8], src: &[u8]) -> Result<(), ResultCode> {
-    // Use the lz4_flex crate for decompression if available,
-    // otherwise fall back to a basic implementation.
-    #[cfg(feature = "lz4")]
-    {
-        let result = lz4_flex::decompress_into(src, dst);
-        match result {
-            Ok(size) if size == dst.len() => Ok(()),
-            _ => Err(errors::RESULT_UNEXPECTED_IN_COMPRESSED_STORAGE_C), // ResultUnexpectedInCompressedStorageC
-        }
-    }
-    #[cfg(not(feature = "lz4"))]
-    {
-        // Without LZ4 support, we cannot decompress.
-        log::warn!(
-            "LZ4 decompression requested but lz4 feature not enabled (src={}, dst={})",
-            src.len(),
-            dst.len()
-        );
-        let _ = (dst, src);
-        Err(errors::RESULT_UNEXPECTED_IN_COMPRESSED_STORAGE_C) // ResultUnexpectedInCompressedStorageC
+    let result = lz4_flex::decompress_into(src, dst);
+    match result {
+        Ok(size) if size == dst.len() => Ok(()),
+        _ => Err(errors::RESULT_UNEXPECTED_IN_COMPRESSED_STORAGE_C),
     }
 }
 
@@ -89,13 +73,21 @@ mod tests {
     }
 
     #[test]
-    fn test_decompress_lz4_no_feature() {
-        // Without the lz4 feature, decompress_lz4 should return an error.
-        let mut dst = [0u8; 16];
-        let src = [0u8; 8];
-        let result = decompress_lz4(&mut dst, &src);
-        // Whether we have the feature or not, this should either succeed
-        // (with valid data) or fail. With invalid data, it should fail.
-        assert!(result.is_err());
+    fn test_decompress_lz4_matches_upstream_size_contract() {
+        let expected = b"Ruzu LZ4 parity data";
+        let compressed = lz4_flex::block::compress(expected);
+        let mut output = [0u8; 20];
+
+        decompress_lz4(&mut output, &compressed).unwrap();
+
+        assert_eq!(&output, expected);
+    }
+
+    #[test]
+    fn test_decompress_lz4_rejects_wrong_destination_size() {
+        let compressed = lz4_flex::block::compress(b"four");
+        let mut output = [0u8; 5];
+
+        assert!(decompress_lz4(&mut output, &compressed).is_err());
     }
 }
