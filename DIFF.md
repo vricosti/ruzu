@@ -2396,3 +2396,27 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 ### Binary layout verification
 
 - N/A: this is host-global scalar state and is not serialized or copied to guest memory.
+
+## 2026-08-21 — macro dumping in `src/video_core/src/macro_engine/macro_engine.rs` vs Eden `src/video_core/macro.{h,cpp}`
+
+### Intentional differences
+
+- `dump_to_directory` isolates the mechanical file write so the filename and payload can be tested
+  without mutating Ruzu's process-global dump path. It remains private in the upstream-owned macro
+  module and does not change method ownership.
+- Rust uses `bytemuck::cast_slice` for the same native `u32` byte representation that Eden writes
+  through `reinterpret_cast<const char*>`.
+
+### Unintentional differences (to fix)
+
+- None. Newly compiled macros now read `CacheInfo::hash` after execution and dump when
+  `dump_macros` is enabled, using Eden's exact program-ID/hash/variant filename and payload.
+
+### Missing items
+
+- None in the reviewed macro dump path.
+
+### Binary layout verification
+
+- PASS: the regression test verifies that the `.macro` payload is the contiguous native-byte view
+  of the original `u32` instruction span, matching Eden's `code.size_bytes()` write.

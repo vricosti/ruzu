@@ -7,6 +7,8 @@
 //! base that manages macro code upload, caching, and execution dispatch.
 
 use std::collections::HashMap;
+use std::io::Write;
+use std::path::Path;
 
 use super::macro_hle::HleMacro;
 use super::macro_interpreter::MacroInterpreterImpl;
@@ -480,6 +482,10 @@ impl MacroEngine {
         } else if let Some(ref mut lle) = entry.lle_program {
             lle.execute(parameters, method);
         }
+        if *common::settings::values().dump_macros.get_value() {
+            let decompiled = entry.hle_program.is_some() || entry.lle_program.is_some();
+            dump(entry.hash, &code_for_compile, decompiled);
+        }
     }
 }
 
@@ -492,12 +498,44 @@ fn hash_macro_code(code: &[u32]) -> u64 {
 /// Dump macro code to filesystem (debug utility).
 ///
 /// Port of the anonymous `Dump` function from `macro.cpp`.
-#[allow(dead_code)]
-fn dump(_hash: u64, _code: &[u32], _decompiled: bool) {
-    // Upstream writes macro code to `<dump_dir>/macros/<hash>.macro` using
-    // Common::FS::GetYuzuPath(DumpDir). Only called when Settings::values.dump_macros
-    // is true. Requires Common::FS path resolution and Settings integration,
-    // neither of which is wired to video_core yet.
+fn dump(hash: u64, code: &[u32], decompiled: bool) {
+    let dump_dir = common::fs::path_util::get_ruzu_path(common::fs::path_util::RuzuPath::DumpDir);
+    dump_to_directory(
+        &dump_dir,
+        common::settings::get_current_program_id(),
+        hash,
+        code,
+        decompiled,
+    );
+}
+
+fn dump_to_directory(dump_dir: &Path, program_id: u64, hash: u64, code: &[u32], decompiled: bool) {
+    if !common::fs::fs::create_dir(dump_dir) {
+        log::error!("Failed to create dump directory");
+        return;
+    }
+    let variant_suffix = if decompiled { "jit" } else { "raw" };
+    let path = dump_dir.join(format!(
+        "{program_id:016x}_{hash:016x}_{variant_suffix}.macro"
+    ));
+    let mut macro_file = match std::fs::File::create(&path) {
+        Ok(file) => file,
+        Err(error) => {
+            log::error!(
+                "Unable to open or create file at {}: {}",
+                common::fs::fs_util::path_to_utf8_string(&path),
+                error
+            );
+            return;
+        }
+    };
+    if let Err(error) = macro_file.write_all(bytemuck::cast_slice(code)) {
+        log::error!(
+            "Unable to write macro file at {}: {}",
+            common::fs::fs_util::path_to_utf8_string(&path),
+            error
+        );
+    }
 }
 
 #[cfg(test)]
@@ -633,6 +671,28 @@ mod tests {
     fn hash_macro_code_matches_upstream_hash_range_for_u32_vector() {
         let code = [0x04744351, 0x00708215, 0x00004041, 0x20390021];
         assert_eq!(hash_macro_code(&code), 0x7412B5E8633D2C9B);
+    }
+
+    #[test]
+    fn macro_dump_uses_eden_filename_and_native_u32_payload() {
+        const HOMEBREW_PROGRAM_ID: u64 = 0x0000_0000_4842_5257;
+        const HASH: u64 = 0x7412_B5E8_633D_2C9B;
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dump_dir =
+            std::env::temp_dir().join(format!("ruzu-macro-dump-{}-{unique}", std::process::id()));
+        let code = [0x0474_4351, 0x0070_8215];
+
+        dump_to_directory(&dump_dir, HOMEBREW_PROGRAM_ID, HASH, &code, true);
+
+        let path = dump_dir.join("0000000048425257_7412b5e8633d2c9b_jit.macro");
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            bytemuck::cast_slice::<u32, u8>(&code)
+        );
+        std::fs::remove_dir_all(&dump_dir).unwrap();
     }
 
     #[test]
