@@ -103,42 +103,40 @@ impl AccelerateDMA {
         image_operand: &dma::ImageOperand,
         is_image_upload: bool,
     ) -> bool {
-        unsafe {
-            let buffer_cache = self.buffer_cache.as_mut();
-            let texture_cache = self.texture_cache.as_mut();
-            let buffer_mutex: *const _ = &buffer_cache.mutex;
-            let texture_mutex: *const _ = &texture_cache.base.mutex;
-            lock_two_reentrant_mutexes!(buffer_mutex, texture_mutex, _buffer_guard, _texture_guard);
+        let buffer_cache = unsafe { self.buffer_cache.as_mut() };
+        let texture_cache = unsafe { self.texture_cache.as_mut() };
+        let buffer_mutex: *const _ = &buffer_cache.mutex;
+        let texture_mutex: *const _ = &texture_cache.base.mutex;
+        lock_two_reentrant_mutexes!(buffer_mutex, texture_mutex, _buffer_guard, _texture_guard);
 
-            let image_id = texture_cache
-                .base
-                .dma_image_id(image_operand, is_image_upload);
-            if image_id == NULL_IMAGE_ID {
-                return false;
-            }
-            let buffer_size = buffer_operand.pitch.wrapping_mul(buffer_operand.height);
-            let post_op = if is_image_upload {
-                ObtainBufferOperation::DoNothing
-            } else {
-                ObtainBufferOperation::MarkAsWritten
-            };
-            let (buffer_id, offset) = buffer_cache.obtain_buffer(
-                buffer_operand.address,
-                buffer_size,
-                ObtainBufferSynchronize::FullSynchronize,
-                post_op,
-            );
-            let buffer_handle = buffer_cache.get_buffer_gpu_handle(buffer_id);
-            texture_cache.dma_buffer_image_copy(
-                copy_info,
-                buffer_operand,
-                image_operand,
-                image_id,
-                buffer_handle,
-                offset as usize,
-                is_image_upload,
-            )
+        let image_id = texture_cache
+            .base
+            .dma_image_id(image_operand, is_image_upload);
+        if image_id == NULL_IMAGE_ID {
+            return false;
         }
+        let buffer_size = buffer_operand.pitch.wrapping_mul(buffer_operand.height);
+        let post_op = if is_image_upload {
+            ObtainBufferOperation::DoNothing
+        } else {
+            ObtainBufferOperation::MarkAsWritten
+        };
+        let (buffer_id, offset) = buffer_cache.obtain_buffer(
+            buffer_operand.address,
+            buffer_size,
+            ObtainBufferSynchronize::FullSynchronize,
+            post_op,
+        );
+        let buffer_handle = buffer_cache.get_buffer_gpu_handle(buffer_id);
+        texture_cache.dma_buffer_image_copy(
+            copy_info,
+            buffer_operand,
+            image_operand,
+            image_id,
+            buffer_handle,
+            offset as usize,
+            is_image_upload,
+        )
     }
 }
 
