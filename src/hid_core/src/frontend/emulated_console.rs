@@ -387,9 +387,10 @@ impl EmulatedConsole {
     }
 
     pub fn delete_callback(&mut self, key: i32) {
-        if self.callback_list.lock().remove(&key).is_none() {
-            log::error!("Tried to delete non-existent callback {}", key);
-        }
+        assert!(
+            self.callback_list.lock().remove(&key).is_some(),
+            "Tried to delete non-existent callback {key}"
+        );
     }
 
     fn trigger_callbacks(
@@ -503,5 +504,11 @@ mod tests {
         });
 
         assert_eq!((first, second), (1, 2));
+    }
+
+    #[test]
+    #[should_panic(expected = "Tried to delete non-existent callback")]
+    fn deleting_unknown_callback_matches_eden_assertion() {
+        EmulatedConsole::new().delete_callback(99);
     }
 }

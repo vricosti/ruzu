@@ -2486,6 +2486,8 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
   emulated motion in callback order, resets rotations/quaternion on reload, and applies
   `motion_sensitivity` to `is_at_rest` exactly where Eden does.
 - Callback keys now increment before insertion and therefore start at 1, matching Eden.
+- Deleting an unknown callback now asserts instead of only logging, matching Eden's
+  `ASSERT_MSG` contract.
 
 ### Missing items
 
