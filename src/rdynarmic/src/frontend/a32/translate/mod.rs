@@ -607,14 +607,12 @@ fn translate_arm_instruction(
         // Saturated
         SSAT => saturated::arm_ssat(ir, decoded),
         USAT => saturated::arm_usat(ir, decoded),
-        SSAT16 | USAT16 => {
-            log::warn!("STUBBED SSAT16/USAT16 at PC={:#x}", ir.pc());
-            true
-        }
-        QADD | QSUB | QDADD | QDSUB => {
-            log::warn!("STUBBED saturating arith at PC={:#x}", ir.pc());
-            true
-        }
+        SSAT16 => saturated::arm_ssat16(ir, decoded),
+        USAT16 => saturated::arm_usat16(ir, decoded),
+        QADD => saturated::arm_qadd(ir, decoded),
+        QSUB => saturated::arm_qsub(ir, decoded),
+        QDADD => saturated::arm_qdadd(ir, decoded),
+        QDSUB => saturated::arm_qdsub(ir, decoded),
         // Packing
         PKHBT => packing::arm_pkhbt(ir, decoded),
         PKHTB => packing::arm_pkhtb(ir, decoded),

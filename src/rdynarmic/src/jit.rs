@@ -7638,6 +7638,54 @@ mod tests {
     }
 
     #[test]
+    fn test_a32_scalar_saturation_results_and_q_flag() {
+        let config = JitConfig {
+            callbacks: Box::new(MockCallbacks::new(
+                0x1000,
+                &[
+                    0xE6A7_2011, // SSAT r2, #8, r1
+                    0xE6E8_3010, // USAT r3, #8, r0
+                    0xE102_4051, // QADD r4, r1, r2
+                    0xE6A7_5F36, // SSAT16 r5, #8, r6
+                    0xE6E8_7F38, // USAT16 r7, #8, r8
+                    0xEF00_0000, // SVC #0
+                ],
+            )),
+            enable_cycle_counting: false,
+            code_cache_size: 4 * 1024 * 1024,
+            optimizations: OptimizationFlag::NO_OPTIMIZATIONS,
+            unsafe_optimizations: false,
+            global_monitor: None,
+            fastmem_pointer: None,
+            page_table_pointer: None,
+            define_unpredictable_behaviour: false,
+            processor_id: 0,
+            wall_clock_cntpct: false,
+            cntfrq_el0: 600_000_000,
+            tpidrro_el0: None,
+            tpidr_el0: None,
+            memory: crate::backend::x64::emit_context::MemoryEmitConfig::default(),
+        };
+        let mut jit = A32Jit::new(config).unwrap();
+        jit.set_register(0, u32::MAX);
+        jit.set_register(1, i32::MAX as u32);
+        jit.set_register(6, 0x0100_ff00);
+        jit.set_register(8, 0x0100_ffff);
+        jit.set_register(15, 0x1000);
+        jit.set_cpsr(0x10);
+
+        let halt = jit.run();
+
+        assert!(halt.contains(HaltReason::SVC));
+        assert_eq!(jit.get_register(2), 127);
+        assert_eq!(jit.get_register(3), 0);
+        assert_eq!(jit.get_register(4), i32::MAX as u32);
+        assert_eq!(jit.get_register(5), 0x007f_ff80);
+        assert_eq!(jit.get_register(7), 0x00ff_0000);
+        assert_ne!(jit.get_cpsr() & (1 << 27), 0, "CPSR.Q must be sticky");
+    }
+
+    #[test]
     fn test_a32_cmp_bne_loop_with_all_optimizations() {
         // Same loop but with all optimizations + block linking enabled
         let config = JitConfig {

@@ -2,7 +2,7 @@
 
 ## 2026-08-21 — A32 scalar saturation warning slice
 
-- Status: common-helper prerequisite completed and verified; ready to resume the translator.
+- Status: completed and verified.
 - Interrupted slice: replace the incomplete `frontend/a32/translate/saturated.rs` SSAT/USAT
   translation that ignored `sat_imm`, then remove the corresponding warning.
 - Exact missing prerequisite: Eden's translator calls `IREmitter::{SignedSaturation,
@@ -28,6 +28,10 @@
 - Common-helper result: `pack_2x16_to_1x32` and `most_significant_half` now live in
   `frontend/a32/translate/helpers.rs`, preserve Eden's exact IR operation order, and pass their
   focused regression test.
+- Resumed result: ARM `SSAT`, `SSAT16`, `USAT`, `USAT16`, `QADD`, `QSUB`, `QDADD`, and `QDSUB`
+  now preserve Eden's validation, operand, saturation, register-write, and sticky-Q ordering. The
+  two unused `sat_imm` warnings are gone. Focused translation tests pass, and the same end-to-end
+  result/Q-flag regression passes on native x64 and the AArch64 backend under QEMU.
 
 ## 2026-08-21 — Windows GNU 128-bit callback ABI cleanup
 

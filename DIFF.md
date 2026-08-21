@@ -3344,3 +3344,71 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 ### Binary layout verification
 
 - N/A: these helpers construct internal SSA operations and serialize no guest-visible payload.
+
+## 2026-08-21 — `src/rdynarmic/src/frontend/a32/translate/saturated.rs` vs Eden `src/dynarmic/src/dynarmic/frontend/A32/translate/impl/{saturated.cpp,a32_translate_impl.h}`
+
+### Intentional differences
+
+- Ruzu decodes fields from `DecodedArm::raw` inside each Rust method, while Eden's generated
+  decoder passes typed immediates, booleans, and registers as method arguments.
+- ARM condition state is emitted once at the Rust block-translation boundary; the method bodies
+  therefore begin with Eden's pre-condition register validation and then emit the instruction
+  body. Invalid PC operands still raise Unpredictable before any register read.
+
+### Unintentional differences (to fix)
+
+- None in `arm_ssat`, `arm_ssat16`, `arm_usat`, `arm_usat16`, `arm_qadd`, `arm_qsub`,
+  `arm_qdadd`, or `arm_qdsub`. Saturation widths, immediate-shift carry input, signed halfword
+  extension, result packing, and every sticky-Q update match Eden's order.
+
+### Missing items
+
+- Eden's `arm_QASX`, `arm_QSAX`, `arm_UQASX`, and `arm_UQSAX` remain absent because Ruzu's ARM
+  decoder does not yet expose those instruction IDs. They are pre-existing parallel-instruction
+  debt outside this scalar warning slice.
+
+### Binary layout verification
+
+- N/A: these translators construct internal SSA and no raw guest payload.
+
+## 2026-08-21 — `src/rdynarmic/src/frontend/a32/translate/mod.rs` vs Eden ARM decoder/visitor dispatch for scalar saturation
+
+### Intentional differences
+
+- Rust uses an explicit `ArmInstId` match after block-level condition setup; Eden invokes visitor
+  methods through generated decoder callbacks.
+
+### Unintentional differences (to fix)
+
+- None in this routing slice: all eight decoded ARM scalar saturation instructions now call their
+  owner in `saturated.rs`; the former successful no-op stubs were removed.
+
+### Missing items
+
+- The four parallel saturation IDs named in the `saturated.rs` audit remain absent from the Rust
+  decoder and consequently from this dispatcher.
+
+### Binary layout verification
+
+- N/A: dispatcher routing defines no serialized layout.
+
+## 2026-08-21 — `src/rdynarmic/src/jit.rs` scalar saturation regression vs Eden `frontend/A32/translate/impl/saturated.cpp`
+
+### Intentional differences
+
+- The Rust-native regression executes a compact ARM instruction stream through each available
+  host backend; Eden's C++ source defines the expected semantics but does not own this Rust test.
+
+### Unintentional differences (to fix)
+
+- None in the covered behavior: signed/unsigned scalar and halfword clamps produce the expected
+  registers, saturated addition clamps to INT32_MAX, and CPSR.Q remains set.
+
+### Missing items
+
+- This focused regression does not claim exhaustive immediate widths or every QDADD/QDSUB input;
+  their IR ordering is covered by module tests.
+
+### Binary layout verification
+
+- N/A: the test executes guest instructions but changes no serialized guest structure.
