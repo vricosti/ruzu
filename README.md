@@ -38,9 +38,9 @@ SPDX-License-Identifier: GPL-3.0-or-later
 
 ## What this project actually is
 
-The question was narrow: **can frontier LLMs port a genuinely
-huge piece of software from C++ to Rust?** Not generate a plausible-looking file,
-not translate a self-contained algorithm, carry a whole codebase across, one
+I wanted to know one thing: **could frontier LLMs carry a genuinely huge piece
+of software from C++ to Rust?** Not generate a plausible-looking file, not
+translate a self-contained algorithm, carry a whole codebase across, one
 that is:
 
 - large: hundreds of thousands of lines across a dozen subsystems;
@@ -80,6 +80,16 @@ rdynarmic's ARM32 and ARM64 translation is validated by **differential fuzzing
 against the C++ dynarmic oracle**: the same instruction encodings are fed to
 both implementations and the resulting register and flag state is compared.
 That, rather than "the game boots", is what makes a JIT port credible.
+
+Testing an emulator needs something to run on it, so one more project came out
+of this work:
+
+| Project | What it is | Upstream |
+|---|---|---|
+| [**FreeBrick**](https://github.com/vricosti/freebrick) | A brick breaker in C++/SFML, with builds for Linux, macOS, Windows and Switch homebrew. MIT licensed, with original or freely licensed art and audio, so it can be shipped with the emulator | [dawid-wolinski/arkanoid-game](https://github.com/dawid-wolinski/arkanoid-game) |
+
+Being homebrew, it boots without keys or firmware — which makes it a
+reproducible test case rather than one more game nobody can legally hand you.
 
 ## Platforms
 
