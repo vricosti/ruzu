@@ -4286,3 +4286,52 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 - N/A: this slice emits host instructions and introduces no serialized or raw-copied payload.
   Focused tests verify the four exact AArch64 instruction encodings and dispatch all four IR
   opcodes through the cryptography owner.
+
+## 2026-08-21 — `src/web_service/src/announce_room_json.rs` vs `src/web_service/announce_room_json.h` and `.cpp`
+
+### Intentional differences
+
+- Rust implements Eden's file-local nlohmann `to_json`/`from_json` helpers with file-local
+  `serde_json::Value` conversion helpers. Required-field failures panic where Eden propagates a
+  JSON exception; missing optional descriptions, player lists, and member identities retain the
+  same fallback behavior.
+- Rust's detached delete worker creates an equivalent `Client` from the stored host and
+  credentials because a safe thread cannot borrow `self`. The shared JWT cache preserves the
+  authenticated request, and `Drop` joins every retained worker like destruction of Eden's
+  `std::jthread` vector.
+- The Rust backend methods take `&mut self` through the `Backend` trait instead of relying on C++
+  object mutability.
+
+### Unintentional differences (to fix)
+
+- None in this slice. Member/room field names and omission rules, signed-to-unsigned numeric casts,
+  registration payload and response state, player-only update payload, room-list parsing,
+  room-ID paths, and asynchronous deletion now match Eden.
+
+### Missing items
+
+- None in `RoomJson`'s declared backend API and JSON conversion behavior.
+
+### Binary layout verification
+
+- N/A: rooms are serialized as named JSON fields rather than by raw object layout.
+
+## 2026-08-21 — `src/web_service/src/verify_login.rs` vs `src/web_service/verify_login.h` and `.cpp`
+
+### Intentional differences
+
+- Rust uses `serde_json` and panics on malformed JSON where Eden's nlohmann parse propagates an
+  exception.
+
+### Unintentional differences (to fix)
+
+- None. An empty response fails, a missing `username` succeeds only for an empty requested name,
+  and a present value must equal the requested username.
+
+### Missing items
+
+- None in `VerifyLogin`.
+
+### Binary layout verification
+
+- N/A: profile data is parsed from JSON.
