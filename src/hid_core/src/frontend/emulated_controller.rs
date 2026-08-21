@@ -1803,6 +1803,11 @@ impl EmulatedController {
         self.status.lock().motion_values.clone()
     }
 
+    /// Port of EmulatedController::GetBatteryValues.
+    pub fn get_battery_values(&self) -> [BatteryLevel; MAX_EMULATED_CONTROLLERS] {
+        self.status.lock().battery_values
+    }
+
     /// Port of EmulatedController::GetCameraValues.
     pub fn get_camera_values(&self) -> CameraStatus {
         self.status.lock().camera_values.clone()
@@ -3124,6 +3129,17 @@ mod tests {
             },
         );
         assert_eq!(status.lock().nfc_state.state, NfcState::NewAmiibo);
+    }
+
+    #[test]
+    fn battery_values_accessor_returns_both_raw_device_levels() {
+        let controller = EmulatedController::new(NpadIdType::Player1);
+        controller.status.lock().battery_values = [BatteryLevel::Charging, BatteryLevel::Low];
+
+        assert_eq!(
+            controller.get_battery_values(),
+            [BatteryLevel::Charging, BatteryLevel::Low]
+        );
     }
 
     #[test]

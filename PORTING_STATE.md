@@ -612,3 +612,18 @@
   `ChangeRegionState`, `ForEachModifiedRange`, and `FlushCachedWrites`, uses Eden's helper
   boundaries, and passes focused cross-word coalescing regressions plus the full `video_core` test
   suite.
+
+## 2026-08-22 — controller preview battery rendering interrupted by raw-value accessor prerequisite
+
+- Interrupted slice: port Eden's player LED and battery rendering into
+  `src/ruzu/src/configuration/controller_preview.rs`.
+- Exact missing prerequisite: `ControllerStatus` already owns Eden's two raw `battery_values`, but
+  `EmulatedController` does not expose the matching `GetBatteryValues()` accessor. Its existing
+  `get_battery()` returns the converted HID-service `BatteryLevelState` instead and is not the
+  frontend API used by Eden's preview.
+- Required next action: add `get_battery_values()` to the matching hid-core frontend owner, add a
+  focused snapshot regression, reread Eden's declaration and implementation, update `DIFF.md`,
+  then resume the controller-preview slice.
+- Status: prerequisite ported and re-verified against Eden's header and implementation. The raw
+  two-device array is returned unchanged from the controller-owned status, and the focused
+  left/right snapshot regression passes. The preview slice can resume.
