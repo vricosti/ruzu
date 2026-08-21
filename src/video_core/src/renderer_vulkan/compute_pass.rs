@@ -4,7 +4,7 @@
 //! Port of `vk_compute_pass.h` / `vk_compute_pass.cpp`.
 //!
 //! Reusable compute passes for index buffer assembly, conditional rendering,
-//! prefix scans, ASTC decoding, and MSAA copy.
+//! prefix scans, and ASTC decoding.
 
 use ash::vk;
 use std::ptr::NonNull;
@@ -16,7 +16,6 @@ use super::update_descriptor::{ComputePassDescriptorQueue, DescriptorUpdateEntry
 use crate::engines::maxwell_3d::IndexFormat;
 use crate::host_shaders::spirv_shaders::{
     ASTC_DECODER_COMP_SPV, BLOCK_LINEAR_UNSWIZZLE_3D_BCN_COMP_SPV,
-    CONVERT_MSAA_TO_NON_MSAA_COMP_SPV, CONVERT_NON_MSAA_TO_MSAA_COMP_SPV,
     QUERIES_PREFIX_SCAN_SUM_COMP_SPV, QUERIES_PREFIX_SCAN_SUM_NOSUBGROUPS_COMP_SPV,
     RESOLVE_CONDITIONAL_RENDER_COMP_SPV, VULKAN_QUAD_INDEXED_COMP_SPV, VULKAN_UINT8_COMP_SPV,
 };
@@ -192,17 +191,6 @@ const ASTC_BANK_INFO: DescriptorBankInfo = DescriptorBankInfo {
     image_buffers: 0,
     textures: 0,
     images: 1,
-    score: 2,
-};
-
-/// Bank info for MSAA pass (2 storage images).
-const MSAA_BANK_INFO: DescriptorBankInfo = DescriptorBankInfo {
-    uniform_buffers: 0,
-    storage_buffers: 0,
-    texture_buffers: 0,
-    image_buffers: 0,
-    textures: 0,
-    images: 2,
     score: 2,
 };
 
@@ -902,7 +890,7 @@ impl AstcDecoderPass {
         descriptor_pool: &mut DescriptorPool,
         compute_pass_descriptor_queue: &mut ComputePassDescriptorQueue,
     ) -> Result<Self, vk::Result> {
-        let bindings = [
+        let bindings: [vk::DescriptorSetLayoutBinding; ASTC_NUM_BINDINGS] = [
             vk::DescriptorSetLayoutBinding {
                 binding: ASTC_BINDING_INPUT_BUFFER,
                 descriptor_type: vk::DescriptorType::STORAGE_BUFFER,
@@ -918,7 +906,7 @@ impl AstcDecoderPass {
                 p_immutable_samplers: std::ptr::null(),
             },
         ];
-        let templates = [
+        let templates: [vk::DescriptorUpdateTemplateEntry; ASTC_NUM_BINDINGS] = [
             vk::DescriptorUpdateTemplateEntry {
                 dst_binding: ASTC_BINDING_INPUT_BUFFER,
                 dst_array_element: 0,
@@ -1477,244 +1465,6 @@ impl BlockLinearUnswizzle3DPass {
     }
 }
 
-// ---------------------------------------------------------------------------
-// MSAACopyPass
-// ---------------------------------------------------------------------------
-
-/// Port of `MSAACopyPass` class.
-///
-/// Copies between MSAA and non-MSAA images via compute shader.
-/// Maintains two pipelines: [0] = non-msaa to msaa, [1] = msaa to non-msaa.
-pub struct MsaaCopyPass {
-    base: ComputePass,
-    modules: [vk::ShaderModule; 2],
-    pipelines: [vk::Pipeline; 2],
-    compute_pass_descriptor_queue: NonNull<ComputePassDescriptorQueue>,
-}
-
-impl MsaaCopyPass {
-    pub fn new(
-        device: &ash::Device,
-        descriptor_pool: &mut DescriptorPool,
-        compute_pass_descriptor_queue: &mut ComputePassDescriptorQueue,
-    ) -> Result<Self, vk::Result> {
-        let bindings = [
-            vk::DescriptorSetLayoutBinding {
-                binding: 0,
-                descriptor_type: vk::DescriptorType::STORAGE_IMAGE,
-                descriptor_count: 1,
-                stage_flags: vk::ShaderStageFlags::COMPUTE,
-                p_immutable_samplers: std::ptr::null(),
-            },
-            vk::DescriptorSetLayoutBinding {
-                binding: 1,
-                descriptor_type: vk::DescriptorType::STORAGE_IMAGE,
-                descriptor_count: 1,
-                stage_flags: vk::ShaderStageFlags::COMPUTE,
-                p_immutable_samplers: std::ptr::null(),
-            },
-        ];
-        let templates = [vk::DescriptorUpdateTemplateEntry {
-            dst_binding: 0,
-            dst_array_element: 0,
-            descriptor_count: 2,
-            descriptor_type: vk::DescriptorType::STORAGE_IMAGE,
-            offset: 0,
-            stride: std::mem::size_of::<
-                crate::renderer_vulkan::update_descriptor::DescriptorUpdateEntry,
-            >(),
-        }];
-        let base = ComputePass::new(
-            device,
-            descriptor_pool,
-            &bindings,
-            &templates,
-            &MSAA_BANK_INFO,
-            &[],
-            CONVERT_NON_MSAA_TO_MSAA_COMP_SPV,
-            None,
-        )?;
-        Self::new_with_pass(
-            device,
-            base,
-            CONVERT_NON_MSAA_TO_MSAA_COMP_SPV,
-            CONVERT_MSAA_TO_NON_MSAA_COMP_SPV,
-            descriptor_pool,
-            compute_pass_descriptor_queue,
-        )
-    }
-
-    /// Port of `MSAACopyPass::MSAACopyPass`.
-    ///
-    /// Creates both MSAA copy pipelines (to/from MSAA).
-    pub fn new_with_pass(
-        device: &ash::Device,
-        base: ComputePass,
-        non_msaa_to_msaa_code: &[u32],
-        msaa_to_non_msaa_code: &[u32],
-        descriptor_pool: &mut DescriptorPool,
-        compute_pass_descriptor_queue: &mut ComputePassDescriptorQueue,
-    ) -> Result<Self, vk::Result> {
-        let make_pipeline = |code: &[u32]| -> Result<(vk::ShaderModule, vk::Pipeline), vk::Result> {
-            let module_ci = vk::ShaderModuleCreateInfo::builder().code(code).build();
-            let module = unsafe { device.create_shader_module(&module_ci, None)? };
-
-            let main_name = std::ffi::CString::new("main").unwrap();
-            let stage_ci = vk::PipelineShaderStageCreateInfo::builder()
-                .stage(vk::ShaderStageFlags::COMPUTE)
-                .module(module)
-                .name(&main_name)
-                .build();
-
-            let pipeline_ci = vk::ComputePipelineCreateInfo::builder()
-                .stage(stage_ci)
-                .layout(base.layout)
-                .build();
-
-            let pipelines = unsafe {
-                device
-                    .create_compute_pipelines(vk::PipelineCache::null(), &[pipeline_ci], None)
-                    .map_err(|e| e.1)?
-            };
-
-            Ok((module, pipelines[0]))
-        };
-
-        let (module0, pipeline0) = make_pipeline(non_msaa_to_msaa_code)?;
-        let (module1, pipeline1) = make_pipeline(msaa_to_non_msaa_code)?;
-
-        Ok(MsaaCopyPass {
-            base,
-            modules: [module0, module1],
-            pipelines: [pipeline0, pipeline1],
-            compute_pass_descriptor_queue: NonNull::from(compute_pass_descriptor_queue),
-        })
-    }
-
-    /// Port of `MSAACopyPass::CopyImage`.
-    ///
-    /// Dispatches the appropriate MSAA copy pipeline for each image copy region.
-    pub fn copy_image(
-        &mut self,
-        device: &ash::Device,
-        scheduler: &mut Scheduler,
-        cmdbuf: vk::CommandBuffer,
-        dst_image: vk::Image,
-        src_view: vk::ImageView,
-        dst_view: vk::ImageView,
-        extent_width: u32,
-        extent_height: u32,
-        extent_depth: u32,
-        msaa_to_non_msaa: bool,
-    ) {
-        let pipeline_idx = if msaa_to_non_msaa { 1 } else { 0 };
-        let msaa_pipeline = self.pipelines[pipeline_idx];
-        let descriptor_set = self
-            .base
-            .descriptor_allocator
-            .commit(scheduler.known_gpu_tick(), scheduler.pending_tick())
-            .expect("MSAACopyPass descriptor allocation failed");
-        let descriptor_images = [
-            vk::DescriptorImageInfo {
-                sampler: vk::Sampler::null(),
-                image_view: src_view,
-                image_layout: vk::ImageLayout::GENERAL,
-            },
-            vk::DescriptorImageInfo {
-                sampler: vk::Sampler::null(),
-                image_view: dst_view,
-                image_layout: vk::ImageLayout::GENERAL,
-            },
-        ];
-        unsafe {
-            self.compute_pass_descriptor_queue
-                .as_mut()
-                .acquire(scheduler, 2, false);
-            self.compute_pass_descriptor_queue
-                .as_mut()
-                .add_image(src_view);
-            self.compute_pass_descriptor_queue
-                .as_mut()
-                .add_image(dst_view);
-            let writes = [vk::WriteDescriptorSet::builder()
-                .dst_set(descriptor_set)
-                .dst_binding(0)
-                .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
-                .image_info(&descriptor_images)
-                .build()];
-            device.update_descriptor_sets(&writes, &[]);
-        }
-
-        let num_dispatches_x = (extent_width + 7) / 8;
-        let num_dispatches_y = (extent_height + 7) / 8;
-        let num_dispatches_z = extent_depth;
-
-        unsafe {
-            device.cmd_bind_pipeline(cmdbuf, vk::PipelineBindPoint::COMPUTE, msaa_pipeline);
-            device.cmd_bind_descriptor_sets(
-                cmdbuf,
-                vk::PipelineBindPoint::COMPUTE,
-                self.base.layout,
-                0,
-                &[descriptor_set],
-                &[],
-            );
-            device.cmd_dispatch(cmdbuf, num_dispatches_x, num_dispatches_y, num_dispatches_z);
-
-            let write_barrier = vk::ImageMemoryBarrier {
-                s_type: vk::StructureType::IMAGE_MEMORY_BARRIER,
-                p_next: std::ptr::null(),
-                src_access_mask: vk::AccessFlags::SHADER_WRITE,
-                dst_access_mask: vk::AccessFlags::SHADER_READ,
-                old_layout: vk::ImageLayout::GENERAL,
-                new_layout: vk::ImageLayout::GENERAL,
-                src_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
-                dst_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
-                image: dst_image,
-                subresource_range: vk::ImageSubresourceRange {
-                    aspect_mask: vk::ImageAspectFlags::COLOR,
-                    base_mip_level: 0,
-                    level_count: vk::REMAINING_MIP_LEVELS,
-                    base_array_layer: 0,
-                    layer_count: vk::REMAINING_ARRAY_LAYERS,
-                },
-            };
-
-            device.cmd_pipeline_barrier(
-                cmdbuf,
-                vk::PipelineStageFlags::COMPUTE_SHADER,
-                vk::PipelineStageFlags::FRAGMENT_SHADER,
-                vk::DependencyFlags::empty(),
-                &[],
-                &[],
-                &[write_barrier],
-            );
-        }
-    }
-
-    pub fn pipeline(&self, msaa_to_non_msaa: bool) -> vk::Pipeline {
-        self.pipelines[if msaa_to_non_msaa { 1 } else { 0 }]
-    }
-
-    pub fn layout(&self) -> vk::PipelineLayout {
-        self.base.layout
-    }
-
-    pub fn descriptor_set_layout(&self) -> vk::DescriptorSetLayout {
-        self.base.descriptor_set_layout
-    }
-
-    pub fn commit_descriptor_set(
-        &self,
-        known_gpu_tick: u64,
-        current_tick: u64,
-    ) -> Result<vk::DescriptorSet, vk::Result> {
-        self.base
-            .descriptor_allocator
-            .commit(known_gpu_tick, current_tick)
-    }
-}
-
 // Implement bytemuck traits for push constants that need it
 unsafe impl bytemuck::Zeroable for AstcPushConstants {}
 unsafe impl bytemuck::Pod for AstcPushConstants {}
@@ -1761,7 +1511,6 @@ mod tests {
         assert_eq!(INPUT_OUTPUT_BANK_INFO.storage_buffers, 2);
         assert_eq!(QUERIES_SCAN_BANK_INFO.storage_buffers, 3);
         assert_eq!(ASTC_BANK_INFO.images, 1);
-        assert_eq!(MSAA_BANK_INFO.images, 2);
     }
 
     #[test]
