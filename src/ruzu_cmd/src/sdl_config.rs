@@ -189,7 +189,6 @@ pub struct SdlConfig {
     /// Whether this is a global (non-custom) config instance.
     /// Maps to C++ `Config::global`.
     is_global: bool,
-    config_path: std::path::PathBuf,
     base: BaseConfig,
 }
 
@@ -209,7 +208,6 @@ impl SdlConfig {
         base.reload();
         let mut instance = SdlConfig {
             is_global: true,
-            config_path,
             base,
         };
         instance.read_sdl_values();

@@ -4137,3 +4137,46 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 
 - N/A: these methods emit JIT instructions and define no shared or serialized structures. The
   AVX/EVEX prerequisite encodings are independently verified in the preceding rxbyak entry.
+
+## 2026-08-21 — `src/frontend_common/src/config.rs` vs `src/frontend_common/config.h` and `config.cpp` (config-array ownership audit)
+
+### Intentional differences
+
+- Rust names the live array-stack element `ConfigArrayEntry` and exposes it because `BaseConfig`
+  is shared across frontend crates; its three fields and stack ownership match Eden's private
+  `Config::ConfigArray`.
+
+### Unintentional differences (to fix)
+
+- None in the focused slice. Removed a second, unused `ConfigArray` declaration that duplicated
+  the live `ConfigArrayEntry` without owning Eden's `BeginArray`, `EndArray`, or `SetArrayIndex`
+  behavior.
+
+### Missing items
+
+- None in the config-array state representation and lifecycle.
+
+### Binary layout verification
+
+- N/A: config-array entries are in-memory parser state and are not serialized by raw layout.
+
+## 2026-08-21 — `src/ruzu_cmd/src/sdl_config.rs` vs `src/yuzu_cmd/sdl_config.h` and `sdl_config.cpp` (configuration-path ownership audit)
+
+### Intentional differences
+
+- Rust composes `BaseConfig` instead of inheriting C++ `Config`; the base object remains the owner
+  of the resolved configuration location and INI state.
+
+### Unintentional differences (to fix)
+
+- None in the focused slice. Removed the unused duplicate `SdlConfig::config_path`; Eden's derived
+  `SdlConfig` does not retain a second path after `Config::Initialize` stores it in the base.
+
+### Missing items
+
+- None for configuration-path ownership. Other SDL configuration methods are outside this warning
+  slice.
+
+### Binary layout verification
+
+- N/A: neither configuration class is serialized by raw object layout.

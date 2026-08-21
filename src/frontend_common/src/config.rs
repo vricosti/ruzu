@@ -31,19 +31,6 @@ pub enum ConfigType {
 }
 
 // ---------------------------------------------------------------------------
-// ConfigArray (internal helper)
-// ---------------------------------------------------------------------------
-
-/// Internal representation of a config array context.
-/// Maps to C++ `Config::ConfigArray`.
-#[derive(Clone, Debug)]
-struct ConfigArray {
-    name: String,
-    size: i32,
-    index: i32,
-}
-
-// ---------------------------------------------------------------------------
 // Special characters for output adjustment
 // ---------------------------------------------------------------------------
 
