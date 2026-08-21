@@ -12,7 +12,7 @@ use super::fssystem::nca_file_system_driver::NcaFileSystemDriver;
 use super::fssystem::nca_header::{NcaFsEncryptionType, NcaFsType};
 use super::fssystem::nca_reader::{NcaFsHeaderReader, NcaReader};
 use super::partition_filesystem::{PartitionFilesystem, ResultStatus};
-use super::vfs::vfs::{VfsDirectory, VfsFile};
+use super::vfs::vfs::VfsDirectory;
 use super::vfs::vfs_types::{VirtualDir, VirtualFile};
 use crate::crypto::key_manager::{KeyManager, S128KeyType};
 
@@ -79,7 +79,6 @@ pub struct NCA {
 
     status: ResultStatus,
 
-    encrypted: bool,
     is_update: bool,
 
     reader: Option<Arc<NcaReader>>,
@@ -101,17 +100,10 @@ impl NCA {
             logo: None,
             file: file.clone(),
             status: ResultStatus::Success,
-            encrypted: false,
             is_update: false,
             reader: None,
             keys,
         };
-
-        // Null file check.
-        if file.get_size() == 0 {
-            nca.status = ResultStatus::ErrorNullFile;
-            return nca;
-        }
 
         // Create and initialize the NCA reader.
         let mut reader = NcaReader::new();
@@ -133,10 +125,10 @@ impl NCA {
             master_key_id as u64,
             reader.get_key_index() as u64,
         ) {
-            // Key area keys not available - continue anyway as keys may not be loaded.
-            // Upstream returns ErrorMissingKeyAreaKey here, but in practice the NcaReader
-            // has already derived the keys in initialize() using the crypto configuration's
-            // generate_key function. We only fail if the reader itself failed.
+            nca.status = ResultStatus::ErrorMissingKeyAreaKey;
+            drop(keys);
+            nca.reader = Some(Arc::new(reader));
+            return nca;
         }
 
         // Handle rights ID (external titlekey decryption).
@@ -248,6 +240,8 @@ impl NCA {
                         nca.exefs = Some(npfs);
                     } else if is_directory_logo_partition(&npfs) {
                         nca.logo = Some(npfs);
+                    } else {
+                        continue;
                     }
                 }
             }
@@ -398,5 +392,54 @@ impl VfsDirectory for NCA {
 
     fn rename(&self, _name: &str) -> bool {
         false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::file_sys::fssystem::nca_header::NcaHeader;
+    use crate::file_sys::vfs::vfs_vector::VectorVfsFile;
+
+    #[test]
+    fn missing_key_area_key_matches_upstream_status() {
+        let mut header: NcaHeader = unsafe { std::mem::zeroed() };
+        header.magic = NcaHeader::MAGIC3;
+        header.sdk_addon_version = 0x000B_0000;
+        header.key_generation = u8::MAX;
+        header.key_generation_2 = u8::MAX;
+        header.content_size = NcaHeader::SIZE as u64;
+
+        let header_bytes = unsafe {
+            std::slice::from_raw_parts(&header as *const NcaHeader as *const u8, NcaHeader::SIZE)
+        }
+        .to_vec();
+        let file: VirtualFile = Arc::new(VectorVfsFile::new(
+            header_bytes,
+            "synthetic.nca".to_string(),
+            None,
+        ));
+
+        let master_key_id = master_key_id_for_key_generation(u8::MAX);
+        assert!(!KeyManager::instance().lock().unwrap().has_key_128(
+            S128KeyType::KeyArea,
+            master_key_id as u64,
+            0,
+        ));
+
+        let nca = NCA::new(file, None);
+        assert_eq!(nca.get_status(), ResultStatus::ErrorMissingKeyAreaKey);
+    }
+
+    #[test]
+    fn empty_file_is_a_bad_header_not_a_null_file() {
+        let file: VirtualFile = Arc::new(VectorVfsFile::new(
+            Vec::new(),
+            "empty.nca".to_string(),
+            None,
+        ));
+
+        let nca = NCA::new(file, None);
+        assert_eq!(nca.get_status(), ResultStatus::ErrorBadNCAHeader);
     }
 }

@@ -3544,3 +3544,34 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 ### Binary layout verification
 
 - N/A: this optimizer rewrites internal SSA and defines no serialized structure.
+
+## 2026-08-21 — `src/core/src/file_sys/content_archive.rs` vs Eden `src/core/file_sys/{content_archive.h,content_archive.cpp}`
+
+### Intentional differences
+
+- Rust receives a non-nullable `VirtualFile`; Eden's initial `file == nullptr` branch therefore has
+  no Rust representation. An empty, non-null file is passed to `NcaReader::Initialize` and reported
+  as `ErrorBadNCAHeader`, as Eden does for the same object.
+- Rust stores the reader in an `Option<Arc<NcaReader>>` because initialization can fail before an
+  initialized reader is available. The getters retain their existing safe defaults when called on
+  a failed object; Eden relies on callers checking `GetStatus()` before using those getters.
+- The unused `encrypted` member was removed. Eden declares and default-initializes the member but
+  never reads or writes it anywhere; retaining it in Rust only produced dead-state warning noise.
+- `Arc<Mutex<KeyManager>>` replaces Eden's reference to the singleton key manager while preserving
+  key lookup ownership and constructor ordering.
+
+### Unintentional differences (to fix)
+
+- `get_type` maps an invalid raw content-type byte (or a missing reader after failed construction)
+  to `Program`; Eden directly casts the byte to `NCAContentType`. Preserving an invalid discriminant
+  safely requires changing the Rust public type instead of constructing an invalid enum value.
+
+### Missing items
+
+- None in the constructor paths audited here: reader initialization, key-area validation, title-key
+  setup, filesystem classification, update detection, and final status now follow Eden's ordering.
+
+### Binary layout verification
+
+- PASS: `NCA` itself is not serialized. The regression fixture writes the existing `repr(C)`
+  `NcaHeader`, whose compile-time size assertion remains `0x400`; it introduces no new payload type.
