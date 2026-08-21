@@ -16,7 +16,7 @@ use parking_lot::Mutex;
 use super::engine_interface::{EngineInterface, EngineInterfaceState};
 use super::engine_upload;
 use crate::memory_manager::MemoryManager;
-use crate::rasterizer_interface::{RasterizerHandle, RasterizerInterface};
+use crate::rasterizer_interface::RasterizerInterface;
 
 // ── Register layout constants ───────────────────────────────────────────────
 
@@ -88,15 +88,13 @@ pub struct KeplerMemory {
     pub regs: Regs,
     pub upload_state: engine_upload::State,
     pub interface_state: EngineInterfaceState,
-    memory_manager: Arc<Mutex<MemoryManager>>,
-    rasterizer: Option<RasterizerHandle>,
 }
 
 impl KeplerMemory {
     /// Create a new KeplerMemory engine.
     ///
     /// Corresponds to upstream `KeplerMemory(Core::System&, MemoryManager&)`.
-    /// Rust stores the upstream `MemoryManager&` owner directly here.
+    /// Rust stores the upstream `MemoryManager&` owner in `upload_state`.
     pub fn new(memory_manager: Arc<Mutex<MemoryManager>>) -> Self {
         Self {
             regs: Regs::default(),
@@ -104,8 +102,6 @@ impl KeplerMemory {
                 &memory_manager,
             )),
             interface_state: EngineInterfaceState::new(),
-            memory_manager,
-            rasterizer: None,
         }
     }
 
@@ -113,7 +109,6 @@ impl KeplerMemory {
     ///
     /// Corresponds to `KeplerMemory::BindRasterizer`.
     pub fn bind_rasterizer(&mut self, rasterizer: &dyn RasterizerInterface) {
-        self.rasterizer = Some(RasterizerHandle::from_ref(rasterizer));
         self.upload_state.bind_rasterizer(rasterizer);
         // Reset and configure execution mask
         self.interface_state.execution_mask.fill(false);
