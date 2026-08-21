@@ -235,14 +235,19 @@ impl BlitScreen {
                 width: layout.screen.get_width(),
                 height: layout.screen.get_height(),
             };
+            if self.layers.len() != framebuffers.len() {
+                self.layers.clear();
+            }
             while self.layers.len() < framebuffers.len() {
                 self.layers.push(Layer::new(
                     self.device.clone(),
+                    allocator,
+                    scheduler,
+                    device_memory,
                     self.image_count,
                     window_size,
                     window_adapt.get_descriptor_set_layout(),
                     self.filters,
-                    allocator,
                     device.is_float16_supported(),
                 ));
             }
@@ -265,9 +270,6 @@ impl BlitScreen {
                     &mut push_constants[i],
                     &mut descriptor_sets[i],
                     rasterizer,
-                    scheduler,
-                    allocator,
-                    device_memory.as_ref(),
                     sampler,
                     self.image_index,
                     &framebuffers[i],

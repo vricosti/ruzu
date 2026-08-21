@@ -4413,10 +4413,6 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 - The tail of `ConfigureDraw` remains a same-file Rust helper that accepts the already-resolved
   source image, dimensions, layout, and normalized crop. The upstream-owned framebuffer lookup and
   crop computation remain in `configure_draw_from_framebuffer`.
-
-### Unintentional differences (to fix)
-
-- `Layer` still receives `MemoryAllocator`, `Scheduler`, and `MaxwellDeviceMemoryManager` through
-  its methods instead of retaining Eden's three non-owning references. Consequently the tick wait
-  currently lives immediately before `ReleaseRawImages` in `RefreshResources` rather than inside
-  `ReleaseRawImages` itself.
+- Rust represents Eden's retained allocator and scheduler references with stable `NonNull` pointers
+  and retains the shared device-memory owner with `Arc`. Their enclosing renderer owners outlive
+  every `Layer`; `ReleaseRawImages` now performs its own tick waits as Eden does.
