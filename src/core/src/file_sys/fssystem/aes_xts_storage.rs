@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //
 // Ported from: core/file_sys/fssystem/fssystem_aes_xts_storage.h / .cpp
-// Status: COMPLETE (structural parity; actual AES-XTS decryption deferred)
+// Status: COMPLETE
 //
 // AES-XTS storage layer (read-only). Reads data through an AES-XTS cipher,
 // operating on block-aligned accesses.
@@ -75,19 +75,14 @@ impl AesXtsStorage {
     /// Make an AES-XTS IV from an offset and block size.
     ///
     /// The IV is structured as:
-    /// - bytes [0..8]: zero
+    /// - bytes [0..8]: left unchanged
     /// - bytes [8..16]: offset / block_size (big-endian)
     ///
     /// Corresponds to upstream `AesXtsStorage::MakeAesXtsIv`.
     pub fn make_aes_xts_iv(dst: &mut [u8; IV_SIZE], offset: i64, block_size: usize) {
         assert!(offset >= 0);
 
-        let block_index = if block_size > 0 {
-            offset as u64 / block_size as u64
-        } else {
-            0
-        };
-        dst[..8].copy_from_slice(&[0u8; 8]);
+        let block_index = offset as u64 / block_size as u64;
         dst[8..].copy_from_slice(&block_index.to_be_bytes());
     }
 
@@ -124,28 +119,47 @@ impl AesXtsStorage {
 
         let _lock = self.mutex.lock().unwrap();
 
-        // Read the encrypted data from the base storage.
-        let read = self.base_storage.read(buffer, size, offset);
-        if read == 0 {
-            return 0;
-        }
+        // Upstream deliberately ignores the base read result and reports the requested size.
+        self.base_storage.read(buffer, size, offset);
 
-        // Decrypt using AES-XTS with the crypto module.
         use crate::crypto::aes_util::{AesCipher, Mode, Op};
         let mut cipher = AesCipher::new_256(self.key, Mode::XTS);
 
-        // Starting sector number.
-        let start_sector = offset / self.block_size;
+        // Setup the counter from the caller-provided IV.
+        let mut ctr = self.iv;
+        add_counter(&mut ctr, (offset / self.block_size) as u64);
 
-        cipher.xts_transcode(
-            &buffer[..read].to_vec(),
-            &mut buffer[..read],
-            start_sector,
-            self.block_size,
-            Op::Decrypt,
-        );
+        // Handle data before the first block-size boundary. The whole XTS sector must be
+        // transcoded so that the per-AES-block tweak reaches the requested bytes.
+        let mut processed_size = 0;
+        if offset % self.block_size != 0 {
+            use super::nca_header::NcaHeader;
 
-        read
+            assert!(self.block_size <= NcaHeader::XTS_BLOCK_SIZE);
+            let mut tmp_buf = vec![0u8; self.block_size];
+            let skip_size = offset - (offset / self.block_size) * self.block_size;
+            let data_size = size.min(self.block_size - skip_size);
+            tmp_buf[skip_size..skip_size + data_size].copy_from_slice(&buffer[..data_size]);
+            cipher.set_iv(&ctr);
+            cipher.transcode_inplace(&mut tmp_buf, Op::Decrypt);
+            buffer[..data_size].copy_from_slice(&tmp_buf[skip_size..skip_size + data_size]);
+
+            add_counter(&mut ctr, 1);
+            processed_size += data_size;
+            assert_eq!(processed_size, size.min(self.block_size - skip_size));
+        }
+
+        // Decrypt aligned chunks, resetting the XTS tweak for every storage block.
+        let mut current = processed_size;
+        while current < size {
+            let current_size = self.block_size.min(size - current);
+            cipher.set_iv(&ctr);
+            cipher.transcode_inplace(&mut buffer[current..current + current_size], Op::Decrypt);
+            current += current_size;
+            add_counter(&mut ctr, 1);
+        }
+
+        size
     }
 }
 
@@ -209,7 +223,41 @@ mod tests {
     fn test_make_aes_xts_iv_zero() {
         let mut iv = [0xFFu8; IV_SIZE];
         AesXtsStorage::make_aes_xts_iv(&mut iv, 0, 0x200);
-        assert_eq!(iv, [0u8; 16]);
+        assert_eq!(&iv[..8], &[0xFF; 8]);
+        assert_eq!(&iv[8..], &[0; 8]);
+    }
+
+    #[test]
+    fn read_uses_initial_iv_and_preserves_xts_tweak_for_unaligned_sector_offset() {
+        use crate::crypto::aes_util::{AesCipher, Mode, Op};
+        use crate::file_sys::vfs::vfs_vector::VectorVfsFile;
+        use std::sync::Arc;
+
+        const SECTOR_SIZE: usize = 0x200;
+        let key1 = [0x11; KEY_SIZE / 2];
+        let key2 = [0x22; KEY_SIZE / 2];
+        let mut key = [0; KEY_SIZE];
+        key[..KEY_SIZE / 2].copy_from_slice(&key1);
+        key[KEY_SIZE / 2..].copy_from_slice(&key2);
+
+        let mut iv = [0; IV_SIZE];
+        iv[IV_SIZE - 1] = 5;
+        let plaintext: Vec<u8> = (0..SECTOR_SIZE).map(|value| value as u8).collect();
+        let mut ciphertext = plaintext.clone();
+        let mut cipher = AesCipher::new_256(key, Mode::XTS);
+        cipher.set_iv(&iv);
+        cipher.transcode_inplace(&mut ciphertext, Op::Encrypt);
+
+        let base: VirtualFile = Arc::new(VectorVfsFile::new(
+            ciphertext,
+            "synthetic.xts".to_string(),
+            None,
+        ));
+        let storage = AesXtsStorage::new(base, &key1, &key2, &iv, SECTOR_SIZE);
+        let mut output = [0; AES_BLOCK_SIZE];
+
+        assert_eq!(storage.read_at(&mut output, AES_BLOCK_SIZE), AES_BLOCK_SIZE);
+        assert_eq!(output, plaintext[AES_BLOCK_SIZE..2 * AES_BLOCK_SIZE]);
     }
 
     #[test]

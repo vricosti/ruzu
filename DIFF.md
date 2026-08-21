@@ -3575,3 +3575,31 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 
 - PASS: `NCA` itself is not serialized. The regression fixture writes the existing `repr(C)`
   `NcaHeader`, whose compile-time size assertion remains `0x400`; it introduces no new payload type.
+
+## 2026-08-21 — `src/core/src/file_sys/fssystem/aes_xts_storage.rs` vs Eden `src/core/file_sys/fssystem/{fssystem_aes_xts_storage.h,fssystem_aes_xts_storage.cpp}`
+
+### Intentional differences
+
+- Rust constructs an `AesCipher` from the retained key for each locked read; Eden constructs and
+  retains an optional cipher in the object. This preserves serialized access and the exact tweak
+  sequence, with only cipher-context reuse differing.
+- Eden's bounded `boost::container::static_vector` is represented by a zero-initialized `Vec` after
+  enforcing the same `NcaHeader::XtsBlockSize` maximum. Its bytes and lifetime are equivalent, but
+  Rust currently allocates this uncommon partial-sector buffer on the heap.
+- The `VfsFile` implementation supplies the Rust VFS naming, parent, readability, and write-reject
+  methods around Eden's `IReadOnlyStorage` interface.
+
+### Unintentional differences (to fix)
+
+- None in `MakeAesXtsIv`, construction, `Read`, or `GetSize` after this audit. In particular, reads
+  now seed the counter from the supplied IV and preserve XTS block-tweak position for an offset in
+  the middle of a storage block.
+
+### Missing items
+
+- None for this storage layer.
+
+### Binary layout verification
+
+- N/A: `AesXtsStorage` is an in-memory polymorphic storage object and is not serialized. Key and IV
+  arrays retain Eden's exact `0x20` and `0x10` byte sizes.
