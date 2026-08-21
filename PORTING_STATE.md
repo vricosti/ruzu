@@ -1,5 +1,29 @@
 # Porting State
 
+## 2026-08-21 — SMAA creation-helper warning slice
+
+- Status: completed and verified.
+- Interrupted slice: restore `SMAA::CreateImages` through `CreatePipelines` so the retained
+  `m_image_count` state is consumed by its upstream-owned methods instead of flattened constructor
+  locals.
+- Exact missing prerequisite: Eden's `SMAA::UploadImages` calls
+  `present/util.cpp::UploadImage`, but Ruzu has no counterpart. `smaa.rs` instead owns private
+  upload-buffer and command helpers, keeps two upload buffers for the lifetime of `Smaa`, and uses
+  tightly packed Vulkan copy-region dimensions instead of Eden's explicit texture dimensions.
+- Required prerequisite work: port `UploadImage` to
+  `src/video_core/src/renderer_vulkan/present/util.rs`, preserve its staging-buffer lifetime through
+  `Scheduler::finish`, verify it against `util.h/.cpp`, then remove the misplaced SMAA helpers and
+  resume the class-owned creation methods.
+- Resume condition: the utility compiles with focused presentation tests, its upstream comparison
+  is recorded in `DIFF.md`, and SMAA can call it through its retained allocator owner.
+- Prerequisite result: `present/util.rs::upload_image` now owns staging allocation, mapped copy and
+  flush, explicit row dimensions, render-pass exit, layout transitions, copy recording, and the
+  synchronous finish in Eden's order. `cargo check -p video_core` passes and the utility has a
+  focused upstream audit entry; the SMAA slice is resumed.
+- Resumed result: all nine SMAA creation methods again own their matching logic, `m_image_count`
+  drives dynamic-image and descriptor-pool creation, the misplaced upload helpers and permanent
+  staging buffers are removed, and first-use upload follows Eden through `util::upload_image`.
+
 ## 2026-08-21 — A32 scalar saturation warning slice
 
 - Status: completed and verified.

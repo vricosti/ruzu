@@ -10,6 +10,7 @@
 
 use ash::vk;
 
+use crate::renderer_vulkan::scheduler::Scheduler;
 use crate::vulkan_common::vulkan_memory_allocator::{MemoryAllocator, MemoryUsage};
 
 // ---------------------------------------------------------------------------
@@ -112,6 +113,74 @@ pub fn transition_image_layout(
             &[barrier],
         );
     }
+}
+
+/// Port of `UploadImage`.
+pub fn upload_image(
+    device: &ash::Device,
+    allocator: &MemoryAllocator,
+    scheduler: &mut Scheduler,
+    image: vk::Image,
+    dimensions: vk::Extent2D,
+    _format: vk::Format,
+    initial_contents: &[u8],
+) {
+    let upload_ci = vk::BufferCreateInfo::builder()
+        .size(initial_contents.len() as vk::DeviceSize)
+        .usage(vk::BufferUsageFlags::TRANSFER_SRC)
+        .sharing_mode(vk::SharingMode::EXCLUSIVE)
+        .build();
+    let mut upload_buffer = allocator
+        .create_mapped_buffer(&upload_ci, MemoryUsage::Upload)
+        .expect("Failed to create image upload buffer");
+    upload_buffer.mapped_slice_mut()[..initial_contents.len()].copy_from_slice(initial_contents);
+    upload_buffer.flush();
+
+    let region = vk::BufferImageCopy::builder()
+        .buffer_offset(0)
+        .buffer_row_length(dimensions.width)
+        .buffer_image_height(dimensions.height)
+        .image_subresource(vk::ImageSubresourceLayers {
+            aspect_mask: vk::ImageAspectFlags::COLOR,
+            mip_level: 0,
+            base_array_layer: 0,
+            layer_count: 1,
+        })
+        .image_offset(vk::Offset3D::default())
+        .image_extent(vk::Extent3D {
+            width: dimensions.width,
+            height: dimensions.height,
+            depth: 1,
+        })
+        .build();
+
+    scheduler.request_outside_renderpass();
+    let device = device.clone();
+    let upload_buffer_handle = upload_buffer.buffer();
+    scheduler.record(move |cmdbuf| unsafe {
+        transition_image_layout(
+            &device,
+            cmdbuf,
+            image,
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            vk::ImageLayout::UNDEFINED,
+        );
+        device.cmd_copy_buffer_to_image(
+            cmdbuf,
+            upload_buffer_handle,
+            image,
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            &[region],
+        );
+        transition_image_layout(
+            &device,
+            cmdbuf,
+            image,
+            vk::ImageLayout::GENERAL,
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+        );
+    });
+    scheduler.finish();
 }
 
 /// Port of `DownloadColorImage`.

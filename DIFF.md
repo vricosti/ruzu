@@ -4381,3 +4381,23 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 - `CreateShaders` receives the already-queried float16 capability because the local raw
   `ash::Device` does not own Eden's `Device::IsFloat16Supported` capability state. Shader
   selection and construction order otherwise match Eden.
+
+## 2026-08-21 — `src/video_core/src/renderer_vulkan/present/util.rs` vs `src/video_core/renderer_vulkan/present/util.h` and `.cpp` (`UploadImage`)
+
+### Intentional differences
+
+- The scheduler requires a `'static` command closure, so Rust copies the Vulkan device and raw
+  staging-buffer handle into the closure. The owning mapped buffer remains in the function until
+  the matching `Scheduler::finish`, preserving Eden's staging allocation lifetime and command
+  order.
+
+## 2026-08-21 — `src/video_core/src/renderer_vulkan/present/smaa.rs` vs `src/video_core/renderer_vulkan/present/smaa.h` and `.cpp`
+
+### Intentional differences
+
+- Rust retains Eden's non-owning `MemoryAllocator&` as `NonNull<MemoryAllocator>` because the
+  allocator is owned by the enclosing Vulkan renderer and a lifetime borrow would make its `Layer`
+  storage self-referential. The pointer is consumed only by `CreateImages` and `UploadImages`, at
+  the same lifecycle points as Eden.
+- The raw `ash::Device` is retained by `Smaa` because the local `AntiAliasPass::draw` trait does not
+  receive Eden's `Device&`; resource selection and command ordering are unchanged.

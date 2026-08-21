@@ -681,8 +681,8 @@ impl Layer {
                 Box::new(Smaa::new(
                     self.device.clone(),
                     allocator,
-                    extent,
                     self.image_count,
+                    extent,
                 ))
             }
         };
