@@ -2950,3 +2950,28 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 
 - N/A: the index-based `RBEntry` is an internal safe-Rust representation and is not copied to or
   from Eden's packed, pointer-based host structure.
+
+## 2026-08-21 — removed `src/common/src/x64/cpu_wait.rs` vs Eden `src/common/thread.{h,cpp}`
+
+### Intentional differences
+
+- None for the removed module: Eden has no `common/x64/cpu_wait.*` counterpart and Ruzu had no
+  production caller for its public `micro_sleep` function.
+
+### Unintentional differences (to fix)
+
+- Ruzu's separate helper monitored the address of a temporary aligned zero rather than the
+  `Event::is_set` state used by Eden. Consequently it could only expire by timer and could not be
+  awakened by `Event::set`; retaining or moving it would not provide upstream behavior.
+
+### Missing items
+
+- Ruzu's `common/thread.rs` still uses the condition-variable `Event::wait_for` path on Windows and
+  does not yet port Eden's x86-64 Windows `MONITORX`/`WAITPKG` branches. This is a separate,
+  platform-specific implementation slice rather than a prerequisite for removing the unreachable
+  helper.
+
+### Binary layout verification
+
+- N/A: the removed cache-line-aligned tuple was host-only temporary storage passed to inline
+  assembly and was never serialized.
