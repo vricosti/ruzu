@@ -3466,3 +3466,27 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 ### Binary layout verification
 
 - N/A: parameter naming and Rust test call-site cleanup define no serialized layout.
+
+## 2026-08-21 — `src/rdynarmic/src/frontend/a32/translate/thumb16.rs` PUSH/POP vs Eden `src/dynarmic/src/dynarmic/frontend/A32/translate/impl/{thumb16.cpp,a32_translate_impl.h}`
+
+### Intentional differences
+
+- Ruzu extracts `M`/`P` and the low register list from `DecodedThumb16`; Eden's generated decoder
+  passes those fields as typed visitor arguments. Both construct the same 16-bit register mask.
+- Rust uses `Reg::R13` for Eden's `Reg::SP` spelling and `Value::ImmU1` carry operands for the
+  equivalent `ir.Add`/`ir.Sub` operations.
+
+### Unintentional differences (to fix)
+
+- None in the re-audited PUSH/POP slice: empty lists are rejected before reading SP, stack
+  accesses are `Atomic`, registers are visited in ascending order, and POP writes the incremented
+  address to SP at Eden's exact point before `PopRSBHint`.
+
+### Missing items
+
+- None in `thumb16_PUSH` or `thumb16_POP`. Other methods in the shared Rust file were not claimed
+  by this warning-driven audit.
+
+### Binary layout verification
+
+- N/A: the methods emit guest memory operations but define no serialized structure.

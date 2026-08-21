@@ -880,27 +880,30 @@ fn thumb16_uxtb(ir: &mut A32IREmitter, inst: &DecodedThumb16) -> bool {
 // --- Load/Store multiple ---
 
 fn thumb16_push(ir: &mut A32IREmitter, inst: &DecodedThumb16) -> bool {
-    let reglist = inst.register_list() as u16;
+    let mut reglist = inst.register_list() as u16;
     let lr_bit = (inst.raw >> 8) & 1 != 0;
-    let reg_count = reglist.count_ones() + if lr_bit { 1 } else { 0 };
+    if lr_bit {
+        reglist |= 1 << 14;
+    }
+    if reglist.count_ones() < 1 {
+        return super::unpredictable_instruction(ir);
+    }
 
     let sp = ir.get_register(Reg::R13);
-    let new_sp = ir
-        .ir()
-        .sub_32(sp, Value::ImmU32(reg_count * 4), Value::ImmU1(true));
+    let new_sp = ir.ir().sub_32(
+        sp,
+        Value::ImmU32(reglist.count_ones() * 4),
+        Value::ImmU1(true),
+    );
 
     let mut addr = new_sp;
-    for i in 0..8u32 {
+    for i in 0..16u32 {
         if reglist & (1 << i) != 0 {
             let reg = Reg::from_u32(i);
             let val = ir.get_register(reg);
-            ir.write_memory_32(addr, val, AccType::Normal);
+            ir.write_memory_32(addr, val, AccType::Atomic);
             addr = ir.ir().add_32(addr, Value::ImmU32(4), Value::ImmU1(false));
         }
-    }
-    if lr_bit {
-        let lr = ir.get_register(Reg::R14);
-        ir.write_memory_32(addr, lr, AccType::Normal);
     }
 
     ir.set_register(Reg::R13, new_sp);
@@ -908,37 +911,36 @@ fn thumb16_push(ir: &mut A32IREmitter, inst: &DecodedThumb16) -> bool {
 }
 
 fn thumb16_pop(ir: &mut A32IREmitter, inst: &DecodedThumb16) -> bool {
-    let reglist = inst.register_list() as u16;
+    let mut reglist = inst.register_list() as u16;
     let pc_bit = (inst.raw >> 8) & 1 != 0;
-    let reg_count = reglist.count_ones() + if pc_bit { 1 } else { 0 };
+    if pc_bit {
+        reglist |= 1 << 15;
+    }
+    if reglist.count_ones() < 1 {
+        return super::unpredictable_instruction(ir);
+    }
 
-    let sp = ir.get_register(Reg::R13);
-    let mut addr = sp;
+    let mut addr = ir.get_register(Reg::R13);
 
-    for i in 0..8u32 {
+    for i in 0..15u32 {
         if reglist & (1 << i) != 0 {
-            let val = ir.read_memory_32(addr, AccType::Normal);
+            let val = ir.read_memory_32(addr, AccType::Atomic);
             ir.set_register(Reg::from_u32(i), val);
             addr = ir.ir().add_32(addr, Value::ImmU32(4), Value::ImmU1(false));
         }
     }
 
     if pc_bit {
-        let val = ir.read_memory_32(addr, AccType::Normal);
+        let val = ir.read_memory_32(addr, AccType::Atomic);
         ir.update_upper_location_descriptor();
         ir.load_write_pc(val);
         addr = ir.ir().add_32(addr, Value::ImmU32(4), Value::ImmU1(false));
-    }
-
-    let new_sp = ir
-        .ir()
-        .add_32(sp, Value::ImmU32(reg_count * 4), Value::ImmU1(false));
-    ir.set_register(Reg::R13, new_sp);
-
-    if pc_bit {
+        ir.set_register(Reg::R13, addr);
         ir.set_term(Terminal::PopRSBHint);
         return false;
     }
+
+    ir.set_register(Reg::R13, addr);
     true
 }
 
@@ -1243,5 +1245,86 @@ mod tests {
                 && inst.args[0] == Value::ImmU32(0x4002)
                 && inst.args[1] == Value::ImmU32(0xFFFF_FFFE)
         }));
+    }
+
+    #[test]
+    fn thumb16_push_pop_use_atomic_stack_accesses() {
+        let loc = A32LocationDescriptor::new(0x4000, PSR::new(0x20), FPSCR::default(), false);
+
+        let mut push_block = Block::new(loc.to_location());
+        {
+            let mut ir = A32IREmitter::with_location(&mut push_block, loc);
+            let inst = DecodedThumb16 {
+                raw: 0xB501, // PUSH {r0, lr}
+                id: Thumb16InstId::PUSH,
+            };
+            assert!(thumb16_push(&mut ir, &inst));
+        }
+        let writes: Vec<_> = push_block
+            .instructions
+            .iter()
+            .filter(|inst| inst.opcode == Opcode::A32WriteMemory32)
+            .collect();
+        assert_eq!(writes.len(), 2);
+        assert!(writes
+            .iter()
+            .all(|inst| inst.args[3] == Value::ImmAccType(AccType::Atomic)));
+
+        let mut pop_block = Block::new(loc.to_location());
+        {
+            let mut ir = A32IREmitter::with_location(&mut pop_block, loc);
+            let inst = DecodedThumb16 {
+                raw: 0xBD01, // POP {r0, pc}
+                id: Thumb16InstId::POP,
+            };
+            assert!(!thumb16_pop(&mut ir, &inst));
+        }
+        let reads: Vec<_> = pop_block
+            .instructions
+            .iter()
+            .filter(|inst| inst.opcode == Opcode::A32ReadMemory32)
+            .collect();
+        assert_eq!(reads.len(), 2);
+        assert!(reads
+            .iter()
+            .all(|inst| inst.args[2] == Value::ImmAccType(AccType::Atomic)));
+        let last_increment = pop_block
+            .instructions
+            .iter()
+            .rposition(|inst| inst.opcode == Opcode::Add32)
+            .expect("POP address increment");
+        let sp_write = pop_block
+            .instructions
+            .iter()
+            .position(|inst| {
+                inst.opcode == Opcode::A32SetRegister && inst.args[0].get_a32_reg() == Reg::R13
+            })
+            .expect("POP stack-pointer write");
+        assert!(last_increment < sp_write);
+        assert!(matches!(pop_block.terminal, Terminal::PopRSBHint));
+    }
+
+    #[test]
+    fn thumb16_empty_push_pop_are_unpredictable() {
+        let loc = A32LocationDescriptor::new(0x4000, PSR::new(0x20), FPSCR::default(), false);
+        for (raw, id) in [(0xB400, Thumb16InstId::PUSH), (0xBC00, Thumb16InstId::POP)] {
+            let mut block = Block::new(loc.to_location());
+            let mut ir = A32IREmitter::with_location(&mut block, loc);
+            let inst = DecodedThumb16 { raw, id };
+            let result = match id {
+                Thumb16InstId::PUSH => thumb16_push(&mut ir, &inst),
+                Thumb16InstId::POP => thumb16_pop(&mut ir, &inst),
+                _ => unreachable!(),
+            };
+            assert!(!result);
+            assert!(block
+                .instructions
+                .iter()
+                .any(|inst| inst.opcode == Opcode::A32ExceptionRaised));
+            assert!(!block
+                .instructions
+                .iter()
+                .any(|inst| inst.opcode == Opcode::A32GetRegister));
+        }
     }
 }
