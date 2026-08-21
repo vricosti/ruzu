@@ -18,6 +18,9 @@ use crate::present::{PRESENT_FILTERS_FOR_APPLET_CAPTURE, PRESENT_FILTERS_FOR_DIS
 use crate::rasterizer_interface::RasterizerInterface;
 use crate::renderer_base::{RendererBase, RendererBaseData};
 use crate::textures::decoders;
+use crate::vulkan_common::vulkan_debug_callback::{
+    create_debug_utils_callback, DebugUtilsMessenger,
+};
 use crate::vulkan_common::vulkan_device::Device;
 use crate::vulkan_common::vulkan_instance;
 use crate::vulkan_common::vulkan_library;
@@ -160,7 +163,8 @@ pub struct RendererVulkan {
     device: Box<Device>,
     /// Presentation surface owner.
     surface: Arc<std::sync::Mutex<OwnedSurface>>,
-    debug_messenger: vk::DebugUtilsMessengerEXT,
+    /// Validation callback owner, present when renderer debugging is enabled.
+    debug_messenger: Option<DebugUtilsMessenger>,
     /// Vulkan instance owner.
     instance: Instance,
 
@@ -252,6 +256,14 @@ impl RendererVulkan {
             window_type,
             *common::settings::values().renderer_debug.get_value(),
         )?;
+        let debug_messenger = if *common::settings::values().renderer_debug.get_value() {
+            Some(create_debug_utils_callback(
+                &instance.entry,
+                &instance.instance,
+            )?)
+        } else {
+            None
+        };
         let surface_info = vulkan_surface::WindowSystemInfo {
             window_type,
             display_connection: window_info.display_connection as *mut std::ffi::c_void,
@@ -442,7 +454,7 @@ impl RendererVulkan {
             memory_allocator,
             device,
             surface,
-            debug_messenger: vk::DebugUtilsMessengerEXT::null(),
+            debug_messenger,
             instance,
             device_memory,
             window_shown,

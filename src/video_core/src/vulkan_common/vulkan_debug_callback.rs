@@ -11,6 +11,23 @@ use std::ffi::CStr;
 
 use super::vulkan_wrapper::VulkanError;
 
+/// RAII owner for the Vulkan debug messenger.
+///
+/// Counterpart of upstream's `vk::DebugUtilsMessenger`: the extension loader
+/// carries the instance dispatch table required to destroy the handle.
+pub struct DebugUtilsMessenger {
+    loader: ash::extensions::ext::DebugUtils,
+    handle: vk::DebugUtilsMessengerEXT,
+}
+
+impl Drop for DebugUtilsMessenger {
+    fn drop(&mut self) {
+        unsafe {
+            self.loader.destroy_debug_utils_messenger(self.handle, None);
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Known false-positive message IDs to skip — port of the switch in DebugUtilCallback
 // ---------------------------------------------------------------------------
@@ -26,6 +43,10 @@ const IGNORED_MESSAGE_IDS: &[u32] = &[
     0x1608dec0, // Image layout mismatch in vkUpdateDescriptorSet
     0x55362756, // Descriptor binding and framebuffer attachment overlap
 ];
+
+fn is_ignored_message_id(message_id: u32) -> bool {
+    IGNORED_MESSAGE_IDS.contains(&message_id)
+}
 
 #[cfg(target_os = "android")]
 const IGNORED_MESSAGE_IDS: &[u32] = &[
@@ -68,7 +89,7 @@ unsafe extern "system" fn debug_utils_callback(
 
     // Skip known false-positive validation errors
     let message_id = data.message_id_number as u32;
-    if IGNORED_MESSAGE_IDS.contains(&message_id) {
+    if is_ignored_message_id(message_id) {
         return vk::FALSE;
     }
 
@@ -102,12 +123,12 @@ unsafe extern "system" fn debug_utils_callback(
 ///
 /// Port of `Vulkan::CreateDebugUtilsCallback` from `vulkan_debug_callback.cpp`.
 ///
-/// Returns the messenger handle and the debug utils loader (which must be kept alive
-/// to call the destroy function).
+/// Returns an owner retaining both the messenger handle and the debug-utils
+/// loader needed to destroy it.
 pub fn create_debug_utils_callback(
     entry: &ash::Entry,
     instance: &ash::Instance,
-) -> Result<(vk::DebugUtilsMessengerEXT, ash::extensions::ext::DebugUtils), VulkanError> {
+) -> Result<DebugUtilsMessenger, VulkanError> {
     let debug_utils = ash::extensions::ext::DebugUtils::new(entry, instance);
 
     let create_info = vk::DebugUtilsMessengerCreateInfoEXT::builder()
@@ -131,5 +152,22 @@ pub fn create_debug_utils_callback(
             .map_err(|e| VulkanError::new(e))?
     };
 
-    Ok((messenger, debug_utils))
+    Ok(DebugUtilsMessenger {
+        loader: debug_utils,
+        handle: messenger,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_ignored_message_id;
+
+    #[test]
+    fn known_validation_false_positive_is_ignored() {
+        #[cfg(not(target_os = "android"))]
+        assert!(is_ignored_message_id(0x682a878a));
+        #[cfg(target_os = "android")]
+        assert!(is_ignored_message_id(0xbf9cf353));
+        assert!(!is_ignored_message_id(0));
+    }
 }

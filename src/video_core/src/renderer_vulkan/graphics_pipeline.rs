@@ -42,7 +42,7 @@ use shader_recompiler::runtime_info::{
     AttributeType, CompareFunction, InputTopology, TessPrimitive, TessSpacing,
 };
 use shader_recompiler::shader_info::{num_descriptors, Info as ShaderInfo};
-use shader_recompiler::{CompiledShader, PipelineCache, Profile, RuntimeInfo, ShaderStage};
+use shader_recompiler::{CompiledShader, Profile, RuntimeInfo, ShaderStage};
 use smallvec::SmallVec;
 
 use super::buffer_cache::VulkanCommonBufferCache;
@@ -1844,21 +1844,14 @@ fn graphics_resource_metadata(stage_infos: &[ShaderInfo; 5]) -> (usize, u32, boo
 /// concrete compile/build path.
 pub struct GraphicsPipelineCache {
     device_owner: DeviceReference,
-    shader_cache: PipelineCache,
     profile: Profile,
     host_info: HostTranslateInfo,
 }
 
 impl GraphicsPipelineCache {
-    pub fn new(
-        vulkan_device: &Device,
-        shader_cache: PipelineCache,
-        profile: Profile,
-        host_info: HostTranslateInfo,
-    ) -> Self {
+    pub fn new(vulkan_device: &Device, profile: Profile, host_info: HostTranslateInfo) -> Self {
         Self {
             device_owner: DeviceReference::new(vulkan_device),
-            shader_cache,
             profile,
             host_info,
         }
@@ -1867,7 +1860,6 @@ impl GraphicsPipelineCache {
     pub fn clone_for_disk_worker(&self) -> Self {
         Self {
             device_owner: self.device_owner,
-            shader_cache: PipelineCache::new(self.profile.clone()),
             profile: self.profile.clone(),
             host_info: self.host_info.clone(),
         }

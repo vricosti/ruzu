@@ -522,7 +522,6 @@ pub struct RasterizerVulkan {
     blit_image: Box<BlitImageHelper>,
     fallback_uniform_buffer: vk::Buffer,
     fallback_uniform_memory: vk::DeviceMemory,
-    fallback_uniform_mapped: *mut u8,
     fallback_sampler: vk::Sampler,
     shader_cache: crate::shader_cache::ShaderCache,
     query_cache: VulkanQueryCache,
@@ -566,7 +565,6 @@ pub struct RasterizerVulkan {
     draw_skipped_pipeline: u64,
     /// Draws redirected to the offscreen framebuffer because no guest
     /// render-target framebuffer could be resolved (diagnostic).
-    has_null_descriptor: bool,
     driver_id: vk::DriverId,
     extended_dynamic_state_supported: bool,
     extended_dynamic_state2_supported: bool,
@@ -1074,7 +1072,6 @@ impl RasterizerVulkan {
             blit_image,
             fallback_uniform_buffer,
             fallback_uniform_memory,
-            fallback_uniform_mapped,
             fallback_sampler,
             render_pass_cache,
             shader_cache,
@@ -1102,7 +1099,6 @@ impl RasterizerVulkan {
             draw_counter: 0,
             draw_sequence: 0,
             draw_skipped_pipeline: 0,
-            has_null_descriptor,
             driver_id,
             extended_dynamic_state_supported,
             extended_dynamic_state2_supported,

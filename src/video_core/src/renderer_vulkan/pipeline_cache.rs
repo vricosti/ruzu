@@ -849,7 +849,6 @@ impl PipelineCache {
         let device = vulkan_device.get_logical().clone();
         let profile = make_shader_profile(vulkan_device);
         let host_info = make_host_translate_info(vulkan_device);
-        let shader_cache = shader_recompiler::PipelineCache::new(profile.clone());
         let use_asynchronous_shaders = *common::settings::values()
             .use_asynchronous_shaders
             .get_value();
@@ -913,12 +912,7 @@ impl PipelineCache {
             ),
             profile: profile.clone(),
             host_info: host_info.clone(),
-            graphics_pipeline_cache: GraphicsPipelineCache::new(
-                vulkan_device,
-                shader_cache,
-                profile,
-                host_info,
-            ),
+            graphics_pipeline_cache: GraphicsPipelineCache::new(vulkan_device, profile, host_info),
             graphics_cache: HashMap::with_hasher(BuildUnorderedDenseHasher),
             graphics_key: GraphicsPipelineKey::default(),
             current_pipeline: None,

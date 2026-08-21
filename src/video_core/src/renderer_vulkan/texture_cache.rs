@@ -1674,7 +1674,6 @@ pub struct TextureCacheRuntime {
     staging_buffer_pool: NonNull<StagingBufferPool>,
     blit_image_helper: NonNull<BlitImageHelper>,
     render_pass_cache: NonNull<RenderPassCache>,
-    compute_pass_descriptor_queue: NonNull<ComputePassDescriptorQueue>,
     astc_decoder_pass: Option<AstcDecoderPass>,
     bl3d_unswizzle_pass: Option<BlockLinearUnswizzle3DPass>,
     /// Cached `vkGetPhysicalDeviceFormatProperties` results (upstream caches
@@ -1789,7 +1788,6 @@ impl TextureCacheRuntime {
             staging_buffer_pool: NonNull::from(staging_buffer_pool),
             blit_image_helper: NonNull::from(blit_image_helper),
             render_pass_cache: NonNull::from(render_pass_cache),
-            compute_pass_descriptor_queue: NonNull::from(compute_pass_descriptor_queue),
             astc_decoder_pass,
             bl3d_unswizzle_pass,
             format_properties: std::cell::RefCell::new(std::collections::HashMap::new()),

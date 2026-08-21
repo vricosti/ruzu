@@ -4463,3 +4463,16 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
   `std::array`. Ruzu stores `size_bytes` at runtime and uses separate stack-or-heap channel views.
   Restoring that structural/layout parity requires changing the manager-pool type graph and is
   outside this local batching slice.
+
+## 2026-08-22 — `src/video_core/src/vulkan_common/vulkan_debug_callback.rs` vs `src/video_core/vulkan_common/vulkan_debug_callback.h` and `.cpp`
+
+### Intentional differences
+
+- Rust's `DebugUtilsMessenger` owns both the Vulkan handle and the `ash` extension loader needed
+  to destroy it. This is the RAII counterpart of Eden's `vk::DebugUtilsMessenger`, whose instance
+  dispatch table is retained by the wrapper internally.
+
+### Missing items
+
+- Eden additionally forwards validation messages to `GPU::Logging::GPULogger` when Vulkan-call
+  logging is active. Ruzu does not yet have that GPU logging subsystem.
