@@ -3658,3 +3658,25 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 ### Binary layout verification
 
 - N/A: patch records are parsed into owned containers and are not serialized as native structs.
+
+## 2026-08-21 — `src/common/src/fs/path_util.rs` `sanitize_path` vs Eden `src/common/fs/{path_util.h,path_util.cpp}` `SanitizePath`
+
+### Intentional differences
+
+- Rust builds the normalized result from borrowed UTF-8 components instead of Eden's mutable byte
+  string and `string_view` vector. Separator selection, Windows network-prefix preservation,
+  absolute-path handling, and component ordering remain the same for valid platform paths.
+
+### Unintentional differences (to fix)
+
+- Android content URIs are not bypassed before normalization. Android filesystem glue is an
+  explicit project exception; this remains relevant only if that excluded frontend is introduced.
+
+### Missing items
+
+- None for desktop `SanitizePath`: repeated separators and trailing separators are removed, `.` is
+  discarded, and `..` removes the preceding retained component exactly as in Eden.
+
+### Binary layout verification
+
+- N/A: path normalization defines no serialized structure.

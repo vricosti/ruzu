@@ -476,8 +476,6 @@ pub fn split_path_components_copy(filename: &str) -> Vec<String> {
 ///
 /// Maps to upstream `SanitizePath`.
 pub fn sanitize_path(path: &str, directory_separator: DirectorySeparator) -> String {
-    let mut result = path.to_string();
-
     let (type1, type2) = match directory_separator {
         DirectorySeparator::BackwardSlash => ('/', '\\'),
         DirectorySeparator::ForwardSlash => ('\\', '/'),
@@ -490,18 +488,40 @@ pub fn sanitize_path(path: &str, directory_separator: DirectorySeparator) -> Str
         }
     };
 
-    // Replace type1 with type2
-    result = result.replace(type1, &type2.to_string());
-
-    // Remove duplicate separators
-    let type2_str = type2.to_string();
-    let double = format!("{}{}", type2, type2);
-    while result.contains(&double) {
-        result = result.replace(&double, &type2_str);
+    let replaced = path.replace(type1, &type2.to_string());
+    let preserve_network_prefix =
+        cfg!(windows) && replaced.starts_with(type2) && replaced.chars().nth(1) == Some(type2);
+    let mut collapsed = String::with_capacity(replaced.len());
+    for character in replaced.chars() {
+        if character == type2 && collapsed.ends_with(type2) {
+            if !(preserve_network_prefix && collapsed.len() == type2.len_utf8()) {
+                continue;
+            }
+        }
+        collapsed.push(character);
     }
 
-    // Remove trailing slash
-    remove_trailing_slash(&result).to_string()
+    let absolute = collapsed.starts_with(type2);
+    let mut parts: Vec<&str> = Vec::new();
+    for part in split_path_components(&collapsed) {
+        if part.is_empty() || part == "." {
+            continue;
+        }
+        if part == ".." && parts.last().is_some_and(|previous| *previous != "..") {
+            parts.pop();
+        } else if part != ".." {
+            parts.push(part);
+        }
+    }
+
+    let separator = type2.to_string();
+    let mut resolved = if absolute {
+        separator.clone()
+    } else {
+        String::new()
+    };
+    resolved.push_str(&parts.join(&separator));
+    remove_trailing_slash(&resolved).to_string()
 }
 
 /// Gets all text up to the last '/' or '\\' in the path.
@@ -681,6 +701,14 @@ mod tests {
     fn test_sanitize_path() {
         let result = sanitize_path("path//to///file/", DirectorySeparator::ForwardSlash);
         assert_eq!(result, "path/to/file");
+        assert_eq!(
+            sanitize_path("/root/./child/../file", DirectorySeparator::ForwardSlash),
+            "/root/file"
+        );
+        assert_eq!(
+            sanitize_path("../../relative/file", DirectorySeparator::ForwardSlash),
+            "relative/file"
+        );
     }
 
     #[test]

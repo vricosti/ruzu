@@ -490,3 +490,14 @@
   regressions and the prior closed-reply regression pass, post-implementation
   upstream re-verification is complete, `ARCHI_CHOICES.md` documents the Rust
   adaptation, and the release build succeeds. Runtime validation remains.
+
+## 2026-08-21 — interrupted real-VFS file-reference parity
+
+- Interrupted slice: port Eden's retained `IOFile` references, LRU eviction, trait-level open/create
+  operations, and directory-root checks in `core/file_sys/vfs/vfs_real.rs`.
+- Exact missing prerequisite: Eden's `Common::FS::SanitizePath` resolves `.` and `..` components
+  before `RealVfsDirectory::IsWithinRoot` runs. Ruzu's counterpart only normalized separators, so a
+  focused root-escape regression still opened `root/../outside.bin`.
+- Resume condition: port `SanitizePath` component resolution in its owning common module, verify it
+  against Eden and update `DIFF.md`, then rerun the suspended VFS tests and finish its audit.
+- Status: prerequisite implementation in progress; the uncommitted VFS slice remains suspended.
