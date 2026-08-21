@@ -116,49 +116,11 @@ impl Layer {
         allocator: &MemoryAllocator,
         supports_float16: bool,
     ) -> Self {
-        // Create descriptor pool
-        let descriptor_pool = util::create_wrapped_descriptor_pool(
-            &device,
-            image_count as u32,
-            image_count as u32,
-            &[vk::DescriptorType::COMBINED_IMAGE_SAMPLER],
-        );
-
-        // Create descriptor sets
-        let layouts = vec![layout; image_count];
-        let descriptor_sets =
-            util::create_wrapped_descriptor_sets(&device, descriptor_pool, &layouts);
-
-        let sr_filter = match (filters.get_scaling_filter)() {
-            ScalingFilter::Fsr => SuperResolutionFilter::Fsr(Fsr::new(
-                device.clone(),
-                allocator,
-                image_count,
-                output_size,
-                supports_float16,
-            )),
-            ScalingFilter::Sgsr => SuperResolutionFilter::Sgsr(Sgsr::new(
-                device.clone(),
-                allocator,
-                image_count,
-                output_size,
-                false,
-            )),
-            ScalingFilter::SgsrEdge => SuperResolutionFilter::Sgsr(Sgsr::new(
-                device.clone(),
-                allocator,
-                image_count,
-                output_size,
-                true,
-            )),
-            _ => SuperResolutionFilter::None,
-        };
-
-        Layer {
+        let mut layer = Layer {
             device,
             image_count,
-            descriptor_pool,
-            descriptor_sets,
+            descriptor_pool: vk::DescriptorPool::null(),
+            descriptor_sets: Vec::new(),
             buffer: None,
             raw_images: Vec::new(),
             raw_image_views: Vec::new(),
@@ -168,10 +130,55 @@ impl Layer {
             pixel_format: None,
             anti_alias_setting: AntiAliasingSetting::None,
             anti_alias: Box::new(NoAa),
-            sr_filter,
+            sr_filter: SuperResolutionFilter::None,
             resource_ticks: Vec::new(),
             filters,
-        }
+        };
+
+        layer.create_descriptor_pool();
+        layer.create_descriptor_sets(layout);
+        layer.sr_filter = match (filters.get_scaling_filter)() {
+            ScalingFilter::Fsr => SuperResolutionFilter::Fsr(Fsr::new(
+                layer.device.clone(),
+                allocator,
+                image_count,
+                output_size,
+                supports_float16,
+            )),
+            ScalingFilter::Sgsr => SuperResolutionFilter::Sgsr(Sgsr::new(
+                layer.device.clone(),
+                allocator,
+                image_count,
+                output_size,
+                false,
+            )),
+            ScalingFilter::SgsrEdge => SuperResolutionFilter::Sgsr(Sgsr::new(
+                layer.device.clone(),
+                allocator,
+                image_count,
+                output_size,
+                true,
+            )),
+            _ => SuperResolutionFilter::None,
+        };
+        layer
+    }
+
+    /// Port of `Layer::CreateDescriptorPool`.
+    fn create_descriptor_pool(&mut self) {
+        self.descriptor_pool = util::create_wrapped_descriptor_pool(
+            &self.device,
+            self.image_count as u32,
+            self.image_count as u32,
+            &[vk::DescriptorType::COMBINED_IMAGE_SAMPLER],
+        );
+    }
+
+    /// Port of `Layer::CreateDescriptorSets`.
+    fn create_descriptor_sets(&mut self, layout: vk::DescriptorSetLayout) {
+        let layouts = vec![layout; self.image_count];
+        self.descriptor_sets =
+            util::create_wrapped_descriptor_sets(&self.device, self.descriptor_pool, &layouts);
     }
 
     /// Port of `Layer::ConfigureDraw`.
@@ -187,8 +194,6 @@ impl Layer {
         image_index: usize,
         source_image: vk::Image,
         source_image_view: vk::ImageView,
-        texture_width: u32,
-        texture_height: u32,
         scaled_width: u32,
         scaled_height: u32,
         layout: &FramebufferLayout,
@@ -328,8 +333,6 @@ impl Layer {
             image_index,
             source_image,
             source_image_view,
-            texture_width,
-            texture_height,
             scaled_width,
             scaled_height,
             layout,
@@ -561,7 +564,15 @@ impl Layer {
     }
 
     /// Port of `Layer::ReleaseRawImages`.
-    pub fn release_raw_images(&mut self) {
+    fn release_raw_images(&mut self) {
+        unsafe {
+            for image_view in &mut self.raw_image_views {
+                if *image_view != vk::ImageView::null() {
+                    self.device.destroy_image_view(*image_view, None);
+                    *image_view = vk::ImageView::null();
+                }
+            }
+        }
         self.raw_images.clear();
         self.raw_image_views.clear();
         self.raw_image_initialized.clear();
@@ -686,5 +697,19 @@ impl Layer {
                 ))
             }
         };
+    }
+}
+
+impl Drop for Layer {
+    /// Port of `Layer::~Layer` plus explicit destruction for raw Vulkan handles.
+    fn drop(&mut self) {
+        self.release_raw_images();
+        if self.descriptor_pool != vk::DescriptorPool::null() {
+            unsafe {
+                self.device
+                    .destroy_descriptor_pool(self.descriptor_pool, None);
+            }
+            self.descriptor_pool = vk::DescriptorPool::null();
+        }
     }
 }

@@ -4401,3 +4401,22 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
   the same lifecycle points as Eden.
 - The raw `ash::Device` is retained by `Smaa` because the local `AntiAliasPass::draw` trait does not
   receive Eden's `Device&`; resource selection and command ordering are unchanged.
+
+## 2026-08-21 — `src/video_core/src/renderer_vulkan/present/layer.rs` vs `src/video_core/renderer_vulkan/present/layer.h` and `.cpp`
+
+### Intentional differences
+
+- Eden's Vulkan RAII wrappers release descriptor pools and image views implicitly. Rust owns raw
+  handles, so `Drop` destroys the descriptor pool explicitly and `ReleaseRawImages` destroys each
+  image view after the existing tick wait; the enclosing renderer waits for device idle before
+  final field destruction.
+- The tail of `ConfigureDraw` remains a same-file Rust helper that accepts the already-resolved
+  source image, dimensions, layout, and normalized crop. The upstream-owned framebuffer lookup and
+  crop computation remain in `configure_draw_from_framebuffer`.
+
+### Unintentional differences (to fix)
+
+- `Layer` still receives `MemoryAllocator`, `Scheduler`, and `MaxwellDeviceMemoryManager` through
+  its methods instead of retaining Eden's three non-owning references. Consequently the tick wait
+  currently lives immediately before `ReleaseRawImages` in `RefreshResources` rather than inside
+  `ReleaseRawImages` itself.
