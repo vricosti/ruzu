@@ -4355,3 +4355,11 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 
 - N/A: these methods emit host instructions and do not serialize a shared structure. A focused
   regression routes all eight IR opcodes through the ARM64 data-processing owner.
+
+## 2026-08-21 — `src/video_core/src/control/channel_state_cache.rs` vs `src/video_core/control/channel_state_cache.h`, `.cpp`, and `.inc`
+
+### Intentional differences
+
+- Rust's `&mut self` mutation methods exclude concurrent `&self` lookups at the type boundary, so
+  it does not retain Eden's inner `config_mutex`; the cache owners must provide any cross-thread
+  synchronization around the complete `ChannelSetupCaches` value.

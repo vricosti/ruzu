@@ -140,11 +140,6 @@ pub struct ChannelSetupCaches<P> {
     channel_map: HashMap<i32, usize>,
     active_channel_ids: Vec<usize>,
     address_spaces: HashMap<usize, AddressSpaceRef>,
-
-    /// Protects the above collections.
-    ///
-    /// Upstream: `mutable std::mutex config_mutex`.
-    config_mutex: Mutex<()>,
 }
 
 impl<P> ChannelSetupCaches<P> {
@@ -163,7 +158,6 @@ impl<P> ChannelSetupCaches<P> {
             channel_map: HashMap::new(),
             active_channel_ids: Vec::new(),
             address_spaces: HashMap::new(),
-            config_mutex: Mutex::new(()),
         }
     }
 
@@ -189,8 +183,6 @@ impl<P> ChannelSetupCaches<P> {
     ) where
         P: FromChannelState,
     {
-        // Note: upstream locks config_mutex here, but &mut self already
-        // guarantees exclusive access in Rust.
         assert!(
             !self.channel_map.contains_key(&channel.bind_id) && channel.bind_id >= 0,
             "duplicate or negative bind_id in create_channel"
@@ -242,8 +234,6 @@ impl<P> ChannelSetupCaches<P> {
     where
         P: ChannelCacheAccessor,
     {
-        // Note: upstream locks config_mutex; &mut self provides exclusivity.
-
         let &storage_id = self
             .channel_map
             .get(&id)
@@ -265,8 +255,6 @@ impl<P> ChannelSetupCaches<P> {
     ///
     /// Corresponds to `ChannelSetupCaches<P>::EraseChannel` (channel_state_cache.inc).
     pub fn erase_channel(&mut self, id: i32) {
-        // Note: upstream locks config_mutex; &mut self provides exclusivity.
-
         let &storage_id = self
             .channel_map
             .get(&id)
@@ -301,7 +289,6 @@ impl<P> ChannelSetupCaches<P> {
     ///
     /// Corresponds to `ChannelSetupCaches<P>::GetFromID`.
     pub fn get_from_id(&self, id: usize) -> Option<usize> {
-        // Note: upstream locks config_mutex; &mut self provides exclusivity.
         self.address_spaces.get(&id).map(|r| r.gpu_memory_id)
     }
 
@@ -309,7 +296,6 @@ impl<P> ChannelSetupCaches<P> {
     ///
     /// Corresponds to `ChannelSetupCaches<P>::getStorageID`.
     pub fn get_storage_id(&self, id: usize) -> Option<usize> {
-        // Note: upstream locks config_mutex; &mut self provides exclusivity.
         self.address_spaces.get(&id).map(|r| r.storage_id)
     }
 
