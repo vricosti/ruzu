@@ -10144,6 +10144,89 @@ mod tests {
 
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     #[test]
+    fn test_a64_srhadd_and_urhadd_all_element_sizes() {
+        fn vector_pair(bytes: [u8; 16]) -> (u64, u64) {
+            (
+                u64::from_le_bytes(bytes[..8].try_into().unwrap()),
+                u64::from_le_bytes(bytes[8..].try_into().unwrap()),
+            )
+        }
+
+        let a = [
+            0x80, 0x7f, 0xff, 0x00, 0x01, 0xfe, 0x40, 0xc0, 0x34, 0x12, 0x78, 0x56, 0xef, 0xcd,
+            0xab, 0x89,
+        ];
+        let b = [
+            0x7f, 0x80, 0x01, 0xff, 0xff, 0x02, 0xc0, 0x40, 0xcc, 0xed, 0x88, 0xa9, 0x11, 0x32,
+            0x55, 0x76,
+        ];
+
+        let mut signed8 = [0u8; 16];
+        let mut unsigned8 = [0u8; 16];
+        for lane in 0..16 {
+            signed8[lane] =
+                (((a[lane] as i8 as i16) + (b[lane] as i8 as i16) + 1) >> 1) as i8 as u8;
+            unsigned8[lane] = ((a[lane] as u16 + b[lane] as u16 + 1) >> 1) as u8;
+        }
+
+        let mut signed16 = [0u8; 16];
+        let mut unsigned16 = [0u8; 16];
+        for lane in 0..8 {
+            let offset = lane * 2;
+            let lhs_signed = i16::from_le_bytes(a[offset..offset + 2].try_into().unwrap());
+            let rhs_signed = i16::from_le_bytes(b[offset..offset + 2].try_into().unwrap());
+            let lhs_unsigned = u16::from_le_bytes(a[offset..offset + 2].try_into().unwrap());
+            let rhs_unsigned = u16::from_le_bytes(b[offset..offset + 2].try_into().unwrap());
+            signed16[offset..offset + 2].copy_from_slice(
+                &(((lhs_signed as i32 + rhs_signed as i32 + 1) >> 1) as i16).to_le_bytes(),
+            );
+            unsigned16[offset..offset + 2].copy_from_slice(
+                &(((lhs_unsigned as u32 + rhs_unsigned as u32 + 1) >> 1) as u16).to_le_bytes(),
+            );
+        }
+
+        let mut signed32 = [0u8; 16];
+        let mut unsigned32 = [0u8; 16];
+        for lane in 0..4 {
+            let offset = lane * 4;
+            let lhs_signed = i32::from_le_bytes(a[offset..offset + 4].try_into().unwrap());
+            let rhs_signed = i32::from_le_bytes(b[offset..offset + 4].try_into().unwrap());
+            let lhs_unsigned = u32::from_le_bytes(a[offset..offset + 4].try_into().unwrap());
+            let rhs_unsigned = u32::from_le_bytes(b[offset..offset + 4].try_into().unwrap());
+            signed32[offset..offset + 4].copy_from_slice(
+                &(((lhs_signed as i64 + rhs_signed as i64 + 1) >> 1) as i32).to_le_bytes(),
+            );
+            unsigned32[offset..offset + 4].copy_from_slice(
+                &(((lhs_unsigned as u64 + rhs_unsigned as u64 + 1) >> 1) as u32).to_le_bytes(),
+            );
+        }
+
+        let code: &[u32] = &[
+            0x4E35_1680, // srhadd v0.16b, v20.16b, v21.16b
+            0x4E75_1681, // srhadd v1.8h, v20.8h, v21.8h
+            0x4EB5_1682, // srhadd v2.4s, v20.4s, v21.4s
+            0x6E35_1683, // urhadd v3.16b, v20.16b, v21.16b
+            0x6E75_1684, // urhadd v4.8h, v20.8h, v21.8h
+            0x6EB5_1685, // urhadd v5.4s, v20.4s, v21.4s
+            0xD400_0001, // svc #0
+        ];
+        let jit = run_a64_alu(code, |j| {
+            let (a_low, a_high) = vector_pair(a);
+            let (b_low, b_high) = vector_pair(b);
+            j.set_vector(20, a_low, a_high);
+            j.set_vector(21, b_low, b_high);
+        });
+
+        assert_eq!(jit.get_vector(0), vector_pair(signed8));
+        assert_eq!(jit.get_vector(1), vector_pair(signed16));
+        assert_eq!(jit.get_vector(2), vector_pair(signed32));
+        assert_eq!(jit.get_vector(3), vector_pair(unsigned8));
+        assert_eq!(jit.get_vector(4), vector_pair(unsigned16));
+        assert_eq!(jit.get_vector(5), vector_pair(unsigned32));
+    }
+
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[test]
     fn test_a64_sqadd_v1_8h_saturates_and_sets_qc() {
         let code: &[u32] = &[
             0x4E61_0CE1, // sqadd v1.8h, v7.8h, v1.8h

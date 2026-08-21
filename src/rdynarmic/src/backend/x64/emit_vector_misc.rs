@@ -115,29 +115,70 @@ pub fn emit_vector_unsigned_absolute_difference32(
 }
 
 // ---------------------------------------------------------------------------
-// VectorRoundingHalvingAddSigned — fallback
+// VectorRoundingHalvingAddSigned
 // ---------------------------------------------------------------------------
 
-macro_rules! define_rounding_halving_add_signed {
-    ($name:ident, $sty:ty, $wide:ty, $count:expr) => {
-        extern "C" fn $name(result: *mut [u8; 16], a: *const [u8; 16], b: *const [u8; 16]) {
-            unsafe {
-                let va: [$sty; $count] = std::mem::transmute(*a);
-                let vb: [$sty; $count] = std::mem::transmute(*b);
-                let mut out = [0 as $sty; $count];
-                for i in 0..$count {
-                    let sum = va[i] as $wide + vb[i] as $wide + 1;
-                    out[i] = (sum >> 1) as $sty;
-                }
-                *result = std::mem::transmute(out);
-            }
-        }
-    };
-}
+fn emit_vector_rounding_halving_add_signed(
+    element_size: usize,
+    ra: &mut RegAlloc,
+    inst_ref: InstRef,
+    inst: &Inst,
+) {
+    let mut args = ra.get_argument_info(inst_ref, &inst.args, inst.num_args());
+    let a = ra.use_scratch_xmm(&mut args[0]);
+    let b = ra.use_scratch_xmm(&mut args[1]);
 
-define_rounding_halving_add_signed!(fallback_rhadd_s8, i8, i16, 16);
-define_rounding_halving_add_signed!(fallback_rhadd_s16, i16, i32, 8);
-define_rounding_halving_add_signed!(fallback_rhadd_s32, i32, i64, 4);
+    match element_size {
+        8 => {
+            let vec_128 = ra.scratch_xmm();
+            let sign_bias = ra
+                .constant_pool
+                .as_mut()
+                .expect("constant pool required")
+                .get_constant(0x8080_8080_8080_8080, 0x8080_8080_8080_8080);
+            ra.asm
+                .movdqa(vec_128, rxbyak::xmmword_ptr(sign_bias))
+                .unwrap();
+            ra.asm.paddb(a, vec_128).unwrap();
+            ra.asm.paddb(b, vec_128).unwrap();
+            ra.asm.pavgb(a, b).unwrap();
+            ra.asm.paddb(a, vec_128).unwrap();
+            ra.release(vec_128);
+        }
+        16 => {
+            let vec_32768 = ra.scratch_xmm();
+            let sign_bias = ra
+                .constant_pool
+                .as_mut()
+                .expect("constant pool required")
+                .get_constant(0x8000_8000_8000_8000, 0x8000_8000_8000_8000);
+            ra.asm
+                .movdqa(vec_32768, rxbyak::xmmword_ptr(sign_bias))
+                .unwrap();
+            ra.asm.paddw(a, vec_32768).unwrap();
+            ra.asm.paddw(b, vec_32768).unwrap();
+            ra.asm.pavgw(a, b).unwrap();
+            ra.asm.paddw(a, vec_32768).unwrap();
+            ra.release(vec_32768);
+        }
+        32 => {
+            let tmp = ra.scratch_xmm();
+            ra.asm.movdqa(tmp, a).unwrap();
+            ra.asm.por(a, b).unwrap();
+            ra.asm.psrad_imm(tmp, 1).unwrap();
+            ra.asm.psrad_imm(b, 1).unwrap();
+            ra.asm.pslld_imm(a, 31).unwrap();
+            ra.asm.paddd(b, tmp).unwrap();
+            ra.asm.psrld_imm(a, 31).unwrap();
+            ra.asm.paddd(a, b).unwrap();
+            ra.release(tmp);
+        }
+        _ => unreachable!("unsupported signed RHADD element size"),
+    }
+
+    ra.release(b);
+    ra.define_value(inst_ref, a);
+}
 
 pub fn emit_vector_rounding_halving_add_signed8(
     _ctx: &EmitContext,
@@ -145,7 +186,7 @@ pub fn emit_vector_rounding_halving_add_signed8(
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_two_arg_fallback(ra, inst_ref, inst, fallback_rhadd_s8 as usize);
+    emit_vector_rounding_halving_add_signed(8, ra, inst_ref, inst);
 }
 pub fn emit_vector_rounding_halving_add_signed16(
     _ctx: &EmitContext,
@@ -153,7 +194,7 @@ pub fn emit_vector_rounding_halving_add_signed16(
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_two_arg_fallback(ra, inst_ref, inst, fallback_rhadd_s16 as usize);
+    emit_vector_rounding_halving_add_signed(16, ra, inst_ref, inst);
 }
 pub fn emit_vector_rounding_halving_add_signed32(
     _ctx: &EmitContext,
@@ -161,60 +202,66 @@ pub fn emit_vector_rounding_halving_add_signed32(
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_two_arg_fallback(ra, inst_ref, inst, fallback_rhadd_s32 as usize);
+    emit_vector_rounding_halving_add_signed(32, ra, inst_ref, inst);
 }
 
 // ---------------------------------------------------------------------------
-// VectorRoundingHalvingAddUnsigned — fallback
+// VectorRoundingHalvingAddUnsigned
 // ---------------------------------------------------------------------------
 
-macro_rules! define_rounding_halving_add_unsigned {
-    ($name:ident, $uty:ty, $wide:ty, $count:expr) => {
-        extern "C" fn $name(result: *mut [u8; 16], a: *const [u8; 16], b: *const [u8; 16]) {
-            unsafe {
-                let va: [$uty; $count] = std::mem::transmute(*a);
-                let vb: [$uty; $count] = std::mem::transmute(*b);
-                let mut out = [0 as $uty; $count];
-                for i in 0..$count {
-                    let sum = va[i] as $wide + vb[i] as $wide + 1;
-                    out[i] = (sum >> 1) as $uty;
-                }
-                *result = std::mem::transmute(out);
-            }
+fn emit_vector_rounding_halving_add_unsigned(
+    element_size: usize,
+    ra: &mut RegAlloc,
+    inst_ref: InstRef,
+    inst: &Inst,
+) {
+    match element_size {
+        8 => emit_vector_op(ra, inst_ref, inst, rxbyak::CodeAssembler::pavgb),
+        16 => emit_vector_op(ra, inst_ref, inst, rxbyak::CodeAssembler::pavgw),
+        32 => {
+            let mut args = ra.get_argument_info(inst_ref, &inst.args, inst.num_args());
+            let a = ra.use_scratch_xmm(&mut args[0]);
+            let b = ra.use_scratch_xmm(&mut args[1]);
+            let tmp = ra.scratch_xmm();
+            ra.asm.movdqa(tmp, a).unwrap();
+            ra.asm.por(a, b).unwrap();
+            ra.asm.psrld_imm(tmp, 1).unwrap();
+            ra.asm.psrld_imm(b, 1).unwrap();
+            ra.asm.pslld_imm(a, 31).unwrap();
+            ra.asm.paddd(b, tmp).unwrap();
+            ra.asm.psrld_imm(a, 31).unwrap();
+            ra.asm.paddd(a, b).unwrap();
+            ra.release(tmp);
+            ra.release(b);
+            ra.define_value(inst_ref, a);
         }
-    };
+        _ => unreachable!("unsupported unsigned RHADD element size"),
+    }
 }
 
-define_rounding_halving_add_unsigned!(fallback_rhadd_u8, u8, u16, 16);
-define_rounding_halving_add_unsigned!(fallback_rhadd_u16, u16, u32, 8);
-define_rounding_halving_add_unsigned!(fallback_rhadd_u32, u32, u64, 4);
-
-// RoundingHalvingAddUnsigned8: SSE2 pavgb = (a + b + 1) >> 1
 pub fn emit_vector_rounding_halving_add_unsigned8(
     _ctx: &EmitContext,
     ra: &mut RegAlloc,
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_vector_op(ra, inst_ref, inst, rxbyak::CodeAssembler::pavgb);
+    emit_vector_rounding_halving_add_unsigned(8, ra, inst_ref, inst);
 }
-// RoundingHalvingAddUnsigned16: SSE2 pavgw
 pub fn emit_vector_rounding_halving_add_unsigned16(
     _ctx: &EmitContext,
     ra: &mut RegAlloc,
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_vector_op(ra, inst_ref, inst, rxbyak::CodeAssembler::pavgw);
+    emit_vector_rounding_halving_add_unsigned(16, ra, inst_ref, inst);
 }
-// RoundingHalvingAddUnsigned32: no pavgd in SSE — keep fallback
 pub fn emit_vector_rounding_halving_add_unsigned32(
     _ctx: &EmitContext,
     ra: &mut RegAlloc,
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_two_arg_fallback(ra, inst_ref, inst, fallback_rhadd_u32 as usize);
+    emit_vector_rounding_halving_add_unsigned(32, ra, inst_ref, inst);
 }
 
 // ---------------------------------------------------------------------------
@@ -590,20 +637,5 @@ mod tests {
             &[0x10, 0x11, 0x17, 0x80, 0x81, 0x87, 0xDD, 0xDD]
         );
         assert_eq!(&frame.result[8..], &[0xDD; 8]);
-    }
-
-    #[test]
-    fn test_fallback_rhadd_u8() {
-        let a: [u8; 16] =
-            unsafe { std::mem::transmute([3u8, 7, 0, 255, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]) };
-        let b: [u8; 16] =
-            unsafe { std::mem::transmute([4u8, 8, 1, 254, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]) };
-        let mut result = [0u8; 16];
-        fallback_rhadd_u8(&mut result, &a, &b);
-        let out: [u8; 16] = result;
-        assert_eq!(out[0], 4); // (3+4+1)/2 = 4
-        assert_eq!(out[1], 8); // (7+8+1)/2 = 8
-        assert_eq!(out[2], 1); // (0+1+1)/2 = 1
-        assert_eq!(out[3], 255); // (255+254+1)/2 = 255
     }
 }

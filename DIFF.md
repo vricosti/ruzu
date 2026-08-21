@@ -4004,3 +4004,30 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 ### Binary layout verification
 
 - N/A: these methods emit JIT instructions and define no shared or serialized structures.
+
+## 2026-08-21 — `src/rdynarmic/src/backend/x64/emit_vector_misc.rs` vs `src/dynarmic/src/dynarmic/backend/x64/emit_x64_vector.cpp` (rounding-halving-add slice)
+
+### Intentional differences
+
+- Rust explicitly releases temporary register-allocation locks; Eden releases its scoped register
+  wrappers on scope exit. The emitted instruction ordering is otherwise preserved.
+- The public Rust dispatch methods retain their explicit signed/unsigned and element-width names;
+  both families delegate to private element-size helpers matching Eden's two static helpers.
+
+### Unintentional differences (to fix)
+
+- None in the focused slice. Signed 8/16-bit RHADD now applies Eden's sign-bit bias around
+  `pavgb`/`pavgw`; signed 32-bit and unsigned 32-bit RHADD now use Eden's overflow-safe shift/add
+  sequences instead of host callbacks.
+- Removed all six scalar RHADD fallbacks. Eden emits native SSE2 for every supported width, so the
+  unused unsigned 8/16-bit fallbacks were dead code and the remaining fallbacks represented parity
+  debt.
+
+### Missing items
+
+- None among the signed and unsigned 8/16/32-bit rounding-halving-add emitters. Other
+  `emit_vector_misc.rs` families remain outside this focused warning-driven audit.
+
+### Binary layout verification
+
+- N/A: these methods emit JIT instructions and define no shared or serialized structures.
