@@ -2854,3 +2854,24 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 
 - N/A: `AudioRenderer` and `RendererShared` are host-side synchronization and ownership objects;
   guest command-buffer layouts remain owned by `command_buffer.rs`.
+
+## 2026-08-21 — `src/audio_core/src/adsp/apps/opus/opus_decoder.rs` vs Eden `src/audio_core/adsp/apps/opus/opus_decoder.{h,cpp}`
+
+### Intentional differences
+
+- Focused Rust tests exercise the mailbox protocol and decoder lifecycle directly. Their success
+  assertions now use the upstream Opus-domain constant `OPUS_OK`, rather than the numerically equal
+  but unrelated HLE-service `ResultCode::SUCCESS`.
+
+### Unintentional differences (to fix)
+
+- None introduced by this warning-cleanup slice; runtime decoder behavior is unchanged.
+
+### Missing items
+
+- None discovered while tracing the unused `ResultCode` import through the upstream return-value
+  assignments.
+
+### Binary layout verification
+
+- N/A: this slice only changes test assertions and removes an unused production import.

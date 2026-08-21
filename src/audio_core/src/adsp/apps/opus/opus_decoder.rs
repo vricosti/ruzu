@@ -7,7 +7,6 @@ use crate::adsp::mailbox::{Direction as MailboxDirection, Mailbox};
 use crate::opus::parameters::OPUS_STREAM_COUNT_MAX;
 use crate::SharedSystem;
 use common::thread::set_current_thread_name;
-use common::ResultCode;
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -800,10 +799,7 @@ mod tests {
             decoder.receive(Direction::Host),
             Message::InitializeDecodeObjectOK
         );
-        assert_eq!(
-            shared_memory.lock().dsp_return_data[0],
-            ResultCode::SUCCESS.raw() as u64
-        );
+        assert_eq!(shared_memory.lock().dsp_return_data[0], OPUS_OK as u64);
 
         let packet = opus_silence_packet();
         {
@@ -825,7 +821,7 @@ mod tests {
         );
 
         let shared = shared_memory.lock();
-        assert_eq!(shared.dsp_return_data[0], ResultCode::SUCCESS.raw() as u64);
+        assert_eq!(shared.dsp_return_data[0], OPUS_OK as u64);
         assert!(shared.dsp_return_data[1] > 0);
         assert!(shared.read_transfer(0x400, 8).is_some());
     }
@@ -850,10 +846,7 @@ mod tests {
             decoder.receive(Direction::Host),
             Message::ShutdownDecodeObjectOK
         );
-        assert_eq!(
-            shared_memory.lock().dsp_return_data[0],
-            ResultCode::SUCCESS.raw() as u64
-        );
+        assert_eq!(shared_memory.lock().dsp_return_data[0], OPUS_OK as u64);
     }
 
     #[test]
@@ -924,10 +917,7 @@ mod tests {
             decoder.receive(Direction::Host),
             Message::InitializeMultiStreamDecodeObjectOK
         );
-        assert_eq!(
-            shared_memory.lock().dsp_return_data[0],
-            ResultCode::SUCCESS.raw() as u64
-        );
+        assert_eq!(shared_memory.lock().dsp_return_data[0], OPUS_OK as u64);
 
         let packet = opus_silence_packet();
         {
@@ -950,7 +940,7 @@ mod tests {
 
         {
             let shared = shared_memory.lock();
-            assert_eq!(shared.dsp_return_data[0], ResultCode::SUCCESS.raw() as u64);
+            assert_eq!(shared.dsp_return_data[0], OPUS_OK as u64);
             assert!(shared.dsp_return_data[1] > 0);
             assert!(shared.read_transfer(0x400, 8).is_some());
         }
@@ -965,10 +955,7 @@ mod tests {
             decoder.receive(Direction::Host),
             Message::ShutdownMultiStreamDecodeObjectOK
         );
-        assert_eq!(
-            shared_memory.lock().dsp_return_data[0],
-            ResultCode::SUCCESS.raw() as u64
-        );
+        assert_eq!(shared_memory.lock().dsp_return_data[0], OPUS_OK as u64);
     }
 
     #[test]
@@ -1018,10 +1005,7 @@ mod tests {
             decoder.receive(Direction::Host),
             Message::InitializeMultiStreamDecodeObjectOK
         );
-        assert_eq!(
-            shared_memory.lock().dsp_return_data[0],
-            ResultCode::SUCCESS.raw() as u64
-        );
+        assert_eq!(shared_memory.lock().dsp_return_data[0], OPUS_OK as u64);
 
         {
             let mut shared = shared_memory.lock();
@@ -1033,9 +1017,6 @@ mod tests {
             decoder.receive(Direction::Host),
             Message::ShutdownDecodeObjectOK
         );
-        assert_eq!(
-            shared_memory.lock().dsp_return_data[0],
-            ResultCode::SUCCESS.raw() as u64
-        );
+        assert_eq!(shared_memory.lock().dsp_return_data[0], OPUS_OK as u64);
     }
 }
