@@ -4416,3 +4416,11 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 - Rust represents Eden's retained allocator and scheduler references with stable `NonNull` pointers
   and retains the shared device-memory owner with `Arc`. Their enclosing renderer owners outlive
   every `Layer`; `ReleaseRawImages` now performs its own tick waits as Eden does.
+
+## 2026-08-21 — `src/video_core/src/renderer_vulkan/present/sgsr.rs` vs `src/video_core/renderer_vulkan/present/sgsr.h` and `.cpp`
+
+### Intentional differences
+
+- Rust uses the constructor's `edge_dir` parameter directly when selecting the fragment shader
+  instead of retaining Eden's `m_edge_dir` member. Eden only reads that member during construction,
+  so retaining a second copy after the shader has been created would be dead state.

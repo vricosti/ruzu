@@ -39,7 +39,6 @@ pub struct Sgsr {
     sampler: vk::Sampler,
     dynamic_images: Vec<Images>,
     images_ready: bool,
-    edge_dir: bool,
 }
 
 impl Sgsr {
@@ -148,7 +147,6 @@ impl Sgsr {
             sampler,
             dynamic_images,
             images_ready: false,
-            edge_dir,
         }
     }
 
