@@ -666,6 +666,24 @@ impl SDLDriver {
                 "0"
             },
         );
+
+        #[cfg(target_os = "windows")]
+        if *settings.disable_wgi_xinput.get_value() {
+            let hint_with_priority = |name: &str, value: &str| {
+                let name = std::ffi::CString::new(name).unwrap();
+                let value = std::ffi::CString::new(value).unwrap();
+                unsafe {
+                    sdl::SDL_SetHintWithPriority(
+                        name.as_ptr(),
+                        value.as_ptr(),
+                        sdl::SDL_HINT_OVERRIDE,
+                    )
+                };
+            };
+            hint_with_priority("SDL_JOYSTICK_RAWINPUT_CORRELATE_XINPUT", "0");
+            hint_with_priority("SDL_JOYSTICK_WGI", "0");
+        }
+
         hint("SDL_JOYSTICK_HIDAPI_STEAM", "1");
         hint("SDL_GAMECONTROLLER_SENSOR_FUSION", "1");
         hint("SDL_AUTO_UPDATE_SENSORS", "1");
