@@ -3490,3 +3490,31 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 ### Binary layout verification
 
 - N/A: the methods emit guest memory operations but define no serialized structure.
+
+## 2026-08-21 — `src/rdynarmic/src/frontend/a64/translate/mod.rs` vs Eden `src/dynarmic/src/dynarmic/frontend/A64/translate/{a64_translate.cpp,a64_translate.h}`
+
+### Intentional differences
+
+- Rust returns its newly allocated `Block`; Eden appends into a caller-owned block. Location
+  advancement, cycle accounting, single-step linking, terminal validation, and end-location
+  assignment otherwise retain the same ownership and order.
+- Rust leaves `should_continue` uninitialized until the first mandatory loop iteration, avoiding
+  an overwritten-value warning. Eden initializes it for C++ `do`/`while` syntax; both assign it
+  on every path before reading it.
+
+### Unintentional differences (to fix)
+
+- Eden raises `UnallocatedEncoding` whenever its decoder has no match. Ruzu currently raises it
+  only for the reserved low encoding range and sends other unmatched instructions to
+  `interpret_this_instruction` so its incomplete decoder can fall back to the interpreter. This
+  compatibility path must disappear when decoder parity is complete; changing it in this
+  warning-only slice would turn still-supported instructions into exceptions.
+
+### Missing items
+
+- The public equivalent of Eden's `TranslateSingleInstruction` is absent. Module-local test
+  helpers with a similar name do not implement that API.
+
+### Binary layout verification
+
+- N/A: block translation control flow defines no serialized guest structure.

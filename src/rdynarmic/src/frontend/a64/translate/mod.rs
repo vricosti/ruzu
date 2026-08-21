@@ -72,7 +72,7 @@ pub fn translate(
     let mut block = Block::new(descriptor.to_location());
     let mut visitor = TranslatorVisitor::new(&mut block, descriptor, options);
 
-    let mut should_continue = true;
+    let mut should_continue;
     loop {
         let pc = visitor.ir.pc();
 
