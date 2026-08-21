@@ -1107,7 +1107,6 @@ impl TfbReport {
 
 #[derive(Clone, Copy)]
 struct TfbCounterConfig {
-    enabled: bool,
     buffers_count: usize,
     streams_mask: u64,
     stream_to_slot: [usize; NUM_TFB_STREAMS],
@@ -1117,7 +1116,6 @@ struct TfbCounterConfig {
 impl Default for TfbCounterConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
             buffers_count: 0,
             streams_mask: 0,
             stream_to_slot: [INVALID_TFB_SLOT; NUM_TFB_STREAMS],
@@ -1127,15 +1125,11 @@ impl Default for TfbCounterConfig {
 }
 
 fn make_tfb_counter_config(
-    enabled: bool,
     feedback_state: crate::transform_feedback::TransformFeedbackState,
     buffers: [crate::engines::maxwell_3d::TransformFeedbackBufferInfo;
         NUM_TRANSFORM_FEEDBACK_BUFFERS],
 ) -> TfbCounterConfig {
-    let mut config = TfbCounterConfig {
-        enabled,
-        ..TfbCounterConfig::default()
-    };
+    let mut config = TfbCounterConfig::default();
     for index in 0..NUM_TRANSFORM_FEEDBACK_BUFFERS {
         if buffers[index].enable == 0 {
             continue;
@@ -1183,7 +1177,6 @@ impl TfbCounterState {
         // this pointer is cleared by `bind_3d_engine(None)`.
         let maxwell3d = unsafe { &*(maxwell3d as *const crate::engines::maxwell_3d::Maxwell3D) };
         self.config = make_tfb_counter_config(
-            maxwell3d.transform_feedback_enabled(),
             maxwell3d.transform_feedback_state(),
             std::array::from_fn(|index| maxwell3d.transform_feedback_buffer_info(index as u32)),
         );
@@ -3144,9 +3137,8 @@ mod tests {
         buffers[0].enable = 1;
         buffers[3].enable = 1;
 
-        let config = make_tfb_counter_config(true, feedback_state, buffers);
+        let config = make_tfb_counter_config(feedback_state, buffers);
 
-        assert!(config.enabled);
         assert_eq!(config.buffers_count, 4);
         assert_eq!(config.streams_mask, (1 << 1) | (1 << 2));
         assert_eq!(
