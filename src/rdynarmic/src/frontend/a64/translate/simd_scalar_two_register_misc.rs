@@ -141,6 +141,15 @@ impl<'a> TranslatorVisitor<'a> {
         true
     }
 
+    /// FCMEQ (zero, scalar, single/double).
+    /// `010111101z100000110110nnnnnddddd` — sz at bit 22.
+    pub fn fcmeq_zero_2(&mut self, inst: &DecodedInst) -> bool {
+        let sz = inst.bit(22);
+        let vn = Vec::from_u32(inst.bits(9, 5));
+        let vd = Vec::from_u32(inst.rd());
+        self.scalar_fp_compare_against_zero(sz, vn, vd, FpZeroCmp::Eq)
+    }
+
     fn scalar_fp_compare_against_zero(
         &mut self,
         sz: bool,
@@ -431,6 +440,24 @@ mod tests {
             .iter()
             .any(|inst| inst.opcode == Opcode::FPSingleToFixedS32));
         assert!(!matches!(block.terminal, Terminal::Interpret { .. }));
+    }
+
+    #[test]
+    fn scalar_fcmeq_zero_single_and_double_match_upstream() {
+        let cases = [
+            (0x5EA0_D800, Opcode::FPVectorEqual32),
+            (0x5EE0_D800, Opcode::FPVectorEqual64),
+        ];
+
+        for (encoding, expected_opcode) in cases {
+            let (block, should_continue) = translate_one(encoding);
+            assert!(should_continue, "encoding 0x{encoding:08X}");
+            assert!(block
+                .instructions
+                .iter()
+                .any(|inst| inst.opcode == expected_opcode));
+            assert!(!matches!(block.terminal, Terminal::Interpret { .. }));
+        }
     }
 
     #[test]

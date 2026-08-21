@@ -233,6 +233,16 @@ impl<'a> TranslatorVisitor<'a> {
         true
     }
 
+    /// FCMEQ (register, scalar, single/double).
+    /// `010111100z1mmmmm111001nnnnnddddd` — sz at bit 22.
+    pub fn fcmeq_reg_2(&mut self, inst: &DecodedInst) -> bool {
+        let sz = inst.bit(22);
+        let vm = Vec::from_u32(inst.bits(20, 16));
+        let vn = Vec::from_u32(inst.bits(9, 5));
+        let vd = Vec::from_u32(inst.rd());
+        self.scalar_fp_compare_register(sz, vm, vn, vd, FpCmpKind::Eq)
+    }
+
     fn scalar_fp_compare_register(
         &mut self,
         sz: bool,
@@ -414,6 +424,25 @@ mod tests {
                     .any(|inst| inst.opcode == expected_opcode),
                 "encoding 0x{encoding:08X} did not emit {expected_opcode:?}"
             );
+            assert!(!matches!(block.terminal, Terminal::Interpret { .. }));
+        }
+    }
+
+    #[test]
+    fn scalar_fcmeq_register_single_and_double_match_upstream() {
+        let cases = [
+            (0x5E20_E400, Opcode::FPVectorEqual32),
+            (0x5E60_E400, Opcode::FPVectorEqual64),
+        ];
+
+        for (encoding, expected_opcode) in cases {
+            let (block, should_continue, name) = translate_one(encoding);
+            assert_eq!(name, A64InstructionName::FCMEQ_reg_2);
+            assert!(should_continue, "encoding 0x{encoding:08X}");
+            assert!(block
+                .instructions
+                .iter()
+                .any(|inst| inst.opcode == expected_opcode));
             assert!(!matches!(block.terminal, Terminal::Interpret { .. }));
         }
     }

@@ -503,3 +503,18 @@
 - Status: prerequisite implemented and verified; the VFS slice resumed and both retained-handle
   and root-escape regressions pass. Full `core` validation is currently red on three unrelated,
   independently reproducible `k_process` tests; the VFS-focused tests remain green.
+
+## 2026-08-21 — interrupted rdynarmic warning cleanup on scalar FCMEQ parity
+
+- Interrupted slice: classify and remove unused x64 vector fallback warnings after checking each
+  emitter against Eden's Dynarmic implementation.
+- Exact missing prerequisite: the unused `Eq` variants exposed that Eden's scalar A64
+  `FCMEQ_reg_2` and `FCMEQ_zero_2` translators were present in Ruzu's decoder table but absent from
+  both their upstream-owned translation files and `TranslatorVisitor::dispatch`; decoded
+  single/double scalar equality instructions therefore fell through to interpretation.
+- Resume condition: port both methods in their matching scalar translation files, restore their
+  dispatch entries, add focused 32/64-bit translation regressions, reread the two upstream C++
+  files and declarations, update `DIFF.md`, then resume the x64 fallback audit.
+- Status: prerequisite ported and re-verified against both upstream implementation files and
+  `impl.h`; focused single/double register and zero-comparison regressions pass. The x64 fallback
+  warning audit can resume.

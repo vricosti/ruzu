@@ -3843,3 +3843,24 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 
 - PASS: no fields were added, removed, or reordered; the existing `repr(C, align(16))` layout and
   offset tests remain unchanged.
+
+## 2026-08-21 — `src/rdynarmic/src/frontend/a64/translate/{simd_scalar_three_same.rs,simd_scalar_two_register_misc.rs,visitor.rs}` vs `src/dynarmic/src/dynarmic/frontend/A64/translate/impl/{simd_scalar_three_same.cpp,simd_scalar_two_register_misc.cpp,impl.h}`
+
+### Intentional differences
+
+- Rust's decoded instruction object supplies Eden's `sz`, `Vm`, `Vn`, and `Vd` parameters to the
+  matching snake-case methods; the comparison helper boundaries remain file-local like upstream.
+
+### Unintentional differences (to fix)
+
+- None in the focused scalar equality slice. `FCMEQ_reg_2` and `FCMEQ_zero_2` now dispatch and emit
+  the same element-size-specific floating-point equality IR as Eden.
+
+### Missing items
+
+- This audit covers only the two scalar FCMEQ methods discovered through warning analysis; the
+  remaining A64 translator surface is not claimed complete here.
+
+### Binary layout verification
+
+- N/A: translator dispatch and IR construction serialize no raw payload.
