@@ -312,7 +312,7 @@ fn send_sync_request_impl(
         None
     };
     let mut phase_last = phase_t0;
-    let mut record_phase = |label: &'static str, last: &mut Option<std::time::Instant>| {
+    let record_phase = |label: &'static str, last: &mut Option<std::time::Instant>| {
         if let Some(t) = last {
             record_ipc_phase(label, t.elapsed());
             *last = Some(std::time::Instant::now());
@@ -2068,7 +2068,7 @@ fn reply_and_receive_impl(
     };
     let scheduler = system.scheduler_arc();
 
-    let mut process = process_arc.lock().unwrap();
+    let process = process_arc.lock().unwrap();
 
     let mut handle_values = Vec::with_capacity(num_handles as usize);
     if num_handles > 0 {

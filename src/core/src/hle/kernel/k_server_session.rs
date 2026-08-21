@@ -2221,7 +2221,7 @@ impl KServerSession {
     ) {
         let profile_phases = std::env::var_os("RUZU_PROFILE_IPC_PHASES").is_some();
         let mut phase_last = profile_phases.then(std::time::Instant::now);
-        let mut record_phase = |label: &'static str, last: &mut Option<std::time::Instant>| {
+        let record_phase = |label: &'static str, last: &mut Option<std::time::Instant>| {
             if let Some(t) = last {
                 crate::hle::kernel::svc::svc_ipc::record_ipc_phase(label, t.elapsed());
                 *last = Some(std::time::Instant::now());
@@ -2244,7 +2244,7 @@ impl KServerSession {
     fn on_request_impl_locked(&mut self, request: Arc<Mutex<KSessionRequest>>) -> u32 {
         let profile_phases = std::env::var_os("RUZU_PROFILE_IPC_PHASES").is_some();
         let mut phase_last = profile_phases.then(std::time::Instant::now);
-        let mut record_phase = |label: &'static str, last: &mut Option<std::time::Instant>| {
+        let record_phase = |label: &'static str, last: &mut Option<std::time::Instant>| {
             if let Some(t) = last {
                 crate::hle::kernel::svc::svc_ipc::record_ipc_phase(label, t.elapsed());
                 *last = Some(std::time::Instant::now());

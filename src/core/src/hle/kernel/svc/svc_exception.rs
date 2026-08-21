@@ -5,8 +5,6 @@
 //! SVC handlers for Break and ReturnFromException.
 
 use crate::core::System;
-use crate::hle::kernel::svc::svc_results::*;
-use crate::hle::kernel::svc::svc_types::*;
 use crate::hle::result::ResultCode;
 
 /// Break program execution.

@@ -11,7 +11,6 @@
 
 use std::sync::{Arc, Mutex};
 
-use super::super::k_process::ProcessLock;
 use crate::core::System;
 use crate::hle::kernel::k_port::KPort;
 use crate::hle::kernel::svc::svc_results::*;

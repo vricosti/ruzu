@@ -323,10 +323,10 @@ impl KPageHeap {
         let mut big_index = self.num_blocks as i32 - 1;
         let start = addr;
         let end = addr + (num_pages * PAGE_SIZE) as u64;
-        let mut before_start = start;
+        let before_start = start;
         let mut before_end = start;
         let mut after_start = end;
-        let mut after_end = end;
+        let after_end = end;
 
         while big_index >= 0 {
             let block_size = self.blocks[big_index as usize].get_size() as u64;

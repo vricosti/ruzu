@@ -4,9 +4,8 @@
 //!
 //! SVC handlers for thread operations.
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
-use super::super::k_process::ProcessLock;
 use crate::core::System;
 use crate::hle::kernel::k_light_lock::KScopedLightLock;
 use crate::hle::kernel::k_resource_limit::LimitableResource;
@@ -746,11 +745,12 @@ pub fn get_thread_id(
 mod tests {
     use super::*;
     use crate::core::System;
-    use crate::hle::kernel::k_process::KProcess;
+    use crate::hle::kernel::k_process::{KProcess, ProcessLock};
     use crate::hle::kernel::k_resource_limit::{
         create_resource_limit_for_process, LimitableResource,
     };
     use crate::hle::kernel::k_thread::ThreadState;
+    use std::sync::Mutex;
     use crate::hle::kernel::k_thread_local_page::KThreadLocalPage;
     use crate::hle::kernel::k_typed_address::KProcessAddress;
     use crate::hle::kernel::k_worker_task_manager::KWorkerTaskManager;

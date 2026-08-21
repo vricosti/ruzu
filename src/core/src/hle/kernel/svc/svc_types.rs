@@ -4,7 +4,6 @@
 //!
 //! SVC types, enums, and constants used by the kernel SVC handlers.
 
-use crate::hle::kernel::svc_common::Handle;
 
 /// Memory state enumeration.
 #[repr(u32)]

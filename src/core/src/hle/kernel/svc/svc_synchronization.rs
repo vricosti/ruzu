@@ -5,7 +5,6 @@
 //! SVC handlers for synchronization operations (CloseHandle, ResetSignal,
 //! WaitSynchronization, CancelSynchronization, SynchronizePreemptionState).
 
-use super::super::k_process::ProcessLock;
 use crate::core::System;
 use crate::hle::kernel::k_synchronization_object;
 use crate::hle::kernel::svc::svc_results::*;
@@ -141,7 +140,7 @@ pub fn wait_synchronization(
     }
 
     let process_arc = system.current_process_arc();
-    let mut process = process_arc.lock().unwrap();
+    let process = process_arc.lock().unwrap();
 
     // Read handle array from guest memory.
     // Upstream: R_UNLESS(GetCurrentMemory(kernel).ReadBlock(user_handles, handles.data(),

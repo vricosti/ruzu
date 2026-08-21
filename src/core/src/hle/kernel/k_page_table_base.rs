@@ -27,7 +27,6 @@ use super::svc::svc_types::PageInfo;
 use super::svc_types::{CreateProcessFlag, MemoryState as SvcMemoryState, ADDRESS_SPACE_MASK};
 use crate::core::SystemRef;
 use crate::hle::kernel::svc::svc_results;
-use crate::hle::result::ResultCode;
 use crate::memory::memory::Memory;
 
 /// RAII wrapper for acquiring two page-table light locks in a stable address
@@ -1076,8 +1075,8 @@ impl KPageTableBase {
         // Set code regions and determine remaining sizes.
         let process_code_start: usize;
         let process_code_end: usize;
-        let mut stack_region_size: usize;
-        let mut kernel_map_region_size: usize;
+        let stack_region_size: usize;
+        let kernel_map_region_size: usize;
 
         if as_width == 39 {
             alias_region_size = get_space_size(AddressSpaceInfoType::Alias);
@@ -2027,7 +2026,7 @@ impl KPageTableBase {
                 }
             }
         }
-        let mut pg_guard = PgCloseGuard {
+        let pg_guard = PgCloseGuard {
             pg: &mut pg,
             armed: true,
         };

@@ -15,7 +15,7 @@ use super::k_resource_limit::LimitableResource;
 use super::k_shared_memory::MemoryPermission;
 use super::k_typed_address::KProcessAddress;
 use crate::hle::result::ResultCode;
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Weak};
 
 /// KTransferMemory: allows transferring a memory region from one process
 /// to another. Upstream inherits from KAutoObjectWithSlabHeapAndContainer.

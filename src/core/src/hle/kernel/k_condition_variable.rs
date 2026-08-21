@@ -12,7 +12,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use super::k_process::ProcessLock;
@@ -1155,7 +1155,7 @@ impl KConditionVariable {
         let scheduler_lock = super::kernel::scheduler_lock()
             .expect("scheduler_lock must exist — kernel not initialized?");
         let hardware_timer = super::kernel::get_hardware_timer_arc();
-        let mut wait_queue = ThreadQueueImplForKConditionVariableWaitConditionVariable::queue();
+        let wait_queue = ThreadQueueImplForKConditionVariableWaitConditionVariable::queue();
         let thread_ptr = {
             let guard = current_thread.lock().unwrap();
             &*guard as *const super::k_thread::KThread as usize
@@ -1795,7 +1795,7 @@ mod tests {
     use crate::core::System;
     use crate::hle::kernel::k_scheduler::KScheduler;
     use crate::hle::kernel::k_thread::{ConditionVariableTreeState, ThreadState};
-    use std::sync::OnceLock;
+    use std::sync::{Mutex, OnceLock};
 
     fn ensure_scheduler_lock_for_test() {
         static INIT: OnceLock<()> = OnceLock::new();

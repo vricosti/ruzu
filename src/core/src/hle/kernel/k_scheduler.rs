@@ -11,9 +11,7 @@ use std::time::Duration;
 
 use common::fiber::Fiber;
 
-use super::k_process::KProcess;
 use super::k_process::ProcessLock;
-use super::k_thread::KThread;
 use super::k_thread::KThreadLock;
 use super::k_thread::ThreadState;
 
@@ -255,6 +253,8 @@ impl Default for SchedulingState {
 mod tests {
     use super::*;
     use crate::hle::kernel::global_scheduler_context::GlobalSchedulerContext;
+    use crate::hle::kernel::k_process::KProcess;
+    use crate::hle::kernel::k_thread::KThread;
 
     #[test]
     fn thread_context_guard_stays_locked_until_explicit_unlock() {
@@ -1539,7 +1539,7 @@ impl KScheduler {
     pub fn reload(&self, thread: &Arc<KThreadLock>) {
         // Inline PhysicalCore::LoadContext since the scheduler doesn't hold
         // a reference to the kernel's physical cores.
-        let mut thread_guard = thread.lock().unwrap();
+        let thread_guard = thread.lock().unwrap();
         let parent = match thread_guard.parent.as_ref().and_then(|w| w.upgrade()) {
             Some(p) => p,
             None => return,
@@ -2138,7 +2138,7 @@ impl KScheduler {
             return;
         };
 
-        let mut process = process.lock().unwrap();
+        let process = process.lock().unwrap();
         {
             let current_thread = current_thread.lock().unwrap();
             if current_thread.get_yield_schedule_count() == process.get_scheduled_count() {
@@ -2240,7 +2240,7 @@ impl KScheduler {
             return;
         };
 
-        let mut process = process.lock().unwrap();
+        let process = process.lock().unwrap();
         {
             let current_thread = current_thread.lock().unwrap();
             if current_thread.get_yield_schedule_count() == process.get_scheduled_count() {
@@ -2374,7 +2374,7 @@ impl KScheduler {
             return;
         };
 
-        let mut process = process.lock().unwrap();
+        let process = process.lock().unwrap();
         {
             let current_thread = current_thread.lock().unwrap();
             if current_thread.get_yield_schedule_count() == process.get_scheduled_count() {
@@ -2682,7 +2682,7 @@ impl KScheduler {
     }
 
     pub fn wake_signaled_synchronization_threads(&mut self, process: &Arc<ProcessLock>) -> bool {
-        let mut process = process.lock().unwrap();
+        let process = process.lock().unwrap();
         let mut woke_any = false;
         for thread_id in &process.thread_list {
             let Some(thread) = process.get_thread_by_thread_id(*thread_id) else {

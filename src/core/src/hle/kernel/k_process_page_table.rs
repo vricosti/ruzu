@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 
 use super::k_memory_block::{
     convert_to_k_memory_permission, KMemoryAttribute, KMemoryInfo, KMemoryPermission, KMemoryState,
-    SvcMemoryPermission, PAGE_SIZE,
+    SvcMemoryPermission,
 };
 use super::k_page_table_base::KPageTableBase;
 use super::k_resource_limit::KResourceLimit;

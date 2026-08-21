@@ -4,7 +4,7 @@
 //!
 //! KSessionRequest: represents an IPC request in flight, with buffer mappings.
 
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Weak};
 
 use super::k_memory_block::KMemoryState;
 use super::k_thread::KThreadLock;

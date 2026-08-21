@@ -2841,7 +2841,7 @@ impl KThread {
     /// Matches upstream `KThread::RequestTerminate()`.
     pub fn request_terminate(&mut self) -> ThreadState {
         // Atomic CAS: only proceed if this is the first request.
-        let mut expected = false;
+        let expected = false;
         let first_request = self
             .termination_requested
             .compare_exchange(expected, true, Ordering::SeqCst, Ordering::SeqCst)

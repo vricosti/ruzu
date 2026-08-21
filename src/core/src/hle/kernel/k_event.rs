@@ -8,7 +8,6 @@ use std::sync::{Arc, Mutex};
 
 use super::k_process::KProcess;
 use super::k_process::ProcessLock;
-use super::k_scheduler::KScheduler;
 use super::k_scheduler_lock::KScopedSchedulerLock;
 use crate::hle::result::RESULT_SUCCESS;
 
@@ -167,6 +166,7 @@ impl Default for KEvent {
 mod tests {
     use super::*;
     use crate::hle::kernel::global_scheduler_context::GlobalSchedulerContext;
+    use crate::hle::kernel::k_scheduler::KScheduler;
 
     #[test]
     fn signal_clear_signal_roundtrip_uses_same_readable_event() {

@@ -22,7 +22,7 @@
 //! * a future port of multi-level guest page tables drops in without
 //!   touching every caller.
 
-use super::k_page_table_slab_heap::{KPageTableSlabHeap, PageTablePage, RefCount};
+use super::k_page_table_slab_heap::{KPageTableSlabHeap, RefCount};
 
 /// `KPageTableManager` — typed wrapper around `KPageTableSlabHeap`.
 ///

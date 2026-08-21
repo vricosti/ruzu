@@ -5,7 +5,6 @@
 //! SVC handler for outputting debug strings.
 
 use crate::core::System;
-use crate::hle::kernel::svc::svc_results::*;
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 
 /// Used to output a message on a debug hardware unit — does nothing on a retail unit.

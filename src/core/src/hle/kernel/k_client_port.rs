@@ -14,7 +14,6 @@ use super::k_light_client_session::KLightClientSession;
 use super::k_light_server_session::KLightServerSession;
 use super::k_light_session::KLightSession;
 use super::k_process::KProcess;
-use super::k_process::ProcessLock;
 use super::k_resource_limit::LimitableResource;
 use super::k_scoped_resource_reservation::KScopedResourceReservation;
 use super::k_session::KSession;
@@ -325,6 +324,7 @@ mod tests {
     use super::*;
     use crate::core::System;
     use crate::hle::kernel::k_port::KPort;
+    use crate::hle::kernel::k_process::ProcessLock;
 
     #[test]
     fn create_session_allocates_and_registers_session_objects() {

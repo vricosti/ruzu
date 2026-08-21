@@ -162,7 +162,7 @@ pub fn map_transfer_memory(
     }
 
     let process_arc = system.current_process_arc();
-    let mut process = process_arc.lock().unwrap();
+    let process = process_arc.lock().unwrap();
 
     // Get transfer memory from handle.
     let object_id = match process.handle_table.get_object(trmem_handle) {
@@ -217,7 +217,7 @@ pub fn unmap_transfer_memory(
     }
 
     let process_arc = system.current_process_arc();
-    let mut process = process_arc.lock().unwrap();
+    let process = process_arc.lock().unwrap();
 
     // Get transfer memory from handle.
     let object_id = match process.handle_table.get_object(trmem_handle) {

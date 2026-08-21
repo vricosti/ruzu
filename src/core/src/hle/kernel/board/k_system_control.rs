@@ -8,7 +8,6 @@
 
 use super::secure_monitor::{MemoryArrangement, MemorySize};
 use crate::hle::kernel::k_trace::K_TRACE_BUFFER_SIZE;
-use crate::hle::result::ResultCode;
 
 /// Secure applet memory size (4 MiB).
 pub const SECURE_APPLET_MEMORY_SIZE: usize = 4 * 1024 * 1024;

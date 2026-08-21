@@ -4,7 +4,7 @@
 //!
 //! KThreadQueue and KThreadQueueWithoutEndWait: thread wait queue abstractions.
 
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Weak};
 
 use super::k_hardware_timer::KHardwareTimer;
 use super::k_thread::{KThread, KThreadLock};

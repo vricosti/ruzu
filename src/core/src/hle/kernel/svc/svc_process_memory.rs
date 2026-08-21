@@ -5,11 +5,10 @@
 //! SVC handlers for process memory operations.
 
 use crate::core::System;
-use crate::hle::kernel::k_process::ProcessLock;
 use crate::hle::kernel::svc::svc_results::*;
 use crate::hle::kernel::svc::svc_types::*;
 use crate::hle::kernel::svc_common::Handle;
-use crate::hle::result::{ResultCode, RESULT_SUCCESS};
+use crate::hle::result::ResultCode;
 
 fn is_valid_address_range(address: u64, size: u64) -> bool {
     address.checked_add(size).map_or(false, |end| end > address)
@@ -162,7 +161,7 @@ pub fn map_process_memory(
     }
 
     {
-        let mut src_process = src_process_arc.lock().unwrap();
+        let src_process = src_process_arc.lock().unwrap();
         if !src_process.page_table.contains(src_kpa, size as usize) {
             return RESULT_INVALID_CURRENT_MEMORY;
         }

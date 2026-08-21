@@ -9,7 +9,7 @@ use crate::hle::kernel::k_memory_block::KMemoryState;
 use crate::hle::kernel::svc::svc_results::*;
 use crate::hle::kernel::svc::svc_types::*;
 use crate::hle::kernel::svc_common::Handle;
-use crate::hle::result::{ResultCode, RESULT_SUCCESS};
+use crate::hle::result::ResultCode;
 
 fn is_valid_shared_memory_permission(perm: MemoryPermission) -> bool {
     matches!(perm, MemoryPermission::Read | MemoryPermission::ReadWrite)

@@ -13,7 +13,7 @@ use crate::hle::kernel::k_address_arbiter::{ArbitrationType as KArbType, SignalT
 use crate::hle::kernel::k_memory_layout::is_kernel_address;
 use crate::hle::kernel::svc::svc_results::*;
 use crate::hle::kernel::svc::svc_types::*;
-use crate::hle::result::{ResultCode, RESULT_SUCCESS};
+use crate::hle::result::ResultCode;
 
 fn should_trace_sync_debug() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();

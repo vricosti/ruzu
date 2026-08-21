@@ -145,7 +145,7 @@ impl KReadableEvent {
         let Some(process_arc) = kernel.get_process_by_id(owner_process_id) else {
             return;
         };
-        let mut process = process_arc.lock().unwrap();
+        let process = process_arc.lock().unwrap();
         let Some(parent) = process.get_event_by_object_id(parent_id) else {
             return;
         };

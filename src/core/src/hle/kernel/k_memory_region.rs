@@ -350,7 +350,7 @@ impl KMemoryRegionTree {
 
         // Insert new/adjusted regions.
         if old_address == address {
-            let mut region =
+            let region =
                 KMemoryRegion::new_full(address, inserted_last, old_pair, new_attr, type_id);
             self.regions.insert(address, region);
         } else {

@@ -17,7 +17,7 @@
 use crate::core::System;
 use crate::hle::kernel::svc::svc_results::*;
 use crate::hle::kernel::svc_common::Handle;
-use crate::hle::result::{ResultCode, RESULT_SUCCESS};
+use crate::hle::result::ResultCode;
 
 /// Sends a light sync request.
 ///

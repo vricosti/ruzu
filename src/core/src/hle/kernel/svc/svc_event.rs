@@ -6,7 +6,6 @@
 
 use std::sync::{Arc, Mutex};
 
-use super::super::k_process::ProcessLock;
 use crate::core::System;
 use crate::hle::kernel::k_event::KEvent;
 use crate::hle::kernel::k_readable_event::KReadableEvent;
@@ -22,7 +21,7 @@ pub fn signal_event(system: &System, event_handle: Handle) -> ResultCode {
     );
 
     let process_arc = system.current_process_arc();
-    let mut process = process_arc.lock().unwrap();
+    let process = process_arc.lock().unwrap();
     let Some(object_id) = process.handle_table.get_object(event_handle) else {
         return RESULT_INVALID_HANDLE;
     };

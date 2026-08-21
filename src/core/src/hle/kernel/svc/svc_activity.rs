@@ -4,12 +4,11 @@
 //!
 //! SVC handlers for thread and process activity.
 
-use super::super::k_process::ProcessLock;
 use crate::core::System;
 use crate::hle::kernel::svc::svc_results::*;
 use crate::hle::kernel::svc::svc_types::*;
 use crate::hle::kernel::svc_common::Handle;
-use crate::hle::result::{ResultCode, RESULT_SUCCESS};
+use crate::hle::result::ResultCode;
 
 /// Sets the thread activity.
 ///
@@ -79,6 +78,7 @@ mod tests {
     use crate::hle::kernel::k_process::{KProcess, ProcessLock};
     use crate::hle::kernel::k_thread::{KThread, KThreadLock, SuspendType};
     use crate::hle::kernel::svc::svc_thread;
+    use crate::hle::result::RESULT_SUCCESS;
 
     fn test_system() -> System {
         let mut system = System::new_for_test();
