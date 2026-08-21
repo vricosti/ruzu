@@ -118,9 +118,6 @@ pub struct BufferCache<P: BufferCacheParams, DT: DeviceTracker> {
     // -- Page table: maps device page -> BufferId --
     page_table: Vec<BufferId>,
 
-    // -- Draw indirect state --
-    last_index_count: u32,
-
     // -- Vertex buffer slots --
     // Upstream: enabled_vertex_buffers_mask, vertex_buffers_serial, v_buffer.
     enabled_vertex_buffers_mask: u32,
@@ -152,7 +149,6 @@ pub struct BufferCache<P: BufferCacheParams, DT: DeviceTracker> {
     async_downloads: OverlapRangeSet,
 
     // -- Immediate buffer --
-    immediate_buffer_capacity: usize,
     immediate_buffer_alloc: Vec<u8>,
 
     // -- LRU / GC state --
@@ -218,7 +214,6 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
             current_draw_indirect: None,
             slot_buffers,
             page_table: vec![SlotId::invalid(); PAGE_TABLE_SIZE],
-            last_index_count: 0,
             enabled_vertex_buffers_mask: 0,
             vertex_buffers_serial: 0,
             v_buffer: [NULL_BINDING; 32],
@@ -232,7 +227,6 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
             pending_downloads: VecDeque::new(),
             async_buffers_death_ring: VecDeque::new(),
             async_downloads: OverlapRangeSet::new(),
-            immediate_buffer_capacity: 0,
             immediate_buffer_alloc: Vec::new(),
             frame_tick: 0,
             total_used_memory: 0,
@@ -1478,22 +1472,20 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
         self.clear_download(cpu_dest_address, amount);
 
         // Find (or create) buffers covering source and destination.
-        let mut buffer_a = NULL_BUFFER_ID;
-        let mut buffer_b = NULL_BUFFER_ID;
-        loop {
+        let (buffer_a, buffer_b) = loop {
             if let Some(cs) = self.channel_caches.current_channel_state_mut() {
                 cs.has_deleted_buffers = false;
             }
-            buffer_a = self.find_buffer(cpu_src_address, amount as u32);
-            buffer_b = self.find_buffer(cpu_dest_address, amount as u32);
+            let buffer_a = self.find_buffer(cpu_src_address, amount as u32);
+            let buffer_b = self.find_buffer(cpu_dest_address, amount as u32);
             if let Some(cs) = self.channel_caches.current_channel_state() {
                 if !cs.has_deleted_buffers {
-                    break;
+                    break (buffer_a, buffer_b);
                 }
             } else {
-                break;
+                break (buffer_a, buffer_b);
             }
-        }
+        };
 
         self.synchronize_buffer(buffer_a, cpu_src_address, amount as u32);
         self.synchronize_buffer(buffer_b, cpu_dest_address, amount as u32);

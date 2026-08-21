@@ -4424,3 +4424,11 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 - Rust uses the constructor's `edge_dir` parameter directly when selecting the fragment shader
   instead of retaining Eden's `m_edge_dir` member. Eden only reads that member during construction,
   so retaining a second copy after the shader has been created would be dead state.
+
+## 2026-08-21 — `src/video_core/src/buffer_cache/buffer_cache.rs` vs `src/video_core/buffer_cache/buffer_cache_base.h` and `buffer_cache.h`
+
+### Intentional differences
+
+- Rust omits Eden's `last_index_count` and `immediate_buffer_capacity` members. Neither member is
+  read or updated upstream: indirect draw state is held by the channel bindings, while
+  `ScratchBuffer::resize_destructive` manages the immediate allocation capacity internally.
