@@ -2926,3 +2926,27 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 ### Binary layout verification
 
 - N/A: timezone values are host-side strings and scalar calculations, not serialized structures.
+
+## 2026-08-21 — `src/common/src/tree.rs` vs Eden `src/common/tree.h`
+
+### Intentional differences
+
+- Rust stores links as indices into a caller-owned slice and uses `usize::MAX` as the null
+  sentinel, instead of retaining raw `T*` links. Every upstream rotation, color repair, lookup,
+  insertion, removal, and traversal helper remains owned by this file with the same ordering.
+- `HasRBEntry` replaces Eden's `CheckRBEntry`, `IsRBEntry`, and `HasRBEntry` C++ concepts.
+- Rust naming follows snake_case, and a returned index replaces each returned pointer.
+
+### Unintentional differences (to fix)
+
+- None. `RB_REMOVE`'s `child` is assigned exactly once on each control-flow path as in Eden; its
+  unnecessary Rust `mut` qualifier was removed without changing the algorithm.
+
+### Missing items
+
+- None from the upstream red-black-tree type and function set.
+
+### Binary layout verification
+
+- N/A: the index-based `RBEntry` is an internal safe-Rust representation and is not copied to or
+  from Eden's packed, pointer-based host structure.

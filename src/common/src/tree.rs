@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2002 Niels Provos <provos@citi.umich.edu>
 // SPDX-License-Identifier: BSD-2-Clause
 
-//! Port of zuyu/src/common/tree.h
+//! Port of Eden `src/common/tree.h`.
 //!
 //! Red-black tree implementation based on the FreeBSD tree.h.
 //! Uses index-based references instead of raw pointers for safe Rust.
@@ -365,7 +365,7 @@ fn rb_remove_color<T: HasRBEntry>(
 /// Corresponds to `RB_REMOVE`.
 pub fn rb_remove<T: HasRBEntry>(head: &mut RBHead, nodes: &mut [T], elm: usize) -> usize {
     let old = elm;
-    let mut child: usize;
+    let child: usize;
     let mut parent: usize;
     let color: RBColor;
 
