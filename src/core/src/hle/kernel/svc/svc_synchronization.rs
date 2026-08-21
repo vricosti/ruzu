@@ -80,7 +80,7 @@ pub fn close_handle(system: &System, handle: Handle) -> ResultCode {
 
 /// Clears the signaled state of an event or process.
 pub fn reset_signal(system: &System, handle: Handle) -> ResultCode {
-    log::debug!("svc::ResetSignal called handle 0x{:08X}", handle);
+    log::trace!("svc::ResetSignal called handle 0x{:08X}", handle);
 
     let process_arc = system.current_process_arc();
     let mut process = process_arc.lock().unwrap();

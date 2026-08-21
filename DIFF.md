@@ -1802,3 +1802,20 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 ### Binary layout verification
 
 - N/A: this is host GUI state only.
+## 2026-08-21 — `src/core/src/hle/kernel/svc/svc_synchronization.rs` vs Eden `src/core/hle/kernel/svc/svc_synchronization.cpp` (`7731b5bc`)
+
+### Intentional differences
+
+- None in the `ResetSignal` logging-level slice.
+
+### Unintentional differences (to fix)
+
+- None. `ResetSignal` now logs routine calls at trace level, matching Eden's demotion from debug.
+
+### Missing items
+
+- None for this upstream commit.
+
+### Binary layout verification
+
+- N/A: the change affects host logging only.
