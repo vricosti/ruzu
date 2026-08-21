@@ -3822,3 +3822,24 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 ### Binary layout verification
 
 - N/A: this changes only warning policy for test helpers.
+
+## 2026-08-21 — `src/rdynarmic/src/backend/x64/jit_state.rs` vs `src/dynarmic/src/dynarmic/backend/x64/a32_jitstate.{h,cpp}`
+
+### Intentional differences
+
+- Rust uses `debug_assert_eq!` for Eden's `DEBUG_ASSERT` on the stored FPSCR NZCV mask.
+
+### Unintentional differences (to fix)
+
+- None in the audited A32 FPSCR slice. Ruzu now stores `fpsr_nzcv` directly in ARM FPSCR bits
+  31:28, resets both MXCSR shadows to Eden's exact defaults before applying rounding/FZ, and
+  preserves only the lower location-descriptor half before installing FPSCR mode bits.
+
+### Missing items
+
+- None in `A32JitState::{get_fpscr,set_fpscr}`.
+
+### Binary layout verification
+
+- PASS: no fields were added, removed, or reordered; the existing `repr(C, align(16))` layout and
+  offset tests remain unchanged.

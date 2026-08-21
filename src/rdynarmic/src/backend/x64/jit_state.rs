@@ -307,6 +307,7 @@ const A32_MXCSR_RMODE: [u32; 4] = [0x0000, 0x4000, 0x2000, 0x6000];
 const FPSCR_RMODE_SHIFT: u32 = 22;
 const FPSCR_FZ_BIT: u32 = 24;
 const FPSCR_QC_BIT: u32 = 27;
+const FPSCR_MODE_MASK: u32 = 0x07F7_0000;
 const FPSCR_NZCV_MASK: u32 = 0xF000_0000;
 
 /// ARM32 JIT state — the in-memory representation used during JIT execution.
@@ -531,60 +532,46 @@ impl A32JitState {
 
     /// Get the full FPSCR value by combining MXCSR exception bits with stored state.
     pub fn get_fpscr(&self) -> u32 {
-        let nzcv = nzcv_util::from_x64(self.fpsr_nzcv);
-        let qc = if self.fpsr_qc != 0 {
-            1u32 << FPSCR_QC_BIT
-        } else {
-            0
-        };
+        debug_assert_eq!(self.fpsr_nzcv & !FPSCR_NZCV_MASK, 0);
 
+        let fpscr_mode = self.upper_location_descriptor & FPSCR_MODE_MASK;
         let mxcsr = self.guest_mxcsr | self.asimd_mxcsr;
-        let mut exc = 0u32;
+        let mut fpscr = fpscr_mode | self.fpsr_nzcv;
         // IOC = IE (bit 0)
-        exc |= mxcsr & 0b0000_0000_0001;
+        fpscr |= mxcsr & 0b0000_0000_0001;
         // IXC, UFC, OFC, DZC = PE, UE, OE, ZE (shifted down by 1)
-        exc |= (mxcsr & 0b0000_0011_1100) >> 1;
-        exc |= self.fpsr_exc;
+        fpscr |= (mxcsr & 0b0000_0011_1100) >> 1;
+        fpscr |= self.fpsr_exc;
+        if self.fpsr_qc != 0 {
+            fpscr |= 1 << FPSCR_QC_BIT;
+        }
 
-        // Reconstruct the control bits from the upper_location_descriptor
-        // which stores the FPSCR mode bits.
-        let fpscr_mode = self.upper_location_descriptor & 0x07F7_0000;
-
-        nzcv | qc | fpscr_mode | exc
+        fpscr
     }
 
     /// Set FPSCR value and update MXCSR shadow registers accordingly.
     pub fn set_fpscr(&mut self, value: u32) {
-        self.fpsr_nzcv = nzcv_util::to_x64(value);
-        self.fpsr_qc = if value & (1 << FPSCR_QC_BIT) != 0 {
-            1
-        } else {
-            0
-        };
-        self.fpsr_exc = value & 0x9F;
+        self.upper_location_descriptor &= 0x0000_FFFF;
+        self.upper_location_descriptor |= value & FPSCR_MODE_MASK;
 
-        // Clear exception flags, preserve control
-        self.asimd_mxcsr &= MXCSR_EXCEPTION_FLAGS;
-        self.guest_mxcsr &= MXCSR_EXCEPTION_FLAGS;
-        // Mask all exceptions
-        self.asimd_mxcsr |= MXCSR_EXCEPTION_MASK;
-        self.guest_mxcsr |= MXCSR_EXCEPTION_MASK;
+        self.fpsr_nzcv = value & FPSCR_NZCV_MASK;
+        self.fpsr_qc = (value >> FPSCR_QC_BIT) & 1;
+
+        self.guest_mxcsr = 0x0000_1F80;
+        self.asimd_mxcsr = 0x0000_9FC0;
 
         // Map ARM RMode to MXCSR rounding mode
         let rmode = ((value >> FPSCR_RMODE_SHIFT) & 0x3) as usize;
         self.guest_mxcsr |= A32_MXCSR_RMODE[rmode];
+
+        // Cumulative flags IDC, IOC, IXC, UFC, OFC, DZC.
+        self.fpsr_exc = value & 0x9F;
 
         // Map ARM FZ to MXCSR FZ + DAZ
         if value & (1 << FPSCR_FZ_BIT) != 0 {
             self.guest_mxcsr |= MXCSR_FLUSH_TO_ZERO;
             self.guest_mxcsr |= MXCSR_DENORMALS_ARE_ZERO;
         }
-
-        // Update FPSCR mode bits in upper_location_descriptor.
-        // Matches upstream: upper_location_descriptor = (upper & 0x0000FFFF) | (FPSCR & MODE_MASK)
-        const FPSCR_MODE_MASK: u32 = 0x07F7_0000;
-        self.upper_location_descriptor =
-            (self.upper_location_descriptor & 0x0000_FFFF) | (value & FPSCR_MODE_MASK);
     }
 
     /// Compute unique hash for block lookup (PC in lower 32 bits, upper_location_descriptor in upper 32).
@@ -849,6 +836,31 @@ mod tests {
         let state = A32JitState::new();
         assert_eq!(state.guest_mxcsr, 0x0000_1F80);
         assert_eq!(state.asimd_mxcsr, 0x0000_9FC0);
+    }
+
+    #[test]
+    fn test_a32_fpscr_matches_upstream_storage_and_mxcsr_reset() {
+        let mut state = A32JitState::new();
+        state.upper_location_descriptor = 0xFFFF_FFFF;
+        state.guest_mxcsr = u32::MAX;
+        state.asimd_mxcsr = u32::MAX;
+
+        let fpscr = 0xB000_0000 | (1 << FPSCR_QC_BIT) | (1 << FPSCR_FZ_BIT) | (1 << 22) | 0x91;
+        state.set_fpscr(fpscr);
+
+        assert_eq!(state.fpsr_nzcv, fpscr & FPSCR_NZCV_MASK);
+        assert_eq!(state.fpsr_qc, 1);
+        assert_eq!(state.fpsr_exc, fpscr & 0x9F);
+        assert_eq!(
+            state.upper_location_descriptor,
+            0x0000_FFFF | (fpscr & FPSCR_MODE_MASK)
+        );
+        assert_eq!(state.guest_mxcsr, 0x0000_1F80 | 0x4000 | 0x8000 | 0x40);
+        assert_eq!(state.asimd_mxcsr, 0x0000_9FC0);
+        assert_eq!(
+            state.get_fpscr(),
+            fpscr & (FPSCR_MODE_MASK | FPSCR_NZCV_MASK | (1 << FPSCR_QC_BIT) | 0x9F)
+        );
     }
 
     #[test]
