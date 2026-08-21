@@ -518,3 +518,14 @@
 - Status: prerequisite ported and re-verified against both upstream implementation files and
   `impl.h`; focused single/double register and zero-comparison regressions pass. The x64 fallback
   warning audit can resume.
+
+## 2026-08-21 — rdynarmic vector-arrangement validation limitation
+
+- Validated slice: Eden-parity x64 narrow, sign-extension, and zero-extension emitters, including
+  the corrected `VectorSignExtend64` high-lane sign mask and SSE2 host-feature fallbacks.
+- Focused emitter tests and `cargo check -p rdynarmic --lib` pass.
+- Full `cargo test -p rdynarmic --lib` is not currently a clean validation gate: the unchanged
+  `a32_write_memory32_after_shift_and_add_emits_without_losing_address_value` test panics before
+  reaching this slice because its A32 fastmem configuration has no fallback table. Several fuzz
+  tests also continued past 60 seconds, so the run was stopped after recording the independent
+  failure rather than left blocking indefinitely.

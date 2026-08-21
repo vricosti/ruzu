@@ -3907,3 +3907,25 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 ### Binary layout verification
 
 - N/A: decoder locals and helper parameters define no serialized structure.
+
+## 2026-08-21 — `src/rdynarmic/src/backend/x64/emit_vector_arrangement.rs` vs `src/dynarmic/src/dynarmic/backend/x64/emit_x64_vector.cpp` (narrow/sign-extend/zero-extend slice)
+
+### Intentional differences
+
+- Rust releases scratch-register locks explicitly where Eden's register-allocation wrappers release
+  them by scope; emitted instruction ordering is otherwise preserved.
+
+### Unintentional differences (to fix)
+
+- None in the focused slice. `VectorSignExtend64` now copies the low 64-bit lane to a GPR, performs
+  an arithmetic shift by 63, and installs that sign mask in the high lane like Eden instead of
+  incorrectly widening two 32-bit lanes. The 8/16/32-bit sign/zero extensions now also retain
+  Eden's SSE2 paths when SSE4.1 is unavailable.
+
+### Missing items
+
+- Other vector-arrangement emitters remain under the separate warning/parity audit.
+
+### Binary layout verification
+
+- N/A: JIT instruction emission changes no shared state layout or serialized payload.

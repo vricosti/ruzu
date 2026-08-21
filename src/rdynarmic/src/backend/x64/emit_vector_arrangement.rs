@@ -898,45 +898,6 @@ pub fn emit_vector_shuffle_low_halfwords(
     emit_vector_shuffle_op(ra, inst_ref, inst, rxbyak::CodeAssembler::pshuflw);
 }
 
-// ---------------------------------------------------------------------------
-// VectorNarrow — fallback
-// ---------------------------------------------------------------------------
-
-extern "C" fn fallback_narrow16(result: *mut [u8; 16], a: *const [u8; 16]) {
-    unsafe {
-        let va: [u16; 8] = std::mem::transmute(*a);
-        let dst = &mut *result;
-        for i in 0..8 {
-            dst[i] = va[i] as u8;
-        }
-        for byte in dst.iter_mut().skip(8) {
-            *byte = 0;
-        }
-    }
-}
-
-extern "C" fn fallback_narrow32(result: *mut [u8; 16], a: *const [u8; 16]) {
-    unsafe {
-        let va: [u32; 4] = std::mem::transmute(*a);
-        let mut out = [0u16; 8];
-        for i in 0..4 {
-            out[i] = va[i] as u16;
-        }
-        *result = std::mem::transmute(out);
-    }
-}
-
-extern "C" fn fallback_narrow64(result: *mut [u8; 16], a: *const [u8; 16]) {
-    unsafe {
-        let va: [u64; 2] = std::mem::transmute(*a);
-        let mut out = [0u32; 4];
-        for i in 0..2 {
-            out[i] = va[i] as u32;
-        }
-        *result = std::mem::transmute(out);
-    }
-}
-
 // Narrow16: truncate 8×u16 from a to 8×u8 in the low half, zero upper half.
 pub fn emit_vector_narrow16(ctx: &EmitContext, ra: &mut RegAlloc, inst_ref: InstRef, inst: &Inst) {
     let mut args = ra.get_argument_info(inst_ref, &inst.args, inst.num_args());
@@ -1007,89 +968,155 @@ pub fn emit_vector_narrow64(ctx: &EmitContext, ra: &mut RegAlloc, inst_ref: Inst
 }
 
 // ---------------------------------------------------------------------------
-// VectorSignExtend — native SSE4.1: pmovsxbw/wd/dq
-// VectorSignExtend64 — fallback
+// VectorSignExtend — SSE4.1 fast paths with Eden's SSE2 fallbacks
 // ---------------------------------------------------------------------------
 
 pub fn emit_vector_sign_extend8(
-    _ctx: &EmitContext,
+    ctx: &EmitContext,
     ra: &mut RegAlloc,
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_vector_unary_op(ra, inst_ref, inst, rxbyak::CodeAssembler::pmovsxbw);
+    let mut args = ra.get_argument_info(inst_ref, &inst.args, inst.num_args());
+    if ctx.has_host_feature(HostFeature::SSE41) {
+        let result = ra.use_scratch_xmm(&mut args[0]);
+        ra.asm.pmovsxbw(result, result).unwrap();
+        ra.define_value(inst_ref, result);
+        return;
+    }
+
+    let source = ra.use_xmm(&mut args[0]);
+    let result = ra.scratch_xmm();
+    ra.asm.pxor(result, result).unwrap();
+    ra.asm.punpcklbw(result, source).unwrap();
+    ra.asm.psraw_imm(result, 8).unwrap();
+    ra.release(source);
+    ra.define_value(inst_ref, result);
 }
 pub fn emit_vector_sign_extend16(
-    _ctx: &EmitContext,
+    ctx: &EmitContext,
     ra: &mut RegAlloc,
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_vector_unary_op(ra, inst_ref, inst, rxbyak::CodeAssembler::pmovsxwd);
+    let mut args = ra.get_argument_info(inst_ref, &inst.args, inst.num_args());
+    if ctx.has_host_feature(HostFeature::SSE41) {
+        let result = ra.use_scratch_xmm(&mut args[0]);
+        ra.asm.pmovsxwd(result, result).unwrap();
+        ra.define_value(inst_ref, result);
+        return;
+    }
+
+    let source = ra.use_xmm(&mut args[0]);
+    let result = ra.scratch_xmm();
+    ra.asm.pxor(result, result).unwrap();
+    ra.asm.punpcklwd(result, source).unwrap();
+    ra.asm.psrad_imm(result, 16).unwrap();
+    ra.release(source);
+    ra.define_value(inst_ref, result);
 }
 pub fn emit_vector_sign_extend32(
-    _ctx: &EmitContext,
+    ctx: &EmitContext,
     ra: &mut RegAlloc,
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_vector_unary_op(ra, inst_ref, inst, rxbyak::CodeAssembler::pmovsxdq);
-}
-
-extern "C" fn fallback_sign_extend64(result: *mut [u8; 16], a: *const [u8; 16]) {
-    unsafe {
-        let va: [i32; 4] = std::mem::transmute(*a);
-        let out: [i64; 2] = [va[0] as i64, va[1] as i64];
-        *result = std::mem::transmute(out);
+    let mut args = ra.get_argument_info(inst_ref, &inst.args, inst.num_args());
+    let result = ra.use_scratch_xmm(&mut args[0]);
+    if ctx.has_host_feature(HostFeature::SSE41) {
+        ra.asm.pmovsxdq(result, result).unwrap();
+    } else {
+        let sign = ra.scratch_xmm();
+        ra.asm.movaps(sign, result).unwrap();
+        ra.asm.psrad_imm(sign, 31).unwrap();
+        ra.asm.punpckldq(result, sign).unwrap();
+        ra.release(sign);
     }
+    ra.define_value(inst_ref, result);
 }
 
-// SignExtend64: i32[0..1] → i64[0..1] = pmovsxdq
 pub fn emit_vector_sign_extend64(
-    _ctx: &EmitContext,
+    ctx: &EmitContext,
     ra: &mut RegAlloc,
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_vector_unary_op(ra, inst_ref, inst, rxbyak::CodeAssembler::pmovsxdq);
+    let mut args = ra.get_argument_info(inst_ref, &inst.args, inst.num_args());
+    let data = ra.use_scratch_xmm(&mut args[0]);
+    let sign = ra.scratch_gpr();
+    ra.asm.movq(sign, data).unwrap();
+    ra.asm.sar(sign, 63).unwrap();
+
+    if ctx.has_host_feature(HostFeature::SSE41) {
+        ra.asm.pinsrq(data, sign, 1).unwrap();
+    } else {
+        let sign_vector = ra.scratch_xmm();
+        ra.asm.movq(sign_vector, sign).unwrap();
+        ra.asm.punpcklqdq(data, sign_vector).unwrap();
+        ra.release(sign_vector);
+    }
+
+    ra.release(sign);
+    ra.define_value(inst_ref, data);
 }
 
 // ---------------------------------------------------------------------------
-// VectorZeroExtend — native SSE4.1: pmovzxbw/wd/dq
-// VectorZeroExtend64 — fallback
+// VectorZeroExtend — SSE4.1 fast paths with Eden's SSE2 fallbacks
 // ---------------------------------------------------------------------------
 
 pub fn emit_vector_zero_extend8(
-    _ctx: &EmitContext,
+    ctx: &EmitContext,
     ra: &mut RegAlloc,
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_vector_unary_op(ra, inst_ref, inst, rxbyak::CodeAssembler::pmovzxbw);
+    let mut args = ra.get_argument_info(inst_ref, &inst.args, inst.num_args());
+    let result = ra.use_scratch_xmm(&mut args[0]);
+    if ctx.has_host_feature(HostFeature::SSE41) {
+        ra.asm.pmovzxbw(result, result).unwrap();
+    } else {
+        let zero = ra.scratch_xmm();
+        ra.asm.pxor(zero, zero).unwrap();
+        ra.asm.punpcklbw(result, zero).unwrap();
+        ra.release(zero);
+    }
+    ra.define_value(inst_ref, result);
 }
 pub fn emit_vector_zero_extend16(
-    _ctx: &EmitContext,
+    ctx: &EmitContext,
     ra: &mut RegAlloc,
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_vector_unary_op(ra, inst_ref, inst, rxbyak::CodeAssembler::pmovzxwd);
+    let mut args = ra.get_argument_info(inst_ref, &inst.args, inst.num_args());
+    let result = ra.use_scratch_xmm(&mut args[0]);
+    if ctx.has_host_feature(HostFeature::SSE41) {
+        ra.asm.pmovzxwd(result, result).unwrap();
+    } else {
+        let zero = ra.scratch_xmm();
+        ra.asm.pxor(zero, zero).unwrap();
+        ra.asm.punpcklwd(result, zero).unwrap();
+        ra.release(zero);
+    }
+    ra.define_value(inst_ref, result);
 }
 pub fn emit_vector_zero_extend32(
-    _ctx: &EmitContext,
+    ctx: &EmitContext,
     ra: &mut RegAlloc,
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_vector_unary_op(ra, inst_ref, inst, rxbyak::CodeAssembler::pmovzxdq);
-}
-
-extern "C" fn fallback_zero_extend64(result: *mut [u8; 16], a: *const [u8; 16]) {
-    unsafe {
-        let va: [u64; 2] = std::mem::transmute(*a);
-        let out: [u64; 2] = [va[0], 0];
-        *result = std::mem::transmute(out);
+    let mut args = ra.get_argument_info(inst_ref, &inst.args, inst.num_args());
+    let result = ra.use_scratch_xmm(&mut args[0]);
+    if ctx.has_host_feature(HostFeature::SSE41) {
+        ra.asm.pmovzxdq(result, result).unwrap();
+    } else {
+        let zero = ra.scratch_xmm();
+        ra.asm.pxor(zero, zero).unwrap();
+        ra.asm.punpckldq(result, zero).unwrap();
+        ra.release(zero);
     }
+    ra.define_value(inst_ref, result);
 }
 
 // ZeroExtend64: preserve the low u64 and clear the high u64.
@@ -1130,6 +1157,7 @@ mod tests {
         let _: fn(&EmitContext, &mut RegAlloc, InstRef, &Inst) = emit_vector_shuffle_words;
         let _: fn(&EmitContext, &mut RegAlloc, InstRef, &Inst) = emit_vector_narrow16;
         let _: fn(&EmitContext, &mut RegAlloc, InstRef, &Inst) = emit_vector_sign_extend8;
+        let _: fn(&EmitContext, &mut RegAlloc, InstRef, &Inst) = emit_vector_sign_extend64;
         let _: fn(&EmitContext, &mut RegAlloc, InstRef, &Inst) = emit_vector_zero_extend64;
     }
 
