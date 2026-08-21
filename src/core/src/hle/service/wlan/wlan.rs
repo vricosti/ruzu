@@ -11,194 +11,453 @@ use crate::hle::service::hle_ipc::{
 };
 use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
 
-macro_rules! define_stub_service {
-    ($type:ident, $service:literal, [$(($id:expr, $command:literal)),* $(,)?]) => {
-        pub struct $type { handlers: BTreeMap<u32, FunctionInfo>, handlers_tipc: BTreeMap<u32, FunctionInfo> }
-        impl $type { pub fn new() -> Self { Self { handlers: build_handler_map(&[$(($id, None, $command)),*]), handlers_tipc: BTreeMap::new() } } }
-        impl SessionRequestHandler for $type {
-            fn handle_sync_request(&self, ctx: &mut HLERequestContext) -> ResultCode { ServiceFramework::handle_sync_request_impl(self, ctx) }
-            fn service_name(&self) -> &str { $service }
-        }
-        impl ServiceFramework for $type {
-            fn get_service_name(&self) -> &str { $service }
-            fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> { &self.handlers }
-            fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> { &self.handlers_tipc }
-        }
-    };
+pub struct ILocalManager {
+    handlers: BTreeMap<u32, FunctionInfo>,
+    handlers_tipc: BTreeMap<u32, FunctionInfo>,
 }
 
-define_stub_service!(
-    ILocalManager,
-    "wlan:lcl",
-    [
-        (0, "OpenMasterMode"),
-        (0, "OpenMode_2"),
-        (1, "CloseMasterMode"),
-        (1, "CloseMode_2"),
-        (2, "OpenClientMode"),
-        (2, "GetMacAddress_2"),
-        (3, "CloseClientMode"),
-        (3, "CreateBss"),
-        (4, "OpenSpectatorMode"),
-        (4, "DestroyBss"),
-        (5, "CloseSpectatorMode"),
-        (5, "StartScan_2"),
-        (6, "GetMacAddress_2"),
-        (6, "StopScan_2"),
-        (7, "CreateBss"),
-        (7, "Connect_2"),
-        (8, "DestroyBss"),
-        (8, "CancelConnect_2"),
-        (9, "StartScan_2"),
-        (9, "Join"),
-        (10, "StopScan_2"),
-        (10, "CancelJoin"),
-        (11, "Connect_2"),
-        (11, "Disconnect_2"),
-        (12, "CancelConnect_2"),
-        (12, "SetBeaconLostCount"),
-        (13, "Join"),
-        (13, "GetSystemEvent_2"),
-        (14, "CancelJoin"),
-        (14, "GetConnectionStatus_2"),
-        (15, "Disconnect_2"),
-        (15, "GetClientStatus"),
-        (16, "SetBeaconLostCount"),
-        (16, "GetBssIndicationEvent"),
-        (17, "GetSystemEvent_2"),
-        (17, "GetBssIndicationInfo"),
-        (18, "GetConnectionStatus_2"),
-        (18, "GetState_2"),
-        (19, "GetClientStatus"),
-        (19, "GetAllowedChannels"),
-        (20, "GetBssIndicationEvent"),
-        (20, "AddIe"),
-        (21, "GetBssIndicationInfo"),
-        (21, "DeleteIe"),
-        (22, "GetState_2"),
-        (22, "PutFrameRaw"),
-        (23, "GetAllowedChannels"),
-        (23, "CancelGetFrame"),
-        (24, "AddIe"),
-        (24, "CreateRxEntry"),
-        (25, "DeleteIe"),
-        (25, "DeleteRxEntry"),
-        (26, "PutFrameRaw"),
-        (26, "AddEthertypeToRxEntry"),
-        (27, "CancelGetFrame"),
-        (27, "DeleteEthertypeFromRxEntry"),
-        (28, "CreateRxEntry"),
-        (28, "AddMatchingDataToRxEntry"),
-        (29, "DeleteRxEntry"),
-        (29, "RemoveMatchingDataFromRxEntry"),
-        (30, "AddEthertypeToRxEntry"),
-        (30, "GetScanResult_2"),
-        (31, "DeleteEthertypeFromRxEntry"),
-        (31, "PutActionFrameOneShot"),
-        (32, "AddMatchingDataToRxEntry"),
-        (32, "SetActionFrameWithBeacon"),
-        (33, "RemoveMatchingDataFromRxEntry"),
-        (33, "CancelActionFrameWithBeacon"),
-        (34, "GetScanResult_2"),
-        (34, "CreateRxEntryForActionFrame"),
-        (35, "PutActionFrameOneShot"),
-        (35, "DeleteRxEntryForActionFrame"),
-        (36, "SetActionFrameWithBeacon"),
-        (36, "AddSubtypeToRxEntryForActionFrame"),
-        (37, "CancelActionFrameWithBeacon"),
-        (37, "DeleteSubtypeFromRxEntryForActionFrame"),
-        (38, "CreateRxEntryForActionFrame"),
-        (38, "CancelGetActionFrame"),
-        (39, "DeleteRxEntryForActionFrame"),
-        (39, "GetRssi_2"),
-        (40, "AddSubtypeToRxEntryForActionFrame"),
-        (40, "SetMaxAssociationNumber"),
-        (41, "DeleteSubtypeFromRxEntryForActionFrame"),
-        (41, "Cmd41"),
-        (42, "CancelGetActionFrame"),
-        (42, "Cmd42"),
-        (43, "GetRssi_2"),
-        (43, "Cmd43"),
-        (44, "SetMaxAssociationNumber"),
-        (45, "OpenLcsMasterMode"),
-        (46, "CloseLcsMasterMode"),
-        (47, "OpenLcsClientMode"),
-        (48, "CloseLcsClientMode"),
-        (49, "GetChannelStats"),
-        (50, "Cmd50"),
-        (51, "Cmd51"),
-        (52, "Cmd52"),
-    ]
-);
-define_stub_service!(ILocalGetFrame, "wlan:lg", [(0, "GetFrameRaw")]);
-define_stub_service!(ILocalGetActionFrame, "wlan:lga", [(0, "GetActionFrame")]);
-define_stub_service!(ISocketGetFrame, "wlan:sg", [(0, "GetFrameRaw")]);
-define_stub_service!(
-    ISocketManager,
-    "wlan:soc",
-    [
-        (0, "PutFrameRaw_2"),
-        (1, "CancelGetFrame_2"),
-        (2, "CreateRxEntry_2"),
-        (3, "DeleteRxEntry_2"),
-        (4, "AddEthertypeToRxEntry_2"),
-        (5, "DeleteEthertypeFromRxEntry_2"),
-        (6, "GetMacAddress_3"),
-        (7, "SwitchTsfTimerFunction"),
-        (8, "GetDeltaTimeBetweenSystemAndTsf"),
-        (9, "RegisterSharedMemory"),
-        (10, "UnregisterSharedMemory"),
-        (11, "EnableSharedMemory"),
-        (12, "SetMulticastFilter")
-    ]
-);
-define_stub_service!(
-    IDetectManager,
-    "wlan:dtc",
-    [
-        (0, "Cmd0"),
-        (1, "Cmd1"),
-        (2, "Cmd2"),
-        (3, "Cmd3"),
-        (4, "Cmd4"),
-        (5, "Cmd5"),
-        (6, "Cmd6"),
-        (7, "Cmd7"),
-        (8, "Cmd8"),
-        (9, "Cmd9"),
-        (10, "Cmd10"),
-        (11, "Cmd11"),
-        (12, "Cmd12"),
-        (13, "Cmd13"),
-        (14, "Cmd14"),
-        (15, "Cmd15"),
-        (16, "Cmd16"),
-        (17, "Cmd17"),
-        (18, "Cmd18"),
-        (19, "Cmd19"),
-        (20, "Cmd20"),
-        (21, "Cmd21"),
-        (22, "Cmd22"),
-        (23, "Cmd23"),
-        (24, "Cmd24"),
-        (25, "Cmd25"),
-        (26, "Cmd26"),
-        (27, "Cmd27")
-    ]
-);
-define_stub_service!(
-    IPrivateServiceCreator,
-    "wlan:p",
-    [
-        (0, "CreateWirelessCommunicationService"),
-        (1, "CreatePrivateWirelessCommunicationService")
-    ]
-);
-define_stub_service!(
-    ISfDriverServiceCreator,
-    "wlan:nd",
-    [(0, "CreateDriverService")]
-);
+impl ILocalManager {
+    pub fn new() -> Self {
+        Self {
+            handlers: build_handler_map(&[
+                (0, None, "OpenMasterMode"),
+                (0, None, "OpenMode_2"),
+                (1, None, "CloseMasterMode"),
+                (1, None, "CloseMode_2"),
+                (2, None, "OpenClientMode"),
+                (2, None, "GetMacAddress_2"),
+                (3, None, "CloseClientMode"),
+                (3, None, "CreateBss"),
+                (4, None, "OpenSpectatorMode"),
+                (4, None, "DestroyBss"),
+                (5, None, "CloseSpectatorMode"),
+                (5, None, "StartScan_2"),
+                (6, None, "GetMacAddress_2"),
+                (6, None, "StopScan_2"),
+                (7, None, "CreateBss"),
+                (7, None, "Connect_2"),
+                (8, None, "DestroyBss"),
+                (8, None, "CancelConnect_2"),
+                (9, None, "StartScan_2"),
+                (9, None, "Join"),
+                (10, None, "StopScan_2"),
+                (10, None, "CancelJoin"),
+                (11, None, "Connect_2"),
+                (11, None, "Disconnect_2"),
+                (12, None, "CancelConnect_2"),
+                (12, None, "SetBeaconLostCount"),
+                (13, None, "Join"),
+                (13, None, "GetSystemEvent_2"),
+                (14, None, "CancelJoin"),
+                (14, None, "GetConnectionStatus_2"),
+                (15, None, "Disconnect_2"),
+                (15, None, "GetClientStatus"),
+                (16, None, "SetBeaconLostCount"),
+                (16, None, "GetBssIndicationEvent"),
+                (17, None, "GetSystemEvent_2"),
+                (17, None, "GetBssIndicationInfo"),
+                (18, None, "GetConnectionStatus_2"),
+                (18, None, "GetState_2"),
+                (19, None, "GetClientStatus"),
+                (19, None, "GetAllowedChannels"),
+                (20, None, "GetBssIndicationEvent"),
+                (20, None, "AddIe"),
+                (21, None, "GetBssIndicationInfo"),
+                (21, None, "DeleteIe"),
+                (22, None, "GetState_2"),
+                (22, None, "PutFrameRaw"),
+                (23, None, "GetAllowedChannels"),
+                (23, None, "CancelGetFrame"),
+                (24, None, "AddIe"),
+                (24, None, "CreateRxEntry"),
+                (25, None, "DeleteIe"),
+                (25, None, "DeleteRxEntry"),
+                (26, None, "PutFrameRaw"),
+                (26, None, "AddEthertypeToRxEntry"),
+                (27, None, "CancelGetFrame"),
+                (27, None, "DeleteEthertypeFromRxEntry"),
+                (28, None, "CreateRxEntry"),
+                (28, None, "AddMatchingDataToRxEntry"),
+                (29, None, "DeleteRxEntry"),
+                (29, None, "RemoveMatchingDataFromRxEntry"),
+                (30, None, "AddEthertypeToRxEntry"),
+                (30, None, "GetScanResult_2"),
+                (31, None, "DeleteEthertypeFromRxEntry"),
+                (31, None, "PutActionFrameOneShot"),
+                (32, None, "AddMatchingDataToRxEntry"),
+                (32, None, "SetActionFrameWithBeacon"),
+                (33, None, "RemoveMatchingDataFromRxEntry"),
+                (33, None, "CancelActionFrameWithBeacon"),
+                (34, None, "GetScanResult_2"),
+                (34, None, "CreateRxEntryForActionFrame"),
+                (35, None, "PutActionFrameOneShot"),
+                (35, None, "DeleteRxEntryForActionFrame"),
+                (36, None, "SetActionFrameWithBeacon"),
+                (36, None, "AddSubtypeToRxEntryForActionFrame"),
+                (37, None, "CancelActionFrameWithBeacon"),
+                (37, None, "DeleteSubtypeFromRxEntryForActionFrame"),
+                (38, None, "CreateRxEntryForActionFrame"),
+                (38, None, "CancelGetActionFrame"),
+                (39, None, "DeleteRxEntryForActionFrame"),
+                (39, None, "GetRssi_2"),
+                (40, None, "AddSubtypeToRxEntryForActionFrame"),
+                (40, None, "SetMaxAssociationNumber"),
+                (41, None, "DeleteSubtypeFromRxEntryForActionFrame"),
+                (41, None, "Cmd41"),
+                (42, None, "CancelGetActionFrame"),
+                (42, None, "Cmd42"),
+                (43, None, "GetRssi_2"),
+                (43, None, "Cmd43"),
+                (44, None, "SetMaxAssociationNumber"),
+                (45, None, "OpenLcsMasterMode"),
+                (46, None, "CloseLcsMasterMode"),
+                (47, None, "OpenLcsClientMode"),
+                (48, None, "CloseLcsClientMode"),
+                (49, None, "GetChannelStats"),
+                (50, None, "Cmd50"),
+                (51, None, "Cmd51"),
+                (52, None, "Cmd52"),
+            ]),
+            handlers_tipc: BTreeMap::new(),
+        }
+    }
+}
+
+impl SessionRequestHandler for ILocalManager {
+    fn handle_sync_request(&self, ctx: &mut HLERequestContext) -> ResultCode {
+        ServiceFramework::handle_sync_request_impl(self, ctx)
+    }
+
+    fn service_name(&self) -> &str {
+        "wlan:lcl"
+    }
+}
+
+impl ServiceFramework for ILocalManager {
+    fn get_service_name(&self) -> &str {
+        "wlan:lcl"
+    }
+
+    fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers
+    }
+
+    fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers_tipc
+    }
+}
+
+pub struct ILocalGetFrame {
+    handlers: BTreeMap<u32, FunctionInfo>,
+    handlers_tipc: BTreeMap<u32, FunctionInfo>,
+}
+
+impl ILocalGetFrame {
+    pub fn new() -> Self {
+        Self {
+            handlers: build_handler_map(&[(0, None, "GetFrameRaw")]),
+            handlers_tipc: BTreeMap::new(),
+        }
+    }
+}
+
+impl SessionRequestHandler for ILocalGetFrame {
+    fn handle_sync_request(&self, ctx: &mut HLERequestContext) -> ResultCode {
+        ServiceFramework::handle_sync_request_impl(self, ctx)
+    }
+
+    fn service_name(&self) -> &str {
+        "wlan:lg"
+    }
+}
+
+impl ServiceFramework for ILocalGetFrame {
+    fn get_service_name(&self) -> &str {
+        "wlan:lg"
+    }
+
+    fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers
+    }
+
+    fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers_tipc
+    }
+}
+
+pub struct ILocalGetActionFrame {
+    handlers: BTreeMap<u32, FunctionInfo>,
+    handlers_tipc: BTreeMap<u32, FunctionInfo>,
+}
+
+impl ILocalGetActionFrame {
+    pub fn new() -> Self {
+        Self {
+            handlers: build_handler_map(&[(0, None, "GetActionFrame")]),
+            handlers_tipc: BTreeMap::new(),
+        }
+    }
+}
+
+impl SessionRequestHandler for ILocalGetActionFrame {
+    fn handle_sync_request(&self, ctx: &mut HLERequestContext) -> ResultCode {
+        ServiceFramework::handle_sync_request_impl(self, ctx)
+    }
+
+    fn service_name(&self) -> &str {
+        "wlan:lga"
+    }
+}
+
+impl ServiceFramework for ILocalGetActionFrame {
+    fn get_service_name(&self) -> &str {
+        "wlan:lga"
+    }
+
+    fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers
+    }
+
+    fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers_tipc
+    }
+}
+
+pub struct ISocketGetFrame {
+    handlers: BTreeMap<u32, FunctionInfo>,
+    handlers_tipc: BTreeMap<u32, FunctionInfo>,
+}
+
+impl ISocketGetFrame {
+    pub fn new() -> Self {
+        Self {
+            handlers: build_handler_map(&[(0, None, "GetFrameRaw")]),
+            handlers_tipc: BTreeMap::new(),
+        }
+    }
+}
+
+impl SessionRequestHandler for ISocketGetFrame {
+    fn handle_sync_request(&self, ctx: &mut HLERequestContext) -> ResultCode {
+        ServiceFramework::handle_sync_request_impl(self, ctx)
+    }
+
+    fn service_name(&self) -> &str {
+        "wlan:sg"
+    }
+}
+
+impl ServiceFramework for ISocketGetFrame {
+    fn get_service_name(&self) -> &str {
+        "wlan:sg"
+    }
+
+    fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers
+    }
+
+    fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers_tipc
+    }
+}
+
+pub struct ISocketManager {
+    handlers: BTreeMap<u32, FunctionInfo>,
+    handlers_tipc: BTreeMap<u32, FunctionInfo>,
+}
+
+impl ISocketManager {
+    pub fn new() -> Self {
+        Self {
+            handlers: build_handler_map(&[
+                (0, None, "PutFrameRaw_2"),
+                (1, None, "CancelGetFrame_2"),
+                (2, None, "CreateRxEntry_2"),
+                (3, None, "DeleteRxEntry_2"),
+                (4, None, "AddEthertypeToRxEntry_2"),
+                (5, None, "DeleteEthertypeFromRxEntry_2"),
+                (6, None, "GetMacAddress_3"),
+                (7, None, "SwitchTsfTimerFunction"),
+                (8, None, "GetDeltaTimeBetweenSystemAndTsf"),
+                (9, None, "RegisterSharedMemory"),
+                (10, None, "UnregisterSharedMemory"),
+                (11, None, "EnableSharedMemory"),
+                (12, None, "SetMulticastFilter"),
+            ]),
+            handlers_tipc: BTreeMap::new(),
+        }
+    }
+}
+
+impl SessionRequestHandler for ISocketManager {
+    fn handle_sync_request(&self, ctx: &mut HLERequestContext) -> ResultCode {
+        ServiceFramework::handle_sync_request_impl(self, ctx)
+    }
+
+    fn service_name(&self) -> &str {
+        "wlan:soc"
+    }
+}
+
+impl ServiceFramework for ISocketManager {
+    fn get_service_name(&self) -> &str {
+        "wlan:soc"
+    }
+
+    fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers
+    }
+
+    fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers_tipc
+    }
+}
+
+pub struct IDetectManager {
+    handlers: BTreeMap<u32, FunctionInfo>,
+    handlers_tipc: BTreeMap<u32, FunctionInfo>,
+}
+
+impl IDetectManager {
+    pub fn new() -> Self {
+        Self {
+            handlers: build_handler_map(&[
+                (0, None, "Cmd0"),
+                (1, None, "Cmd1"),
+                (2, None, "Cmd2"),
+                (3, None, "Cmd3"),
+                (4, None, "Cmd4"),
+                (5, None, "Cmd5"),
+                (6, None, "Cmd6"),
+                (7, None, "Cmd7"),
+                (8, None, "Cmd8"),
+                (9, None, "Cmd9"),
+                (10, None, "Cmd10"),
+                (11, None, "Cmd11"),
+                (12, None, "Cmd12"),
+                (13, None, "Cmd13"),
+                (14, None, "Cmd14"),
+                (15, None, "Cmd15"),
+                (16, None, "Cmd16"),
+                (17, None, "Cmd17"),
+                (18, None, "Cmd18"),
+                (19, None, "Cmd19"),
+                (20, None, "Cmd20"),
+                (21, None, "Cmd21"),
+                (22, None, "Cmd22"),
+                (23, None, "Cmd23"),
+                (24, None, "Cmd24"),
+                (25, None, "Cmd25"),
+                (26, None, "Cmd26"),
+                (27, None, "Cmd27"),
+            ]),
+            handlers_tipc: BTreeMap::new(),
+        }
+    }
+}
+
+impl SessionRequestHandler for IDetectManager {
+    fn handle_sync_request(&self, ctx: &mut HLERequestContext) -> ResultCode {
+        ServiceFramework::handle_sync_request_impl(self, ctx)
+    }
+
+    fn service_name(&self) -> &str {
+        "wlan:dtc"
+    }
+}
+
+impl ServiceFramework for IDetectManager {
+    fn get_service_name(&self) -> &str {
+        "wlan:dtc"
+    }
+
+    fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers
+    }
+
+    fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers_tipc
+    }
+}
+
+pub struct IPrivateServiceCreator {
+    handlers: BTreeMap<u32, FunctionInfo>,
+    handlers_tipc: BTreeMap<u32, FunctionInfo>,
+}
+
+impl IPrivateServiceCreator {
+    pub fn new() -> Self {
+        Self {
+            handlers: build_handler_map(&[
+                (0, None, "CreateWirelessCommunicationService"),
+                (1, None, "CreatePrivateWirelessCommunicationService"),
+            ]),
+            handlers_tipc: BTreeMap::new(),
+        }
+    }
+}
+
+impl SessionRequestHandler for IPrivateServiceCreator {
+    fn handle_sync_request(&self, ctx: &mut HLERequestContext) -> ResultCode {
+        ServiceFramework::handle_sync_request_impl(self, ctx)
+    }
+
+    fn service_name(&self) -> &str {
+        "wlan:p"
+    }
+}
+
+impl ServiceFramework for IPrivateServiceCreator {
+    fn get_service_name(&self) -> &str {
+        "wlan:p"
+    }
+
+    fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers
+    }
+
+    fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers_tipc
+    }
+}
+
+pub struct ISfDriverServiceCreator {
+    handlers: BTreeMap<u32, FunctionInfo>,
+    handlers_tipc: BTreeMap<u32, FunctionInfo>,
+}
+
+impl ISfDriverServiceCreator {
+    pub fn new() -> Self {
+        Self {
+            handlers: build_handler_map(&[(0, None, "CreateDriverService")]),
+            handlers_tipc: BTreeMap::new(),
+        }
+    }
+}
+
+impl SessionRequestHandler for ISfDriverServiceCreator {
+    fn handle_sync_request(&self, ctx: &mut HLERequestContext) -> ResultCode {
+        ServiceFramework::handle_sync_request_impl(self, ctx)
+    }
+
+    fn service_name(&self) -> &str {
+        "wlan:nd"
+    }
+}
+
+impl ServiceFramework for ISfDriverServiceCreator {
+    fn get_service_name(&self) -> &str {
+        "wlan:nd"
+    }
+
+    fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers
+    }
+
+    fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers_tipc
+    }
+}
 
 pub fn loop_process(system: crate::core::SystemRef) {
     use crate::hle::service::server_manager::ServerManager;

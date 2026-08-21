@@ -174,6 +174,16 @@ impl ETicket {
             (38, None, "OwnTicket3"),
             (39, None, "DeleteAllInactivePersonalizedTicket"),
             (40, None, "DeletePrepurchaseRecordByNintendoAccountId"),
+            (101, None, "Unknown101"),
+            (102, None, "Unknown102"),
+            (103, None, "Unknown103"),
+            (104, None, "Unknown104"),
+            (105, None, "Unknown105"),
+            (201, None, "Unknown201"),
+            (202, None, "Unknown202"),
+            (203, None, "Unknown203"),
+            (204, None, "Unknown204"),
+            (205, None, "Unknown205"),
             (501, None, "Unknown501"),
             (502, None, "Unknown502"),
             (503, None, "GetTitleKey"),
@@ -843,5 +853,15 @@ mod a41_tests {
         assert_eq!(NdrmLu::new().handlers().len(), 5);
         assert_eq!(NdrmLa::new().handlers().len(), 54);
         assert!(!NdrmLa::new().handlers().contains_key(&41));
+    }
+
+    #[test]
+    fn eticket_reserved_commands_match_upstream() {
+        let service = ETicket::new();
+        for id in [101, 102, 103, 104, 105, 201, 202, 203, 204, 205] {
+            let handler = service.handlers().get(&id).unwrap();
+            assert_eq!(handler.name, format!("Unknown{id}"));
+            assert!(handler.handler_callback.is_none());
+        }
     }
 }

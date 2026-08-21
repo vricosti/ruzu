@@ -1870,3 +1870,81 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 
 - PASS: controller state and shared-memory payload declarations are unchanged. The added regression
   test verifies that unregistering an unknown ARUID cannot clear the first registered resource.
+
+## 2026-08-21 — corrective audit of Eden `a41a98028a` homebrew-service prerequisites
+
+### Intentional differences
+
+- `src/core/src/file_sys/registered_cache.rs` stores Eden's
+  `ContentProviderParsingFunction` and `VfsCopyFunction` as Rust `Fn` trait objects. The install
+  callback accepts non-`'static` captures, preserving the flexibility of upstream `std::function`.
+- The pre-existing Rust cache indexes remain `BTreeMap`s instead of Eden's
+  `ankerl::unordered_dense::map`s. This makes enumeration deterministic but does not alter lookup,
+  filtering or ownership; changing the container is outside this corrective method slice.
+- `RegisteredCache::install_entry_xci` returns `ErrorMetaFailed` if an XCI has no secure-partition
+  NSP. Eden dereferences the returned pointer without a null check; the valid-XCI path and install
+  ordering are otherwise identical.
+- `src/core/src/hle/service/filesystem/filesystem.rs` keeps the existing frontend-owned
+  `FrontendManual` provider for configured game directories. Therefore Eden's concrete
+  `FileSystemController::GetExternalContentProvider` accessor has no Rust counterpart; Ruzu's
+  excluded GUI frontend populates the content-provider union directly.
+- `FileSystemController` stores Ruzu's concrete `Arc<RealVfsFilesystem>` rather than Eden's
+  abstract VFS reference. BIS partition-storage behavior and result ordering remain the same.
+- `src/core/src/core.rs::get_game_file_from_path` uses Rust host-path detection for extracted
+  directories and the existing Rust VFS concatenation owner. It otherwise preserves Eden's
+  `00` through `0F` scan order, early stop, directory name and `/main` fallback.
+- If game-file opening fails, Rust logs the failure and does not call `set_game_card`; Eden passes
+  the null VFS handle into `SetGameCard`. Valid current-game and configured-image paths preserve
+  Eden's branch ordering, including applying the empty-path check only to the configured path.
+
+### Unintentional differences (to fix)
+
+- None in the re-reviewed NCM command/handler slice, registered-cache install/iteration/rights-ID
+  slice, SDMC parsing path, filesystem-controller wrappers, or game-file opening path.
+- This entry supersedes the broader “none” claim in the earlier `a41a98028a` service entry:
+  subsequent line-by-line review found and fixed missing NCM prerequisites, NAX parsing,
+  metadata filtering, registered installation and game-card setup.
+
+### Missing items
+
+- None among the 31 reviewed `PlaceholderCache`/`RegisteredCache` methods: `GetRightsID`, all four
+  `InstallEntry` overloads and `IterateAllMetadata` are now present.
+- None among the eight reviewed NCM interfaces: the same 12 commands have concrete handlers in
+  Eden and Ruzu, and all remaining commands are registered stubs on both sides.
+- `FileSystemController::GetExternalContentProvider` remains intentionally absent for the
+  frontend-provider ownership reason above. The other methods called out by the review — BIS
+  partition access, the standalone save-data controller, image-directory access and placeholder
+  wrappers — are now present in their upstream-owned controller file.
+
+### Binary layout verification
+
+- PASS: `ContentMetaKey` remains `repr(C)` and 0x10 bytes; padding is ignored when matching keys,
+  as upstream does.
+- PASS: `CNMTHeader`, `OptionalHeader` and `ContentRecord` remain deterministically initialized
+  `repr(C)` payloads of 0x20, 0x10 and 0x38 bytes respectively. The new install path serializes the
+  same fields and hashes the same first 1 MiB as Eden.
+- N/A: filesystem controller accessors and `GetGameFileFromPath` add no guest-visible raw payload.
+
+## 2026-08-21 — explicit service declarations vs Eden `a41a98028a` service owners
+
+### Intentional differences
+
+- Rust service-framework trait boilerplate remains implemented with the existing mechanical
+  `impl_service_framework!` helper. It does not declare commands, own behavior or combine upstream
+  files.
+
+### Unintentional differences (to fix)
+
+- None in the reviewed stub-service ownership slice. The port-local `define_stub_service!` macro
+  has been removed from `audio`, `nvdrv`, `usb`, `psc`, `sockets`, `ptm`, `glue/ectx`, `wlan` and
+  `bpc`; each upstream service type and command table is now explicit in its corresponding Rust
+  owner.
+
+### Missing items
+
+- None introduced by expanding these declarations. Null Eden handlers remain explicit Rust
+  unimplemented handlers with the same command IDs and labels.
+
+### Binary layout verification
+
+- N/A: this ownership correction changes declarations only and adds no raw-copied structure.

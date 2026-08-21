@@ -15,51 +15,133 @@ use crate::hle::result::ResultCode;
 use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
 use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
 
-macro_rules! define_stub_service {
-    ($type:ident, $service:literal, [$(($id:expr, $command:literal)),* $(,)?]) => {
-        pub struct $type { handlers: BTreeMap<u32, FunctionInfo>, handlers_tipc: BTreeMap<u32, FunctionInfo> }
-        impl $type { pub fn new() -> Self { Self { handlers: build_handler_map(&[$(($id, None, $command)),*]), handlers_tipc: BTreeMap::new() } } }
-        impl SessionRequestHandler for $type {
-            fn handle_sync_request(&self, ctx: &mut HLERequestContext) -> ResultCode { ServiceFramework::handle_sync_request_impl(self, ctx) }
-            fn service_name(&self) -> &str { $service }
-        }
-        impl ServiceFramework for $type {
-            fn get_service_name(&self) -> &str { $service }
-            fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> { &self.handlers }
-            fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> { &self.handlers_tipc }
-        }
-    };
+pub struct EthcC {
+    handlers: BTreeMap<u32, FunctionInfo>,
+    handlers_tipc: BTreeMap<u32, FunctionInfo>,
 }
 
-define_stub_service!(
-    EthcC,
-    "ethc:c",
-    [
-        (0, "Initialize"),
-        (1, "Cancel"),
-        (2, "GetResult"),
-        (3, "GetMediaList"),
-        (4, "SetMediaType"),
-        (5, "GetMediaType"),
-        (6, "GetMacAddress")
-    ]
-);
-define_stub_service!(
-    EthcI,
-    "ethc:i",
-    [
-        (0, "GetReadableHandle"),
-        (1, "Cancel"),
-        (2, "GetResult"),
-        (3, "GetInterfaceList"),
-        (4, "GetInterfaceCount")
-    ]
-);
-define_stub_service!(
-    ISfDriverServiceCreator,
-    "eth:nd",
-    [(0, "CreateDriverService")]
-);
+impl EthcC {
+    pub fn new() -> Self {
+        Self {
+            handlers: build_handler_map(&[
+                (0, None, "Initialize"),
+                (1, None, "Cancel"),
+                (2, None, "GetResult"),
+                (3, None, "GetMediaList"),
+                (4, None, "SetMediaType"),
+                (5, None, "GetMediaType"),
+                (6, None, "GetMacAddress"),
+            ]),
+            handlers_tipc: BTreeMap::new(),
+        }
+    }
+}
+
+impl SessionRequestHandler for EthcC {
+    fn handle_sync_request(&self, ctx: &mut HLERequestContext) -> ResultCode {
+        ServiceFramework::handle_sync_request_impl(self, ctx)
+    }
+
+    fn service_name(&self) -> &str {
+        "ethc:c"
+    }
+}
+
+impl ServiceFramework for EthcC {
+    fn get_service_name(&self) -> &str {
+        "ethc:c"
+    }
+
+    fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers
+    }
+
+    fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers_tipc
+    }
+}
+
+pub struct EthcI {
+    handlers: BTreeMap<u32, FunctionInfo>,
+    handlers_tipc: BTreeMap<u32, FunctionInfo>,
+}
+
+impl EthcI {
+    pub fn new() -> Self {
+        Self {
+            handlers: build_handler_map(&[
+                (0, None, "GetReadableHandle"),
+                (1, None, "Cancel"),
+                (2, None, "GetResult"),
+                (3, None, "GetInterfaceList"),
+                (4, None, "GetInterfaceCount"),
+            ]),
+            handlers_tipc: BTreeMap::new(),
+        }
+    }
+}
+
+impl SessionRequestHandler for EthcI {
+    fn handle_sync_request(&self, ctx: &mut HLERequestContext) -> ResultCode {
+        ServiceFramework::handle_sync_request_impl(self, ctx)
+    }
+
+    fn service_name(&self) -> &str {
+        "ethc:i"
+    }
+}
+
+impl ServiceFramework for EthcI {
+    fn get_service_name(&self) -> &str {
+        "ethc:i"
+    }
+
+    fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers
+    }
+
+    fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers_tipc
+    }
+}
+
+pub struct ISfDriverServiceCreator {
+    handlers: BTreeMap<u32, FunctionInfo>,
+    handlers_tipc: BTreeMap<u32, FunctionInfo>,
+}
+
+impl ISfDriverServiceCreator {
+    pub fn new() -> Self {
+        Self {
+            handlers: build_handler_map(&[(0, None, "CreateDriverService")]),
+            handlers_tipc: BTreeMap::new(),
+        }
+    }
+}
+
+impl SessionRequestHandler for ISfDriverServiceCreator {
+    fn handle_sync_request(&self, ctx: &mut HLERequestContext) -> ResultCode {
+        ServiceFramework::handle_sync_request_impl(self, ctx)
+    }
+
+    fn service_name(&self) -> &str {
+        "eth:nd"
+    }
+}
+
+impl ServiceFramework for ISfDriverServiceCreator {
+    fn get_service_name(&self) -> &str {
+        "eth:nd"
+    }
+
+    fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers
+    }
+
+    fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers_tipc
+    }
+}
 
 /// Errno values matching upstream.
 ///

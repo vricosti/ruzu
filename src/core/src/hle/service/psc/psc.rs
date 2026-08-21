@@ -18,75 +18,228 @@ use crate::hle::result::ResultCode;
 use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
 use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
 
-macro_rules! define_stub_service {
-    ($type:ident, $service:literal, [$(($id:expr, $command:literal)),* $(,)?]) => {
-        pub struct $type { handlers: BTreeMap<u32, FunctionInfo>, handlers_tipc: BTreeMap<u32, FunctionInfo> }
-        impl $type {
-            pub fn new() -> Self { Self { handlers: build_handler_map(&[$(($id, None, $command)),*]), handlers_tipc: BTreeMap::new() } }
-        }
-        impl SessionRequestHandler for $type {
-            fn handle_sync_request(&self, ctx: &mut HLERequestContext) -> ResultCode { ServiceFramework::handle_sync_request_impl(self, ctx) }
-            fn service_name(&self) -> &str { $service }
-        }
-        impl ServiceFramework for $type {
-            fn get_service_name(&self) -> &str { $service }
-            fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> { &self.handlers }
-            fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> { &self.handlers_tipc }
-        }
-    };
+pub struct PscL {
+    handlers: BTreeMap<u32, FunctionInfo>,
+    handlers_tipc: BTreeMap<u32, FunctionInfo>,
 }
 
-define_stub_service!(
-    PscL,
-    "psc:l",
-    [
-        (0, "Initialize_3"),
-        (1, "Lock"),
-        (2, "Unlock"),
-        (3, "IsLocked"),
-        (4, "GetRelatedState")
-    ]
-);
-define_stub_service!(
-    InsR,
-    "ins:r",
-    [(0, "GetInputSourceState"), (1, "GetTriggerTargetEvent")]
-);
-define_stub_service!(InsS, "ins:s", [(0, "GetNotifyEvent")]);
-define_stub_service!(
-    HshlSys,
-    "hshl:sys",
-    [
-        (0, "GetBatteryPercentage"),
-        (1, "GetChargerType"),
-        (2, "OpenChargeSession"),
-        (3, "GetRawBatteryPercentage"),
-        (4, "GetBatteryVoltageLevel"),
-        (5, "OpenThermalSession"),
-        (6, "GetAbnormalTemperatureSet"),
-        (7, "OpenClockSession"),
-        (8, "GetClockRate"),
-        (9, "OpenBridgeSession"),
-        (10, "GetBridgePowerSupply"),
-        (11, "OpenVsysVoltageSession"),
-        (12, "GetIsBatteryEnoughForFullAwake"),
-        (13, "GetIsCharging"),
-        (14, "Cmd14"),
-        (15, "Cmd15")
-    ]
-);
-define_stub_service!(
-    HshlSet,
-    "hshl:set",
-    [
-        (0, "OpenChargeSession_2"),
-        (1, "OpenThermalSession_2"),
-        (2, "SetClockRate"),
-        (3, "SetBridgePowerSupply"),
-        (4, "Cmd4"),
-        (5, "Cmd5")
-    ]
-);
+impl PscL {
+    pub fn new() -> Self {
+        Self {
+            handlers: build_handler_map(&[
+                (0, None, "Initialize_3"),
+                (1, None, "Lock"),
+                (2, None, "Unlock"),
+                (3, None, "IsLocked"),
+                (4, None, "GetRelatedState"),
+            ]),
+            handlers_tipc: BTreeMap::new(),
+        }
+    }
+}
+
+impl SessionRequestHandler for PscL {
+    fn handle_sync_request(&self, ctx: &mut HLERequestContext) -> ResultCode {
+        ServiceFramework::handle_sync_request_impl(self, ctx)
+    }
+
+    fn service_name(&self) -> &str {
+        "psc:l"
+    }
+}
+
+impl ServiceFramework for PscL {
+    fn get_service_name(&self) -> &str {
+        "psc:l"
+    }
+
+    fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers
+    }
+
+    fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers_tipc
+    }
+}
+
+pub struct InsR {
+    handlers: BTreeMap<u32, FunctionInfo>,
+    handlers_tipc: BTreeMap<u32, FunctionInfo>,
+}
+
+impl InsR {
+    pub fn new() -> Self {
+        Self {
+            handlers: build_handler_map(&[
+                (0, None, "GetInputSourceState"),
+                (1, None, "GetTriggerTargetEvent"),
+            ]),
+            handlers_tipc: BTreeMap::new(),
+        }
+    }
+}
+
+impl SessionRequestHandler for InsR {
+    fn handle_sync_request(&self, ctx: &mut HLERequestContext) -> ResultCode {
+        ServiceFramework::handle_sync_request_impl(self, ctx)
+    }
+
+    fn service_name(&self) -> &str {
+        "ins:r"
+    }
+}
+
+impl ServiceFramework for InsR {
+    fn get_service_name(&self) -> &str {
+        "ins:r"
+    }
+
+    fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers
+    }
+
+    fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers_tipc
+    }
+}
+
+pub struct InsS {
+    handlers: BTreeMap<u32, FunctionInfo>,
+    handlers_tipc: BTreeMap<u32, FunctionInfo>,
+}
+
+impl InsS {
+    pub fn new() -> Self {
+        Self {
+            handlers: build_handler_map(&[(0, None, "GetNotifyEvent")]),
+            handlers_tipc: BTreeMap::new(),
+        }
+    }
+}
+
+impl SessionRequestHandler for InsS {
+    fn handle_sync_request(&self, ctx: &mut HLERequestContext) -> ResultCode {
+        ServiceFramework::handle_sync_request_impl(self, ctx)
+    }
+
+    fn service_name(&self) -> &str {
+        "ins:s"
+    }
+}
+
+impl ServiceFramework for InsS {
+    fn get_service_name(&self) -> &str {
+        "ins:s"
+    }
+
+    fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers
+    }
+
+    fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers_tipc
+    }
+}
+
+pub struct HshlSys {
+    handlers: BTreeMap<u32, FunctionInfo>,
+    handlers_tipc: BTreeMap<u32, FunctionInfo>,
+}
+
+impl HshlSys {
+    pub fn new() -> Self {
+        Self {
+            handlers: build_handler_map(&[
+                (0, None, "GetBatteryPercentage"),
+                (1, None, "GetChargerType"),
+                (2, None, "OpenChargeSession"),
+                (3, None, "GetRawBatteryPercentage"),
+                (4, None, "GetBatteryVoltageLevel"),
+                (5, None, "OpenThermalSession"),
+                (6, None, "GetAbnormalTemperatureSet"),
+                (7, None, "OpenClockSession"),
+                (8, None, "GetClockRate"),
+                (9, None, "OpenBridgeSession"),
+                (10, None, "GetBridgePowerSupply"),
+                (11, None, "OpenVsysVoltageSession"),
+                (12, None, "GetIsBatteryEnoughForFullAwake"),
+                (13, None, "GetIsCharging"),
+                (14, None, "Cmd14"),
+                (15, None, "Cmd15"),
+            ]),
+            handlers_tipc: BTreeMap::new(),
+        }
+    }
+}
+
+impl SessionRequestHandler for HshlSys {
+    fn handle_sync_request(&self, ctx: &mut HLERequestContext) -> ResultCode {
+        ServiceFramework::handle_sync_request_impl(self, ctx)
+    }
+
+    fn service_name(&self) -> &str {
+        "hshl:sys"
+    }
+}
+
+impl ServiceFramework for HshlSys {
+    fn get_service_name(&self) -> &str {
+        "hshl:sys"
+    }
+
+    fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers
+    }
+
+    fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers_tipc
+    }
+}
+
+pub struct HshlSet {
+    handlers: BTreeMap<u32, FunctionInfo>,
+    handlers_tipc: BTreeMap<u32, FunctionInfo>,
+}
+
+impl HshlSet {
+    pub fn new() -> Self {
+        Self {
+            handlers: build_handler_map(&[
+                (0, None, "OpenChargeSession_2"),
+                (1, None, "OpenThermalSession_2"),
+                (2, None, "SetClockRate"),
+                (3, None, "SetBridgePowerSupply"),
+                (4, None, "Cmd4"),
+                (5, None, "Cmd5"),
+            ]),
+            handlers_tipc: BTreeMap::new(),
+        }
+    }
+}
+
+impl SessionRequestHandler for HshlSet {
+    fn handle_sync_request(&self, ctx: &mut HLERequestContext) -> ResultCode {
+        ServiceFramework::handle_sync_request_impl(self, ctx)
+    }
+
+    fn service_name(&self) -> &str {
+        "hshl:set"
+    }
+}
+
+impl ServiceFramework for HshlSet {
+    fn get_service_name(&self) -> &str {
+        "hshl:set"
+    }
+
+    fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers
+    }
+
+    fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers_tipc
+    }
+}
 
 pub const PSC_SERVICE_NAMES: &[&str] = &[
     "psc:c", "psc:m", "psc:l", "ins:r", "ins:s", "hshl:sys", "hshl:set", "ovln:rcv", "ovln:snd",

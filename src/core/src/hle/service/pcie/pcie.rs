@@ -35,10 +35,10 @@ pub mod session_commands {
     pub const ACQUIRE_IRQ: u32 = 17;
     pub const RELEASE_IRQ: u32 = 18;
     pub const SET_IRQ_ENABLE: u32 = 19;
-    pub const SET_ASPM_ENABLE: u32 = 20;
-    pub const SET_RESET_UPON_RESUME_ENABLE: u32 = 21;
-    pub const RESET_FUNCTION: u32 = 22;
-    pub const UNKNOWN23: u32 = 23;
+    pub const GET_IRQ_EVENT: u32 = 20;
+    pub const SET_ASPM_ENABLE: u32 = 21;
+    pub const SET_RESET_UPON_RESUME_ENABLE: u32 = 22;
+    pub const RESET_FUNCTION: u32 = 23;
 }
 
 /// IPC command IDs for PCIe
@@ -96,6 +96,7 @@ impl ISession {
                 (session_commands::ACQUIRE_IRQ, None, "AcquireIrq"),
                 (session_commands::RELEASE_IRQ, None, "ReleaseIrq"),
                 (session_commands::SET_IRQ_ENABLE, None, "SetIrqEnable"),
+                (session_commands::GET_IRQ_EVENT, None, "GetIrqEvent"),
                 (session_commands::SET_ASPM_ENABLE, None, "SetAspmEnable"),
                 (
                     session_commands::SET_RESET_UPON_RESUME_ENABLE,
@@ -103,7 +104,6 @@ impl ISession {
                     "SetResetUponResumeEnable",
                 ),
                 (session_commands::RESET_FUNCTION, None, "ResetFunction"),
-                (session_commands::UNKNOWN23, None, "Unknown23"),
             ]),
             handlers_tipc: BTreeMap::new(),
         }
@@ -262,5 +262,22 @@ mod tests {
         assert_eq!(PCIe::new().handlers.len(), 2);
         assert_eq!(ISession::new().handlers.len(), 24);
         assert_eq!(PcieLog::new().handlers.len(), 2);
+    }
+
+    #[test]
+    fn pcie_session_tail_matches_upstream_ids() {
+        let session = ISession::new();
+        let names = (20..=23)
+            .map(|id| session.handlers.get(&id).unwrap().name)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            names,
+            [
+                "GetIrqEvent",
+                "SetAspmEnable",
+                "SetResetUponResumeEnable",
+                "ResetFunction",
+            ]
+        );
     }
 }

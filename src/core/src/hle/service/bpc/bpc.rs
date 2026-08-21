@@ -184,74 +184,133 @@ impl ServiceFramework for BpcR {
     }
 }
 
-macro_rules! define_stub_service {
-    ($type:ident, $service_name:literal, [$(($id:expr, $name:literal)),* $(,)?]) => {
-        pub struct $type {
-            handlers: BTreeMap<u32, FunctionInfo>,
-            handlers_tipc: BTreeMap<u32, FunctionInfo>,
-        }
-
-        impl $type {
-            pub fn new() -> Self {
-                Self {
-                    handlers: build_handler_map(&[$(($id, None, $name)),*]),
-                    handlers_tipc: BTreeMap::new(),
-                }
-            }
-        }
-
-        impl SessionRequestHandler for $type {
-            fn handle_sync_request(&self, ctx: &mut HLERequestContext) -> ResultCode {
-                ServiceFramework::handle_sync_request_impl(self, ctx)
-            }
-
-            fn service_name(&self) -> &str {
-                $service_name
-            }
-        }
-
-        impl ServiceFramework for $type {
-            fn get_service_name(&self) -> &str {
-                $service_name
-            }
-
-            fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> {
-                &self.handlers
-            }
-
-            fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
-                &self.handlers_tipc
-            }
-        }
-    };
+pub struct BpcC {
+    handlers: BTreeMap<u32, FunctionInfo>,
+    handlers_tipc: BTreeMap<u32, FunctionInfo>,
 }
 
-define_stub_service!(
-    BpcC,
-    "bpc:c",
-    [
-        (0, "ShutdownSystem"),
-        (1, "RebootSystem"),
-        (2, "GetWakeupReason"),
-        (3, "GetShutdownReason"),
-        (4, "GetAcOk"),
-        (5, "GetPowerEvent"),
-    ]
-);
-define_stub_service!(
-    BpcB,
-    "bpc:b",
-    [(0, "GetSleepButtonState"), (1, "GetPowerButtonEvent")]
-);
-define_stub_service!(
-    BpcW,
-    "bpc:w",
-    [
-        (0, "CreateWakeupTimer"),
-        (1, "CancelWakeupTimer"),
-        (2, "EnableWakeupTimerOnDevice"),
-    ]
-);
+impl BpcC {
+    pub fn new() -> Self {
+        Self {
+            handlers: build_handler_map(&[
+                (0, None, "ShutdownSystem"),
+                (1, None, "RebootSystem"),
+                (2, None, "GetWakeupReason"),
+                (3, None, "GetShutdownReason"),
+                (4, None, "GetAcOk"),
+                (5, None, "GetPowerEvent"),
+            ]),
+            handlers_tipc: BTreeMap::new(),
+        }
+    }
+}
+
+impl SessionRequestHandler for BpcC {
+    fn handle_sync_request(&self, ctx: &mut HLERequestContext) -> ResultCode {
+        ServiceFramework::handle_sync_request_impl(self, ctx)
+    }
+
+    fn service_name(&self) -> &str {
+        "bpc:c"
+    }
+}
+
+impl ServiceFramework for BpcC {
+    fn get_service_name(&self) -> &str {
+        "bpc:c"
+    }
+
+    fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers
+    }
+
+    fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers_tipc
+    }
+}
+
+pub struct BpcB {
+    handlers: BTreeMap<u32, FunctionInfo>,
+    handlers_tipc: BTreeMap<u32, FunctionInfo>,
+}
+
+impl BpcB {
+    pub fn new() -> Self {
+        Self {
+            handlers: build_handler_map(&[
+                (0, None, "GetSleepButtonState"),
+                (1, None, "GetPowerButtonEvent"),
+            ]),
+            handlers_tipc: BTreeMap::new(),
+        }
+    }
+}
+
+impl SessionRequestHandler for BpcB {
+    fn handle_sync_request(&self, ctx: &mut HLERequestContext) -> ResultCode {
+        ServiceFramework::handle_sync_request_impl(self, ctx)
+    }
+
+    fn service_name(&self) -> &str {
+        "bpc:b"
+    }
+}
+
+impl ServiceFramework for BpcB {
+    fn get_service_name(&self) -> &str {
+        "bpc:b"
+    }
+
+    fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers
+    }
+
+    fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers_tipc
+    }
+}
+
+pub struct BpcW {
+    handlers: BTreeMap<u32, FunctionInfo>,
+    handlers_tipc: BTreeMap<u32, FunctionInfo>,
+}
+
+impl BpcW {
+    pub fn new() -> Self {
+        Self {
+            handlers: build_handler_map(&[
+                (0, None, "CreateWakeupTimer"),
+                (1, None, "CancelWakeupTimer"),
+                (2, None, "EnableWakeupTimerOnDevice"),
+            ]),
+            handlers_tipc: BTreeMap::new(),
+        }
+    }
+}
+
+impl SessionRequestHandler for BpcW {
+    fn handle_sync_request(&self, ctx: &mut HLERequestContext) -> ResultCode {
+        ServiceFramework::handle_sync_request_impl(self, ctx)
+    }
+
+    fn service_name(&self) -> &str {
+        "bpc:w"
+    }
+}
+
+impl ServiceFramework for BpcW {
+    fn get_service_name(&self) -> &str {
+        "bpc:w"
+    }
+
+    fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers
+    }
+
+    fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers_tipc
+    }
+}
 
 /// Registers "bpc" and "bpc:r" services.
 ///

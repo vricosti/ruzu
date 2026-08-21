@@ -1,5 +1,21 @@
 # Porting State
 
+## 2026-08-21 — NCM content-service parity
+
+- Status: completed and verified.
+- Interrupted slice: port `IContentStorage`, `IContentMetaDatabase`, and the
+  `NCM::OpenContent*` handlers from `core/hle/service/ncm/ncm.cpp`.
+- Prerequisite result: storage selection, mutable NAND/SDMC caches,
+  placeholder registration, registered-content deletion and raw NCA install
+  now live in their upstream-owned filesystem modules. Game-card registered
+  and placeholder caches are also constructed and selected as upstream does.
+- Resumed result: all eight NCM interfaces expose the same command tables as
+  Eden and the same 12 commands have concrete handlers. Placeholder mutation,
+  metadata staging/commit and child-interface creation use the real caches.
+- Follow-up audit result: `RegisteredCache::InstallEntry`,
+  `IterateAllMetadata`, `PlaceholderCache::GetRightsID`, and the SDMC NAX
+  parsing callback are ported and covered by focused cache tests.
+
 ## 2026-08-05 — Controls Motion / Touch configuration
 
 - Status: completed and verified.

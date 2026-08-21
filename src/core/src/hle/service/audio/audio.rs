@@ -11,140 +11,427 @@ use crate::hle::service::hle_ipc::{
 use crate::hle::service::server_manager::ServerManager;
 use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
 
-macro_rules! define_stub_service {
-    ($type:ident, $service_name:literal, [$(($id:expr, $name:literal)),* $(,)?]) => {
-        pub struct $type {
-            handlers: BTreeMap<u32, FunctionInfo>,
-            handlers_tipc: BTreeMap<u32, FunctionInfo>,
-        }
-
-        impl $type {
-            pub fn new() -> Self {
-                Self {
-                    handlers: build_handler_map(&[$(($id, None, $name)),*]),
-                    handlers_tipc: BTreeMap::new(),
-                }
-            }
-        }
-
-        impl SessionRequestHandler for $type {
-            fn handle_sync_request(&self, ctx: &mut HLERequestContext) -> ResultCode {
-                ServiceFramework::handle_sync_request_impl(self, ctx)
-            }
-
-            fn service_name(&self) -> &str {
-                $service_name
-            }
-        }
-
-        impl ServiceFramework for $type {
-            fn get_service_name(&self) -> &str {
-                $service_name
-            }
-
-            fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> {
-                &self.handlers
-            }
-
-            fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
-                &self.handlers_tipc
-            }
-        }
-    };
+pub struct IAudioOutManagerForApplet {
+    handlers: BTreeMap<u32, FunctionInfo>,
+    handlers_tipc: BTreeMap<u32, FunctionInfo>,
 }
 
-define_stub_service!(
-    IAudioOutManagerForApplet,
-    "audout:a",
-    [
-        (0, "RequestSuspend"),
-        (1, "RequestResume"),
-        (2, "GetProcessMasterVolume"),
-        (3, "SetProcessMasterVolume"),
-        (4, "GetProcessRecordVolume"),
-        (5, "SetProcessRecordVolume")
-    ]
-);
-define_stub_service!(
-    IAudioSnoopManager,
-    "auddev",
-    [
-        (0, "GetDspStatistics"),
-        (1, "GetAppletStateSummaries"),
-        (2, "SetDspStatisticsParameter"),
-        (3, "GetDspStatisticsParameter"),
-        (6, "GetDspUsage")
-    ]
-);
-define_stub_service!(
-    IAudioInManagerForApplet,
-    "audin:a",
-    [
-        (0, "RequestSuspend"),
-        (1, "RequestResume"),
-        (2, "GetProcessMasterVolume"),
-        (3, "SetProcessMasterVolume")
-    ]
-);
-define_stub_service!(
-    IAudioRendererManagerForApplet,
-    "audren:a",
-    [
-        (0, "RequestSuspend"),
-        (1, "RequestResume"),
-        (2, "GetProcessMasterVolume"),
-        (3, "SetProcessMasterVolume"),
-        (4, "RegisterAppletResourceUserId"),
-        (5, "UnregisterAppletResourceUserId"),
-        (6, "GetProcessRecordVolume"),
-        (7, "SetProcessRecordVolume")
-    ]
-);
-define_stub_service!(
-    IAudioOutManagerForDebugger,
-    "audout:d",
-    [(0, "RequestSuspend"), (1, "RequestResume")]
-);
-define_stub_service!(
-    IAudioInManagerForDebugger,
-    "audin:d",
-    [(0, "RequestSuspend"), (1, "RequestResume")]
-);
-define_stub_service!(
-    IFinalOutputRecorderManagerForDebugger,
-    "audrec:d",
-    [(0, "RequestSuspend"), (1, "RequestResume")]
-);
-define_stub_service!(
-    IAudioRendererManagerForDebugger,
-    "audren:d",
-    [(0, "RequestSuspend"), (1, "RequestResume")]
-);
-define_stub_service!(
-    IAudioSystemManagerForApplet,
-    "aud:a",
-    [
-        (0, "RegisterAppletResourceUserId"),
-        (1, "UnregisterAppletResourceUserId"),
-        (2, "RequestSuspendAudio"),
-        (3, "RequestResumeAudio"),
-        (4, "GetAudioOutputProcessMasterVolume"),
-        (5, "SetAudioOutputProcessMasterVolume"),
-        (6, "GetAudioInputProcessMasterVolume"),
-        (7, "SetAudioInputProcessMasterVolume"),
-        (8, "GetAudioOutputProcessRecordVolume"),
-        (9, "SetAudioOutputProcessRecordVolume"),
-        (10, "GetAppletStateSummaries")
-    ]
-);
-define_stub_service!(
-    IAudioSystemManagerForDebugger,
-    "aud:d",
-    [
-        (0, "RequestSuspendAudioForDebug"),
-        (1, "RequestResumeAudioForDebug")
-    ]
-);
+impl IAudioOutManagerForApplet {
+    pub fn new() -> Self {
+        Self {
+            handlers: build_handler_map(&[
+                (0, None, "RequestSuspend"),
+                (1, None, "RequestResume"),
+                (2, None, "GetProcessMasterVolume"),
+                (3, None, "SetProcessMasterVolume"),
+                (4, None, "GetProcessRecordVolume"),
+                (5, None, "SetProcessRecordVolume"),
+            ]),
+            handlers_tipc: BTreeMap::new(),
+        }
+    }
+}
+
+impl SessionRequestHandler for IAudioOutManagerForApplet {
+    fn handle_sync_request(&self, ctx: &mut HLERequestContext) -> ResultCode {
+        ServiceFramework::handle_sync_request_impl(self, ctx)
+    }
+
+    fn service_name(&self) -> &str {
+        "audout:a"
+    }
+}
+
+impl ServiceFramework for IAudioOutManagerForApplet {
+    fn get_service_name(&self) -> &str {
+        "audout:a"
+    }
+
+    fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers
+    }
+
+    fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers_tipc
+    }
+}
+
+pub struct IAudioSnoopManager {
+    handlers: BTreeMap<u32, FunctionInfo>,
+    handlers_tipc: BTreeMap<u32, FunctionInfo>,
+}
+
+impl IAudioSnoopManager {
+    pub fn new() -> Self {
+        Self {
+            handlers: build_handler_map(&[
+                (0, None, "GetDspStatistics"),
+                (1, None, "GetAppletStateSummaries"),
+                (2, None, "SetDspStatisticsParameter"),
+                (3, None, "GetDspStatisticsParameter"),
+                (6, None, "GetDspUsage"),
+            ]),
+            handlers_tipc: BTreeMap::new(),
+        }
+    }
+}
+
+impl SessionRequestHandler for IAudioSnoopManager {
+    fn handle_sync_request(&self, ctx: &mut HLERequestContext) -> ResultCode {
+        ServiceFramework::handle_sync_request_impl(self, ctx)
+    }
+
+    fn service_name(&self) -> &str {
+        "auddev"
+    }
+}
+
+impl ServiceFramework for IAudioSnoopManager {
+    fn get_service_name(&self) -> &str {
+        "auddev"
+    }
+
+    fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers
+    }
+
+    fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers_tipc
+    }
+}
+
+pub struct IAudioInManagerForApplet {
+    handlers: BTreeMap<u32, FunctionInfo>,
+    handlers_tipc: BTreeMap<u32, FunctionInfo>,
+}
+
+impl IAudioInManagerForApplet {
+    pub fn new() -> Self {
+        Self {
+            handlers: build_handler_map(&[
+                (0, None, "RequestSuspend"),
+                (1, None, "RequestResume"),
+                (2, None, "GetProcessMasterVolume"),
+                (3, None, "SetProcessMasterVolume"),
+            ]),
+            handlers_tipc: BTreeMap::new(),
+        }
+    }
+}
+
+impl SessionRequestHandler for IAudioInManagerForApplet {
+    fn handle_sync_request(&self, ctx: &mut HLERequestContext) -> ResultCode {
+        ServiceFramework::handle_sync_request_impl(self, ctx)
+    }
+
+    fn service_name(&self) -> &str {
+        "audin:a"
+    }
+}
+
+impl ServiceFramework for IAudioInManagerForApplet {
+    fn get_service_name(&self) -> &str {
+        "audin:a"
+    }
+
+    fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers
+    }
+
+    fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers_tipc
+    }
+}
+
+pub struct IAudioRendererManagerForApplet {
+    handlers: BTreeMap<u32, FunctionInfo>,
+    handlers_tipc: BTreeMap<u32, FunctionInfo>,
+}
+
+impl IAudioRendererManagerForApplet {
+    pub fn new() -> Self {
+        Self {
+            handlers: build_handler_map(&[
+                (0, None, "RequestSuspend"),
+                (1, None, "RequestResume"),
+                (2, None, "GetProcessMasterVolume"),
+                (3, None, "SetProcessMasterVolume"),
+                (4, None, "RegisterAppletResourceUserId"),
+                (5, None, "UnregisterAppletResourceUserId"),
+                (6, None, "GetProcessRecordVolume"),
+                (7, None, "SetProcessRecordVolume"),
+            ]),
+            handlers_tipc: BTreeMap::new(),
+        }
+    }
+}
+
+impl SessionRequestHandler for IAudioRendererManagerForApplet {
+    fn handle_sync_request(&self, ctx: &mut HLERequestContext) -> ResultCode {
+        ServiceFramework::handle_sync_request_impl(self, ctx)
+    }
+
+    fn service_name(&self) -> &str {
+        "audren:a"
+    }
+}
+
+impl ServiceFramework for IAudioRendererManagerForApplet {
+    fn get_service_name(&self) -> &str {
+        "audren:a"
+    }
+
+    fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers
+    }
+
+    fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers_tipc
+    }
+}
+
+pub struct IAudioOutManagerForDebugger {
+    handlers: BTreeMap<u32, FunctionInfo>,
+    handlers_tipc: BTreeMap<u32, FunctionInfo>,
+}
+
+impl IAudioOutManagerForDebugger {
+    pub fn new() -> Self {
+        Self {
+            handlers: build_handler_map(&[(0, None, "RequestSuspend"), (1, None, "RequestResume")]),
+            handlers_tipc: BTreeMap::new(),
+        }
+    }
+}
+
+impl SessionRequestHandler for IAudioOutManagerForDebugger {
+    fn handle_sync_request(&self, ctx: &mut HLERequestContext) -> ResultCode {
+        ServiceFramework::handle_sync_request_impl(self, ctx)
+    }
+
+    fn service_name(&self) -> &str {
+        "audout:d"
+    }
+}
+
+impl ServiceFramework for IAudioOutManagerForDebugger {
+    fn get_service_name(&self) -> &str {
+        "audout:d"
+    }
+
+    fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers
+    }
+
+    fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers_tipc
+    }
+}
+
+pub struct IAudioInManagerForDebugger {
+    handlers: BTreeMap<u32, FunctionInfo>,
+    handlers_tipc: BTreeMap<u32, FunctionInfo>,
+}
+
+impl IAudioInManagerForDebugger {
+    pub fn new() -> Self {
+        Self {
+            handlers: build_handler_map(&[(0, None, "RequestSuspend"), (1, None, "RequestResume")]),
+            handlers_tipc: BTreeMap::new(),
+        }
+    }
+}
+
+impl SessionRequestHandler for IAudioInManagerForDebugger {
+    fn handle_sync_request(&self, ctx: &mut HLERequestContext) -> ResultCode {
+        ServiceFramework::handle_sync_request_impl(self, ctx)
+    }
+
+    fn service_name(&self) -> &str {
+        "audin:d"
+    }
+}
+
+impl ServiceFramework for IAudioInManagerForDebugger {
+    fn get_service_name(&self) -> &str {
+        "audin:d"
+    }
+
+    fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers
+    }
+
+    fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers_tipc
+    }
+}
+
+pub struct IFinalOutputRecorderManagerForDebugger {
+    handlers: BTreeMap<u32, FunctionInfo>,
+    handlers_tipc: BTreeMap<u32, FunctionInfo>,
+}
+
+impl IFinalOutputRecorderManagerForDebugger {
+    pub fn new() -> Self {
+        Self {
+            handlers: build_handler_map(&[(0, None, "RequestSuspend"), (1, None, "RequestResume")]),
+            handlers_tipc: BTreeMap::new(),
+        }
+    }
+}
+
+impl SessionRequestHandler for IFinalOutputRecorderManagerForDebugger {
+    fn handle_sync_request(&self, ctx: &mut HLERequestContext) -> ResultCode {
+        ServiceFramework::handle_sync_request_impl(self, ctx)
+    }
+
+    fn service_name(&self) -> &str {
+        "audrec:d"
+    }
+}
+
+impl ServiceFramework for IFinalOutputRecorderManagerForDebugger {
+    fn get_service_name(&self) -> &str {
+        "audrec:d"
+    }
+
+    fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers
+    }
+
+    fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers_tipc
+    }
+}
+
+pub struct IAudioRendererManagerForDebugger {
+    handlers: BTreeMap<u32, FunctionInfo>,
+    handlers_tipc: BTreeMap<u32, FunctionInfo>,
+}
+
+impl IAudioRendererManagerForDebugger {
+    pub fn new() -> Self {
+        Self {
+            handlers: build_handler_map(&[(0, None, "RequestSuspend"), (1, None, "RequestResume")]),
+            handlers_tipc: BTreeMap::new(),
+        }
+    }
+}
+
+impl SessionRequestHandler for IAudioRendererManagerForDebugger {
+    fn handle_sync_request(&self, ctx: &mut HLERequestContext) -> ResultCode {
+        ServiceFramework::handle_sync_request_impl(self, ctx)
+    }
+
+    fn service_name(&self) -> &str {
+        "audren:d"
+    }
+}
+
+impl ServiceFramework for IAudioRendererManagerForDebugger {
+    fn get_service_name(&self) -> &str {
+        "audren:d"
+    }
+
+    fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers
+    }
+
+    fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers_tipc
+    }
+}
+
+pub struct IAudioSystemManagerForApplet {
+    handlers: BTreeMap<u32, FunctionInfo>,
+    handlers_tipc: BTreeMap<u32, FunctionInfo>,
+}
+
+impl IAudioSystemManagerForApplet {
+    pub fn new() -> Self {
+        Self {
+            handlers: build_handler_map(&[
+                (0, None, "RegisterAppletResourceUserId"),
+                (1, None, "UnregisterAppletResourceUserId"),
+                (2, None, "RequestSuspendAudio"),
+                (3, None, "RequestResumeAudio"),
+                (4, None, "GetAudioOutputProcessMasterVolume"),
+                (5, None, "SetAudioOutputProcessMasterVolume"),
+                (6, None, "GetAudioInputProcessMasterVolume"),
+                (7, None, "SetAudioInputProcessMasterVolume"),
+                (8, None, "GetAudioOutputProcessRecordVolume"),
+                (9, None, "SetAudioOutputProcessRecordVolume"),
+                (10, None, "GetAppletStateSummaries"),
+            ]),
+            handlers_tipc: BTreeMap::new(),
+        }
+    }
+}
+
+impl SessionRequestHandler for IAudioSystemManagerForApplet {
+    fn handle_sync_request(&self, ctx: &mut HLERequestContext) -> ResultCode {
+        ServiceFramework::handle_sync_request_impl(self, ctx)
+    }
+
+    fn service_name(&self) -> &str {
+        "aud:a"
+    }
+}
+
+impl ServiceFramework for IAudioSystemManagerForApplet {
+    fn get_service_name(&self) -> &str {
+        "aud:a"
+    }
+
+    fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers
+    }
+
+    fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers_tipc
+    }
+}
+
+pub struct IAudioSystemManagerForDebugger {
+    handlers: BTreeMap<u32, FunctionInfo>,
+    handlers_tipc: BTreeMap<u32, FunctionInfo>,
+}
+
+impl IAudioSystemManagerForDebugger {
+    pub fn new() -> Self {
+        Self {
+            handlers: build_handler_map(&[
+                (0, None, "RequestSuspendAudioForDebug"),
+                (1, None, "RequestResumeAudioForDebug"),
+            ]),
+            handlers_tipc: BTreeMap::new(),
+        }
+    }
+}
+
+impl SessionRequestHandler for IAudioSystemManagerForDebugger {
+    fn handle_sync_request(&self, ctx: &mut HLERequestContext) -> ResultCode {
+        ServiceFramework::handle_sync_request_impl(self, ctx)
+    }
+
+    fn service_name(&self) -> &str {
+        "aud:d"
+    }
+}
+
+impl ServiceFramework for IAudioSystemManagerForDebugger {
+    fn get_service_name(&self) -> &str {
+        "aud:d"
+    }
+
+    fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers
+    }
+
+    fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers_tipc
+    }
+}
 
 /// Registers all audio services and runs the server.
 ///

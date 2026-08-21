@@ -14,37 +14,122 @@ use crate::hle::service::hle_ipc::{
 use crate::hle::service::ipc_helpers::ResponseBuilder;
 use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
 
-macro_rules! define_stub_service {
-    ($type:ident, $service:literal, [$(($id:expr, $command:literal)),* $(,)?]) => {
-        pub struct $type { handlers: BTreeMap<u32, FunctionInfo>, handlers_tipc: BTreeMap<u32, FunctionInfo> }
-        impl $type { pub fn new() -> Self { Self { handlers: build_handler_map(&[$(($id, None, $command)),*]), handlers_tipc: BTreeMap::new() } } }
-        impl SessionRequestHandler for $type {
-            fn handle_sync_request(&self, ctx: &mut HLERequestContext) -> ResultCode { ServiceFramework::handle_sync_request_impl(self, ctx) }
-            fn service_name(&self) -> &str { $service }
-        }
-        impl ServiceFramework for $type {
-            fn get_service_name(&self) -> &str { $service }
-            fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> { &self.handlers }
-            fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> { &self.handlers_tipc }
-        }
-    };
+pub struct IPdManufactureManager {
+    handlers: BTreeMap<u32, FunctionInfo>,
+    handlers_tipc: BTreeMap<u32, FunctionInfo>,
 }
 
-define_stub_service!(
-    IPdManufactureManager,
-    "usb:pd:m",
-    [(0, "OpenManufactureSession")]
-);
-define_stub_service!(
-    IQdbManager,
-    "usb:qdb",
-    [(0, "ImportQuirkDevices"), (1, "HasQuirk")]
-);
-define_stub_service!(
-    IPmObserverService,
-    "usb:obsv",
-    [(0, "GetTopologyChangeEvent"), (1, "GetFlattenedTopology")]
-);
+impl IPdManufactureManager {
+    pub fn new() -> Self {
+        Self {
+            handlers: build_handler_map(&[(0, None, "OpenManufactureSession")]),
+            handlers_tipc: BTreeMap::new(),
+        }
+    }
+}
+
+impl SessionRequestHandler for IPdManufactureManager {
+    fn handle_sync_request(&self, ctx: &mut HLERequestContext) -> ResultCode {
+        ServiceFramework::handle_sync_request_impl(self, ctx)
+    }
+
+    fn service_name(&self) -> &str {
+        "usb:pd:m"
+    }
+}
+
+impl ServiceFramework for IPdManufactureManager {
+    fn get_service_name(&self) -> &str {
+        "usb:pd:m"
+    }
+
+    fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers
+    }
+
+    fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers_tipc
+    }
+}
+
+pub struct IQdbManager {
+    handlers: BTreeMap<u32, FunctionInfo>,
+    handlers_tipc: BTreeMap<u32, FunctionInfo>,
+}
+
+impl IQdbManager {
+    pub fn new() -> Self {
+        Self {
+            handlers: build_handler_map(&[(0, None, "ImportQuirkDevices"), (1, None, "HasQuirk")]),
+            handlers_tipc: BTreeMap::new(),
+        }
+    }
+}
+
+impl SessionRequestHandler for IQdbManager {
+    fn handle_sync_request(&self, ctx: &mut HLERequestContext) -> ResultCode {
+        ServiceFramework::handle_sync_request_impl(self, ctx)
+    }
+
+    fn service_name(&self) -> &str {
+        "usb:qdb"
+    }
+}
+
+impl ServiceFramework for IQdbManager {
+    fn get_service_name(&self) -> &str {
+        "usb:qdb"
+    }
+
+    fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers
+    }
+
+    fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers_tipc
+    }
+}
+
+pub struct IPmObserverService {
+    handlers: BTreeMap<u32, FunctionInfo>,
+    handlers_tipc: BTreeMap<u32, FunctionInfo>,
+}
+
+impl IPmObserverService {
+    pub fn new() -> Self {
+        Self {
+            handlers: build_handler_map(&[
+                (0, None, "GetTopologyChangeEvent"),
+                (1, None, "GetFlattenedTopology"),
+            ]),
+            handlers_tipc: BTreeMap::new(),
+        }
+    }
+}
+
+impl SessionRequestHandler for IPmObserverService {
+    fn handle_sync_request(&self, ctx: &mut HLERequestContext) -> ResultCode {
+        ServiceFramework::handle_sync_request_impl(self, ctx)
+    }
+
+    fn service_name(&self) -> &str {
+        "usb:obsv"
+    }
+}
+
+impl ServiceFramework for IPmObserverService {
+    fn get_service_name(&self) -> &str {
+        "usb:obsv"
+    }
+
+    fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers
+    }
+
+    fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers_tipc
+    }
+}
 
 /// IPC command IDs for IDsInterface
 pub mod ds_interface_commands {
@@ -665,7 +750,12 @@ pub fn loop_process(system: crate::core::SystemRef) {
                 16,
             );
         }
-        if crate::hle::api_version::HOS_VERSION_MAJOR >= 8 {
+        if crate::hle::service::set::system_settings_server::get_firmware_version_impl(
+            crate::hle::service::set::settings_types::GetFirmwareVersionType::Version1,
+        )
+        .major
+            >= 8
+        {
             server_manager.register_named_service(
                 "usb:obsv",
                 Box::new(|| -> SessionRequestHandlerPtr {

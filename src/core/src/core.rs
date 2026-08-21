@@ -11,7 +11,9 @@ use crate::core_timing::CoreTiming;
 use crate::cpu_manager::CpuManager;
 use crate::device_memory::DeviceMemory;
 use crate::file_sys::fs_filesystem::OpenMode;
+use crate::file_sys::vfs::vfs_concat::ConcatenatedVfsFile;
 use crate::file_sys::vfs::vfs_real::RealVfsFilesystem;
+use crate::file_sys::vfs::vfs_types::VirtualFile;
 use crate::gpu_dirty_memory_manager::GpuDirtyMemoryManager;
 use crate::hardware_properties;
 use crate::hle::kernel::k_process::SharedProcessMemory;
@@ -37,6 +39,36 @@ use parking_lot::Mutex;
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
+
+/// Open a game file, joining the standard `00`, `01`, …, `0F` FAT32 split
+/// layout and resolving extracted-directory launches through their `main`
+/// file. Port of upstream `Core::GetGameFileFromPath` in `core.cpp`.
+pub fn get_game_file_from_path(vfs: &Arc<RealVfsFilesystem>, path: &str) -> Option<VirtualFile> {
+    let split_at = path.rfind(|character| character == '/' || character as u32 == 0x5c);
+    let (directory_name, filename) = match split_at {
+        Some(index) => (&path[..index], &path[index + 1..]),
+        None => ("", path),
+    };
+
+    if filename == "00" {
+        let directory = vfs.arc_open_directory(directory_name, OpenMode::READ)?;
+        let mut parts = Vec::new();
+        for index in 0..0x10_u32 {
+            let part_name = format!("{index:02X}");
+            let Some(part) = directory.get_file(&part_name) else {
+                break;
+            };
+            parts.push(part);
+        }
+        return ConcatenatedVfsFile::make_concatenated_file(directory.get_name(), parts);
+    }
+
+    if std::path::Path::new(path).is_dir() {
+        return vfs.arc_open_file(&format!("{path}/main"), OpenMode::READ);
+    }
+
+    vfs.arc_open_file(path, OpenMode::READ)
+}
 
 /// Enumeration representing the return values of the System Initialize and Load process.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1590,7 +1622,7 @@ impl System {
             .expect("VFS must be created in initialize()");
 
         // Open the game file.
-        let file = match vfs.arc_open_file(filepath, OpenMode::READ) {
+        let file = match get_game_file_from_path(vfs, filepath) {
             Some(f) => f,
             None => {
                 log::error!("Failed to open ROM file: {}", filepath);
@@ -1863,6 +1895,49 @@ impl System {
             }
 
             self.current_process_arc = Some(process_arc);
+        }
+
+        // Port of the game-card setup in `System::Impl::Load`: only expose an
+        // XCI through the filesystem controller when the configured virtual
+        // game card is inserted.
+        let (gamecard_inserted, gamecard_current_game, configured_gamecard_path) = {
+            let values = common::settings::values();
+            (
+                *values.gamecard_inserted.get_value(),
+                *values.gamecard_current_game.get_value(),
+                values.gamecard_path.get_value().clone(),
+            )
+        };
+        if gamecard_inserted {
+            if gamecard_current_game {
+                if let Some(file) = self
+                    .virtual_filesystem
+                    .as_ref()
+                    .and_then(|vfs| get_game_file_from_path(vfs, filepath))
+                {
+                    self.filesystem_controller
+                        .lock()
+                        .unwrap()
+                        .set_game_card(file);
+                } else {
+                    log::error!("Failed to open current game as game-card image: {filepath}");
+                }
+            } else if !configured_gamecard_path.is_empty() {
+                if let Some(file) = self
+                    .virtual_filesystem
+                    .as_ref()
+                    .and_then(|vfs| get_game_file_from_path(vfs, &configured_gamecard_path))
+                {
+                    self.filesystem_controller
+                        .lock()
+                        .unwrap()
+                        .set_game_card(file);
+                } else {
+                    log::error!(
+                        "Failed to open configured game-card image: {configured_gamecard_path}"
+                    );
+                }
+            }
         }
 
         // Maps to upstream `System::Impl::Load`: performance counters become
@@ -2849,8 +2924,33 @@ impl Default for System {
 #[cfg(test)]
 mod exit_state_tests {
     use super::*;
+    use std::fs;
     use std::sync::atomic::AtomicUsize;
-    use std::time::{Duration, Instant};
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn game_file_helper_handles_fat32_parts_and_extracted_directories() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let base = std::env::temp_dir().join(format!("ruzu-homebrew-split-{unique}"));
+        fs::create_dir_all(&base).unwrap();
+        fs::write(base.join("00"), [0x11, 0x22]).unwrap();
+        fs::write(base.join("01"), [0x33, 0x44, 0x55]).unwrap();
+        fs::write(base.join("main"), [0x66, 0x77]).unwrap();
+
+        let vfs = RealVfsFilesystem::new();
+        let game = get_game_file_from_path(&vfs, base.join("00").to_str().unwrap()).unwrap();
+
+        assert_eq!(game.get_size(), 5);
+        assert_eq!(game.read_all_bytes(), vec![0x11, 0x22, 0x33, 0x44, 0x55]);
+
+        let extracted = get_game_file_from_path(&vfs, base.to_str().unwrap()).unwrap();
+        assert_eq!(extracted.read_all_bytes(), vec![0x66, 0x77]);
+
+        fs::remove_dir_all(base).unwrap();
+    }
 
     #[test]
     fn exit_lock_handle_tracks_system_state() {

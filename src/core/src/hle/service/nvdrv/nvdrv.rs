@@ -426,62 +426,144 @@ impl Module {
     }
 }
 
-macro_rules! define_stub_service {
-    ($type:ident, $service:literal, [$(($id:expr, $command:literal)),* $(,)?]) => {
-        pub struct $type { handlers: BTreeMap<u32, FunctionInfo>, handlers_tipc: BTreeMap<u32, FunctionInfo> }
-        impl $type { pub fn new() -> Self { Self { handlers: build_handler_map(&[$(($id, None, $command)),*]), handlers_tipc: BTreeMap::new() } } }
-        impl SessionRequestHandler for $type {
-            fn handle_sync_request(&self, ctx: &mut HLERequestContext) -> ResultCode { ServiceFramework::handle_sync_request_impl(self, ctx) }
-            fn service_name(&self) -> &str { $service }
-        }
-        impl ServiceFramework for $type {
-            fn get_service_name(&self) -> &str { $service }
-            fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> { &self.handlers }
-            fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> { &self.handlers_tipc }
-        }
-    };
+pub struct NvgemC {
+    handlers: BTreeMap<u32, FunctionInfo>,
+    handlers_tipc: BTreeMap<u32, FunctionInfo>,
 }
 
-define_stub_service!(
-    NvgemC,
-    "nvgem:c",
-    [
-        (0, "Initialize"),
-        (1, "GetEventHandle"),
-        (2, "ControlNotification"),
-        (3, "SetNotificationPerm"),
-        (4, "SetCoreDumpPerm"),
-        (5, "GetAruid"),
-        (6, "Reset"),
-        (7, "GetAruid2")
-    ]
-);
-define_stub_service!(
-    NvgemCd,
-    "nvgem:cd",
-    [
-        (0, "Initialize"),
-        (1, "GetAruid"),
-        (2, "ReadNextBlock"),
-        (3, "GetNextBlockSize"),
-        (4, "ReadNextBlock2")
-    ]
-);
-define_stub_service!(
-    NvdbgD,
-    "nvdbg:d",
-    [
-        (0, "Open"),
-        (1, "Ioctl"),
-        (2, "Close"),
-        (4, "QueryEvent"),
-        (9, "DumpStatus"),
-        (10, "InitializeDevtools"),
-        (11, "Ioctl2"),
-        (12, "Ioctl3"),
-        (13, "SetConfiguration")
-    ]
-);
+impl NvgemC {
+    pub fn new() -> Self {
+        Self {
+            handlers: build_handler_map(&[
+                (0, None, "Initialize"),
+                (1, None, "GetEventHandle"),
+                (2, None, "ControlNotification"),
+                (3, None, "SetNotificationPerm"),
+                (4, None, "SetCoreDumpPerm"),
+                (5, None, "GetAruid"),
+                (6, None, "Reset"),
+                (7, None, "GetAruid2"),
+            ]),
+            handlers_tipc: BTreeMap::new(),
+        }
+    }
+}
+
+impl SessionRequestHandler for NvgemC {
+    fn handle_sync_request(&self, ctx: &mut HLERequestContext) -> ResultCode {
+        ServiceFramework::handle_sync_request_impl(self, ctx)
+    }
+
+    fn service_name(&self) -> &str {
+        "nvgem:c"
+    }
+}
+
+impl ServiceFramework for NvgemC {
+    fn get_service_name(&self) -> &str {
+        "nvgem:c"
+    }
+
+    fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers
+    }
+
+    fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers_tipc
+    }
+}
+
+pub struct NvgemCd {
+    handlers: BTreeMap<u32, FunctionInfo>,
+    handlers_tipc: BTreeMap<u32, FunctionInfo>,
+}
+
+impl NvgemCd {
+    pub fn new() -> Self {
+        Self {
+            handlers: build_handler_map(&[
+                (0, None, "Initialize"),
+                (1, None, "GetAruid"),
+                (2, None, "ReadNextBlock"),
+                (3, None, "GetNextBlockSize"),
+                (4, None, "ReadNextBlock2"),
+            ]),
+            handlers_tipc: BTreeMap::new(),
+        }
+    }
+}
+
+impl SessionRequestHandler for NvgemCd {
+    fn handle_sync_request(&self, ctx: &mut HLERequestContext) -> ResultCode {
+        ServiceFramework::handle_sync_request_impl(self, ctx)
+    }
+
+    fn service_name(&self) -> &str {
+        "nvgem:cd"
+    }
+}
+
+impl ServiceFramework for NvgemCd {
+    fn get_service_name(&self) -> &str {
+        "nvgem:cd"
+    }
+
+    fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers
+    }
+
+    fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers_tipc
+    }
+}
+
+pub struct NvdbgD {
+    handlers: BTreeMap<u32, FunctionInfo>,
+    handlers_tipc: BTreeMap<u32, FunctionInfo>,
+}
+
+impl NvdbgD {
+    pub fn new() -> Self {
+        Self {
+            handlers: build_handler_map(&[
+                (0, None, "Open"),
+                (1, None, "Ioctl"),
+                (2, None, "Close"),
+                (4, None, "QueryEvent"),
+                (9, None, "DumpStatus"),
+                (10, None, "InitializeDevtools"),
+                (11, None, "Ioctl2"),
+                (12, None, "Ioctl3"),
+                (13, None, "SetConfiguration"),
+            ]),
+            handlers_tipc: BTreeMap::new(),
+        }
+    }
+}
+
+impl SessionRequestHandler for NvdbgD {
+    fn handle_sync_request(&self, ctx: &mut HLERequestContext) -> ResultCode {
+        ServiceFramework::handle_sync_request_impl(self, ctx)
+    }
+
+    fn service_name(&self) -> &str {
+        "nvdbg:d"
+    }
+}
+
+impl ServiceFramework for NvdbgD {
+    fn get_service_name(&self) -> &str {
+        "nvdbg:d"
+    }
+
+    fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers
+    }
+
+    fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers_tipc
+    }
+}
 
 /// Launches Nvidia services. Ownership matches Eden `nvdrv.cpp::LoopProcess`.
 pub fn loop_process(system: crate::core::SystemRef) {

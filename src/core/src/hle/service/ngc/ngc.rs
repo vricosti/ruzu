@@ -26,6 +26,8 @@ pub mod ngc_commands {
     pub const CHECK: u32 = 1;
     pub const MASK: u32 = 2;
     pub const RELOAD: u32 = 3;
+    pub const CHECK2: u32 = 4;
+    pub const MASK2: u32 = 5;
 }
 
 /// Upstream: `NgcContentVersion` constant.
@@ -213,6 +215,16 @@ impl NgcServiceImpl {
                     Some(NgcServiceImpl::reload_handler),
                     "Reload",
                 ),
+                (
+                    ngc_commands::CHECK2,
+                    Some(NgcServiceImpl::check_handler),
+                    "Check2",
+                ),
+                (
+                    ngc_commands::MASK2,
+                    Some(NgcServiceImpl::mask_handler),
+                    "Mask2",
+                ),
             ]),
             handlers_tipc: BTreeMap::new(),
         }
@@ -381,5 +393,25 @@ mod tests {
                 .collect::<Vec<_>>(),
             [0, 1, 100, 101, 110, 111, 112, 120, 130]
         );
+    }
+
+    #[test]
+    fn ngc_service_aliases_match_upstream() {
+        let service = NgcServiceImpl::new();
+        assert_eq!(service.handlers().len(), 6);
+        assert_eq!(service.handlers().get(&4).unwrap().name, "Check2");
+        assert_eq!(service.handlers().get(&5).unwrap().name, "Mask2");
+        assert!(service
+            .handlers()
+            .get(&4)
+            .unwrap()
+            .handler_callback
+            .is_some());
+        assert!(service
+            .handlers()
+            .get(&5)
+            .unwrap()
+            .handler_callback
+            .is_some());
     }
 }
