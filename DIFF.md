@@ -4363,3 +4363,11 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 - Rust's `&mut self` mutation methods exclude concurrent `&self` lookups at the type boundary, so
   it does not retain Eden's inner `config_mutex`; the cache owners must provide any cross-thread
   synchronization around the complete `ChannelSetupCaches` value.
+
+## 2026-08-21 — `src/video_core/src/host1x/ffmpeg/ffmpeg.rs` and `ffmpeg_shim.c` vs `src/video_core/host1x/ffmpeg.h` and `.cpp`
+
+### Intentional differences
+
+- The native C shim retains Eden's `DecoderContext::m_decoder` codec pointer inside
+  `RuzuFfmpegDecoder`; the Rust wrapper therefore does not duplicate that codec or hold a
+  self-referential borrow into `DecodeApi::decoder`.

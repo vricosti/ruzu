@@ -43,7 +43,6 @@ mod ffi {
             pts: i64,
             dts: i64,
         ) -> c_int;
-        pub fn ruzu_ffmpeg_decoder_receive_frame(decoder: *mut RuzuFfmpegDecoder) -> *mut AVFrame;
         pub fn ruzu_ffmpeg_decoder_receive_frame_with_hw_transfer(
             decoder: *mut RuzuFfmpegDecoder,
         ) -> *mut AVFrame;
@@ -284,15 +283,20 @@ impl Drop for HardwareContext {
 /// Port of `FFmpeg::DecoderContext`.
 pub struct DecoderContext {
     raw: *mut ffi::RuzuFfmpegDecoder,
-    codec: VideoCodec,
     decode_order: bool,
 }
 
 impl DecoderContext {
     pub fn new(decoder: &Decoder) -> Self {
+        let raw = unsafe { ffi::ruzu_ffmpeg_decoder_create(decoder.codec as u64) };
+        if raw.is_null() {
+            log::error!(
+                "FFmpeg::DecoderContext::new: failed to allocate codec {:?}",
+                decoder.codec
+            );
+        }
         Self {
-            raw: std::ptr::null_mut(),
-            codec: decoder.codec,
+            raw,
             decode_order: false,
         }
     }
@@ -302,23 +306,8 @@ impl DecoderContext {
         // side effects inside HardwareContext::initialize_for_decoder.
     }
 
-    fn prepare_context(&mut self, decoder: &Decoder) -> bool {
-        if !self.raw.is_null() {
-            return true;
-        }
-        self.raw = unsafe { ffi::ruzu_ffmpeg_decoder_create(decoder.codec as u64) };
+    pub fn open_context(&mut self, _decoder: &Decoder) -> bool {
         if self.raw.is_null() {
-            log::error!(
-                "FFmpeg::DecoderContext::prepare_context: failed to allocate codec {:?}",
-                decoder.codec
-            );
-            return false;
-        }
-        true
-    }
-
-    pub fn open_context(&mut self, decoder: &Decoder) -> bool {
-        if !self.prepare_context(decoder) {
             return false;
         }
         let ret = unsafe { ffi::ruzu_ffmpeg_decoder_open(self.raw) };
@@ -451,7 +440,7 @@ impl DecodeApi {
         self.reset();
         let decoder = Decoder::new(codec);
         let mut decoder_context = DecoderContext::new(&decoder);
-        if !decoder_context.prepare_context(&decoder) {
+        if decoder_context.raw.is_null() {
             return false;
         }
         if *common::settings::values().nvdec_emulation.get_value()
@@ -552,6 +541,14 @@ mod tests {
         let mut api = DecodeApi::new();
         assert!(api.initialize(VideoCodec::H264));
         assert!(!api.using_decode_order());
+    }
+
+    #[test]
+    fn decoder_context_allocates_native_context_during_construction() {
+        let decoder = Decoder::new(VideoCodec::H264);
+        let context = DecoderContext::new(&decoder);
+
+        assert!(!context.raw.is_null());
     }
 
     #[test]
