@@ -3,8 +3,6 @@
 //
 // Ported from: core/file_sys/fssystem/fssystem_hierarchical_sha3_storage.h / .cpp
 
-use std::sync::Mutex;
-
 use crate::file_sys::errors;
 use crate::file_sys::vfs::vfs::VfsFile;
 use crate::file_sys::vfs::vfs_types::{VirtualDir, VirtualFile};
@@ -32,7 +30,6 @@ pub struct HierarchicalSha3Storage {
     hash_buffer_size: usize,
     hash_target_block_size: i32,
     log_size_ratio: i32,
-    mutex: Mutex<()>,
 }
 
 impl HierarchicalSha3Storage {
@@ -47,7 +44,6 @@ impl HierarchicalSha3Storage {
             hash_buffer_size: 0,
             hash_target_block_size: 0,
             log_size_ratio: 0,
-            mutex: Mutex::new(()),
         }
     }
 
@@ -154,10 +150,49 @@ impl Default for HierarchicalSha3Storage {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::file_sys::vfs::vfs_vector::VectorVfsFile;
+    use std::sync::Arc;
 
     #[test]
     fn constants_match_upstream() {
         assert_eq!(HierarchicalSha3Storage::LAYER_COUNT, 3);
         assert_eq!(HierarchicalSha3Storage::HASH_SIZE, 32);
+    }
+
+    #[test]
+    fn initialized_storage_reads_from_the_data_layer() {
+        let master: VirtualFile = Arc::new(VectorVfsFile::new(
+            vec![0; HierarchicalSha3Storage::HASH_SIZE],
+            "master.sha3".to_string(),
+            None,
+        ));
+        let hashes: VirtualFile = Arc::new(VectorVfsFile::new(
+            vec![0; HierarchicalSha3Storage::HASH_SIZE],
+            "hashes.sha3".to_string(),
+            None,
+        ));
+        let data_bytes: Vec<u8> = (0..HierarchicalSha3Storage::HASH_SIZE)
+            .map(|value| value as u8)
+            .collect();
+        let data: VirtualFile = Arc::new(VectorVfsFile::new(
+            data_bytes.clone(),
+            "data.bin".to_string(),
+            None,
+        ));
+
+        let mut storage = HierarchicalSha3Storage::new();
+        storage
+            .initialize(
+                &[master, hashes, data],
+                HierarchicalSha3Storage::LAYER_COUNT,
+                HierarchicalSha3Storage::HASH_SIZE,
+                &[0; HierarchicalSha3Storage::HASH_SIZE],
+            )
+            .unwrap();
+
+        let mut output = [0; 8];
+        let output_size = output.len();
+        assert_eq!(storage.read(&mut output, output_size, 4), output_size);
+        assert_eq!(output, data_bytes[4..12]);
     }
 }

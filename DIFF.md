@@ -3603,3 +3603,28 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 
 - N/A: `AesXtsStorage` is an in-memory polymorphic storage object and is not serialized. Key and IV
   arrays retain Eden's exact `0x20` and `0x10` byte sizes.
+
+## 2026-08-21 — `src/core/src/file_sys/fssystem/hierarchical_sha3_storage.rs` vs Eden `src/core/file_sys/fssystem/{fssystem_hierarchical_sha3_storage.h,fssystem_hierarchical_sha3_storage.cpp}`
+
+### Intentional differences
+
+- Rust owns a copy of the caller-provided hash work buffer in a `Vec<u8>`; Eden retains and fills a
+  caller-owned raw pointer. The buffer is not consulted after initialization in either
+  implementation, while owned storage avoids an unsafe lifetime spanning the object.
+- Rust represents the not-yet-initialized base storage with `Option` and returns zero from safe
+  getters; Eden requires `Initialize` before `GetSize` or non-empty `Read`.
+- The unused mutex was removed. Eden declares and constructs `m_mutex` but never locks it in either
+  `Initialize` or `Read`, so the Rust field provided no synchronization or lifecycle behavior.
+
+### Unintentional differences (to fix)
+
+- None in the initialization bounds, layer selection, hash-buffer fill, size query, or pass-through
+  read paths audited here.
+
+### Missing items
+
+- None for the behavior present in Eden's current hierarchical SHA3 storage.
+
+### Binary layout verification
+
+- N/A: this storage object and its owned work buffer are not serialized.
