@@ -825,11 +825,8 @@ impl RasterizerVulkan {
         max_vertex_input_attributes: u32,
         max_vertex_input_bindings: u32,
         max_compute_work_group_count: [u32; 3],
-        vertex_attribute_divisor_supported: bool,
-        provoking_vertex_supported: bool,
         draw_indirect_count_supported: bool,
         push_descriptor_supported: bool,
-        max_push_descriptors: u32,
         syncpoints: Arc<SyncpointManager>,
         device_memory: Arc<MaxwellDeviceMemoryManager>,
         memory_allocator: &mut MemoryAllocator,
@@ -1465,7 +1462,7 @@ impl RasterizerVulkan {
     }
 
     fn should_wait_async_flushes(&self) -> bool {
-        let cache_wait = unsafe {
+        let cache_wait = {
             let texture_mutex: *const _ = &self.texture_cache.base.mutex;
             let buffer_mutex: *const _ = &self.common_buffer_cache.mutex;
             lock_two_reentrant_mutexes!(buffer_mutex, texture_mutex, _buffer_guard, _texture_guard);
@@ -1476,7 +1473,7 @@ impl RasterizerVulkan {
     }
 
     fn should_flush_async(&self) -> bool {
-        let cache_flush = unsafe {
+        let cache_flush = {
             let texture_mutex: *const _ = &self.texture_cache.base.mutex;
             let buffer_mutex: *const _ = &self.common_buffer_cache.mutex;
             lock_two_reentrant_mutexes!(buffer_mutex, texture_mutex, _buffer_guard, _texture_guard);
@@ -1487,7 +1484,7 @@ impl RasterizerVulkan {
     }
 
     fn pop_async_flushes(&mut self) {
-        unsafe {
+        {
             let texture_mutex: *const _ = &self.texture_cache.base.mutex;
             let buffer_mutex: *const _ = &self.common_buffer_cache.mutex;
             lock_two_reentrant_mutexes!(buffer_mutex, texture_mutex, _buffer_guard, _texture_guard);
@@ -1498,7 +1495,7 @@ impl RasterizerVulkan {
     }
 
     fn commit_async_flushes(&mut self) {
-        unsafe {
+        {
             let texture_mutex: *const _ = &self.texture_cache.base.mutex;
             let buffer_mutex: *const _ = &self.common_buffer_cache.mutex;
             lock_two_reentrant_mutexes!(buffer_mutex, texture_mutex, _buffer_guard, _texture_guard);
