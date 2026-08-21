@@ -683,6 +683,114 @@ pub fn emit_signed_div64(
     emit_div::<64, true>(code, ctx, inst_ref)
 }
 
+fn emit_max_min32(
+    code: &mut BlockOfCode,
+    ctx: &mut EmitContext<'_>,
+    inst_ref: InstRef,
+    cond: Cond,
+) -> Result<(), String> {
+    let args = ctx.reg_alloc.get_argument_info(ctx.block, inst_ref);
+
+    let mut result = ctx.reg_alloc.write_w(inst_ref);
+    let mut op1 = ctx.reg_alloc.read_w(args[0]);
+    let mut op2 = ctx.reg_alloc.read_w(args[1]);
+    RegAlloc::realize_all(code, ctx.block, &mut [&mut result, &mut op1, &mut op2])?;
+    ctx.reg_alloc.spill_flags(code)?;
+
+    let result = result.index().expect("realized W result") as u8;
+    let op1 = op1.index().expect("realized W op1") as u8;
+    let op2 = op2.index().expect("realized W op2") as u8;
+    code.write_u32(inst::cmp_w_reg(op1, op2))?;
+    code.write_u32(inst::csel_w(result, op1, op2, cond))?;
+    Ok(())
+}
+
+fn emit_max_min64(
+    code: &mut BlockOfCode,
+    ctx: &mut EmitContext<'_>,
+    inst_ref: InstRef,
+    cond: Cond,
+) -> Result<(), String> {
+    let args = ctx.reg_alloc.get_argument_info(ctx.block, inst_ref);
+
+    let mut result = ctx.reg_alloc.write_x(inst_ref);
+    let mut op1 = ctx.reg_alloc.read_x(args[0]);
+    let mut op2 = ctx.reg_alloc.read_x(args[1]);
+    RegAlloc::realize_all(code, ctx.block, &mut [&mut result, &mut op1, &mut op2])?;
+    ctx.reg_alloc.spill_flags(code)?;
+
+    let result = result.index().expect("realized X result") as u8;
+    let op1 = op1.index().expect("realized X op1") as u8;
+    let op2 = op2.index().expect("realized X op2") as u8;
+    code.write_u32(inst::cmp_x_reg(op1, op2))?;
+    code.write_u32(inst::csel_x(result, op1, op2, cond))?;
+    Ok(())
+}
+
+pub fn emit_max_signed32(
+    code: &mut BlockOfCode,
+    ctx: &mut EmitContext<'_>,
+    inst_ref: InstRef,
+) -> Result<(), String> {
+    emit_max_min32(code, ctx, inst_ref, Cond::GT)
+}
+
+pub fn emit_max_signed64(
+    code: &mut BlockOfCode,
+    ctx: &mut EmitContext<'_>,
+    inst_ref: InstRef,
+) -> Result<(), String> {
+    emit_max_min64(code, ctx, inst_ref, Cond::GT)
+}
+
+pub fn emit_max_unsigned32(
+    code: &mut BlockOfCode,
+    ctx: &mut EmitContext<'_>,
+    inst_ref: InstRef,
+) -> Result<(), String> {
+    emit_max_min32(code, ctx, inst_ref, Cond::HI)
+}
+
+pub fn emit_max_unsigned64(
+    code: &mut BlockOfCode,
+    ctx: &mut EmitContext<'_>,
+    inst_ref: InstRef,
+) -> Result<(), String> {
+    emit_max_min64(code, ctx, inst_ref, Cond::HI)
+}
+
+pub fn emit_min_signed32(
+    code: &mut BlockOfCode,
+    ctx: &mut EmitContext<'_>,
+    inst_ref: InstRef,
+) -> Result<(), String> {
+    emit_max_min32(code, ctx, inst_ref, Cond::LT)
+}
+
+pub fn emit_min_signed64(
+    code: &mut BlockOfCode,
+    ctx: &mut EmitContext<'_>,
+    inst_ref: InstRef,
+) -> Result<(), String> {
+    emit_max_min64(code, ctx, inst_ref, Cond::LT)
+}
+
+pub fn emit_min_unsigned32(
+    code: &mut BlockOfCode,
+    ctx: &mut EmitContext<'_>,
+    inst_ref: InstRef,
+) -> Result<(), String> {
+    emit_max_min32(code, ctx, inst_ref, Cond::LO)
+}
+
+pub fn emit_min_unsigned64(
+    code: &mut BlockOfCode,
+    ctx: &mut EmitContext<'_>,
+    inst_ref: InstRef,
+) -> Result<(), String> {
+    emit_max_min64(code, ctx, inst_ref, Cond::LO)
+}
+
 pub fn emit_logical_shift_left_masked32(
     code: &mut BlockOfCode,
     ctx: &mut EmitContext<'_>,
@@ -1696,7 +1804,7 @@ fn emit_shift_masked32(
     let shift_arg = args[1];
 
     if shift_arg.is_immediate() {
-        let shift = shift_arg.get_immediate_u8() & 0x1f;
+        let shift = (shift_arg.get_immediate_u32() & 0x1f) as u8;
         let mut result = ctx.reg_alloc.write_w(inst_ref);
         let mut operand = ctx.reg_alloc.read_w(operand_arg);
         RegAlloc::realize_all(code, ctx.block, &mut [&mut result, &mut operand])?;
@@ -1744,7 +1852,7 @@ fn emit_shift_masked64(
     let shift_arg = args[1];
 
     if shift_arg.is_immediate() {
-        let shift = shift_arg.get_immediate_u8() & 0x3f;
+        let shift = (shift_arg.get_immediate_u64() & 0x3f) as u8;
         let mut result = ctx.reg_alloc.write_x(inst_ref);
         let mut operand = ctx.reg_alloc.read_x(operand_arg);
         RegAlloc::realize_all(code, ctx.block, &mut [&mut result, &mut operand])?;

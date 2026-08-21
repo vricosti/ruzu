@@ -2126,6 +2126,66 @@ pub fn aesimc_v16b(rd: u8, rn: u8) -> u32 {
     0x4e28_7800 | (reg5(rn) << 5) | reg5(rd)
 }
 
+/// `crc32b Wd, Wn, Wm`.
+pub fn crc32b_w(rd: u8, rn: u8, rm: u8) -> u32 {
+    0x1ac0_4000 | (reg5(rm) << 16) | (reg5(rn) << 5) | reg5(rd)
+}
+
+/// `crc32h Wd, Wn, Wm`.
+pub fn crc32h_w(rd: u8, rn: u8, rm: u8) -> u32 {
+    0x1ac0_4400 | (reg5(rm) << 16) | (reg5(rn) << 5) | reg5(rd)
+}
+
+/// `crc32w Wd, Wn, Wm`.
+pub fn crc32w_w(rd: u8, rn: u8, rm: u8) -> u32 {
+    0x1ac0_4800 | (reg5(rm) << 16) | (reg5(rn) << 5) | reg5(rd)
+}
+
+/// `crc32x Wd, Wn, Xm`.
+pub fn crc32x_x(rd: u8, rn: u8, rm: u8) -> u32 {
+    0x9ac0_4c00 | (reg5(rm) << 16) | (reg5(rn) << 5) | reg5(rd)
+}
+
+/// `crc32cb Wd, Wn, Wm`.
+pub fn crc32cb_w(rd: u8, rn: u8, rm: u8) -> u32 {
+    0x1ac0_5000 | (reg5(rm) << 16) | (reg5(rn) << 5) | reg5(rd)
+}
+
+/// `crc32ch Wd, Wn, Wm`.
+pub fn crc32ch_w(rd: u8, rn: u8, rm: u8) -> u32 {
+    0x1ac0_5400 | (reg5(rm) << 16) | (reg5(rn) << 5) | reg5(rd)
+}
+
+/// `crc32cw Wd, Wn, Wm`.
+pub fn crc32cw_w(rd: u8, rn: u8, rm: u8) -> u32 {
+    0x1ac0_5800 | (reg5(rm) << 16) | (reg5(rn) << 5) | reg5(rd)
+}
+
+/// `crc32cx Wd, Wn, Xm`.
+pub fn crc32cx_x(rd: u8, rn: u8, rm: u8) -> u32 {
+    0x9ac0_5c00 | (reg5(rm) << 16) | (reg5(rn) << 5) | reg5(rd)
+}
+
+/// `sha256h qD, qN, vM.4s`.
+pub fn sha256h_q(rd: u8, rn: u8, rm: u8) -> u32 {
+    0x5e00_4000 | (reg5(rm) << 16) | (reg5(rn) << 5) | reg5(rd)
+}
+
+/// `sha256h2 qD, qN, vM.4s`.
+pub fn sha256h2_q(rd: u8, rn: u8, rm: u8) -> u32 {
+    0x5e00_5000 | (reg5(rm) << 16) | (reg5(rn) << 5) | reg5(rd)
+}
+
+/// `sha256su0 vD.4s, vN.4s`.
+pub fn sha256su0_v4s(rd: u8, rn: u8) -> u32 {
+    0x5e28_2800 | (reg5(rn) << 5) | reg5(rd)
+}
+
+/// `sha256su1 vD.4s, vN.4s, vM.4s`.
+pub fn sha256su1_v4s(rd: u8, rn: u8, rm: u8) -> u32 {
+    0x5e00_6000 | (reg5(rm) << 16) | (reg5(rn) << 5) | reg5(rd)
+}
+
 /// `movi vD.16b, #imm`.
 pub fn movi_v16b_imm(rd: u8, imm: u8) -> u32 {
     match imm {
@@ -2965,6 +3025,18 @@ mod tests {
         assert_eq!(aesd_v16b(16, 17), 0x4e28_5a30);
         assert_eq!(aesmc_v16b(16, 17), 0x4e28_6a30);
         assert_eq!(aesimc_v16b(16, 17), 0x4e28_7a30);
+        assert_eq!(crc32b_w(16, 17, 18), 0x1ad2_4230);
+        assert_eq!(crc32h_w(16, 17, 18), 0x1ad2_4630);
+        assert_eq!(crc32w_w(16, 17, 18), 0x1ad2_4a30);
+        assert_eq!(crc32x_x(16, 17, 18), 0x9ad2_4e30);
+        assert_eq!(crc32cb_w(16, 17, 18), 0x1ad2_5230);
+        assert_eq!(crc32ch_w(16, 17, 18), 0x1ad2_5630);
+        assert_eq!(crc32cw_w(16, 17, 18), 0x1ad2_5a30);
+        assert_eq!(crc32cx_x(16, 17, 18), 0x9ad2_5e30);
+        assert_eq!(sha256h_q(16, 17, 18), 0x5e12_4230);
+        assert_eq!(sha256h2_q(16, 17, 18), 0x5e12_5230);
+        assert_eq!(sha256su0_v4s(16, 17), 0x5e28_2a30);
+        assert_eq!(sha256su1_v4s(16, 17, 18), 0x5e12_6230);
         assert_eq!(sub_sp_imm(224), 0xd103_83ff);
         assert_eq!(sub_sp_imm(1184), 0xd112_83ff);
         assert_eq!(sub_x_imm(26, 26, 7), 0xd100_1f5a);

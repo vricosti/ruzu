@@ -3823,6 +3823,49 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 
 - N/A: this changes only warning policy for test helpers.
 
+## 2026-08-21 — `core/src/hle/kernel/k_session.rs` vs Eden `core/hle/kernel/k_session.{h,cpp}`
+
+### Intentional differences
+- Rust stores the embedded client and server endpoints behind separate `Arc<Mutex<_>>` owners. `KSession::on_server_closed` does not lock the client endpoint solely to invoke `KClientSession::on_server_closed`, because that upstream method has an empty body; doing so introduced a Rust-only endpoint/session ABBA deadlock during concurrent close.
+
+### Unintentional differences (to fix)
+- None in the server-close notification corrected by this entry.
+
+### Missing items
+- The wider `KAutoObject` reference-count lifecycle remains represented by Rust registries and endpoint-close flags rather than Eden's intrusive kernel-object ownership.
+
+### Binary layout verification
+- N/A: these kernel objects are not raw-copied or serialized.
+
+## 2026-08-21 — `rdynarmic/backend/arm64/emit_arm64_cryptography.rs` vs Eden `dynarmic/backend/arm64/emit_arm64_cryptography.cpp`
+
+### Intentional differences
+- Rust writes verified AArch64 instruction words through `BlockOfCode`; Eden expresses the same `SHA256H`, `SHA256H2`, `SHA256SU0`, and `SHA256SU1` instructions through Oaknut.
+
+### Unintentional differences (to fix)
+- None in the AES and SHA-256 instruction families currently owned by this file.
+
+### Missing items
+- Eden's `SM4AccessSubstitutionBox` unreachable specialization remains outside this implementation slice.
+
+### Binary layout verification
+- PASS: focused instruction tests match words assembled by Apple's AArch64 assembler for registers `v16`, `v17`, and `v18`.
+
+## 2026-08-21 — `rdynarmic/backend/arm64/emit_arm64_cryptography.rs` vs Eden `dynarmic/backend/arm64/emit_arm64_cryptography.cpp` (CRC32 completion)
+
+### Intentional differences
+- Rust selects the 32-bit or 64-bit data register with a boolean passed to the owner-local `emit_crc` helper; Eden expresses the same distinction through the `EmitCRC<bitsize>` template parameter.
+- Rust writes verified AArch64 instruction words through `BlockOfCode`; Eden invokes the corresponding Oaknut CRC32 instruction methods.
+
+### Unintentional differences (to fix)
+- None in the CRC32 ISO and Castagnoli 8/16/32/64-bit instruction families.
+
+### Missing items
+- Eden's `SM4AccessSubstitutionBox` unreachable specialization remains the only cryptography opcode specialization not represented by this Rust owner.
+
+### Binary layout verification
+- PASS: all eight CRC32 instruction words match Apple's AArch64 assembler for `w16`, `w17`, and `w18`/`x18`. The existing end-to-end ISO CRC32 test now executes on Apple Silicon and matches the expected result.
+
 ## 2026-08-21 — `src/rdynarmic/src/backend/x64/jit_state.rs` vs `src/dynarmic/src/dynarmic/backend/x64/a32_jitstate.{h,cpp}`
 
 ### Intentional differences
@@ -4277,3 +4320,38 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 - Ruzu's raw-handle `create_image`, `create_buffer`, and `create_mapped_buffer` compatibility paths
   still use dedicated Vulkan allocations. Eden returns owning VMA-backed `vk::Image`/`vk::Buffer`
   wrappers; `create_owned_buffer` already uses VMA but the remaining callers have not all migrated.
+
+## 2026-08-21 — `rdynarmic/backend/arm64/emit_arm64_data_processing.rs` vs Eden `dynarmic/backend/arm64/emit_arm64_data_processing.cpp` (masked shifts)
+
+### Intentional differences
+- Rust casts the masked shift count to `u8` only after applying Eden's 32-bit or 64-bit mask, because the local instruction encoders accept the already-valid immediate as `u8`.
+
+### Unintentional differences (to fix)
+- None in the immediate and register forms of 32-bit and 64-bit masked logical-left, logical-right, arithmetic-right, and rotate-right shifts.
+
+### Missing items
+- None in this masked-shift helper slice.
+
+### Binary layout verification
+- N/A: this change only selects an AArch64 shift immediate. A focused regression emits all eight masked-shift opcodes with full-width constants whose upper bits are nonzero.
+
+## 2026-08-21 — `src/rdynarmic/src/backend/arm64/emit_arm64_data_processing.rs` vs Eden `src/dynarmic/src/dynarmic/backend/arm64/emit_arm64_data_processing.cpp` (scalar integer min/max)
+
+### Intentional differences
+
+- Rust writes the `CMP` and `CSEL` instruction words through the local `inst.rs` encoder rather
+  than Oaknut. Argument acquisition, W/X register allocation, realization, flag spilling, and
+  instruction ordering are identical.
+
+### Unintentional differences (to fix)
+
+- None in `MaxSigned32/64`, `MaxUnsigned32/64`, `MinSigned32/64`, or `MinUnsigned32/64`.
+
+### Missing items
+
+- None in this scalar integer min/max slice.
+
+### Binary layout verification
+
+- N/A: these methods emit host instructions and do not serialize a shared structure. A focused
+  regression routes all eight IR opcodes through the ARM64 data-processing owner.

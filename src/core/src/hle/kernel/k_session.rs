@@ -192,7 +192,10 @@ impl KSession {
     pub fn on_server_closed(&mut self) {
         if self.get_state() == SessionState::Normal {
             self.set_state(SessionState::ServerClosed);
-            self.client.lock().unwrap().on_server_closed();
+            // Upstream calls the embedded KClientSession::OnServerClosed(),
+            // whose body is empty. Taking the Rust endpoint mutex here adds
+            // an artificial client-endpoint -> parent-session lock cycle when
+            // both endpoints close concurrently.
         }
     }
 
@@ -306,6 +309,29 @@ mod tests {
 
         session.on_server_closed();
         assert!(session.is_server_closed());
+    }
+
+    #[test]
+    fn on_server_closed_does_not_wait_for_client_endpoint() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let session = Arc::new(Mutex::new(KSession::new()));
+        session.lock().unwrap().initialize(None, 0);
+        let client = Arc::clone(session.lock().unwrap().get_client_session());
+        let client_guard = client.lock().unwrap();
+        let (completed_tx, completed_rx) = mpsc::channel();
+
+        let closing_session = Arc::clone(&session);
+        let close_thread = std::thread::spawn(move || {
+            closing_session.lock().unwrap().on_server_closed();
+            completed_tx.send(()).unwrap();
+        });
+
+        assert!(completed_rx.recv_timeout(Duration::from_secs(1)).is_ok());
+        drop(client_guard);
+        close_thread.join().unwrap();
+        assert!(session.lock().unwrap().is_server_closed());
     }
 
     #[test]

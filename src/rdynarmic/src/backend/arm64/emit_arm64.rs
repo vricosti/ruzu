@@ -33,7 +33,10 @@ use crate::backend::arm64::emit_arm64_a64_memory::{
 };
 use crate::backend::arm64::emit_arm64_cryptography::{
     emit_aes_decrypt_single_round, emit_aes_encrypt_single_round, emit_aes_inverse_mix_columns,
-    emit_aes_mix_columns,
+    emit_aes_mix_columns, emit_crc32_castagnoli_16, emit_crc32_castagnoli_32,
+    emit_crc32_castagnoli_64, emit_crc32_castagnoli_8, emit_crc32_iso_16, emit_crc32_iso_32,
+    emit_crc32_iso_64, emit_crc32_iso_8, emit_sha256_hash, emit_sha256_message_schedule_0,
+    emit_sha256_message_schedule_1,
 };
 use crate::backend::arm64::emit_arm64_data_processing::{
     emit_add32, emit_add64, emit_and32, emit_and64, emit_and_not32, emit_and_not64,
@@ -46,8 +49,10 @@ use crate::backend::arm64::emit_arm64_data_processing::{
     emit_least_significant_half, emit_least_significant_word, emit_logical_shift_left32,
     emit_logical_shift_left64, emit_logical_shift_left_masked32, emit_logical_shift_left_masked64,
     emit_logical_shift_right32, emit_logical_shift_right64, emit_logical_shift_right_masked32,
-    emit_logical_shift_right_masked64, emit_most_significant_word, emit_mul32, emit_mul64,
-    emit_not32, emit_not64, emit_or32, emit_or64, emit_pack_2x32_to_1x64, emit_pack_2x64_to_1x128,
+    emit_logical_shift_right_masked64, emit_max_signed32, emit_max_signed64, emit_max_unsigned32,
+    emit_max_unsigned64, emit_min_signed32, emit_min_signed64, emit_min_unsigned32,
+    emit_min_unsigned64, emit_most_significant_word, emit_mul32, emit_mul64, emit_not32,
+    emit_not64, emit_or32, emit_or64, emit_pack_2x32_to_1x64, emit_pack_2x64_to_1x128,
     emit_replicate_bit32, emit_replicate_bit64, emit_rotate_right32, emit_rotate_right64,
     emit_rotate_right_extended, emit_rotate_right_masked32, emit_rotate_right_masked64,
     emit_sign_extend_byte_to_long, emit_sign_extend_byte_to_word, emit_sign_extend_half_to_long,
@@ -603,6 +608,14 @@ fn emit_ir_instruction(
         Opcode::UnsignedDiv64 => emit_unsigned_div64(code, ctx, inst_ref),
         Opcode::SignedDiv32 => emit_signed_div32(code, ctx, inst_ref),
         Opcode::SignedDiv64 => emit_signed_div64(code, ctx, inst_ref),
+        Opcode::MaxSigned32 => emit_max_signed32(code, ctx, inst_ref),
+        Opcode::MaxSigned64 => emit_max_signed64(code, ctx, inst_ref),
+        Opcode::MaxUnsigned32 => emit_max_unsigned32(code, ctx, inst_ref),
+        Opcode::MaxUnsigned64 => emit_max_unsigned64(code, ctx, inst_ref),
+        Opcode::MinSigned32 => emit_min_signed32(code, ctx, inst_ref),
+        Opcode::MinSigned64 => emit_min_signed64(code, ctx, inst_ref),
+        Opcode::MinUnsigned32 => emit_min_unsigned32(code, ctx, inst_ref),
+        Opcode::MinUnsigned64 => emit_min_unsigned64(code, ctx, inst_ref),
         Opcode::FPAbs32 => emit_fp_abs32(code, ctx, inst_ref),
         Opcode::FPAbs64 => emit_fp_abs64(code, ctx, inst_ref),
         Opcode::FPAdd32 => emit_fp_add32(code, ctx, inst_ref),
@@ -730,6 +743,17 @@ fn emit_ir_instruction(
         Opcode::AESEncryptSingleRound => emit_aes_encrypt_single_round(code, ctx, inst_ref),
         Opcode::AESInverseMixColumns => emit_aes_inverse_mix_columns(code, ctx, inst_ref),
         Opcode::AESMixColumns => emit_aes_mix_columns(code, ctx, inst_ref),
+        Opcode::CRC32Castagnoli8 => emit_crc32_castagnoli_8(code, ctx, inst_ref),
+        Opcode::CRC32Castagnoli16 => emit_crc32_castagnoli_16(code, ctx, inst_ref),
+        Opcode::CRC32Castagnoli32 => emit_crc32_castagnoli_32(code, ctx, inst_ref),
+        Opcode::CRC32Castagnoli64 => emit_crc32_castagnoli_64(code, ctx, inst_ref),
+        Opcode::CRC32ISO8 => emit_crc32_iso_8(code, ctx, inst_ref),
+        Opcode::CRC32ISO16 => emit_crc32_iso_16(code, ctx, inst_ref),
+        Opcode::CRC32ISO32 => emit_crc32_iso_32(code, ctx, inst_ref),
+        Opcode::CRC32ISO64 => emit_crc32_iso_64(code, ctx, inst_ref),
+        Opcode::SHA256Hash => emit_sha256_hash(code, ctx, inst_ref),
+        Opcode::SHA256MessageSchedule0 => emit_sha256_message_schedule_0(code, ctx, inst_ref),
+        Opcode::SHA256MessageSchedule1 => emit_sha256_message_schedule_1(code, ctx, inst_ref),
         Opcode::VectorSignedSaturatedAdd8
         | Opcode::VectorSignedSaturatedAdd16
         | Opcode::VectorSignedSaturatedAdd32
@@ -2480,6 +2504,161 @@ mod tests {
             let mut block = return_to_dispatch_block();
             let input = block.append(Opcode::A64GetQ, &[Value::ImmA64Vec(A64Vec::V0)]);
             block.append(opcode, &[Value::Inst(input)]);
+            let mut code = BlockOfCode::with_size(4096).unwrap();
+
+            emit_arm64(
+                &mut code,
+                block,
+                EmitConfig::from_a64_config(&config(false)),
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn emit_arm64_routes_crc32_to_cryptography_owner() {
+        for (opcode, data) in [
+            (Opcode::CRC32Castagnoli8, Value::ImmU8(0x12)),
+            (Opcode::CRC32Castagnoli16, Value::ImmU16(0x1234)),
+            (Opcode::CRC32Castagnoli32, Value::ImmU32(0x1234_5678)),
+            (
+                Opcode::CRC32Castagnoli64,
+                Value::ImmU64(0x1234_5678_9abc_def0),
+            ),
+            (Opcode::CRC32ISO8, Value::ImmU8(0x12)),
+            (Opcode::CRC32ISO16, Value::ImmU16(0x1234)),
+            (Opcode::CRC32ISO32, Value::ImmU32(0x1234_5678)),
+            (Opcode::CRC32ISO64, Value::ImmU64(0x1234_5678_9abc_def0)),
+        ] {
+            let mut block = return_to_dispatch_block();
+            let input = block.append(Opcode::A64GetW, &[Value::ImmA64Reg(A64Reg::R0)]);
+            block.append(opcode, &[Value::Inst(input), data]);
+            let mut code = BlockOfCode::with_size(4096).unwrap();
+
+            emit_arm64(
+                &mut code,
+                block,
+                EmitConfig::from_a64_config(&config(false)),
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn emit_arm64_routes_sha256_to_cryptography_owner() {
+        let mut block = return_to_dispatch_block();
+        let x = block.append(Opcode::A64GetQ, &[Value::ImmA64Vec(A64Vec::V0)]);
+        let y = block.append(Opcode::A64GetQ, &[Value::ImmA64Vec(A64Vec::V1)]);
+        let w = block.append(Opcode::A64GetQ, &[Value::ImmA64Vec(A64Vec::V2)]);
+        block.append(
+            Opcode::SHA256Hash,
+            &[
+                Value::Inst(x),
+                Value::Inst(y),
+                Value::Inst(w),
+                Value::ImmU1(true),
+            ],
+        );
+        block.append(
+            Opcode::SHA256MessageSchedule0,
+            &[Value::Inst(x), Value::Inst(y)],
+        );
+        block.append(
+            Opcode::SHA256MessageSchedule1,
+            &[Value::Inst(x), Value::Inst(y), Value::Inst(w)],
+        );
+        let mut code = BlockOfCode::with_size(4096).unwrap();
+
+        emit_arm64(
+            &mut code,
+            block,
+            EmitConfig::from_a64_config(&config(false)),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn emit_arm64_masked_shifts_accept_full_width_immediates() {
+        for (opcode, get_opcode, input, shift) in [
+            (
+                Opcode::LogicalShiftLeftMasked32,
+                Opcode::A64GetW,
+                Value::ImmA64Reg(A64Reg::R0),
+                Value::ImmU32(0x1234_567f),
+            ),
+            (
+                Opcode::LogicalShiftRightMasked32,
+                Opcode::A64GetW,
+                Value::ImmA64Reg(A64Reg::R0),
+                Value::ImmU32(0x1234_567f),
+            ),
+            (
+                Opcode::ArithmeticShiftRightMasked32,
+                Opcode::A64GetW,
+                Value::ImmA64Reg(A64Reg::R0),
+                Value::ImmU32(0x1234_567f),
+            ),
+            (
+                Opcode::RotateRightMasked32,
+                Opcode::A64GetW,
+                Value::ImmA64Reg(A64Reg::R0),
+                Value::ImmU32(0x1234_567f),
+            ),
+            (
+                Opcode::LogicalShiftLeftMasked64,
+                Opcode::A64GetX,
+                Value::ImmA64Reg(A64Reg::R0),
+                Value::ImmU64(0x1234_5678_9abc_deff),
+            ),
+            (
+                Opcode::LogicalShiftRightMasked64,
+                Opcode::A64GetX,
+                Value::ImmA64Reg(A64Reg::R0),
+                Value::ImmU64(0x1234_5678_9abc_deff),
+            ),
+            (
+                Opcode::ArithmeticShiftRightMasked64,
+                Opcode::A64GetX,
+                Value::ImmA64Reg(A64Reg::R0),
+                Value::ImmU64(0x1234_5678_9abc_deff),
+            ),
+            (
+                Opcode::RotateRightMasked64,
+                Opcode::A64GetX,
+                Value::ImmA64Reg(A64Reg::R0),
+                Value::ImmU64(0x1234_5678_9abc_deff),
+            ),
+        ] {
+            let mut block = return_to_dispatch_block();
+            let input = block.append(get_opcode, &[input]);
+            block.append(opcode, &[Value::Inst(input), shift]);
+            let mut code = BlockOfCode::with_size(4096).unwrap();
+
+            emit_arm64(
+                &mut code,
+                block,
+                EmitConfig::from_a64_config(&config(false)),
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn emit_arm64_routes_scalar_integer_min_max_to_data_processing_owner() {
+        for (opcode, get_opcode) in [
+            (Opcode::MaxSigned32, Opcode::A64GetW),
+            (Opcode::MaxSigned64, Opcode::A64GetX),
+            (Opcode::MaxUnsigned32, Opcode::A64GetW),
+            (Opcode::MaxUnsigned64, Opcode::A64GetX),
+            (Opcode::MinSigned32, Opcode::A64GetW),
+            (Opcode::MinSigned64, Opcode::A64GetX),
+            (Opcode::MinUnsigned32, Opcode::A64GetW),
+            (Opcode::MinUnsigned64, Opcode::A64GetX),
+        ] {
+            let mut block = return_to_dispatch_block();
+            let op1 = block.append(get_opcode, &[Value::ImmA64Reg(A64Reg::R0)]);
+            let op2 = block.append(get_opcode, &[Value::ImmA64Reg(A64Reg::R1)]);
+            block.append(opcode, &[Value::Inst(op1), Value::Inst(op2)]);
             let mut code = BlockOfCode::with_size(4096).unwrap();
 
             emit_arm64(

@@ -5523,7 +5523,6 @@ mod tests {
         jit
     }
 
-    #[cfg(target_arch = "x86_64")]
     #[test]
     fn test_a64_crc32x_then_crc32b_matches_iso_crc32() {
         let crc32x = run_a64_alu(&[0x9ACE_4D0E, 0xD400_0001], |jit| {
