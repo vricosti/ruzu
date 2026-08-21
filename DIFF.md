@@ -3006,3 +3006,131 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 
 - N/A for the removed boolean: `SigHandlerState` is host-only Rust state. Platform context and SEH
   layouts are verified by the existing platform-specific tests in this module.
+
+## 2026-08-21 — `src/rdynarmic/src/backend/x64/block_of_code.rs` vs Eden `src/dynarmic/src/dynarmic/backend/x64/block_of_code.{h,cpp}`
+
+### Intentional differences
+
+- Ruzu emits x64 through `rxbyak::CodeAssembler` and stores byte offsets into its owned code buffer;
+  Eden derives `BlockOfCode` from C++ Xbyak and stores native code pointers.
+- Rust uses `cfg(target_os = "windows")` for Eden's `_WIN32` callee-saved XMM6–XMM15 path.
+
+### Unintentional differences (to fix)
+
+- None in the reviewed ABI import/save-restore slice. The `xmmword_ptr` operand and
+  `xmm_save_base` helper are now compiled only on Windows, matching the only path that consumes
+  them. The native constant-pool regression test now verifies both deduplicated operands.
+
+### Missing items
+
+- None introduced or discovered in the Windows callee-save operand slice.
+
+### Binary layout verification
+
+- PASS: the existing stack-frame and Windows unwind-code tests verify the offsets consumed by the
+  XMM save/restore instructions; no serialized guest structure is changed.
+
+## 2026-08-21 — `src/rdynarmic/src/backend/x64/emit_memory.rs` vs Eden `src/dynarmic/src/dynarmic/backend/x64/{a64_emit_x64_memory.cpp,emit_x64_memory.cpp.inc}`
+
+### Intentional differences
+
+- Rust keeps the scalar callback emitters in this shared x64 module and represents the 128-bit
+  callback return with an explicit stack buffer on Windows.
+- Rust also passes 128-bit callback writes through an explicit pointer on Windows; Eden's C++ ABI
+  passes its `Vector` aggregate indirectly there. System V continues to use two integer lanes.
+- `rxbyak` memory-operand constructors replace C++ Xbyak's `ptr`/`xword` address frames.
+
+### Unintentional differences (to fix)
+
+- None in the reviewed callback ABI slice. The indirect return buffer now applies to every Windows
+  toolchain, matching Eden's `_WIN32`, instead of only MSVC. Ordinary 128-bit writes likewise use
+  a Windows pointer payload, and 32/64-bit XMM-backed scalar writes select their third argument
+  through `ABI_PARAMS` rather than hard-coding System V's `RDX`.
+
+### Missing items
+
+- The fastmem/page-table 128-bit paths are owned by
+  `backend/x64/a64_emit_x64_memory.rs`; this file intentionally remains the callback-only owner
+  selected by the current dispatcher for `A64ReadMemory128`/`A64WriteMemory128`.
+
+### Binary layout verification
+
+- PASS: Windows read/write buffers are exactly 16 bytes after ABI shadow space, and the
+  non-Windows path still transfers two 64-bit lanes through ABI-selected registers.
+
+## 2026-08-21 — `src/rdynarmic/src/backend/x64/a64_emit_x64_memory.rs` vs Eden `src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64_memory.cpp`
+
+### Intentional differences
+
+- Ruzu stores fallback entry offsets in Rust hash maps and calls explicit Rust trampolines; Eden
+  stores native function pointers and devirtualizes C++ `UserCallbacks`.
+- The Rust Windows read trampoline accepts an explicit output pointer after the fixed context and
+  address arguments. This preserves the same stack-buffer transfer without relying on C++'s
+  compiler-specific hidden-return ordering.
+
+### Unintentional differences (to fix)
+
+- None in the reviewed 128-bit read-fallback ABI slice. Both MSVC and MinGW now use the Windows
+  stack buffer, matching upstream `_WIN32`; System V no longer reserves the unused 16-byte local.
+- Removed one unused register binding from Ruzu-only fastmem diagnostic emission; emitted code is
+  unchanged.
+
+### Missing items
+
+- Ruzu's current dispatcher routes ordinary 128-bit accesses through callback-only
+  `emit_memory.rs`; it does not yet select Eden's fastmem/page-table 128-bit read/write fallback
+  path. This is pre-existing behavioral debt outside the ABI prerequisite fixed here.
+
+### Binary layout verification
+
+- PASS for the reviewed fallback payload: the Windows local is 16 bytes and is loaded with
+  `movups`; System V reconstructs the vector from the two 64-bit return registers.
+
+## 2026-08-21 — `src/rdynarmic/src/backend/x64/emit_exclusive_memory.rs` vs Eden `src/dynarmic/src/dynarmic/backend/x64/emit_x64_memory.cpp.inc`
+
+### Intentional differences
+
+- Ruzu owns architecture-specific exclusive emission in this Rust file, while Eden instantiates
+  the shared C++ template include from its A64 emitter.
+- Rust's Windows trampolines take explicit pointer payloads for 128-bit values instead of exposing
+  the host compiler's aggregate ABI directly to generated code.
+
+### Unintentional differences (to fix)
+
+- None in the reviewed callback-only 128-bit read/write slice. All Windows toolchains use the
+  stack-buffer read path, and exclusive writes use a pointer payload rather than System V lane
+  registers that overwrite Win64 arguments.
+
+### Missing items
+
+- No new missing item found in the callback-only exclusive slice; inline fastmem ownership was not
+  re-audited as part of this prerequisite.
+
+### Binary layout verification
+
+- PASS: each Windows exclusive payload occupies 16 bytes after the 32-byte shadow space; System V
+  continues to pass or return two 64-bit lanes.
+
+## 2026-08-21 — `src/rdynarmic/src/jit.rs` vs Eden `src/dynarmic/src/dynarmic/interface/A64/config.h` and x64 memory callback call sites
+
+### Intentional differences
+
+- Rust uses free `extern "C"` trampolines to recover `JitInner`; Eden invokes virtual
+  `UserCallbacks` through `ArgCallback`/`Devirtualize`.
+- On Windows, Rust gives the read and write trampolines explicit `Pair128` pointers. Eden obtains
+  the equivalent indirect aggregate transfer from its C++ ABI and generated accessor stubs.
+
+### Unintentional differences (to fix)
+
+- None in the reviewed A64 128-bit trampoline slice. The ordinary and exclusive read/write
+  signatures now agree with the emitter on both Windows toolchains.
+
+### Missing items
+
+- None introduced in the A64 trampoline slice. A32 trampolines have separate emitter ownership and
+  were not changed or claimed by this comparison.
+
+### Binary layout verification
+
+- PASS: `Pair128` is `repr(C)`, compile-time asserted to size 16/alignment 8, and every field is
+  initialized before it crosses the trampoline boundary.

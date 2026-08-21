@@ -12,7 +12,9 @@ use crate::backend::x64::jit_state::{A32JitState, A64JitState};
 use crate::frontend::a64::translate::TranslationOptions;
 use crate::halt_reason::HaltReason;
 use crate::ir::location::LocationDescriptor;
-use crate::jit_config::{JitConfig, OptimizationFlag, UserCallbacks};
+#[cfg(test)]
+use crate::jit_config::OptimizationFlag;
+use crate::jit_config::{JitConfig, UserCallbacks};
 
 /// Public ARM64 JIT compiler.
 ///
@@ -1382,6 +1384,11 @@ pub struct Pair128 {
     pub hi: u64,
 }
 
+const _: () = {
+    assert!(core::mem::size_of::<Pair128>() == 16);
+    assert!(core::mem::align_of::<Pair128>() == 8);
+};
+
 impl A64Jit {
     /// Create a new A64Jit from the given configuration.
     ///
@@ -2166,12 +2173,12 @@ fn memory_read_128_impl(inner_ptr: u64, vaddr: u64) -> Pair128 {
     Pair128 { lo, hi }
 }
 
-#[cfg(not(all(target_os = "windows", target_env = "msvc")))]
+#[cfg(not(target_os = "windows"))]
 extern "C" fn memory_read_128_trampoline(inner_ptr: u64, vaddr: u64) -> Pair128 {
     memory_read_128_impl(inner_ptr, vaddr)
 }
 
-#[cfg(all(target_os = "windows", target_env = "msvc"))]
+#[cfg(target_os = "windows")]
 extern "C" fn memory_read_128_trampoline(inner_ptr: u64, vaddr: u64, ret_ptr: *mut Pair128) {
     unsafe { ret_ptr.write(memory_read_128_impl(inner_ptr, vaddr)) };
 }
@@ -2342,15 +2349,26 @@ extern "C" fn memory_write_64_trampoline(inner_ptr: u64, vaddr: u64, value: u64)
     inner.callbacks.memory_write_64(vaddr, value);
 }
 
+fn memory_write_128_impl(inner_ptr: u64, vaddr: u64, value_lo: u64, value_hi: u64) {
+    let inner = unsafe { &mut *(inner_ptr as *mut JitInner) };
+    maybe_log_watch_write(inner, vaddr, 16, value_lo, value_hi);
+    inner.callbacks.memory_write_128(vaddr, value_lo, value_hi);
+}
+
+#[cfg(not(target_os = "windows"))]
 extern "C" fn memory_write_128_trampoline(
     inner_ptr: u64,
     vaddr: u64,
     value_lo: u64,
     value_hi: u64,
 ) {
-    let inner = unsafe { &mut *(inner_ptr as *mut JitInner) };
-    maybe_log_watch_write(inner, vaddr, 16, value_lo, value_hi);
-    inner.callbacks.memory_write_128(vaddr, value_lo, value_hi);
+    memory_write_128_impl(inner_ptr, vaddr, value_lo, value_hi);
+}
+
+#[cfg(target_os = "windows")]
+extern "C" fn memory_write_128_trampoline(inner_ptr: u64, vaddr: u64, value: *const Pair128) {
+    let value = unsafe { value.read_unaligned() };
+    memory_write_128_impl(inner_ptr, vaddr, value.lo, value.hi);
 }
 
 // System trampolines
@@ -2481,12 +2499,12 @@ fn exclusive_read_128_impl(inner_ptr: u64, vaddr: u64) -> Pair128 {
     Pair128 { lo, hi }
 }
 
-#[cfg(not(all(target_os = "windows", target_env = "msvc")))]
+#[cfg(not(target_os = "windows"))]
 extern "C" fn exclusive_read_128_trampoline(inner_ptr: u64, vaddr: u64) -> Pair128 {
     exclusive_read_128_impl(inner_ptr, vaddr)
 }
 
-#[cfg(all(target_os = "windows", target_env = "msvc"))]
+#[cfg(target_os = "windows")]
 extern "C" fn exclusive_read_128_trampoline(inner_ptr: u64, vaddr: u64, ret_ptr: *mut Pair128) {
     unsafe { ret_ptr.write(exclusive_read_128_impl(inner_ptr, vaddr)) };
 }
@@ -2604,12 +2622,7 @@ extern "C" fn exclusive_write_64_trampoline(inner_ptr: u64, vaddr: u64, value: u
     }
 }
 
-extern "C" fn exclusive_write_128_trampoline(
-    inner_ptr: u64,
-    vaddr: u64,
-    value_lo: u64,
-    value_hi: u64,
-) -> u64 {
+fn exclusive_write_128_impl(inner_ptr: u64, vaddr: u64, value_lo: u64, value_hi: u64) -> u64 {
     let inner = unsafe { &mut *(inner_ptr as *mut JitInner) };
     if inner.jit_state.exclusive_state == 0 {
         return 1;
@@ -2647,6 +2660,26 @@ extern "C" fn exclusive_write_128_trampoline(
     } else {
         1
     }
+}
+
+#[cfg(not(target_os = "windows"))]
+extern "C" fn exclusive_write_128_trampoline(
+    inner_ptr: u64,
+    vaddr: u64,
+    value_lo: u64,
+    value_hi: u64,
+) -> u64 {
+    exclusive_write_128_impl(inner_ptr, vaddr, value_lo, value_hi)
+}
+
+#[cfg(target_os = "windows")]
+extern "C" fn exclusive_write_128_trampoline(
+    inner_ptr: u64,
+    vaddr: u64,
+    value: *const Pair128,
+) -> u64 {
+    let value = unsafe { value.read_unaligned() };
+    exclusive_write_128_impl(inner_ptr, vaddr, value.lo, value.hi)
 }
 
 extern "C" fn raw_exclusive_write_8_trampoline(
@@ -5345,6 +5378,114 @@ mod tests {
 
         assert!(halt.contains(HaltReason::SVC));
         assert_eq!(jit.get_vector(0), (lo, hi));
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn test_a64_str_q_uses_host_128_bit_argument_abi() {
+        let code: &[u32] = &[
+            0x3D80_0020, // STR Q0, [X1]
+            0xD400_0001, // SVC #0
+        ];
+        let lo = 0x0123_4567_89AB_CDEFu64;
+        let hi = 0xFEDC_BA98_7654_3210u64;
+        let memory = Arc::new(Mutex::new(vec![0u8; 0x2000]));
+        for (index, word) in code.iter().copied().enumerate() {
+            memory.lock().unwrap()[index * 4..index * 4 + 4].copy_from_slice(&word.to_le_bytes());
+        }
+        let config = JitConfig {
+            callbacks: Box::new(MockCallbacks::from_shared_memory(0x1000, memory.clone())),
+            enable_cycle_counting: false,
+            code_cache_size: 4 * 1024 * 1024,
+            optimizations: OptimizationFlag::NO_OPTIMIZATIONS,
+            unsafe_optimizations: false,
+            global_monitor: None,
+            fastmem_pointer: None,
+            page_table_pointer: None,
+            define_unpredictable_behaviour: false,
+            processor_id: 0,
+            wall_clock_cntpct: false,
+            cntfrq_el0: 600_000_000,
+            tpidrro_el0: None,
+            tpidr_el0: None,
+            memory: crate::backend::x64::emit_context::MemoryEmitConfig::default(),
+        };
+        let mut jit = A64Jit::new(config).expect("A64 JIT");
+        jit.set_pc(0x1000);
+        jit.set_register(1, 0x1100);
+        jit.set_vector(0, lo, hi);
+
+        let halt = jit.run();
+
+        assert!(halt.contains(HaltReason::SVC));
+        let memory = memory.lock().unwrap();
+        assert_eq!(
+            u64::from_le_bytes(memory[0x100..0x108].try_into().unwrap()),
+            lo
+        );
+        assert_eq!(
+            u64::from_le_bytes(memory[0x108..0x110].try_into().unwrap()),
+            hi
+        );
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn test_a64_stxp_uses_host_128_bit_argument_abi() {
+        let code: &[u32] = &[
+            0xC87F_14C4, // LDXP X4, X5, [X6]
+            0xC829_20C7, // STXP W9, X7, X8, [X6]
+            0xD400_0001, // SVC #0
+        ];
+        let old_lo = 0x1122_3344_5566_7788u64;
+        let old_hi = 0x99AA_BBCC_DDEE_FF00u64;
+        let new_lo = 0x0123_4567_89AB_CDEFu64;
+        let new_hi = 0xFEDC_BA98_7654_3210u64;
+        let mut contents = vec![0u8; 0x2000];
+        for (index, word) in code.iter().copied().enumerate() {
+            contents[index * 4..index * 4 + 4].copy_from_slice(&word.to_le_bytes());
+        }
+        contents[0x100..0x108].copy_from_slice(&old_lo.to_le_bytes());
+        contents[0x108..0x110].copy_from_slice(&old_hi.to_le_bytes());
+        let memory = Arc::new(Mutex::new(contents));
+        let config = JitConfig {
+            callbacks: Box::new(MockCallbacks::from_shared_memory(0x1000, memory.clone())),
+            enable_cycle_counting: false,
+            code_cache_size: 4 * 1024 * 1024,
+            optimizations: OptimizationFlag::NO_OPTIMIZATIONS,
+            unsafe_optimizations: false,
+            global_monitor: None,
+            fastmem_pointer: None,
+            page_table_pointer: None,
+            define_unpredictable_behaviour: false,
+            processor_id: 0,
+            wall_clock_cntpct: false,
+            cntfrq_el0: 600_000_000,
+            tpidrro_el0: None,
+            tpidr_el0: None,
+            memory: crate::backend::x64::emit_context::MemoryEmitConfig::default(),
+        };
+        let mut jit = A64Jit::new(config).expect("A64 JIT");
+        jit.set_pc(0x1000);
+        jit.set_register(6, 0x1100);
+        jit.set_register(7, new_lo);
+        jit.set_register(8, new_hi);
+
+        let halt = jit.run();
+
+        assert!(halt.contains(HaltReason::SVC));
+        assert_eq!(jit.get_register(4), old_lo);
+        assert_eq!(jit.get_register(5), old_hi);
+        assert_eq!(jit.get_register(9), 0);
+        let memory = memory.lock().unwrap();
+        assert_eq!(
+            u64::from_le_bytes(memory[0x100..0x108].try_into().unwrap()),
+            new_lo
+        );
+        assert_eq!(
+            u64::from_le_bytes(memory[0x108..0x110].try_into().unwrap()),
+            new_hi
+        );
     }
 
     fn run_a64_alu(code: &[u32], setup: impl FnOnce(&mut A64Jit)) -> A64Jit {

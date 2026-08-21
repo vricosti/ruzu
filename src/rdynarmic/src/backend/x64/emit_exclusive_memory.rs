@@ -7,7 +7,7 @@ use crate::backend::x64::emit_x64_memory::{emit_fastmem_vaddr_a64, emit_read_mem
 use crate::backend::x64::reg_alloc::RegAlloc;
 use crate::ir::inst::Inst;
 use crate::ir::value::InstRef;
-#[cfg(all(target_os = "windows", target_env = "msvc"))]
+#[cfg(target_os = "windows")]
 use rxbyak::RSP;
 use rxbyak::{
     byte_ptr, dword_ptr, qword_ptr, word_ptr, xmmword_ptr, CodeAssembler, JmpType, Reg, RegExp,
@@ -237,7 +237,7 @@ fn emit_exclusive_read(
         let result = ra.scratch_xmm();
         ra.host_call(None, &mut [None, Some(&mut args[1]), None, None]);
 
-        #[cfg(all(target_os = "windows", target_env = "msvc"))]
+        #[cfg(target_os = "windows")]
         {
             let frame_size = 16 + abi::ABI_SHADOW_SPACE;
             ra.alloc_stack_space(frame_size);
@@ -260,7 +260,7 @@ fn emit_exclusive_read(
             ra.release_stack_space(frame_size);
         }
 
-        #[cfg(not(all(target_os = "windows", target_env = "msvc")))]
+        #[cfg(not(target_os = "windows"))]
         {
             ctx.config
                 .callbacks
@@ -362,34 +362,56 @@ fn emit_exclusive_write(
     // ArgCallback: position 0 = None (context), position 1 = vaddr, position 2 = value
 
     if bitsize == 128 {
-        // The 128-bit value is an XMM IR value but the trampoline takes it as
-        // (value_lo, value_hi) in RDX:RCX — same ABI as the non-exclusive
-        // A64WriteMemory128 path (emit_memory_write::<128>). Pin vaddr→RSI and
-        // value→XMM1, release the per-arg locks, spill caller-saves via
-        // host_call, then extract XMM1 lo/hi into RDX/RCX before the call.
-        // host_call uses Some(inst_ref) so the success result (RAX) is bound
-        // to this instruction. The previous code passed the 128-bit value as a
-        // single integer arg, sending only half the value (and no high word).
+        // Pin the address and vector value before releasing the allocation
+        // scope. Windows passes the 16-byte value through a pointer, while
+        // System V passes its two lanes in the third and fourth integer
+        // parameter registers.
         let (first, rest) = args.split_at_mut(2);
         ra.use_loc(&mut first[1], abi::ABI_PARAMS[1]); // vaddr → RSI
         ra.use_loc(&mut rest[0], HostLoc::Xmm(1)); // value → XMM1
         ra.end_of_alloc_scope();
         ra.host_call(Some(inst_ref), &mut [None, None, None, None]);
-        // SystemV: RDI=context (filled by ArgCallback), RSI=vaddr,
-        // RDX=value_lo, RCX=value_hi.
-        ra.asm.movq(RDX, Reg::xmm(1)).unwrap();
-        if ctx.has_host_feature(HostFeature::SSE41) {
-            ra.asm.pextrq(RCX, Reg::xmm(1), 1).unwrap();
-        } else {
-            ra.asm.movaps(XMM0, Reg::xmm(1)).unwrap();
-            ra.asm.punpckhqdq(XMM0, XMM0).unwrap();
-            ra.asm.movq(RCX, XMM0).unwrap();
+        #[cfg(target_os = "windows")]
+        {
+            let frame_size = 16 + abi::ABI_SHADOW_SPACE;
+            ra.alloc_stack_space(frame_size);
+            ra.asm
+                .movups(
+                    xmmword_ptr(RegExp::from(RSP) + abi::ABI_SHADOW_SPACE as i32),
+                    Reg::xmm(1),
+                )
+                .unwrap();
+            ctx.config
+                .callbacks
+                .exclusive_write_128
+                .emit_call(&mut *ra.asm, &|code, params| {
+                    code.lea(
+                        params[1],
+                        qword_ptr(RegExp::from(RSP) + abi::ABI_SHADOW_SPACE as i32),
+                    )
+                })
+                .unwrap();
+            ra.release_stack_space(frame_size);
         }
-        ctx.config
-            .callbacks
-            .exclusive_write_128
-            .emit_call_simple(&mut *ra.asm)
-            .unwrap();
+
+        #[cfg(not(target_os = "windows"))]
+        {
+            let value_lo = abi::ABI_PARAMS[2].to_reg64();
+            let value_hi = abi::ABI_PARAMS[3].to_reg64();
+            ra.asm.movq(value_lo, Reg::xmm(1)).unwrap();
+            if ctx.has_host_feature(HostFeature::SSE41) {
+                ra.asm.pextrq(value_hi, Reg::xmm(1), 1).unwrap();
+            } else {
+                ra.asm.movaps(XMM0, Reg::xmm(1)).unwrap();
+                ra.asm.punpckhqdq(XMM0, XMM0).unwrap();
+                ra.asm.movq(value_hi, XMM0).unwrap();
+            }
+            ctx.config
+                .callbacks
+                .exclusive_write_128
+                .emit_call_simple(&mut *ra.asm)
+                .unwrap();
+        }
         emit_a64_check_memory_abort(ctx, ra, inst, None);
         return;
     }

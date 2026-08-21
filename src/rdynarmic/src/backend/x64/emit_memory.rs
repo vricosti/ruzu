@@ -1,4 +1,6 @@
-use rxbyak::{qword_ptr, xmmword_ptr, Reg, RegExp, EDX, RAX, RCX, RDX, RSP};
+use rxbyak::Reg;
+#[cfg(target_os = "windows")]
+use rxbyak::{qword_ptr, xmmword_ptr, RegExp, RSP};
 
 use crate::backend::x64::abi;
 use crate::backend::x64::emit_context::EmitContext;
@@ -109,7 +111,7 @@ fn emit_memory_read(
         let result = ra.scratch_xmm();
         ra.host_call(None, &mut [None, Some(&mut args[1]), None, None]);
 
-        #[cfg(all(target_os = "windows", target_env = "msvc"))]
+        #[cfg(target_os = "windows")]
         {
             let frame_size = 16 + abi::ABI_SHADOW_SPACE;
             ra.alloc_stack_space(frame_size);
@@ -132,15 +134,17 @@ fn emit_memory_read(
             ra.release_stack_space(frame_size);
         }
 
-        #[cfg(not(all(target_os = "windows", target_env = "msvc")))]
+        #[cfg(not(target_os = "windows"))]
         {
             ctx.config
                 .callbacks
                 .memory_read_128
                 .emit_call_simple(&mut *ra.asm)
                 .unwrap();
-            ra.asm.movq(result, RAX).unwrap();
-            ra.asm.pinsrq(result, RDX, 1).unwrap();
+            ra.asm.movq(result, abi::ABI_RETURN.to_reg64()).unwrap();
+            ra.asm
+                .pinsrq(result, abi::ABI_RETURN2.to_reg64(), 1)
+                .unwrap();
         }
         ra.define_value(inst_ref, result);
         return;
@@ -309,14 +313,6 @@ fn emit_memory_write(
             ra.asm.ud2().unwrap();
         }
 
-        // RSI already holds vaddr (preserved across the spill — spill is
-        // a memory store). Extract XMM1's lo/hi into RDX/RCX before the
-        // call, since the trampoline expects (inner, vaddr, lo, hi) per
-        // SystemV ABI: RDI/RSI/RDX/RCX. RDI is filled by the ArgCallback
-        // wrapper inside emit_call_simple.
-        ra.asm.movq(RDX, Reg::xmm(1)).unwrap();
-        ra.asm.pextrq(RCX, Reg::xmm(1), 1).unwrap();
-
         if assert_point.as_deref() == Some("C") && value_is_broadcast_zero {
             ra.asm.ptest(Reg::xmm(1), Reg::xmm(1)).unwrap();
             ra.asm.db(0x74).unwrap();
@@ -324,11 +320,45 @@ fn emit_memory_write(
             ra.asm.ud2().unwrap();
         }
 
-        ctx.config
-            .callbacks
-            .memory_write_128
-            .emit_call_simple(&mut *ra.asm)
-            .unwrap();
+        #[cfg(target_os = "windows")]
+        {
+            let frame_size = 16 + abi::ABI_SHADOW_SPACE;
+            ra.alloc_stack_space(frame_size);
+            ra.asm
+                .movups(
+                    xmmword_ptr(RegExp::from(RSP) + abi::ABI_SHADOW_SPACE as i32),
+                    Reg::xmm(1),
+                )
+                .unwrap();
+            ctx.config
+                .callbacks
+                .memory_write_128
+                .emit_call(&mut *ra.asm, &|code, params| {
+                    code.lea(
+                        params[1],
+                        qword_ptr(RegExp::from(RSP) + abi::ABI_SHADOW_SPACE as i32),
+                    )
+                })
+                .unwrap();
+            ra.release_stack_space(frame_size);
+        }
+
+        #[cfg(not(target_os = "windows"))]
+        {
+            // System V: context, vaddr, low lane and high lane occupy the
+            // first four integer parameter registers.
+            ra.asm
+                .movq(abi::ABI_PARAMS[2].to_reg64(), Reg::xmm(1))
+                .unwrap();
+            ra.asm
+                .pextrq(abi::ABI_PARAMS[3].to_reg64(), Reg::xmm(1), 1)
+                .unwrap();
+            ctx.config
+                .callbacks
+                .memory_write_128
+                .emit_call_simple(&mut *ra.asm)
+                .unwrap();
+        }
         return;
     }
 
@@ -342,10 +372,13 @@ fn emit_memory_write(
         ra.use_loc(&mut rest[0], HostLoc::Xmm(1)); // value -> XMM1
         ra.end_of_alloc_scope();
         ra.host_call(None, &mut [None, None, None, None]);
+        let value_param = abi::ABI_PARAMS[2].to_reg64();
         if bitsize == 64 {
-            ra.asm.movq(RDX, Reg::xmm(1)).unwrap();
+            ra.asm.movq(value_param, Reg::xmm(1)).unwrap();
         } else {
-            ra.asm.movd(EDX, Reg::xmm(1)).unwrap();
+            ra.asm
+                .movd(value_param.cvt32().unwrap(), Reg::xmm(1))
+                .unwrap();
         }
         let callback = match bitsize {
             32 => &ctx.config.callbacks.memory_write_32,

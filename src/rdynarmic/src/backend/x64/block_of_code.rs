@@ -1,5 +1,6 @@
 use rxbyak::dword_ptr;
 use rxbyak::qword_ptr;
+#[cfg(target_os = "windows")]
 use rxbyak::xmmword_ptr;
 use rxbyak::{CodeAssembler, JmpType, Reg, RegExp};
 use rxbyak::{R14, R15, RAX, RBX, RSP};
@@ -135,6 +136,7 @@ pub struct DispatcherLabels {
 /// aligned caller frame, not before it.
 pub const STACK_LAYOUT_RSP_OFFSET: usize = abi::ABI_SHADOW_SPACE;
 
+#[cfg(target_os = "windows")]
 pub(crate) fn xmm_save_base(frame_size: usize) -> usize {
     frame_size.next_multiple_of(16) + abi::ABI_SHADOW_SPACE
 }
@@ -819,6 +821,7 @@ mod tests {
         let addr1 = boc.constant_pool.get_constant(0x1234, 0x5678);
         let addr2 = boc.constant_pool.get_constant(0x1234, 0x5678);
         assert!(addr1.is_rip());
+        assert!(addr2.is_rip());
         assert_eq!(
             boc.constant_pool.len(),
             1,

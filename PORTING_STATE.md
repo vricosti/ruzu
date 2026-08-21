@@ -1,5 +1,30 @@
 # Porting State
 
+## 2026-08-21 — Windows GNU 128-bit callback ABI cleanup
+
+- Status: completed and verified.
+- Interrupted slice: remove platform-specific unused imports from
+  `backend/x64/{block_of_code,emit_memory}.rs` while preserving Eden's ABI.
+- Exact missing prerequisite: the reviewed emitter correctly showed that Eden
+  selects its indirect 128-bit memory-read path with `_WIN32`, but Ruzu's
+  ordinary/exclusive-read trampolines and fastmem fallback owners still selected
+  that contract only for `target_env = "msvc"`. The ordinary and exclusive
+  128-bit write paths also forwarded their lanes in hard-coded System V
+  registers, which overwrote the Windows context/address parameters.
+- Required prerequisite work: make each explicit Rust trampoline/fallback owner
+  select by `target_os = "windows"`, pass 128-bit writes through a Windows pointer
+  payload, verify both native and `x86_64-pc-windows-gnu` builds, then resume the
+  warning cleanup slice. Keep `callback.rs`'s MSVC-vs-MinGW hidden-return ordering:
+  Eden makes that distinction explicitly in `callback.cpp`.
+- Resume condition: targeted ordinary/exclusive 128-bit tests pass, MinGW
+  `cargo check` reports no warning in the touched files, and each owner has a
+  fresh upstream comparison in `DIFF.md`.
+- Prerequisite result: ordinary and exclusive A64 reads use an explicit output
+  pointer on every Windows toolchain; writes use an explicit 16-byte input
+  payload instead of System V lane registers. Native `LDR Q`, `STR Q`, `LDXP`
+  and `STXP` execution regressions pass, both native and MinGW checks pass, and
+  the touched files emit no warning in either check.
+
 ## 2026-08-21 — NCM content-service parity
 
 - Status: completed and verified.

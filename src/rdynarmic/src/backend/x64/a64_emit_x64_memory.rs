@@ -15,7 +15,7 @@
 
 use std::collections::HashMap;
 
-#[cfg(all(target_os = "windows", target_env = "msvc"))]
+#[cfg(target_os = "windows")]
 use rxbyak::xmmword_ptr;
 use rxbyak::{
     dword_ptr, qword_ptr, CodeAssembler, JmpType, Label, Reg, RegExp, EDX, R13, R15, RAX, RBX, RCX,
@@ -249,17 +249,22 @@ fn emit_read_fallback_128(
     vaddr_idx: u8,
     value_idx: u8,
 ) {
+    #[cfg(target_os = "windows")]
     let (saved, local) = abi::push_caller_save_registers_and_adjust_stack_except_with_local(
         asm,
         Some(HostLoc::Xmm(value_idx)),
         16,
     )
     .unwrap();
+    #[cfg(not(target_os = "windows"))]
+    let saved =
+        abi::push_caller_save_registers_and_adjust_stack_except(asm, Some(HostLoc::Xmm(value_idx)))
+            .unwrap();
     if ordered {
         asm.mfence().unwrap();
     }
 
-    #[cfg(all(target_os = "windows", target_env = "msvc"))]
+    #[cfg(target_os = "windows")]
     callbacks
         .memory_read_128
         .emit_call(asm, &|code, params| {
@@ -269,7 +274,7 @@ fn emit_read_fallback_128(
         })
         .unwrap();
 
-    #[cfg(not(all(target_os = "windows", target_env = "msvc")))]
+    #[cfg(not(target_os = "windows"))]
     callbacks
         .memory_read_128
         .emit_call(asm, &|code, params| {
@@ -278,13 +283,13 @@ fn emit_read_fallback_128(
         })
         .unwrap();
 
-    #[cfg(all(target_os = "windows", target_env = "msvc"))]
+    #[cfg(target_os = "windows")]
     asm.movups(
         Reg::xmm(value_idx),
         xmmword_ptr(RegExp::from(RSP) + local as i32),
     )
     .unwrap();
-    #[cfg(not(all(target_os = "windows", target_env = "msvc")))]
+    #[cfg(not(target_os = "windows"))]
     {
         asm.movq(Reg::xmm(value_idx), RAX).unwrap();
         asm.pinsrq(Reg::xmm(value_idx), RDX, 1).unwrap();
@@ -1033,7 +1038,6 @@ pub fn emit_a64_memory_write<const BITSIZE: usize>(
             && vaddr_idx != 11
         {
             let ok = ra.asm.create_label();
-            let value_reg = rxbyak::Reg::gpr64(value_idx);
             let vaddr_reg = rxbyak::Reg::gpr64(vaddr_idx);
             let r11 = rxbyak::Reg::gpr64(11);
             let r11_32 = rxbyak::Reg::gpr32(11);
