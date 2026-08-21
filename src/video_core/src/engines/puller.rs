@@ -339,7 +339,6 @@ pub struct Puller {
     pub regs: PullerRegs,
     /// Mapping of subchannels to bound engine IDs.
     pub bound_engines: [EngineID; NUM_SUBCHANNELS],
-    gpu: *const crate::gpu::Gpu,
     memory_manager: Arc<parking_lot::Mutex<crate::memory_manager::MemoryManager>>,
     dma_pusher: *mut crate::dma_pusher::DmaPusher,
     rasterizer: Option<RasterizerHandle>,
@@ -348,7 +347,6 @@ pub struct Puller {
 
 impl Puller {
     pub fn new(
-        gpu: *const crate::gpu::Gpu,
         memory_manager: Arc<parking_lot::Mutex<crate::memory_manager::MemoryManager>>,
         dma_pusher: *mut crate::dma_pusher::DmaPusher,
         channel_state: *mut ChannelState,
@@ -356,7 +354,6 @@ impl Puller {
         Self {
             regs: PullerRegs::default(),
             bound_engines: [EngineID::default(); NUM_SUBCHANNELS],
-            gpu,
             memory_manager,
             dma_pusher,
             rasterizer: None,
@@ -897,7 +894,6 @@ impl Puller {
 impl Default for Puller {
     fn default() -> Self {
         Self::new(
-            std::ptr::null(),
             Arc::new(parking_lot::Mutex::new(
                 crate::memory_manager::MemoryManager::default(),
             )),

@@ -271,12 +271,7 @@ impl DmaPusher {
             gpu,
             system,
             memory_manager,
-            puller: Puller::new(
-                gpu,
-                puller_memory_manager,
-                std::ptr::null_mut(),
-                channel_state,
-            ),
+            puller: Puller::new(puller_memory_manager, std::ptr::null_mut(), channel_state),
             rasterizer: None,
             signal_sync: false,
             sync_state: Arc::new(DmaSyncState::default()),
