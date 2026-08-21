@@ -423,7 +423,7 @@ impl Gpu {
     /// from `Box::as_ref()`). The caller must ensure the Gpu outlives the
     /// renderer — this matches the existing pattern in `ruzu_cmd` where a
     /// `*const Gpu` is captured for service callbacks (see `gpu_ptr` in
-    /// `ruzu_cmd/src/main.rs`).
+    /// `src/ruzu_cmd/src/main.rs`).
     ///
     /// # Safety
     ///

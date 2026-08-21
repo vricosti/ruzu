@@ -90,7 +90,7 @@ verifier que eden et reden utilisent les memes appels opengl glsl/vulkan sur ...
   jusqu'au bout — à confirmer.
 
   scripts/build-macos-app.sh positionne encore PKG_CONFIG_PATH pour opus, ffmpeg et openssl@3. C'est devenu redondant : le
-  script fait déjà export PATH="$brew_prefix/bin:$PATH", ce qui suffit, et opus est désormais résolu par audio_core/build.rs.
+  script fait déjà export PATH="$brew_prefix/bin:$PATH", ce qui suffit, et opus est désormais résolu par src/audio_core/build.rs.
   Inoffensif, mais c'est le symptôme que je traitais moi-même il y a quelques heures.
 
   Un détail de style : le chemin ~/Dev/emulators/eden/build/bin/eden.app est en dur dans du code suivi par git. C'est

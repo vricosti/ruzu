@@ -5,9 +5,12 @@ fn main() {
     let manifest_dir = std::path::PathBuf::from(
         std::env::var_os("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR must be set"),
     );
-    let workspace_dir = manifest_dir
+    let source_dir = manifest_dir
         .parent()
-        .expect("video_core must be inside the ruzu workspace");
+        .expect("video_core must be inside the ruzu source directory");
+    let workspace_dir = source_dir
+        .parent()
+        .expect("the ruzu source directory must be inside the workspace");
     let stb_dir = workspace_dir.join("externals/stb");
     let bc_decoder_dir = workspace_dir.join("externals/bc_decoder");
 

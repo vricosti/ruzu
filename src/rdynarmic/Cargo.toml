@@ -17,7 +17,7 @@ profile_opcodes = []
 no_execute_support = []
 
 [dependencies]
-rxbyak = { path = "../externals/rxbyak" }
+rxbyak = { path = "../../externals/rxbyak" }
 bitflags = "2"
 log = "0.4"
 thiserror = "2"

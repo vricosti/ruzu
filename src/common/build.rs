@@ -133,7 +133,10 @@ fn track_git_head(repository: &Path) {
 
 fn main() {
     let manifest_dir = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap());
-    let repository = manifest_dir.parent().unwrap_or(&manifest_dir);
+    let repository = manifest_dir
+        .parent()
+        .and_then(Path::parent)
+        .unwrap_or(&manifest_dir);
     track_git_head(repository);
     println!("cargo:rerun-if-env-changed=CXX");
     println!("cargo:rerun-if-env-changed=GIT_REV");

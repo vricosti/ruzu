@@ -610,7 +610,7 @@ For each upstream `.h`/`.cpp` pair you touch:
 1. **Read upstream first.** Open `<zuyu>/src/<path>.cpp` and `.h`. List
    every method, constant, member, helper, validation rule.
 2. **Identify the Rust counterpart.** Path mirrors upstream
-   (`zuyu/src/video_core/foo.cpp` → `ruzu/video_core/src/foo.rs`).
+   (`zuyu/src/video_core/foo.cpp` → `ruzu/src/video_core/src/foo.rs`).
    If the Rust file does not exist yet, create it with the file header
    from §1 and stop to confirm the placement.
 3. **Port names, signatures, and ordering verbatim** (snake_case only).

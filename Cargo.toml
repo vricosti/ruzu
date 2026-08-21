@@ -1,20 +1,20 @@
 [workspace]
 members = [
-    "audio_core",
-    "common",
-    "core",
-    "core/crypto",
-    "rdynarmic",
-    "shader_recompiler",
-    "video_core",
-    "hid_core",
-    "input_common",
-    "network",
-    "web_service",
-    "frontend_common",
-    "dedicated_room",
-    "ruzu_cmd",
-    "ruzu",
+    "src/audio_core",
+    "src/common",
+    "src/core",
+    "src/core/crypto",
+    "src/rdynarmic",
+    "src/shader_recompiler",
+    "src/video_core",
+    "src/hid_core",
+    "src/input_common",
+    "src/network",
+    "src/web_service",
+    "src/frontend_common",
+    "src/dedicated_room",
+    "src/ruzu_cmd",
+    "src/ruzu",
     "tools/capture_harness",
 ]
 resolver = "2"
@@ -27,17 +27,17 @@ license = "GPL-3.0-or-later"
 
 [workspace.dependencies]
 # Internal crates
-common = { path = "common" }
-shader_recompiler = { path = "shader_recompiler" }
-video_core = { path = "video_core" }
-input_common = { path = "input_common" }
-network = { path = "network" }
-web_service = { path = "web_service" }
-frontend_common = { path = "frontend_common" }
+common = { path = "src/common" }
+shader_recompiler = { path = "src/shader_recompiler" }
+video_core = { path = "src/video_core" }
+input_common = { path = "src/input_common" }
+network = { path = "src/network" }
+web_service = { path = "src/web_service" }
+frontend_common = { path = "src/frontend_common" }
 
 # JIT recompiler maintained directly in this repository. Its x64 backend
 # references the rxbyak submodule under `externals/`.
-rdynarmic = { path = "rdynarmic" }
+rdynarmic = { path = "src/rdynarmic" }
 
 # CLI / Config
 clap = { version = "4", features = ["derive"] }

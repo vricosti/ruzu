@@ -62,7 +62,7 @@ dispatch is adapted.
 
 **The port.** `BankPool<Arc<SamplesQueryBank>>`, with `BankBase` behind a
 `parking_lot::Mutex` inside each bank
-(`video_core/src/renderer_vulkan/query_cache.rs`).
+(`src/video_core/src/renderer_vulkan/query_cache.rs`).
 
 **Why.** A query's results are resolved on the **fence thread**, in
 `pop_unsynced_queries`, after the streamer's borrow has ended. Shared ownership
@@ -184,7 +184,7 @@ the Rust manager that have no direct C++ counterpart.
 
 - `cargo test -p video_core --lib`: 1464 passed, 0 failed, including focused
   regressions for `BankBase::close`, `is_dead`, and `BankPool::can_recycle_front`
-  in `video_core/src/query_cache/bank_base.rs`.
+  in `src/video_core/src/query_cache/bank_base.rs`.
 - Successive samples reports are cumulative until `ResetCounter`, matching
   upstream `WriteCounter`; focused tests cover history snapshots and wide-range
   merging.

@@ -703,7 +703,7 @@ mod startup_prerequisite_tests {
         assert!(!should_warn_about_missing_keys(true));
         assert!(!MISSING_KEYS_DETAIL.contains("yuzu"));
         assert!(MISSING_KEYS_DETAIL.contains(QUICKSTART_URL));
-        assert!(include_str!("../../docs/quickstart.md").contains("Install decryption keys"));
+        assert!(include_str!("../../../docs/quickstart.md").contains("Install decryption keys"));
     }
 }
 

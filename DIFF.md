@@ -8,10 +8,10 @@ procedures are intentionally omitted.
 
 ### Unintentional differences (to fix)
 
-- `core/src/hle/kernel/k_process.rs` still represents thread-local pages, thread ownership, and
+- `src/core/src/hle/kernel/k_process.rs` still represents thread-local pages, thread ownership, and
   shared-memory ownership with Rust side vectors instead of upstream's intrusive kernel-object
   structures.
-- `core/src/hle/kernel/k_worker_task_manager.rs` has the asynchronous queue but not upstream's
+- `src/core/src/hle/kernel/k_worker_task_manager.rs` has the asynchronous queue but not upstream's
   `KernelCore` ownership and lifecycle.
 - Light ports are not supported by `svc_port.rs` and `sm.rs`; affected requests are rejected
   instead of using upstream's light-session path.
@@ -48,8 +48,8 @@ procedures are intentionally omitted.
 
 - `network` does not implement the ENet transport. Room creation/join, peer lifecycle, packet
   delivery, chat, moderation, and announcement loops remain local stubs.
-- `web_service/src/web_backend.rs` has no HTTP client; generic web requests return a local error.
-- Web telemetry submission is disabled in `core/src/telemetry_session.rs`.
+- `src/web_service/src/web_backend.rs` has no HTTP client; generic web requests return a local error.
+- Web telemetry submission is disabled in `src/core/src/telemetry_session.rs`.
 - The LDN service has helper methods for a small subset of commands, but its IPC table remains
   disconnected as listed above and it does not own upstream's event and network lifecycle.
 
@@ -79,7 +79,7 @@ and persisted under upstream's `UIGameList\\favorites_expanded` key.
 
 - Not applicable. The changed state is GTK frontend model data only.
 
-## 2026-08-09 — `ruzu/src/game_list.rs` vs `src/yuzu/game_list.cpp` (`GameList::PopupContextMenu` and `AddGamePopup`)
+## 2026-08-09 — `src/ruzu/src/game_list.rs` vs `src/yuzu/game_list.cpp` (`GameList::PopupContextMenu` and `AddGamePopup`)
 
 ### Intentional differences
 
@@ -93,7 +93,7 @@ and persisted under upstream's `UIGameList\\favorites_expanded` key.
 
 - Not applicable. This only changes GTK context-menu construction order.
 
-## 2026-08-09 — `ruzu/src/main_window.rs` vs `src/yuzu/main.{h,cpp}` (`GMainWindow::OnRestartGame`)
+## 2026-08-09 — `src/ruzu/src/main_window.rs` vs `src/yuzu/main.{h,cpp}` (`GMainWindow::OnRestartGame`)
 
 ### Intentional differences
 
@@ -109,7 +109,7 @@ and persisted under upstream's `UIGameList\\favorites_expanded` key.
 - Not applicable. This changes frontend action wiring and lifecycle state only. A focused regression
   test verifies that the retained restart path survives only a successful non-closing shutdown.
 
-## 2026-08-09 — `ruzu/src/configuration/qt_config.rs`, `configure_dialog.rs`, and `main.rs` vs `src/frontend_common/config.cpp` and `src/yuzu/configuration/qt_config.cpp`
+## 2026-08-09 — `src/ruzu/src/configuration/qt_config.rs`, `configure_dialog.rs`, and `main.rs` vs `src/frontend_common/config.cpp` and `src/yuzu/configuration/qt_config.cpp`
 
 ### Intentional differences
 
@@ -124,19 +124,19 @@ and persisted under upstream's `UIGameList\\favorites_expanded` key.
 
 ### Missing items
 
-- `ruzu_cmd/src/sdl_config.rs` can read the currently bridged settings but does not implement the
+- `src/ruzu_cmd/src/sdl_config.rs` can read the currently bridged settings but does not implement the
   upstream reload/save and INI write paths for SDL, players, debug controls, and HIDBus values.
-- `ruzu/src/configuration/configure_hotkeys.rs` displays default bindings, but bindings are not
+- `src/ruzu/src/configuration/configure_hotkeys.rs` displays default bindings, but bindings are not
   editable or persisted because `HotkeyRegistry` is absent; Clear All and Restore Defaults only
   log requests.
 - Several advanced input configuration actions in
-  `ruzu/src/configuration/configure_input_advanced.rs` remain informational placeholders.
+  `src/ruzu/src/configuration/configure_input_advanced.rs` remain informational placeholders.
 - The Android Oboe audio backend is represented by a no-op stub in
-  `audio_core/src/sink/oboe_sink.rs`.
+  `src/audio_core/src/sink/oboe_sink.rs`.
 
 ## Video core
 
-## 2026-08-09 — `ruzu/src/boot.rs`, `main_window.rs`, and `render_window_x11.rs` vs `src/video_core/video_core.cpp` and `src/yuzu/bootmanager.{h,cpp}`
+## 2026-08-09 — `src/ruzu/src/boot.rs`, `main_window.rs`, and `render_window_x11.rs` vs `src/video_core/video_core.cpp` and `src/yuzu/bootmanager.{h,cpp}`
 
 ### Intentional differences
 
@@ -161,7 +161,7 @@ and persisted under upstream's `UIGameList\\favorites_expanded` key.
 - Not applicable. This slice changes frontend native-context ownership and renderer dispatch; no
   guest-visible structure or raw payload layout changes.
 
-## 2026-08-09 — `video_core/src/renderer_vulkan/turbo_mode.rs`, `renderer_vulkan/texture_cache.rs`, and `host_shaders/vulkan_turbo_mode.comp` vs `src/video_core/renderer_vulkan/vk_turbo_mode.{h,cpp}`, `vk_texture_cache.cpp`, and `host_shaders/vulkan_turbo_mode.comp`
+## 2026-08-09 — `src/video_core/src/renderer_vulkan/turbo_mode.rs`, `renderer_vulkan/texture_cache.rs`, and `host_shaders/vulkan_turbo_mode.comp` vs `src/video_core/renderer_vulkan/vk_turbo_mode.{h,cpp}`, `vk_texture_cache.cpp`, and `host_shaders/vulkan_turbo_mode.comp`
 
 ### Intentional differences
 
@@ -178,7 +178,7 @@ and persisted under upstream's `UIGameList\\favorites_expanded` key.
 - The turbo compute shader is byte-for-byte identical to upstream. This slice introduces no
   guest-visible raw-memory structure.
 
-## 2026-08-09 — `video_core/src/host1x/codecs/vp8.rs`, `vp9.rs`, and `vp9_types.rs` vs `src/video_core/host1x/codecs/vp8.{h,cpp}`, `vp9.{h,cpp}`, and `vp9_types.h`
+## 2026-08-09 — `src/video_core/src/host1x/codecs/vp8.rs`, `vp9.rs`, and `vp9_types.rs` vs `src/video_core/host1x/codecs/vp8.{h,cpp}`, `vp9.{h,cpp}`, and `vp9_types.h`
 
 ### Intentional differences
 
@@ -193,7 +193,7 @@ and persisted under upstream's `UIGameList\\favorites_expanded` key.
   respectively `0x100`, `0xea0`, and `0x7b4` bytes; compile-time offset assertions cover the fields
   read from NVDEC memory. Focused tests verify VP8 frame tags and VP9 range/bitstream encoder bytes.
 
-## 2026-08-09 — `common/src/thread_worker.rs`, `video_core/src/rasterizer_interface.rs`, and renderer disk-cache loaders vs `src/common/thread_worker.h`, `src/video_core/rasterizer_interface.h`, and renderer shader caches
+## 2026-08-09 — `src/common/src/thread_worker.rs`, `src/video_core/src/rasterizer_interface.rs`, and renderer disk-cache loaders vs `src/common/thread_worker.h`, `src/video_core/rasterizer_interface.h`, and renderer shader caches
 
 ### Intentional differences
 
@@ -209,7 +209,7 @@ and persisted under upstream's `UIGameList\\favorites_expanded` key.
 
 - Not applicable: this slice changes synchronization and owner propagation only.
 
-## 2026-08-09 — `video_core/src/renderer_opengl/gl_state_tracker.rs` and `gl_rasterizer.rs` vs `src/video_core/renderer_opengl/gl_state_tracker.{h,cpp}` and `gl_rasterizer.cpp`
+## 2026-08-09 — `src/video_core/src/renderer_opengl/gl_state_tracker.rs` and `gl_rasterizer.rs` vs `src/video_core/renderer_opengl/gl_state_tracker.{h,cpp}` and `gl_rasterizer.cpp`
 
 ### Intentional differences
 
@@ -224,7 +224,7 @@ and persisted under upstream's `UIGameList\\favorites_expanded` key.
 - Not applicable: this slice changes owner references and lifecycle ordering only; no guest-visible
   structure is serialized or copied as raw bytes.
 
-## 2026-08-09 — `video_core/src/texture_cache/texture_cache_base.rs` vs `src/video_core/texture_cache/texture_cache_base.h` and `control/channel_state_cache.inc`
+## 2026-08-09 — `src/video_core/src/texture_cache/texture_cache_base.rs` vs `src/video_core/texture_cache/texture_cache_base.h` and `control/channel_state_cache.inc`
 
 ### Intentional differences
 
@@ -236,7 +236,7 @@ and persisted under upstream's `UIGameList\\favorites_expanded` key.
 
 - Not applicable: this slice only updates channel ownership state.
 
-## 2026-08-09 — `video_core/src/renderer_opengl/` vs `src/video_core/renderer_opengl/`
+## 2026-08-09 — `src/video_core/src/renderer_opengl/` vs `src/video_core/renderer_opengl/`
 
 ### Intentional differences
 
@@ -263,7 +263,7 @@ and persisted under upstream's `UIGameList\\favorites_expanded` key.
 
 ## Shader recompiler and JIT
 
-## 2026-08-09 — `rdynarmic/src/backend/arm64/emit_arm64_floating_point.rs`, `emit_arm64_vector_floating_point.rs`, and x64 exclusive-memory emitters vs Dynarmic `backend/arm64/emit_arm64_{floating_point,vector_floating_point}.cpp` and `backend/x64/emit_x64_memory.cpp.inc`
+## 2026-08-09 — `src/rdynarmic/src/backend/arm64/emit_arm64_floating_point.rs`, `emit_arm64_vector_floating_point.rs`, and x64 exclusive-memory emitters vs Dynarmic `backend/arm64/emit_arm64_{floating_point,vector_floating_point}.cpp` and `backend/x64/emit_x64_memory.cpp.inc`
 
 ### Intentional differences
 
@@ -300,7 +300,7 @@ and persisted under upstream's `UIGameList\\favorites_expanded` key.
   min/max, halving, rounding, and broadcast operations. Upstream's 16-bit FP specializations that
   themselves terminate with `ASSERT_FALSE("Unimplemented")` are not counted as port debt.
 
-## 2026-08-09 — `frontend_common/src/play_time_manager.rs` vs Eden `src/frontend_common/play_time_manager.{h,cpp}`
+## 2026-08-09 — `src/frontend_common/src/play_time_manager.rs` vs Eden `src/frontend_common/play_time_manager.{h,cpp}`
 
 ### Intentional differences
 
@@ -313,7 +313,7 @@ and persisted under upstream's `UIGameList\\favorites_expanded` key.
 - PASS: each entry is two consecutive little-endian `u64` values and occupies 16 bytes, matching
   Eden's raw `PlayTimeElement` array in `playtime.bin`.
 
-## 2026-08-09 — `ruzu/src/game_list.rs` vs Eden `src/yuzu/game/game_list.{h,cpp}` and `src/qt_common/game_list/{model,worker}.{h,cpp}`
+## 2026-08-09 — `src/ruzu/src/game_list.rs` vs Eden `src/yuzu/game/game_list.{h,cpp}` and `src/qt_common/game_list/{model,worker}.{h,cpp}`
 
 ### Intentional differences
 
@@ -332,7 +332,7 @@ and persisted under upstream's `UIGameList\\favorites_expanded` key.
 
 - Not applicable to the GTK model; the shared play-time file layout is verified separately.
 
-## 2026-08-09 — `ruzu/src/{boot,main_window}.rs` vs Eden `src/yuzu/main_window.{h,cpp}`
+## 2026-08-09 — `src/ruzu/src/{boot,main_window}.rs` vs Eden `src/yuzu/main_window.{h,cpp}`
 
 ### Intentional differences
 
@@ -344,7 +344,7 @@ and persisted under upstream's `UIGameList\\favorites_expanded` key.
 
 - Not applicable: this changes frontend lifecycle events only.
 
-## 2026-08-09 — `ruzu/src/configuration/configure_per_game_addons.rs` vs Eden `src/yuzu/configuration/configure_per_game_addons.{h,cpp,ui}`
+## 2026-08-09 — `src/ruzu/src/configuration/configure_per_game_addons.rs` vs Eden `src/yuzu/configuration/configure_per_game_addons.{h,cpp,ui}`
 
 ### Intentional differences
 
@@ -357,7 +357,7 @@ and persisted under upstream's `UIGameList\\favorites_expanded` key.
 
 - Not applicable: this is host frontend state.
 
-## 2026-08-09 — `common/src/settings.rs` vs Eden `src/common/settings.h`
+## 2026-08-09 — `src/common/src/settings.rs` vs Eden `src/common/settings.h`
 
 ### Intentional differences
 
@@ -371,7 +371,7 @@ and persisted under upstream's `UIGameList\\favorites_expanded` key.
 
 - Not applicable: this setting is not guest-visible.
 
-## 2026-08-09 — `core/src/file_sys/registered_cache.rs` vs Eden `src/core/file_sys/registered_cache.{h,cpp}`
+## 2026-08-09 — `src/core/src/file_sys/registered_cache.rs` vs Eden `src/core/file_sys/registered_cache.{h,cpp}`
 
 ### Intentional differences
 
@@ -385,7 +385,7 @@ and persisted under upstream's `UIGameList\\favorites_expanded` key.
 - Not applicable: manual-provider entries are host-only. Focused tests cover highest-version
   selection, descending update order, and clearing versioned entries.
 
-## 2026-08-09 — `video_core/src/engines/maxwell_3d.rs` and `video_core/src/buffer_cache/buffer_cache.rs` vs Eden `src/video_core/engines/maxwell_3d.h` and `src/video_core/buffer_cache/buffer_cache.h`
+## 2026-08-09 — `src/video_core/src/engines/maxwell_3d.rs` and `src/video_core/src/buffer_cache/buffer_cache.rs` vs Eden `src/video_core/engines/maxwell_3d.h` and `src/video_core/buffer_cache/buffer_cache.h`
 
 ### Intentional differences
 
@@ -407,7 +407,7 @@ and persisted under upstream's `UIGameList\\favorites_expanded` key.
 - PASS: focused register tests verify that `0xffff_fff0` and `0xffff_ffe0` are exposed as `-16`
   and `-32`; consumers cast back to unsigned values without clamping or normalization.
 
-## 2026-08-09 — `video_core/src/renderer_vulkan/query_cache.rs`, `scheduler.rs`, `vk_rasterizer.rs`, `renderer_vulkan.rs`, and `video_core/src/vulkan_common/vulkan_device.rs` vs Eden `src/video_core/renderer_vulkan/vk_query_cache.{h,cpp}`, `vk_scheduler.{h,cpp}`, `vk_rasterizer.{h,cpp}`, `renderer_vulkan.{h,cpp}`, and `vk_device.{h,cpp}`
+## 2026-08-09 — `src/video_core/src/renderer_vulkan/query_cache.rs`, `scheduler.rs`, `vk_rasterizer.rs`, `renderer_vulkan.rs`, and `src/video_core/src/vulkan_common/vulkan_device.rs` vs Eden `src/video_core/renderer_vulkan/vk_query_cache.{h,cpp}`, `vk_scheduler.{h,cpp}`, `vk_rasterizer.{h,cpp}`, `renderer_vulkan.{h,cpp}`, and `vk_device.{h,cpp}`
 
 ### Intentional differences
 
@@ -449,7 +449,7 @@ and persisted under upstream's `UIGameList\\favorites_expanded` key.
   unsynchronized fence rejection, empty ZPass reports, scan size classes and producer barriers,
   TFB stream mapping, query payload/timestamp writes, and draw preparation ordering.
 
-## 2026-08-09 — `video_core/src/renderer_vulkan/compute_pass.rs`, `descriptor_pool.rs`, and `update_descriptor.rs` vs Eden `src/video_core/renderer_vulkan/vk_compute_pass.{h,cpp}`, `vk_descriptor_pool.{h,cpp}`, and `vk_update_descriptor.{h,cpp}`
+## 2026-08-09 — `src/video_core/src/renderer_vulkan/compute_pass.rs`, `descriptor_pool.rs`, and `update_descriptor.rs` vs Eden `src/video_core/renderer_vulkan/vk_compute_pass.{h,cpp}`, `vk_descriptor_pool.{h,cpp}`, and `vk_update_descriptor.{h,cpp}`
 
 ### Intentional differences
 
@@ -465,7 +465,7 @@ and persisted under upstream's `UIGameList\\favorites_expanded` key.
 - PASS: compute descriptor templates use `size_of::<DescriptorUpdateEntry>()` as Eden does. Unit
   tests verify the union size/alignment and the two- and three-buffer template strides.
 
-## 2026-08-09 — `core/src/core.rs` and `core/src/hle/kernel/kernel.rs` vs Eden `src/core/hle/kernel/kernel.cpp`
+## 2026-08-09 — `src/core/src/core.rs` and `src/core/src/hle/kernel/kernel.rs` vs Eden `src/core/hle/kernel/kernel.cpp`
 
 ### Intentional differences
 
@@ -483,7 +483,7 @@ and persisted under upstream's `UIGameList\\favorites_expanded` key.
 - PASS: no guest-visible binary layout is changed; the regression test verifies both upstream
   capacities and their combined runtime value.
 
-## 2026-08-09 — `core/src/hle/kernel/k_shared_memory.rs` vs Eden `src/core/hle/kernel/k_shared_memory.{h,cpp}`
+## 2026-08-09 — `src/core/src/hle/kernel/k_shared_memory.rs` vs Eden `src/core/hle/kernel/k_shared_memory.{h,cpp}`
 
 ### Unintentional differences (fixed)
 
@@ -522,7 +522,7 @@ and persisted under upstream's `UIGameList\\favorites_expanded` key.
 - N/A: this change affects native dependency selection only. `audio_core` and
   `input_common` unit tests pass with the resolved SDL 3.4.14 build.
 
-## 2026-08-18 — `ruzu/Info.plist` and `scripts/build-macos-app.sh` vs Eden `src/yuzu/Info.plist` and `src/yuzu/CMakeLists.txt`
+## 2026-08-18 — `src/ruzu/Info.plist` and `scripts/build-macos-app.sh` vs Eden `src/yuzu/Info.plist` and `src/yuzu/CMakeLists.txt`
 
 ### Intentional differences
 
@@ -549,7 +549,7 @@ and persisted under upstream's `UIGameList\\favorites_expanded` key.
   `Contents/Frameworks/libMoltenVK.dylib`. `codesign --verify --deep --strict` passes, and a
   LaunchServices smoke test starts the bundled executable.
 
-## 2026-08-18 — `video_core/src/vulkan_common/vulkan_library.rs` vs Eden `src/video_core/vulkan_common/vulkan_library.cpp`
+## 2026-08-18 — `src/video_core/src/vulkan_common/vulkan_library.rs` vs Eden `src/video_core/vulkan_common/vulkan_library.cpp`
 
 ### Intentional differences
 
@@ -573,7 +573,7 @@ and persisted under upstream's `UIGameList\\favorites_expanded` key.
 
 - N/A: the Vulkan loader ABI is unchanged; this only selects the dynamic library implementation.
 
-## 2026-08-18 — `ruzu_cmd/src/emu_window/emu_window_sdl3_vk.rs` vs Eden `src/yuzu_cmd/emu_window/emu_window_sdl3_vk.cpp`
+## 2026-08-18 — `src/ruzu_cmd/src/emu_window/emu_window_sdl3_vk.rs` vs Eden `src/yuzu_cmd/emu_window/emu_window_sdl3_vk.cpp`
 
 ### Intentional differences
 
@@ -595,7 +595,7 @@ and persisted under upstream's `UIGameList\\favorites_expanded` key.
 
 - N/A: no serialized or guest-visible structure is changed.
 
-## 2026-08-18 — `video_core/src/vulkan_common/vulkan_device.rs` vs Eden `src/video_core/vulkan_common/vulkan_device.cpp`
+## 2026-08-18 — `src/video_core/src/vulkan_common/vulkan_device.rs` vs Eden `src/video_core/vulkan_common/vulkan_device.cpp`
 
 ### Intentional differences
 
@@ -620,7 +620,7 @@ and persisted under upstream's `UIGameList\\favorites_expanded` key.
 
 - N/A: the change only extends physical-device capability discovery.
 
-## 2026-08-18 — `video_core/src/renderer_vulkan/query_cache.rs` vs Eden `src/video_core/renderer_vulkan/vk_query_cache.cpp`
+## 2026-08-18 — `src/video_core/src/renderer_vulkan/query_cache.rs` vs Eden `src/video_core/renderer_vulkan/vk_query_cache.cpp`
 
 ### Intentional differences
 
@@ -650,7 +650,7 @@ and persisted under upstream's `UIGameList\\favorites_expanded` key.
   `vkGetQueryPoolResults ... NOT_READY` messages; the previous implementation produced roughly
   8,000 such messages in the same startup/title interval.
 
-## 2026-08-18 — `core/src/gpu_core.rs` and `video_core/src/gpu.rs` vs Eden `src/video_core/gpu.{h,cpp}`
+## 2026-08-18 — `src/core/src/gpu_core.rs` and `src/video_core/src/gpu.rs` vs Eden `src/video_core/gpu.{h,cpp}`
 
 ### Intentional differences
 
@@ -675,7 +675,7 @@ and persisted under upstream's `UIGameList\\favorites_expanded` key.
 
 - N/A: no guest-visible or serialized structure changed.
 
-## 2026-08-18 — `core/src/hle/service/nvdrv/devices/nvdisp_disp0.rs` vs Eden `src/core/hle/service/nvdrv/devices/nvdisp_disp0.{h,cpp}`
+## 2026-08-18 — `src/core/src/hle/service/nvdrv/devices/nvdisp_disp0.rs` vs Eden `src/core/hle/service/nvdrv/devices/nvdisp_disp0.{h,cpp}`
 
 ### Intentional differences
 
@@ -694,7 +694,7 @@ and persisted under upstream's `UIGameList\\favorites_expanded` key.
 
 - N/A: no ABI payload changed.
 
-## 2026-08-18 — `core/src/hle/service/nvnflinger/display.rs` and `hardware_composer.rs` vs Eden `src/core/hle/service/nvnflinger/display.h` and `hardware_composer.{h,cpp}`
+## 2026-08-18 — `src/core/src/hle/service/nvnflinger/display.rs` and `hardware_composer.rs` vs Eden `src/core/hle/service/nvnflinger/display.h` and `hardware_composer.{h,cpp}`
 
 ### Intentional differences
 
@@ -719,7 +719,7 @@ and persisted under upstream's `UIGameList\\favorites_expanded` key.
 
 - N/A: these are host-side service structures. The Layer default regression test passes.
 
-## 2026-08-18 — `core/src/hle/service/nvnflinger/surface_flinger.rs` vs Eden `src/core/hle/service/nvnflinger/surface_flinger.{h,cpp}`
+## 2026-08-18 — `src/core/src/hle/service/nvnflinger/surface_flinger.rs` vs Eden `src/core/hle/service/nvnflinger/surface_flinger.{h,cpp}`
 
 ### Intentional differences
 
@@ -739,7 +739,7 @@ and persisted under upstream's `UIGameList\\favorites_expanded` key.
 
 - N/A: no guest-visible structure changed.
 
-## 2026-08-18 — `core/src/hle/service/vi/container.rs`, `manager_display_service.rs`, and `system_display_service.rs` vs Eden `src/core/hle/service/vi/container.{h,cpp}`, `manager_display_service.{h,cpp}`, and `system_display_service.{h,cpp}`
+## 2026-08-18 — `src/core/src/hle/service/vi/container.rs`, `manager_display_service.rs`, and `system_display_service.rs` vs Eden `src/core/hle/service/vi/container.{h,cpp}`, `manager_display_service.{h,cpp}`, and `system_display_service.{h,cpp}`
 
 ### Intentional differences
 
@@ -763,7 +763,7 @@ and persisted under upstream's `UIGameList\\favorites_expanded` key.
 - PASS: SetLayerZ consumes two consecutive 64-bit request values in Eden's signature order;
   GetLayerZ returns the signed 32-bit z index sign-extended and reinterpreted as `u64`.
 
-## 2026-08-20 — `video_core/src/query_cache/bank_base.rs` vs Eden `src/video_core/query_cache/bank_base.h`
+## 2026-08-20 — `src/video_core/src/query_cache/bank_base.rs` vs Eden `src/video_core/query_cache/bank_base.h`
 
 ### Intentional differences
 
@@ -784,7 +784,7 @@ and persisted under upstream's `UIGameList\\favorites_expanded` key.
 
 - N/A: these are host-only bookkeeping types.
 
-## 2026-08-20 — `video_core/src/renderer_vulkan/query_cache.rs` vs Eden `src/video_core/renderer_vulkan/vk_query_cache.{h,cpp}`
+## 2026-08-20 — `src/video_core/src/renderer_vulkan/query_cache.rs` vs Eden `src/video_core/renderer_vulkan/vk_query_cache.{h,cpp}`
 
 ### Intentional differences
 
@@ -815,7 +815,7 @@ and persisted under upstream's `UIGameList\\favorites_expanded` key.
 
 - N/A: no guest-visible raw-memory structure changed.
 
-## 2026-08-20 — `video_core/src/renderer_vulkan/scheduler.rs` vs Eden `src/video_core/renderer_vulkan/vk_scheduler.{h,cpp}`
+## 2026-08-20 — `src/video_core/src/renderer_vulkan/scheduler.rs` vs Eden `src/video_core/renderer_vulkan/vk_scheduler.{h,cpp}`
 
 ### Intentional differences
 
@@ -837,7 +837,7 @@ and persisted under upstream's `UIGameList\\favorites_expanded` key.
 
 - N/A: scheduler state is host-only.
 
-## 2026-08-20 — `video_core/src/renderer_vulkan/vk_rasterizer.rs` vs Eden `src/video_core/renderer_vulkan/vk_rasterizer.{h,cpp}`
+## 2026-08-20 — `src/video_core/src/renderer_vulkan/vk_rasterizer.rs` vs Eden `src/video_core/renderer_vulkan/vk_rasterizer.{h,cpp}`
 
 ### Intentional differences
 
@@ -859,7 +859,7 @@ and persisted under upstream's `UIGameList\\favorites_expanded` key.
 
 - N/A: no guest ABI or serialized payload changed.
 
-## 2026-08-20 — `core/src/hle/service/am/service/library_applet_creator.rs` vs Eden `src/core/hle/service/am/service/library_applet_creator.{h,cpp}`
+## 2026-08-20 — `src/core/src/hle/service/am/service/library_applet_creator.rs` vs Eden `src/core/hle/service/am/service/library_applet_creator.{h,cpp}`
 
 ### Intentional differences
 
@@ -882,7 +882,7 @@ and persisted under upstream's `UIGameList\\favorites_expanded` key.
 - PASS: `RequestParser::align_for::<i64>()` advances the raw CMIF cursor to the same 8-byte
   boundary used by Eden's typed serialization.
 
-## 2026-08-20 — `ruzu/src/applets/software_keyboard.rs` vs Eden `src/yuzu/applets/qt_software_keyboard.{h,cpp}`
+## 2026-08-20 — `src/ruzu/src/applets/software_keyboard.rs` vs Eden `src/yuzu/applets/qt_software_keyboard.{h,cpp}`
 
 ### Intentional differences
 
@@ -913,7 +913,7 @@ and persisted under upstream's `UIGameList\\favorites_expanded` key.
 - N/A: this is host UI state. Guest-visible string lengths and cursor positions are explicitly
   converted to UTF-16 code-unit counts, with a focused regression test.
 
-## 2026-08-20 — `ruzu/src/applets/mod.rs`, `ruzu/src/boot.rs`, and `ruzu/src/main_window.rs` vs Eden `src/yuzu/main_window.{h,cpp}` software-keyboard ownership
+## 2026-08-20 — `src/ruzu/src/applets/mod.rs`, `src/ruzu/src/boot.rs`, and `src/ruzu/src/main_window.rs` vs Eden `src/yuzu/main_window.{h,cpp}` software-keyboard ownership
 
 ### Intentional differences
 
@@ -921,10 +921,10 @@ and persisted under upstream's `UIGameList\\favorites_expanded` key.
   `boot_game`; Eden owns a persistent `QtSoftwareKeyboard` signal bridge and allocates the dialog
   from its main-window slots.
 - The module and boot wiring have no direct file counterpart because Eden's Qt frontend directory
-  is excluded and ruzu owns its GTK frontend under `ruzu/src/applets`.
+  is excluded and ruzu owns its GTK frontend under `src/ruzu/src/applets`.
 
 
-## 2026-08-20 — `core/src/hle/service/am/frontend/applet_software_keyboard.rs` vs Eden `src/core/hle/service/am/frontend/applet_software_keyboard.{h,cpp}`
+## 2026-08-20 — `src/core/src/hle/service/am/frontend/applet_software_keyboard.rs` vs Eden `src/core/hle/service/am/frontend/applet_software_keyboard.{h,cpp}`
 
 ### Intentional differences
 
@@ -939,7 +939,7 @@ and persisted under upstream's `UIGameList\\favorites_expanded` key.
 - PASS: the foreground result remains a zero-initialized `sizeof(SwkbdResult) +
   STRING_BUFFER_SIZE` buffer, with the result followed by UTF-8 or UTF-16 text exactly as before.
 
-## 2026-08-20 — `core/src/hle/kernel/k_process.rs` vs Eden `src/core/hle/kernel/k_process.{h,cpp}` termination caller selection
+## 2026-08-20 — `src/core/src/hle/kernel/k_process.rs` vs Eden `src/core/hle/kernel/k_process.{h,cpp}` termination caller selection
 
 ### Intentional differences
 
@@ -949,7 +949,7 @@ and persisted under upstream's `UIGameList\\favorites_expanded` key.
   releasing the process guard because Rust cannot re-enter the thread lifecycle while borrowing
   `KProcess` through its owning cell.
 
-## 2026-08-20 — `ruzu/src/overlay_dialog.rs` and `ruzu/src/main_window.rs` vs Eden `src/yuzu/util/overlay_dialog.{h,cpp,ui}` and `src/yuzu/main_window.{h,cpp}`
+## 2026-08-20 — `src/ruzu/src/overlay_dialog.rs` and `src/ruzu/src/main_window.rs` vs Eden `src/yuzu/util/overlay_dialog.{h,cpp,ui}` and `src/yuzu/main_window.{h,cpp}`
 
 ### Intentional differences
 
@@ -973,7 +973,7 @@ and persisted under upstream's `UIGameList\\favorites_expanded` key.
 
 - N/A: the overlay contains host UI state only.
 
-## 2026-08-20 — `ruzu/src/game_list.rs` and `ruzu/src/main_window.rs` vs Eden `src/yuzu/game/game_list.{h,cpp}` and `src/yuzu/main_window.{h,cpp}` shortcut dispatch
+## 2026-08-20 — `src/ruzu/src/game_list.rs` and `src/ruzu/src/main_window.rs` vs Eden `src/yuzu/game/game_list.{h,cpp}` and `src/yuzu/main_window.{h,cpp}` shortcut dispatch
 
 ### Intentional differences
 
@@ -995,7 +995,7 @@ and persisted under upstream's `UIGameList\\favorites_expanded` key.
 
 - N/A: this is host frontend dispatch.
 
-## 2026-08-20 — `ruzu/src/util/game.rs` vs Eden `src/qt_common/util/game.{h,cpp}` shortcut creation
+## 2026-08-20 — `src/ruzu/src/util/game.rs` vs Eden `src/qt_common/util/game.{h,cpp}` shortcut creation
 
 ### Intentional differences
 
@@ -1024,7 +1024,7 @@ and persisted under upstream's `UIGameList\\favorites_expanded` key.
 
 - N/A on Linux. The `.desktop` field order and optional-field rules are covered by a focused test.
 
-## 2026-08-20 — `ruzu/src/game_list.rs` vs Eden `src/yuzu/game/game_list.cpp` context-menu submenu presentation
+## 2026-08-20 — `src/ruzu/src/game_list.rs` vs Eden `src/yuzu/game/game_list.cpp` context-menu submenu presentation
 
 ### Intentional differences
 
@@ -1045,7 +1045,7 @@ and persisted under upstream's `UIGameList\\favorites_expanded` key.
 
 - N/A: this is host UI behavior only.
 
-## 2026-08-20 — `ruzu/src/overlay_dialog.rs` vs Eden `src/yuzu/util/overlay_dialog.cpp` and `src/yuzu/main_window.cpp` shutdown-dialog destruction
+## 2026-08-20 — `src/ruzu/src/overlay_dialog.rs` vs Eden `src/yuzu/util/overlay_dialog.cpp` and `src/yuzu/main_window.cpp` shutdown-dialog destruction
 
 ### Intentional differences
 
@@ -1066,7 +1066,7 @@ and persisted under upstream's `UIGameList\\favorites_expanded` key.
 
 - N/A: this is host UI lifecycle state only.
 
-## 2026-08-20 — `ruzu/src/main_window.rs` and `ruzu/src/game_list.rs` vs Eden `src/yuzu/main_window.{h,cpp}` and `src/qt_common/game_list/model.{h,cpp}` refresh ownership
+## 2026-08-20 — `src/ruzu/src/main_window.rs` and `src/ruzu/src/game_list.rs` vs Eden `src/yuzu/main_window.{h,cpp}` and `src/qt_common/game_list/model.{h,cpp}` refresh ownership
 
 ### Intentional differences
 
@@ -1096,7 +1096,7 @@ and persisted under upstream's `UIGameList\\favorites_expanded` key.
 
 - N/A: this is host frontend state and worker dispatch.
 
-## 2026-08-20 — `ruzu/src/util/game.rs` and `ruzu/src/uisettings.rs` vs Eden `src/qt_common/util/game.{h,cpp}` and `src/yuzu/uisettings.h` metadata reset
+## 2026-08-20 — `src/ruzu/src/util/game.rs` and `src/ruzu/src/uisettings.rs` vs Eden `src/qt_common/util/game.{h,cpp}` and `src/yuzu/uisettings.h` metadata reset
 
 ### Intentional differences
 
@@ -1118,7 +1118,7 @@ and persisted under upstream's `UIGameList\\favorites_expanded` key.
 
 - N/A: cache entries are host files; the focused test verifies complete directory removal.
 
-## 2026-08-20 — `ruzu/src/configuration/configure_filesystem.rs` vs Eden `src/yuzu/configuration/configure_filesystem.{h,cpp}` metadata-reset action
+## 2026-08-20 — `src/ruzu/src/configuration/configure_filesystem.rs` vs Eden `src/yuzu/configuration/configure_filesystem.{h,cpp}` metadata-reset action
 
 ### Intentional differences
 
@@ -1138,7 +1138,7 @@ and persisted under upstream's `UIGameList\\favorites_expanded` key.
 
 - N/A: this is host UI dispatch.
 
-## 2026-08-20 — `hid_core/src/resources/ring_lifo.rs` vs Eden `src/hid_core/resources/ring_lifo.h`
+## 2026-08-20 — `src/hid_core/src/resources/ring_lifo.rs` vs Eden `src/hid_core/resources/ring_lifo.h`
 
 ### Intentional differences
 
@@ -1162,7 +1162,7 @@ and persisted under upstream's `UIGameList\\favorites_expanded` key.
 - PASS: `AtomicStorage` and `Lifo` remain `repr(C)` with unchanged fields; the full HID shared
   memory layout test passes, and focused tests verify the even marker and source sample contract.
 
-## 2026-08-20 — `hid_core/src/resources/shared_memory_format.rs` vs Eden `src/hid_core/resources/shared_memory_format.h`
+## 2026-08-20 — `src/hid_core/src/resources/shared_memory_format.rs` vs Eden `src/hid_core/resources/shared_memory_format.h`
 
 ### Intentional differences
 
@@ -1182,7 +1182,7 @@ and persisted under upstream's `UIGameList\\favorites_expanded` key.
 - PASS: trait implementations add no fields or vtables to the state values, and
   `shared_memory_layout_matches_upstream` passes.
 
-## 2026-08-20 — `hid_core/src/resources/six_axis/seven_six_axis.rs` vs Eden `src/hid_core/resources/six_axis/seven_six_axis.{h,cpp}`
+## 2026-08-20 — `src/hid_core/src/resources/six_axis/seven_six_axis.rs` vs Eden `src/hid_core/resources/six_axis/seven_six_axis.{h,cpp}`
 
 ### Intentional differences
 
@@ -1201,7 +1201,7 @@ and persisted under upstream's `UIGameList\\favorites_expanded` key.
 
 - PASS: the state remains `repr(C)` and its existing `0x48` size assertion is unchanged.
 
-## 2026-08-20 — `hid_core/src/resources/npad/npad.rs` vs Eden `src/hid_core/resources/npad/npad.{h,cpp}` prefill regression
+## 2026-08-20 — `src/hid_core/src/resources/npad/npad.rs` vs Eden `src/hid_core/resources/npad/npad.{h,cpp}` prefill regression
 
 ### Intentional differences
 
@@ -1221,7 +1221,7 @@ and persisted under upstream's `UIGameList\\favorites_expanded` key.
 
 - PASS: no Npad production struct changed; the full HID layout test and all Npad tests pass.
 
-## 2026-08-20 — `core/src/hle/service/aoc/addon_content_manager.rs` vs Eden `src/core/hle/service/aoc/addon_content_manager.{h,cpp}`
+## 2026-08-20 — `src/core/src/hle/service/aoc/addon_content_manager.rs` vs Eden `src/core/hle/service/aoc/addon_content_manager.{h,cpp}`
 
 ### Intentional differences
 
@@ -1249,7 +1249,7 @@ and persisted under upstream's `UIGameList\\favorites_expanded` key.
 - PASS: add-on IDs are emitted as packed four-byte little-endian values, matching Eden's raw
   `u32` buffer copy; no shared structs changed.
 
-## 2026-08-20 — `shader_recompiler/src/frontend/control_flow.rs` vs Eden `src/shader_recompiler/frontend/maxwell/control_flow.{h,cpp}`
+## 2026-08-20 — `src/shader_recompiler/src/frontend/control_flow.rs` vs Eden `src/shader_recompiler/frontend/maxwell/control_flow.{h,cpp}`
 
 ### Intentional differences
 
@@ -1278,7 +1278,7 @@ and persisted under upstream's `UIGameList\\favorites_expanded` key.
 
 - N/A: CFG nodes are host-only analysis structures and are not copied to guest or GPU memory.
 
-## 2026-08-20 — `common/src/scm_rev.rs` and `common/build.rs` vs Eden `src/common/scm_rev.{h,cpp.in}` and `CMakeModules/GenerateSCMRev.cmake`
+## 2026-08-20 — `src/common/src/scm_rev.rs` and `src/common/build.rs` vs Eden `src/common/scm_rev.{h,cpp.in}` and `CMakeModules/GenerateSCMRev.cmake`
 
 ### Intentional differences
 
@@ -1304,7 +1304,7 @@ and persisted under upstream's `UIGameList\\favorites_expanded` key.
 
 - N/A: Rust string constants replace generated C++ character arrays and are not guest-visible.
 
-## 2026-08-20 — `ruzu/src/boot.rs` vs Eden `src/yuzu/main_window.cpp` `MainWindow::BootGame`
+## 2026-08-20 — `src/ruzu/src/boot.rs` vs Eden `src/yuzu/main_window.cpp` `MainWindow::BootGame`
 
 ### Intentional differences
 
@@ -1326,7 +1326,7 @@ and persisted under upstream's `UIGameList\\favorites_expanded` key.
 
 - N/A: title metadata is host UI text.
 
-## 2026-08-20 — `ruzu/src/main_window.rs` vs Eden `src/yuzu/main_window.{h,cpp}` `UpdateWindowTitle`
+## 2026-08-20 — `src/ruzu/src/main_window.rs` vs Eden `src/yuzu/main_window.{h,cpp}` `UpdateWindowTitle`
 
 ### Intentional differences
 
@@ -1348,7 +1348,7 @@ and persisted under upstream's `UIGameList\\favorites_expanded` key.
 
 - N/A: window titles are host UI strings.
 
-## 2026-08-20 — `ruzu/src/game_list.rs` vs Eden `src/qt_common/game_list/worker.cpp` and `src/core/file_sys/program_metadata.{h,cpp}`
+## 2026-08-20 — `src/ruzu/src/game_list.rs` vs Eden `src/qt_common/game_list/worker.cpp` and `src/core/file_sys/program_metadata.{h,cpp}`
 
 ### Intentional differences
 
@@ -1377,7 +1377,7 @@ and persisted under upstream's `UIGameList\\favorites_expanded` key.
 - PASS: `ProgramMetadata::is_64_bit_program` reads the existing NPDM bit; no guest or container
   binary structure was changed.
 
-## 2026-08-21 — `shader_recompiler/src/backend/spirv/emit_spirv_special.rs` vs Eden `src/shader_recompiler/backend/spirv/emit_spirv_special.cpp`
+## 2026-08-21 — `src/shader_recompiler/src/backend/spirv/emit_spirv_special.rs` vs Eden `src/shader_recompiler/backend/spirv/emit_spirv_special.cpp`
 
 ### Intentional differences
 
@@ -1405,7 +1405,7 @@ and persisted under upstream's `UIGameList\\favorites_expanded` key.
 
 - N/A: this change emits SPIR-V instructions and does not alter a serialized host structure.
 
-## 2026-08-21 — `shader_recompiler/src/runtime_info.rs` vs Eden `src/shader_recompiler/runtime_info.h`
+## 2026-08-21 — `src/shader_recompiler/src/runtime_info.rs` vs Eden `src/shader_recompiler/runtime_info.h`
 
 ### Intentional differences
 
@@ -1425,7 +1425,7 @@ and persisted under upstream's `UIGameList\\favorites_expanded` key.
 
 - N/A: `RuntimeInfo` is host-side compiler state and is not copied as a guest binary payload.
 
-## 2026-08-21 — `video_core/src/transform_feedback.rs` vs Eden `src/video_core/transform_feedback.{h,cpp}`
+## 2026-08-21 — `src/video_core/src/transform_feedback.rs` vs Eden `src/video_core/transform_feedback.{h,cpp}`
 
 ### Intentional differences
 
@@ -1445,7 +1445,7 @@ and persisted under upstream's `UIGameList\\favorites_expanded` key.
 - PASS: `TransformFeedbackLayout` remains `repr(C)` with Eden's `stream`, `varying_count`, and
   `stride` field order; generated varying descriptors are host-side values.
 
-## 2026-08-21 — `shader_recompiler/src/backend/spirv/spirv_emit_context.rs` vs Eden `src/shader_recompiler/backend/spirv/spirv_emit_context.{h,cpp}`
+## 2026-08-21 — `src/shader_recompiler/src/backend/spirv/spirv_emit_context.rs` vs Eden `src/shader_recompiler/backend/spirv/spirv_emit_context.{h,cpp}`
 
 ### Intentional differences
 
@@ -1466,9 +1466,9 @@ and persisted under upstream's `UIGameList\\favorites_expanded` key.
 
 ## 2026-08-21 — renderer runtime-info propagation
 
-Compared `video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
+Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 `src/video_core/renderer_vulkan/vk_pipeline_cache.cpp`, and
-`video_core/src/renderer_opengl/gl_shader_cache.rs` with Eden
+`src/video_core/src/renderer_opengl/gl_shader_cache.rs` with Eden
 `src/video_core/renderer_opengl/gl_shader_cache.cpp`.
 
 ### Intentional differences
@@ -1488,7 +1488,7 @@ Compared `video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 
 - N/A: these are host-side compiler inputs.
 
-## 2026-08-21 — `shader_recompiler/src/pipeline_cache.rs` runtime identity vs Eden runtime shader state
+## 2026-08-21 — `src/shader_recompiler/src/pipeline_cache.rs` runtime identity vs Eden runtime shader state
 
 ### Intentional differences
 
@@ -1507,7 +1507,7 @@ Compared `video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 
 - N/A: the value is a host-side cache identity hash.
 
-## 2026-08-21 — `shader_recompiler/src/frontend/translate/load_store_attribute.rs` vs Eden `src/shader_recompiler/frontend/maxwell/translate/impl/load_store_attribute.cpp`
+## 2026-08-21 — `src/shader_recompiler/src/frontend/translate/load_store_attribute.rs` vs Eden `src/shader_recompiler/frontend/maxwell/translate/impl/load_store_attribute.cpp`
 
 ### Intentional differences
 
@@ -1531,7 +1531,7 @@ Compared `video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 - N/A: the instruction is decoded from the same bit positions, but no host struct is copied as a
   guest payload.
 
-## 2026-08-21 — `shader_recompiler/src/ir/value.rs` vs Eden `src/shader_recompiler/frontend/ir/attribute.h`
+## 2026-08-21 — `src/shader_recompiler/src/ir/value.rs` vs Eden `src/shader_recompiler/frontend/ir/attribute.h`
 
 ### Intentional differences
 
@@ -1553,7 +1553,7 @@ Compared `video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 
 - N/A: attributes are host-side IR identifiers and are not raw-copied guest payloads.
 
-## 2026-08-21 — `shader_recompiler/src/frontend/translate_program.rs` vs Eden `src/shader_recompiler/frontend/maxwell/translate_program.cpp`
+## 2026-08-21 — `src/shader_recompiler/src/frontend/translate_program.rs` vs Eden `src/shader_recompiler/frontend/maxwell/translate_program.cpp`
 
 ### Intentional differences
 
@@ -1572,7 +1572,7 @@ Compared `video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 ### Binary layout verification
 
 - N/A: this pass rewrites host-side IR instructions.
-## 2026-08-20 — `core/src/hle/service/filesystem/filesystem.rs` vs Eden `src/core/hle/service/filesystem/filesystem.{h,cpp}`
+## 2026-08-20 — `src/core/src/hle/service/filesystem/filesystem.rs` vs Eden `src/core/hle/service/filesystem/filesystem.{h,cpp}`
 
 ### Intentional differences
 
@@ -1596,7 +1596,7 @@ Compared `video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 
 - N/A: the added host-side `VirtualDir` does not alter a guest-visible or serialized structure.
 
-## 2026-08-20 — `ruzu/src/homebrew_vfs.rs` vs Eden `src/core/file_sys/vfs/vfs_layered.{h,cpp}`
+## 2026-08-20 — `src/ruzu/src/homebrew_vfs.rs` vs Eden `src/core/file_sys/vfs/vfs_layered.{h,cpp}`
 
 ### Intentional differences
 
@@ -1625,7 +1625,7 @@ Compared `video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 
 - N/A: the view contains host VFS handles and path components only.
 
-## 2026-08-20 — `ruzu/src/boot.rs` and `ruzu/src/main.rs` vs Eden `src/yuzu/main_window.cpp` `MainWindow::BootGame` and `src/yuzu/main.cpp`
+## 2026-08-20 — `src/ruzu/src/boot.rs` and `src/ruzu/src/main.rs` vs Eden `src/yuzu/main_window.cpp` `MainWindow::BootGame` and `src/yuzu/main.cpp`
 
 ### Intentional differences
 
@@ -1646,3 +1646,26 @@ Compared `video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 ### Binary layout verification
 
 - N/A: this changes host-side launch wiring only.
+## 2026-08-21 — workspace source layout vs Eden repository source layout
+
+### Intentional differences
+
+- Rust keeps each crate's conventional inner `src/` directory, so Eden's
+  `src/video_core/foo.cpp` maps to Ruzu's `src/video_core/src/foo.rs`.
+- Cargo manifests remain inside their crates, while the root `Cargo.toml` coordinates the
+  workspace.
+- The GTK frontend test for the quick-start action reaches the repository-level documentation
+  through `../../../docs/quickstart.md`; Eden's excluded Qt frontend has different test ownership.
+
+### Unintentional differences (to fix)
+
+- None: all source crates now live under the top-level `src/` directory; scripts,
+  documentation, externals, tools, and agent configuration remain at the repository root.
+
+### Missing items
+
+- None for the workspace layout migration.
+
+### Binary layout verification
+
+- N/A: this is a path-only structural migration and changes no guest-visible layout.
