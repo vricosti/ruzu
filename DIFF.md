@@ -3680,3 +3680,38 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 ### Binary layout verification
 
 - N/A: path normalization defines no serialized structure.
+
+## 2026-08-21 — `src/core/src/file_sys/vfs/vfs_real.rs` vs Eden `src/core/file_sys/vfs/{vfs_real.h,vfs_real.cpp}`
+
+### Intentional differences
+
+- Eden stores intrusive `FileReference` nodes owned directly by each `RealVfsFile`. Rust assigns an
+  opaque ID to each file and owns the references in the filesystem's locked state; open/closed LRU
+  order, the `8192`-handle limit, reopening, eviction, and drop ordering are preserved.
+- Rust's single state mutex contains Eden's cache, reference lists, open count, and list mutex. It
+  remains held across seek/read/write just as Eden retains the lock returned by `RefreshReference`.
+- `Arc::new_cyclic` supplies a non-owning self reference so methods reached through
+  `VfsFilesystem` can create files and directories that retain the filesystem. Eden obtains that
+  relationship through its external `shared_ptr` lifetime and raw back-reference.
+- Eden's `in_dtor` workaround handles a FreeBSD C++ destruction-order issue. Rust files own an
+  `Arc` to the filesystem and therefore drop their reference before the filesystem can be freed.
+- `RealVfsDirectory::new` is public because existing Rust frontend construction sites instantiate
+  the directory directly; Eden restricts its constructor to filesystem friendship.
+
+### Unintentional differences (to fix)
+
+- `get_file_time_stamp` still returns a zero timestamp on non-Unix targets, whereas Eden uses
+  `_wstat64` on Windows. The retained-handle and directory traversal slice does not address that
+  pre-existing platform implementation gap.
+- Android content-URI filename handling is absent, consistently with the project's Android
+  filesystem exception.
+
+### Missing items
+
+- None in file-reference lifecycle: cached opens create a closed reference, first access opens it,
+  every access promotes it to the LRU front, the least-recent open handle is evicted at the same
+  limit, and `Drop` removes and closes the reference.
+
+### Binary layout verification
+
+- N/A: VFS objects and host file-reference state are not serialized.

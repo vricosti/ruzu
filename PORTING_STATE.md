@@ -500,4 +500,6 @@
   focused root-escape regression still opened `root/../outside.bin`.
 - Resume condition: port `SanitizePath` component resolution in its owning common module, verify it
   against Eden and update `DIFF.md`, then rerun the suspended VFS tests and finish its audit.
-- Status: prerequisite implementation in progress; the uncommitted VFS slice remains suspended.
+- Status: prerequisite implemented and verified; the VFS slice resumed and both retained-handle
+  and root-escape regressions pass. Full `core` validation is currently red on three unrelated,
+  independently reproducible `k_process` tests; the VFS-focused tests remain green.

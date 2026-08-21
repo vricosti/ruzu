@@ -4,7 +4,7 @@
 //! Port of zuyu/src/core/file_sys/vfs/vfs_real.h and vfs_real.cpp
 //! RealVfsFilesystem, RealVfsFile, RealVfsDirectory: VFS backed by the real filesystem.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::path::Path;
 use std::sync::{Arc, Mutex, Weak};
 
@@ -24,7 +24,15 @@ use crate::file_sys::fs_filesystem::OpenMode;
 /// Maximum number of concurrently open file handles.
 ///
 /// Maps to upstream `MaxOpenFiles`.
-const MAX_OPEN_FILES: usize = 512;
+const MAX_OPEN_FILES: usize = 8192;
+
+fn is_within_root(root: &str, full_path: &str) -> bool {
+    root.is_empty()
+        || (full_path.starts_with(root)
+            && (full_path.len() == root.len()
+                || full_path.as_bytes().get(root.len()) == Some(&b'/')
+                || full_path.as_bytes().get(root.len()) == Some(&b'\\')))
+}
 
 // ============================================================================
 // Helper: convert OpenMode to FileAccessMode
@@ -47,7 +55,67 @@ fn mode_flags_to_file_access_mode(mode: OpenMode) -> FileAccessMode {
 ///
 /// Maps to upstream `FileReference` (intrusive list node).
 struct FileReference {
-    file: Option<Arc<IOFile>>,
+    file: Option<IOFile>,
+}
+
+struct RealVfsFilesystemState {
+    cache: BTreeMap<String, Weak<dyn VfsFile>>,
+    references: BTreeMap<u64, FileReference>,
+    open_references: VecDeque<u64>,
+    closed_references: VecDeque<u64>,
+    num_open_files: usize,
+    next_reference_id: u64,
+}
+
+impl RealVfsFilesystemState {
+    fn new() -> Self {
+        Self {
+            cache: BTreeMap::new(),
+            references: BTreeMap::new(),
+            open_references: VecDeque::new(),
+            closed_references: VecDeque::new(),
+            num_open_files: 0,
+            next_reference_id: 0,
+        }
+    }
+
+    fn insert_reference(&mut self) -> u64 {
+        let id = self.next_reference_id;
+        self.next_reference_id = self.next_reference_id.wrapping_add(1);
+        self.references.insert(id, FileReference::new());
+        self.closed_references.push_front(id);
+        id
+    }
+
+    fn remove_reference_from_lists(&mut self, id: u64) {
+        self.open_references.retain(|candidate| *candidate != id);
+        self.closed_references.retain(|candidate| *candidate != id);
+    }
+
+    fn evict_single_reference(&mut self) {
+        if self.num_open_files < MAX_OPEN_FILES || self.open_references.is_empty() {
+            return;
+        }
+        let id = self.open_references.pop_back().unwrap();
+        if let Some(reference) = self.references.get_mut(&id) {
+            if reference.file.take().is_some() {
+                self.num_open_files -= 1;
+            }
+            self.closed_references.push_front(id);
+        }
+    }
+
+    fn drop_reference(&mut self, id: u64) {
+        self.remove_reference_from_lists(id);
+        if self
+            .references
+            .remove(&id)
+            .and_then(|reference| reference.file)
+            .is_some()
+        {
+            self.num_open_files -= 1;
+        }
+    }
 }
 
 impl FileReference {
@@ -65,17 +133,15 @@ impl FileReference {
 ///
 /// Maps to upstream `RealVfsFilesystem`.
 pub struct RealVfsFilesystem {
-    cache: Mutex<BTreeMap<String, Weak<dyn VfsFile>>>,
-    open_references: Mutex<Vec<(String, FileReference)>>,
-    num_open_files: Mutex<usize>,
+    state: Mutex<RealVfsFilesystemState>,
+    self_weak: Weak<RealVfsFilesystem>,
 }
 
 impl RealVfsFilesystem {
     pub fn new() -> Arc<Self> {
-        Arc::new(Self {
-            cache: Mutex::new(BTreeMap::new()),
-            open_references: Mutex::new(Vec::new()),
-            num_open_files: Mutex::new(0),
+        Arc::new_cyclic(|self_weak| Self {
+            state: Mutex::new(RealVfsFilesystemState::new()),
+            self_weak: self_weak.clone(),
         })
     }
 
@@ -92,13 +158,10 @@ impl RealVfsFilesystem {
         let sanitized =
             path_util::sanitize_path(path, path_util::DirectorySeparator::PlatformDefault);
 
-        // Check cache
-        {
-            let cache = self.cache.lock().unwrap();
-            if let Some(weak) = cache.get(&sanitized) {
-                if let Some(file) = weak.upgrade() {
-                    return Some(file);
-                }
+        let mut state = self.state.lock().unwrap();
+        if let Some(weak) = state.cache.get(&sanitized) {
+            if let Some(file) = weak.upgrade() {
+                return Some(file);
             }
         }
 
@@ -106,59 +169,61 @@ impl RealVfsFilesystem {
             return None;
         }
 
+        let reference_id = state.insert_reference();
         let file: Arc<dyn VfsFile> = Arc::new(RealVfsFile::new(
             Arc::clone(self),
+            reference_id,
             sanitized.clone(),
             perms,
             size,
             parent_path.unwrap_or_else(|| path_util::get_parent_path(&sanitized)),
         ));
 
-        let mut cache = self.cache.lock().unwrap();
-        cache.insert(sanitized, Arc::downgrade(&file));
+        state.cache.insert(sanitized, Arc::downgrade(&file));
 
         Some(file)
     }
 
-    fn evict_if_needed(&self) {
-        let num = *self.num_open_files.lock().unwrap();
-        if num < MAX_OPEN_FILES {
-            return;
+    fn with_reference<R>(
+        &self,
+        reference_id: u64,
+        path: &str,
+        perms: OpenMode,
+        operation: impl FnOnce(&mut IOFile) -> R,
+    ) -> Option<R> {
+        let mut state = self.state.lock().unwrap();
+        state.remove_reference_from_lists(reference_id);
+
+        let needs_open = state
+            .references
+            .get(&reference_id)
+            .is_none_or(|reference| reference.file.is_none());
+        if needs_open {
+            state.evict_single_reference();
+            let file = IOFile::new(
+                Path::new(path),
+                mode_flags_to_file_access_mode(perms),
+                FileType::BinaryFile,
+                FileShareFlag::ShareReadOnly,
+            );
+            if file.is_open() {
+                state.references.get_mut(&reference_id)?.file = Some(file);
+                state.num_open_files += 1;
+            }
         }
 
-        // Evict the oldest open reference
-        let mut refs = self.open_references.lock().unwrap();
-        if let Some(pos) = refs.iter().position(|(_, r)| r.file.is_some()) {
-            refs[pos].1.file = None;
-            *self.num_open_files.lock().unwrap() -= 1;
-        }
-    }
-
-    /// Opens a fresh IOFile handle for the given path and permissions.
-    /// Unlike upstream's RefreshReference which reuses handles, we open a fresh one
-    /// each time because Rust's IOFile requires &mut self for read/write/seek.
-    fn open_fresh_handle(&self, path: &str, perms: OpenMode) -> Option<IOFile> {
-        let io_file = IOFile::new(
-            Path::new(path),
-            mode_flags_to_file_access_mode(perms),
-            FileType::BinaryFile,
-            FileShareFlag::ShareReadOnly,
-        );
-        if io_file.is_open() {
-            Some(io_file)
+        let is_open = state.references.get(&reference_id)?.file.is_some();
+        if is_open {
+            state.open_references.push_front(reference_id);
         } else {
-            None
+            state.closed_references.push_front(reference_id);
         }
-    }
-}
-
-impl Default for RealVfsFilesystem {
-    fn default() -> Self {
-        Self {
-            cache: Mutex::new(BTreeMap::new()),
-            open_references: Mutex::new(Vec::new()),
-            num_open_files: Mutex::new(0),
-        }
+        state
+            .references
+            .get_mut(&reference_id)?
+            .file
+            .as_mut()
+            .map(operation)
     }
 }
 
@@ -188,15 +253,12 @@ impl VfsFilesystem for RealVfsFilesystem {
         VfsEntryType::File
     }
 
-    fn open_file(&self, path: &str, _perms: OpenMode) -> Option<VirtualFile> {
-        // We need Arc<Self> but only have &self. For the real implementation this would
-        // require the filesystem to be stored in an Arc. This is a structural limitation.
-        // Users should call open_file_from_entry via Arc<RealVfsFilesystem>.
-        None
+    fn open_file(&self, path: &str, perms: OpenMode) -> Option<VirtualFile> {
+        self.self_weak.upgrade()?.arc_open_file(path, perms)
     }
 
-    fn create_file(&self, _path: &str, _perms: OpenMode) -> Option<VirtualFile> {
-        None
+    fn create_file(&self, path: &str, perms: OpenMode) -> Option<VirtualFile> {
+        self.self_weak.upgrade()?.arc_create_file(path, perms)
     }
 
     fn copy_file(&self, _old_path: &str, _new_path: &str) -> Option<VirtualFile> {
@@ -204,31 +266,29 @@ impl VfsFilesystem for RealVfsFilesystem {
         None
     }
 
-    fn move_file(&self, _old_path: &str, _new_path: &str) -> Option<VirtualFile> {
-        None
+    fn move_file(&self, old_path: &str, new_path: &str) -> Option<VirtualFile> {
+        self.self_weak.upgrade()?.arc_move_file(old_path, new_path)
     }
 
     fn delete_file(&self, path: &str) -> bool {
         let sanitized =
             path_util::sanitize_path(path, path_util::DirectorySeparator::PlatformDefault);
         {
-            let mut cache = self.cache.lock().unwrap();
-            cache.remove(&sanitized);
+            self.state.lock().unwrap().cache.remove(&sanitized);
         }
         fs_ops::remove_file(Path::new(&sanitized))
     }
 
-    fn open_directory(&self, _path: &str, _perms: OpenMode) -> Option<VirtualDir> {
-        None
+    fn open_directory(&self, path: &str, perms: OpenMode) -> Option<VirtualDir> {
+        self.self_weak.upgrade()?.arc_open_directory(path, perms)
     }
 
-    fn create_directory(&self, path: &str, _perms: OpenMode) -> Option<VirtualDir> {
+    fn create_directory(&self, path: &str, perms: OpenMode) -> Option<VirtualDir> {
         let sanitized =
             path_util::sanitize_path(path, path_util::DirectorySeparator::PlatformDefault);
-        if !fs_ops::create_dirs(Path::new(&sanitized)) {
-            return None;
-        }
-        None
+        self.self_weak
+            .upgrade()?
+            .arc_create_directory(&sanitized, perms)
     }
 
     fn copy_directory(&self, _old_path: &str, _new_path: &str) -> Option<VirtualDir> {
@@ -244,7 +304,9 @@ impl VfsFilesystem for RealVfsFilesystem {
         if !fs_ops::rename_dir(Path::new(&old), Path::new(&new)) {
             return None;
         }
-        self.open_directory(&new, OpenMode::READ_WRITE)
+        self.self_weak
+            .upgrade()?
+            .arc_open_directory(&new, OpenMode::READ_WRITE)
     }
 
     fn delete_directory(&self, path: &str) -> bool {
@@ -267,8 +329,7 @@ impl RealVfsFilesystem {
         let sanitized =
             path_util::sanitize_path(path, path_util::DirectorySeparator::PlatformDefault);
         {
-            let mut cache = self.cache.lock().unwrap();
-            cache.remove(&sanitized);
+            self.state.lock().unwrap().cache.remove(&sanitized);
         }
 
         let p = Path::new(&sanitized);
@@ -300,9 +361,9 @@ impl RealVfsFilesystem {
         let new =
             path_util::sanitize_path(new_path, path_util::DirectorySeparator::PlatformDefault);
         {
-            let mut cache = self.cache.lock().unwrap();
-            cache.remove(&old);
-            cache.remove(&new);
+            let mut state = self.state.lock().unwrap();
+            state.cache.remove(&old);
+            state.cache.remove(&new);
         }
         if !fs_ops::rename_file(Path::new(&old), Path::new(&new)) {
             return None;
@@ -347,6 +408,7 @@ impl RealVfsFilesystem {
 /// Maps to upstream `RealVfsFile`.
 pub struct RealVfsFile {
     base: Arc<RealVfsFilesystem>,
+    reference_id: u64,
     path: String,
     parent_path: String,
     path_components: Vec<String>,
@@ -357,6 +419,7 @@ pub struct RealVfsFile {
 impl RealVfsFile {
     fn new(
         base: Arc<RealVfsFilesystem>,
+        reference_id: u64,
         path: String,
         perms: OpenMode,
         size: Option<u64>,
@@ -365,12 +428,23 @@ impl RealVfsFile {
         let path_components = path_util::split_path_components_copy(&path);
         Self {
             base,
+            reference_id,
             path,
             parent_path,
             path_components,
             size: Mutex::new(size),
             perms,
         }
+    }
+}
+
+impl Drop for RealVfsFile {
+    fn drop(&mut self) {
+        self.base
+            .state
+            .lock()
+            .unwrap()
+            .drop_reference(self.reference_id);
     }
 }
 
@@ -389,20 +463,20 @@ impl VfsFile for RealVfsFile {
             return s as usize;
         }
 
-        let io_file = match self.base.open_fresh_handle(&self.path, self.perms) {
-            Some(f) => f,
-            None => return 0,
-        };
-        io_file.get_size() as usize
+        self.base
+            .with_reference(self.reference_id, &self.path, self.perms, |file| {
+                file.get_size() as usize
+            })
+            .unwrap_or(0)
     }
 
     fn resize(&self, new_size: usize) -> bool {
         *self.size.lock().unwrap() = None;
-        let io_file = match self.base.open_fresh_handle(&self.path, self.perms) {
-            Some(f) => f,
-            None => return false,
-        };
-        io_file.set_size(new_size as u64)
+        self.base
+            .with_reference(self.reference_id, &self.path, self.perms, |file| {
+                file.set_size(new_size as u64)
+            })
+            .unwrap_or(false)
     }
 
     fn get_containing_directory(&self) -> Option<VirtualDir> {
@@ -418,26 +492,26 @@ impl VfsFile for RealVfsFile {
     }
 
     fn read(&self, data: &mut [u8], length: usize, offset: usize) -> usize {
-        let mut io_file = match self.base.open_fresh_handle(&self.path, self.perms) {
-            Some(f) => f,
-            None => return 0,
-        };
-        if !io_file.seek(offset as i64, SeekOrigin::SetOrigin) {
-            return 0;
-        }
-        io_file.read_bytes(&mut data[..length])
+        self.base
+            .with_reference(self.reference_id, &self.path, self.perms, |file| {
+                if !file.seek(offset as i64, SeekOrigin::SetOrigin) {
+                    return 0;
+                }
+                file.read_bytes(&mut data[..length])
+            })
+            .unwrap_or(0)
     }
 
     fn write(&self, data: &[u8], length: usize, offset: usize) -> usize {
         *self.size.lock().unwrap() = None;
-        let mut io_file = match self.base.open_fresh_handle(&self.path, self.perms) {
-            Some(f) => f,
-            None => return 0,
-        };
-        if !io_file.seek(offset as i64, SeekOrigin::SetOrigin) {
-            return 0;
-        }
-        io_file.write_bytes(&data[..length])
+        self.base
+            .with_reference(self.reference_id, &self.path, self.perms, |file| {
+                if !file.seek(offset as i64, SeekOrigin::SetOrigin) {
+                    return 0;
+                }
+                file.write_bytes(&data[..length])
+            })
+            .unwrap_or(0)
     }
 
     fn rename(&self, name: &str) -> bool {
@@ -489,7 +563,9 @@ impl VfsDirectory for RealVfsDirectory {
             path_util::DirectorySeparator::ForwardSlash,
         );
         let p = Path::new(&full_path);
-        if !fs_ops::exists(p) || fs_ops::is_dir(p) {
+        let root =
+            path_util::sanitize_path(&self.path, path_util::DirectorySeparator::PlatformDefault);
+        if !fs_ops::exists(p) || fs_ops::is_dir(p) || !is_within_root(&root, &full_path) {
             return None;
         }
         self.base.arc_open_file(&full_path, self.perms)
@@ -501,7 +577,9 @@ impl VfsDirectory for RealVfsDirectory {
             path_util::DirectorySeparator::ForwardSlash,
         );
         let p = Path::new(&full_path);
-        if !fs_ops::exists(p) || !fs_ops::is_dir(p) {
+        let root =
+            path_util::sanitize_path(&self.path, path_util::DirectorySeparator::PlatformDefault);
+        if !fs_ops::exists(p) || !fs_ops::is_dir(p) || !is_within_root(&root, &full_path) {
             return None;
         }
         self.base.arc_open_directory(&full_path, self.perms)
@@ -520,7 +598,10 @@ impl VfsDirectory for RealVfsDirectory {
             &format!("{}/{}", self.path, relative_path),
             path_util::DirectorySeparator::ForwardSlash,
         );
-        if !fs_ops::create_parent_dirs(Path::new(&full_path)) {
+        let root =
+            path_util::sanitize_path(&self.path, path_util::DirectorySeparator::PlatformDefault);
+        if !fs_ops::create_parent_dirs(Path::new(&full_path)) || !is_within_root(&root, &full_path)
+        {
             return None;
         }
         self.base.arc_create_file(&full_path, self.perms)
@@ -586,7 +667,6 @@ impl VfsDirectory for RealVfsDirectory {
         #[cfg(unix)]
         {
             use std::ffi::CString;
-            use std::os::unix::ffi::OsStrExt;
 
             let c_path = match CString::new(full_path.as_bytes()) {
                 Ok(p) => p,
@@ -725,5 +805,80 @@ impl VfsDirectory for RealVfsDirectory {
         }
 
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn test_directory() -> std::path::PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("ruzu-vfs-real-{}-{unique}", std::process::id()))
+    }
+
+    #[test]
+    fn filesystem_trait_reuses_and_drops_file_reference() {
+        let directory = test_directory();
+        std::fs::create_dir_all(&directory).unwrap();
+        let file_path = directory.join("homebrew.bin");
+        std::fs::write(&file_path, b"free-data").unwrap();
+
+        let filesystem = RealVfsFilesystem::new();
+        let file = VfsFilesystem::open_file(
+            filesystem.as_ref(),
+            &file_path.to_string_lossy(),
+            OpenMode::READ,
+        )
+        .unwrap();
+        let mut first = [0; 4];
+        let mut second = [0; 4];
+        assert_eq!(file.read(&mut first, 4, 0), 4);
+        assert_eq!(file.read(&mut second, 4, 4), 4);
+        assert_eq!(&first, b"free");
+        assert_eq!(&second, b"-dat");
+
+        {
+            let state = filesystem.state.lock().unwrap();
+            assert_eq!(state.num_open_files, 1);
+            assert_eq!(state.open_references.len(), 1);
+            assert!(state.closed_references.is_empty());
+        }
+
+        drop(file);
+        {
+            let state = filesystem.state.lock().unwrap();
+            assert_eq!(state.num_open_files, 0);
+            assert!(state.references.is_empty());
+            assert!(state.open_references.is_empty());
+        }
+
+        std::fs::remove_file(file_path).unwrap();
+        std::fs::remove_dir(directory).unwrap();
+    }
+
+    #[test]
+    fn relative_lookup_cannot_escape_directory_root() {
+        let directory = test_directory();
+        let root = directory.join("root");
+        std::fs::create_dir_all(&root).unwrap();
+        let outside = directory.join("outside.bin");
+        std::fs::write(&outside, b"outside").unwrap();
+
+        let filesystem = RealVfsFilesystem::new();
+        let root_directory = RealVfsDirectory::new(
+            filesystem,
+            root.to_string_lossy().into_owned(),
+            OpenMode::READ,
+        );
+        assert!(root_directory.get_file_relative("../outside.bin").is_none());
+
+        std::fs::remove_file(outside).unwrap();
+        std::fs::remove_dir(root).unwrap();
+        std::fs::remove_dir(directory).unwrap();
     }
 }
