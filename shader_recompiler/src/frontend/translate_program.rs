@@ -361,7 +361,7 @@ pub fn convert_legacy_to_generic(program: &mut Program, runtime_info: &RuntimeIn
                 let Some(Value::Attribute(attr)) = inst.args.first().copied() else {
                     continue;
                 };
-                if !is_legacy_attribute(attr) {
+                if !attr.is_legacy() {
                     continue;
                 }
                 if let Some(&mapped_attr) = mappings.get(&(attr.0 as u64)) {
@@ -403,7 +403,7 @@ pub fn convert_legacy_to_generic(program: &mut Program, runtime_info: &RuntimeIn
                 let Some(Value::Attribute(attr)) = inst.args.first().copied() else {
                     continue;
                 };
-                if !is_legacy_attribute(attr) {
+                if !attr.is_legacy() {
                     continue;
                 }
                 if let Some(&mapped_attr) = mappings.get(&(attr.0 as u64)) {
@@ -649,21 +649,12 @@ fn remap_value_blocks(value: Value, offset: u32) -> Value {
 
 const NUM_GENERICS: usize = 32;
 const NUM_FIXEDFNCTEXTURE: usize = 10;
-const COLOR_FRONT_DIFFUSE_R: u32 = 160;
-const COLOR_BACK_SPECULAR_A: u32 = 175;
-const FOG_COORDINATE: u32 = 186;
-const FIXED_FNC_TEXTURE0_S: u32 = 192;
-const FIXED_FNC_TEXTURE9_Q: u32 = 231;
+const COLOR_FRONT_DIFFUSE_R: u32 = Attribute::FRONT_COLOR_DIFFUSE_R.0;
+const FOG_COORDINATE: u32 = Attribute::FOG_COORDINATE.0;
+const FIXED_FNC_TEXTURE0_S: u32 = Attribute::FIXED_FNC_TEXTURE_0_S.0;
 
 fn generic_x(index: usize) -> u64 {
     (Attribute::generic(index as u32, 0).0) as u64
-}
-
-fn is_legacy_attribute(attribute: Attribute) -> bool {
-    let raw = attribute.0;
-    (COLOR_FRONT_DIFFUSE_R..=COLOR_BACK_SPECULAR_A).contains(&raw)
-        || raw == FOG_COORDINATE
-        || (FIXED_FNC_TEXTURE0_S..=FIXED_FNC_TEXTURE9_Q).contains(&raw)
 }
 
 fn generate_legacy_to_generic_mappings(

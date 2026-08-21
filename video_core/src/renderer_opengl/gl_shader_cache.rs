@@ -1091,6 +1091,7 @@ impl ShaderCache {
                         .map(
                             |varying| shader_recompiler::runtime_info::TransformFeedbackVarying {
                                 buffer: varying.buffer,
+                                stream: varying.stream,
                                 stride: varying.stride,
                                 offset: varying.offset,
                                 components: varying.components,

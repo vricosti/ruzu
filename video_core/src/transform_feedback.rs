@@ -68,13 +68,14 @@ impl Default for TransformFeedbackState {
 #[derive(Debug, Clone, Copy, Default)]
 pub struct TransformFeedbackVarying {
     pub buffer: u32,
+    pub stream: u32,
     pub stride: u32,
     pub offset: u32,
     pub components: u32,
 }
 
 /// Vector attribute base offsets used for transform feedback varying mapping.
-const VECTORS: [u32; 44] = [
+const VECTORS: [u32; 45] = [
     28,  // gl_Position
     32,  // Generic 0
     36,  // Generic 1
@@ -119,7 +120,7 @@ const VECTORS: [u32; 44] = [
     208, // gl_TexCoord[4]
     212, // gl_TexCoord[5]
     216, // gl_TexCoord[6]
-         // 220, // gl_TexCoord[7] -- not included since array is 44
+    220, // gl_TexCoord[7]
 ];
 
 /// Generate transform feedback varyings from the given state.
@@ -150,12 +151,9 @@ pub fn make_transform_feedback_varyings(
                 }
             };
 
-            if layout.stream != 0 {
-                log::warn!("Stream is not zero: {}", layout.stream);
-            }
-
             let mut varying = TransformFeedbackVarying {
                 buffer: buffer as u32,
+                stream: layout.stream,
                 stride: layout.stride,
                 offset: offset * 4,
                 components: 1,
@@ -195,4 +193,41 @@ pub fn make_transform_feedback_varyings(
     }
 
     (xfb, count + 1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn varying_preserves_layout_stream() {
+        let mut state = TransformFeedbackState::default();
+        state.layouts[0] = TransformFeedbackLayout {
+            stream: 3,
+            varying_count: 1,
+            stride: 4,
+        };
+        state.varyings[0][0] = StreamOutLayout::from_raw(32);
+
+        let (varyings, count) = make_transform_feedback_varyings(&state);
+
+        assert_eq!(count, 33);
+        assert_eq!(varyings[32].stream, 3);
+    }
+
+    #[test]
+    fn last_fixed_function_texture_vector_is_grouped() {
+        let mut state = TransformFeedbackState::default();
+        state.layouts[0] = TransformFeedbackLayout {
+            stream: 0,
+            varying_count: 2,
+            stride: 8,
+        };
+        state.varyings[0][0] = StreamOutLayout::from_raw(220 | (221 << 8));
+
+        let (varyings, count) = make_transform_feedback_varyings(&state);
+
+        assert_eq!(count, 221);
+        assert_eq!(varyings[220].components, 2);
+    }
 }

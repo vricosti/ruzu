@@ -11,6 +11,7 @@ use crate::ir::value::{Attribute, Patch, Reg, Value};
 use crate::program_header::PixelImap;
 
 const INTERPOLATION_MODE_MULTIPLY: u32 = 1;
+const INTERPOLATION_MODE_SC: u32 = 3;
 
 /// Walk the indexed-attribute element loop, computing
 /// `final_offset = index_value + (element * 4)`. Port of upstream's
@@ -123,6 +124,7 @@ pub fn ipa(tv: &mut TranslatorVisitor, insn: u64) {
     let attr = Attribute(field(insn, 30, 8));
     let indexed = bit(insn, 38);
     let saturated = bit(insn, 51);
+    let _sample_mode = field(insn, 52, 2);
     let interpolation_mode = field(insn, 54, 2);
 
     let is_indexed = indexed && index_reg != Reg::RZ.0 as u32;
@@ -134,14 +136,25 @@ pub fn ipa(tv: &mut TranslatorVisitor, insn: u64) {
         tv.ir.get_attribute(attr, vertex)
     };
 
-    if attr.is_generic() {
-        if let Some(sph) = tv.sph.as_ref() {
+    let is_legacy = attr.is_legacy();
+    if attr.is_generic() || is_legacy {
+        let mut is_perspective = is_legacy && interpolation_mode != INTERPOLATION_MODE_SC;
+        if !is_legacy {
+            let sph = tv
+                .sph
+                .as_ref()
+                .expect("IPA generic interpolation requires a program header");
             let input_map = sph.ps_generic_input_map(attr.generic_index());
-            let element = attr.generic_element() as usize;
-            if input_map[element] == PixelImap::Perspective {
-                let position_w = tv.ir.get_attribute(Attribute::POSITION_W, Value::ImmU32(0));
-                result = tv.ir.fp_mul_32(result, position_w);
-            }
+            let effective_imap = input_map
+                .into_iter()
+                .find(|component| *component != PixelImap::Unused)
+                .unwrap_or(PixelImap::Unused);
+            is_perspective =
+                matches!(effective_imap, PixelImap::Perspective | PixelImap::Unused);
+        }
+        if is_perspective {
+            let position_w = tv.ir.get_attribute(Attribute::POSITION_W, Value::ImmU32(0));
+            result = tv.ir.fp_mul_32(result, position_w);
         }
     }
 
@@ -151,6 +164,9 @@ pub fn ipa(tv: &mut TranslatorVisitor, insn: u64) {
     }
 
     if saturated {
+        if attr == Attribute::FRONT_FACE {
+            panic!("IPA.SAT on FrontFace");
+        }
         result = tv.ir.fp_saturate_32(result);
     }
 
@@ -165,5 +181,82 @@ fn num_elements(size: u32) -> u32 {
         2 => 3,
         3 => 4,
         _ => unreachable!(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ir::opcodes::Opcode;
+    use crate::ir::program::Program;
+    use crate::ir::types::ShaderStage;
+    use crate::program_header::ProgramHeader;
+
+    fn ipa_insn(attr: Attribute, interpolation_mode: u32, saturated: bool) -> u64 {
+        ((attr.0 as u64) << 30) | ((saturated as u64) << 51) | ((interpolation_mode as u64) << 54)
+    }
+
+    fn translate_ipa(
+        attr: Attribute,
+        interpolation_map: u8,
+        interpolation_mode: u32,
+    ) -> Vec<Opcode> {
+        let mut program = Program::new(ShaderStage::Fragment);
+        let block = program.add_block();
+        let mut sph = ProgramHeader::default();
+        sph.raw[6 + attr.generic_index() as usize / 4] =
+            (interpolation_map as u32) << ((attr.generic_index() % 4) * 8);
+        {
+            let mut visitor = TranslatorVisitor::new_with_sph(&mut program, block, Some(sph));
+            ipa(&mut visitor, ipa_insn(attr, interpolation_mode, false));
+        }
+        program.blocks[block as usize]
+            .iter()
+            .map(|inst| inst.opcode)
+            .collect()
+    }
+
+    #[test]
+    fn ipa_uses_first_active_component_interpolation_for_the_whole_vector() {
+        // Mesa homebrew shaders may describe one vector as ScreenLinear followed by
+        // Perspective. Upstream uses the first active component for every IPA in it.
+        let opcodes = translate_ipa(Attribute::generic(0, 1), 0b10_10_10_11, 0);
+        assert!(!opcodes.contains(&Opcode::FPMul32));
+    }
+
+    #[test]
+    fn ipa_applies_perspective_to_perspective_and_unused_vectors() {
+        for interpolation_map in [0b10_10_10_10, 0] {
+            let opcodes = translate_ipa(Attribute::generic(0, 0), interpolation_map, 0);
+            assert!(opcodes.contains(&Opcode::FPMul32));
+        }
+    }
+
+    #[test]
+    fn ipa_legacy_sc_skips_perspective_while_pass_applies_it() {
+        for (mode, expected) in [(INTERPOLATION_MODE_SC, false), (0, true)] {
+            let mut program = Program::new(ShaderStage::Fragment);
+            let block = program.add_block();
+            {
+                let mut visitor = TranslatorVisitor::new(&mut program, block);
+                ipa(
+                    &mut visitor,
+                    ipa_insn(Attribute::FOG_COORDINATE, mode, false),
+                );
+            }
+            let has_mul = program.blocks[block as usize]
+                .iter()
+                .any(|inst| inst.opcode == Opcode::FPMul32);
+            assert_eq!(has_mul, expected);
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "IPA.SAT on FrontFace")]
+    fn ipa_rejects_saturated_front_face() {
+        let mut program = Program::new(ShaderStage::Fragment);
+        let block = program.add_block();
+        let mut visitor = TranslatorVisitor::new(&mut program, block);
+        ipa(&mut visitor, ipa_insn(Attribute::FRONT_FACE, 0, true));
     }
 }

@@ -89,6 +89,7 @@ impl Default for TessSpacing {
 #[derive(Debug, Clone, Copy, Default)]
 pub struct TransformFeedbackVarying {
     pub buffer: u32,
+    pub stream: u32,
     pub stride: u32,
     pub offset: u32,
     pub components: u32,
@@ -134,11 +135,14 @@ pub struct RuntimeInfo {
     /// Use storage buffers instead of global pointers on GLASM.
     pub glasm_use_storage_buffers: bool,
 
-    /// Fragment color output type per render target.
-    pub frag_color_types: [AttributeType; 8],
-
     /// Transform feedback state for each varying.
     pub xfb_varyings: Vec<TransformFeedbackVarying>,
     /// Number of transform feedback varyings.
     pub xfb_count: u32,
+
+    /// Fragment color output type per render target.
+    pub frag_color_types: [AttributeType; 8],
+
+    /// Whether attachment 0 uses dual-source blending.
+    pub dual_source_blend: bool,
 }

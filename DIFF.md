@@ -1376,3 +1376,199 @@ and persisted under upstream's `UIGameList\\favorites_expanded` key.
 
 - PASS: `ProgramMetadata::is_64_bit_program` reads the existing NPDM bit; no guest or container
   binary structure was changed.
+
+## 2026-08-21 — `shader_recompiler/src/backend/spirv/emit_spirv_special.rs` vs Eden `src/shader_recompiler/backend/spirv/emit_spirv_special.cpp`
+
+### Intentional differences
+
+- Ruzu uses `rspirv::dr::Builder` result IDs and Rust `match` expressions in place of Sirit's
+  `EmitContext` helpers and the C++ `switch`; the emitted ordered floating-point comparisons,
+  selection merge, conditional branch, and `OpKill` ordering are the same.
+- Ruzu checks host-side SPIR-V IDs against zero and treats a missing position output as a no-op;
+  Eden uses `Sirit::ValidId` for fragment colors and assumes its declared vertex outputs are valid.
+- Ruzu derives the clip-distance-written mask once from `Program::info.stores` and keeps it in the
+  per-compilation SPIR-V context; Eden uses a header-level `std::bitset<8>`. The emitted prologue
+  still initializes exactly the clip-distance components not written by the shader, while the Rust
+  ownership prevents state leaking between concurrent shader compilations.
+- Unsupported geometry streams panic in Rust where Eden throws `NotImplementedException`.
+
+### Unintentional differences (to fix)
+
+- None in the reviewed prologue/epilogue slice: dual-source fragment outputs, component-aware
+  generic varyings, unwritten clip distances, and the fragment alpha test follow Eden's ordering.
+
+### Missing items
+
+- None in the reviewed prologue/epilogue slice.
+
+### Binary layout verification
+
+- N/A: this change emits SPIR-V instructions and does not alter a serialized host structure.
+
+## 2026-08-21 — `shader_recompiler/src/runtime_info.rs` vs Eden `src/shader_recompiler/runtime_info.h`
+
+### Intentional differences
+
+- Rust stores active transform-feedback entries in a `Vec`; Eden uses a fixed 256-entry array.
+  `xfb_count` remains the authoritative bound in both implementations.
+
+### Unintentional differences (to fix)
+
+- None in the reviewed runtime-state slice: `TransformFeedbackVarying::stream` and
+  `RuntimeInfo::dual_source_blend` now have the same owners and defaults as Eden.
+
+### Missing items
+
+- None in the reviewed runtime-state slice.
+
+### Binary layout verification
+
+- N/A: `RuntimeInfo` is host-side compiler state and is not copied as a guest binary payload.
+
+## 2026-08-21 — `video_core/src/transform_feedback.rs` vs Eden `src/video_core/transform_feedback.{h,cpp}`
+
+### Intentional differences
+
+- Invalid attribute indices are ignored safely in Rust; Eden indexes its fixed array directly.
+
+### Unintentional differences (to fix)
+
+- None: generated varyings preserve `layout.stream`, and the complete Eden vector table through
+  `gl_TexCoord[7]` is present.
+
+### Missing items
+
+- None in `MakeTransformFeedbackVaryings`.
+
+### Binary layout verification
+
+- PASS: `TransformFeedbackLayout` remains `repr(C)` with Eden's `stream`, `varying_count`, and
+  `stride` field order; generated varying descriptors are host-side values.
+
+## 2026-08-21 — `shader_recompiler/src/backend/spirv/spirv_emit_context.rs` vs Eden `src/shader_recompiler/backend/spirv/spirv_emit_context.{h,cpp}`
+
+### Intentional differences
+
+- SPIR-V construction uses `rspirv::dr::Builder` instead of Sirit.
+
+### Unintentional differences (to fix)
+
+- None in `DefineGenericOutput`: split component outputs and nonzero geometry transform-feedback
+  stream decorations now match Eden.
+
+### Missing items
+
+- None in the reviewed generic-output slice.
+
+### Binary layout verification
+
+- N/A: this slice emits SPIR-V declarations and decorations.
+
+## 2026-08-21 — renderer runtime-info propagation
+
+Compared `video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
+`src/video_core/renderer_vulkan/vk_pipeline_cache.cpp`, and
+`video_core/src/renderer_opengl/gl_shader_cache.rs` with Eden
+`src/video_core/renderer_opengl/gl_shader_cache.cpp`.
+
+### Intentional differences
+
+- Rust maps the fixed pipeline key into owned `RuntimeInfo` values; Eden copies into fixed arrays.
+
+### Unintentional differences (to fix)
+
+- None in the reviewed fields: Vulkan propagates `attachment0_dual_source_blend`, and both Vulkan
+  and OpenGL propagate transform-feedback `stream`.
+
+### Missing items
+
+- None in the reviewed runtime-info propagation slice.
+
+### Binary layout verification
+
+- N/A: these are host-side compiler inputs.
+
+## 2026-08-21 — `shader_recompiler/src/pipeline_cache.rs` runtime identity vs Eden runtime shader state
+
+### Intentional differences
+
+- Ruzu hashes runtime compiler inputs for its Rust pipeline cache; Eden keys the equivalent state
+  through its fixed pipeline cache key.
+
+### Unintentional differences (to fix)
+
+- None: `dual_source_blend` and transform-feedback `stream` now participate in Ruzu's runtime hash.
+
+### Missing items
+
+- None in the reviewed runtime-hash slice.
+
+### Binary layout verification
+
+- N/A: the value is a host-side cache identity hash.
+
+## 2026-08-21 — `shader_recompiler/src/frontend/translate/load_store_attribute.rs` vs Eden `src/shader_recompiler/frontend/maxwell/translate/impl/load_store_attribute.cpp`
+
+### Intentional differences
+
+- Rust decodes instruction bit fields into integers and represents Eden's translation exceptions
+  as panics.
+- The Rust visitor stores the program header in an `Option`; generic `IPA` now requires it to be
+  present, matching Eden's unconditional `env.SPH()` access.
+
+### Unintentional differences (to fix)
+
+- None in `IPA`: legacy interpolation, whole-vector effective `PixelImap` selection, the
+  perspective fallback for an unused vector, `Sc` handling, multiplier ordering, and the
+  saturated `FrontFace` rejection now match Eden.
+
+### Missing items
+
+- None in the reviewed `IPA` slice.
+
+### Binary layout verification
+
+- N/A: the instruction is decoded from the same bit positions, but no host struct is copied as a
+  guest payload.
+
+## 2026-08-21 — `shader_recompiler/src/ir/value.rs` vs Eden `src/shader_recompiler/frontend/ir/attribute.h`
+
+### Intentional differences
+
+- The active Rust IR represents an attribute as a checked numeric newtype instead of a C++ enum;
+  the numeric values and range predicates remain upstream-owned contracts.
+
+### Unintentional differences (to fix)
+
+- The crate still contains a second, enum-based `Attribute` in `ir/attribute.rs`. Consolidating
+  those pre-existing parallel IR representations is a structural refactor outside this runtime
+  correction; `IsLegacyAttribute` was added to the active translation type so current users share
+  one predicate.
+
+### Missing items
+
+- None in the reviewed generic/legacy classification slice.
+
+### Binary layout verification
+
+- N/A: attributes are host-side IR identifiers and are not raw-copied guest payloads.
+
+## 2026-08-21 — `shader_recompiler/src/frontend/translate_program.rs` vs Eden `src/shader_recompiler/frontend/maxwell/translate_program.cpp`
+
+### Intentional differences
+
+- Rust invokes the active attribute newtype's `is_legacy` method; Eden imports
+  `IR::IsLegacyAttribute` from `attribute.h`.
+
+### Unintentional differences (to fix)
+
+- None in the reviewed legacy-varying classification call sites; the duplicate private predicate
+  was removed.
+
+### Missing items
+
+- None in the reviewed call-site slice.
+
+### Binary layout verification
+
+- N/A: this pass rewrites host-side IR instructions.

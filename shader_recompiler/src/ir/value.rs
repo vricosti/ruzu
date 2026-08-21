@@ -108,14 +108,18 @@ impl Attribute {
     pub const POSITION_Z: Attribute = Attribute(30);
     pub const POSITION_W: Attribute = Attribute(31);
     pub const FRONT_COLOR_DIFFUSE_R: Attribute = Attribute(160);
+    pub const BACK_COLOR_SPECULAR_A: Attribute = Attribute(175);
     pub const CLIP_DISTANCE_0: Attribute = Attribute(176);
     pub const CLIP_DISTANCE_7: Attribute = Attribute(183);
     pub const POINT_SPRITE_S: Attribute = Attribute(184);
     pub const POINT_SPRITE_T: Attribute = Attribute(185);
+    pub const FOG_COORDINATE: Attribute = Attribute(186);
     pub const TESSELLATION_EVALUATION_POINT_U: Attribute = Attribute(188);
     pub const TESSELLATION_EVALUATION_POINT_V: Attribute = Attribute(189);
     pub const INSTANCE_ID: Attribute = Attribute(190);
     pub const VERTEX_ID: Attribute = Attribute(191);
+    pub const FIXED_FNC_TEXTURE_0_S: Attribute = Attribute(192);
+    pub const FIXED_FNC_TEXTURE_9_Q: Attribute = Attribute(231);
     pub const VIEWPORT_MASK: Attribute = Attribute(232);
     pub const FRONT_FACE: Attribute = Attribute(255);
     pub const BASE_INSTANCE: Attribute = Attribute(256);
@@ -136,7 +140,16 @@ impl Attribute {
 
     /// Whether this is a generic attribute.
     pub fn is_generic(self) -> bool {
-        (32..160).contains(&self.0)
+        (32..=156).contains(&self.0)
+    }
+
+    /// Whether this is a legacy fixed-function varying.
+    ///
+    /// Mirrors upstream `IR::IsLegacyAttribute` in `frontend/ir/attribute.h`.
+    pub fn is_legacy(self) -> bool {
+        (Self::FRONT_COLOR_DIFFUSE_R.0..=Self::BACK_COLOR_SPECULAR_A.0).contains(&self.0)
+            || self == Self::FOG_COORDINATE
+            || (Self::FIXED_FNC_TEXTURE_0_S.0..=Self::FIXED_FNC_TEXTURE_9_Q.0).contains(&self.0)
     }
 
     /// Generic attribute index (0..31), valid only if `is_generic()`.

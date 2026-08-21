@@ -426,6 +426,10 @@ pub struct SpirvEmitContext {
     pub point_coord: spirv::Word,
     pub tess_coord: spirv::Word,
     pub clip_distances: spirv::Word,
+    /// Clip-distance components written by the IR program. This is kept per
+    /// compilation context instead of Eden's header-level bitset so parallel
+    /// shader compilation cannot leak state between programs.
+    pub(crate) clip_distance_written: [bool; 8],
     pub need_input_position_indirect: bool,
     pub input_position: spirv::Word,
     pub output_point_size: spirv::Word,
@@ -716,6 +720,12 @@ impl SpirvEmitContext {
             point_coord: 0,
             tess_coord: 0,
             clip_distances: 0,
+            clip_distance_written: std::array::from_fn(|index| {
+                program
+                    .info
+                    .stores
+                    .get((ir::value::Attribute::CLIP_DISTANCE_0.0 + index as u32) as usize)
+            }),
             need_input_position_indirect: false,
             input_position: 0,
             output_point_size: 0,
@@ -2885,6 +2895,13 @@ impl SpirvEmitContext {
                     spirv::Decoration::Offset,
                     vec![Operand::LiteralBit32(varying.offset)],
                 );
+                if self.stage == ShaderStage::Geometry && varying.stream != 0 {
+                    self.builder.decorate(
+                        id,
+                        spirv::Decoration::Stream,
+                        vec![Operand::LiteralBit32(varying.stream)],
+                    );
+                }
             }
             const SWIZZLE: &str = "xyzw";
             if num_components < 4 || element > 0 {
@@ -6699,6 +6716,7 @@ mod tests {
             .set(Attribute::generic(0, 0).0 as usize, true);
         let varying = TransformFeedbackVarying {
             buffer: 1,
+            stream: 0,
             stride: 16,
             offset: 4,
             components: 1,
@@ -6745,6 +6763,42 @@ mod tests {
                     Operand::LiteralBit32(1)
                 ]
             )));
+    }
+
+    #[test]
+    fn geometry_transform_feedback_output_uses_stream_decoration() {
+        let mut program = ir::Program::new(ShaderStage::Geometry);
+        program
+            .info
+            .stores
+            .set(Attribute::generic(0, 0).0 as usize, true);
+        let base = Attribute::generic(0, 0).0 as usize;
+        let mut runtime_info = RuntimeInfo {
+            xfb_varyings: vec![TransformFeedbackVarying::default(); base + 1],
+            xfb_count: (base + 1) as u32,
+            ..RuntimeInfo::default()
+        };
+        runtime_info.xfb_varyings[base] = TransformFeedbackVarying {
+            buffer: 1,
+            stream: 2,
+            stride: 16,
+            offset: 0,
+            components: 4,
+        };
+
+        let mut ctx = SpirvEmitContext::new(&program, &Profile::default(), &runtime_info);
+        ctx.define_global_variables(&program, &mut Bindings::default());
+
+        assert!(ctx.builder.module_ref().annotations.iter().any(|inst| {
+            matches!(
+                inst.operands.as_slice(),
+                [
+                    Operand::IdRef(_),
+                    Operand::Decoration(spirv::Decoration::Stream),
+                    Operand::LiteralBit32(2)
+                ]
+            )
+        }));
     }
 
     /// Declares generic attribute 0 as a fragment input of `input_type` with

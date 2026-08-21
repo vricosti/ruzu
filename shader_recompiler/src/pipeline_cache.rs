@@ -1032,14 +1032,16 @@ fn hash_runtime_info(info: &RuntimeInfo) -> u64 {
     info.alpha_test_reference.to_bits().hash(&mut hasher);
     info.y_negate.hash(&mut hasher);
     info.glasm_use_storage_buffers.hash(&mut hasher);
-    info.frag_color_types.hash(&mut hasher);
     info.xfb_count.hash(&mut hasher);
     for varying in info.xfb_varyings.iter().take(info.xfb_count as usize) {
         varying.buffer.hash(&mut hasher);
+        varying.stream.hash(&mut hasher);
         varying.stride.hash(&mut hasher);
         varying.offset.hash(&mut hasher);
         varying.components.hash(&mut hasher);
     }
+    info.frag_color_types.hash(&mut hasher);
+    info.dual_source_blend.hash(&mut hasher);
     hasher.finish()
 }
 
@@ -1591,4 +1593,25 @@ mod tests {
         let _ = cache.get_or_compile(&code, ShaderStage::VertexB, &converted_depth_runtime);
         assert_eq!(cache.len(), 2);
     }
+}
+#[test]
+fn runtime_hash_includes_dual_source_blend_and_xfb_stream() {
+    let base = RuntimeInfo::default();
+    let mut dual_source = base.clone();
+    dual_source.dual_source_blend = true;
+    assert_ne!(hash_runtime_info(&base), hash_runtime_info(&dual_source));
+
+    let varying = crate::runtime_info::TransformFeedbackVarying {
+        components: 1,
+        ..Default::default()
+    };
+    let mut stream_zero = base.clone();
+    stream_zero.xfb_varyings = vec![varying];
+    stream_zero.xfb_count = 1;
+    let mut stream_one = stream_zero.clone();
+    stream_one.xfb_varyings[0].stream = 1;
+    assert_ne!(
+        hash_runtime_info(&stream_zero),
+        hash_runtime_info(&stream_one)
+    );
 }

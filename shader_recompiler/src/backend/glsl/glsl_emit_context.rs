@@ -843,6 +843,7 @@ mod tests {
         runtime_info.xfb_varyings[Attribute::Generic0X as usize] =
             crate::runtime_info::TransformFeedbackVarying {
                 buffer: 1,
+                stream: 0,
                 stride: 16,
                 offset: 0,
                 components: 2,
@@ -850,6 +851,7 @@ mod tests {
         runtime_info.xfb_varyings[Attribute::Generic0Z as usize] =
             crate::runtime_info::TransformFeedbackVarying {
                 buffer: 1,
+                stream: 0,
                 stride: 16,
                 offset: 8,
                 components: 2,

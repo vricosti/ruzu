@@ -2520,6 +2520,7 @@ fn make_runtime_info(
             info.alpha_test_func =
                 Some(compare_function_from_maxwell(fixed_state.alpha_test_func()));
             info.alpha_test_reference = f32::from_bits(fixed_state.alpha_test_ref);
+            info.dual_source_blend = fixed_state.attachment0_dual_source_blend();
             for (index, &format) in fixed_state.color_formats.iter().enumerate() {
                 if format == 0 {
                     info.frag_color_types[index] = AttributeType::Float;
@@ -2551,6 +2552,7 @@ fn fill_transform_feedback_runtime_info(info: &mut RuntimeInfo, fixed_state: &Fi
         .map(
             |varying| shader_recompiler::runtime_info::TransformFeedbackVarying {
                 buffer: varying.buffer,
+                stream: varying.stream,
                 stride: varying.stride,
                 offset: varying.offset,
                 components: varying.components,
@@ -3236,6 +3238,7 @@ mod tests {
         fixed_state.point_size = 1.5f32.to_bits();
         fixed_state.set_alpha_test_func(crate::engines::maxwell_3d::ComparisonOp::Greater);
         fixed_state.alpha_test_ref = 0.25f32.to_bits();
+        fixed_state.set_attachment0_dual_source_blend(true);
         fixed_state.set_tessellation_primitive(2);
         fixed_state.set_tessellation_spacing(1);
         fixed_state.set_tessellation_clockwise(true);
@@ -3260,6 +3263,7 @@ mod tests {
         let fragment = make_runtime_info(&key, ShaderStage::Fragment, None);
         assert_eq!(fragment.alpha_test_func, Some(CompareFunction::Greater));
         assert_eq!(fragment.alpha_test_reference, 0.25);
+        assert!(fragment.dual_source_blend);
     }
 
     #[test]
