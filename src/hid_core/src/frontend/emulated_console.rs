@@ -7,11 +7,12 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use common::input::{self, CallbackStatus, InputCallback, InputDevice, TouchStatus};
+use common::input::{self, CallbackStatus, InputCallback, InputDevice, MotionStatus, TouchStatus};
 use common::param_package::ParamPackage;
 use parking_lot::Mutex;
 
-use super::input_converter::transform_to_touch;
+use super::input_converter::{transform_to_motion, transform_to_touch};
+use super::motion_input::{MotionInput, Quaternion};
 use crate::hid_types::*;
 
 pub const MAX_TOUCH_DEVICES: usize = 32;
@@ -24,13 +25,21 @@ pub struct ConsoleMotion {
     pub gyro: Vec3f,
     pub rotation: Vec3f,
     pub orientation: [Vec3f; 3],
+    pub quaternion: Quaternion,
     pub gyro_bias: Vec3f,
     pub verticalization_error: f32,
     pub is_at_rest: bool,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct ConsoleMotionInfo {
+    pub raw_status: MotionStatus,
+    pub emulated: MotionInput,
+}
+
 pub type TouchFingerState = [TouchFinger; MAX_ACTIVE_TOUCH_INPUTS];
-type TouchValues = [TouchStatus; MAX_TOUCH_DEVICES];
+pub type ConsoleMotionValues = ConsoleMotionInfo;
+pub type TouchValues = [TouchStatus; MAX_TOUCH_DEVICES];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ConsoleTriggerType {
@@ -44,14 +53,18 @@ pub struct ConsoleUpdateCallback {
 }
 
 struct ConsoleStatus {
+    motion_values: ConsoleMotionInfo,
     touch_values: TouchValues,
+    motion_state: ConsoleMotion,
     touch_state: TouchFingerState,
 }
 
 impl Default for ConsoleStatus {
     fn default() -> Self {
         Self {
+            motion_values: ConsoleMotionInfo::default(),
             touch_values: [TouchStatus::default(); MAX_TOUCH_DEVICES],
+            motion_state: ConsoleMotion::default(),
             touch_state: [TouchFinger::default(); MAX_ACTIVE_TOUCH_INPUTS],
         }
     }
@@ -60,12 +73,13 @@ impl Default for ConsoleStatus {
 pub struct EmulatedConsole {
     is_configuring: Arc<AtomicBool>,
     motion_sensitivity: f32,
+    motion_params: [ParamPackage; 2],
     touch_params: [ParamPackage; MAX_TOUCH_DEVICES],
+    motion_devices: [Option<Box<dyn InputDevice>>; 2],
     touch_devices: [Option<Box<dyn InputDevice>>; MAX_TOUCH_DEVICES],
     console: Arc<Mutex<ConsoleStatus>>,
     callback_list: Arc<Mutex<HashMap<i32, ConsoleUpdateCallback>>>,
     last_callback_key: i32,
-    motion_state: ConsoleMotion,
 }
 
 impl EmulatedConsole {
@@ -73,16 +87,20 @@ impl EmulatedConsole {
         Self {
             is_configuring: Arc::new(AtomicBool::new(false)),
             motion_sensitivity: 0.01,
+            motion_params: std::array::from_fn(|_| ParamPackage::default()),
             touch_params: std::array::from_fn(|_| ParamPackage::default()),
+            motion_devices: std::array::from_fn(|_| None),
             touch_devices: std::array::from_fn(|_| None),
             console: Arc::new(Mutex::new(ConsoleStatus::default())),
             callback_list: Arc::new(Mutex::new(HashMap::new())),
             last_callback_key: 0,
-            motion_state: ConsoleMotion::default(),
         }
     }
 
     pub fn unload_input(&mut self) {
+        for motion in &mut self.motion_devices {
+            *motion = None;
+        }
         for touch in &mut self.touch_devices {
             *touch = None;
         }
@@ -103,6 +121,38 @@ impl EmulatedConsole {
 
     pub fn reload_input(&mut self) {
         self.set_touch_params();
+        self.motion_params[1] =
+            ParamPackage::from_serialized("engine:virtual_gamepad,port:8,motion:0");
+
+        for index in 0..self.motion_devices.len() {
+            let mut device = input::create_input_device(&self.motion_params[index]);
+            let console = Arc::clone(&self.console);
+            let callback_list = Arc::clone(&self.callback_list);
+            let is_configuring = Arc::clone(&self.is_configuring);
+            let motion_sensitivity = self.motion_sensitivity;
+            device.set_callback(InputCallback {
+                on_change: Some(Arc::new(move |callback| {
+                    Self::set_motion(
+                        &console,
+                        &callback_list,
+                        &is_configuring,
+                        motion_sensitivity,
+                        callback,
+                    );
+                })),
+            });
+            self.motion_devices[index] = Some(device);
+        }
+
+        {
+            let mut console = self.console.lock();
+            let emulated_motion = &mut console.motion_values.emulated;
+            emulated_motion.reset_rotations();
+            emulated_motion.reset_quaternion();
+            let motion_state = Self::motion_state(emulated_motion, self.motion_sensitivity);
+            console.motion_state = motion_state;
+        }
+
         for index in 0..self.touch_devices.len() {
             let mut device = input::create_input_device(&self.touch_params[index]);
             let console = Arc::clone(&self.console);
@@ -118,7 +168,54 @@ impl EmulatedConsole {
     }
 
     pub fn reload_from_settings(&mut self) {
+        let motion = common::settings::values().players.get_value()[0].motions[0].clone();
+        self.motion_params[0] = ParamPackage::from_serialized(&motion);
         self.reload_input();
+    }
+
+    fn motion_state(emulated: &MotionInput, motion_sensitivity: f32) -> ConsoleMotion {
+        ConsoleMotion {
+            accel: emulated.get_acceleration(),
+            gyro: emulated.get_gyroscope(),
+            rotation: emulated.get_rotations(),
+            orientation: emulated.get_orientation(),
+            quaternion: emulated.get_quaternion(),
+            gyro_bias: emulated.get_gyro_bias(),
+            verticalization_error: 0.0,
+            is_at_rest: !emulated.is_moving(motion_sensitivity),
+        }
+    }
+
+    fn set_motion(
+        console: &Arc<Mutex<ConsoleStatus>>,
+        callback_list: &Arc<Mutex<HashMap<i32, ConsoleUpdateCallback>>>,
+        is_configuring: &AtomicBool,
+        motion_sensitivity: f32,
+        callback: &CallbackStatus,
+    ) {
+        let mut console = console.lock();
+        let raw_status = transform_to_motion(callback);
+        console.motion_values.raw_status = raw_status;
+        let emulated = &mut console.motion_values.emulated;
+        emulated.set_acceleration(Vec3f {
+            x: raw_status.accel.x.value,
+            y: raw_status.accel.y.value,
+            z: raw_status.accel.z.value,
+        });
+        emulated.set_gyroscope(Vec3f {
+            x: raw_status.gyro.x.value,
+            y: raw_status.gyro.y.value,
+            z: raw_status.gyro.z.value,
+        });
+        emulated.update_rotation(raw_status.delta_timestamp);
+        emulated.update_orientation(raw_status.delta_timestamp);
+
+        if !is_configuring.load(Ordering::Relaxed) {
+            let motion_state = Self::motion_state(emulated, motion_sensitivity);
+            console.motion_state = motion_state;
+        }
+        drop(console);
+        Self::trigger_callbacks(callback_list, ConsoleTriggerType::Motion);
     }
 
     fn set_touch_params(&mut self) {
@@ -256,8 +353,25 @@ impl EmulatedConsole {
         self.reload_from_settings();
     }
 
+    pub fn get_motion_param(&self) -> ParamPackage {
+        self.motion_params[0].clone()
+    }
+
+    pub fn set_motion_param(&mut self, param: ParamPackage) {
+        self.motion_params[0] = param;
+        self.reload_input();
+    }
+
+    pub fn get_motion_values(&self) -> ConsoleMotionValues {
+        self.console.lock().motion_values.clone()
+    }
+
+    pub fn get_touch_values(&self) -> TouchValues {
+        self.console.lock().touch_values
+    }
+
     pub fn get_motion(&self) -> ConsoleMotion {
-        self.motion_state
+        self.console.lock().motion_state
     }
 
     pub fn get_touch(&self) -> TouchFingerState {
@@ -265,10 +379,11 @@ impl EmulatedConsole {
     }
 
     pub fn set_callback(&mut self, update_callback: ConsoleUpdateCallback) -> i32 {
-        let key = self.last_callback_key;
-        self.callback_list.lock().insert(key, update_callback);
         self.last_callback_key += 1;
-        key
+        self.callback_list
+            .lock()
+            .insert(self.last_callback_key, update_callback);
+        self.last_callback_key
     }
 
     pub fn delete_callback(&mut self, key: i32) {
@@ -296,8 +411,10 @@ impl Default for EmulatedConsole {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use common::input::InputType;
     use input_common::drivers::mouse::{Mouse, MouseButton};
     use input_common::input_poller::InputFactory;
+    use std::sync::atomic::AtomicUsize;
 
     #[test]
     fn mouse_touch_callback_updates_console_state() {
@@ -334,5 +451,57 @@ mod tests {
 
         mouse.release_button(MouseButton::Left);
         assert!(!console.lock().touch_state[0].pressed);
+    }
+
+    #[test]
+    fn motion_callback_updates_emulated_console_state_and_uses_sensitivity() {
+        let console = Arc::new(Mutex::new(ConsoleStatus::default()));
+        let callback_count = Arc::new(AtomicUsize::new(0));
+        let callback_list = Arc::new(Mutex::new(HashMap::from([(
+            1,
+            ConsoleUpdateCallback {
+                on_change: Box::new({
+                    let callback_count = Arc::clone(&callback_count);
+                    move |trigger| {
+                        assert_eq!(trigger, ConsoleTriggerType::Motion);
+                        callback_count.fetch_add(1, Ordering::Relaxed);
+                    }
+                }),
+            },
+        )])));
+        let mut callback = CallbackStatus {
+            input_type: InputType::Motion,
+            ..Default::default()
+        };
+        callback.motion_status.accel.z.raw_value = -1.0;
+        callback.motion_status.gyro.x.raw_value = 0.02;
+        callback.motion_status.delta_timestamp = 1_000;
+
+        EmulatedConsole::set_motion(
+            &console,
+            &callback_list,
+            &AtomicBool::new(false),
+            0.01,
+            &callback,
+        );
+
+        let console = console.lock();
+        assert_eq!(console.motion_values.raw_status.gyro.x.value, 0.02);
+        assert_eq!(console.motion_state.gyro.x, 0.02);
+        assert!(!console.motion_state.is_at_rest);
+        assert_eq!(callback_count.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn callback_keys_start_at_one_like_eden() {
+        let mut console = EmulatedConsole::new();
+        let first = console.set_callback(ConsoleUpdateCallback {
+            on_change: Box::new(|_| {}),
+        });
+        let second = console.set_callback(ConsoleUpdateCallback {
+            on_change: Box::new(|_| {}),
+        });
+
+        assert_eq!((first, second), (1, 2));
     }
 }

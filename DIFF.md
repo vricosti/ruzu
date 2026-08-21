@@ -2464,3 +2464,36 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 ### Binary layout verification
 
 - N/A: this changes host callback ownership only.
+
+## 2026-08-21 — `src/hid_core/src/frontend/emulated_console.rs` vs Eden `src/hid_core/frontend/emulated_console.{h,cpp}` motion path
+
+### Intentional differences
+
+- Input callbacks capture `Arc<Mutex<ConsoleStatus>>`, the configuration flag, and the immutable
+  sensitivity instead of Eden's raw `this` pointer. This preserves callback-thread safety without
+  moving console behavior out of its upstream-owned file.
+- Ruzu's input factory always returns an `InputDevice` (a null device for an unavailable backend),
+  so the explicit null-device branches in Eden are represented by normal callback installation.
+- `ConsoleMotion::quaternion` uses this module's existing Rust `MotionInput::Quaternion`; it carries
+  the same four scalar components and is host state rather than a raw guest payload.
+- The private `motion_state` helper mechanically shares Eden's identical field projection between
+  reload and callback paths while remaining in the same upstream-owned module.
+
+### Unintentional differences (to fix)
+
+- None in the reviewed file. Ruzu now owns both motion parameter slots and devices, restores the
+  first player's configured motion source, adds the virtual-gamepad source, updates raw and
+  emulated motion in callback order, resets rotations/quaternion on reload, and applies
+  `motion_sensitivity` to `is_at_rest` exactly where Eden does.
+- Callback keys now increment before insertion and therefore start at 1, matching Eden.
+
+### Missing items
+
+- The downstream `ConsoleSixAxis` and `SevenSixAxis` resources do not yet consume this newly live
+  console state in their update paths. That wiring belongs to those corresponding files and is a
+  separate prerequisite-sensitive slice.
+
+### Binary layout verification
+
+- N/A: `ConsoleMotion` and `ConsoleMotionInfo` are synchronized host-side frontend state and are
+  not copied raw into guest memory.
