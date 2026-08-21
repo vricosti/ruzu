@@ -3715,3 +3715,24 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 ### Binary layout verification
 
 - N/A: VFS objects and host file-reference state are not serialized.
+
+## 2026-08-21 — `src/core/src/loader/kip.rs` loader file ownership vs Eden `src/core/loader/{loader.h,kip.h,kip.cpp}`
+
+### Intentional differences
+
+- Eden inherits the protected `file` and `is_loaded` members from `AppLoader`; Rust's `AppLoader`
+  is a trait, so `AppLoaderKip` owns both fields directly. The retained file is named `_file` to
+  express base-class ownership while avoiding a false dead-field warning.
+
+### Unintentional differences (to fix)
+
+- None in the file-lifetime slice. The complete KIP loading algorithm was not reimplemented here.
+
+### Missing items
+
+- None for `AppLoader` base-file ownership; a regression verifies the `VirtualFile` remains alive
+  until the loader is dropped.
+
+### Binary layout verification
+
+- N/A: loader ownership state is not serialized.

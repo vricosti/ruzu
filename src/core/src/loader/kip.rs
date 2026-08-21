@@ -38,7 +38,7 @@ const fn page_align_size(size: u32) -> u32 {
 ///
 /// Maps to upstream `Loader::AppLoader_KIP`.
 pub struct AppLoaderKip {
-    file: VirtualFile,
+    _file: VirtualFile,
     is_loaded: bool,
     /// Parsed KIP content. Maps to upstream `std::unique_ptr<FileSys::KIP> kip`.
     kip: Option<KIP>,
@@ -74,10 +74,32 @@ impl AppLoaderKip {
                 Some(kip) // Keep even on failure, upstream stores it and checks status in GetFileType/Load
             };
         Self {
-            file,
+            _file: file,
             is_loaded: false,
             kip: kip_opt,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::file_sys::vfs::vfs_vector::VectorVfsFile;
+    use std::sync::Arc;
+
+    #[test]
+    fn loader_retains_base_file_for_its_lifetime() {
+        let file: VirtualFile = Arc::new(VectorVfsFile::new(
+            Vec::new(),
+            "free-homebrew.kip".to_string(),
+            None,
+        ));
+        let weak_file = Arc::downgrade(&file);
+        let loader = AppLoaderKip::new(file);
+
+        assert!(weak_file.upgrade().is_some());
+        drop(loader);
+        assert!(weak_file.upgrade().is_none());
     }
 }
 
