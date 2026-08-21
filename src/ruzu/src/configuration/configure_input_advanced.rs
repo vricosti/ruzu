@@ -105,6 +105,14 @@ pub fn page(input_subsystem: Rc<RefCell<input_common::InputSubsystem>>) -> Page 
             .emulate_analog_keyboard
             .get_value(),
     );
+    let disable_wgi_xinput = w::check_row(
+        "Disable SDL WGI/XInput (Requires restart)",
+        *common::settings::values().disable_wgi_xinput.get_value(),
+    );
+    disable_wgi_xinput.set_tooltip_text(Some(
+        "Aimed to disable SDL GUIDE button hack: synthetic GUIDE(HOME) event when SELECT(MINUS) + START(PLUS) pressed. May impact Win related trigger/rumble/etc stuff",
+    ));
+    disable_wgi_xinput.set_visible(cfg!(target_os = "windows"));
     let udp_controllers = w::check_row(
         "Enable UDP controllers (not needed for motion)",
         *common::settings::values().enable_udp_controller.get_value(),
@@ -127,6 +135,7 @@ pub fn page(input_subsystem: Rc<RefCell<input_common::InputSubsystem>>) -> Page 
     );
     for check in [
         &emulate_analog,
+        &disable_wgi_xinput,
         &udp_controllers,
         &controller_navigation,
         &joycon_driver,
@@ -188,6 +197,9 @@ pub fn page(input_subsystem: Rc<RefCell<input_common::InputSubsystem>>) -> Page 
         values
             .emulate_analog_keyboard
             .set_value(emulate_analog.is_active());
+        values
+            .disable_wgi_xinput
+            .set_value(disable_wgi_xinput.is_active());
         values
             .enable_udp_controller
             .set_value(udp_controllers.is_active());

@@ -263,6 +263,7 @@ pub struct Values {
     // ── Controls ────────────────────────────────────────────────────────
     pub players: InputSetting<[PlayerInput; 10]>,
 
+    pub disable_wgi_xinput: Setting<bool>,
     pub enable_raw_input: Setting<bool>,
     pub controller_navigation: Setting<bool>,
     pub enable_joycon_driver: Setting<bool>,
@@ -551,6 +552,8 @@ impl Values {
             ),
             Category::Linux => visit!(enable_gamemode),
             Category::Controls => visit!(
+                disable_wgi_xinput,
+                enable_raw_input,
                 vibration_enabled,
                 enable_accurate_vibrations,
                 motion_enabled,
@@ -1301,12 +1304,20 @@ impl Default for Values {
             // Controls
             players: InputSetting::new(),
 
+            disable_wgi_xinput: Setting::with_options(
+                false,
+                "disable_wgi_xinput",
+                Controls,
+                Specialization::DEFAULT,
+                cfg!(target_os = "windows"),
+                false,
+            ),
             enable_raw_input: Setting::with_options(
                 false,
                 "enable_raw_input",
                 Controls,
                 Specialization::DEFAULT,
-                false,
+                cfg!(target_os = "windows"),
                 false,
             ),
             controller_navigation: Setting::new(true, "controller_navigation", Controls),
@@ -2151,6 +2162,23 @@ mod tests {
         });
         assert_eq!(labels, ["network_interface", "airplane_mode"]);
         assert_eq!(switchable, [false, true]);
+    }
+
+    #[test]
+    fn windows_only_sdl_input_settings_match_upstream_defaults_and_persistence() {
+        let mut values = Values::default();
+
+        assert!(!*values.disable_wgi_xinput.get_value());
+        assert!(!*values.enable_raw_input.get_value());
+        assert_eq!(values.disable_wgi_xinput.save, cfg!(target_os = "windows"));
+        assert_eq!(values.enable_raw_input.save, cfg!(target_os = "windows"));
+
+        let mut labels = Vec::new();
+        values.for_each_setting_in_category_mut(Category::Controls, |setting| {
+            labels.push(setting.label().to_string());
+        });
+        assert!(labels.iter().any(|label| label == "disable_wgi_xinput"));
+        assert!(labels.iter().any(|label| label == "enable_raw_input"));
     }
 
     #[test]
