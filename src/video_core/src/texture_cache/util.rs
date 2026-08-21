@@ -21,8 +21,8 @@ use super::types::*;
 
 use crate::surface;
 use crate::textures::decoders::{
-    GOB_SIZE, GOB_SIZE_SHIFT, GOB_SIZE_X, GOB_SIZE_X_SHIFT, GOB_SIZE_Y, GOB_SIZE_Y_SHIFT,
-    GOB_SIZE_Z, GOB_SIZE_Z_SHIFT,
+    GOB_SIZE_SHIFT, GOB_SIZE_X, GOB_SIZE_X_SHIFT, GOB_SIZE_Y, GOB_SIZE_Y_SHIFT, GOB_SIZE_Z,
+    GOB_SIZE_Z_SHIFT,
 };
 
 // ── Alignment helpers ─────────────────────────────────────────────────

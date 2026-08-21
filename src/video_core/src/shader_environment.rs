@@ -12,10 +12,12 @@ use std::io::Write;
 use std::path::Path;
 use std::sync::Arc;
 
-use crate::engines::kepler_compute::{ConstBufferConfig, KeplerCompute};
-use crate::engines::maxwell_3d::{
-    ConstBufferBinding, EngineHint, Maxwell3D, SamplerBinding, ShaderStageType,
-};
+#[cfg(test)]
+use crate::engines::kepler_compute::ConstBufferConfig;
+use crate::engines::kepler_compute::KeplerCompute;
+#[cfg(test)]
+use crate::engines::maxwell_3d::ConstBufferBinding;
+use crate::engines::maxwell_3d::{EngineHint, Maxwell3D, SamplerBinding, ShaderStageType};
 use crate::memory_manager::MemoryManager;
 use crate::texture_cache::format_lookup_table::pixel_format_from_texture_info_raw;
 use crate::textures::texture::{texture_pair, TextureType as TegraTextureType, TicEntry};

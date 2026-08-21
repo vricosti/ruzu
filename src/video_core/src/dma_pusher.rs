@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use crate::engines::engine_interface::EngineTypes;
 use crate::engines::engine_interface::{EngineHandle, EngineInterface};
-use crate::engines::puller::{EngineID, MethodCall, Puller};
+use crate::engines::puller::{MethodCall, Puller};
 use crate::guest_memory::{GpuGuestMemory, GpuMemoryManagerHandle, GuestMemoryFlags};
 use common::scratch_buffer::ScratchBuffer;
 use common::settings;
