@@ -2352,3 +2352,25 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 
 - N/A for the removed host-only structures. The active mapping records are not copied to guest
   memory or serialized.
+
+## 2026-08-21 — `src/dedicated_room/src/main.rs` announcement credentials vs Eden `src/dedicated_room/yuzu_room.cpp`
+
+### Intentional differences
+
+- Ruzu retains the historical setting field names `yuzu_username` and `yuzu_token`; they are the
+  existing Rust equivalents consumed by `AnnounceMultiplayerSession`.
+
+### Unintentional differences (to fix)
+
+- None in this slice. Before constructing the verification backend and announcement session, Ruzu
+  now writes `web_api_url`, username, and token to global settings in the same branches and order as
+  Eden. Display tokens publish the decoded token directly instead of assigning it to an otherwise
+  unread local variable.
+
+### Missing items
+
+- None for dedicated-room announcement credential propagation.
+
+### Binary layout verification
+
+- N/A: credentials are host strings and are not raw guest payloads.

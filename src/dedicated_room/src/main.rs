@@ -9,7 +9,6 @@
 
 use std::fs;
 use std::io::{self, BufRead, Write};
-use std::path::Path;
 
 use clap::Parser;
 
@@ -456,14 +455,22 @@ fn main() {
         log::info!("Endpoint url is empty: Hosting a private room");
     }
     if announce {
+        let mut settings = common::settings::values_mut();
+        settings.web_api_url.set_value(web_api_url.clone());
         if username.is_empty() {
             log::info!("Hosting a public room");
             pad_token(&mut token);
-            username = username_from_display_token(&token);
-            token = token_from_display_token(&token);
+            settings
+                .yuzu_username
+                .set_value(username_from_display_token(&token));
+            username.clone_from(settings.yuzu_username.get_value());
+            settings
+                .yuzu_token
+                .set_value(token_from_display_token(&token));
         } else {
             log::info!("Hosting a public room");
-            // username and token already set from args
+            settings.yuzu_username.set_value(username.clone());
+            settings.yuzu_token.set_value(token.clone());
         }
     }
     if !announce && enable_yuzu_mods {
@@ -601,6 +608,14 @@ mod tests {
     }
 
     #[test]
+    fn test_display_token_extracts_eden_credentials() {
+        let display_token = base64_encode(b"reviewer:secret-token");
+
+        assert_eq!(username_from_display_token(&display_token), "reviewer");
+        assert_eq!(token_from_display_token(&display_token), "secret-token");
+    }
+
+    #[test]
     fn test_load_ban_list_missing_file() {
         // A non-existent file should return an empty ban list without panicking.
         let result = load_ban_list("/nonexistent/path/banlist.txt");
@@ -610,7 +625,6 @@ mod tests {
 
     #[test]
     fn test_save_and_load_ban_list_roundtrip() {
-        use std::io::Write;
         let dir = tempfile::tempdir().expect("temp dir");
         let path = dir.path().join("banlist.txt");
         let path_str = path.to_str().unwrap();
