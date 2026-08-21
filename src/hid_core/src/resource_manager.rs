@@ -798,26 +798,7 @@ impl ResourceManager {
 
         // console_six_axis->OnUpdate(core_timing)
         if let Some(ref console_six_axis) = self.console_six_axis {
-            let applet_resource = match self.applet_resource {
-                Some(ref ar) => ar.clone(),
-                None => return,
-            };
-            let mut ar_guard = applet_resource.lock();
-            let active_aruid = ar_guard.get_active_aruid();
-            let data = match ar_guard.get_aruid_data(active_aruid) {
-                Some(d) => d.clone(),
-                None => return,
-            };
-            if !data.flag.is_assigned() {
-                return;
-            }
-            if let Some(shared_memory) = ar_guard.get_shared_memory_format_mut(active_aruid) {
-                let mut csa = console_six_axis.lock();
-                // Upstream reads motion from EmulatedConsole::GetMotion()
-                let motion_status =
-                    crate::resources::six_axis::console_six_axis::ConsoleMotionStatus::default();
-                csa.on_update(&mut shared_memory.console, &motion_status);
-            }
+            console_six_axis.lock().on_update();
         }
     }
 
@@ -1000,22 +981,27 @@ impl ResourceManager {
     }
 
     fn initialize_console_six_axis_sampler(&mut self) {
-        self.console_six_axis = Some(Arc::new(Mutex::new(ConsoleSixAxis::new())));
+        let Some(hid_core) = self.hid_core.as_ref().cloned() else {
+            return;
+        };
+        self.console_six_axis = Some(Arc::new(Mutex::new(ConsoleSixAxis::new(hid_core))));
         self.seven_six_axis = Some(Arc::new(Mutex::new(SevenSixAxis::new())));
 
         // Wire console_six_axis to applet_resource
         if let Some(ref applet_resource) = self.applet_resource {
-            if let Some(ref hid_core) = self.hid_core {
-                if let Some(ref console_six_axis) = self.console_six_axis {
-                    let mut csa = console_six_axis.lock();
-                    csa.activation.set_applet_resource(applet_resource.clone());
-                    csa.activation.set_hid_core(hid_core.clone());
-                }
-                if let Some(ref seven_six_axis) = self.seven_six_axis {
-                    let mut ssa = seven_six_axis.lock();
-                    ssa.activation.set_applet_resource(applet_resource.clone());
-                    ssa.activation.set_hid_core(hid_core.clone());
-                }
+            if let Some(ref console_six_axis) = self.console_six_axis {
+                console_six_axis
+                    .lock()
+                    .activation
+                    .set_applet_resource(applet_resource.clone());
+            }
+            if let (Some(hid_core), Some(seven_six_axis)) =
+                (self.hid_core.as_ref(), self.seven_six_axis.as_ref())
+            {
+                seven_six_axis
+                    .lock()
+                    .activation
+                    .set_hid_core(hid_core.clone());
             }
         }
     }

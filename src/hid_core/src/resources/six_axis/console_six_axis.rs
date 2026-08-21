@@ -3,17 +3,14 @@
 
 //! Port of hid_core/resources/six_axis/console_six_axis.h and console_six_axis.cpp
 
-use crate::hid_types::Vec3f;
+use std::sync::Arc;
+
+use parking_lot::Mutex;
+
+use crate::frontend::emulated_console::ConsoleMotion;
+use crate::hid_core::HIDCore;
 use crate::resources::controller_base::ControllerActivation;
 use crate::resources::shared_memory_format::ConsoleSixAxisSensorSharedMemoryFormat;
-
-/// Console motion status as returned by EmulatedConsole::GetMotion().
-#[derive(Debug, Clone, Copy, Default)]
-pub struct ConsoleMotionStatus {
-    pub is_at_rest: bool,
-    pub verticalization_error: f32,
-    pub gyro_bias: Vec3f,
-}
 
 /// ConsoleSixAxis controller — reads console motion data from EmulatedConsole
 /// and writes into ConsoleSixAxisSensorSharedMemoryFormat.
@@ -22,10 +19,10 @@ pub struct ConsoleSixAxis {
 }
 
 impl ConsoleSixAxis {
-    pub fn new() -> Self {
-        Self {
-            activation: ControllerActivation::new(),
-        }
+    pub fn new(hid_core: Arc<Mutex<HIDCore>>) -> Self {
+        let mut activation = ControllerActivation::new();
+        activation.set_hid_core(hid_core);
+        Self { activation }
     }
 
     pub fn on_init(&mut self) {}
@@ -43,15 +40,35 @@ impl ConsoleSixAxis {
     ///   shared_memory.is_seven_six_axis_sensor_at_rest = motion_status.is_at_rest
     ///   shared_memory.verticalization_error = motion_status.verticalization_error
     ///   shared_memory.gyro_bias = motion_status.gyro_bias
-    pub fn on_update(
-        &mut self,
-        shared_memory: &mut ConsoleSixAxisSensorSharedMemoryFormat,
-        motion_status: &ConsoleMotionStatus,
-    ) {
+    pub fn on_update(&mut self) {
+        let Some(applet_resource) = self.activation.applet_resource.as_ref().cloned() else {
+            return;
+        };
+        let Some(hid_core) = self.activation.hid_core.as_ref().cloned() else {
+            return;
+        };
+        let mut applet_resource = applet_resource.lock();
+        let aruid = applet_resource.get_active_aruid();
+        let Some(data) = applet_resource.get_aruid_data(aruid) else {
+            return;
+        };
+        if !data.flag.is_assigned() {
+            return;
+        }
         if !self.activation.is_controller_activated() {
             return;
         }
+        let motion_status = hid_core.lock().get_emulated_console().get_motion();
+        let Some(shared_memory) = applet_resource.get_shared_memory_format_mut(aruid) else {
+            return;
+        };
+        Self::update_shared_memory(&mut shared_memory.console, &motion_status);
+    }
 
+    fn update_shared_memory(
+        shared_memory: &mut ConsoleSixAxisSensorSharedMemoryFormat,
+        motion_status: &ConsoleMotion,
+    ) {
         shared_memory.sampling_number += 1;
         shared_memory.is_seven_six_axis_sensor_at_rest = motion_status.is_at_rest;
         shared_memory.verticalization_error = motion_status.verticalization_error;
@@ -59,8 +76,32 @@ impl ConsoleSixAxis {
     }
 }
 
-impl Default for ConsoleSixAxis {
-    fn default() -> Self {
-        Self::new()
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::hid_types::Vec3f;
+
+    #[test]
+    fn update_projects_console_motion_into_shared_memory() {
+        let mut shared_memory = ConsoleSixAxisSensorSharedMemoryFormat::default();
+        let motion = ConsoleMotion {
+            is_at_rest: true,
+            verticalization_error: 0.25,
+            gyro_bias: Vec3f {
+                x: 1.0,
+                y: 2.0,
+                z: 3.0,
+            },
+            ..Default::default()
+        };
+
+        ConsoleSixAxis::update_shared_memory(&mut shared_memory, &motion);
+
+        assert_eq!(shared_memory.sampling_number, 1);
+        assert!(shared_memory.is_seven_six_axis_sensor_at_rest);
+        assert_eq!(shared_memory.verticalization_error, 0.25);
+        assert_eq!(shared_memory.gyro_bias.x, 1.0);
+        assert_eq!(shared_memory.gyro_bias.y, 2.0);
+        assert_eq!(shared_memory.gyro_bias.z, 3.0);
     }
 }

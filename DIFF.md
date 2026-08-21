@@ -2497,3 +2497,35 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 
 - N/A: `ConsoleMotion` and `ConsoleMotionInfo` are synchronized host-side frontend state and are
   not copied raw into guest memory.
+
+## 2026-08-21 — console six-axis ownership in `src/hid_core/src/resources/six_axis/console_six_axis.rs` / `resource_manager.rs` vs Eden counterparts
+
+### Intentional differences
+
+- Ruzu's `ControllerActivation` stores shared `Arc<Mutex<...>>` references in place of Eden's
+  `ControllerBase` raw/reference members. `ConsoleSixAxis::new` receives the HID core and the
+  resource manager supplies the applet resource during sampler initialization.
+- The private `update_shared_memory` helper is a mechanical extraction of Eden's four assignments
+  so their projection can be regression-tested without fabricating kernel-backed applet memory.
+
+### Unintentional differences (to fix)
+
+- None. `ConsoleSixAxis::on_update` now owns active-ARUID validation, activation validation,
+  `EmulatedConsole::get_motion`, and the shared-memory projection. `ResourceManager::update_motion`
+  only schedules the call, matching Eden's ownership boundary.
+- The obsolete Ruzu-only `ConsoleMotionStatus` duplicate and the default status constructed by the
+  resource manager were removed.
+- Sampler initialization no longer assigns an applet resource to `SevenSixAxis`, matching Eden,
+  which only assigns one to `ConsoleSixAxis`.
+
+### Missing items
+
+- `SevenSixAxis::on_update` still needs the `Core::System` timing/application-memory dependency
+  owned by its Eden constructor. It remains a separate structural prerequisite and was not
+  approximated in this slice.
+
+### Binary layout verification
+
+- PASS: the existing compile-time assertion still verifies
+  `ConsoleSixAxisSensorSharedMemoryFormat` is `0x20` bytes; the focused test verifies the exact
+  fields projected by Eden's update.
