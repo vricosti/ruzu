@@ -11,10 +11,10 @@
 // `Draw*Controller` / `Draw*Body` entry points and the primitive helpers they
 // build on (`DrawPolygon`, `DrawCircleButton`, `DrawArrowButton`, …).
 //
-// Upstream also animates the drawing: pressed buttons fill with a highlight
-// colour and the sticks follow live input, refreshed from a 40 ms timer. That
-// needs the polling loop hooked to the widget; the shapes and layout come
-// first, so buttons are drawn in their released colour for now.
+// Upstream also animates the drawing: pressed buttons fill with a highlight,
+// sticks follow live input, player LEDs reflect the connection and batteries
+// show their current level. Ruzu snapshots the same controller-owned values on
+// the 16 ms refresh interval used by Eden.
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -23,6 +23,7 @@ use gtk::cairo;
 use gtk::glib;
 use gtk::prelude::*;
 
+use common::input::BatteryLevel;
 use common::settings_input::native_button::Values as NB;
 use common::settings_input::{native_analog, native_button, ControllerType};
 
@@ -159,9 +160,10 @@ fn rgb(r: u8, g: u8, b: u8) -> (f64, f64, f64) {
 
 /// The live controller state the drawing reacts to.
 ///
-/// Upstream keeps `button_values`, `stick_values` and `trigger_values` as
+/// Upstream keeps `button_values`, `stick_values`, `led_pattern` and
+/// `battery_values` as
 /// members of `PlayerControlPreview`, refreshed by `ControllerUpdate` whenever
-/// the emulated controller changes. The same three arrays are collected here
+/// the emulated controller changes. The same values are collected here
 /// and handed to `draw`, so the drawing stays a pure function of them.
 #[derive(Clone)]
 pub struct Input {
@@ -170,6 +172,10 @@ pub struct Input {
     sticks: [(f64, f64); native_analog::NUM_ANALOGS],
     /// The raw (uncalibrated) stick values, drawn by `DrawJoystickDot`.
     raw_sticks: [(f64, f64); native_analog::NUM_ANALOGS],
+    /// Raw `LedPattern` bits. Eden clears these while the controller is disconnected.
+    led_pattern: u64,
+    /// Left and right raw device levels, matching `BatteryValues`.
+    battery_values: [BatteryLevel; 2],
 }
 
 impl Input {
@@ -180,6 +186,8 @@ impl Input {
             buttons: vec![false; native_button::NUM_BUTTONS],
             sticks: [(0.0, 0.0); native_analog::NUM_ANALOGS],
             raw_sticks: [(0.0, 0.0); native_analog::NUM_ANALOGS],
+            led_pattern: 0,
+            battery_values: [BatteryLevel::None; 2],
         }
     }
 
@@ -207,6 +215,12 @@ impl Input {
             buttons,
             sticks,
             raw_sticks,
+            led_pattern: if controller.is_connected(true) {
+                controller.get_led_pattern().raw
+            } else {
+                0
+            },
+            battery_values: controller.get_battery_values(),
         }
     }
 
@@ -227,6 +241,8 @@ impl Input {
         self.buttons == other.buttons
             && self.sticks == other.sticks
             && self.raw_sticks == other.raw_sticks
+            && self.led_pattern == other.led_pattern
+            && self.battery_values == other.battery_values
     }
 
     fn raw_stick(&self, analog: native_analog::Values) -> (f64, f64) {
@@ -570,6 +586,64 @@ fn symbol(
     cr.close_path();
     cr.set_source_rgb(color.0, color.1, color.2);
     let _ = cr.fill();
+}
+
+/// Upstream `DrawBattery`. Despite the upstream parameter name, `top_left` is
+/// the battery body's top-left corner rather than its centre.
+fn battery(cr: &cairo::Context, top_left: (f64, f64), level: BatteryLevel, colors: &Colors) {
+    if level == BatteryLevel::None {
+        return;
+    }
+
+    // Outer button-coloured outline and terminal.
+    cr.set_line_width(5.0);
+    rounded_rect_path(cr, top_left.0, top_left.1, 34.0, 16.0, 2.0);
+    cr.set_source_rgb(colors.button.0, colors.button.1, colors.button.2);
+    let _ = cr.stroke();
+    cr.set_line_width(3.0);
+    cr.rectangle(top_left.0 + 35.0, top_left.1 + 4.5, 4.0, 7.0);
+    cr.set_source_rgb(colors.button.0, colors.button.1, colors.button.2);
+    let _ = cr.stroke();
+
+    // Green inner outline and filled terminal.
+    rounded_rect_path(cr, top_left.0, top_left.1, 34.0, 16.0, 2.0);
+    cr.set_source_rgb(
+        colors.indicator2.0,
+        colors.indicator2.1,
+        colors.indicator2.2,
+    );
+    let _ = cr.stroke();
+    cr.set_line_width(1.0);
+    cr.rectangle(top_left.0 + 35.0, top_left.1 + 4.5, 4.0, 7.0);
+    fill_stroke(cr, colors.indicator2, colors.indicator2);
+
+    let fill_width = match level {
+        BatteryLevel::Charging | BatteryLevel::Full => 34.0,
+        BatteryLevel::Medium => 25.0,
+        BatteryLevel::Low => 17.0,
+        BatteryLevel::Critical => 6.0,
+        BatteryLevel::Empty => 3.0,
+        BatteryLevel::None => 0.0,
+    };
+    cr.rectangle(top_left.0, top_left.1, fill_width, 16.0);
+    fill_stroke(cr, colors.indicator2, colors.indicator2);
+
+    if level == BatteryLevel::Charging {
+        let glyph_center = (top_left.0 + 17.0, top_left.1 + 8.0);
+        for (index, pair) in art::SYMBOL_CHARGING.chunks_exact(2).enumerate() {
+            let x = glyph_center.0 + pair[0] as f64 * 2.1;
+            let y = glyph_center.1 + pair[1] as f64 * 2.1;
+            if index == 0 {
+                cr.move_to(x, y);
+            } else {
+                cr.line_to(x, y);
+            }
+        }
+        cr.close_path();
+        fill_stroke(cr, colors.charging, colors.slider);
+    }
+
+    cr.set_line_width(1.0);
 }
 
 /// `DrawPolygon` over a slice of the vertex list.
@@ -971,6 +1045,8 @@ fn draw_pro_controller(cr: &cairo::Context, center: (f64, f64), colors: &Colors,
         colors.outline,
     );
     symbol(cr, at(29.0, -56.0), art::HOUSE, 3.9, colors.font2);
+
+    battery(cr, at(-20.0, -160.0), input.battery_values[0], colors);
 }
 
 /// Trace a rounded rectangle whose *top-left* corner is `(x, y)`.
@@ -1330,6 +1406,8 @@ fn draw_gc_controller(cr: &cairo::Context, center: (f64, f64), colors: &Colors, 
         colors.button_color(input.pressed(NB::Plus)),
         colors.outline,
     );
+
+    battery(cr, at(-20.0, 110.0), input.battery_values[0], colors);
 }
 
 /// Upstream `DrawGCBody`.
@@ -1602,7 +1680,7 @@ fn draw_left_controller(cr: &cairo::Context, center: (f64, f64), colors: &Colors
         );
     }
 
-    draw_left_body(cr, center, colors);
+    draw_left_body(cr, center, colors, input);
 
     // Left trigger top view, drawn over the body.
     polygon(cr, center, art::LEFT_JOYSTICK_L_TOPVIEW, false);
@@ -1697,6 +1775,8 @@ fn draw_left_controller(cr: &cairo::Context, center: (f64, f64), colors: &Colors
         colors.outline,
     );
     circle_button(cr, at(26.0, 71.0), 5.0, colors.font2, colors.font2);
+
+    battery(cr, at(-160.0, -140.0), input.battery_values[0], colors);
 }
 
 /// Upstream `DrawRightController`.
@@ -1813,7 +1893,7 @@ fn draw_right_controller(cr: &cairo::Context, center: (f64, f64), colors: &Color
         );
     }
 
-    draw_right_body(cr, center, colors);
+    draw_right_body(cr, center, colors, input);
 
     // Right trigger top view.
     polygon(cr, center, art::LEFT_JOYSTICK_L_TOPVIEW, true);
@@ -1908,6 +1988,8 @@ fn draw_right_controller(cr: &cairo::Context, center: (f64, f64), colors: &Color
         colors.outline,
     );
     symbol(cr, home, art::HOUSE, 5.0, colors.font2);
+
+    battery(cr, at(120.0, -140.0), input.battery_values[1], colors);
 }
 
 /// Upstream `DrawLeftTriggers` / `DrawRightTriggers`: the shoulder seen from
@@ -1976,13 +2058,13 @@ fn draw_left_z_triggers(
 }
 
 /// Upstream `DrawLeftBody`.
-fn draw_left_body(cr: &cairo::Context, center: (f64, f64), colors: &Colors) {
-    draw_joycon_body(cr, center, colors, false);
+fn draw_left_body(cr: &cairo::Context, center: (f64, f64), colors: &Colors, input: &Input) {
+    draw_joycon_body(cr, center, colors, input, false);
 }
 
 /// Upstream `DrawRightBody` — the same shapes with every x negated.
-fn draw_right_body(cr: &cairo::Context, center: (f64, f64), colors: &Colors) {
-    draw_joycon_body(cr, center, colors, true);
+fn draw_right_body(cr: &cairo::Context, center: (f64, f64), colors: &Colors, input: &Input) {
+    draw_joycon_body(cr, center, colors, input, true);
 }
 
 /// The shared body drawing.
@@ -1990,7 +2072,13 @@ fn draw_right_body(cr: &cairo::Context, center: (f64, f64), colors: &Colors) {
 /// `DrawLeftBody` and `DrawRightBody` really are line-for-line mirrors of one
 /// another upstream — same vertex arrays, same constants, every x negated — so
 /// unlike the controller functions above they collapse without losing anything.
-fn draw_joycon_body(cr: &cairo::Context, center: (f64, f64), colors: &Colors, mirror: bool) {
+fn draw_joycon_body(
+    cr: &cairo::Context,
+    center: (f64, f64),
+    colors: &Colors,
+    input: &Input,
+    mirror: bool,
+) {
     let flip = if mirror { -1.0 } else { 1.0 };
     let at = |dx: f64, dy: f64| (center.0 + flip * dx, center.1 + dy);
 
@@ -2121,12 +2209,17 @@ fn draw_joycon_body(cr: &cairo::Context, center: (f64, f64), colors: &Colors, mi
     // all-off until a controller is connected to the emulated console.
     const LED_SIZE: f64 = 5.0;
     for index in 0..4 {
+        let fill = if input.led_pattern & (1 << index) != 0 {
+            colors.led_on
+        } else {
+            colors.led_off
+        };
         rectangle(
             cr,
             rail(0.0, -36.0 + 12.0 * index as f64),
             LED_SIZE,
             LED_SIZE,
-            colors.led_off,
+            fill,
             colors.outline,
         );
     }
@@ -2371,6 +2464,9 @@ fn draw_dual_controller(cr: &cairo::Context, center: (f64, f64), colors: &Colors
     );
     motion_cube(cr, at(-180.0, 90.0), (0.0, 0.0, 0.0), 20.0, colors.outline);
     motion_cube(cr, at(180.0, 90.0), (0.0, 0.0, 0.0), 20.0, colors.outline);
+
+    battery(cr, at(-200.0, -10.0), input.battery_values[0], colors);
+    battery(cr, at(160.0, -10.0), input.battery_values[1], colors);
 }
 
 /// Upstream `DrawDualTriggers`: the two shoulders at `size = 1.62`,
@@ -2706,6 +2802,9 @@ fn draw_handheld_controller(
         colors.outline,
     );
     symbol(cr, home, art::HOUSE, 2.75, colors.font2);
+
+    battery(cr, at(-188.0, 95.0), input.battery_values[0], colors);
+    battery(cr, at(150.0, 95.0), input.battery_values[1], colors);
 }
 
 /// Upstream `DrawHandheldBody`.
@@ -2850,6 +2949,15 @@ mod tests {
         surface
     }
 
+    fn pixel_at(surface: &mut cairo::ImageSurface, offset: (f64, f64)) -> [u8; 3] {
+        let stride = surface.stride() as usize;
+        let x = (PREVIEW_WIDTH as f64 / 2.0 + offset.0).round() as usize;
+        let y = (PREVIEW_HEIGHT as f64 / 2.0 + offset.1).round() as usize;
+        let data = surface.data().unwrap();
+        let index = y * stride + x * 4;
+        [data[index], data[index + 1], data[index + 2]]
+    }
+
     /// A pressed button fills with `highlight`, upstream's dark red. Before the
     /// live values were wired up every button drew in its released colour no
     /// matter what the pad was doing.
@@ -2920,6 +3028,65 @@ mod tests {
             moved.data().unwrap().to_vec(),
             "pushing a stick should change the drawing"
         );
+    }
+
+    #[test]
+    fn charging_battery_uses_edens_level_and_symbol_colours() {
+        let mut input = Input::released();
+        input.battery_values[0] = BatteryLevel::Charging;
+        let mut surface = render_with(ControllerType::ProController, &input);
+
+        let charging = Colors::light().charging;
+        let expected = [
+            (charging.2 * 255.0).round() as u8,
+            (charging.1 * 255.0).round() as u8,
+            (charging.0 * 255.0).round() as u8,
+        ];
+        let data = surface.data().unwrap();
+        let pixels = data
+            .chunks_exact(4)
+            .filter(|pixel| pixel[..3] == expected)
+            .count();
+        assert!(pixels > 10, "charging glyph painted only {pixels} pixels");
+    }
+
+    #[test]
+    fn joycon_player_leds_follow_the_four_pattern_bits() {
+        let mut input = Input::released();
+        input.led_pattern = 0b0101;
+        let mut surface = render_with(ControllerType::LeftJoycon, &input);
+
+        let on = Colors::light().led_on;
+        let off = Colors::light().led_off;
+        let on_pixel = [
+            (on.2 * 255.0).round() as u8,
+            (on.1 * 255.0).round() as u8,
+            (on.0 * 255.0).round() as u8,
+        ];
+        let off_pixel = [
+            (off.2 * 255.0).round() as u8,
+            (off.1 * 255.0).round() as u8,
+            (off.0 * 255.0).round() as u8,
+        ];
+
+        assert_eq!(pixel_at(&mut surface, (155.0, -36.0)), on_pixel);
+        assert_eq!(pixel_at(&mut surface, (155.0, -24.0)), off_pixel);
+        assert_eq!(pixel_at(&mut surface, (155.0, -12.0)), on_pixel);
+        assert_eq!(pixel_at(&mut surface, (155.0, 0.0)), off_pixel);
+    }
+
+    #[test]
+    fn led_snapshot_uses_the_configuration_connection_state() {
+        use hid_core::hid_types::{NpadIdType, NpadStyleIndex};
+
+        let mut controller = EmulatedController::new(NpadIdType::Player1);
+        controller.set_npad_style_index(NpadStyleIndex::Fullkey);
+        controller.enable_configuration();
+        controller.connect(true);
+        assert_eq!(Input::from_controller(&controller).led_pattern, 0b0001);
+
+        controller.disconnect();
+        assert_eq!(Input::from_controller(&controller).led_pattern, 0);
     }
 
     /// Write each drawing to `$RUZU_PREVIEW_DUMP` for visual inspection.

@@ -4544,3 +4544,12 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 - `GtkEmuWindow` is retained by `RenderHandles` for the full session. GTK map/unmap signals update
   its shared visibility flag, and platform resize paths call its framebuffer-layout method; this is
   the GTK ownership counterpart of Eden's persistent `GRenderWindow`.
+
+## 2026-08-22 — controller preview live status vs Eden PlayerControlPreview
+
+### Intentional differences
+
+- Eden updates `led_pattern` and `battery_values` from controller callbacks; the GTK preview takes
+  the same controller-owned snapshot during its existing 16 ms refresh and redraws only when the
+  snapshot changes. Connection loss still clears all four LED bits, while both raw battery values
+  and all of Eden's per-controller drawing positions are preserved.
