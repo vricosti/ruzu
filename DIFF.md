@@ -4701,3 +4701,18 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
   context/device owners, scan/input threads, and `InputSubsystem::Impl` registration. That
   prerequisite is recorded in `PORTING_STATE.md`; the unfinished adapter is no longer compiled as
   if it were a functional default driver.
+
+## 2026-08-22 — `src/input_common/src/drivers/joycon.rs` and `helpers/joycon_*` vs Eden's Joy-Con driver
+
+### Intentional differences
+
+- The always-registered Rust `joycon` engine currently retains parameter parsing, automapping,
+  and UI naming so existing controller configurations remain readable. The unconsumed hardware
+  stack is compiled only with the `joycon-hid` feature until its SDL3 HID owner is ported.
+
+### Missing items
+
+- Eden's controller arrays, HID enumeration, device registration, report input thread, protocol
+  callbacks, and hardware output methods remain absent. Private no-op `Setup`, `ScanThread`, name,
+  and result-translation bodies were removed because no state or caller could reach them; the
+  exact prerequisite and resume condition are recorded in `PORTING_STATE.md`.

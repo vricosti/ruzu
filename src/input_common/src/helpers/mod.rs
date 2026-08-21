@@ -6,6 +6,7 @@
 //! Contains helper modules for input processing, including Joy-Con protocol,
 //! stick-from-buttons, touch-from-buttons, and UDP protocol.
 
+#[cfg(feature = "joycon-hid")]
 pub mod joycon_driver;
 pub mod joycon_protocol;
 pub mod stick_from_buttons;

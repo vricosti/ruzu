@@ -10,22 +10,16 @@ use std::sync::Arc;
 use parking_lot::Mutex;
 
 use common::input::{
-    BatteryLevel, BodyColorStatus, ButtonNames, CameraFormat, CameraStatus, DriverResult,
-    LedStatus, MifareRequest, NfcState, NfcStatus, PollingMode, VibrationStatus,
+    ButtonNames, CameraFormat, DriverResult, LedStatus, MifareRequest, NfcState, PollingMode,
+    VibrationStatus,
 };
 use common::param_package::ParamPackage;
 use common::settings_input::{native_analog, native_button, native_motion};
 use common::uuid::UUID;
 
-use crate::helpers::joycon_protocol::joycon_types::{
-    self, Color, ControllerType, IrsMode, IrsResolution, MifareCmd, MifareReadChunk,
-    MifareReadData, MifareWriteChunk, PadAxes, PadButton, SerialNumber, VibrationValue,
-};
+use crate::helpers::joycon_protocol::joycon_types::{ControllerType, PadAxes, PadButton};
 use crate::input_engine::{InputEngine, PadIdentifier};
 use crate::main_common::{AnalogMapping, ButtonMapping, MotionMapping};
-
-/// Maximum number of supported controllers.
-const MAX_SUPPORTED_CONTROLLERS: usize = 8;
 
 /// Port of `Joycons` class from joycon.h / joycon.cpp
 pub struct Joycons {
@@ -72,7 +66,7 @@ impl Joycons {
     pub fn set_leds(
         &mut self,
         _identifier: &PadIdentifier,
-        led_status: &LedStatus,
+        _led_status: &LedStatus,
     ) -> DriverResult {
         // In C++: converts led_status to a bitmask and calls handle->SetLedConfig()
         DriverResult::InvalidHandle
@@ -332,17 +326,6 @@ impl Joycons {
         // In C++: stops scan_thread and all JoyconDriver instances, calls SDL_hid_exit().
     }
 
-    /// Port of Joycons::Setup
-    fn setup(&mut self) {
-        // In C++: initializes pad identifiers, creates JoyconDriver instances,
-        // starts scan_thread.
-    }
-
-    /// Port of Joycons::ScanThread
-    fn scan_thread(&mut self) {
-        // In C++: periodically enumerates HID devices from Nintendo (VID 0x057e).
-    }
-
     /// Port of Joycons::GetIdentifier
     fn get_identifier(&self, port: usize, controller_type: ControllerType) -> PadIdentifier {
         let mut guid = [0u8; 16];
@@ -363,17 +346,6 @@ impl Joycons {
         params.set_int("port", identifier.port as i32);
         params.set_int("pad", identifier.pad as i32);
         params
-    }
-
-    /// Port of Joycons::JoyconName (by ControllerType)
-    fn joycon_name(&self, controller_type: ControllerType) -> &'static str {
-        match controller_type {
-            ControllerType::Left => "Left Joycon",
-            ControllerType::Right => "Right Joycon",
-            ControllerType::Pro => "Pro Controller",
-            ControllerType::Dual => "Dual Joycon",
-            _ => "Unknown Switch Controller",
-        }
     }
 
     /// Port of Joycons::GetUIButtonName
@@ -408,15 +380,6 @@ impl Joycons {
         }
     }
 
-    /// Port of Joycons::TranslateDriverResult
-    fn translate_driver_result(&self, result: DriverResult) -> NfcState {
-        match result {
-            DriverResult::Success => NfcState::Success,
-            DriverResult::Disabled => NfcState::WrongDeviceState,
-            DriverResult::NotSupported => NfcState::NotSupported,
-            _ => NfcState::Unknown,
-        }
-    }
 }
 
 impl Drop for Joycons {

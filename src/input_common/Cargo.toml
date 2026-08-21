@@ -9,6 +9,9 @@ default = []
 # InputSubsystem registration must be ported before this can be enabled by a
 # frontend build.
 libusb = []
+# The SDL3 HID owner and protocol wiring are not ported yet. The mapping-only
+# `joycon` engine remains available without this feature for config parity.
+joycon-hid = []
 
 [dependencies]
 common.workspace = true

@@ -8,8 +8,6 @@
 //! https://github.com/CTCaer/jc_toolkit
 //! https://github.com/dekuNukem/Nintendo_Switch_Reverse_Engineering
 
-use std::fmt;
-
 pub const MAX_ERROR_COUNT: u32 = 50;
 pub const MAX_BUFFER_SIZE: u32 = 368;
 pub const DEFAULT_VIBRATION_BUFFER: [u8; 8] = [0x0, 0x1, 0x40, 0x40, 0x0, 0x1, 0x40, 0x40];

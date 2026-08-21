@@ -1,5 +1,20 @@
 # Porting State
 
+## 2026-08-22 — Joy-Con HID warning slice
+
+- Status: interrupted pending the SDL3 HID owner prerequisite.
+- Interrupted slice: restore Eden's live `JoyconDriver` arrays, scan thread, output methods, and
+  protocol callbacks instead of retaining private no-op methods solely to resemble the header.
+- Exact missing prerequisite: Ruzu has no `JoyconHandle` owner around `SDL_hid_device`, and its
+  `CommonProtocol` explicitly has no HID handle. Consequently `JoyconDriver` cannot request device
+  access, read reports, write subcommands, or construct the protocol objects used by Eden.
+- Required prerequisite work: port `JoyconHandle` in `joycon_types.rs`, wire it into
+  `CommonProtocol` and every protocol owner, then port `JoyconDriver::RequestDeviceAccess` and its
+  stoppable input thread before resuming `Joycons::{Setup,ScanThread}` and the controller arrays.
+- Resume condition: `input_common/joycon-hid` can be enabled with SDL3 HID enumeration and report
+  I/O working, after which the mapping-only compatibility engine can regain Eden's hardware state
+  and output behavior without placeholder methods.
+
 ## 2026-08-22 — GameCube Adapter warning slice
 
 - Status: interrupted pending the USB transport prerequisite.

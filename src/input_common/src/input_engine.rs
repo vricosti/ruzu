@@ -13,7 +13,7 @@ use parking_lot::Mutex;
 
 use common::input::{
     BatteryLevel, BodyColorStatus, ButtonNames, CameraFormat, CameraStatus, DriverResult,
-    InputDevice, LedStatus, MifareRequest, NfcState, NfcStatus, PollingMode, VibrationStatus,
+    LedStatus, MifareRequest, NfcState, NfcStatus, PollingMode, VibrationStatus,
 };
 use common::param_package::ParamPackage;
 use common::uuid::UUID;
