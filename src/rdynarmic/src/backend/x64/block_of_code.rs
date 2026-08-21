@@ -785,6 +785,11 @@ impl BlockOfCode {
     }
 }
 
+// Windows still emits and registers its unwind table from `prelude_complete`
+// because the table occupies code-buffer space. The per-emitter
+// `ExceptionHandler` normally removes it first; retain this Windows-only guard
+// for standalone BlockOfCode owners that never construct an emitter.
+#[cfg(all(target_os = "windows", target_arch = "x86_64"))]
 impl Drop for BlockOfCode {
     fn drop(&mut self) {
         crate::backend::x64::exception_handler::unregister_code_block(self.asm.top());

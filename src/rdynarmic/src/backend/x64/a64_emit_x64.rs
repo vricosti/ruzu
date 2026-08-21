@@ -11,7 +11,7 @@ use crate::backend::x64::block_of_code::{
 use crate::backend::x64::emit::emit_block;
 use crate::backend::x64::emit_context::{ArchConfig, DeferredEmitCtx, EmitConfig, EmitContext};
 use crate::backend::x64::exception_handler::{
-    register_code_block, supports_fastmem, DoNotFastmemMarker, FastmemPatchTable,
+    DoNotFastmemMarker, ExceptionHandler, FastmemPatchTable,
 };
 use crate::backend::x64::host_feature::HostFeature;
 use crate::backend::x64::hostloc::{HostLoc, ANY_GPR, ANY_XMM, HOST_R13, HOST_R14};
@@ -69,6 +69,9 @@ fn fast_dispatch_hash(location_descriptor: u64, table_ptr: u64, has_sse42: bool)
 ///
 /// Owns the `BlockOfCode` (code buffer + dispatcher) and `BlockCache`.
 pub struct A64EmitX64 {
+    /// Owns the platform exception registration and removes it before the code
+    /// buffer and callback state are dropped, matching upstream `EmitX64`.
+    exception_handler: ExceptionHandler,
     pub code: BlockOfCode,
     pub cache: BlockCache,
     pub dispatcher_labels: DispatcherLabels,
@@ -141,9 +144,13 @@ impl A64EmitX64 {
             .gen_run_code(&run_callbacks)
             .map_err(|e| format!("Failed to generate dispatcher: {:?}", e))?;
 
-        let fastmem_enabled = run_callbacks.fastmem_pointer.is_some() && supports_fastmem();
+        let mut exception_handler = ExceptionHandler::new();
+        exception_handler.register(code.code_base_ptr(), code.total_size());
+        let fastmem_enabled =
+            run_callbacks.fastmem_pointer.is_some() && exception_handler.supports_fastmem();
 
         let mut emitter = Self {
+            exception_handler,
             code,
             cache: BlockCache::new(),
             dispatcher_labels,
@@ -174,27 +181,20 @@ impl A64EmitX64 {
             emitter.emit_config.raw_exclusive_write_callbacks.as_ref(),
         );
 
-        // Register the JIT code region with the SIGSEGV handler so
-        // fastmem faults can be redirected to the stubs we just
-        // generated. The closure captures the patches table address as
-        // a `usize` to satisfy `Send`; safety: the emitter outlives
-        // the signal-handler registration (it's owned by the JIT
-        // instance which is dropped on JIT shutdown).
-        if emitter.fastmem_enabled {
-            let code_begin = emitter.code.code_base_ptr();
-            let code_size = emitter.code.total_size();
-            let code_end = unsafe { code_begin.add(code_size) };
+        // Publish the fastmem callback whenever a fastmem pointer was supplied,
+        // matching upstream even when handler installation disabled fastmem.
+        // The closure captures the patches table address as a `usize` to
+        // satisfy `Send`; the owning ExceptionHandler is dropped first.
+        if emitter.run_callbacks.fastmem_pointer.is_some() {
             // Take the heap address of the boxed patch table — stable
             // even if `emitter` itself moves on return from `new()`.
             let patches_addr = &*emitter.fastmem_patches as *const FastmemPatchTable as usize;
-            register_code_block(
-                code_begin,
-                code_end,
-                Box::new(move |rip| {
+            emitter
+                .exception_handler
+                .set_fastmem_callback(Box::new(move |rip| {
                     let patches = unsafe { &*(patches_addr as *const FastmemPatchTable) };
                     patches.lookup_and_record_recompile(rip)
-                }),
-            );
+                }));
         }
 
         Ok(emitter)

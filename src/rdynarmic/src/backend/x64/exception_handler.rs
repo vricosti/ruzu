@@ -66,71 +66,224 @@ pub struct FakeCall {
 }
 
 /// Callback type: given faulting RIP, returns FakeCall or None.
-type FastmemCallback = Box<dyn Fn(u64) -> Option<FakeCall> + Send>;
+type FastmemCallback = Box<dyn Fn(u64) -> Option<FakeCall> + Send + Sync>;
 
-/// Whether this x64 backend has a working host exception path for fastmem.
+/// Per-emitter exception-handler registration.
 ///
-/// Mirrors upstream `ExceptionHandler::SupportsFastmem()`. Linux/x86-64 and
-/// Windows/x86-64 have native handlers below; every other target uses the
-/// callback/page-table paths instead of emitting faulting direct accesses.
-pub const fn supports_fastmem() -> bool {
-    cfg!(any(
-        all(target_os = "linux", target_arch = "x86_64"),
-        all(target_os = "windows", target_arch = "x86_64")
-    ))
+/// Mirrors upstream `Dynarmic::Backend::ExceptionHandler`: `register` creates
+/// the platform implementation, `set_fastmem_callback` publishes the code
+/// range, and dropping the owner removes that range before its JIT storage is
+/// released.
+pub struct ExceptionHandler {
+    code_range: Option<(u64, u64)>,
+}
+
+impl ExceptionHandler {
+    pub const fn new() -> Self {
+        Self { code_range: None }
+    }
+
+    pub fn register(&mut self, code_begin: *const u8, code_size: usize) {
+        self.unregister();
+
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        register_handler();
+
+        self.code_range = Some((code_begin as u64, code_size as u64));
+    }
+
+    pub fn supports_fastmem(&self) -> bool {
+        self.code_range.is_some() && platform_supports_fastmem()
+    }
+
+    pub fn set_fastmem_callback(&self, callback: FastmemCallback) {
+        let Some((code_begin, code_size)) = self.code_range else {
+            return;
+        };
+        set_code_block_callback(code_begin, code_size, callback);
+    }
+
+    fn unregister(&mut self) {
+        let Some((code_begin, _)) = self.code_range.take() else {
+            return;
+        };
+        unregister_code_block(code_begin as *const u8);
+    }
+}
+
+impl Default for ExceptionHandler {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Drop for ExceptionHandler {
+    fn drop(&mut self) {
+        self.unregister();
+    }
+}
+
+/// Whether the process-global platform handler was installed successfully.
+///
+/// Low-level emit helpers use this after their owning `ExceptionHandler` has
+/// registered. Per-emitter decisions should use
+/// `ExceptionHandler::supports_fastmem`, matching Eden's ownership.
+pub fn supports_fastmem() -> bool {
+    platform_supports_fastmem()
 }
 
 // ── Linux-only: SIGSEGV-based fastmem handler ─────────────────────────────────
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-use std::sync::Mutex;
+use std::sync::RwLock;
 
 /// Code block range with its associated fastmem callback.
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 struct CodeBlockInfo {
-    code_begin: u64,
-    code_end: u64,
+    size: u64,
     callback: FastmemCallback,
 }
 
-/// Global signal handler state.
-/// There's only one SIGSEGV handler per process, so this must be global.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+struct MappedSignalStack {
+    memory: *mut libc::c_void,
+    size: usize,
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+unsafe impl Send for MappedSignalStack {}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+impl MappedSignalStack {
+    fn new() -> Option<Self> {
+        let size = usize::max(libc::SIGSTKSZ, 2 * 1024 * 1024);
+        let memory = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                size,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        (memory != libc::MAP_FAILED).then_some(Self { memory, size })
+    }
+
+    fn activate(&self) -> bool {
+        let signal_stack = libc::stack_t {
+            ss_sp: self.memory,
+            ss_flags: 0,
+            ss_size: self.size,
+        };
+        unsafe { libc::sigaltstack(&signal_stack, std::ptr::null_mut()) == 0 }
+    }
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+impl Drop for MappedSignalStack {
+    fn drop(&mut self) {
+        unsafe {
+            libc::munmap(self.memory, self.size);
+        }
+    }
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+struct ThreadSignalStack(MappedSignalStack);
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+impl Drop for ThreadSignalStack {
+    fn drop(&mut self) {
+        unsafe {
+            let mut current: libc::stack_t = std::mem::zeroed();
+            if libc::sigaltstack(std::ptr::null(), &mut current) == 0
+                && current.ss_sp == self.0.memory
+                && current.ss_flags & libc::SS_DISABLE == 0
+            {
+                let disabled = libc::stack_t {
+                    ss_sp: std::ptr::null_mut(),
+                    ss_flags: libc::SS_DISABLE,
+                    ss_size: 0,
+                };
+                libc::sigaltstack(&disabled, std::ptr::null_mut());
+            }
+        }
+    }
+}
+
+/// Global signal handler state. There is one process-wide signal disposition,
+/// while the code-block registry uses reader/writer locking like Eden's
+/// `std::shared_mutex`.
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 struct SigHandlerState {
-    code_blocks: Vec<CodeBlockInfo>,
-    old_sa: libc::sigaction,
+    supports_fast_mem: bool,
+    _signal_stack: Option<MappedSignalStack>,
+    code_blocks: HashMap<u64, CodeBlockInfo>,
+    old_sa_segv: libc::sigaction,
 }
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 unsafe impl Send for SigHandlerState {}
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-static SIG_HANDLER: Mutex<Option<SigHandlerState>> = Mutex::new(None);
+unsafe impl Sync for SigHandlerState {}
 
-/// Register a JIT code region with the SIGSEGV handler (Linux) or no-op (macOS).
-///
-/// On Linux: installs SIGSEGV handler on first call, records the code range.
-/// On macOS: fastmem is not supported; this function does nothing.
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-pub fn register_code_block(code_begin: *const u8, code_end: *const u8, callback: FastmemCallback) {
-    let mut guard = SIG_HANDLER.lock().unwrap();
-    let state = guard.get_or_insert_with(|| install_signal_handler());
-    state.code_blocks.push(CodeBlockInfo {
-        code_begin: code_begin as u64,
-        code_end: code_end as u64,
-        callback,
-    });
+static SIG_HANDLER: RwLock<Option<SigHandlerState>> = RwLock::new(None);
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn register_handler() {
+    let mut guard = SIG_HANDLER
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if guard.is_none() {
+        *guard = Some(install_signal_handler());
+    }
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn platform_supports_fastmem() -> bool {
+    SIG_HANDLER
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .as_ref()
+        .is_some_and(|state| state.supports_fast_mem)
+}
+
+#[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+fn platform_supports_fastmem() -> bool {
+    true
 }
 
 #[cfg(not(any(
     all(target_os = "linux", target_arch = "x86_64"),
     all(target_os = "windows", target_arch = "x86_64")
 )))]
-pub fn register_code_block(
-    _code_begin: *const u8,
-    _code_end: *const u8,
-    _callback: FastmemCallback,
-) {
+fn platform_supports_fastmem() -> bool {
+    false
 }
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn set_code_block_callback(code_begin: u64, code_size: u64, callback: FastmemCallback) {
+    let mut guard = SIG_HANDLER
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(state) = guard.as_mut() {
+        state.code_blocks.insert(
+            code_begin,
+            CodeBlockInfo {
+                size: code_size,
+                callback,
+            },
+        );
+    }
+}
+
+#[cfg(not(any(
+    all(target_os = "linux", target_arch = "x86_64"),
+    all(target_os = "windows", target_arch = "x86_64")
+)))]
+fn set_code_block_callback(_code_begin: u64, _code_size: u64, _callback: FastmemCallback) {}
 
 /// Register a per-thread alternate signal stack for the current thread.
 /// Linux only — no-op on macOS.
@@ -143,32 +296,22 @@ pub fn register_thread_signal_stack() {}
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 pub fn register_thread_signal_stack() {
     thread_local! {
-        static ALTSTACK_INSTALLED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        static SIGNAL_STACK: std::cell::RefCell<Option<ThreadSignalStack>> = const {
+            std::cell::RefCell::new(None)
+        };
     }
-    ALTSTACK_INSTALLED.with(|installed| {
-        if installed.get() {
+    SIGNAL_STACK.with(|slot| {
+        if slot.borrow().is_some() {
             return;
         }
-        unsafe {
-            let stack_size = 2 * 1024 * 1024;
-            let stack_ptr = libc::mmap(
-                std::ptr::null_mut(),
-                stack_size,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
-                -1,
-                0,
-            );
-            if stack_ptr != libc::MAP_FAILED {
-                let ss = libc::stack_t {
-                    ss_sp: stack_ptr,
-                    ss_flags: 0,
-                    ss_size: stack_size,
-                };
-                if libc::sigaltstack(&ss, std::ptr::null_mut()) == 0 {
-                    installed.set(true);
-                }
+        if let Some(stack) = MappedSignalStack::new() {
+            if stack.activate() {
+                *slot.borrow_mut() = Some(ThreadSignalStack(stack));
+            } else {
+                eprintln!("dynarmic: POSIX SigHandler: init failure at sigaltstack");
             }
+        } else {
+            eprintln!("dynarmic: POSIX SigHandler: could not allocate signal stack");
         }
     });
 }
@@ -182,47 +325,58 @@ pub fn unregister_code_block(_code_begin: *const u8) {}
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 pub fn unregister_code_block(code_begin: *const u8) {
-    let mut guard = SIG_HANDLER.lock().unwrap();
+    let mut guard = SIG_HANDLER
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     if let Some(state) = guard.as_mut() {
-        state
-            .code_blocks
-            .retain(|b| b.code_begin != code_begin as u64);
+        state.code_blocks.remove(&(code_begin as u64));
     }
 }
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 fn install_signal_handler() -> SigHandlerState {
     unsafe {
-        // Allocate alternate signal stack (2 MB, matching upstream)
-        let stack_size = 2 * 1024 * 1024;
-        let stack_ptr = libc::mmap(
-            std::ptr::null_mut(),
-            stack_size,
-            libc::PROT_READ | libc::PROT_WRITE,
-            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
-            -1,
-            0,
-        );
-        if stack_ptr != libc::MAP_FAILED {
-            let ss = libc::stack_t {
-                ss_sp: stack_ptr,
-                ss_flags: 0,
-                ss_size: stack_size,
+        let signal_stack = MappedSignalStack::new();
+        let mut old_sa_segv: libc::sigaction = std::mem::zeroed();
+        let Some(signal_stack) = signal_stack else {
+            eprintln!("dynarmic: POSIX SigHandler: could not allocate signal stack");
+            return SigHandlerState {
+                supports_fast_mem: false,
+                _signal_stack: None,
+                code_blocks: HashMap::new(),
+                old_sa_segv,
             };
-            libc::sigaltstack(&ss, std::ptr::null_mut());
+        };
+        if !signal_stack.activate() {
+            eprintln!("dynarmic: POSIX SigHandler: init failure at sigaltstack");
+            return SigHandlerState {
+                supports_fast_mem: false,
+                _signal_stack: Some(signal_stack),
+                code_blocks: HashMap::new(),
+                old_sa_segv,
+            };
         }
 
-        let mut old_sa: libc::sigaction = std::mem::zeroed();
         let mut sa: libc::sigaction = std::mem::zeroed();
         sa.sa_sigaction = sig_action as usize;
         sa.sa_flags = libc::SA_SIGINFO | libc::SA_ONSTACK | libc::SA_RESTART;
         libc::sigemptyset(&mut sa.sa_mask);
 
-        libc::sigaction(libc::SIGSEGV, &sa, &mut old_sa);
+        if libc::sigaction(libc::SIGSEGV, &sa, &mut old_sa_segv) != 0 {
+            eprintln!("dynarmic: POSIX SigHandler: could not set SIGSEGV handler");
+            return SigHandlerState {
+                supports_fast_mem: false,
+                _signal_stack: Some(signal_stack),
+                code_blocks: HashMap::new(),
+                old_sa_segv,
+            };
+        }
 
         SigHandlerState {
-            code_blocks: Vec::new(),
-            old_sa,
+            supports_fast_mem: true,
+            _signal_stack: Some(signal_stack),
+            code_blocks: HashMap::new(),
+            old_sa_segv,
         }
     }
 }
@@ -242,10 +396,12 @@ extern "C" fn sig_action(
 
         // Match upstream `SigHandler::SigAction`: dispatch faults in registered JIT code and
         // otherwise chain to the handler that was installed before Dynarmic.
-        let guard = SIG_HANDLER.lock().unwrap();
+        let guard = SIG_HANDLER
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(state) = guard.as_ref() {
-            for block in &state.code_blocks {
-                if rip >= block.code_begin && rip < block.code_end {
+            for (&code_begin, block) in &state.code_blocks {
+                if rip >= code_begin && rip < code_begin.wrapping_add(block.size) {
                     if let Some(fake_call) = (block.callback)(rip) {
                         // "Fake call": push ret_rip, set RIP to call_rip
                         *rsp_ref -= 8;
@@ -256,7 +412,8 @@ extern "C" fn sig_action(
                     }
                 }
             }
-            let old_sa = std::ptr::read(&state.old_sa);
+            eprintln!("Unhandled SIGSEGV at rip {rip:#018x}");
+            let old_sa = std::ptr::read(&state.old_sa_segv);
             drop(guard);
             if old_sa.sa_flags & libc::SA_SIGINFO != 0 {
                 let handler = std::mem::transmute::<
@@ -844,8 +1001,12 @@ mod windows_seh {
 // ── Windows public surface ─────────────────────────────────────────────────────
 
 #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
-pub fn register_code_block(code_begin: *const u8, code_end: *const u8, callback: FastmemCallback) {
-    windows_seh::register_code_block_impl(code_begin, code_end, callback);
+fn set_code_block_callback(code_begin: u64, code_size: u64, callback: FastmemCallback) {
+    windows_seh::register_code_block_impl(
+        code_begin as *const u8,
+        (code_begin + code_size) as *const u8,
+        callback,
+    );
 }
 
 #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
@@ -963,14 +1124,35 @@ mod fastmem_patch_table_tests {
     use super::*;
 
     #[test]
-    fn fastmem_support_matches_the_compiled_exception_handler() {
-        assert_eq!(
-            supports_fastmem(),
-            cfg!(any(
-                all(target_os = "linux", target_arch = "x86_64"),
-                all(target_os = "windows", target_arch = "x86_64")
-            ))
-        );
+    fn fastmem_support_requires_an_owner_and_uses_platform_state() {
+        let mut handler = ExceptionHandler::new();
+        assert!(!handler.supports_fastmem());
+
+        handler.register(0x1000usize as *const u8, 0x1000);
+        assert_eq!(handler.supports_fastmem(), supports_fastmem());
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn dropping_exception_handler_removes_owned_code_block() {
+        let code_begin = 0x7fff_1234_0000usize as *const u8;
+        let mut handler = ExceptionHandler::new();
+        handler.register(code_begin, 0x2000);
+        handler.set_fastmem_callback(Box::new(|_| None));
+
+        assert!(SIG_HANDLER
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .is_some_and(|state| state.code_blocks.contains_key(&(code_begin as u64))));
+
+        drop(handler);
+
+        assert!(SIG_HANDLER
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .is_some_and(|state| !state.code_blocks.contains_key(&(code_begin as u64))));
     }
 
     #[test]

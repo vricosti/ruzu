@@ -2980,32 +2980,93 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 
 ### Intentional differences
 
-- Rust represents code ranges in a process-global registry because its x64 emitters register each
-  generated range directly; Eden owns an `ExceptionHandler::Impl` per registered code block.
 - Rust's `Option<FakeCall>` callback can decline a fault. Eden's callback returns `FakeCall`
   directly for a matched code range.
 - The Windows SEH implementation remains in the same Rust file under `cfg(windows)` because the
   crate currently exposes one x64 exception-handler module rather than Eden's per-platform C++
   translation units.
+- Ruzu additionally installs an owned alternate stack on each Linux CPU thread because POSIX
+  alternate stacks are thread-local. Eden's singleton owns only the stack installed on the thread
+  that constructs it. The Rust thread-local owner disables and unmaps its stack at thread exit.
+- Eden's POSIX source installs `SIGBUS` only when `__APPLE__` is defined. Ruzu's macOS path is the
+  separately documented non-fastmem Mach stub, so Linux correctly installs only `SIGSEGV`.
 
 ### Unintentional differences (to fix)
 
-- Linux `supports_fastmem()` is currently a compile-time platform predicate. Eden installs the
-  handler first and returns false when alternate-stack or signal-handler setup fails.
-- The Rust Linux registry does not yet mirror Eden's per-handler cleanup, mapped signal-stack
-  lifetime, SIGBUS handling on applicable POSIX hosts, or shared-reader/exclusive-writer locking.
-- The unused `installed` field was removed: it was unconditionally true even when `sigaltstack` or
-  `sigaction` failed, so it neither matched Eden's `supports_fast_mem` state nor affected behavior.
+- None identified for the Linux x86-64 handler lifecycle after the 2026-08-21 parity pass.
 
 ### Missing items
 
-- A fallible handler-registration state queried by `supports_fastmem`, with cleanup tied to the
-  registered code-block owner.
+- None for the Linux x86-64 handler lifecycle. macOS fastmem remains disabled as documented at the
+  top of the Rust module and is outside this POSIX/Linux slice.
 
 ### Binary layout verification
 
-- N/A for the removed boolean: `SigHandlerState` is host-only Rust state. Platform context and SEH
+- N/A: `SigHandlerState` is host-only Rust state. Platform context and SEH
   layouts are verified by the existing platform-specific tests in this module.
+
+## 2026-08-21 — `src/rdynarmic/src/backend/x64/a64_emit_x64.rs` vs Eden `src/dynarmic/src/dynarmic/backend/x64/{emit_x64,a64_emit_x64}.{h,cpp}`
+
+### Intentional differences
+
+- Rust has no shared C++ `EmitX64` base object, so the A64 emitter directly owns its
+  `ExceptionHandler`. It is declared before the owned code buffer and callback table so Rust's
+  field drop order removes the registration first.
+
+### Unintentional differences (to fix)
+
+- None identified in exception-handler registration, support probing, callback publication, or
+  destruction ordering.
+
+### Missing items
+
+- None for this exception-handler ownership slice.
+
+### Binary layout verification
+
+- N/A: the new owner contains host pointers/ranges and is not copied to guest memory.
+
+## 2026-08-21 — `src/rdynarmic/src/backend/x64/a32_emit_x64.rs` vs Eden `src/dynarmic/src/dynarmic/backend/x64/{emit_x64,a32_emit_x64}.{h,cpp}`
+
+### Intentional differences
+
+- Rust has no shared C++ `EmitX64` base object, so the A32 emitter directly owns its
+  `ExceptionHandler`. It is declared before the owned code buffer and callback table so cleanup
+  follows Eden's emitter-before-code lifetime.
+
+### Unintentional differences (to fix)
+
+- None identified in exception-handler registration, support probing, callback publication, or
+  destruction ordering.
+
+### Missing items
+
+- None for this exception-handler ownership slice.
+
+### Binary layout verification
+
+- N/A: the new owner contains host pointers/ranges and is not copied to guest memory.
+
+## 2026-08-21 — `src/rdynarmic/src/backend/x64/block_of_code.rs` vs Eden `src/dynarmic/src/dynarmic/backend/x64/block_of_code.{h,cpp}`
+
+### Intentional differences
+
+- On Windows, Ruzu still places and registers SEH unwind metadata during `prelude_complete`; its
+  Windows-only `Drop` remains a fallback for standalone code-buffer tests. Production cleanup is
+  now first performed by the emitter-owned `ExceptionHandler`.
+
+### Unintentional differences (to fix)
+
+- None identified in Linux code-block cleanup: the non-upstream unconditional `BlockOfCode::drop`
+  registration removal has been deleted.
+
+### Missing items
+
+- None for this exception-handler ownership slice.
+
+### Binary layout verification
+
+- N/A on Linux. Existing Windows tests verify the in-buffer unwind layouts.
 
 ## 2026-08-21 — `src/rdynarmic/src/backend/x64/block_of_code.rs` vs Eden `src/dynarmic/src/dynarmic/backend/x64/block_of_code.{h,cpp}`
 

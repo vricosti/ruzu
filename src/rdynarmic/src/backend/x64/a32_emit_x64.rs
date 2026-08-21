@@ -18,7 +18,7 @@ use crate::backend::x64::block_of_code::{
 use crate::backend::x64::emit::emit_block;
 use crate::backend::x64::emit_context::{ArchConfig, DeferredEmitCtx, EmitConfig, EmitContext};
 use crate::backend::x64::exception_handler::{
-    supports_fastmem, DoNotFastmemMarker, FastmemPatchInfo, FastmemPatchTable,
+    DoNotFastmemMarker, ExceptionHandler, FastmemPatchInfo, FastmemPatchTable,
 };
 use crate::backend::x64::host_feature::HostFeature;
 use crate::backend::x64::hostloc::{HostLoc, ANY_GPR, ANY_XMM, HOST_R13, HOST_R14};
@@ -66,6 +66,8 @@ fn fast_dispatch_hash(location_descriptor: u64, table_ptr: u64, has_sse42: bool)
 ///
 /// Same infrastructure as A64EmitX64 but uses A32 frontend for translation.
 pub struct A32EmitX64 {
+    /// Owns the platform exception registration, as upstream `EmitX64` does.
+    exception_handler: ExceptionHandler,
     pub code: BlockOfCode,
     pub cache: BlockCache,
     pub dispatcher_labels: DispatcherLabels,
@@ -130,7 +132,11 @@ impl A32EmitX64 {
             .gen_run_code(&run_callbacks)
             .map_err(|e| format!("Failed to generate dispatcher: {:?}", e))?;
 
+        let mut exception_handler = ExceptionHandler::new();
+        exception_handler.register(code.code_base_ptr(), code.total_size());
+
         let mut emitter = Self {
+            exception_handler,
             code,
             cache: BlockCache::new(),
             dispatcher_labels,
@@ -155,12 +161,9 @@ impl A32EmitX64 {
         );
         emitter.gen_terminal_handlers()?;
 
-        // Register the JIT code region with the SIGSEGV handler for fastmem fallback.
-        if emitter.run_code_callbacks.fastmem_pointer.is_some() && supports_fastmem() {
-            let code_begin = emitter.code.code_base_ptr();
-            let code_size = emitter.code.total_size();
-            let code_end = unsafe { code_begin.add(code_size) };
-
+        // Publish the callback whenever fastmem was configured. Eden does this
+        // independently of whether platform-handler installation succeeded.
+        if emitter.run_code_callbacks.fastmem_pointer.is_some() {
             // The callback closure captures the patches table address as usize
             // to satisfy Send requirements. Safety: the emitter outlives the
             // signal handler registration.
@@ -169,14 +172,12 @@ impl A32EmitX64 {
             // the heap-allocated table itself (`&*emitter.fastmem_patches`),
             // not the address of the Box on the stack.
             let patches_addr = &*emitter.fastmem_patches as *const FastmemPatchTable as usize;
-            crate::backend::x64::exception_handler::register_code_block(
-                code_begin,
-                code_end,
-                Box::new(move |rip| {
+            emitter
+                .exception_handler
+                .set_fastmem_callback(Box::new(move |rip| {
                     let patches = unsafe { &*(patches_addr as *const FastmemPatchTable) };
                     patches.lookup_and_record_recompile(rip)
-                }),
-            );
+                }));
         }
 
         Ok(emitter)
@@ -348,8 +349,8 @@ impl A32EmitX64 {
                 .iter()
                 .any(|inst| inst.opcode == Opcode::A32BXWritePC);
             ctx.end_location = Some(block.end_location());
-            ctx.fastmem_available =
-                self.run_code_callbacks.fastmem_pointer.is_some() && supports_fastmem();
+            ctx.fastmem_available = self.run_code_callbacks.fastmem_pointer.is_some()
+                && self.exception_handler.supports_fastmem();
             ctx.do_not_fastmem = Some(&self.do_not_fastmem);
             ctx.fastmem_fallbacks =
                 Some(&self.fastmem_fallbacks as *const FastmemFallbacksTable as *const ());
