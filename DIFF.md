@@ -2816,3 +2816,41 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 ### Binary layout verification
 
 - N/A: the change contains frontend-only callback and modal state.
+
+## 2026-08-21 — `src/audio_core/src/adsp/apps/audio_renderer/audio_renderer.rs` vs Eden `src/audio_core/adsp/apps/audio_renderer/audio_renderer.{h,cpp}`
+
+### Intentional differences
+
+- Rust stores command buffers, processors, and stream handles in
+  `Arc<parking_lot::Mutex<RendererShared>>`; this preserves Eden's single owning
+  `AudioRenderer` while allowing its host and DSP threads to access the same state safely.
+- Ruzu's mailbox and stream waits accept an atomic stop request, and `Stop` drains the response
+  before resetting the mailbox. This is the Rust counterpart of `std::jthread` stop-token
+  cancellation and prevents teardown from waiting forever after the DSP worker exits.
+- `wait_with_stop`, `wait_with_timeout`, and startup-abort cleanup are Rust lifecycle adapters used
+  by the threaded system manager; Eden expresses those ownership paths through `std::jthread` and
+  blocking mailbox calls.
+- Environment-gated event tracing remains available through `RUZU_TRACE_ADSP_AUDIO`. The removed
+  `RUZU_PROFILE_ADSP` per-step timer had no Eden equivalent and imposed `Instant::now()` calls and
+  an extra stream lock on the real-time render path even though it was only investigation tooling.
+- Ruzu handles the map/unmap protocol messages declared by Eden's `Message` enum inline; Eden's
+  current `Main` still leaves the separate map/unmap worker as a TODO.
+- `CommandListProcessor::process` returns elapsed processing time in both implementations. Ruzu
+  stores that duration directly; Eden's current `Process(index) - start_time` subtracts a global
+  timestamp from that duration and is inconsistent with the method's implementation and contract.
+- Fallible Rust initialization and optional stream handles reject an invalid session safely where
+  Eden relies on initialized raw pointers.
+
+### Unintentional differences (to fix)
+
+- None in the reviewed renderer lifecycle and render-loop slice. The 200 ms shutdown delay and the
+  `SetProcessTimeMax` → `WaitFreeSpace` → `Process` ordering now match Eden.
+
+### Missing items
+
+- None from the upstream `AudioRenderer` public/private method set or message constants.
+
+### Binary layout verification
+
+- N/A: `AudioRenderer` and `RendererShared` are host-side synchronization and ownership objects;
+  guest command-buffer layouts remain owned by `command_buffer.rs`.
