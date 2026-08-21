@@ -1770,6 +1770,7 @@ impl GMainWindow {
         }
         if let Some(mouse) = subsystem.get_mouse_mut() {
             mouse.release_all_buttons();
+            mouse.notify_changed();
         }
         if let Some(touch_screen) = subsystem.get_touch_screen_mut() {
             touch_screen.release_all_touch();
@@ -1843,6 +1844,7 @@ impl GMainWindow {
         mouse.press_mouse_button(button);
         mouse.press_button(position.mouse_x, position.mouse_y, button);
         mouse.press_touch_button(position.touch_x, position.touch_y, button);
+        mouse.notify_changed();
     }
 
     /// Upstream `GRenderWindow::mouseMoveEvent`.
@@ -1863,6 +1865,7 @@ impl GMainWindow {
             position.center_x,
             position.center_y,
         );
+        mouse.notify_changed();
     }
 
     /// Upstream `GRenderWindow::mouseReleaseEvent`.
@@ -1873,6 +1876,7 @@ impl GMainWindow {
         let mut subsystem = self.input_subsystem.borrow_mut();
         if let Some(mouse) = subsystem.get_mouse_mut() {
             mouse.release_button(gdk_button_to_mouse_button(button));
+            mouse.notify_changed();
         }
     }
 
@@ -1890,6 +1894,7 @@ impl GMainWindow {
                 (delta_x * 120.0).round() as i32,
                 (-delta_y * 120.0).round() as i32,
             );
+            mouse.notify_changed();
         }
     }
 

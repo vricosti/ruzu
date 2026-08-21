@@ -4716,3 +4716,13 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
   callbacks, and hardware output methods remain absent. Private no-op `Setup`, `ScanThread`, name,
   and result-translation bodies were removed because no state or caller could reach them; the
   exact prerequisite and resume condition are recorded in `PORTING_STATE.md`.
+
+## 2026-08-22 — `src/input_common/src/drivers/mouse.rs` vs `src/input_common/drivers/mouse.h` and `.cpp`
+
+### Intentional differences
+
+- Rust collects pending input callbacks while holding the shared engine lock and dispatches them
+  after releasing it. Stick decay, motion clamping, sample publication, and mutation ordering
+  otherwise follow Eden's `NotifyChanged` path.
+- Eden's `last_mouse_position` is initialized and assigned but never read. Ruzu omits this dead
+  host-only field while retaining the live origin, stick, motion, wheel, and button state.

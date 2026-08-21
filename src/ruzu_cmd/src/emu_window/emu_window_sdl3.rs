@@ -532,6 +532,7 @@ impl EmuWindowSdl3 {
             } else {
                 mouse.release_button(mouse_button);
             }
+            mouse.notify_changed();
         }
     }
 
@@ -544,6 +545,7 @@ impl EmuWindowSdl3 {
             mouse.move_cursor(x, y, 0, 0);
             mouse.mouse_move(touch.0, touch.1);
             mouse.touch_move(touch.0, touch.1);
+            mouse.notify_changed();
         }
     }
 

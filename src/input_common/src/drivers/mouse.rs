@@ -10,7 +10,7 @@ use common::param_package::ParamPackage;
 use parking_lot::Mutex;
 use std::sync::Arc;
 
-use crate::input_engine::{InputEngine, PadIdentifier};
+use crate::input_engine::{BasicMotion, InputEngine, PadIdentifier};
 use crate::main_common::AnalogMapping;
 
 const UPDATE_TIME: i32 = 10;
@@ -75,7 +75,6 @@ pub enum MouseButton {
 pub struct Mouse {
     engine: Arc<Mutex<InputEngine>>,
     mouse_origin: (i32, i32),
-    last_mouse_position: (i32, i32),
     last_mouse_change: (f32, f32),
     last_motion_change: (f32, f32, f32),
     wheel_position: (i32, i32),
@@ -104,7 +103,6 @@ impl Mouse {
         Self {
             engine,
             mouse_origin: (0, 0),
-            last_mouse_position: (0, 0),
             last_mouse_change: (0.0, 0.0),
             last_motion_change: (0.0, 0.0, 0.0),
             wheel_position: (0, 0),
@@ -215,7 +213,6 @@ impl Mouse {
 
         // Set initial analog parameters
         self.mouse_origin = (x, y);
-        self.last_mouse_position = (x, y);
         self.button_pressed = true;
     }
 
@@ -303,6 +300,13 @@ impl Mouse {
         self.button_pressed = false;
     }
 
+    /// Notifies the engine that accumulated mouse state must be published.
+    /// Port of Mouse::NotifyChanged.
+    pub fn notify_changed(&mut self) {
+        self.update_stick_input();
+        self.update_motion_input();
+    }
+
     /// Port of Mouse::GetInputDevices (override)
     pub fn get_input_devices(&self) -> Vec<ParamPackage> {
         let mut param = ParamPackage::default();
@@ -346,6 +350,82 @@ impl Mouse {
 
     // ---- Private methods ----
 
+    /// Port of Mouse::UpdateStickInput.
+    fn update_stick_input(&mut self) {
+        if !self.is_mouse_panning_enabled() {
+            return;
+        }
+
+        let length =
+            (self.last_mouse_change.0.powi(2) + self.last_mouse_change.1.powi(2)).sqrt();
+        if length > MAXIMUM_STICK_RANGE {
+            self.last_mouse_change.0 =
+                self.last_mouse_change.0 / length * MAXIMUM_STICK_RANGE;
+            self.last_mouse_change.1 =
+                self.last_mouse_change.1 / length * MAXIMUM_STICK_RANGE;
+        }
+
+        let pending = {
+            let mut engine = self.engine.lock();
+            vec![
+                engine.set_axis(&identifier(), MOUSE_AXIS_X, self.last_mouse_change.0),
+                engine.set_axis(&identifier(), MOUSE_AXIS_Y, -self.last_mouse_change.1),
+            ]
+        };
+        for callbacks in pending {
+            callbacks.dispatch();
+        }
+
+        let settings = common::settings::values();
+        let clamped_length = length.min(1.0);
+        let decay_strength = *settings.mouse_panning_decay_strength.get_value() as f32;
+        let decay = 1.0 - clamped_length * clamped_length * decay_strength * 0.01;
+        let min_decay = *settings.mouse_panning_min_decay.get_value() as f32;
+        let clamped_decay = (1.0 - min_decay / 100.0).min(decay);
+        self.last_mouse_change.0 *= clamped_decay;
+        self.last_mouse_change.1 *= clamped_decay;
+    }
+
+    /// Port of Mouse::UpdateMotionInput.
+    fn update_motion_input(&mut self) {
+        let panning_enabled = self.is_mouse_panning_enabled();
+        let sensitivity = if panning_enabled {
+            DEFAULT_MOTION_PANNING_SENSITIVITY
+        } else {
+            DEFAULT_MOTION_SENSITIVITY
+        };
+
+        let rotation_velocity =
+            (self.last_motion_change.0.powi(2) + self.last_motion_change.1.powi(2)).sqrt();
+        if rotation_velocity > MAXIMUM_ROTATION_SPEED / sensitivity {
+            let multiplier = MAXIMUM_ROTATION_SPEED / rotation_velocity / sensitivity;
+            self.last_motion_change.0 *= multiplier;
+            self.last_motion_change.1 *= multiplier;
+        }
+
+        let motion_data = BasicMotion {
+            gyro_x: self.last_motion_change.0 * sensitivity,
+            gyro_y: self.last_motion_change.1 * sensitivity,
+            gyro_z: self.last_motion_change.2 * sensitivity,
+            accel_x: 0.0,
+            accel_y: 0.0,
+            accel_z: 0.0,
+            delta_timestamp: UPDATE_TIME as u64 * 1000,
+        };
+
+        if panning_enabled {
+            self.last_motion_change.0 = 0.0;
+            self.last_motion_change.1 = 0.0;
+        }
+        self.last_motion_change.2 = 0.0;
+
+        let pending = self
+            .engine
+            .lock()
+            .set_motion(&motion_identifier(), 0, &motion_data);
+        pending.dispatch();
+    }
+
     /// Port of Mouse::IsMousePanningEnabled
     fn is_mouse_panning_enabled(&self) -> bool {
         let settings = common::settings::values();
@@ -366,5 +446,37 @@ impl Mouse {
             6 => ButtonNames::ButtonExtra,
             _ => ButtonNames::Undefined,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn notify_changed_publishes_upstream_motion_sample() {
+        let mut mouse = Mouse::new("mouse-test".to_string());
+        mouse.last_motion_change = (1.0, -2.0, 3.0);
+        let panning_enabled = mouse.is_mouse_panning_enabled();
+        let sensitivity = if panning_enabled {
+            DEFAULT_MOTION_PANNING_SENSITIVITY
+        } else {
+            DEFAULT_MOTION_SENSITIVITY
+        };
+
+        mouse.notify_changed();
+
+        let motion = mouse.engine.lock().get_motion(&motion_identifier(), 0);
+        let rotation_velocity = 5.0_f32.sqrt();
+        let multiplier = if rotation_velocity > MAXIMUM_ROTATION_SPEED / sensitivity {
+            MAXIMUM_ROTATION_SPEED / rotation_velocity / sensitivity
+        } else {
+            1.0
+        };
+        assert!((motion.gyro_x - multiplier * sensitivity).abs() < f32::EPSILON * 8.0);
+        assert!((motion.gyro_y + 2.0 * multiplier * sensitivity).abs() < f32::EPSILON * 8.0);
+        assert!((motion.gyro_z - 3.0 * sensitivity).abs() < f32::EPSILON * 8.0);
+        assert_eq!(motion.delta_timestamp, UPDATE_TIME as u64 * 1000);
+        assert_eq!(mouse.last_motion_change.2, 0.0);
     }
 }
