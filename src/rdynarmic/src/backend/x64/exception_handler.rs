@@ -98,7 +98,6 @@ struct CodeBlockInfo {
 struct SigHandlerState {
     code_blocks: Vec<CodeBlockInfo>,
     old_sa: libc::sigaction,
-    installed: bool,
 }
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
@@ -224,7 +223,6 @@ fn install_signal_handler() -> SigHandlerState {
         SigHandlerState {
             code_blocks: Vec::new(),
             old_sa,
-            installed: true,
         }
     }
 }

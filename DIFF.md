@@ -2975,3 +2975,34 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 
 - N/A: the removed cache-line-aligned tuple was host-only temporary storage passed to inline
   assembly and was never serialized.
+
+## 2026-08-21 — `src/rdynarmic/src/backend/x64/exception_handler.rs` vs Eden `src/dynarmic/src/dynarmic/backend/exception_handler.{h,posix.cpp}`
+
+### Intentional differences
+
+- Rust represents code ranges in a process-global registry because its x64 emitters register each
+  generated range directly; Eden owns an `ExceptionHandler::Impl` per registered code block.
+- Rust's `Option<FakeCall>` callback can decline a fault. Eden's callback returns `FakeCall`
+  directly for a matched code range.
+- The Windows SEH implementation remains in the same Rust file under `cfg(windows)` because the
+  crate currently exposes one x64 exception-handler module rather than Eden's per-platform C++
+  translation units.
+
+### Unintentional differences (to fix)
+
+- Linux `supports_fastmem()` is currently a compile-time platform predicate. Eden installs the
+  handler first and returns false when alternate-stack or signal-handler setup fails.
+- The Rust Linux registry does not yet mirror Eden's per-handler cleanup, mapped signal-stack
+  lifetime, SIGBUS handling on applicable POSIX hosts, or shared-reader/exclusive-writer locking.
+- The unused `installed` field was removed: it was unconditionally true even when `sigaltstack` or
+  `sigaction` failed, so it neither matched Eden's `supports_fast_mem` state nor affected behavior.
+
+### Missing items
+
+- A fallible handler-registration state queried by `supports_fastmem`, with cleanup tied to the
+  registered code-block owner.
+
+### Binary layout verification
+
+- N/A for the removed boolean: `SigHandlerState` is host-only Rust state. Platform context and SEH
+  layouts are verified by the existing platform-specific tests in this module.
