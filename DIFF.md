@@ -2576,3 +2576,32 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 
 - N/A: `AnalogStatus` is host-side callback state. Tests cover the non-clamped range, deadzone,
   copied properties, and Eden's deliberately preserved inversion ordering.
+
+## 2026-08-21 — `src/hid_core/src/frontend/emulated_devices.rs` vs Eden `src/hid_core/frontend/emulated_devices.{h,cpp}`
+
+### Intentional differences
+
+- Device callbacks capture `Arc<Mutex<DeviceStatus>>`, the atomic configuration flag, and the
+  callback map rather than Eden's raw `this` pointer. State, callback, and method ownership remain
+  in `EmulatedDevices`.
+- Ruzu's input factory returns a null-object `InputDevice` when a backend is unavailable, so every
+  array slot contains `Some(device)` after reload instead of requiring Eden's pointer-null checks.
+- The private `assign_bit` helper mechanically represents Eden's `BitField::Assign` operations for
+  keyboard modifiers and mouse buttons.
+
+### Unintentional differences (to fix)
+
+- None. Reload/unload now owns all mouse buttons, position, wheel axes, keyboard keys, and keyboard
+  modifiers with Eden's exact parameter packages and callback order.
+- Button toggle/lock transitions, configuration-mode suppression, modifier bit mapping, mouse
+  projection, raw-value getters, notifications, and callback-key lifecycle now match upstream.
+
+### Missing items
+
+- None in the reviewed `EmulatedDevices` file.
+
+### Binary layout verification
+
+- PASS: the existing compile-time assertions retain `KeyboardKey` at `0x20`,
+  `KeyboardModifier`/`MouseButton` at `0x4`, and `AnalogStickState` at `0x8`; focused tests verify
+  the corresponding bit and numeric projections.
