@@ -529,3 +529,18 @@
   reaching this slice because its A32 fastmem configuration has no fallback table. Several fuzz
   tests also continued past 60 seconds, so the run was stopped after recording the independent
   failure rather than left blocking indefinitely.
+
+## 2026-08-21 — rdynarmic vector-basic slice interrupted by AVX immediate-shift prerequisite
+
+- Interrupted slice: Eden parity for `VectorCountLeadingZeros8/16/32`,
+  `VectorPopulationCount`, and `VectorReverseBits` in
+  `src/rdynarmic/src/backend/x64/emit_vector_basic.rs`.
+- Exact missing prerequisite: local `rxbyak` exposes legacy `psll*`/`psrl*` immediate forms and AVX
+  register-count forms, but not the three-operand AVX immediate forms used by Eden's AVX CLZ16
+  path (`vpsrlw dst, src, imm` and `vpsllw dst, src, imm`).
+- Required next action: add and byte-test the missing encoders in `externals/rxbyak`, verify their
+  VEX encodings, then resume the interrupted vector-basic slice. No temporary SSE-only shortcut is
+  being retained.
+- Status: prerequisite implemented in rxbyak commit `b0a6181`; XMM, YMM, and extended-register
+  encodings match NASM byte-for-byte and the rxbyak all-target check passes. The vector-basic slice
+  can now resume.

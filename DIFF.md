@@ -3956,3 +3956,24 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 ### Binary layout verification
 
 - N/A: these methods emit JIT instructions and define no shared or serialized structures.
+
+## 2026-08-21 — `externals/rxbyak/src/assembler.rs` AVX packed immediate shifts
+
+### Intentional differences
+
+- The Rust API suffixes immediate packed-shift overloads with `_imm`, consistent with the existing
+  legacy SSE methods, because Rust does not support C++-style method overloading.
+
+### Unintentional differences (to fix)
+
+- None in the focused encoder slice. `vpsllw`, `vpsrlw`, and `vpsrld` immediate forms encode the
+  opcode extension in ModRM.reg, the destination in VEX.vvvv, and the source in ModRM.r/m.
+
+### Missing items
+
+- Other AVX packed immediate-shift element widths are not required by the interrupted Eden emitter
+  slice and were not part of this focused prerequisite.
+
+### Binary layout verification
+
+- PASS: XMM, YMM, and extended-register encodings are asserted byte-for-byte against NASM output.
