@@ -777,7 +777,7 @@ impl Image {
             let vk_copies = transform_buffer_image_copies(copies, staging_offset, aspect);
             let device = runtime.device().clone();
             runtime.scheduler().request_outside_renderpass();
-            runtime.scheduler().record(move |cmd| unsafe {
+            runtime.scheduler().record(move |cmd| {
                 copy_buffer_to_image(
                     &device,
                     cmd,
@@ -827,7 +827,7 @@ impl Image {
         let device = runtime.device().clone();
         let scheduler = runtime.scheduler();
         scheduler.request_outside_renderpass();
-        scheduler.record(move |cmd| unsafe {
+        scheduler.record(move |cmd| {
             copy_buffer_to_image(
                 &device,
                 cmd,
@@ -2236,7 +2236,7 @@ impl TextureCacheRuntime {
             .iter()
             .map(|copy| {
                 let mut adjusted = *copy;
-                adjusted.src_offset.x = ((bpp_out as i32 * copy.src_offset.x) / bpp_in as i32);
+                adjusted.src_offset.x = (bpp_out as i32 * copy.src_offset.x) / bpp_in as i32;
                 adjusted.extent.width = (bpp_out * copy.extent.width) / bpp_in;
                 make_buffer_image_copy(&adjusted, true, src_aspect)
             })
@@ -4375,7 +4375,7 @@ impl TextureCache {
             object_id: slot,
         });
 
-        let Some(mut download_map) = self
+        let Some(download_map) = self
             .base
             .runtime_mut()
             .download_staging_buffer(size as vk::DeviceSize, true)

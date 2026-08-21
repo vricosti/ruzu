@@ -372,14 +372,14 @@ pub fn available_version(entry: &ash::Entry) -> u32 {
 pub fn enumerate_instance_extension_properties(
     entry: &ash::Entry,
 ) -> Option<Vec<vk::ExtensionProperties>> {
-    unsafe { entry.enumerate_instance_extension_properties(None).ok() }
+    entry.enumerate_instance_extension_properties(None).ok()
 }
 
 /// Enumerates instance layer properties.
 ///
 /// Port of `vk::EnumerateInstanceLayerProperties`.
 pub fn enumerate_instance_layer_properties(entry: &ash::Entry) -> Option<Vec<vk::LayerProperties>> {
-    unsafe { entry.enumerate_instance_layer_properties().ok() }
+    entry.enumerate_instance_layer_properties().ok()
 }
 
 // ---------------------------------------------------------------------------
