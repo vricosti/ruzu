@@ -414,10 +414,6 @@ fn is_sched_control_word(word_index: usize) -> bool {
     word_index % 4 == 0
 }
 
-fn maxwell_opcode_is_unknown(word: u64) -> bool {
-    super::frontend::maxwell_opcodes::decode_opcode(word).is_none()
-}
-
 impl PipelineCache {
     /// Create a new pipeline cache with the given GPU profile.
     pub fn new(profile: Profile) -> Self {

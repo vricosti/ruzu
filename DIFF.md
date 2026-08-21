@@ -2420,3 +2420,24 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 
 - PASS: the regression test verifies that the `.macro` payload is the contiguous native-byte view
   of the original `u32` instruction span, matching Eden's `code.size_bytes()` write.
+
+## 2026-08-21 — `src/shader_recompiler/src/pipeline_cache.rs` vs Eden Maxwell decode/translate ownership
+
+### Intentional differences
+
+- None for this cleanup.
+
+### Unintentional differences (to fix)
+
+- None. The unused Ruzu-only `maxwell_opcode_is_unknown` wrapper was removed. Opcode decoding
+  remains owned by the control-flow and translation modules that consume it, matching Eden's
+  direct `Decode` use rather than making the unrelated pipeline cache an extra owner.
+
+### Missing items
+
+- None introduced by this removal; the broader structured-control-flow parity work remains a
+  separate implementation slice.
+
+### Binary layout verification
+
+- N/A: no guest-visible or serialized data changed.
