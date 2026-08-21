@@ -71,6 +71,13 @@ pub struct FileSystemController {
     /// SDMC factory for SD card content and mod roots.
     /// Upstream: `std::unique_ptr<FileSys::SDMCFactory> sdmc_factory`.
     sdmc_factory: Option<SdmcFactory>,
+    /// Frontend-owned per-launch view returned by `OpenSDMC`.
+    ///
+    /// Eden always returns `sdmc_factory->Open()`. Ruzu uses this optional
+    /// override only while booting a standalone homebrew NRO so its sibling
+    /// assets can be exposed without host symbolic links or junction points.
+    /// Content caches and SDMC metadata continue to use `sdmc_factory`.
+    sdmc_open_override: Option<VirtualDir>,
     /// Shared content provider union owned by System.
     content_provider: Option<Arc<Mutex<ContentProviderUnion>>>,
     // gamecard: Option<XCI>,
@@ -85,6 +92,7 @@ impl FileSystemController {
             bis_factory: None,
             vfs: None,
             sdmc_factory: None,
+            sdmc_open_override: None,
             content_provider: None,
         }
     }
@@ -155,6 +163,14 @@ impl FileSystemController {
     pub fn open_sdmc(&self) -> Result<VirtualDir, ResultCode> {
         log::trace!("FileSystemController::OpenSDMC called");
 
+        if let Some(sdmc) = self.sdmc_open_override.as_ref() {
+            log::debug!(
+                "FileSystemController::OpenSDMC returning per-launch root={}",
+                sdmc.get_full_path()
+            );
+            return Ok(Arc::clone(sdmc));
+        }
+
         let Some(sdmc_factory) = self.sdmc_factory.as_ref() else {
             return Err(errors::RESULT_PORT_SD_CARD_NO_DEVICE);
         };
@@ -165,6 +181,14 @@ impl FileSystemController {
             sdmc.get_full_path()
         );
         Ok(sdmc)
+    }
+
+    /// Install a frontend-owned SDMC view for the current launch.
+    ///
+    /// This is a Ruzu frontend extension; passing `None` restores Eden's
+    /// factory-backed `OpenSDMC` behavior.
+    pub fn set_sdmc_open_override(&mut self, sdmc: Option<VirtualDir>) {
+        self.sdmc_open_override = sdmc;
     }
 
     /// Port of upstream `FileSystemController::GetFreeSpaceSize` (filesystem.cpp:402-424).
@@ -383,6 +407,7 @@ impl FileSystemController {
         if overwrite {
             self.bis_factory = None;
             self.sdmc_factory = None;
+            self.sdmc_open_override = None;
             if let Some(provider) = self.content_provider.as_ref() {
                 let mut provider = provider.lock().unwrap();
                 provider.clear_slot(ContentProviderUnionSlot::SysNAND);
@@ -492,12 +517,33 @@ mod tests {
     use super::FileSystemController;
     use crate::file_sys::registered_cache::{ContentProviderUnion, ContentProviderUnionSlot};
     use crate::file_sys::romfs_factory::RomFSFactory;
-    use crate::file_sys::vfs::vfs_types::VirtualFile;
-    use crate::file_sys::vfs::vfs_vector::VectorVfsFile;
+    use crate::file_sys::vfs::vfs_types::{VirtualDir, VirtualFile};
+    use crate::file_sys::vfs::vfs_vector::{VectorVfsDirectory, VectorVfsFile};
     use common::fs::path_util::{get_ruzu_path, set_ruzu_path, RuzuPath};
     use std::fs;
     use std::sync::{Arc, Mutex};
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn open_sdmc_uses_and_clears_the_frontend_override() {
+        let mut controller = FileSystemController::new();
+        let override_root: VirtualDir = Arc::new(VectorVfsDirectory::new(
+            Vec::new(),
+            Vec::new(),
+            "homebrew-sdmc".to_string(),
+            None,
+        ));
+
+        controller.set_sdmc_open_override(Some(Arc::clone(&override_root)));
+        let opened = controller.open_sdmc().unwrap();
+        assert!(Arc::ptr_eq(&opened, &override_root));
+
+        controller.set_sdmc_open_override(None);
+        assert!(matches!(
+            controller.open_sdmc(),
+            Err(result) if result == crate::file_sys::errors::RESULT_PORT_SD_CARD_NO_DEVICE
+        ));
+    }
 
     #[test]
     fn registered_nca_process_exposes_its_romfs_controller() {

@@ -1572,3 +1572,77 @@ Compared `video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 ### Binary layout verification
 
 - N/A: this pass rewrites host-side IR instructions.
+## 2026-08-20 — `core/src/hle/service/filesystem/filesystem.rs` vs Eden `src/core/hle/service/filesystem/filesystem.{h,cpp}`
+
+### Intentional differences
+
+- Ruzu adds an optional frontend-owned `sdmc_open_override`. `OpenSDMC` returns it when installed,
+  while every content-cache, modification-root, size, and normal launch path remains owned by the
+  upstream-equivalent `SDMCFactory`.
+- `set_sdmc_open_override` is a narrow Ruzu extension used only for standalone NRO launches. An
+  overwriting `create_factories` call clears it together with the upstream factories so a view
+  cannot leak into a later launch.
+
+### Unintentional differences (to fix)
+
+- None in this slice. With no override installed, `open_sdmc` retains Eden's factory/null-device
+  behavior.
+
+### Missing items
+
+- None for the per-launch SDMC override.
+
+### Binary layout verification
+
+- N/A: the added host-side `VirtualDir` does not alter a guest-visible or serialized structure.
+
+## 2026-08-20 — `ruzu/src/homebrew_vfs.rs` vs Eden `src/core/file_sys/vfs/vfs_layered.{h,cpp}`
+
+### Intentional differences
+
+- Eden's `LayeredVfsDirectory` is read-only, so it remains unchanged. Ruzu's GTK frontend owns a
+  separate writable two-layer view for homebrew: the standalone NRO's containing directory has
+  first priority and the configured SDMC is the fallback.
+- Creates and missing parent directories are routed to the homebrew layer. Existing fallback-only
+  entries retain normal SDMC behavior. Directory enumeration recursively merges both layers and
+  hides lower-priority entries shadowed by either a file or directory in the homebrew layer.
+- Entry enumeration uses ordered Rust maps/sets for deterministic results; Eden's layered VFS uses
+  an unordered set. The guest-visible set and priority are unchanged.
+- Activation checks the NRO header through `AppLoaderNro::IdentifyType`, rather than trusting the
+  filename extension. No symbolic-link, junction-point, or platform-specific filesystem API is
+  required.
+
+### Unintentional differences (to fix)
+
+- None. The writable semantics are deliberately frontend-specific because changing Eden's
+  read-only layered VFS would violate its contract.
+
+### Missing items
+
+- None for exposing sibling homebrew assets and writable nested paths.
+
+### Binary layout verification
+
+- N/A: the view contains host VFS handles and path components only.
+
+## 2026-08-20 — `ruzu/src/boot.rs` and `ruzu/src/main.rs` vs Eden `src/yuzu/main_window.cpp` `MainWindow::BootGame` and `src/yuzu/main.cpp`
+
+### Intentional differences
+
+- After the upstream-equivalent filesystem factories are created and before `System::Load`, Ruzu
+  detects a standalone NRO and installs its per-launch homebrew SDMC view. Eden has no equivalent
+  boot hook and relies on files already being present in its configured SDMC.
+- The GTK entry point declares `homebrew_vfs` as a private frontend module; Eden's excluded Qt
+  frontend has no corresponding source file.
+
+### Unintentional differences (to fix)
+
+- None. Non-NRO boot ordering and filesystem behavior are unchanged.
+
+### Missing items
+
+- None for this boot integration.
+
+### Binary layout verification
+
+- N/A: this changes host-side launch wiring only.
