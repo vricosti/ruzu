@@ -33,16 +33,6 @@ struct Maxwell3DPtr(*mut Maxwell3D);
 
 unsafe impl Send for Maxwell3DPtr {}
 
-impl Maxwell3DPtr {
-    unsafe fn call_method(self, address: u32, value: u32) {
-        (&mut *self.0).call_method(address, value, true);
-    }
-
-    unsafe fn read_reg(self, method: u32) -> u32 {
-        (&*self.0).get_register_value(method)
-    }
-}
-
 // ── Register offset constants (method addresses) ────────────────────────────
 
 /// Number of user clip distances exposed by Maxwell registers.
@@ -268,6 +258,7 @@ const STREAM_OUT_LAYOUT_BASE: u32 = reg_index!(0x2800);
 ///            bits[26:21]=size, bits[29:27]=type, bit[31]=bgra.
 pub(crate) const VERTEX_ATTRIB_BASE: u32 = reg_index!(0x1160);
 pub(crate) const NUM_VERTEX_ATTRIBS: u32 = 32;
+#[cfg(test)]
 pub(crate) const NUM_VERTEX_ARRAYS: u32 = 32;
 
 // ── Shader pipeline registers ─────────────────────────────────────────────
@@ -356,7 +347,6 @@ const LOAD_MME_START_ADDR: u32 = reg_index!(0x0120);
 /// Now uses word indices matching upstream (ENGINE_REG_COUNT = 0xE00).
 const MACRO_METHODS_START: u32 = reg_index!(0x3800);
 /// Exclusive end of macro method range (0x1000 * 4).
-const MACRO_METHODS_END: u32 = reg_index!(0x4000);
 
 // ── Additional register offsets (upstream ASSERT_REG_POSITION values) ──────
 
@@ -454,8 +444,6 @@ const MACRO_REGISTERS_START: u32 = reg_index!(0x3800);
 
 // ── Common render target formats ────────────────────────────────────────────
 
-pub(crate) const RT_FORMAT_A8B8G8R8_UNORM: u32 = reg_index!(0x0354);
-pub(crate) const RT_FORMAT_A8B8G8R8_SRGB: u32 = reg_index!(0x0358);
 #[allow(dead_code)]
 const RT_FORMAT_A8R8G8B8_UNORM: u32 = reg_index!(0x00CC);
 #[allow(dead_code)]
@@ -3529,85 +3517,6 @@ impl Maxwell3D {
     pub fn report_semaphore_payload(&self) -> u32 {
         self.regs[(REPORT_SEMAPHORE_BASE + 2) as usize]
     }
-
-    // ── Side-effect handlers ─────────────────────────────────────────────
-
-    /// Handle DRAW_BEGIN: captures topology and instance mode from value.
-    fn handle_draw_begin(&mut self, value: u32) {
-        self.regs[DRAW_BEGIN as usize] = value;
-        self.with_draw_manager(|draw_manager, this| {
-            draw_manager.draw_begin(this);
-        });
-    }
-
-    /// Handle DRAW_END: behaviour depends on current draw mode.
-    fn handle_draw_end(&mut self) {
-        self.with_draw_manager(|draw_manager, this| {
-            draw_manager.draw_end(1, false, this);
-        });
-    }
-
-    /// Flush a deferred instanced draw batch. Called when a new First
-    /// instance_id is seen or when take_draw_calls needs to finalize.
-    fn flush_deferred_draw(&mut self) {
-        self.with_draw_manager(|draw_manager, this| {
-            draw_manager.draw_deferred(this);
-        });
-    }
-
-    /// Handle report semaphore trigger (write to REPORT_SEMAPHORE_BASE + 3).
-    fn handle_report_semaphore(&mut self, value: u32) {
-        let _ = value;
-        self.process_query_get();
-    }
-
-    /// Handle CB_DATA write: auto-increment CB offset by 4.
-    fn handle_cb_data(&mut self, _value: u32) {
-        let offset_reg = (CB_CONFIG_BASE + 3) as usize;
-        self.regs[offset_reg] = self.regs[offset_reg].wrapping_add(4);
-    }
-
-    /// Handle CB_BIND trigger for a shader stage.
-    fn handle_cb_bind(&mut self, stage: usize) {
-        let bind_base = (CB_BIND_BASE + stage as u32 * CB_BIND_STRIDE) as usize;
-        let raw_config = self.regs[bind_base + 4];
-
-        let valid = (raw_config & 1) != 0;
-        let slot = ((raw_config >> 4) & 0x1F) as usize;
-
-        if slot >= MAX_CB_SLOTS {
-            log::warn!(
-                "Maxwell3D: CB_BIND stage {} slot {} out of range",
-                stage,
-                slot
-            );
-            return;
-        }
-
-        if valid {
-            let cb_base = CB_CONFIG_BASE as usize;
-            let size = self.regs[cb_base];
-            let addr_high = self.regs[cb_base + 1] as u64;
-            let addr_low = self.regs[cb_base + 2] as u64;
-            let address = (addr_high << 32) | addr_low;
-
-            self.cb_bindings[stage][slot] = ConstBufferBinding {
-                enabled: true,
-                address,
-                size,
-            };
-            log::trace!(
-                "Maxwell3D: CB_BIND stage={} slot={} addr=0x{:X} size={}",
-                stage,
-                slot,
-                address,
-                size
-            );
-        } else {
-            self.cb_bindings[stage][slot] = ConstBufferBinding::default();
-            log::trace!("Maxwell3D: CB_BIND stage={} slot={} disabled", stage, slot);
-        }
-    }
 }
 
 impl RenderConditionStateSource for Maxwell3D {
@@ -4147,6 +4056,7 @@ impl Maxwell3D {
         &mut self.dirty.flags
     }
 
+    #[cfg(test)]
     pub(crate) fn dirty_tables(&self) -> &dirty_flags::DirtyTables {
         &self.dirty.tables
     }
@@ -4396,14 +4306,7 @@ impl Maxwell3D {
         }
     }
 
-    // ── Upstream ProcessMacroUpload / ProcessMacroBind / ProcessFirmwareCall4 ──
-
-    /// Upload a macro code word. Matches upstream `ProcessMacroUpload`.
-    fn process_macro_upload(&mut self, data: u32) {
-        let ptr = self.regs[LOAD_MME_INSTRUCTION_PTR as usize];
-        self.macro_engine.add_code(ptr, data);
-        self.regs[LOAD_MME_INSTRUCTION_PTR as usize] = ptr.wrapping_add(1);
-    }
+    // ── Upstream ProcessMacroBind / ProcessFirmwareCall4 ─────────────────
 
     /// Bind a macro start address. Matches upstream `ProcessMacroBind`.
     fn process_macro_bind(&mut self, data: u32) {
@@ -5211,68 +5114,6 @@ impl Maxwell3D {
         self.interface_state.method_sink = sink;
     }
 
-    // ── Legacy process_method (used by MacroProcessor::macro_write) ─────
-
-    /// Process a method write: store to register array and handle side effects.
-    /// This is the shared implementation used by `MacroProcessor::macro_write`.
-    fn process_method(&mut self, method: u32, value: u32) {
-        self.process_dirty_registers(method, value);
-
-        // Detect side-effect triggers.
-        match method {
-            CLEAR_SURFACE | DRAW_BEGIN | DRAW_END | VB_FIRST | VB_COUNT => {
-                self.with_draw_manager(|draw_manager, this| {
-                    draw_manager.process_method_call(method, value, this);
-                });
-            }
-            m if m == IB_BASE + IB_OFF_FIRST || m == IB_BASE + IB_OFF_COUNT => {
-                self.with_draw_manager(|draw_manager, this| {
-                    draw_manager.process_method_call(method, value, this);
-                });
-            }
-            INDEX_BUFFER32_SUBSEQUENT
-            | INDEX_BUFFER16_SUBSEQUENT
-            | INDEX_BUFFER8_SUBSEQUENT
-            | INDEX_BUFFER32_FIRST
-            | INDEX_BUFFER16_FIRST
-            | INDEX_BUFFER8_FIRST
-            | DRAW_INLINE_INDEX
-            | INLINE_INDEX_2X16_EVEN
-            | INLINE_INDEX_4X8_INDEX0
-            | VERTEX_ARRAY_INSTANCE_FIRST
-            | VERTEX_ARRAY_INSTANCE_SUBSEQUENT
-            | DRAW_TEXTURE_SRC_Y0 => {
-                self.with_draw_manager(|draw_manager, this| {
-                    draw_manager.process_method_call(method, value, this);
-                });
-            }
-            REPORT_SEMAPHORE_TRIGGER => self.handle_report_semaphore(value),
-            m if m >= CB_DATA_BASE && m < CB_DATA_END => self.handle_cb_data(value),
-            CB_BIND_TRIGGER_0 => self.handle_cb_bind(0),
-            CB_BIND_TRIGGER_1 => self.handle_cb_bind(1),
-            CB_BIND_TRIGGER_2 => self.handle_cb_bind(2),
-            CB_BIND_TRIGGER_3 => self.handle_cb_bind(3),
-            CB_BIND_TRIGGER_4 => self.handle_cb_bind(4),
-            _ => {}
-        }
-
-        log::trace!("Maxwell3D: reg[0x{:X}] = 0x{:X}", method, value);
-    }
-
-    /// Handle a write to a macro method register (used by Engine::write_reg
-    /// for backward compatibility).
-    fn handle_macro_method(&mut self, method: u32, value: u32) {
-        // Even method = start of new macro call; odd = additional parameter.
-        if self.executing_macro == 0 || (method & 1) == 0 {
-            if self.executing_macro != 0 {
-                self.flush_macro();
-            }
-            self.executing_macro = method;
-            self.macro_params.clear();
-        }
-        self.macro_params.push(value);
-    }
-
     /// Execute the pending macro (if any) and reset state.
     pub fn flush_macro(&mut self) {
         if self.executing_macro == 0 || self.macro_params.is_empty() {
@@ -5737,8 +5578,8 @@ mod tests {
     fn test_draw_logs_without_crash() {
         let mut engine = Maxwell3D::new();
         // Just ensure draw begin/end doesn't panic.
-        engine.handle_draw_begin(0x0004); // Triangles
-        engine.handle_draw_end();
+        engine.write_reg(DRAW_BEGIN, 0x0004); // Triangles
+        engine.write_reg(DRAW_END, 0);
         assert!(engine.take_framebuffer().is_none());
         assert_eq!(engine.take_draw_calls().len(), 1);
     }
@@ -5872,10 +5713,10 @@ mod tests {
     #[test]
     fn test_draw_begin_sets_topology() {
         let mut engine = Maxwell3D::new();
-        engine.handle_draw_begin(4); // Triangles
+        engine.write_reg(DRAW_BEGIN, 4); // Triangles
         assert_eq!(engine.current_topology(), PrimitiveTopology::Triangles);
 
-        engine.handle_draw_begin(1); // Lines
+        engine.write_reg(DRAW_BEGIN, 1); // Lines
         assert_eq!(engine.current_topology(), PrimitiveTopology::Lines);
     }
 
@@ -7308,7 +7149,7 @@ mod tests {
         let mut engine = Maxwell3D::new();
         // Topology = TriangleStrip(5), instance_id = Subsequent (bits[27:26]=1).
         let value = 5 | (1 << 26);
-        engine.handle_draw_begin(value);
+        engine.write_reg(DRAW_BEGIN, value);
         let draw_state = engine.draw_manager_state();
         assert_eq!(draw_state.topology, PrimitiveTopology::TriangleStrip);
         assert_eq!(draw_state.draw_mode, dm::DrawMode::Instance);
@@ -8074,7 +7915,7 @@ mod tests {
     }
 
     #[test]
-    fn test_process_method_marks_flags_from_dirty_tables() {
+    fn test_call_method_marks_flags_from_dirty_tables() {
         let mut engine = Maxwell3D::new();
         let method = 0x124usize;
 
@@ -8082,12 +7923,12 @@ mod tests {
         engine.dirty.tables[0][method] = dirty_flags::flags::INDEX_BUFFER;
         engine.dirty.tables[1][method] = dirty_flags::flags::SHADERS;
 
-        engine.process_method(method as u32, 0);
+        engine.call_method(method as u32, 0, true);
         assert!(engine.dirty.flags[dirty_flags::flags::INDEX_BUFFER as usize]);
         assert!(engine.dirty.flags[dirty_flags::flags::SHADERS as usize]);
 
         engine.dirty.flags.fill(false);
-        engine.process_method(method as u32, 0xFEED_FACE);
+        engine.call_method(method as u32, 0xFEED_FACE, true);
         assert!(engine.dirty.flags[dirty_flags::flags::INDEX_BUFFER as usize]);
         assert!(engine.dirty.flags[dirty_flags::flags::SHADERS as usize]);
     }
