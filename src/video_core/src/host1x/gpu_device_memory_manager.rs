@@ -419,6 +419,7 @@ impl MultiAddressContainer {
         buffer.resize(index);
     }
 
+    #[cfg(test)]
     fn gather_values(&self, start_entry: u32) -> Vec<u32> {
         if start_entry == 0 {
             return Vec::new();
@@ -525,6 +526,7 @@ impl SmmuReverseMappings {
         }
     }
 
+    #[cfg(test)]
     fn gather_device_pages(&self, physical_page: u32) -> Vec<u64> {
         let base = self.compressed_device_addr.get(physical_page);
         if base == 0 {
