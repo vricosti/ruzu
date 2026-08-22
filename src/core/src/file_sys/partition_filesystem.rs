@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use common::common_funcs::make_magic;
 
-use super::vfs::vfs::{VfsDirectory, VfsFile};
+use super::vfs::vfs::VfsDirectory;
 use super::vfs::vfs_offset::OffsetVfsFile;
 use super::vfs::vfs_types::{VirtualDir, VirtualFile};
 

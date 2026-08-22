@@ -10,7 +10,7 @@ use std::sync::Arc;
 use super::content_archive::{is_directory_exefs, NCAContentType, NCA};
 use super::nca_metadata::{ContentRecordType, TitleType, CNMT};
 use super::partition_filesystem::{PartitionFilesystem, ResultStatus};
-use super::vfs::vfs::{VfsDirectory, VfsFile};
+use super::vfs::vfs::VfsDirectory;
 use super::vfs::vfs_types::{VirtualDir, VirtualFile};
 
 // ============================================================================

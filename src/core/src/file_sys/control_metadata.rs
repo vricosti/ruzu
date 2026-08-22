@@ -4,7 +4,6 @@
 // Ported from: core/file_sys/control_metadata.h and control_metadata.cpp
 // NACP control metadata parsing.
 
-use super::vfs::vfs::VfsFile;
 use super::vfs::vfs_types::VirtualFile;
 
 // ============================================================================

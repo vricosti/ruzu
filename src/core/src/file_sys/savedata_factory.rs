@@ -10,7 +10,7 @@
 use super::fs_save_data_types::{
     SaveDataAttribute, SaveDataSize, SaveDataSpaceId, SaveDataType, UserId,
 };
-use super::vfs::vfs::{get_or_create_directory_relative, VfsDirectory, VfsFile};
+use super::vfs::vfs::get_or_create_directory_relative;
 use super::vfs::vfs_types::VirtualDir;
 
 /// The hidden file name used to persist save data size.

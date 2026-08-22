@@ -6,7 +6,6 @@
 
 use super::nca_header::*;
 use crate::file_sys::errors::*;
-use crate::file_sys::vfs::vfs::VfsFile;
 use crate::file_sys::vfs::vfs_offset::OffsetVfsFile;
 use crate::file_sys::vfs::vfs_types::VirtualFile;
 use common::ResultCode;

@@ -9,7 +9,6 @@
 use std::sync::Arc;
 
 use super::content_archive::NCA;
-use super::vfs::vfs::VfsFile;
 use super::vfs::vfs_offset::OffsetVfsFile;
 use super::vfs::vfs_types::{VirtualDir, VirtualFile};
 use crate::crypto::aes_util::{AesCipher, Mode, Op};

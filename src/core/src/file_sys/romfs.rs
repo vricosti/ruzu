@@ -7,7 +7,7 @@
 use std::sync::Arc;
 
 use super::fsmitm_romfsbuild::RomFSBuildContext;
-use super::vfs::vfs::{VfsDirectory, VfsFile};
+use super::vfs::vfs::VfsDirectory;
 use super::vfs::vfs_concat::ConcatenatedVfsFile;
 use super::vfs::vfs_offset::OffsetVfsFile;
 use super::vfs::vfs_types::{VirtualDir, VirtualFile};

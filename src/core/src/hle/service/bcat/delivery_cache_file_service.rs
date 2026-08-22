@@ -8,7 +8,6 @@ use std::collections::BTreeMap;
 
 use super::bcat_result;
 use super::bcat_types::*;
-use crate::file_sys::vfs::vfs::{VfsDirectory, VfsFile};
 use crate::file_sys::vfs::vfs_types::{VirtualDir, VirtualFile};
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};

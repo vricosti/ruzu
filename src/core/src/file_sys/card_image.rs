@@ -11,7 +11,7 @@ use common::common_funcs::make_magic;
 use super::content_archive::{NCAContentType, NCA};
 use super::partition_filesystem::{PartitionFilesystem, ResultStatus};
 use super::submission_package::NSP;
-use super::vfs::vfs::{VfsDirectory, VfsFile};
+use super::vfs::vfs::VfsDirectory;
 use super::vfs::vfs_offset::OffsetVfsFile;
 use super::vfs::vfs_types::{VirtualDir, VirtualFile};
 use super::vfs::vfs_vector::VectorVfsDirectory;
