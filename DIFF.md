@@ -4777,3 +4777,12 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 - `add_directory` and `add_file` now assign parent ownership themselves, and `add_file` returns
   Eden's success value. The former path-based repair contained an empty parent loop and a
   placeholder sibling expression; both are removed in favor of the upstream ownership sequence.
+
+## 2026-08-22 — `src/core/src/file_sys/fs_path_utility.rs` vs `core/file_sys/fs_path_utility.h`
+
+### Intentional differences
+
+- Eden advances raw `src` pointers and retains the pre-parse pointer to calculate consumed bytes.
+  Ruzu's parsers return that consumed offset directly, so the duplicate `src_offset` and
+  pre-Windows-parse binding were dead Rust locals and have been removed. Normalization order,
+  length checks, backslash replacement and the preserved Nintendo `cur_pos + 1` bug are unchanged.

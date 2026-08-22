@@ -1188,7 +1188,6 @@ impl PathFormatter {
         flags: &PathFlags,
     ) -> Result<(), ResultCode> {
         let mut src = path;
-        let mut src_offset: usize = 0;
         let mut cur_pos: usize = 0;
         let mut is_windows_path_found = false;
 
@@ -1215,8 +1214,7 @@ impl PathFormatter {
                 cur_pos += mlen;
             }
             mount_name_len = mlen;
-            src_offset = offset;
-            src = &path[src_offset..];
+            src = &path[offset..];
         }
 
         // Handle drive-relative prefix
@@ -1268,8 +1266,6 @@ impl PathFormatter {
 
         // Handle windows path
         if flags.is_windows_path_allowed() {
-            let orig_src = src;
-
             if cur_pos >= dst_size {
                 return Err(RESULT_TOO_LONG_PATH);
             }
