@@ -1,5 +1,31 @@
 # Porting State
 
+## 2026-08-22 — AlarmWorker warning slice interrupted by event-wiring prerequisite
+
+- Status: interrupted before changing the unread `closest_alarm_event` field.
+- Interrupted slice: classify and consume `AlarmWorker::closest_alarm_event` according to Eden's
+  `m_event` ownership and timer lifecycle.
+- Exact missing prerequisite: Ruzu constructs a fresh unrelated `Event`, while Eden obtains the
+  readable endpoint from `PSC::Time::ServiceManager::GetClosestAlarmUpdatedEvent`. Ruzu's
+  `TimeWorker` also constructs `AlarmWorker` without the already-available shared PSC time manager
+  or `CoreTiming`, so `Initialize` cannot attach the real event or own its timer faithfully.
+- Required next action: pass the existing shared PSC time manager and `CoreTiming` through
+  `Glue::Time::TimeManager -> TimeWorker -> AlarmWorker`, then create/close the timer through
+  `ServiceContext`, attach the actual alarms event during `Initialize`, and restore Eden's
+  unschedule-before-close destructor order.
+- Newly discovered prerequisite: Ruzu implements PSC `time:m` commands 200–202 directly inside
+  their IPC handlers and exposes no `TimeServiceManager::{get_closest_alarm_updated_event,
+  check_and_signal_alarms,get_closest_alarm_info}` methods. Eden owns this behavior in those public
+  methods and `AlarmWorker` calls them. Extract the exact methods in `psc/time/service_manager.rs`
+  and retain the singleton service allocation through Ruzu's type-erased service pointer before
+  resuming the worker implementation.
+- Prerequisite result: commands 200–202 now delegate to their matching public
+  `TimeServiceManager` methods, invalid alarm queries preserve untouched output fields, and the
+  singleton event retains stable identity. Null optional shared-memory pointers are now branched
+  before dereference; the previous `then_some(&*null)` made the existing tests abort before they
+  could exercise the service.
+- Status: `time:m` prerequisite completed; `AlarmWorker` wiring and lifecycle resumed.
+
 ## 2026-08-22 — Friend service warning slice interrupted by method-ownership prerequisite
 
 - Status: interrupted before correcting the unread Friend service/event owners.

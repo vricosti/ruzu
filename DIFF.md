@@ -6486,3 +6486,41 @@ vs Eden `display_list.h` and `layer_list.h`
 - Restored constructor `SystemRef` forwarding, stable readable-event identity, completion-event
   signaling, and explicit event closure for both Friend interfaces. The warning-producing fields
   are now either consumed by behavior or narrowly documented as upstream lifetime owners.
+
+## 2026-08-22 — `src/core/src/hle/service/psc/time/service_manager.rs` vs `src/core/hle/service/psc/time/service_manager.{h,cpp}`
+
+### Intentional differences
+
+- Ruzu's service registry exposes `Arc<dyn SessionRequestHandler>` rather than Eden's typed
+  `shared_ptr<ServiceManager>`. Direct consumers retain that singleton allocation and perform a
+  checked downcast before calling the public service methods.
+- Eden returns `KReadableEvent*` through an out-copy-handle wrapper. Ruzu's public method places
+  the corresponding shared service `Event` in an `Option`; the IPC handler alone materializes and
+  caches its kernel-readable handle.
+- The flattened `system` field is retained with a field-local dead-code allowance. Eden's base
+  `ServiceFramework` stores the same reference; Ruzu's active time paths access it through the
+  captured tick callback and kernel-aware `Event` wrappers.
+
+### Unintentional differences (to fix)
+
+- The broader PSC time service was not re-audited in this alarm-method prerequisite; this entry
+  covers constructor pointer handling and commands 200–202 only.
+
+### Missing items
+
+- None from `GetClosestAlarmUpdatedEvent`, `CheckAndSignalAlarms`, or `GetClosestAlarmInfo`.
+
+### Binary layout verification
+
+- PASS: `AlarmInfo` continues to use its existing raw IPC layout. Invalid queries set only the
+  validity flag and preserve the caller-initialized info/time outputs, matching Eden.
+
+### Fixed parity debt
+
+- Restored the three public service methods as the owners of commands 200–202; IPC handlers now
+  delegate instead of owning their behavior.
+- Replaced eager `then_some(&*pointer)` evaluation with explicit null branches before creating
+  optional shared-memory references. This removes a real null dereference while preserving the
+  constructor's `None` semantics.
+- Corrected the local-clock regression expectation: when steady-clock source IDs differ, Eden
+  derives a context from the current steady clock rather than copying the supplied context.

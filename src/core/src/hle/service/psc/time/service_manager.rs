@@ -28,6 +28,10 @@ use super::manager::TimeManager;
 
 /// PSC::Time::ServiceManager — handles clock core setup.
 pub struct TimeServiceManager {
+    // Flattened counterpart of Eden's `ServiceFramework::system` reference. The active methods
+    // access time through the captured tick source and Event wrappers, but the service remains
+    // associated with the same System for its full lifetime.
+    #[allow(dead_code)]
     system: SystemRef,
     handlers: BTreeMap<u32, FunctionInfo>,
     handlers_tipc: BTreeMap<u32, FunctionInfo>,
@@ -58,13 +62,23 @@ impl TimeServiceManager {
         });
 
         let time = Arc::new(Mutex::new(unsafe {
+            let device_memory = if device_memory.is_null() {
+                None
+            } else {
+                Some(&*device_memory)
+            };
+            let memory_manager = if memory_manager.is_null() {
+                None
+            } else {
+                Some(&mut *memory_manager)
+            };
             TimeManager::new_with_shared_memory(
                 Box::new({
                     let get_time_ns = Arc::clone(&get_time_ns);
                     move || get_time_ns()
                 }),
-                (!device_memory.is_null()).then_some(&*device_memory),
-                (!memory_manager.is_null()).then_some(&mut *memory_manager),
+                device_memory,
+                memory_manager,
             )
         }));
         let local_operation = OperationEvent::new();
@@ -378,6 +392,46 @@ impl TimeServiceManager {
         RESULT_SUCCESS
     }
 
+    pub fn get_closest_alarm_updated_event(
+        &self,
+        out_event: &mut Option<Arc<crate::hle::service::os::event::Event>>,
+    ) -> ResultCode {
+        log::debug!("TimeServiceManager::get_closest_alarm_updated_event called");
+        let time = self.time.lock().unwrap();
+        *out_event = Some(time.alarms.get_event());
+        RESULT_SUCCESS
+    }
+
+    pub fn check_and_signal_alarms(&self) -> ResultCode {
+        log::debug!("TimeServiceManager::check_and_signal_alarms called");
+        let time = self.time.lock().unwrap();
+        time.alarms
+            .check_and_signal(&time.power_state_request_manager);
+        RESULT_SUCCESS
+    }
+
+    pub fn get_closest_alarm_info(
+        &self,
+        out_is_valid: &mut bool,
+        out_info: &mut AlarmInfo,
+        out_time: &mut i64,
+    ) -> ResultCode {
+        log::debug!("TimeServiceManager::get_closest_alarm_info called");
+        let time = self.time.lock().unwrap();
+        if let Some((alert_time, priority)) = time.alarms.get_closest_alarm() {
+            *out_is_valid = true;
+            *out_info = AlarmInfo {
+                alert_time,
+                priority,
+                _padding: 0,
+            };
+            *out_time = time.alarms.get_raw_time();
+        } else {
+            *out_is_valid = false;
+        }
+        RESULT_SUCCESS
+    }
+
     fn get_or_create_event_handle(
         &self,
         ctx: &HLERequestContext,
@@ -650,53 +704,38 @@ impl TimeServiceManager {
         ctx: &mut HLERequestContext,
     ) {
         let service = Self::as_self(this);
-        let event = {
-            let time = service.time.lock().unwrap();
-            time.alarms.get_event()
-        };
+        let mut event = None;
+        let result = service.get_closest_alarm_updated_event(&mut event);
+        let event = event.expect("closest alarm event must exist");
         match service.get_or_create_event_handle(ctx, &event, &service.closest_alarm_readable_event)
         {
             Some(handle) => {
                 let mut rb = ResponseBuilder::new(ctx, 2, 1, 0);
-                rb.push_result(RESULT_SUCCESS);
+                rb.push_result(result);
                 rb.push_copy_objects(handle);
             }
             None => {
                 let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
-                rb.push_result(RESULT_SUCCESS);
+                rb.push_result(result);
             }
         }
     }
 
     fn check_and_signal_alarms_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         let service = Self::as_self(this);
-        let time = service.time.lock().unwrap();
-        time.alarms
-            .check_and_signal(&time.power_state_request_manager);
+        let result = service.check_and_signal_alarms();
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
-        rb.push_result(RESULT_SUCCESS);
+        rb.push_result(result);
     }
 
     fn get_closest_alarm_info_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         let service = Self::as_self(this);
-        let (is_valid, info, out_time) = {
-            let time = service.time.lock().unwrap();
-            if let Some((alert_time, priority)) = time.alarms.get_closest_alarm() {
-                (
-                    true,
-                    AlarmInfo {
-                        alert_time,
-                        priority,
-                        _padding: 0,
-                    },
-                    time.alarms.get_raw_time(),
-                )
-            } else {
-                (false, AlarmInfo::default(), 0)
-            }
-        };
+        let mut is_valid = false;
+        let mut info = AlarmInfo::default();
+        let mut out_time = 0;
+        let result = service.get_closest_alarm_info(&mut is_valid, &mut info, &mut out_time);
         let mut rb = ResponseBuilder::new(ctx, 8, 0, 0);
-        rb.push_result(RESULT_SUCCESS);
+        rb.push_result(result);
         rb.push_bool(is_valid);
         rb.push_raw(&info);
         rb.push_i64(out_time);
@@ -733,7 +772,7 @@ mod tests {
     use crate::hle::service::service::ServiceFramework;
 
     #[test]
-    fn setup_standard_local_system_clock_core_updates_shared_memory_in_time_m_owner() {
+    fn setup_standard_local_system_clock_core_writes_context_derived_from_current_steady_clock() {
         let service =
             TimeServiceManager::new(SystemRef::null(), std::ptr::null(), std::ptr::null_mut());
         let context = SystemClockContext {
@@ -751,7 +790,13 @@ mod tests {
 
         let shared_time = service.shared_time();
         let time = shared_time.lock().unwrap();
-        assert_eq!(time.shared_memory.get_local_system_context(), context);
+        assert_eq!(
+            time.shared_memory.get_local_system_context(),
+            SystemClockContext {
+                offset: 123,
+                steady_time_point: SteadyClockTimePoint::default(),
+            }
+        );
     }
 
     #[test]
@@ -786,5 +831,43 @@ mod tests {
                 cmd
             );
         }
+    }
+
+    #[test]
+    fn alarm_methods_return_stable_event_and_leave_invalid_outputs_untouched() {
+        let service =
+            TimeServiceManager::new(SystemRef::null(), std::ptr::null(), std::ptr::null_mut());
+        let mut first_event = None;
+        let mut second_event = None;
+        assert_eq!(
+            service.get_closest_alarm_updated_event(&mut first_event),
+            RESULT_SUCCESS
+        );
+        assert_eq!(
+            service.get_closest_alarm_updated_event(&mut second_event),
+            RESULT_SUCCESS
+        );
+        assert!(Arc::ptr_eq(
+            first_event.as_ref().unwrap(),
+            second_event.as_ref().unwrap()
+        ));
+
+        let mut is_valid = true;
+        let mut info = AlarmInfo {
+            alert_time: 17,
+            priority: 23,
+            _padding: 42,
+        };
+        let mut out_time = 99;
+        assert_eq!(
+            service.get_closest_alarm_info(&mut is_valid, &mut info, &mut out_time),
+            RESULT_SUCCESS
+        );
+        assert!(!is_valid);
+        assert_eq!(info.alert_time, 17);
+        assert_eq!(info.priority, 23);
+        assert_eq!(info._padding, 42);
+        assert_eq!(out_time, 99);
+        assert_eq!(service.check_and_signal_alarms(), RESULT_SUCCESS);
     }
 }
