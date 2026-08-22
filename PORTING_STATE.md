@@ -1,5 +1,26 @@
 # Porting State
 
+## 2026-08-22 — Cabinet frontend applet warning slice
+
+- Status: interrupted pending the NFC/NFP owner prerequisites.
+- Interrupted slice: consume `Cabinet::is_complete` through Eden's initialization, execution,
+  result and cancellation lifecycle, then install `Cabinet` in `FrontendAppletHolder`.
+- Exact missing prerequisites: Ruzu's `nfp_types.rs` lacks `CabinetMode` and
+  `RegisterInfoPrivate`; `NfcDevice` omits the tag/encrypted-tag owners and HID controller handle,
+  exposes no `SetRegisterInfoPrivate`, and its `GetRegisterInfo` does not return the upstream
+  payload. The frontend currently compensates with duplicate placeholder `TagInfo`,
+  `RegisterInfo` and `CabinetMode` types.
+- Required prerequisite work: port the missing NFP wire/state types in their upstream owner, then
+  restore the NFC device state and methods used by Cabinet before replacing the duplicate frontend
+  types and resuming the applet.
+- Resume condition: focused NFC tests exercise register-info output/mutation and tag-state
+  transitions through the real NFP types; Cabinet can then build its 0x188-byte result without
+  placeholders.
+- Prerequisite progress: `nfp_types.rs` now owns Eden's Cabinet mode, date/setting helpers and
+  complete NFP information payloads, while `TagInfo` is again the NFC-owned alias. Exact size and
+  bit-encoding tests pass. Restoring the NFC device's tag owners and register-info methods remains
+  the active prerequisite.
+
 ## 2026-08-22 — Web browser applet warning slice
 
 - Status: interrupted pending the web-applet debugging-setting prerequisite.

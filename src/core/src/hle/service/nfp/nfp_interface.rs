@@ -497,15 +497,7 @@ impl Interface {
         log::info!("NFP::GetTagInfo called, device_handle={}", device_handle);
         let result = self.with_manager(|mgr| mgr.get_tag_info(device_handle));
         match result {
-            Ok(tag_info) => {
-                // Convert from NFC TagInfo to NFP TagInfo
-                let mut nfp_tag_info = TagInfo::default();
-                nfp_tag_info.uuid = tag_info.uuid;
-                nfp_tag_info.uuid_length = tag_info.uuid_length;
-                nfp_tag_info.protocol = tag_info.protocol.bits();
-                nfp_tag_info.tag_type = tag_info.tag_type.bits();
-                (RESULT_SUCCESS, nfp_tag_info)
-            }
+            Ok(tag_info) => (RESULT_SUCCESS, tag_info),
             Err(e) => (
                 Self::translate_result_to_service_error(e),
                 TagInfo::default(),
@@ -1011,15 +1003,7 @@ impl Interface {
         if result.is_success() {
             // DeviceManager::get_register_info does not yet populate register_info data;
             // write zeroed RegisterInfo to buffer matching upstream layout.
-            let register_info = super::nfp_types::RegisterInfo {
-                mii_store_data: [0u8; 0x44],
-                creation_year: 0,
-                creation_month: 0,
-                creation_day: 0,
-                amiibo_name: [0u8; 41],
-                font_region: 0,
-                reserved: [0u8; 0x7A],
-            };
+            let register_info = super::nfp_types::RegisterInfo::default();
             let bytes = unsafe {
                 core::slice::from_raw_parts(
                     &register_info as *const super::nfp_types::RegisterInfo as *const u8,

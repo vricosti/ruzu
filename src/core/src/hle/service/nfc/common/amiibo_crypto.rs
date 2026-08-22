@@ -123,10 +123,10 @@ pub fn is_amiibo_valid_encrypted(ntag_file: &EncryptedNtag215File) -> bool {
     log::debug!("write_count={}", write_counter);
     let character_id = { model_info.character_id };
     let character_variant = { model_info.character_variant };
-    let amiibo_type = { model_info.amiibo_type };
+    let amiibo_type = { model_info.amiibo_type as u8 };
     let model_number = { model_info.model_number };
-    let series = { model_info.series };
-    let tag_type = { model_info.tag_type };
+    let series = { model_info.series as u8 };
+    let tag_type = { model_info.tag_type.bits() };
     log::debug!("character_id=0x{:x}", character_id);
     log::debug!("character_variant={}", character_variant);
     log::debug!("amiibo_type={}", amiibo_type);

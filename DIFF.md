@@ -5612,3 +5612,22 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 - `GetInputTLVData` mechanically consults `InputTLVExistsInMap` before indexing the map. Eden's two
   helpers are behaviorally equivalent but independent; the Rust call preserves both upstream
   helper owners without leaving one dead.
+
+## 2026-08-22 — `nfp_types.rs` vs `nfp_types.h`
+
+### Intentional differences
+
+- Eden's `u16_be`/`u32_be`/`u64_be` wrappers are raw fixed-width integers in the packed Rust tag
+  layouts. The date helpers perform the same endian conversion at their access boundary; the
+  remaining packed consumers use unaligned reads and preserve the on-disk bit patterns.
+- Eden's `Settings` union exposes named bit fields. Rust keeps the same one-byte owner and exposes
+  explicit getters/setters for its three fields, avoiding references into a packed bit field.
+
+### Fixed parity debt
+
+- Restored Cabinet mode, write-date conversion, NFP size constants, exact public/private register,
+  common, model, admin and aggregate payloads in their upstream owner.
+- `TagInfo` is again an alias of the NFC wire type, and `AmiiboModelInfo` now stores its upstream
+  enum/packed-tag types instead of untyped bytes.
+- Zeroed defaults cover all reserved bytes; focused tests verify every frontend payload size and
+  the upstream date/settings bit encoding.
