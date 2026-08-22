@@ -42,31 +42,41 @@ fn resolve_renderer_backend(
     renderer_override: Option<&str>,
     configured_backend: RendererBackend,
 ) -> &'static str {
-    let configured_name = match configured_backend {
-        RendererBackend::OpenGlGlsl
-        | RendererBackend::OpenGlGlasm
-        | RendererBackend::OpenGlSpirV => "opengl",
-        RendererBackend::Vulkan => "vulkan",
-        RendererBackend::Null => "null",
-    };
+    fn backend_name(backend: RendererBackend) -> &'static str {
+        match backend {
+            RendererBackend::OpenGlGlsl
+            | RendererBackend::OpenGlGlasm
+            | RendererBackend::OpenGlSpirV => "opengl",
+            RendererBackend::Vulkan => "vulkan",
+            RendererBackend::Null => "null",
+        }
+    }
 
-    let Some(renderer_override) = renderer_override else {
-        return configured_name;
-    };
-
-    match renderer_override.to_lowercase().as_str() {
-        "opengl" | "gl" | "0" => "opengl",
-        "vulkan" | "vk" | "1" => "vulkan",
-        "null" | "2" => "null",
-        other => {
+    let configured_backend = common::settings::effective_renderer_backend(configured_backend);
+    let configured_name = backend_name(configured_backend);
+    let requested_backend = match renderer_override.map(str::to_lowercase).as_deref() {
+        None => return configured_name,
+        Some("opengl" | "gl" | "0") => RendererBackend::OpenGlGlsl,
+        Some("vulkan" | "vk" | "1") => RendererBackend::Vulkan,
+        Some("null" | "2") => RendererBackend::Null,
+        Some(other) => {
             log::warn!(
                 "Unknown renderer '{}', using configured backend {}",
                 other,
                 configured_name
             );
-            configured_name
+            return configured_name;
         }
+    };
+    let effective_backend = common::settings::effective_renderer_backend(requested_backend);
+    if effective_backend != requested_backend {
+        log::warn!(
+            "Renderer backend {:?} is unavailable on this host; using {:?}",
+            requested_backend,
+            effective_backend
+        );
     }
+    backend_name(effective_backend)
 }
 
 #[cfg(test)]
@@ -80,7 +90,11 @@ mod tests {
     fn configured_renderer_is_used_without_cli_override() {
         assert_eq!(
             resolve_renderer_backend(None, RendererBackend::OpenGlGlsl),
-            "opengl"
+            if common::settings::is_renderer_backend_supported(RendererBackend::OpenGlGlsl) {
+                "opengl"
+            } else {
+                "vulkan"
+            }
         );
         assert_eq!(
             resolve_renderer_backend(None, RendererBackend::Vulkan),
@@ -100,7 +114,11 @@ mod tests {
         );
         assert_eq!(
             resolve_renderer_backend(Some("GL"), RendererBackend::Vulkan),
-            "opengl"
+            if common::settings::is_renderer_backend_supported(RendererBackend::OpenGlGlsl) {
+                "opengl"
+            } else {
+                "vulkan"
+            }
         );
     }
 

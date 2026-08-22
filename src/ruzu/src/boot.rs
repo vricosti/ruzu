@@ -537,7 +537,16 @@ fn run_boot(
 
     // Subsystem factory (upstream SetupForApplicationProcess): Host1x + GPU +
     // selected renderer + AudioCore. Called during `system.load()`.
-    let renderer_backend = *common::settings::values().renderer_backend.get_value();
+    let configured_renderer_backend = *common::settings::values().renderer_backend.get_value();
+    let renderer_backend =
+        common::settings::effective_renderer_backend(configured_renderer_backend);
+    if renderer_backend != configured_renderer_backend {
+        log::warn!(
+            "Renderer backend {:?} is unavailable on this host; using {:?}",
+            configured_renderer_backend,
+            renderer_backend
+        );
+    }
     let frame_loading_event = Arc::clone(&loading_event);
     let frame_displayed = Arc::clone(&first_frame_displayed);
     system.set_subsystem_factory(Box::new(move |system| {
