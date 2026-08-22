@@ -6550,11 +6550,6 @@ vs Eden `display_list.h` and `layer_list.h`
   self-reference between sibling fields of `TimeWorker`; the resource has no behavior in
   `AlarmWorker`, and CoreTiming is supplied directly instead.
 
-### Unintentional differences (to fix)
-
-- `TimeWorker` does not yet execute its event loop, so its production consumer of `GetEvent` and
-  `GetTimerEvent` remains absent even though both endpoints and their behavior now match Eden.
-
 ### Missing items
 
 - None inside `AlarmWorker`; constructor state, `Initialize`, both getters,
@@ -6586,22 +6581,19 @@ vs Eden `display_list.h` and `layer_list.h`
 
 ### Unintentional differences (to fix)
 
-- `TimeWorker::Initialize`, `StartThread`, `ThreadFunc`, and its destructor are still skeletal.
-  The worker does not create or wait on its exit/clock/timer events, schedule periodic timers,
-  retain clock/settings services, dispatch the nine event cases, or perform Eden's shutdown order.
 - `PmStateChangeHandler` still omits its reference to `AlarmWorker`; Ruzu currently constructs it
-  independently.
+  independently. Its current behavior remains equivalent because Eden's constructor only stores
+  that reference and leaves PM-module registration as a TODO, so both priorities stay zero.
 
 ### Missing items
 
-- The concrete worker thread, `ServiceContext`, seven external/readable event owners, two periodic
-  CoreTiming events, local/network/ephemeral clock owners, settings owner, time service owners,
-  steady-clock and filesystem worker references, and `GetSettingsItemValue` helper remain to be
-  ported in their upstream owner.
+- The PM-module registration described by Eden's own TODO remains absent in
+  `pm_state_change_handler.rs`; this does not remove any implementation present in `worker.cpp`.
 
 ### Binary layout verification
 
-- N/A: the constructor-wiring slice changes ownership only and serializes no raw payload.
+- PASS: `SystemClockContext` and `SteadyClockTimePoint` remain respectively `0x20` and `0x18`
+  bytes. Full zero-initialized buffers are written to `set:sys`, preserving the raw C layouts.
 
 ## 2026-08-22 — `src/core/src/hle/service/glue/time/file_timestamp_worker.rs` vs `src/core/hle/service/glue/time/file_timestamp_worker.{h,cpp}`
 
@@ -6612,11 +6604,6 @@ vs Eden `display_list.h` and `layer_list.h`
 - Failed or missing prerequisites return early through Rust `Option`/`Result` matching instead of
   C++'s short-circuit boolean expression. The call order remains initialized flag, clock read,
   timezone conversion.
-
-### Unintentional differences (to fix)
-
-- The service owners are not yet assigned by `TimeWorker::Initialize`; that wiring is the resumed
-  parent slice.
 
 ### Missing items
 
@@ -6641,8 +6628,10 @@ vs Eden `display_list.h` and `layer_list.h`
   allocation and reference-sharing contract without self-referential Rust structs.
 
 ### Unintentional differences (to fix)
-- `m_set_sys` and `m_time_m` are still acquired as temporary references during initialization
-  instead of being retained as manager members and forwarded to `TimeWorker`.
+- `m_set_sys` and `m_time_m` are acquired as temporary manager references rather than retained as
+  manager fields. The exact singleton owners are now forwarded to and retained by `TimeWorker`, so
+  runtime lifetime and behavior match while the manager's field layout remains structurally
+  different.
 
 ### Missing items
 - The final constructor-side filesystem timestamp update still stops at Eden's own filesystem TODO.
@@ -6691,14 +6680,22 @@ vs Eden `display_list.h` and `layer_list.h`
 ### Intentional differences
 - Eden's two borrowed resource references are represented by clones of the manager's exact
   `Arc<Mutex<_>>` allocations, avoiding an unsafe self-reference while preserving ownership.
+- Rust's `JoinHandle` has no `std::jthread` stop token, so an `Arc<AtomicBool>` carries the same
+  stop request and the exit event wakes the wait before join.
+- The host worker rebuilds stable boxed `MultiWaitHolder` values for each wait iteration. This is
+  the Rust counterpart of Eden's variadic `WaitAny` call and preserves the same event order and
+  priority-dependent two-versus-nine event selection.
 
 ### Unintentional differences (to fix)
-- Construction now receives the correct shared resources, but initialization, timer scheduling,
-  the nine-way event loop, and shutdown ordering are still the interrupted active slice.
+- `PmStateChangeHandler` does not retain the otherwise unused `AlarmWorker` reference. Eden's only
+  current constructor behavior is storing that reference beside a TODO for PM-module setup, so the
+  active priority and dispatch behavior remain equal at zero.
 
 ### Missing items
-- `ServiceContext` events, clock/event owners, timing events, worker thread, and exact event
-  dispatch remain to be ported next.
+- PM-module registration remains absent from `pm_state_change_handler.rs`; Eden also marks that
+  initialization as TODO.
 
 ### Binary layout verification
-- PASS: this ownership-only prerequisite does not expose a binary payload.
+- PASS: `SystemClockContext` (`0x20`) and `SteadyClockTimePoint` (`0x18`) are copied into fully
+  zero-initialized fixed-size settings buffers. Focused dispatch coverage verifies the complete
+  local-clock payload written by the background worker.

@@ -56,6 +56,7 @@ impl TimeManager {
         Self {
             system,
             worker: TimeWorker::new(
+                system,
                 Arc::clone(&time_m_handler),
                 core_timing,
                 Arc::clone(&steady_clock_resource),
@@ -96,7 +97,15 @@ impl TimeManager {
             log::error!("TimeManager: TimeZoneBinary::Mount failed");
         }
 
-        self.worker.initialize();
+        self.worker
+            .initialize(Arc::clone(&self.time_sm), Arc::clone(&set_sys_handler));
+
+        {
+            let mut file_timestamp_worker = self.file_timestamp_worker.lock().unwrap();
+            file_timestamp_worker.system_clock =
+                Some(Arc::new(self.time_sm.get_standard_user_system_clock()));
+            file_timestamp_worker.time_zone = Some(Arc::new(self.time_sm.get_time_zone_service()));
+        }
 
         self.setup_standard_steady_clock_core(set_sys, time_m);
 

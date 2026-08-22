@@ -1,6 +1,6 @@
 # Porting State
 
-## 2026-08-22 — TimeWorker warning slice interrupted by clock-event prerequisites
+## 2026-08-22 — TimeWorker warning/parity slice
 
 - Status: interrupted before consuming the four unread report-context fields or replacing the
   synthetic `running` flag.
@@ -27,6 +27,19 @@
   `Arc<Mutex<_>>`, replacing the independent state copies that diverged from Eden's references.
   Time-zone location changes now invoke the shared file-timestamp worker in Eden's order.
 - Status: all discovered prerequisites completed; the `TimeWorker` implementation may resume.
+- Resumed result: `TimeWorker` now owns the three service-context events and both periodic
+  CoreTiming callbacks, retains the required clock/settings/service owners, and runs Eden's exact
+  nine-case dispatch. Local, network, ephemeral, steady-clock, filesystem, alarm, PM and automatic
+  correction events preserve Eden's clear/update ordering. Destruction signals the three clock
+  events, waits 16 ms, requests stop, signals exit, joins, then closes and unschedules resources in
+  upstream order.
+- `TimeManager` now connects `FileTimestampWorker` to the standard user clock and timezone service
+  immediately after worker initialization, at the same point as Eden.
+- Focused coverage exercises real local-clock event dispatch into `set:sys`, exact shared-resource
+  identity, and clean worker shutdown.
+- Status: completed and re-verified. `PmStateChangeHandler` still has its separately documented
+  unported PM-module registration; like Eden's current TODO implementation, its priority remains
+  zero until that service exists.
 
 ## 2026-08-22 — AlarmWorker warning slice interrupted by event-wiring prerequisite
 
