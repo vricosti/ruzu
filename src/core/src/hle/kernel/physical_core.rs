@@ -151,11 +151,24 @@ impl PhysicalCore {
         jit: &mut dyn ArmInterface,
         thread_context: &mut ThreadContext,
     ) {
-        let _ = KScheduler::lock_thread_context_for_runtime(&main_thread, self.m_core_index as i32);
+        let locked =
+            KScheduler::lock_thread_context_for_runtime(&main_thread, self.m_core_index as i32);
+        assert!(locked, "guest runtime thread context must be available");
         self.restore_thread_to_jit(jit, thread_context, &main_thread);
         *self.m_runtime.lock().unwrap() = Some(PhysicalCoreRuntime {
             m_current_thread: main_thread,
         });
+    }
+
+    pub fn finalize_guest_runtime(&self) {
+        let runtime = self.m_runtime.lock().unwrap().take();
+        if let Some(runtime) = runtime {
+            let unlocked = KScheduler::unlock_thread_context_for_runtime(
+                &runtime.m_current_thread,
+                self.m_core_index as i32,
+            );
+            assert!(unlocked, "guest runtime must release its thread context");
+        }
     }
 
     pub fn handoff_after_svc(
@@ -865,6 +878,37 @@ mod tests {
         assert_eq!(iterations, 1);
         assert_eq!(svc_count, 0);
         assert!(matches!(control, PhysicalCoreExecutionControl::Yield));
+    }
+
+    #[test]
+    fn guest_runtime_releases_the_context_guard_it_acquires() {
+        let (physical_core, _process, _scheduler, current_thread, _system) = test_context();
+        let mut thread_context = ThreadContext::default();
+        let mut jit = TestArmInterface::new(VecDeque::new());
+
+        physical_core.initialize_guest_runtime(
+            current_thread.clone(),
+            &mut jit,
+            &mut thread_context,
+        );
+        assert_eq!(
+            current_thread
+                .lock()
+                .unwrap()
+                .context_guard_owner
+                .load(Ordering::SeqCst),
+            0
+        );
+
+        physical_core.finalize_guest_runtime();
+        assert_eq!(
+            current_thread
+                .lock()
+                .unwrap()
+                .context_guard_owner
+                .load(Ordering::SeqCst),
+            super::super::k_thread::CONTEXT_GUARD_UNOWNED
+        );
     }
 
     #[test]

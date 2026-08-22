@@ -2823,37 +2823,6 @@ impl KScheduler {
         Some(next_thread_id)
     }
 
-    /// Matches upstream `KScheduler::ScheduleImpl()`.
-    /// Clears needs_scheduling, selects the highest priority thread.
-    ///
-    /// Upstream yields to a fiber for context switching via ScheduleImplFiber.
-    /// We provide both cooperative (no fiber) and fiber-based paths.
-    fn schedule_impl_cooperative(&mut self) {
-        self.state.needs_scheduling.store(false, Ordering::Relaxed);
-        std::sync::atomic::fence(Ordering::SeqCst);
-
-        let highest = self.state.highest_priority_thread_id;
-
-        // If the interrupt task is runnable, switch to idle.
-        let target = if self.state.interrupt_task_runnable {
-            self.idle_thread_id
-        } else {
-            highest
-        };
-
-        // If same as current, nothing to do.
-        if target == self.current_thread_id {
-            std::sync::atomic::fence(Ordering::SeqCst);
-            return;
-        }
-
-        // Switch to the target thread.
-        let next_id = target.or(self.idle_thread_id);
-        if let Some(next_id) = next_id {
-            self.switch_thread_impl(None, next_id);
-        }
-    }
-
     /// Matches upstream `KScheduler::ScheduleImpl()` — fiber-based path.
     /// In upstream, this yields to m_switch_fiber which runs ScheduleImplFiber.
     fn schedule_impl_fiber(&mut self) {

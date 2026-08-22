@@ -2971,6 +2971,9 @@ impl System {
             }
         }
 
+        unsafe { &*physical_core }.finalize_guest_runtime();
+        process.lock().unwrap().arm_interfaces[0] = Some(jit_holder);
+
         (total_iteration, total_svc_count)
     }
 }

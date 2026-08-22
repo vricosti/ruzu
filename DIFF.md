@@ -5393,3 +5393,20 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 - The guarded AArch64 NCE implementation remains structurally incomplete: its patch code generation,
   assembly context switch, and signal-context handling still do not provide Eden behavior. This
   build-parity correction does not claim that backend as complete.
+
+## 2026-08-22 — scheduler context lifecycle in `k_scheduler.rs`, `physical_core.rs`, and `core.rs` vs `k_scheduler.{h,cpp}`, `physical_core.{h,cpp}`, and `cpu_manager.cpp`
+
+### Intentional differences
+
+- The Rust-only synchronous `System::run_main_loop` bootstrap bypasses Eden's host-fiber scheduler,
+  so it acquires and releases the running thread's context guard explicitly at the
+  `PhysicalCore` boundary. The normal scheduler path continues to acquire in
+  `ScheduleImplFiber` and release in `Unload`, as Eden does.
+
+### Fixed parity debt
+
+- Removed the unused cooperative `ScheduleImpl` duplicate. Eden has one `ScheduleImpl` path and
+  always transfers a real switch to `ScheduleImplFiber`; the Rust scheduler now keeps only that
+  fiber-owned implementation.
+- The synchronous bootstrap now pairs its context-guard acquisition with an explicit release and
+  returns the temporarily extracted ARM interface to its owning `KProcess` when execution ends.
