@@ -86,10 +86,8 @@ pub fn load_from_file(title_id: u64, path: &Path) -> Vec<AddOn> {
         }
     }
     let controller = Arc::new(Mutex::new(controller));
-    let mut loader_system = LoaderSystem {
-        content_provider: Some(content_provider.clone()),
-        filesystem_controller: Some(controller.clone()),
-    };
+    let mut loader_system =
+        LoaderSystem::new(Some(content_provider.clone()), Some(controller.clone()));
 
     let Some(file) = vfs.arc_open_file(&path.to_string_lossy(), OpenMode::READ) else {
         return Vec::new();

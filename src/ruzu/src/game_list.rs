@@ -2493,10 +2493,10 @@ impl MetadataReader {
         controller.set_content_provider(content_provider.clone());
         controller.create_factories(vfs.clone(), false);
         let controller = Arc::new(Mutex::new(controller));
-        let loader_system = LoaderSystem {
-            content_provider: Some(Arc::clone(&content_provider)),
-            filesystem_controller: Some(Arc::clone(&controller)),
-        };
+        let loader_system = LoaderSystem::new(
+            Some(Arc::clone(&content_provider)),
+            Some(Arc::clone(&controller)),
+        );
         Self {
             vfs,
             content_provider,

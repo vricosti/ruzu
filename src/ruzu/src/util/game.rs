@@ -280,10 +280,10 @@ fn read_title_and_icon(game_path: &str, program_id: u64) -> (Option<String>, Vec
     controller.set_content_provider(Arc::clone(&content_provider));
     controller.create_factories(Arc::clone(&vfs), false);
     let controller = Arc::new(Mutex::new(controller));
-    let mut loader_system = LoaderSystem {
-        content_provider: Some(Arc::clone(&content_provider)),
-        filesystem_controller: Some(Arc::clone(&controller)),
-    };
+    let mut loader_system = LoaderSystem::new(
+        Some(Arc::clone(&content_provider)),
+        Some(Arc::clone(&controller)),
+    );
 
     let Some(file) = vfs.arc_open_file(
         game_path,

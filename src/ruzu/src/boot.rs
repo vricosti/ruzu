@@ -1047,10 +1047,7 @@ fn read_program_id(filepath: &str) -> Option<u64> {
     controller.set_content_provider(Arc::clone(&content_provider));
     controller.create_factories(vfs.clone(), false);
     let controller = Arc::new(std::sync::Mutex::new(controller));
-    let mut loader_system = LoaderSystem {
-        content_provider: Some(content_provider),
-        filesystem_controller: Some(controller),
-    };
+    let mut loader_system = LoaderSystem::new(Some(content_provider), Some(controller));
     let file = vfs.arc_open_file(filepath, OpenMode::READ)?;
     let loader = get_loader(&mut loader_system, file, 0, 0)?;
     let mut program_id = 0;
