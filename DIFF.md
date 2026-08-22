@@ -4508,6 +4508,15 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 - The unused AArch32 `trace_read_code_word` diagnostic helper was removed. Instruction fetch still
   goes through the port of Eden's `DynarmicCallbacks32::MemoryReadCode` and its code-page cache.
 
+## 2026-08-22 — `src/core/src/arm/dynarmic/dynarmic_cp15.rs` vs `src/core/arm/dynarmic/dynarmic_cp15.h` and `.cpp`
+
+### Intentional differences
+
+- Eden's CP15 prefetch-flush handler returns a pointer to a global `dummy_value` because the C++
+  Dynarmic API requires writable storage for an ignored MCR operand. Ruzu's rdynarmic x64 and
+  AArch64 emitters consume and discard that operand directly, so the port returns
+  `SendOneWordResult::DummyWrite` without retaining an unread per-instance value.
+
 ## 2026-08-22 — `src/video_core/src/buffer_cache/buffer_cache.rs` vs `src/video_core/buffer_cache/buffer_cache_base.h` and `buffer_cache.h`
 
 ### Intentional differences

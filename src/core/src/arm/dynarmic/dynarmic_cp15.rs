@@ -41,17 +41,11 @@ pub struct DynarmicCP15 {
     pub uprw: u32,
     /// User read-only thread register (CP15 c13 c0 3)
     pub uro: u32,
-    /// Dummy value for flush prefetch buffer writes
-    dummy_value: u32,
 }
 
 impl DynarmicCP15 {
     pub fn new() -> Self {
-        Self {
-            uprw: 0,
-            uro: 0,
-            dummy_value: 0,
-        }
+        Self { uprw: 0, uro: 0 }
     }
 
     /// Handle MCR (write to coprocessor) operations.
@@ -259,4 +253,21 @@ pub enum GetOneWordResult {
 pub enum GetTwoWordsResult {
     Cntpct,
     Unhandled,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CoprocReg, DynarmicCP15, SendOneWordResult};
+
+    #[test]
+    fn flush_prefetch_buffer_is_classified_as_ignored_write() {
+        let mut cp15 = DynarmicCP15::new();
+
+        assert!(matches!(
+            cp15.compile_send_one_word(false, 0, CoprocReg::C7, CoprocReg::C5, 4),
+            SendOneWordResult::DummyWrite
+        ));
+        assert_eq!(cp15.uprw, 0);
+        assert_eq!(cp15.uro, 0);
+    }
 }
