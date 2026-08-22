@@ -6415,3 +6415,23 @@ vs Eden `display_list.h` and `layer_list.h`
   Focused coverage verifies the full implemented/null command partition, shared settings mutation,
   typed service identity, zero-count stubs, stable event identity, and final owner release. The
   unread BTM system fields are gone and `core` decreases from 58 to 57 warnings.
+
+## 2026-08-22 — `src/core/src/hle/service/caps/caps_c.rs` vs `src/core/hle/service/caps/caps_c.h` and `.cpp`
+
+### Intentional differences
+
+- Rust annotates the private `manager` field with `#[allow(dead_code)]`. Eden likewise retains the
+  constructor-provided shared `AlbumManager` without dereferencing it; the field remains in its
+  upstream owner to preserve lifetime and structure instead of being removed or renamed.
+
+### Unintentional differences (to fix)
+
+- None in the warning-producing ownership slice.
+
+### Missing items
+
+- None from `IAlbumControlService`; the command table and sole implemented command match Eden.
+
+### Binary layout verification
+
+- N/A: `IAlbumControlService` is not serialized or copied as a wire payload.

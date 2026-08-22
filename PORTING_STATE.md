@@ -1,5 +1,14 @@
 # Porting State
 
+## 2026-08-22 — CAPS album-manager ownership warning slice
+
+- Status: completed and verified for the `IAlbumControlService` ownership slice.
+- Eden retains its constructor-provided shared `AlbumManager` for the full interface lifetime even
+  though its only implemented command does not dereference it. Ruzu keeps the same owner and
+  suppresses the resulting Rust false positive on that field only.
+- A focused lifetime regression proves that constructing and dropping the service respectively
+  retains and releases the exact shared manager allocation.
+
 ## 2026-08-22 — BTM system-event warning interrupted by service-handler prerequisites
 
 - Status: interrupted before classifying the unread `IBtmSystemCore` event owners.
