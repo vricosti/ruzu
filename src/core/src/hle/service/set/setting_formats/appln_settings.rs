@@ -24,7 +24,7 @@ pub struct ApplnSettings {
     pub _reserved_0x54: [u8; 0x20],
 
     /// in_repair_process_enable_flag
-    pub in_repair_process_enable_flag: bool,
+    pub in_repair_process_enable_flag: u8,
 
     /// Padding
     pub _padding_0x75: [u8; 0x3],

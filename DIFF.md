@@ -5723,11 +5723,11 @@ Compared `system_settings.rs`, `private_settings.rs`, `device_settings.rs`, and
 
 ### Intentional differences
 
-- Eden value-initializes `SystemSettings` to all-zero bytes before assigning its defaults. A zero
-  `LanguageCode` is not a valid Rust enum discriminant, so Ruzu initializes that one field to
-  `Ja` inside `MaybeUninit` before materializing the zeroed structure. `default_system_settings`
-  then overwrites it with the configured language exactly as Eden does; the serialized result is
-  unchanged while the intermediate Rust value remains valid.
+- Eden stores C++ enums and booleans directly in the binary payload. Ruzu stores their exact
+  underlying `u64`/`u32`/`u8` representations in the format structs and converts at API
+  boundaries. This keeps every on-disk bit pattern representable (including an all-zero or
+  externally corrupted payload) without constructing invalid Rust enum or `bool` values; all
+  offsets and sizes remain identical to Eden.
 
 ### Fixed parity debt
 
@@ -5737,3 +5737,6 @@ Compared `system_settings.rs`, `private_settings.rs`, `device_settings.rs`, and
   author UUID, while private and device payloads remain fully zeroed.
 - Focused tests verify the four payload sizes, deterministic zero regions, and every non-zero
   system default assigned by Eden.
+- Replaced enum and `bool` fields in the persisted system/application payloads with raw wire
+  integers, making future byte-for-byte load/store safe while preserving every compile-time
+  offset assertion.

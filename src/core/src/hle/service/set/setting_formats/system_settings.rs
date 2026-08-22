@@ -6,12 +6,11 @@ use crate::hle::service::psc::time::common::{
     LocationName, SteadyClockTimePoint, SystemClockContext,
 };
 use crate::hle::service::set::settings_types::{
-    AccountNotificationSettings, AccountSettings, AudioOutputMode, ChineseTraditionalInputMethod,
-    CmuMode, ColorSet, ConsoleSleepPlan, ErrorReportSharePermission, EulaVersion,
-    HandheldSleepPlan, HdmiContentType, InitialLaunchSettingsPacked, KeyboardLayout, LanguageCode,
-    NotificationSettings, NotificationVolume, PrimaryAlbumStorage, QuestFlag, RgbRange,
-    SleepSettings, SystemRegionCode, TouchScreenMode, TvResolution, TvSettings,
-    AVAILABLE_LANGUAGE_CODES, LANGUAGE_TO_LAYOUT,
+    AccountNotificationSettings, AccountSettings, ChineseTraditionalInputMethod, CmuMode, ColorSet,
+    ConsoleSleepPlan, EulaVersion, HandheldSleepPlan, HdmiContentType, InitialLaunchSettingsPacked,
+    KeyboardLayout, NotificationSettings, NotificationVolume, PrimaryAlbumStorage, RgbRange,
+    SleepSettings, TouchScreenMode, TvResolution, TvSettings, AVAILABLE_LANGUAGE_CODES,
+    LANGUAGE_TO_LAYOUT,
 };
 use common::uuid::UUID;
 
@@ -28,7 +27,7 @@ pub struct SystemSettings {
 
     // offset 0x10
     /// nn::settings::LanguageCode
-    pub language_code: LanguageCode,
+    pub language_code: u64,
     /// Reserved
     pub _reserved_0x18: [u8; 0x38],
 
@@ -36,7 +35,7 @@ pub struct SystemSettings {
     /// nn::settings::system::NetworkSettings count
     pub network_setting_count: u32,
     /// wireless_lan_enable_flag
-    pub wireless_lan_enable_flag: bool,
+    pub wireless_lan_enable_flag: u8,
     pub _padding_0x55: [u8; 0x3],
     /// Reserved
     pub _reserved_0x58: [u8; 0x8],
@@ -49,13 +48,13 @@ pub struct SystemSettings {
     /// nn::settings::system::BluetoothDevicesSettings count
     pub bluetooth_device_settings_count: [u8; 0x4],
     /// bluetooth_enable_flag
-    pub bluetooth_enable_flag: bool,
+    pub bluetooth_enable_flag: u8,
     pub _padding_0x8065: [u8; 0x3],
     /// bluetooth_afh_enable_flag
-    pub bluetooth_afh_enable_flag: bool,
+    pub bluetooth_afh_enable_flag: u8,
     pub _padding_0x8069: [u8; 0x3],
     /// bluetooth_boost_enable_flag
-    pub bluetooth_boost_enable_flag: bool,
+    pub bluetooth_boost_enable_flag: u8,
     pub _padding_0x806d: [u8; 0x3],
     /// nn::settings::system::BluetoothDevicesSettings (first 10)
     pub bluetooth_device_settings_first_10: [[u8; 0x200]; 10],
@@ -89,7 +88,7 @@ pub struct SystemSettings {
 
     // offset 0x98F0
     /// external_rtc_reset_flag
-    pub external_rtc_reset_flag: bool,
+    pub external_rtc_reset_flag: u8,
     pub _padding_0x98f1: [u8; 0x3],
     /// Reserved
     pub _reserved_0x98f4: [u8; 0x3C],
@@ -102,19 +101,19 @@ pub struct SystemSettings {
 
     // offset 0x9970
     /// nn::settings::system::ErrorReportSharePermission
-    pub error_report_share_permission: ErrorReportSharePermission,
+    pub error_report_share_permission: u32,
     /// Reserved
     pub _reserved_0x9974: [u8; 0x3C],
 
     // offset 0x99B0
     /// nn::settings::system::KeyboardLayout
-    pub keyboard_layout: KeyboardLayout,
+    pub keyboard_layout: u32,
     /// Reserved
     pub _reserved_0x99b4: [u8; 0x3C],
 
     // offset 0x99F0
     /// web_inspector_flag
-    pub web_inspector_flag: bool,
+    pub web_inspector_flag: u8,
     pub _padding_0x99f1: [u8; 0x3],
 
     // offset 0x99F4
@@ -123,7 +122,7 @@ pub struct SystemSettings {
 
     // offset 0x99F8
     /// memory_usage_rate_flag
-    pub memory_usage_rate_flag: bool,
+    pub memory_usage_rate_flag: u8,
     pub _padding_0x99f9: [u8; 0x3],
     /// Reserved
     pub _reserved_0x99fc: [u8; 0x34],
@@ -159,7 +158,7 @@ pub struct SystemSettings {
 
     // offset 0xB110
     /// pctl_ready_flag
-    pub pctl_ready_flag: bool,
+    pub pctl_ready_flag: u8,
     pub _padding_0xb111: [u8; 0x3],
     /// Reserved
     pub _reserved_0xb114: [u8; 0x3C],
@@ -174,13 +173,13 @@ pub struct SystemSettings {
 
     // offset 0xB350
     /// nn::settings::system::ChineseTraditionalInputMethod
-    pub chinese_traditional_input_method: ChineseTraditionalInputMethod,
+    pub chinese_traditional_input_method: u32,
     /// Reserved
     pub _reserved_0xb354: [u8; 0x3C],
 
     // offset 0xB390
     /// zoom_flag
-    pub zoom_flag: bool,
+    pub zoom_flag: u8,
     pub _padding_0xb391: [u8; 0x3],
     /// Reserved
     pub _reserved_0xb394: [u8; 0x3C],
@@ -249,22 +248,22 @@ pub struct SystemSettings {
 
     // offset 0x29470
     /// lock_screen_flag
-    pub lock_screen_flag: bool,
+    pub lock_screen_flag: u8,
     pub _padding_0x29471: [u8; 0x3],
     /// Reserved
     pub _reserved_0x29474: [u8; 0x4],
 
     // offset 0x29478
     /// nn::settings::system::ColorSet
-    pub color_set_id: ColorSet,
+    pub color_set_id: u32,
 
     // offset 0x2947C
     /// nn::settings::system::QuestFlag
-    pub quest_flag: QuestFlag,
+    pub quest_flag: u8,
 
     // offset 0x29480
     /// nn::settings::system::SystemRegionCode
-    pub region_code: SystemRegionCode,
+    pub region_code: u32,
 
     // offset 0x29484
     /// InitialLaunchSettingsPacked
@@ -272,7 +271,7 @@ pub struct SystemSettings {
 
     // offset 0x294A0
     /// battery_percentage_flag
-    pub battery_percentage_flag: bool,
+    pub battery_percentage_flag: u8,
     pub _padding_0x294a1: [u8; 0x3],
 
     // offset 0x294A4
@@ -287,7 +286,7 @@ pub struct SystemSettings {
 
     // offset 0x294C0
     /// field_testing_flag
-    pub field_testing_flag: bool,
+    pub field_testing_flag: u8,
     pub _padding_0x294c1: [u8; 0x3],
 
     // offset 0x294C4
@@ -310,7 +309,7 @@ pub struct SystemSettings {
     pub network_system_clock_context: SystemClockContext,
     // offset 0x295C0
     /// user_system_clock_automatic_correction_enabled
-    pub user_system_clock_automatic_correction_enabled: bool,
+    pub user_system_clock_automatic_correction_enabled: u8,
     pub _padding_0x295c1: [u8; 0x3],
     /// Reserved
     pub _reserved_0x295c4: [u8; 0x4],
@@ -332,27 +331,27 @@ pub struct SystemSettings {
     /// nn::settings::system::AudioVolume type1
     pub audio_volume_type1: [u8; 0x8],
     /// AudioOutputMode hdmi
-    pub audio_output_mode_hdmi: AudioOutputMode,
+    pub audio_output_mode_hdmi: u32,
     /// AudioOutputMode speaker
-    pub audio_output_mode_speaker: AudioOutputMode,
+    pub audio_output_mode_speaker: u32,
     /// AudioOutputMode headphone
-    pub audio_output_mode_headphone: AudioOutputMode,
+    pub audio_output_mode_headphone: u32,
     /// force_mute_on_headphone_removed
-    pub force_mute_on_headphone_removed: bool,
+    pub force_mute_on_headphone_removed: u8,
     pub _padding_0x2970d: [u8; 0x3],
     /// headphone_volume_warning_count
     pub headphone_volume_warning_count: i32,
     /// heaphone_volume_update_flag (note: upstream typo preserved)
-    pub heaphone_volume_update_flag: bool,
+    pub heaphone_volume_update_flag: u8,
     pub _padding_0x29715: [u8; 0x3],
     /// nn::settings::system::AudioVolume type2
     pub audio_volume_type2: [u8; 0x8],
     /// AudioOutputMode type3
-    pub audio_output_mode_type3: AudioOutputMode,
+    pub audio_output_mode_type3: u32,
     /// AudioOutputMode type4
-    pub audio_output_mode_type4: AudioOutputMode,
+    pub audio_output_mode_type4: u32,
     /// hearing_protection_safeguard_flag
-    pub hearing_protection_safeguard_flag: bool,
+    pub hearing_protection_safeguard_flag: u8,
     pub _padding_0x29729: [u8; 0x3],
     /// Reserved
     pub _reserved_0x2972c: [u8; 0x4],
@@ -364,14 +363,14 @@ pub struct SystemSettings {
 
     // offset 0x29770
     /// console_information_upload_flag
-    pub console_information_upload_flag: bool,
+    pub console_information_upload_flag: u8,
     pub _padding_0x29771: [u8; 0x3],
     /// Reserved
     pub _reserved_0x29774: [u8; 0x3C],
 
     // offset 0x297B0
     /// automatic_application_download_flag
-    pub automatic_application_download_flag: bool,
+    pub automatic_application_download_flag: u8,
     pub _padding_0x297b1: [u8; 0x3],
     /// Reserved
     pub _reserved_0x297b4: [u8; 0x4],
@@ -399,7 +398,7 @@ pub struct SystemSettings {
 
     // offset 0x29A44
     /// usb_full_key_enable_flag
-    pub usb_full_key_enable_flag: bool,
+    pub usb_full_key_enable_flag: u8,
     pub _padding_0x29a45: [u8; 0x3],
 
     // offset 0x29A48
@@ -410,7 +409,7 @@ pub struct SystemSettings {
 
     // offset 0x29A68
     /// nn::settings::system::TouchScreenMode
-    pub touch_screen_mode: TouchScreenMode,
+    pub touch_screen_mode: u32,
     /// Reserved
     pub _reserved_0x29a6c: [u8; 0x14],
 
@@ -440,7 +439,7 @@ pub struct SystemSettings {
 
     // offset 0x29ED4
     /// requires_run_repair_time_reviser
-    pub requires_run_repair_time_reviser: bool,
+    pub requires_run_repair_time_reviser: u8,
     /// Reserved
     pub _reserved_0x29ed5: [u8; 0x6B],
 
@@ -458,26 +457,26 @@ pub struct SystemSettings {
 
     // offset 0x2A040
     /// nn::settings::system::PrimaryAlbumStorage
-    pub primary_album_storage: PrimaryAlbumStorage,
+    pub primary_album_storage: u32,
     /// Reserved
     pub _reserved_0x2a044: [u8; 0x3C],
 
     // offset 0x2A080
     /// usb_30_enable_flag
-    pub usb_30_enable_flag: bool,
+    pub usb_30_enable_flag: u8,
     pub _padding_0x2a081: [u8; 0x3],
     /// usb_30_host_enable_flag
-    pub usb_30_host_enable_flag: bool,
+    pub usb_30_host_enable_flag: u8,
     pub _padding_0x2a085: [u8; 0x3],
     /// usb_30_device_enable_flag
-    pub usb_30_device_enable_flag: bool,
+    pub usb_30_device_enable_flag: u8,
     pub _padding_0x2a089: [u8; 0x3],
     /// Reserved
     pub _reserved_0x2a08c: [u8; 0x34],
 
     // offset 0x2A0C0
     /// nfc_enable_flag
-    pub nfc_enable_flag: bool,
+    pub nfc_enable_flag: u8,
     pub _padding_0x2a0c1: [u8; 0x3],
     /// Reserved
     pub _reserved_0x2a0c4: [u8; 0x3C],
@@ -507,7 +506,7 @@ pub struct SystemSettings {
 
     // offset 0x2AA50
     /// auto_update_enable_flag
-    pub auto_update_enable_flag: bool,
+    pub auto_update_enable_flag: u8,
     pub _padding_0x2aa51: [u8; 0x3],
     /// Reserved
     pub _reserved_0x2aa54: [u8; 0x4C],
@@ -608,15 +607,9 @@ const _: () = {
 
 impl Default for SystemSettings {
     fn default() -> Self {
-        let mut settings = core::mem::MaybeUninit::<Self>::zeroed();
-
-        // SAFETY: Every byte is initialized by `zeroed`. Zero is a valid representation for all
-        // fields except `LanguageCode`, which is written with a valid discriminant before the
-        // value is materialized. This is the Rust counterpart of upstream `SystemSettings{}`.
-        unsafe {
-            core::ptr::addr_of_mut!((*settings.as_mut_ptr()).language_code).write(LanguageCode::Ja);
-            settings.assume_init()
-        }
+        // SAFETY: Serialized enums and booleans use their raw integer representations, so every
+        // all-zero bit pattern is valid. This matches upstream `SystemSettings{}`.
+        unsafe { core::mem::zeroed() }
     }
 }
 
@@ -645,7 +638,7 @@ pub fn default_system_settings() -> SystemSettings {
     settings.version = 0x140000;
     settings.flags = 7;
     settings.mii_author_id = UUID::make_default().uuid;
-    settings.color_set_id = ColorSet::BasicWhite;
+    settings.color_set_id = ColorSet::BasicWhite as u32;
 
     settings.notification_settings.flags.raw = 0x300;
     settings.notification_settings.volume = NotificationVolume::High as u32;
@@ -671,24 +664,24 @@ pub fn default_system_settings() -> SystemSettings {
     settings.sleep_settings.console_sleep_plan = ConsoleSleepPlan::Sleep1Hour as u32;
 
     settings.device_time_zone_location_name[..3].copy_from_slice(b"UTC");
-    settings.user_system_clock_automatic_correction_enabled = true;
-    settings.primary_album_storage = PrimaryAlbumStorage::SdCard;
-    settings.battery_percentage_flag = true;
-    settings.chinese_traditional_input_method = ChineseTraditionalInputMethod::Unknown0;
+    settings.user_system_clock_automatic_correction_enabled = 1;
+    settings.primary_album_storage = PrimaryAlbumStorage::SdCard as u32;
+    settings.battery_percentage_flag = 1;
+    settings.chinese_traditional_input_method = ChineseTraditionalInputMethod::Unknown0 as u32;
     settings.vibration_master_volume = 1.0;
-    settings.touch_screen_mode = TouchScreenMode::Standard;
-    settings.nfc_enable_flag = true;
-    settings.bluetooth_enable_flag = true;
-    settings.wireless_lan_enable_flag = true;
+    settings.touch_screen_mode = TouchScreenMode::Standard as u32;
+    settings.nfc_enable_flag = 1;
+    settings.bluetooth_enable_flag = 1;
+    settings.wireless_lan_enable_flag = 1;
 
     let language_index = *common::settings::values().language_index.get_value() as u32 as usize;
     let language_code = AVAILABLE_LANGUAGE_CODES[language_index];
-    settings.language_code = language_code;
+    settings.language_code = language_code as u64;
     settings.keyboard_layout = LANGUAGE_TO_LAYOUT
         .iter()
         .find(|(candidate, _)| *candidate == language_code)
         .map(|(_, layout)| *layout)
-        .unwrap_or(KeyboardLayout::EnglishUs);
+        .unwrap_or(KeyboardLayout::EnglishUs) as u32;
 
     settings
 }
@@ -711,8 +704,8 @@ mod tests {
         assert_eq!(core::mem::size_of_val(&settings), 0x336A0);
         assert_eq!(settings.version, 0x140000);
         assert_eq!(settings.flags, 7);
-        assert_eq!(settings.language_code, expected_language);
-        assert_eq!(settings.keyboard_layout, expected_layout);
+        assert_eq!(settings.language_code, expected_language as u64);
+        assert_eq!(settings.keyboard_layout, expected_layout as u32);
         assert_eq!(settings.mii_author_id, UUID::make_default().uuid);
         assert_eq!(settings.notification_settings.flags.raw, 0x300);
         assert_eq!(settings.notification_settings.volume, 2);
@@ -727,17 +720,20 @@ mod tests {
         assert_eq!(settings.sleep_settings.handheld_sleep_plan, 3);
         assert_eq!(settings.sleep_settings.console_sleep_plan, 0);
         assert_eq!(&settings.device_time_zone_location_name[..4], b"UTC\0");
-        assert_eq!(settings.primary_album_storage, PrimaryAlbumStorage::SdCard);
-        assert!(settings.user_system_clock_automatic_correction_enabled);
-        assert!(settings.battery_percentage_flag);
-        assert!(settings.nfc_enable_flag);
-        assert!(settings.bluetooth_enable_flag);
-        assert!(settings.wireless_lan_enable_flag);
+        assert_eq!(
+            settings.primary_album_storage,
+            PrimaryAlbumStorage::SdCard as u32
+        );
+        assert_eq!(settings.user_system_clock_automatic_correction_enabled, 1);
+        assert_eq!(settings.battery_percentage_flag, 1);
+        assert_eq!(settings.nfc_enable_flag, 1);
+        assert_eq!(settings.bluetooth_enable_flag, 1);
+        assert_eq!(settings.wireless_lan_enable_flag, 1);
     }
 
     #[test]
-    fn zero_base_has_a_valid_language_discriminant() {
+    fn zero_base_preserves_raw_wire_values() {
         let settings = SystemSettings::default();
-        assert_eq!(settings.language_code, LanguageCode::Ja);
+        assert_eq!(settings.language_code, 0);
     }
 }
