@@ -43,12 +43,56 @@ pub mod commands {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(i32)]
 enum NetDbError {
-    Internal = -1,
     Success = 0,
     HostNotFound = 1,
     TryAgain = 2,
-    NoRecovery = 3,
-    NoData = 4,
+}
+
+const BLOCKED_DOMAINS: &[&str] = &[
+    "srv.nintendo.net",
+    "nintendo.es",
+    "nintendowifi.net",
+    "nintendo-europe.com",
+    "nintendo.com.hk",
+    "nintendo.com.au",
+    "nintendo.co.kr",
+    "nintendo.co.uk",
+    "nintendo.co.jp",
+    "nintendo.co.nz",
+    "nintendo.co.za",
+    "nintendo.com",
+    "nintendo.jp",
+    "nintendo.tw",
+    "nintendo.at",
+    "nintendo.be",
+    "nintendo.dk",
+    "nintendo.de",
+    "nintendo.fi",
+    "nintendo.fr",
+    "nintendo.gr",
+    "nintendo.hu",
+    "nintendo.it",
+    "nintendo.nl",
+    "nintendo.no",
+    "nintendo.pt",
+    "nintendo.ru",
+    "nintendo.ch",
+    "nintendo.se",
+    "nintendoswitch.com.cn",
+    "nintendoswitch.com",
+    "sun.hac.lp1.d4c.nintendo.net",
+    "phoenix-api.wbagora.com",
+    "battle.net",
+    "microsoft.com",
+    "mojang.com",
+    "xboxlive.com",
+    "api.epicgames.dev",
+    "minecraftservices.com",
+    "508223012e5a5ff19f30a391b2bdadc0.my.2k.com",
+];
+
+fn is_blocked_host(host: &str) -> bool {
+    BLOCKED_DOMAINS.iter().any(|domain| host.contains(domain))
 }
 
 /// Corresponds to `GetAddrInfoErrorToNetDbError` in upstream sfdnsres.cpp.
@@ -260,7 +304,7 @@ impl Sfdnsres {
         // For now, ignore options, which are in input buffer 1 for GetHostByNameRequestWithOptions.
 
         // Prevent resolution of Nintendo servers.
-        if host.contains("srv.nintendo.net") {
+        if is_blocked_host(&host) {
             log::warn!(
                 "Resolution of hostname {} requested, returning EAI_AGAIN",
                 host
@@ -319,7 +363,7 @@ impl Sfdnsres {
         let host = common::string_util::string_from_buffer(&host_buffer);
 
         // Prevent resolution of Nintendo servers.
-        if host.contains("srv.nintendo.net") {
+        if is_blocked_host(&host) {
             log::warn!(
                 "Resolution of hostname {} requested, returning EAI_AGAIN",
                 host
@@ -616,5 +660,42 @@ impl ServiceFramework for DnsPriv {
     }
     fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
         &self.handlers_tipc
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn netdb_mapping_matches_console_verified_upstream_cases() {
+        assert_eq!(
+            get_addr_info_error_to_netdb_error(GetAddrInfoError::SUCCESS),
+            NetDbError::Success
+        );
+        assert_eq!(
+            get_addr_info_error_to_netdb_error(GetAddrInfoError::AGAIN),
+            NetDbError::TryAgain
+        );
+        assert_eq!(
+            get_addr_info_error_to_netdb_error(GetAddrInfoError::NODATA),
+            NetDbError::HostNotFound
+        );
+        assert_eq!(
+            get_addr_info_error_to_netdb_error(GetAddrInfoError::SERVICE),
+            NetDbError::Success
+        );
+        assert_eq!(
+            get_addr_info_error_to_netdb_error(GetAddrInfoError::FAIL),
+            NetDbError::HostNotFound
+        );
+    }
+
+    #[test]
+    fn blocked_host_matching_uses_edens_substring_policy() {
+        assert!(is_blocked_host("sun.hac.lp1.d4c.nintendo.net"));
+        assert!(is_blocked_host("subdomain.nintendo.com.example.org"));
+        assert!(is_blocked_host("api.epicgames.dev"));
+        assert!(!is_blocked_host("libretro.com"));
     }
 }

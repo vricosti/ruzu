@@ -5832,3 +5832,19 @@ vs Eden `display_list.h` and `layer_list.h`
   successful reuse selects the first free slot and advances the monotonic ID exactly once.
 - Focused eight-slot exhaustion/reuse tests cover Eden's display IDs starting at zero and layer
   IDs starting at one. Both previously unused-helper warnings are gone.
+
+## 2026-08-22 — `sfdnsres.rs` NetDB mapping and blocked hosts vs Eden
+`sfdnsres.{h,cpp}`
+
+### Intentional differences
+
+- Eden retains `NetDbError::{Internal,NoRecovery,NoData}`, but its console-verified mapping and
+  every response path can only construct `Success`, `HostNotFound`, or `TryAgain`. Ruzu omits the
+  three unreachable discriminants while preserving their numeric values for all emitted results.
+
+### Fixed parity debt
+
+- Restored Eden's complete blocked-domain table and shared substring helper in both hostname and
+  addrinfo resolution paths. Ruzu previously checked only `srv.nintendo.net` inline.
+- Focused tests cover all distinct upstream NetDB mapping outcomes and the exact substring policy;
+  the unused-variant warning is gone.
