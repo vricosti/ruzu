@@ -1,8 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-//! Port of zuyu/src/core/hle/service/am/service/storage.h
-//! Port of zuyu/src/core/hle/service/am/service/storage.cpp
+//! Port of Eden's `core/hle/service/am/service/storage.{h,cpp}`.
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
@@ -67,6 +66,40 @@ impl IStorage {
         self.backing.lock().unwrap().get_data()
     }
 
+    /// Port of `IStorage::Open`.
+    fn open(&self) -> Result<Arc<IStorageAccessor>, ResultCode> {
+        if self
+            .backing
+            .lock()
+            .unwrap()
+            .get_handle_object_id()
+            .is_some()
+        {
+            return Err(am_results::RESULT_INVALID_STORAGE_TYPE);
+        }
+        Ok(Arc::new(IStorageAccessor::new(
+            self.system,
+            Arc::clone(&self.backing),
+        )))
+    }
+
+    /// Port of `IStorage::OpenTransferStorage`.
+    fn open_transfer_storage(&self) -> Result<Arc<ITransferStorageAccessor>, ResultCode> {
+        if self
+            .backing
+            .lock()
+            .unwrap()
+            .get_handle_object_id()
+            .is_none()
+        {
+            return Err(am_results::RESULT_INVALID_STORAGE_TYPE);
+        }
+        Ok(Arc::new(ITransferStorageAccessor::new(
+            self.system,
+            Arc::clone(&self.backing),
+        )))
+    }
+
     fn push_interface_response(
         ctx: &mut HLERequestContext,
         object: Arc<dyn SessionRequestHandler>,
@@ -83,22 +116,13 @@ impl IStorage {
         let storage = unsafe { &*(this as *const dyn ServiceFramework as *const IStorage) };
         log::debug!("IStorage::Open called");
 
-        // Check that the backing storage does not have a transfer memory handle.
-        // If it does, Open is invalid — use OpenTransferStorage instead.
-        let has_handle = storage
-            .backing
-            .lock()
-            .unwrap()
-            .get_handle_object_id()
-            .is_some();
-        if has_handle {
-            let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
-            rb.push_result(am_results::RESULT_INVALID_STORAGE_TYPE);
-            return;
+        match storage.open() {
+            Ok(accessor) => Self::push_interface_response(ctx, accessor),
+            Err(result) => {
+                let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+                rb.push_result(result);
+            }
         }
-
-        let accessor = Arc::new(IStorageAccessor::new(storage.backing.clone()));
-        Self::push_interface_response(ctx, accessor);
     }
 
     /// Port of IStorage::OpenTransferStorage
@@ -108,21 +132,13 @@ impl IStorage {
         let storage = unsafe { &*(this as *const dyn ServiceFramework as *const IStorage) };
         log::debug!("IStorage::OpenTransferStorage called");
 
-        // Check that the backing storage has a transfer memory handle.
-        let has_handle = storage
-            .backing
-            .lock()
-            .unwrap()
-            .get_handle_object_id()
-            .is_some();
-        if !has_handle {
-            let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
-            rb.push_result(am_results::RESULT_INVALID_STORAGE_TYPE);
-            return;
+        match storage.open_transfer_storage() {
+            Ok(accessor) => Self::push_interface_response(ctx, accessor),
+            Err(result) => {
+                let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+                rb.push_result(result);
+            }
         }
-
-        let accessor = Arc::new(ITransferStorageAccessor::new(storage.backing.clone()));
-        Self::push_interface_response(ctx, accessor);
     }
 }
 
@@ -147,5 +163,21 @@ impl ServiceFramework for IStorage {
 
     fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
         &self.handlers_tipc
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn buffer_storage_opens_only_the_regular_accessor() {
+        let storage = IStorage::new_with_system(SystemRef::null(), vec![1, 2, 3]);
+
+        assert!(storage.open().is_ok());
+        assert!(matches!(
+            storage.open_transfer_storage(),
+            Err(result) if result == am_results::RESULT_INVALID_STORAGE_TYPE
+        ));
     }
 }

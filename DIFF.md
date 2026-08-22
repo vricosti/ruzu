@@ -6187,3 +6187,23 @@ vs Eden `display_list.h` and `layer_list.h`
 - A focused regression verifies single process ownership after construction, release on controller
   destruction and both command registrations. The unread field warning is gone and `core`
   decreases from 67 to 66 warnings.
+
+## 2026-08-22 — `am/service/storage.rs` and `storage_accessor.rs` vs Eden
+`am/service/storage.{h,cpp}` and `storage_accessor.{h,cpp}`
+
+### Intentional differences
+
+- Eden's `ServiceFramework` base stores the `System` reference on every storage accessor. Rust's
+  trait has no corresponding base state, so accessor constructors accept the forwarded
+  `SystemRef` to preserve construction ownership but do not retain another unused copy.
+- The systemless `IStorage::new` convenience delegates to a null `SystemRef` for isolated callers;
+  every AM-owned construction path uses `new_with_system` or `new_with_backing` and forwards the
+  active system.
+
+### Fixed parity debt
+
+- Split `Open` and `OpenTransferStorage` behavior from their IPC adapters and restored Eden's
+  `IStorage` → accessor system flow. Regular storage still rejects transfer access and handled
+  storage still rejects normal access with `ResultInvalidStorageType`.
+- A focused regression covers the buffer-storage branch and its exact invalid-type result. The
+  unread `IStorage::system` warning is gone and `core` decreases from 66 to 65 warnings.

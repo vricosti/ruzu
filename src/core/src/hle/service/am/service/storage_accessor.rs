@@ -1,12 +1,12 @@
 // SPDX-FileCopyrightText: Copyright 2024 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-//! Port of zuyu/src/core/hle/service/am/service/storage_accessor.h
-//! Port of zuyu/src/core/hle/service/am/service/storage_accessor.cpp
+//! Port of Eden's `core/hle/service/am/service/storage_accessor.{h,cpp}`.
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
+use crate::core::SystemRef;
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 use crate::hle::service::am::library_applet_storage::LibraryAppletStorage;
 use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
@@ -35,7 +35,7 @@ pub struct IStorageAccessor {
 }
 
 impl IStorageAccessor {
-    pub fn new(backing: Arc<Mutex<dyn LibraryAppletStorage>>) -> Self {
+    pub fn new(_system: SystemRef, backing: Arc<Mutex<dyn LibraryAppletStorage>>) -> Self {
         let handlers = build_handler_map(&[
             (0, Some(Self::get_size_handler), "GetSize"),
             (10, Some(Self::write_handler), "Write"),
@@ -187,7 +187,7 @@ pub struct ITransferStorageAccessor {
 }
 
 impl ITransferStorageAccessor {
-    pub fn new(backing: Arc<Mutex<dyn LibraryAppletStorage>>) -> Self {
+    pub fn new(_system: SystemRef, backing: Arc<Mutex<dyn LibraryAppletStorage>>) -> Self {
         let handlers = build_handler_map(&[
             (0, Some(Self::get_size_handler), "GetSize"),
             (1, Some(Self::get_handle_handler), "GetHandle"),
