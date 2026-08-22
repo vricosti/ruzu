@@ -5452,3 +5452,11 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 - Rust field-level `dead_code` annotations document the four constructor-state members that Eden
   stores but does not read after construction. Their names, values, placement, and ownership stay
   aligned with `IPC::ResponseBuilder`; only the Rust diagnostic is suppressed.
+
+## 2026-08-22 — `server_manager.rs` host-thread naming vs `server_manager.{h,cpp}`
+
+### Fixed parity debt
+
+- Removed an unused generic thread-name formatter with no Eden counterpart. Additional service
+  thread names remain constructed by `start_additional_host_threads`, matching Eden's method
+  ownership and `name:index` format.

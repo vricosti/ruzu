@@ -538,14 +538,6 @@ impl ServerManager {
         self.system.get().service_manager()
     }
 
-    pub(crate) fn thread_name(&self) -> String {
-        if self.name.is_empty() {
-            "ServiceServer".to_string()
-        } else {
-            format!("HLE:{}", self.name)
-        }
-    }
-
     /// Registers a session with a manager.
     /// Port of upstream `ServerManager::RegisterSession`.
     pub fn register_session(
