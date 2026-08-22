@@ -1,5 +1,23 @@
 # Porting State
 
+## 2026-08-22 — Friend service warning slice interrupted by method-ownership prerequisite
+
+- Status: interrupted before correcting the unread Friend service/event owners.
+- Interrupted slice: consume `IFriendService::service_context`,
+  `INotificationService::{uuid,service_context}`, and `Friend::{system,module}` according to Eden's
+  event and interface lifetimes.
+- Exact missing prerequisite: Eden owns `Module::Interface::{CreateFriendService,
+  CreateNotificationService}` in `friend.cpp`, while Ruzu currently places both methods and their
+  IPC handlers in `friend_interface.rs`. This violates the upstream method boundary and obscures
+  that `system` must be forwarded to both created interfaces.
+- Required next action: move those methods and handlers to `friend.rs` without changing behavior,
+  verify the handler table remains owned by the `Friend` constructor in `friend_interface.rs`, then
+  resume event lifecycle and command parity.
+- Prerequisite result: the two methods, their IPC handlers and response helper now live in
+  `friend.rs`; `friend_interface.rs` retains only the concrete `Friend` constructor, command table
+  and framework implementation. The three-entry callback partition is covered by a focused test.
+- Status: prerequisite completed and warning slice resumed.
+
 ## 2026-08-22 — CAPS album-manager ownership warning slice
 
 - Status: completed and verified for the `IAlbumControlService` ownership slice.

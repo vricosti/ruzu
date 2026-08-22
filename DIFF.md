@@ -6435,3 +6435,27 @@ vs Eden `display_list.h` and `layer_list.h`
 ### Binary layout verification
 
 - N/A: `IAlbumControlService` is not serialized or copied as a wire payload.
+
+## 2026-08-22 — `src/core/src/hle/service/friend/{friend.rs,friend_interface.rs}` vs `src/core/hle/service/friend/{friend.cpp,friend_interface.cpp}`
+
+### Intentional differences
+
+- Rust flattens Eden's `Module::Interface` base into the concrete `Friend` allocation. Its two
+  `Create*` methods are nevertheless implemented in `friend.rs`, while the concrete constructor
+  and command table remain in `friend_interface.rs` with their upstream owners.
+- The flattened fields are `pub(super)` solely so the sibling `friend.rs` implementation can
+  access the same allocation; they remain private outside the Friend service module.
+
+### Unintentional differences (to fix)
+
+- The event lifecycle, system forwarding and implemented command-table differences remain the
+  interrupted warning slice and are resumed after this ownership prerequisite.
+
+### Missing items
+
+- This structural prerequisite adds no missing method; it only relocates the existing methods to
+  their upstream-owned Rust counterpart.
+
+### Binary layout verification
+
+- N/A: the service objects are not serialized or copied as wire payloads.

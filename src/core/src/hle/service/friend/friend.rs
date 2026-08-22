@@ -92,6 +92,62 @@ impl Module {
     }
 }
 
+// These methods are the Rust counterpart of `Module::Interface` in upstream
+// `friend.cpp`. The concrete `Friend` constructor and command table remain in
+// `friend_interface.rs`, matching `friend_interface.cpp`.
+impl super::friend_interface::Friend {
+    /// CreateFriendService (cmd 0).
+    pub fn create_friend_service(&self) -> IFriendService {
+        log::debug!("Friend({})::create_friend_service called", self.name);
+        IFriendService::new()
+    }
+
+    /// CreateNotificationService (cmd 1).
+    pub fn create_notification_service(&self, uuid: UUID) -> INotificationService {
+        log::debug!(
+            "Friend({})::create_notification_service called, uuid=0x{}",
+            self.name,
+            uuid.raw_string()
+        );
+        INotificationService::new(uuid)
+    }
+
+    fn push_interface_response(
+        ctx: &mut HLERequestContext,
+        object: Arc<dyn SessionRequestHandler>,
+    ) {
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 1);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_ipc_interface(object);
+    }
+
+    fn cast(this: &dyn ServiceFramework) -> &Self {
+        unsafe { &*(this as *const dyn ServiceFramework as *const Self) }
+    }
+
+    pub(super) fn create_friend_service_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        let this = Self::cast(this);
+        log::debug!("Friend({})::CreateFriendService called", this.name);
+        let service: Arc<dyn SessionRequestHandler> = Arc::new(this.create_friend_service());
+        Self::push_interface_response(ctx, service);
+    }
+
+    pub(super) fn create_notification_service_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        let this = Self::cast(this);
+        let mut rp = RequestParser::new(ctx);
+        let uuid = rp.pop_raw::<UUID>();
+        let service: Arc<dyn SessionRequestHandler> =
+            Arc::new(this.create_notification_service(uuid));
+        Self::push_interface_response(ctx, service);
+    }
+}
+
 /// IFriendService.
 pub struct IFriendService {
     handlers: BTreeMap<u32, FunctionInfo>,
