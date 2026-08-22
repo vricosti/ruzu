@@ -22,6 +22,7 @@ use crate::frontend::applets::profile_select::{DefaultProfileSelectApplet, Profi
 use crate::frontend::applets::software_keyboard::{
     DefaultSoftwareKeyboardApplet, SoftwareKeyboardApplet,
 };
+use crate::frontend::applets::web_browser::{DefaultWebBrowserApplet, WebBrowserApplet};
 use crate::hle::result::ResultCode;
 use crate::hle::service::am::am_types::{AppletId, LibraryAppletMode};
 use crate::hle::service::am::applet::Applet;
@@ -34,6 +35,7 @@ use super::applet_general::{Auth, PhotoViewer, StubApplet};
 use super::applet_mii_edit::MiiEdit;
 use super::applet_profile_select::ProfileSelect;
 use super::applet_software_keyboard::SoftwareKeyboard;
+use super::applet_web_browser::WebBrowser;
 
 /// Base trait for all frontend applet implementations.
 ///
@@ -62,6 +64,7 @@ pub struct FrontendAppletSet {
     pub photo_viewer: Option<Arc<dyn PhotoViewerApplet>>,
     pub profile_select: Option<Arc<dyn ProfileSelectApplet>>,
     pub software_keyboard: Option<Arc<dyn SoftwareKeyboardApplet>>,
+    pub web_browser: Option<Arc<dyn WebBrowserApplet>>,
 }
 
 pub struct FrontendAppletHolder {
@@ -82,6 +85,7 @@ impl FrontendAppletHolder {
                 photo_viewer: Some(Arc::new(DefaultPhotoViewerApplet)),
                 profile_select: Some(Arc::new(DefaultProfileSelectApplet)),
                 software_keyboard: Some(Arc::new(DefaultSoftwareKeyboardApplet::new())),
+                web_browser: Some(Arc::new(DefaultWebBrowserApplet)),
             },
         }
     }
@@ -112,6 +116,9 @@ impl FrontendAppletHolder {
         }
         if set.software_keyboard.is_some() {
             self.frontend.software_keyboard = set.software_keyboard.take();
+        }
+        if set.web_browser.is_some() {
+            self.frontend.web_browser = set.web_browser.take();
         }
     }
 
@@ -213,6 +220,23 @@ impl FrontendAppletHolder {
                         .expect("default photo-viewer applet is installed"),
                 ),
             ))),
+            AppletId::Web
+            | AppletId::Shop
+            | AppletId::OfflineWeb
+            | AppletId::LoginShare
+            | AppletId::WebAuth
+            | AppletId::Lhub => Some(Box::new(WebBrowser::new(
+                system,
+                applet,
+                broker,
+                mode,
+                Arc::clone(
+                    self.frontend
+                        .web_browser
+                        .as_ref()
+                        .expect("default web-browser applet is installed"),
+                ),
+            ))),
             _ => {
                 log::error!("No backend implementation exists for applet_id={id:?}; falling back to stub applet");
                 Some(Box::new(StubApplet::new(system, applet, broker, id, mode)))
@@ -275,6 +299,7 @@ mod tests {
             photo_viewer: None,
             profile_select: None,
             software_keyboard: None,
+            web_browser: None,
         });
 
         assert!(Arc::ptr_eq(

@@ -143,7 +143,7 @@ const EXPECTED_MAGIC: u32 = 0x36F81A1E;
 /// Upstream `(FontArchives, file_name)` table — the encrypted font file inside
 /// each system NCA's RomFS. Matches
 /// `zuyu/src/core/hle/service/ns/platform_service_manager.h::SHARED_FONTS`.
-const SHARED_FONT_FILE_NAMES: [(FontArchives, &str); 7] = [
+pub const SHARED_FONT_FILE_NAMES: [(FontArchives, &str); 7] = [
     (FontArchives::Standard, "nintendo_udsg-r_std_003.bfttf"),
     (
         FontArchives::ChineseSimple,

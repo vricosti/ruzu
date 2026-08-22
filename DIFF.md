@@ -5592,3 +5592,23 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 ### Missing items
 
 - None in this setting slice.
+## 2026-08-22 — Web frontend applet ownership vs Eden
+`src/core/hle/service/am/frontend/applet_web_browser.{h,cpp}`,
+`src/core/hle/service/am/frontend/applets.{h,cpp}` and
+`src/core/frontend/applets/web_browser.{h,cpp}`
+
+### Intentional differences
+
+- Ruzu serializes the legacy and TLV return buffers field-by-field into zeroed byte vectors;
+  Eden zero-initializes the corresponding C++ structs and copies them with `memcpy`. This keeps
+  the same 0x1010/0x2000 wire bytes without reading Rust padding.
+- Frontend callbacks retain the broker, weak applet owner and completion flags in `Arc`s so an
+  asynchronous Rust frontend cannot borrow `WebBrowser`; a separate `frontend_executing` flag
+  defers owner locking when Eden's default frontend invokes the callback synchronously.
+- Cache paths use Ruzu's cache root name while preserving Eden's `fonts` and
+  `offline_web_applet_<resource>/<title-id>` layout.
+- Malformed shared-font files and unavailable optional Rust subsystem owners are logged and
+  skipped instead of permitting C++ size underflow or dereferencing a null optional owner.
+- `GetInputTLVData` mechanically consults `InputTLVExistsInMap` before indexing the map. Eden's two
+  helpers are behaviorally equivalent but independent; the Rust call preserves both upstream
+  helper owners without leaving one dead.

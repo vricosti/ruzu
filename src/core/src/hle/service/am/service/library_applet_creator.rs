@@ -127,6 +127,7 @@ impl ILibraryAppletCreator {
             0x18 => AppletId::LoginShare,
             0x19 => AppletId::WebAuth,
             0x1A => AppletId::MyPage,
+            0x35 => AppletId::Lhub,
             _ => return None,
         })
     }

@@ -16,6 +16,12 @@
 - Prerequisite result: `Values` now owns `disable_web_applet`, registers it in the Debugging
   category and uses Eden's `true` default. The focused default/category regression passes; the
   WebBrowser slice is resumed.
+- Resumed result: `applet_web_browser.rs` now owns Eden's web-argument parser, shim
+  initialization/execution, shared-font and offline-RomFS extraction, old/TLV result encoding,
+  frontend callbacks and completion lifecycle. `FrontendAppletHolder` installs and routes the
+  browser backend for every upstream web applet ID, including the restored `AppletId::Lhub`.
+  Focused parser, URL, wire-output and holder tests pass; `cargo check -p ruzu` succeeds and the
+  original `WebBrowser.complete` warning is gone.
 
 ## 2026-08-22 — Resource-limit wait lifecycle
 

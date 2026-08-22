@@ -493,6 +493,7 @@ fn run_boot(
                 photo_viewer: None,
                 profile_select: None,
                 software_keyboard,
+                web_browser: None,
             },
         );
     }

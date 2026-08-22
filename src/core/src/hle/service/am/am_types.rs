@@ -110,6 +110,7 @@ pub enum AppletId {
     LoginShare = 0x18,
     WebAuth = 0x19,
     MyPage = 0x1A,
+    Lhub = 0x35,
 }
 
 #[repr(u64)]
