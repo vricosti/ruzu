@@ -877,3 +877,22 @@
 - Status: completed and verified for the `LANDiscovery` warning slice. The separate
   `IUserLocalCommunicationService` IPC command-table debt remains outside this warning-triggered
   slice and must be ported in its own auditable change.
+
+## 2026-08-22 — application-creator warning interrupted by process-creation prerequisite
+
+- Interrupted slice: consume `IApplicationCreator::window_system` through Eden's
+  `CreateApplication` and `CreateSystemApplication` command paths.
+- Exact missing prerequisite: `am/process_creation.rs::create_application_process` is still a
+  no-op stub. Eden's `CreateGuestApplication` must use that owner to initialize the process, read
+  control data, construct the launch property and register both records with ARP before tracking
+  the applet.
+- Required next action: port `CreateApplicationProcess` in `process_creation.rs` using the existing
+  content-provider, loader, patch-manager, filesystem-controller and ARP APIs; verify it against
+  Eden and commit it independently before resuming `application_creator.rs`.
+- Resume condition: the helper returns an initialized process together with Eden's control/loader
+  outputs, preserves ARP registration ordering and has focused failure/launch-property coverage.
+- Prerequisite result: `CreateProcessImpl`, `CreateApplicationProcess`, and `ReinitializeProcess`
+  are now ported in `process_creation.rs`. Loader assignment precedes initialization, failed NACP
+  reads produce an exact zeroed `RawNACP`, launch properties use the installed-content slots and
+  game version, and ARP registration occurs only after successful process creation.
+- Status: prerequisite completed and verified; resume `application_creator.rs`.

@@ -6,6 +6,7 @@
 use std::sync::{Arc, Mutex};
 
 use crate::file_sys::content_archive::NCA;
+use crate::file_sys::control_metadata::{RawNACP, NACP};
 use crate::file_sys::nca_metadata::ContentRecordType;
 use crate::file_sys::partition_filesystem::ResultStatus as FileSysResultStatus;
 use crate::file_sys::patch_manager::PatchManager;
@@ -13,10 +14,34 @@ use crate::file_sys::registered_cache::{
     get_update_title_id, ContentProvider, ContentProviderUnion, ContentProviderUnionSlot,
 };
 use crate::file_sys::romfs_factory::StorageId;
+use crate::file_sys::vfs::vfs_types::VirtualFile;
 use crate::hle::service::filesystem::filesystem::FileSystemController;
 use crate::hle::service::glue::glue_manager::ApplicationLaunchProperty;
 use crate::hle::service::os::process::Process;
-use crate::loader::loader::{get_loader, ResultStatus, System as LoaderSystem};
+use crate::loader::loader::{get_loader, AppLoader, ResultStatus, System as LoaderSystem};
+
+/// Port of upstream anonymous `CreateProcessImpl`.
+fn create_process_impl(
+    out_loader: &mut Option<Box<dyn AppLoader>>,
+    out_load_result: &mut ResultStatus,
+    system: crate::core::SystemRef,
+    file: VirtualFile,
+    program_id: u64,
+    program_index: u64,
+) -> Option<Process> {
+    let system_ref = system.get();
+    let mut loader_system = LoaderSystem::new(
+        system_ref.get_content_provider().cloned(),
+        Some(system_ref.get_filesystem_controller()),
+    );
+    *out_loader = get_loader(&mut loader_system, file, program_id, program_index as usize);
+
+    let loader = out_loader.as_deref_mut()?;
+    let mut process = Process::new();
+    process
+        .initialize(system, loader, out_load_result)
+        .then_some(process)
+}
 
 /// Port of upstream local `GetStorageIdForFrontendSlot`.
 pub fn get_storage_id_for_frontend_slot(slot: Option<ContentProviderUnionSlot>) -> StorageId {
@@ -93,16 +118,16 @@ pub fn create_process(
         }
     }
 
-    let mut loader_system = LoaderSystem::new(
-        Some(Arc::clone(storage)),
-        Some(system_ref.get_filesystem_controller()),
-    );
-    let mut loader = get_loader(&mut loader_system, nca_raw, program_id, 0)?;
-    let mut process = Process::new();
     let mut load_result = ResultStatus::ErrorNotInitialized;
-    process
-        .initialize(system, loader.as_mut(), &mut load_result)
-        .then_some(process)
+    let mut loader = None;
+    create_process_impl(
+        &mut loader,
+        &mut load_result,
+        system,
+        nca_raw,
+        program_id,
+        0,
+    )
 }
 
 /// Port of CreateApplicationProcess
@@ -117,15 +142,86 @@ pub fn create_process(
 /// 4. Registers the title with system.GetARPManager()
 /// 5. Returns the Process along with control data, loader, and load result
 ///
-/// Requires: ContentProviderUnion, NCA, Loader, PatchManager, and ARP manager
-/// infrastructure -- none of which are fully wired yet.
-pub fn create_application_process(_program_id: u64, _program_index: u64) {
-    log::warn!("(STUBBED) create_application_process called -- requires ContentProviderUnion, NCA, Loader, and ARP infrastructure");
+pub fn create_application_process(
+    out_control: &mut Vec<u8>,
+    out_loader: &mut Option<Box<dyn AppLoader>>,
+    out_load_result: &mut ResultStatus,
+    system: crate::core::SystemRef,
+    file: VirtualFile,
+    program_id: u64,
+    program_index: u64,
+) -> Option<Process> {
+    let process = create_process_impl(
+        out_loader,
+        out_load_result,
+        system,
+        file,
+        program_id,
+        program_index,
+    )?;
+
+    let mut nacp = NACP::new();
+    if out_loader
+        .as_deref()
+        .is_some_and(|loader| loader.read_control_data(&mut nacp) == ResultStatus::Success)
+    {
+        *out_control = nacp.get_raw_bytes();
+    } else {
+        out_control.resize(std::mem::size_of::<RawNACP>(), 0);
+        out_control.fill(0);
+    }
+
+    let system_ref = system.get();
+    let storage = system_ref.get_content_provider()?;
+    let launch = build_application_launch_property(
+        process.get_program_id(),
+        0,
+        &system_ref.get_filesystem_controller(),
+        storage,
+    );
+    let _ = system_ref.arp_manager().lock().unwrap().register(
+        launch.title_id,
+        launch,
+        out_control.clone(),
+    );
+
+    Some(process)
+}
+
+/// Port of upstream `ReinitializeProcess`.
+pub fn reinitialize_process(
+    system: crate::core::SystemRef,
+    process: &mut Process,
+    program_id: u64,
+) -> bool {
+    let system_ref = system.get();
+    let Some(storage) = system_ref.get_content_provider() else {
+        return false;
+    };
+    let Some(nca_raw) = storage
+        .lock()
+        .unwrap()
+        .get_entry_raw(program_id, ContentRecordType::Program)
+    else {
+        return false;
+    };
+
+    let mut loader_system = LoaderSystem::new(
+        Some(Arc::clone(storage)),
+        Some(system_ref.get_filesystem_controller()),
+    );
+    let Some(mut loader) = get_loader(&mut loader_system, nca_raw, program_id, 0) else {
+        return false;
+    };
+
+    let mut status = ResultStatus::ErrorNotInitialized;
+    process.initialize(system, loader.as_mut(), &mut status)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::file_sys::vfs::vfs_vector::VectorVfsFile;
 
     #[test]
     fn storage_id_mapping_matches_upstream_frontend_slots() {
@@ -146,5 +242,36 @@ mod tests {
             get_storage_id_for_frontend_slot(Some(ContentProviderUnionSlot::FrontendManual)),
             StorageId::Host
         );
+    }
+
+    #[test]
+    fn create_process_impl_retains_loader_when_process_initialization_fails() {
+        let system = crate::core::System::new();
+        let system_ref = crate::core::SystemRef::from_ref(&system);
+        let file: VirtualFile = Arc::new(VectorVfsFile::new(
+            Vec::new(),
+            "homebrew.nro".to_string(),
+            None,
+        ));
+        let mut loader = None;
+        let mut load_result = ResultStatus::Success;
+
+        let process = create_process_impl(&mut loader, &mut load_result, system_ref, file, 0, 0);
+
+        assert!(process.is_none());
+        assert!(loader.is_some());
+        assert_eq!(load_result, ResultStatus::ErrorNotInitialized);
+    }
+
+    #[test]
+    fn reinitialize_process_fails_without_a_content_provider() {
+        let system = crate::core::System::new();
+        let mut process = Process::new();
+
+        assert!(!reinitialize_process(
+            crate::core::SystemRef::from_ref(&system),
+            &mut process,
+            0,
+        ));
     }
 }

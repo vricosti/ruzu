@@ -6008,3 +6008,39 @@ vs Eden `display_list.h` and `layer_list.h`
 - Eden's implemented commands `GetAppletStateChangedEvent`, `GetResult`,
   `GetCurrentLibraryApplet`, `PushLaunchParameter`, `GetApplicationControlProperty`, and
   `SetUsers` remain absent from this partial service port.
+
+## 2026-08-22 — `am/process_creation.rs` vs Eden `am/process_creation.{h,cpp}`
+
+### Intentional differences
+
+- Rust passes loader, result and control outputs through mutable references and returns
+  `Option<Process>` in place of C++ `unique_ptr` nullability. The loader remains assigned when
+  process initialization fails, matching Eden's output ordering.
+- `LoaderSystem` carries the content-provider and filesystem references required by Rust loader
+  traits. `Process::initialize` transfers loader-produced build-ID and cheat registrations back
+  to the owning `System`; this is the Rust transport for state Eden writes directly through its
+  monolithic `Core::System`.
+- The existing `build_application_launch_property` helper is shared with the transitional
+  top-level load path. It remains in the matching `process_creation.rs` owner and performs the
+  same `PatchManager` and content-slot queries as Eden.
+
+### Fixed parity debt
+
+- Ported the anonymous `CreateProcessImpl` and rewired `CreateProcess` through it, preserving
+  loader construction, initialization and failure order.
+- Replaced the `CreateApplicationProcess` stub with process initialization, NACP extraction or
+  exact zeroed fallback, launch-property construction and ARP registration.
+- Ported `ReinitializeProcess`, including program-NCA and loader failure handling. Focused tests
+  cover loader retention on initialization failure, absent-content failure and every frontend
+  storage-slot mapping.
+
+### Missing items
+
+- The top-level `System::load` path still performs its initial application loading directly and
+  calls only `build_application_launch_property`; migrating that lifecycle into this helper is a
+  separate ownership change because it currently retains the frontend's loader and process.
+
+### Binary layout verification
+
+- PASS: failed control reads produce exactly `size_of::<RawNACP>() == 0x4000` zero bytes, and the
+  registered `ApplicationLaunchProperty` retains its existing verified 0x10-byte C layout.
