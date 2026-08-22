@@ -4786,3 +4786,25 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
   Ruzu's parsers return that consumed offset directly, so the duplicate `src_offset` and
   pre-Windows-parse binding were dead Rust locals and have been removed. Normalization order,
   length checks, backslash replacement and the preserved Nintendo `cur_pos + 1` bug are unchanged.
+
+## 2026-08-22 — `src/core/src/file_sys/fssystem/compressed_storage.rs` vs `core/file_sys/fssystem/fssystem_compressed_storage.h`
+
+### Intentional differences
+
+- Rust read callbacks receive checked mutable slices instead of `(void*, size_t)`, and `Option<Entry>`
+  represents Eden's `prev_entry.virt_offset == -1` sentinel without changing the batching order.
+- Eden's `AccessRange::physical_size` is assigned but never read. Ruzu omits that dead cache-local
+  field while retaining the virtual range and block-alignment state used by the algorithm.
+- `get_entry_list` is retained as the nested core's parity API with `#[allow(dead_code)]`; Eden's
+  outer `CompressedStorage` also does not forward this public method of its private nested class.
+
+### Fixed parity debt
+
+- `CacheManager::read` no longer reads the physical file at the virtual offset. It now finds the
+  head and tail BKTR entries, expands alignment-required boundary blocks, and copies only the
+  requested virtual range as Eden does.
+- `CompressedStorageCore` now validates and traverses BKTR entries, batches at most 0x80 physical
+  accesses, preserves aligned gaps, emits zero regions, resolves the configured decompressor, and
+  enforces Eden's compressed-block size and offset checks.
+- `Drop` now mirrors both upstream destructor/finalize layers, and the `VfsFile` adapter reports the
+  virtual byte count actually available instead of the original request after an end-of-file clamp.
