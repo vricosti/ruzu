@@ -6166,3 +6166,24 @@ vs Eden `display_list.h` and `layer_list.h`
   endpoint identity are unchanged.
 - The focused event regression now resolves the readable endpoint through its actual process
   owner. Both unread-field warnings are gone and `core` decreases from 68 to 67 warnings.
+
+## 2026-08-22 — process ownership in `am/service/self_controller.rs` vs Eden
+`am/service/self_controller.{h,cpp}`
+
+### Intentional differences
+
+- Eden retains `m_process` on both `ISelfController` and its `DisplayLayerManager`, even though the
+  controller reads it only while initializing the manager. Rust transfers the `Arc<ProcessLock>`
+  into `DisplayLayerManager`, the sole post-construction user, instead of holding a second strong
+  reference for the interface lifetime.
+
+### Fixed parity debt
+
+- Removed the duplicate controller-owned process reference while preserving constructor
+  initialization and destructor-time `DisplayLayerManager::Finalize` ordering.
+- Ported the two small implemented commands found during the line-by-line audit: command 67
+  `IsIlluminanceAvailable` returns false, and command 230 `Unknown230` consumes its `u32` input and
+  returns a zeroed `u16` output, exactly like Eden.
+- A focused regression verifies single process ownership after construction, release on controller
+  destruction and both command registrations. The unread field warning is gone and `core`
+  decreases from 67 to 66 warnings.

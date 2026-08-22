@@ -1,8 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-//! Port of zuyu/src/core/hle/service/am/service/self_controller.h
-//! Port of zuyu/src/core/hle/service/am/service/self_controller.cpp
+//! Port of Eden's `core/hle/service/am/service/self_controller.{h,cpp}`.
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
@@ -47,6 +46,7 @@ const RESULT_FATAL_SECTION_COUNT_IMBALANCE: ResultCode =
 /// - 62: SetIdleTimeDetectionExtension
 /// - 63: GetIdleTimeDetectionExtension
 /// - 65: ReportUserIsActive
+/// - 67: IsIlluminanceAvailable
 /// - 68: SetAutoSleepDisabled
 /// - 69: IsAutoSleepDisabled
 /// - 72: SetInputDetectionPolicy
@@ -55,14 +55,13 @@ const RESULT_FATAL_SECTION_COUNT_IMBALANCE: ResultCode =
 /// - 100: SetAlbumImageTakenNotificationEnabled
 /// - 120: SaveCurrentScreenshot
 /// - 130: SetRecordVolumeMuted
+/// - 230: Unknown230
 pub struct ISelfController {
     /// Matches upstream `Core::System& system`.
     system: SystemRef,
     /// Reference to the applet.
     /// Matches upstream `const std::shared_ptr<Applet> m_applet`.
     applet: Arc<Mutex<crate::hle::service::am::applet::Applet>>,
-    /// Matches upstream `Kernel::KProcess* m_process`.
-    process: Option<Arc<ProcessLock>>,
     handlers: BTreeMap<u32, FunctionInfo>,
     handlers_tipc: BTreeMap<u32, FunctionInfo>,
 }
@@ -216,7 +215,11 @@ impl ISelfController {
                 "ReportUserIsActive",
             ),
             (66, None, "GetCurrentIlluminance"),
-            (67, None, "IsIlluminanceAvailable"),
+            (
+                67,
+                Some(Self::is_illuminance_available_handler),
+                "IsIlluminanceAvailable",
+            ),
             (
                 68,
                 Some(Self::set_auto_sleep_disabled_handler),
@@ -261,12 +264,12 @@ impl ISelfController {
                 Some(Self::set_record_volume_muted_handler),
                 "SetRecordVolumeMuted",
             ),
+            (230, Some(Self::unknown_230_handler), "Unknown230"),
             (1000, None, "GetDebugStorageChannel"),
         ]);
         Self {
             system,
             applet,
-            process,
             handlers,
             handlers_tipc: BTreeMap::new(),
         }
@@ -832,6 +835,13 @@ impl ISelfController {
         rb.push_result(RESULT_SUCCESS);
     }
 
+    fn is_illuminance_available_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        log::warn!("(STUBBED) IsIlluminanceAvailable called");
+        let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_bool(false);
+    }
+
     /// SetAutoSleepDisabled (cmd 68).
     /// Matches upstream: locks applet, stores bool.
     fn set_auto_sleep_disabled_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
@@ -961,6 +971,16 @@ impl ISelfController {
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
     }
+
+    fn unknown_230_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let mut rp = RequestParser::new(ctx);
+        let in_val = rp.pop_u32();
+        log::warn!("(STUBBED) Unknown230 called, in_val={in_val}");
+
+        let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_u16(0);
+    }
 }
 
 impl Drop for ISelfController {
@@ -986,5 +1006,41 @@ impl ServiceFramework for ISelfController {
 
     fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
         &self.handlers_tipc
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::hle::kernel::k_process::KProcess;
+    use crate::hle::service::am::applet::Applet;
+    use crate::hle::service::os::process::Process;
+
+    #[test]
+    fn display_manager_is_the_process_owner_and_late_commands_are_registered() {
+        let system = Box::new(crate::core::System::new());
+        let system_ref = SystemRef::from_ref(&system);
+        let process = Arc::new(ProcessLock::from_value(KProcess::new()));
+        let applet = Arc::new(Mutex::new(Applet::new(system_ref, Process::new(), false)));
+
+        let controller =
+            ISelfController::new(system_ref, Arc::clone(&applet), Some(Arc::clone(&process)));
+
+        assert_eq!(Arc::strong_count(&process), 2);
+        assert!(controller
+            .handlers
+            .get(&67)
+            .unwrap()
+            .handler_callback
+            .is_some());
+        assert!(controller
+            .handlers
+            .get(&230)
+            .unwrap()
+            .handler_callback
+            .is_some());
+
+        drop(controller);
+        assert_eq!(Arc::strong_count(&process), 1);
     }
 }
