@@ -1796,9 +1796,6 @@ pub fn get_hardware_timer_arc() -> Option<Arc<KHardwareTimer>> {
 /// Constants from the upstream KernelCore::Impl.
 pub const APPLICATION_MEMORY_BLOCK_SLAB_HEAP_SIZE: usize = 20_000;
 pub const SYSTEM_MEMORY_BLOCK_SLAB_HEAP_SIZE: usize = 10_000;
-/// Combined capacity used until ruzu owns separate application/system managers.
-pub const MEMORY_BLOCK_SLAB_HEAP_SIZE: usize =
-    APPLICATION_MEMORY_BLOCK_SLAB_HEAP_SIZE + SYSTEM_MEMORY_BLOCK_SLAB_HEAP_SIZE;
 pub const BLOCK_INFO_SLAB_HEAP_SIZE: usize = 4000;
 const RESERVED_DYNAMIC_PAGE_COUNT: usize = 64;
 
@@ -1886,25 +1883,18 @@ pub struct KernelCore {
     /// Used by services like KSystemControl::GetInsecureMemoryResourceLimit.
     system_resource_limit: Option<Arc<super::k_resource_limit::KResourceLimit>>,
 
-    /// Kernel-wide slab manager for KMemoryBlock nodes used by
-    /// `KMemoryBlockManagerUpdateAllocator`. Upstream:
-    /// `KernelCore::Impl::application_memory_block_manager` /
-    /// `system_memory_block_manager`. ruzu uses a single slab for all
-    /// processes since application/system distinction isn't enforced yet.
+    /// Compatibility alias to the application resource's memory-block
+    /// manager, used by isolated legacy/test page-table construction.
     memory_block_slab_manager:
         Option<Arc<super::k_dynamic_resource_manager::KMemoryBlockSlabManager>>,
 
-    /// Kernel-wide slab manager for `KBlockInfo` page-group nodes.
+    /// Compatibility alias to the application resource's block-info manager.
     block_info_manager: Option<Arc<super::k_dynamic_resource_manager::KBlockInfoManager>>,
 
-    /// Kernel-wide page-table-page allocator. Upstream:
-    /// `KernelCore::Impl::page_table_manager` initialized from
-    /// `KernelPageTableHeapSize` at boot. Used by `KPageTableBase::Operate`
-    /// to allocate L1/L2/L3 page-table pages and by `FinalizeUpdate` to
-    /// free them. ruzu's flat `common::page_table::PageTable` doesn't
-    /// produce freeable pages today, but the manager is wired so the
-    /// future port of multi-level guest page tables lands cleanly.
-    page_table_manager: Option<Arc<super::k_page_table_manager::KPageTableManager>>,
+    /// Default application and system manager sets created by
+    /// `InitializeResourceManagers`.
+    app_system_resource: Option<Arc<super::k_system_resource::KSystemResource>>,
+    system_system_resource: Option<Arc<super::k_system_resource::KSystemResource>>,
 
     /// Kernel-wide physical memory layout. Upstream:
     /// `KernelCore::Impl::memory_layout` populated at boot by
@@ -2005,7 +1995,8 @@ impl KernelCore {
             system_resource_limit: None,
             memory_block_slab_manager: None,
             block_info_manager: None,
-            page_table_manager: None,
+            app_system_resource: None,
+            system_system_resource: None,
             memory_layout: None,
             next_host_thread_id: AtomicU32::new(hardware_properties::NUM_CPU_CORES),
             single_core_thread_id: AtomicU32::new(0),
@@ -3336,20 +3327,17 @@ impl KernelCore {
         self.system_resource_limit.clone()
     }
 
-    /// Get the kernel-wide KMemoryBlock slab manager. Upstream stores this
-    /// alongside the application/system memory block managers; ruzu uses
-    /// one shared slab whose capacity is the sum of the two upstream heaps.
+    /// Compatibility accessor for legacy/test page-table construction.
+    /// Runtime processes select `GetAppSystemResource` or
+    /// `GetSystemSystemResource`, as Eden does.
     pub fn get_memory_block_slab_manager(
         &self,
     ) -> Option<Arc<super::k_dynamic_resource_manager::KMemoryBlockSlabManager>> {
         self.memory_block_slab_manager.clone()
     }
 
-    /// Initialize the kernel-wide KMemoryBlock slab. Upstream creates
-    /// separate application / system slabs sized from
-    /// `ApplicationMemoryBlockSlabHeapSize` and
-    /// `SystemMemoryBlockSlabHeapSize` in `kernel.cpp`. Ruzu currently uses a
-    /// single manager, so callers pass their combined capacity.
+    /// Test-only style initializer retained for isolated kernel fixtures that
+    /// do not build the complete resource-manager graph.
     pub fn initialize_memory_block_slab_manager(&mut self, capacity: usize) {
         let mut slab = super::k_dynamic_resource_manager::KMemoryBlockSlabManager::new();
         slab.initialize(capacity);
@@ -3366,14 +3354,6 @@ impl KernelCore {
         let mut manager = super::k_dynamic_resource_manager::KBlockInfoManager::new();
         manager.initialize(capacity);
         self.block_info_manager = Some(Arc::new(manager));
-    }
-
-    /// Get the kernel-wide page-table-page allocator. Upstream:
-    /// `KernelCore::PageTableManager()` accessor.
-    pub fn get_page_table_manager(
-        &self,
-    ) -> Option<Arc<super::k_page_table_manager::KPageTableManager>> {
-        self.page_table_manager.clone()
     }
 
     /// Get the kernel-wide physical memory layout. Upstream:
@@ -3404,37 +3384,134 @@ impl KernelCore {
         self.memory_layout = Some(Arc::new(Mutex::new(layout)));
     }
 
-    /// Initialize the kernel-wide page-table-page slab. Upstream sizes
-    /// this from `KernelPageTableHeapSize` (kernel.cpp:1067) — typically
-    /// several thousand page-sized entries. ruzu doesn't currently spend
-    /// any of this allocation pressure (flat page table) so the capacity
-    /// is set conservatively.
-    ///
-    /// Wires a dedicated `KDynamicPageManager` as the page allocator
-    /// behind the slab so `is_in_range` queries return real (non-empty)
-    /// ranges and refcount accounting is anchored to a stable address
-    /// region. Mirrors upstream's
-    /// `Initialize(KDynamicPageManager*, capacity, rc_table)`.
-    pub fn initialize_page_table_manager(&mut self, capacity: usize) {
+    /// Port of `KernelCore::Impl::InitializeResourceManagers`.
+    pub fn initialize_resource_managers(&mut self, address: u64, size: usize) {
         use super::k_dynamic_page_manager::KDynamicPageManager;
-        use super::k_memory_block::PAGE_SIZE;
+        use super::k_dynamic_resource_manager::{
+            KBlockInfoManager, KBlockInfoSlabHeap, KMemoryBlockSlabHeap, KMemoryBlockSlabManager,
+        };
+        use super::k_dynamic_slab_heap::KDynamicSlabHeap;
+        use super::k_memory_block::{KMemoryBlock, PAGE_SIZE};
+        use super::k_page_buffer::KPageBufferSlabHeap;
+        use super::k_page_group::KBlockInfo;
+        use super::k_page_table_manager::KPageTableManager;
+        use super::k_page_table_slab_heap::KPageTableSlabHeap;
+        use super::k_system_resource::KSystemResource;
 
-        // Reserve a dedicated page-manager region for the slab. Pick a
-        // base address well above any guest VA so `is_in_range` queries
-        // never collide with mapped guest memory.
-        let region_size = capacity * PAGE_SIZE;
-        let pa = Arc::new(Mutex::new(KDynamicPageManager::new()));
-        pa.lock()
+        assert_eq!(address % PAGE_SIZE as u64, 0);
+        assert_eq!(size % PAGE_SIZE, 0);
+
+        let reference_count_size = common::alignment::align_up(
+            KPageTableSlabHeap::calculate_reference_count_size(size) as u64,
+            PAGE_SIZE as u64,
+        ) as usize;
+        assert!(reference_count_size < size);
+        let manager_region_size = size - reference_count_size;
+
+        let page_allocator = Arc::new(Mutex::new(KDynamicPageManager::new()));
+        page_allocator
+            .lock()
             .unwrap()
-            .initialize(0xFFFF_E000_0000_0000, region_size, PAGE_SIZE)
-            .expect("KPageTableSlabHeap page allocator init");
+            .initialize(
+                address,
+                manager_region_size,
+                PAGE_SIZE.max(KPageBufferSlabHeap::BUFFER_SIZE),
+            )
+            .expect("resource-manager dynamic page pool initialization");
 
-        let slab = super::k_page_table_slab_heap::KPageTableSlabHeap::new();
-        slab.initialize(pa, capacity);
-        let slab = Arc::new(slab);
-        self.page_table_manager = Some(Arc::new(
-            super::k_page_table_manager::KPageTableManager::new(slab),
+        let mut page_buffer_slab_heap = KPageBufferSlabHeap::new();
+        page_buffer_slab_heap.initialize();
+
+        let app_memory_block_heap = Arc::new(KMemoryBlockSlabHeap::new(false));
+        let system_memory_block_heap = Arc::new(KMemoryBlockSlabHeap::new(false));
+        let block_info_heap = Arc::new(KBlockInfoSlabHeap::new(false));
+        app_memory_block_heap.initialize_with_pages(
+            Arc::clone(&page_allocator),
+            APPLICATION_MEMORY_BLOCK_SLAB_HEAP_SIZE
+                .div_ceil(KDynamicSlabHeap::<KMemoryBlock>::entries_per_page()),
+        );
+        system_memory_block_heap.initialize_with_pages(
+            Arc::clone(&page_allocator),
+            SYSTEM_MEMORY_BLOCK_SLAB_HEAP_SIZE
+                .div_ceil(KDynamicSlabHeap::<KMemoryBlock>::entries_per_page()),
+        );
+        block_info_heap.initialize_with_pages(
+            Arc::clone(&page_allocator),
+            BLOCK_INFO_SLAB_HEAP_SIZE.div_ceil(KDynamicSlabHeap::<KBlockInfo>::entries_per_page()),
+        );
+
+        let num_page_table_pages = {
+            let allocator = page_allocator.lock().unwrap();
+            allocator
+                .get_count()
+                .checked_sub(allocator.get_used() + RESERVED_DYNAMIC_PAGE_COUNT)
+                .expect("resource-manager region must retain reserved dynamic pages")
+        };
+        let page_table_heap = Arc::new(KPageTableSlabHeap::new());
+        page_table_heap.initialize(Arc::clone(&page_allocator), num_page_table_pages);
+
+        let app_memory_block_manager = Arc::new(KMemoryBlockSlabManager::new_with_resources(
+            None,
+            Arc::clone(&app_memory_block_heap),
         ));
+        let system_memory_block_manager = Arc::new(KMemoryBlockSlabManager::new_with_resources(
+            Some(Arc::clone(&page_allocator)),
+            Arc::clone(&system_memory_block_heap),
+        ));
+        let app_block_info_manager = Arc::new(KBlockInfoManager::new_with_resources(
+            None,
+            Arc::clone(&block_info_heap),
+        ));
+        let system_block_info_manager = Arc::new(KBlockInfoManager::new_with_resources(
+            Some(Arc::clone(&page_allocator)),
+            Arc::clone(&block_info_heap),
+        ));
+        let app_page_table_manager = Arc::new(KPageTableManager::new_with_resources(
+            None,
+            Arc::clone(&page_table_heap),
+        ));
+        let system_page_table_manager = Arc::new(KPageTableManager::new_with_resources(
+            Some(Arc::clone(&page_allocator)),
+            Arc::clone(&page_table_heap),
+        ));
+
+        let allocator = page_allocator.lock().unwrap();
+        assert_eq!(
+            allocator.get_count() - allocator.get_used(),
+            RESERVED_DYNAMIC_PAGE_COUNT
+        );
+        drop(allocator);
+
+        let mut app_system_resource = KSystemResource::new();
+        app_system_resource.set_managers(
+            Arc::clone(&app_memory_block_manager),
+            Arc::clone(&app_block_info_manager),
+            Arc::clone(&app_page_table_manager),
+        );
+        let mut system_system_resource = KSystemResource::new();
+        system_system_resource.set_managers(
+            system_memory_block_manager,
+            system_block_info_manager,
+            system_page_table_manager,
+        );
+
+        // Compatibility accessors represent Eden's application manager set.
+        self.memory_block_slab_manager = Some(app_memory_block_manager);
+        self.block_info_manager = Some(app_block_info_manager);
+        self.app_system_resource = Some(Arc::new(app_system_resource));
+        self.system_system_resource = Some(Arc::new(system_system_resource));
+    }
+
+    pub fn get_app_system_resource(
+        &self,
+    ) -> Option<Arc<super::k_system_resource::KSystemResource>> {
+        self.app_system_resource.clone()
+    }
+
+    pub fn get_system_system_resource(
+        &self,
+    ) -> Option<Arc<super::k_system_resource::KSystemResource>> {
+        self.system_system_resource.clone()
     }
 
     /// Initialize the kernel-wide resource limit. Upstream:
@@ -4190,7 +4267,38 @@ mod tests {
     fn memory_block_slab_capacity_matches_upstream_heaps() {
         assert_eq!(APPLICATION_MEMORY_BLOCK_SLAB_HEAP_SIZE, 20_000);
         assert_eq!(SYSTEM_MEMORY_BLOCK_SLAB_HEAP_SIZE, 10_000);
-        assert_eq!(MEMORY_BLOCK_SLAB_HEAP_SIZE, 30_000);
+    }
+
+    #[test]
+    fn resource_managers_preserve_app_fixed_and_system_dynamic_growth() {
+        let mut kernel = KernelCore::new();
+        kernel.initialize_resource_managers(
+            0xFFFF_E000_0000_0000,
+            crate::hle::kernel::k_memory_layout::KERNEL_PAGE_TABLE_HEAP_SIZE,
+        );
+        let app = kernel.get_app_system_resource().unwrap();
+        let system = kernel.get_system_system_resource().unwrap();
+        let app_blocks = app.block_info_manager_arc();
+        let system_blocks = system.block_info_manager_arc();
+
+        assert!(!Arc::ptr_eq(&app_blocks, &system_blocks));
+        assert_eq!(app_blocks.get_count(), system_blocks.get_count());
+        let mut held = Vec::with_capacity(app_blocks.get_count() + 1);
+        for _ in 0..app_blocks.get_count() {
+            held.push(app_blocks.allocate().unwrap());
+        }
+        assert!(app_blocks.allocate().is_none());
+        let old_count = system_blocks.get_count();
+        held.push(
+            system_blocks
+                .allocate()
+                .expect("system block-info manager must grow shared heap"),
+        );
+        assert!(system_blocks.get_count() > old_count);
+
+        for block in held {
+            system_blocks.free(block);
+        }
     }
 }
 

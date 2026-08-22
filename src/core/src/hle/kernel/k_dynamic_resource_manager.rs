@@ -26,20 +26,15 @@ use std::sync::{Arc, Mutex};
 /// `free_count()` accessor for diagnostics.
 pub struct KDynamicResourceManager<T: Default> {
     slab_heap: Arc<KDynamicSlabHeap<T>>,
-    page_allocator: Arc<Mutex<KDynamicPageManager>>,
-    /// True if the page manager owns its backing region (created by
-    /// `initialize`); false if both slab heap and page manager are
-    /// `Default::default()` (caller will wire externally).
-    initialized: bool,
+    page_allocator: Option<Arc<Mutex<KDynamicPageManager>>>,
 }
 
 impl<T: Default> KDynamicResourceManager<T> {
     /// Create an empty manager. Call [`initialize`] to populate it.
     pub fn new() -> Self {
         Self {
-            slab_heap: Arc::new(KDynamicSlabHeap::new(true)),
-            page_allocator: Arc::new(Mutex::new(KDynamicPageManager::new())),
-            initialized: false,
+            slab_heap: Arc::new(KDynamicSlabHeap::new(false)),
+            page_allocator: Some(Arc::new(Mutex::new(KDynamicPageManager::new()))),
         }
     }
 
@@ -48,14 +43,12 @@ impl<T: Default> KDynamicResourceManager<T> {
     ///
     /// Upstream: `Initialize(KDynamicPageManager*, DynamicSlabType*)`.
     pub fn new_with_resources(
-        page_allocator: Arc<Mutex<KDynamicPageManager>>,
+        page_allocator: Option<Arc<Mutex<KDynamicPageManager>>>,
         slab_heap: Arc<KDynamicSlabHeap<T>>,
     ) -> Self {
-        slab_heap.initialize_with_pages(Arc::clone(&page_allocator), 0);
         Self {
             slab_heap,
             page_allocator,
-            initialized: true,
         }
     }
 
@@ -87,13 +80,12 @@ impl<T: Default> KDynamicResourceManager<T> {
             Ordering::Relaxed,
         );
         {
-            let mut pa = self.page_allocator.lock().unwrap();
+            let mut pa = self.page_allocator.as_ref().unwrap().lock().unwrap();
             pa.initialize(base, region_size, super::k_memory_block::PAGE_SIZE)
                 .expect("KDynamicPageManager::initialize");
         }
         self.slab_heap
-            .initialize_with_pages(Arc::clone(&self.page_allocator), num_pages);
-        self.initialized = true;
+            .initialize_with_pages(Arc::clone(self.page_allocator.as_ref().unwrap()), num_pages);
     }
 
     /// Pop one entry from the slab. Upstream:
@@ -101,7 +93,8 @@ impl<T: Default> KDynamicResourceManager<T> {
     /// Returns `None` when both the slab and the page manager are
     /// exhausted (upstream returns `nullptr`).
     pub fn allocate(&self) -> Option<Box<T>> {
-        self.slab_heap.allocate()
+        self.slab_heap
+            .allocate_with_page_allocator(self.page_allocator.as_ref())
     }
 
     /// Return an entry to the slab. Upstream:
@@ -285,8 +278,11 @@ mod tests {
             )
             .unwrap();
         let heap = Arc::new(KDynamicSlabHeap::<KBlockInfo>::new(false));
-        let manager =
-            KBlockInfoManager::new_with_resources(Arc::clone(&page_allocator), Arc::clone(&heap));
+        heap.initialize_with_pages(Arc::clone(&page_allocator), 0);
+        let manager = KBlockInfoManager::new_with_resources(
+            Some(Arc::clone(&page_allocator)),
+            Arc::clone(&heap),
+        );
 
         assert_eq!(page_allocator.lock().unwrap().get_used(), 0);
         assert_eq!(
@@ -298,6 +294,47 @@ mod tests {
         assert_eq!(manager.get_used(), 1);
         manager.free(block);
         assert_eq!(manager.get_used(), 0);
+    }
+
+    #[test]
+    fn shared_heap_grows_only_for_manager_with_dynamic_allocator() {
+        let page_allocator = Arc::new(Mutex::new(KDynamicPageManager::new()));
+        page_allocator
+            .lock()
+            .unwrap()
+            .initialize(
+                0x1_0000_0000,
+                4 * super::super::k_memory_block::PAGE_SIZE,
+                super::super::k_memory_block::PAGE_SIZE,
+            )
+            .unwrap();
+        let heap = Arc::new(KDynamicSlabHeap::<KBlockInfo>::new(false));
+        heap.initialize_with_pages(Arc::clone(&page_allocator), 1);
+        let fixed_manager = KBlockInfoManager::new_with_resources(None, Arc::clone(&heap));
+        let dynamic_manager = KBlockInfoManager::new_with_resources(
+            Some(Arc::clone(&page_allocator)),
+            Arc::clone(&heap),
+        );
+
+        let mut held = Vec::new();
+        for _ in 0..fixed_manager.get_count() {
+            held.push(fixed_manager.allocate().unwrap());
+        }
+        assert!(fixed_manager.allocate().is_none());
+        let page_count_before = page_allocator.lock().unwrap().get_used();
+        held.push(
+            dynamic_manager
+                .allocate()
+                .expect("system manager must grow heap"),
+        );
+        assert_eq!(
+            page_allocator.lock().unwrap().get_used(),
+            page_count_before + 1
+        );
+
+        for block in held {
+            dynamic_manager.free(block);
+        }
     }
 
     #[test]

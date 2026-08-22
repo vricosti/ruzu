@@ -743,3 +743,25 @@
   three manager/heap pairs over its dynamic page pool; process page tables retain the selected
   memory-block and block-info managers, and `KPageGroup` returns each node to that owner with Eden's
   close/free ordering. The original unread-field warning slice is resolved.
+
+## 2026-08-22 — global resource-manager warning cleanup interrupted by allocator-selection prerequisite
+
+- Interrupted slice: use `ReservedDynamicPageCount` by porting
+  `KernelCore::Impl::InitializeResourceManagers` and its application/system resource ownership.
+- Exact missing prerequisite: Eden passes a nullable dynamic-page allocator to each
+  `KDynamicResourceManager::Initialize`; application managers receive `nullptr` while system
+  managers receive the shared allocator. Ruzu currently stores the allocator on the slab heap, so
+  two managers sharing one heap cannot select different growth policies.
+- Required next action: move lazy-growth selection to `KDynamicResourceManager::allocate`, retain
+  the pre-seeded heap independently, and support an absent manager allocator before constructing
+  Eden's shared application/system manager graph.
+- Resume condition: two managers can share one pre-seeded heap while only the system manager may
+  grow it, with focused exhaustion and growth tests matching Eden.
+- Status: prerequisite completed and re-verified. The nullable allocator is now manager-owned,
+  shared slabs keep their independently pre-seeded entries, only a manager with a dynamic
+  allocator may grow them, and reused Rust objects are reconstructed like Eden's `construct_at`.
+  The global resource-manager slice can resume.
+- Resumed result: `InitializeResourceManagers` now creates Eden's separate application/system
+  manager sets over the shared dynamic pool, reserves all but 64 remaining pages for page tables,
+  publishes both `KSystemResource` owners, and default processes retain the matching resource.
+  The original reserved-page warning and its structural debt are resolved.

@@ -5218,3 +5218,133 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 
 - Kernel boot now initializes the global block-info manager beside the memory-block and page-table
   managers before any process page table is created.
+
+## 2026-08-22 — `src/core/src/hle/kernel/k_dynamic_resource_manager.rs` allocator ownership vs `core/hle/kernel/k_dynamic_resource_manager.h`
+
+### Intentional differences
+
+- Rust managers and slabs share `Arc` owners instead of Eden's non-owning pointers. The nullable
+  allocator is nevertheless retained on each manager, independently from the shared slab owner.
+
+### Fixed parity debt
+
+- `allocate` now passes the manager-selected nullable dynamic allocator into its slab. Application
+  and system managers can therefore share pre-seeded entries while only the system manager grows
+  the heap, matching Eden's resource-manager initialization.
+- The unused synthetic `initialized` state was removed, and generic managers no longer select the
+  page-table-only `ClearNode=true` policy.
+
+## 2026-08-22 — `src/core/src/hle/kernel/k_dynamic_slab_heap.rs` allocator selection vs `core/hle/kernel/k_dynamic_slab_heap.h`
+
+### Intentional differences
+
+- Rust has no intrusive free-list pointer inside `Box<T>`, so Eden's `ClearNode` link clearing is
+  unnecessary. Reused values are reset with `T::default()` when allocated to model Eden's
+  destructor/`construct_at` object lifetime.
+
+### Fixed parity debt
+
+- Lazy growth now uses the nullable allocator supplied by the calling resource manager instead of
+  an allocator implicitly selected by the shared heap.
+
+## 2026-08-22 — `src/core/src/hle/kernel/k_memory_block.rs` slab geometry vs `core/hle/kernel/k_memory_block.h`
+
+### Intentional differences
+
+- Rust's ordered block container does not use Eden's intrusive red-black-tree links. Their packed
+  0x1c-byte base storage is retained as zeroed reserved bytes solely to preserve slab geometry.
+
+### Fixed parity debt
+
+- `KMemoryBlock` now has Eden's 0x40-byte size and alignment, so the 20,000- and 10,000-object slab
+  initializations consume the same number of dynamic pages as upstream.
+
+## 2026-08-22 — `src/core/src/hle/kernel/k_page_table_slab_heap.rs` allocator selection vs `core/hle/kernel/k_page_table_slab_heap.h`
+
+### Fixed parity debt
+
+- Allocation accepts the nullable dynamic allocator selected by `KPageTableManager`; managers may
+  still consume the shared pre-seeded page heap, but only the system manager can grow it.
+
+## 2026-08-22 — `src/core/src/hle/kernel/k_page_table_manager.rs` vs `core/hle/kernel/k_page_table_manager.h`
+
+### Intentional differences
+
+- Rust constructor injection replaces Eden's default construction followed by `Initialize`, while
+  retaining the same nullable allocator and shared page-table heap owners.
+
+### Fixed parity debt
+
+- Application and system page-table managers can now share one heap with Eden's distinct fixed and
+  dynamic growth policies.
+
+## 2026-08-22 — `src/core/src/hle/kernel/kernel.rs` resource-manager initialization vs `core/hle/kernel/kernel.cpp`
+
+### Intentional differences
+
+- Rust `Arc` ownership lets each `KSystemResource` retain its managers and their shared heaps, so
+  `KernelCore` need not duplicate Eden's raw-pointer owner fields. The stateless host-emulated page
+  buffer heap is initialized in Eden's order but need not remain stored.
+- The manager region uses a non-guest synthetic kernel address because Ruzu does not map Eden's
+  kernel virtual page-table region into host memory.
+- Direct memory-block and block-info accessors remain as application-resource aliases for isolated
+  legacy/test page-table construction; runtime processes use the two system-resource accessors.
+
+### Fixed parity debt
+
+- `initialize_resource_managers` now subtracts the reference-count area, initializes the shared
+  dynamic page pool, pre-seeds the application/system memory-block and shared block-info heaps,
+  assigns all remaining pages except 64 to the page-table heap, and asserts that exact reserve.
+- Separate application and system manager sets now reproduce Eden's null versus shared dynamic
+  allocator policy and are published through distinct `KSystemResource` owners.
+- The obsolete combined memory-block capacity and standalone kernel page-table-manager path were
+  removed; neither exists in Eden's ownership graph.
+
+## 2026-08-22 — `src/core/src/core.rs` resource-manager boot wiring vs `core/hle/kernel/kernel.cpp`
+
+### Intentional differences
+
+- Ruzu supplies a stable synthetic kernel address with Eden's `KernelPageTableHeapSize`; the host
+  model has no derived kernel virtual page-table mapping to query.
+
+### Fixed parity debt
+
+- Boot now invokes the single upstream-owned resource-manager initialization sequence instead of
+  constructing three independent simplified managers.
+
+## 2026-08-22 — `src/core/src/hle/kernel/k_process.rs` default system-resource ownership vs `core/hle/kernel/k_process.cpp` and `.h`
+
+### Intentional differences
+
+- Rust retains secure and default global resources in separate typed owners instead of one raw
+  `KSystemResource*`; both branches still keep the selected resource alive for the process.
+
+### Fixed parity debt
+
+- A process without private secure memory now selects and retains Eden's application or system
+  `KSystemResource` from `KernelCore`, then passes that exact manager set to page-table
+  initialization. It no longer falls back to unrelated global manager fields.
+
+## 2026-08-22 — `src/core/src/hle/kernel/k_process_page_table.rs` legacy resource wiring vs `core/hle/kernel/k_process_page_table.h`
+
+### Intentional differences
+
+- The compatibility `configure_address_space` path has no upstream counterpart and remains only
+  for pre-`InitializeForProcess` callers.
+
+### Fixed parity debt
+
+- That compatibility path now retains the block-info manager beside the memory-block manager, so
+  any page groups it creates return nodes to the same application resource owner.
+
+## 2026-08-22 — `src/core/src/hle/kernel/k_system_resource.rs` manager attachment vs `core/hle/kernel/k_system_resource.cpp`
+
+### Intentional differences
+
+- Heap initialization remains explicit in the owning resource before Rust manager construction;
+  Eden performs the equivalent heap and manager `Initialize` calls as two ordered phases.
+
+### Fixed parity debt
+
+- Secure-resource managers now attach to already initialized heaps and retain their own nullable
+  allocator, matching the ownership boundary required by global application/system resources.

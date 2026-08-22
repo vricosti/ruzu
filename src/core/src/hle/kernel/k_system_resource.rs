@@ -234,12 +234,14 @@ impl KSecureSystemResource {
         let memory_block_heap = Arc::new(KDynamicSlabHeap::new(false));
         let block_info_heap = Arc::new(KDynamicSlabHeap::new(false));
         let page_table_heap = Arc::new(KPageTableSlabHeap::new());
+        memory_block_heap.initialize_with_pages(Arc::clone(&self.dynamic_page_manager), 0);
+        block_info_heap.initialize_with_pages(Arc::clone(&self.dynamic_page_manager), 0);
         let memory_block_slab_manager = Arc::new(KMemoryBlockSlabManager::new_with_resources(
-            Arc::clone(&self.dynamic_page_manager),
+            Some(Arc::clone(&self.dynamic_page_manager)),
             Arc::clone(&memory_block_heap),
         ));
         let block_info_manager = Arc::new(KBlockInfoManager::new_with_resources(
-            Arc::clone(&self.dynamic_page_manager),
+            Some(Arc::clone(&self.dynamic_page_manager)),
             Arc::clone(&block_info_heap),
         ));
         page_table_heap.initialize(Arc::clone(&self.dynamic_page_manager), 0);

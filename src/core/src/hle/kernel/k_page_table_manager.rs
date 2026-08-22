@@ -22,7 +22,9 @@
 //! * a future port of multi-level guest page tables drops in without
 //!   touching every caller.
 
+use super::k_dynamic_page_manager::KDynamicPageManager;
 use super::k_page_table_slab_heap::{KPageTableSlabHeap, RefCount};
+use std::sync::{Arc, Mutex};
 
 /// `KPageTableManager` — typed wrapper around `KPageTableSlabHeap`.
 ///
@@ -31,7 +33,8 @@ use super::k_page_table_slab_heap::{KPageTableSlabHeap, RefCount};
 /// composition (`Arc<KPageTableSlabHeap>`) since the slab heap owns a
 /// `Mutex` for its free list.
 pub struct KPageTableManager {
-    slab_heap: std::sync::Arc<KPageTableSlabHeap>,
+    slab_heap: Arc<KPageTableSlabHeap>,
+    page_allocator: Option<Arc<Mutex<KDynamicPageManager>>>,
 }
 
 impl KPageTableManager {
@@ -41,15 +44,30 @@ impl KPageTableManager {
     /// `KPageTableManager()` is default-constructible; `Initialize` then
     /// sets the slab pointer. ruzu folds those two phases into the
     /// constructor so the manager is always in a usable state.
-    pub fn new(slab_heap: std::sync::Arc<KPageTableSlabHeap>) -> Self {
-        Self { slab_heap }
+    pub fn new(slab_heap: Arc<KPageTableSlabHeap>) -> Self {
+        let page_allocator = slab_heap.page_allocator_arc();
+        Self {
+            slab_heap,
+            page_allocator,
+        }
+    }
+
+    pub fn new_with_resources(
+        page_allocator: Option<Arc<Mutex<KDynamicPageManager>>>,
+        slab_heap: Arc<KPageTableSlabHeap>,
+    ) -> Self {
+        Self {
+            slab_heap,
+            page_allocator,
+        }
     }
 
     /// Allocate a page-table page. Returns the slab address (u64),
     /// matching upstream's `KVirtualAddress Allocate()`. `None` on
     /// slab exhaustion (upstream returns 0).
     pub fn allocate(&self) -> Option<u64> {
-        self.slab_heap.allocate()
+        self.slab_heap
+            .allocate_with_page_allocator(self.page_allocator.as_ref())
     }
 
     /// Free a page-table page back to the slab. Upstream:

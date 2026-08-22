@@ -143,6 +143,14 @@ impl KPageTableSlabHeap {
     /// which returns 0 on failure; ruzu returns `None` for the failure
     /// case and a non-zero address on success.
     pub fn allocate(&self) -> Option<u64> {
+        let page_allocator = self.page_allocator.lock().unwrap().clone();
+        self.allocate_with_page_allocator(page_allocator.as_ref())
+    }
+
+    pub fn allocate_with_page_allocator(
+        &self,
+        page_allocator: Option<&Arc<Mutex<KDynamicPageManager>>>,
+    ) -> Option<u64> {
         {
             let mut inner = self.inner.lock().unwrap();
             let base = inner.address;
@@ -154,8 +162,7 @@ impl KPageTableSlabHeap {
             }
         }
 
-        let page_allocator = self.page_allocator.lock().unwrap().clone()?;
-        let address = page_allocator.lock().unwrap().allocate()?;
+        let address = page_allocator?.lock().unwrap().allocate()?;
 
         let mut inner = self.inner.lock().unwrap();
         let idx = self.addr_to_index_locked(&inner, address)?;
@@ -165,6 +172,10 @@ impl KPageTableSlabHeap {
         inner.ref_counts[idx] = 0;
         inner.capacity += 1;
         Some(address)
+    }
+
+    pub fn page_allocator_arc(&self) -> Option<Arc<Mutex<KDynamicPageManager>>> {
+        self.page_allocator.lock().unwrap().clone()
     }
 
     /// Free a page-table page back to the slab. Upstream:

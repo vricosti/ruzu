@@ -1504,21 +1504,10 @@ impl System {
             let kernel_size = APPLICATION_POOL_OFFSET as i64;
             kernel.initialize_system_resource_limit(total_size, kernel_size);
 
-            // Ruzu currently shares one manager, so reserve the sum of Eden's
-            // application and system memory-block slab capacities.
-            kernel.initialize_memory_block_slab_manager(
-                crate::hle::kernel::kernel::MEMORY_BLOCK_SLAB_HEAP_SIZE,
+            kernel.initialize_resource_managers(
+                0xFFFF_E000_0000_0000,
+                crate::hle::kernel::k_memory_layout::KERNEL_PAGE_TABLE_HEAP_SIZE,
             );
-            kernel.initialize_block_info_manager(
-                crate::hle::kernel::kernel::BLOCK_INFO_SLAB_HEAP_SIZE,
-            );
-
-            // Initialize the kernel-wide page-table-page allocator.
-            // Upstream sizes this from `KernelPageTableHeapSize` (kernel.cpp:1067).
-            // ruzu's flat page table doesn't actually consume from this
-            // slab, so the capacity is conservative — 256 page-sized
-            // entries is far above the dormant usage.
-            kernel.initialize_page_table_manager(256);
 
             // Upstream `KernelCore::Impl::InitializeHackSharedMemory` runs
             // after the physical memory manager is ready. Initialize the IRS

@@ -54,7 +54,7 @@ use super::k_session::KSession;
 use super::k_shared_memory_info::KSharedMemoryInfo;
 use super::k_synchronization_object;
 use super::k_synchronization_object::SynchronizationObjectState;
-use super::k_system_resource::KSecureSystemResource;
+use super::k_system_resource::{KSecureSystemResource, KSystemResource};
 use super::k_thread::{KThread, KThreadLock};
 use super::k_thread_local_page::{KThreadLocalPage, PAGE_SIZE as THREAD_LOCAL_PAGE_SIZE};
 use super::k_typed_address::KProcessAddress;
@@ -485,9 +485,11 @@ pub struct KProcess {
     /// Resource limit for this process.
     /// Matches upstream `KResourceLimit* m_resource_limit`.
     pub resource_limit: Option<Arc<KResourceLimit>>,
-    /// System resource (slab managers for page table/memory blocks).
-    /// Upstream: `KSystemResource* m_system_resource`.
+    /// Private secure system resource, when NPDM requests one.
     pub system_resource: Option<Arc<Mutex<KSecureSystemResource>>>,
+    /// Default application/system resource otherwise. Together these two
+    /// typed owners represent upstream `KSystemResource* m_system_resource`.
+    default_system_resource: Option<Arc<KSystemResource>>,
     pub memory_release_hint: usize,
     pub state: ProcessState,
     /// Upstream: `KLightLock m_state_lock`.
@@ -637,6 +639,7 @@ impl KProcess {
             ideal_core_id: 0,
             resource_limit: None,
             system_resource: None,
+            default_system_resource: None,
             memory_release_hint: 0,
             state: ProcessState::default(),
             m_state_lock: Arc::new(KLightLock::new()),
@@ -1804,9 +1807,21 @@ impl KProcess {
                 return result.get_inner_value();
             }
             self.system_resource = Some(Arc::new(Mutex::new(secure_resource)));
+            self.default_system_resource = None;
         } else {
             let is_app = (flags & CreateProcessFlag::IS_APPLICATION.bits()) != 0;
             self.is_default_application_system_resource = is_app;
+            let Some(kernel) = super::kernel::get_kernel_ref() else {
+                return RESULT_INVALID_STATE.get_inner_value();
+            };
+            self.default_system_resource = if is_app {
+                kernel.get_app_system_resource()
+            } else {
+                kernel.get_system_system_resource()
+            };
+            if self.default_system_resource.is_none() {
+                return RESULT_INVALID_STATE.get_inner_value();
+            }
         }
 
         // Setup page table (upstream lines 408-417).
@@ -1827,6 +1842,10 @@ impl KProcess {
             let system_resource_guard = system_resource
                 .as_ref()
                 .map(|resource| resource.lock().unwrap());
+            let selected_system_resource = system_resource_guard
+                .as_ref()
+                .map(|resource| resource.base())
+                .or(self.default_system_resource.as_deref());
             let result = self.page_table.initialize_for_process(
                 as_type,
                 enable_aslr,
@@ -1835,9 +1854,7 @@ impl KProcess {
                 pool as u32,
                 code_address as usize,
                 code_size,
-                system_resource_guard
-                    .as_ref()
-                    .map(|resource| resource.base()),
+                selected_system_resource,
                 resource_limit.clone(),
                 memory_ref,
                 aslr_space_start as usize,
@@ -3412,9 +3429,10 @@ mod tests {
 
     fn kernel_with_application_pool_for_test(num_pages: usize) -> ScopedKernelForTest {
         let mut kernel = ScopedKernelForTest::new();
-        kernel
-            .kernel_mut()
-            .initialize_memory_block_slab_manager(4096);
+        kernel.kernel_mut().initialize_resource_managers(
+            0xFFFF_E000_0000_0000,
+            crate::hle::kernel::k_memory_layout::KERNEL_PAGE_TABLE_HEAP_SIZE,
+        );
         kernel.memory_manager_mut().initialize_pool(
             Pool::Application,
             0x1_0000_0000,
@@ -3678,6 +3696,28 @@ mod tests {
         assert_eq!(process.get_main_stack_size(), 0);
         assert!(!process.is_64bit());
         assert!(process.is_application());
+        let default_resource = process
+            .default_system_resource
+            .as_ref()
+            .expect("application without secure memory must retain the app resource");
+        assert!(Arc::ptr_eq(
+            process
+                .page_table
+                .get_base()
+                .m_memory_block_slab_manager
+                .as_ref()
+                .unwrap(),
+            &default_resource.memory_block_slab_manager_arc(),
+        ));
+        assert!(Arc::ptr_eq(
+            process
+                .page_table
+                .get_base()
+                .m_block_info_manager
+                .as_ref()
+                .unwrap(),
+            &default_resource.block_info_manager_arc(),
+        ));
     }
 
     #[test]

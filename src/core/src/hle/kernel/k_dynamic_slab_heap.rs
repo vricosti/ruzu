@@ -24,8 +24,9 @@ use super::k_memory_block::PAGE_SIZE;
 /// `KDynamicSlabHeap<T>` — page-backed dynamically-expanding slab heap.
 ///
 /// Mirrors upstream's `KDynamicSlabHeap<T, ClearNode>`. The `ClearNode`
-/// template parameter is honored as a runtime flag (`clear_node`) which
-/// resets entries on Free.
+/// template parameter only clears the intrusive free-list link before C++
+/// construction; Rust stores no intrusive link and reconstructs the whole
+/// value with `Default` when it is allocated.
 pub struct KDynamicSlabHeap<T: Default> {
     page_allocator: Mutex<Option<Arc<Mutex<KDynamicPageManager>>>>,
     free_list: Mutex<Vec<Box<T>>>,
@@ -34,7 +35,6 @@ pub struct KDynamicSlabHeap<T: Default> {
     peak: AtomicUsize,
     address: AtomicUsize,
     size: AtomicUsize,
-    clear_node: bool,
 }
 
 impl<T: Default> KDynamicSlabHeap<T> {
@@ -54,7 +54,7 @@ impl<T: Default> KDynamicSlabHeap<T> {
         }
     }
 
-    pub fn new(clear_node: bool) -> Self {
+    pub fn new(_clear_node: bool) -> Self {
         Self {
             page_allocator: Mutex::new(None),
             free_list: Mutex::new(Vec::new()),
@@ -63,7 +63,6 @@ impl<T: Default> KDynamicSlabHeap<T> {
             peak: AtomicUsize::new(0),
             address: AtomicUsize::new(0),
             size: AtomicUsize::new(0),
-            clear_node,
         }
     }
 
@@ -146,24 +145,35 @@ impl<T: Default> KDynamicSlabHeap<T> {
     /// attached page manager and refill the free list. Returns `None`
     /// only when both the free list and the page manager are dry.
     pub fn allocate(&self) -> Option<Box<T>> {
+        let page_allocator = self.page_allocator.lock().unwrap().clone();
+        self.allocate_with_page_allocator(page_allocator.as_ref())
+    }
+
+    /// Allocate with the page allocator selected by the owning resource
+    /// manager. Eden stores this nullable pointer on
+    /// `KDynamicResourceManager`, not on the shared slab heap: application
+    /// managers pass `nullptr`, while system managers may grow that same
+    /// pre-seeded heap from the shared dynamic pool.
+    pub fn allocate_with_page_allocator(
+        &self,
+        page_allocator: Option<&Arc<Mutex<KDynamicPageManager>>>,
+    ) -> Option<Box<T>> {
         // Fast path: free list non-empty.
         {
             let mut list = self.free_list.lock().unwrap();
-            if let Some(item) = list.pop() {
+            if let Some(mut item) = list.pop() {
                 drop(list);
+                *item = T::default();
                 self.bump_used();
                 return Some(item);
             }
         }
         // Slow path: try to grow by one page.
         {
-            let pa_opt = self.page_allocator.lock().unwrap();
-            if let Some(pa) = pa_opt.as_ref() {
-                let mut pa = pa.lock().unwrap();
-                if pa.allocate().is_none() {
-                    return None;
-                }
-            } else {
+            let Some(pa) = page_allocator else {
+                return None;
+            };
+            if pa.lock().unwrap().allocate().is_none() {
                 return None;
             }
         }
@@ -179,12 +189,10 @@ impl<T: Default> KDynamicSlabHeap<T> {
         Some(item)
     }
 
-    /// Return an entry to the free list. Resets `*item` per
-    /// upstream's `ClearNode=true` template parameter when set.
-    pub fn free(&self, mut item: Box<T>) {
-        if self.clear_node {
-            *item = T::default();
-        }
+    /// Return an entry to the free list. Eden destructs the object here and
+    /// reconstructs it on the next allocation; Rust performs the equivalent
+    /// reset in `allocate_with_page_allocator`.
+    pub fn free(&self, item: Box<T>) {
         self.free_list.lock().unwrap().push(item);
         self.used.fetch_sub(1, Ordering::Relaxed);
     }
@@ -223,6 +231,17 @@ mod tests {
         let _b = heap.allocate().expect("second allocation");
         heap.free(a);
         assert_eq!(heap.get_used(), 1);
+    }
+
+    #[test]
+    fn reused_entry_is_reconstructed_like_cpp_construct_at() {
+        let heap: KDynamicSlabHeap<u64> = KDynamicSlabHeap::new(false);
+        heap.initialize_with_count(1);
+        let mut value = heap.allocate().unwrap();
+        *value = 0xDEAD_BEEF;
+        heap.free(value);
+
+        assert_eq!(*heap.allocate().unwrap(), 0);
     }
 
     #[test]

@@ -369,10 +369,13 @@ impl KMemoryInfo {
 
 /// Port of Kernel::KMemoryBlock.
 ///
-/// Upstream inherits IntrusiveRedBlackTreeBaseNode; here we represent the data only.
-/// Tree integration is handled by the block manager using a BTreeMap or Vec.
+/// Upstream inherits a 0x1c-byte packed intrusive red-black-tree node. Rust's
+/// block manager owns ordering separately, but the reserved base bytes remain
+/// present so the dynamic slab retains Eden's 0x40-byte object geometry.
+#[repr(C, align(8))]
 #[derive(Debug, Clone)]
 pub struct KMemoryBlock {
+    _tree_node: [u8; 0x1c],
     m_device_disable_merge_left_count: u16,
     m_device_disable_merge_right_count: u16,
     m_address: usize,
@@ -390,6 +393,7 @@ pub struct KMemoryBlock {
 impl KMemoryBlock {
     pub fn new() -> Self {
         Self {
+            _tree_node: [0; 0x1c],
             m_device_disable_merge_left_count: 0,
             m_device_disable_merge_right_count: 0,
             m_address: 0,
@@ -413,6 +417,7 @@ impl KMemoryBlock {
         attr: KMemoryAttribute,
     ) -> Self {
         Self {
+            _tree_node: [0; 0x1c],
             m_device_disable_merge_left_count: 0,
             m_device_disable_merge_right_count: 0,
             m_address: addr,
@@ -788,6 +793,8 @@ impl KMemoryBlock {
         }
     }
 }
+
+const _: () = assert!(std::mem::size_of::<KMemoryBlock>() == 0x40);
 
 impl Default for KMemoryBlock {
     fn default() -> Self {
