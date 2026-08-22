@@ -24,14 +24,6 @@ use super::configure_dialog::Page;
 use super::shared_translation as tr;
 use super::shared_widget as w;
 
-fn supported_graphics_api() -> Vec<(RendererBackend, &'static str)> {
-    tr::GRAPHICS_API
-        .iter()
-        .copied()
-        .filter(|(backend, _)| common::settings::is_renderer_backend_supported(*backend))
-        .collect()
-}
-
 /// Build the Graphics tab — upstream `ConfigureGraphics`.
 pub fn page(expose_compute_option: impl Fn() + 'static, runtime_lock: bool) -> Page {
     let (scroller, column) = w::page();
@@ -39,14 +31,11 @@ pub fn page(expose_compute_option: impl Fn() + 'static, runtime_lock: bool) -> P
     // --- "API Settings" ---------------------------------------------------
     let (api_group, api) = w::group("API Settings");
 
-    let graphics_api = Rc::new(supported_graphics_api());
-    let backend_value = common::settings::effective_renderer_backend(
-        *common::settings::values().renderer_backend.get_value(),
-    );
+    let backend_value = *common::settings::values().renderer_backend.get_value();
     let (backend_row, backend) = w::combo_row(
         "API:",
-        &tr::labels(&graphics_api),
-        tr::index_of(&graphics_api, &backend_value),
+        &tr::labels(tr::GRAPHICS_API),
+        tr::index_of(tr::GRAPHICS_API, &backend_value),
     );
     api.append(&backend_row);
 
@@ -174,9 +163,8 @@ pub fn page(expose_compute_option: impl Fn() + 'static, runtime_lock: bool) -> P
         let vsync = vsync.clone();
         let vsync_modes = Rc::clone(&vsync_modes);
         let device_records = Rc::clone(&device_records);
-        let graphics_api = Rc::clone(&graphics_api);
         backend.connect_selected_notify(move |combo| {
-            let selected = tr::value_at(&graphics_api, combo.selected());
+            let selected = tr::value_at(tr::GRAPHICS_API, combo.selected());
             apply_api_layout(selected, &device_row);
             device_row.set_sensitive(vulkan_device_sensitive(
                 configuring_global,
@@ -198,9 +186,8 @@ pub fn page(expose_compute_option: impl Fn() + 'static, runtime_lock: bool) -> P
         let vsync = vsync.clone();
         let vsync_modes = Rc::clone(&vsync_modes);
         let device_records = Rc::clone(&device_records);
-        let graphics_api = Rc::clone(&graphics_api);
         device.connect_selected_notify(move |device| {
-            let selected_backend = tr::value_at(&graphics_api, backend.selected());
+            let selected_backend = tr::value_at(tr::GRAPHICS_API, backend.selected());
             repopulate_vsync(
                 &vsync,
                 &vsync_modes,
@@ -212,7 +199,7 @@ pub fn page(expose_compute_option: impl Fn() + 'static, runtime_lock: bool) -> P
     }
 
     Page::new("Graphics", scroller, move || {
-        let backend_value = tr::value_at(&graphics_api, backend.selected());
+        let backend_value = tr::value_at(tr::GRAPHICS_API, backend.selected());
         let device_index = device.selected();
         let async_value = async_gpu.is_active();
         let vsync_value = vsync_modes
@@ -450,20 +437,6 @@ mod tests {
                 .collect::<Vec<_>>(),
             [1, 0, 3, 4, 2]
         );
-    }
-
-    #[test]
-    fn graphics_api_hides_opengl_only_on_apple_silicon() {
-        let supported = supported_graphics_api();
-        assert_eq!(
-            supported
-                .iter()
-                .any(|(backend, _)| matches!(backend, RendererBackend::OpenGlGlsl)),
-            !cfg!(all(target_os = "macos", target_arch = "aarch64"))
-        );
-        assert!(supported
-            .iter()
-            .any(|(backend, _)| *backend == RendererBackend::Vulkan));
     }
 
     #[test]

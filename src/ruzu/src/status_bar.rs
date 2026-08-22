@@ -422,7 +422,7 @@ impl StatusBar {
         let values = settings::values();
 
         // `UpdateAPIText`: the fused backend value names the OpenGL shader API.
-        let backend = settings::effective_renderer_backend(*values.renderer_backend.get_value());
+        let backend = *values.renderer_backend.get_value();
         let renderer = match backend {
             RendererBackend::OpenGlGlsl => "OPENGL GLSL".to_string(),
             RendererBackend::OpenGlGlasm => "OPENGL GLASM".to_string(),
@@ -565,22 +565,19 @@ fn renderer_context_choices(running: bool) -> Vec<(RendererBackend, &'static str
     crate::configuration::shared_translation::STATUS_RENDERER_BACKEND
         .iter()
         .copied()
-        .filter(|(backend, _)| {
-            *backend != RendererBackend::Null && settings::is_renderer_backend_supported(*backend)
-        })
+        .filter(|(backend, _)| *backend != RendererBackend::Null)
         .collect()
 }
 
 /// The exact switch in upstream `GMainWindow::OnToggleGraphicsAPI`.
 fn next_graphics_api(api: RendererBackend) -> RendererBackend {
-    let next = match api {
+    match api {
         RendererBackend::Vulkan => RendererBackend::OpenGlGlsl,
         RendererBackend::OpenGlGlsl => RendererBackend::OpenGlGlsl,
         RendererBackend::OpenGlSpirV => RendererBackend::OpenGlGlasm,
         RendererBackend::OpenGlGlasm => RendererBackend::Null,
         RendererBackend::Null => RendererBackend::Vulkan,
-    };
-    settings::effective_renderer_backend(next)
+    }
 }
 
 fn create_tas_frames_string(frames: [usize; PLAYER_NUMBER]) -> String {
@@ -774,15 +771,15 @@ mod tests {
     fn graphics_api_toggle_matches_upstream_switch() {
         assert_eq!(
             next_graphics_api(RendererBackend::Vulkan),
-            settings::effective_renderer_backend(RendererBackend::OpenGlGlsl)
+            RendererBackend::OpenGlGlsl
         );
         assert_eq!(
             next_graphics_api(RendererBackend::OpenGlGlsl),
-            settings::effective_renderer_backend(RendererBackend::OpenGlGlsl)
+            RendererBackend::OpenGlGlsl
         );
         assert_eq!(
             next_graphics_api(RendererBackend::OpenGlSpirV),
-            settings::effective_renderer_backend(RendererBackend::OpenGlGlasm)
+            RendererBackend::OpenGlGlasm
         );
         assert_eq!(
             next_graphics_api(RendererBackend::OpenGlGlasm),
@@ -796,16 +793,15 @@ mod tests {
 
     #[test]
     fn renderer_context_menu_matches_upstream_runtime_lock() {
-        let expected = vec![
-            (RendererBackend::OpenGlGlsl, "OpenGL GLSL"),
-            (RendererBackend::Vulkan, "Vulkan"),
-            (RendererBackend::OpenGlGlasm, "OpenGL GLASM"),
-            (RendererBackend::OpenGlSpirV, "OpenGL SPIRV"),
-        ]
-        .into_iter()
-        .filter(|(backend, _)| settings::is_renderer_backend_supported(*backend))
-        .collect::<Vec<_>>();
-        assert_eq!(renderer_context_choices(false), expected);
+        assert_eq!(
+            renderer_context_choices(false),
+            vec![
+                (RendererBackend::OpenGlGlsl, "OpenGL GLSL"),
+                (RendererBackend::Vulkan, "Vulkan"),
+                (RendererBackend::OpenGlGlasm, "OpenGL GLASM"),
+                (RendererBackend::OpenGlSpirV, "OpenGL SPIRV"),
+            ]
+        );
         assert!(renderer_context_choices(true).is_empty());
     }
 

@@ -1584,34 +1584,9 @@ pub fn is_gpu_fence_behavior_strict(values: &Values) -> bool {
 /// Upstream `Settings::IsOpenGL()`.
 pub fn is_opengl() -> bool {
     matches!(
-        effective_renderer_backend(*values().renderer_backend.get_value()),
+        *values().renderer_backend.get_value(),
         RendererBackend::OpenGlGlsl | RendererBackend::OpenGlGlasm | RendererBackend::OpenGlSpirV
     )
-}
-
-/// Host availability policy layered over Eden's renderer discriminants.
-///
-/// Apple Silicon exposes only OpenGL 4.1 while the renderer requires the
-/// desktop OpenGL feature set. Intel macOS keeps the existing backend choices.
-pub const fn is_renderer_backend_supported(backend: RendererBackend) -> bool {
-    if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
-        !matches!(
-            backend,
-            RendererBackend::OpenGlGlsl
-                | RendererBackend::OpenGlGlasm
-                | RendererBackend::OpenGlSpirV
-        )
-    } else {
-        true
-    }
-}
-
-pub const fn effective_renderer_backend(backend: RendererBackend) -> RendererBackend {
-    if is_renderer_backend_supported(backend) {
-        backend
-    } else {
-        RendererBackend::Vulkan
-    }
 }
 
 /// Returns true if fastmem is effectively enabled.
@@ -2129,28 +2104,6 @@ mod tests {
         assert!(!is_fastmem_enabled(&values));
         values.cpuopt_fastmem.set_value(true);
         assert!(is_fastmem_enabled(&values));
-    }
-
-    #[test]
-    fn renderer_backend_availability_is_host_specific_without_changing_discriminants() {
-        let opengl_supported = !cfg!(all(target_os = "macos", target_arch = "aarch64"));
-        for backend in [
-            RendererBackend::OpenGlGlsl,
-            RendererBackend::OpenGlGlasm,
-            RendererBackend::OpenGlSpirV,
-        ] {
-            assert_eq!(is_renderer_backend_supported(backend), opengl_supported);
-            assert_eq!(
-                effective_renderer_backend(backend),
-                if opengl_supported {
-                    backend
-                } else {
-                    RendererBackend::Vulkan
-                }
-            );
-        }
-        assert!(is_renderer_backend_supported(RendererBackend::Vulkan));
-        assert!(is_renderer_backend_supported(RendererBackend::Null));
     }
 
     #[test]

@@ -6699,27 +6699,3 @@ vs Eden `display_list.h` and `layer_list.h`
 - PASS: `SystemClockContext` (`0x20`) and `SteadyClockTimePoint` (`0x18`) are copied into fully
   zero-initialized fixed-size settings buffers. Focused dispatch coverage verifies the complete
   local-clock payload written by the background worker.
-## 2026-08-22 — renderer host availability policy vs Eden renderer selection
-
-### Intentional differences
-
-- On macOS AArch64 only, the three OpenGL renderer variants are filtered from the GUI and status
-  menus. A persisted or command-line OpenGL selection is normalized to Vulkan, which selects the
-  native Metal renderer on this host. Apple's OpenGL implementation is limited to 4.1 and cannot
-  provide the desktop feature set required by Eden's OpenGL renderer.
-- The restriction is architecture-specific rather than OS-wide: macOS x86_64 retains Eden's
-  OpenGL choices and the SDL OpenGL renderer path.
-
-### Unintentional differences (to fix)
-
-- None in this host-availability slice.
-
-### Missing items
-
-- The GTK frontend's existing OpenGL context bridge remains Linux/GLX-specific. This change does
-  not alter that pre-existing frontend limitation; macOS x86_64 retains the renderer selection and
-  SDL command-line path.
-
-### Binary layout verification
-
-- N/A: renderer enum discriminants and serialized configuration values are unchanged.
