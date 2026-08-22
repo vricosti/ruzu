@@ -10,7 +10,10 @@
 
 use super::alarm_worker::AlarmWorker;
 use super::pm_state_change_handler::PmStateChangeHandler;
+use crate::core_timing::CoreTiming;
+use crate::hle::service::hle_ipc::SessionRequestHandlerPtr;
 use crate::hle::service::psc::time::common::SystemClockContext;
+use std::sync::Arc;
 
 /// Event types processed in the TimeWorker thread loop.
 ///
@@ -56,9 +59,9 @@ impl TimeWorker {
     ///
     /// Corresponds to `TimeWorker::TimeWorker(System&, StandardSteadyClockResource&,
     /// FileTimestampWorker&)` in upstream worker.cpp.
-    pub fn new() -> Self {
+    pub fn new(time_manager: SessionRequestHandlerPtr, core_timing: Arc<CoreTiming>) -> Self {
         Self {
-            alarm_worker: AlarmWorker::new(),
+            alarm_worker: AlarmWorker::new(time_manager, core_timing),
             pm_state_change_handler: PmStateChangeHandler::new(),
             ig_report_network_clock_context_set: false,
             report_network_clock_context: SystemClockContext::default(),

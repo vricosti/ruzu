@@ -25,6 +25,15 @@
   before dereference; the previous `then_some(&*null)` made the existing tests abort before they
   could exercise the service.
 - Status: `time:m` prerequisite completed; `AlarmWorker` wiring and lifecycle resumed.
+- Resumed result: `AlarmWorker::Initialize` now creates its timer through `ServiceContext`, retains
+  the singleton `time:m` allocation, attaches the exact closest-alarm event returned by that
+  service, and creates the correctly named CoreTiming callback. `OnPowerStateChanged` delegates
+  through the restored service methods, and `Drop` unschedules before closing the timer event.
+- Focused coverage verifies event pointer identity, signal propagation from the underlying Alarms
+  owner, and complete timer-event owner release after destruction.
+- Status: `AlarmWorker` slice completed and re-verified. The broader incomplete `TimeWorker` event
+  loop remains the next separate prerequisite before its four report-state warnings can be
+  classified or removed.
 
 ## 2026-08-22 — Friend service warning slice interrupted by method-ownership prerequisite
 

@@ -43,14 +43,20 @@ impl TimeManager {
             .as_any()
             .downcast_ref::<TimeServiceManager>()
             .expect("time:m is not a PSC::Time::ServiceManager");
+        let psc_time = time_m.shared_time();
+        let core_timing = if system.is_null() {
+            Arc::new(crate::core_timing::CoreTiming::new())
+        } else {
+            system.get().core_timing()
+        };
 
         Self {
             system,
-            worker: TimeWorker::new(),
+            worker: TimeWorker::new(Arc::clone(&time_m_handler), core_timing),
             file_timestamp_worker: FileTimestampWorker::new(),
             steady_clock_resource: StandardSteadyClockResource::new(),
             time_zone_binary: TimeZoneBinary::new(system),
-            psc_time: time_m.shared_time(),
+            psc_time,
             time_sm: time_m.get_static_service_as_service_manager(),
             service_manager,
         }

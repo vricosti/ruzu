@@ -6524,3 +6524,73 @@ vs Eden `display_list.h` and `layer_list.h`
   constructor's `None` semantics.
 - Corrected the local-clock regression expectation: when steady-clock source IDs differ, Eden
   derives a context from the current steady clock rather than copying the supplied context.
+
+## 2026-08-22 — `src/core/src/hle/service/glue/time/alarm_worker.rs` vs `src/core/hle/service/glue/time/alarm_worker.{h,cpp}`
+
+### Intentional differences
+
+- Eden reaches CoreTiming and kernel event operations through `Core::System&`. Ruzu retains the
+  shared `Arc<CoreTiming>` directly, while its service `Event` encapsulates the kernel bridge used
+  by signal and clear operations.
+- The Rust service registry erases concrete handler types. `AlarmWorker` retains the exact
+  singleton `Arc<dyn SessionRequestHandler>` and performs a checked downcast to
+  `TimeServiceManager` before each direct service call; ownership remains equivalent to Eden's
+  typed `shared_ptr`.
+- Eden's nullable event pointers are represented as `Option<Arc<Event>>` before initialization.
+  Ruzu additionally retains the numeric `ServiceContext` handle needed by `close_event`.
+- Eden carries an unused reference to `StandardSteadyClockResource`. Rust does not create a
+  self-reference between sibling fields of `TimeWorker`; the resource has no behavior in
+  `AlarmWorker`, and CoreTiming is supplied directly instead.
+
+### Unintentional differences (to fix)
+
+- `TimeWorker` does not yet execute its event loop, so its production consumer of `GetEvent` and
+  `GetTimerEvent` remains absent even though both endpoints and their behavior now match Eden.
+
+### Missing items
+
+- None inside `AlarmWorker`; constructor state, `Initialize`, both getters,
+  `OnPowerStateChanged`, `GetClosestAlarmInfo`, `AttachToClosestAlarmEvent`, and destructor ordering
+  are present.
+
+### Binary layout verification
+
+- N/A: this slice creates and schedules event objects but serializes no raw payload.
+
+### Fixed parity debt
+
+- Replaced the unrelated synthetic closest-alarm event with the actual event owned by PSC
+  `time:m` and restored stable endpoint identity.
+- Timer creation now occurs during `Initialize` through `ServiceContext`; destruction unschedules
+  the CoreTiming callback before closing that timer event, matching Eden's order.
+- Removed the invented `with_refs` and setter construction paths. Required references now arrive
+  through the production `TimeManager -> TimeWorker -> AlarmWorker` construction chain.
+
+## 2026-08-22 — `src/core/src/hle/service/glue/time/{manager.rs,worker.rs}` vs `src/core/hle/service/glue/time/{manager,worker}.{h,cpp}`
+
+### Intentional differences
+
+- Ruzu passes the already-resolved singleton `time:m` handler and shared CoreTiming allocation into
+  `TimeWorker`; this is the Rust ownership form of Eden resolving `time:m` during
+  `TimeWorker::Initialize` and reaching CoreTiming through `Core::System&`.
+- Unit tests may construct `Glue::Time::TimeManager` with a null `SystemRef`; that test-only path
+  supplies an isolated CoreTiming allocation. Production always uses the System-owned allocation.
+
+### Unintentional differences (to fix)
+
+- `TimeWorker::Initialize`, `StartThread`, `ThreadFunc`, and its destructor are still skeletal.
+  The worker does not create or wait on its exit/clock/timer events, schedule periodic timers,
+  retain clock/settings services, dispatch the nine event cases, or perform Eden's shutdown order.
+- `PmStateChangeHandler` still omits its reference to `AlarmWorker`; Ruzu currently constructs it
+  independently.
+
+### Missing items
+
+- The concrete worker thread, `ServiceContext`, seven external/readable event owners, two periodic
+  CoreTiming events, local/network/ephemeral clock owners, settings owner, time service owners,
+  steady-clock and filesystem worker references, and `GetSettingsItemValue` helper remain to be
+  ported in their upstream owner.
+
+### Binary layout verification
+
+- N/A: the constructor-wiring slice changes ownership only and serializes no raw payload.
