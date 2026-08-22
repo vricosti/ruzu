@@ -5578,3 +5578,17 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 - Removed the duplicate frontend `WebExitReason`. The frontend now consumes the HLE-owned type,
   including Eden's `WindowClosed = 4` value instead of the previous incorrect value 8, and uses
   reusable callback semantics matching `std::function`.
+## 2026-08-22 — `src/common/src/settings.rs` vs Eden `src/common/settings.h` (`disable_web_applet`)
+
+### Intentional differences
+
+- Rust registers the setting through `for_each_setting_in_category_mut` instead of Eden's
+  `SettingsRegistry` linkage; both expose the same label, Debugging category and persisted value.
+
+### Unintentional differences (to fix)
+
+- None in this setting slice.
+
+### Missing items
+
+- None in this setting slice.

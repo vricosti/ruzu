@@ -351,6 +351,7 @@ pub struct Values {
     pub use_auto_stub: Setting<bool>,
     pub enable_all_controllers: Setting<bool>,
     pub perform_vulkan_check: Setting<bool>,
+    pub disable_web_applet: Setting<bool>,
 
     // ── Miscellaneous ───────────────────────────────────────────────────
     pub log_filter: Setting<String>,
@@ -531,6 +532,7 @@ impl Values {
                 use_auto_stub,
                 enable_all_controllers,
                 perform_vulkan_check,
+                disable_web_applet,
             ),
             Category::DebuggingGraphics => visit!(
                 dump_guest_shaders,
@@ -1504,6 +1506,7 @@ impl Default for Values {
             ),
             enable_all_controllers: Setting::new(false, "enable_all_controllers", Debugging),
             perform_vulkan_check: Setting::new(true, "perform_vulkan_check", Debugging),
+            disable_web_applet: Setting::new(true, "disable_web_applet", Debugging),
 
             // Miscellaneous
             log_filter: Setting::new("*:Info".to_string(), "log_filter", Miscellaneous),
@@ -2235,6 +2238,18 @@ mod tests {
             AppletMode::LLE
         );
         assert_eq!(*values.swkbd_applet_mode.get_value(), AppletMode::HLE);
+    }
+
+    #[test]
+    fn disable_web_applet_matches_upstream_default_and_category() {
+        let mut values = Values::default();
+        assert!(*values.disable_web_applet.get_value());
+
+        let mut labels = Vec::new();
+        values.for_each_setting_in_category_mut(Category::Debugging, |setting| {
+            labels.push(setting.label().to_string());
+        });
+        assert!(labels.iter().any(|label| label == "disable_web_applet"));
     }
 
     #[test]

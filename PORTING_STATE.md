@@ -1,5 +1,22 @@
 # Porting State
 
+## 2026-08-22 — Web browser applet warning slice
+
+- Status: interrupted pending the web-applet debugging-setting prerequisite.
+- Interrupted slice: replace `frontend/applet_web_browser.rs`'s `complete`-only stub with Eden's
+  TLV parsing, initialization, execution, RomFS extraction and result lifecycle.
+- Exact missing prerequisite: Eden gates non-Web/non-Lhub shims with
+  `Settings::values.disable_web_applet`, but Ruzu's `common::settings::Values` does not own or
+  register that upstream setting.
+- Required prerequisite work: port the setting in `common/settings.rs`, including its Debugging
+  category registration and Eden's default value, verify it against `settings.h`, then resume the
+  applet without substituting a hard-coded policy.
+- Resume condition: the setting participates in the generic settings visitor and its focused
+  default/category test passes.
+- Prerequisite result: `Values` now owns `disable_web_applet`, registers it in the Debugging
+  category and uses Eden's `true` default. The focused default/category regression passes; the
+  WebBrowser slice is resumed.
+
 ## 2026-08-22 — Resource-limit wait lifecycle
 
 - Status: completed and verified for the resource-limit wait/ownership slice.
