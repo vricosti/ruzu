@@ -46,8 +46,9 @@ const _: () = assert!(std::mem::size_of::<PageTablePage>() == PAGE_SIZE);
 pub type RefCount = u16;
 
 struct Inner {
-    /// All slab entries (always present). Indexed by `(addr - base) / PAGE_SIZE`.
-    pages: Vec<Box<PageTablePage>>,
+    /// Slab entries indexed by `(addr - base) / PAGE_SIZE`; `None` means the
+    /// shared page allocator has not assigned that page to this slab.
+    pages: Vec<Option<Box<PageTablePage>>>,
     /// Per-entry "checked out by `Allocate`" bitmap. False = entry is in
     /// the slab's free list and may be returned by the next `Allocate`.
     in_use: Vec<bool>,
@@ -96,41 +97,42 @@ impl KPageTableSlabHeap {
         (size / PAGE_SIZE) * std::mem::size_of::<RefCount>()
     }
 
-    /// Initialize the slab. The page allocator is sized in
-    /// `num_pages * PAGE_SIZE`; the refcount table is sized to one
-    /// `RefCount` slot per entry.
+    /// Initialize the slab over the owner page allocator's complete range and
+    /// pre-seed `num_pages` entries. The refcount table has one slot for each
+    /// page in that shared range.
     ///
     /// Upstream:
     ///   `Initialize(KDynamicPageManager*, size_t object_count, RefCount* rc)`
     /// where `rc` is carved from the kernel management region. ruzu owns
     /// the refcount Vec inline since the slab is host-backed.
     pub fn initialize(&self, page_allocator: Arc<Mutex<KDynamicPageManager>>, num_pages: usize) {
-        // Reserve `num_pages` from the page manager up-front so its
-        // used-count reflects the slab's footprint. Upstream's
-        // `KDynamicSlabHeap::Initialize` does the equivalent.
-        let mut start_address: u64 = 0;
-        {
+        let (address, size, allocated_addresses) = {
             let mut pa = page_allocator.lock().unwrap();
-            for i in 0..num_pages {
-                match pa.allocate() {
-                    Some(addr) => {
-                        if i == 0 {
-                            start_address = addr;
-                        }
-                    }
-                    None => break,
+            let address = pa.get_address();
+            let size = pa.get_size();
+            let mut allocated_addresses = Vec::with_capacity(num_pages);
+            for _ in 0..num_pages {
+                if let Some(allocated) = pa.allocate() {
+                    allocated_addresses.push(allocated);
+                } else {
+                    break;
                 }
             }
-        }
+            (address, size, allocated_addresses)
+        };
+        let slot_count = size / PAGE_SIZE;
         let mut inner = self.inner.lock().unwrap();
-        inner.pages = (0..num_pages)
-            .map(|_| Box::new(PageTablePage::default()))
-            .collect();
-        inner.in_use = vec![false; num_pages];
-        inner.ref_counts = vec![0; num_pages];
-        inner.address = start_address;
-        inner.size = num_pages * PAGE_SIZE;
-        inner.capacity = num_pages;
+        inner.pages = (0..slot_count).map(|_| None).collect();
+        inner.in_use = vec![false; slot_count];
+        inner.ref_counts = vec![0; slot_count];
+        inner.address = address;
+        inner.size = size;
+        inner.capacity = 0;
+        for allocated in allocated_addresses {
+            let index = ((allocated - address) / PAGE_SIZE as u64) as usize;
+            inner.pages[index] = Some(Box::new(PageTablePage::default()));
+            inner.capacity += 1;
+        }
         drop(inner);
         *self.page_allocator.lock().unwrap() = Some(page_allocator);
     }
@@ -141,16 +143,28 @@ impl KPageTableSlabHeap {
     /// which returns 0 on failure; ruzu returns `None` for the failure
     /// case and a non-zero address on success.
     pub fn allocate(&self) -> Option<u64> {
-        let mut inner = self.inner.lock().unwrap();
-        let cap = inner.capacity;
-        let base = inner.address;
-        for idx in 0..cap {
-            if !inner.in_use[idx] {
-                inner.in_use[idx] = true;
-                return Some(base + (idx * PAGE_SIZE) as u64);
+        {
+            let mut inner = self.inner.lock().unwrap();
+            let base = inner.address;
+            for idx in 0..inner.pages.len() {
+                if inner.pages[idx].is_some() && !inner.in_use[idx] {
+                    inner.in_use[idx] = true;
+                    return Some(base + (idx * PAGE_SIZE) as u64);
+                }
             }
         }
-        None
+
+        let page_allocator = self.page_allocator.lock().unwrap().clone()?;
+        let address = page_allocator.lock().unwrap().allocate()?;
+
+        let mut inner = self.inner.lock().unwrap();
+        let idx = self.addr_to_index_locked(&inner, address)?;
+        debug_assert!(inner.pages[idx].is_none());
+        inner.pages[idx] = Some(Box::new(PageTablePage::default()));
+        inner.in_use[idx] = true;
+        inner.ref_counts[idx] = 0;
+        inner.capacity += 1;
+        Some(address)
     }
 
     /// Free a page-table page back to the slab. Upstream:
@@ -171,7 +185,7 @@ impl KPageTableSlabHeap {
         // Reset the entry contents so reused pages don't carry stale
         // state — equivalent to upstream's `ClearNode=true` on the
         // KDynamicSlabHeap template parameter.
-        *inner.pages[idx] = PageTablePage::default();
+        **inner.pages[idx].as_mut().unwrap() = PageTablePage::default();
         inner.in_use[idx] = false;
     }
 
@@ -185,6 +199,16 @@ impl KPageTableSlabHeap {
 
     pub fn get_capacity(&self) -> usize {
         self.inner.lock().unwrap().capacity
+    }
+
+    pub fn get_used(&self) -> usize {
+        self.inner
+            .lock()
+            .unwrap()
+            .in_use
+            .iter()
+            .filter(|in_use| **in_use)
+            .count()
     }
 
     /// Address-range membership test. Returns true for any address that
@@ -243,5 +267,31 @@ impl KPageTableSlabHeap {
 impl Default for KPageTableSlabHeap {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn zero_capacity_heap_grows_from_owner_page_manager() {
+        let page_allocator = Arc::new(Mutex::new(KDynamicPageManager::new()));
+        page_allocator
+            .lock()
+            .unwrap()
+            .initialize(0x1_0000_0000, 4 * PAGE_SIZE, PAGE_SIZE)
+            .unwrap();
+        let heap = KPageTableSlabHeap::new();
+        heap.initialize(Arc::clone(&page_allocator), 0);
+
+        let page = heap.allocate().expect("page-table slab must grow");
+        assert!(page >= 0x1_0000_0000);
+        assert!(page < 0x1_0000_0000 + 4 * PAGE_SIZE as u64);
+        assert_eq!(page % PAGE_SIZE as u64, 0);
+        assert_eq!(heap.get_used(), 1);
+        assert_eq!(page_allocator.lock().unwrap().get_used(), 1);
+        heap.free(page);
+        assert_eq!(heap.get_used(), 0);
     }
 }

@@ -7,7 +7,10 @@
 //! is a concrete implementation that allocates secure memory.
 
 use super::k_dynamic_page_manager::KDynamicPageManager;
-use super::k_dynamic_resource_manager::{KBlockInfoManager, KMemoryBlockSlabManager};
+use super::k_dynamic_resource_manager::{
+    KBlockInfoManager, KBlockInfoSlabHeap, KMemoryBlockSlabHeap, KMemoryBlockSlabManager,
+};
+use super::k_dynamic_slab_heap::KDynamicSlabHeap;
 use super::k_memory_block::PAGE_SIZE;
 use super::k_memory_manager;
 use super::k_page_table_manager::KPageTableManager;
@@ -15,7 +18,7 @@ use super::k_page_table_slab_heap::{KPageTableSlabHeap, RefCount};
 use super::k_resource_limit::{KResourceLimit, LimitableResource};
 use super::k_scoped_resource_reservation::KScopedResourceReservation;
 use crate::hle::result::ResultCode;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard};
 
 /// Port of Kernel::KSystemResource.
 ///
@@ -23,9 +26,9 @@ use std::sync::Arc;
 /// and page table manager. Upstream inherits from KAutoObject; here we keep just the
 /// resource-management fields.
 pub struct KSystemResource {
-    memory_block_slab_manager: Option<Box<KMemoryBlockSlabManager>>,
-    block_info_manager: Option<Box<KBlockInfoManager>>,
-    page_table_manager: Option<Box<KPageTableManager>>,
+    memory_block_slab_manager: Option<Arc<KMemoryBlockSlabManager>>,
+    block_info_manager: Option<Arc<KBlockInfoManager>>,
+    page_table_manager: Option<Arc<KPageTableManager>>,
     is_secure_resource: bool,
 }
 
@@ -49,9 +52,9 @@ impl KSystemResource {
 
     pub fn set_managers(
         &mut self,
-        mb: Box<KMemoryBlockSlabManager>,
-        bi: Box<KBlockInfoManager>,
-        pt: Box<KPageTableManager>,
+        mb: Arc<KMemoryBlockSlabManager>,
+        bi: Arc<KBlockInfoManager>,
+        pt: Arc<KPageTableManager>,
     ) {
         assert!(self.memory_block_slab_manager.is_none());
         assert!(self.block_info_manager.is_none());
@@ -74,16 +77,16 @@ impl KSystemResource {
         self.page_table_manager.as_ref().unwrap()
     }
 
-    pub fn get_memory_block_slab_manager_mut(&mut self) -> &mut KMemoryBlockSlabManager {
-        self.memory_block_slab_manager.as_mut().unwrap()
+    pub fn memory_block_slab_manager_arc(&self) -> Arc<KMemoryBlockSlabManager> {
+        Arc::clone(self.memory_block_slab_manager.as_ref().unwrap())
     }
 
-    pub fn get_block_info_manager_mut(&mut self) -> &mut KBlockInfoManager {
-        self.block_info_manager.as_mut().unwrap()
+    pub fn block_info_manager_arc(&self) -> Arc<KBlockInfoManager> {
+        Arc::clone(self.block_info_manager.as_ref().unwrap())
     }
 
-    pub fn get_page_table_manager_mut(&mut self) -> &mut KPageTableManager {
-        self.page_table_manager.as_mut().unwrap()
+    pub fn page_table_manager_arc(&self) -> Arc<KPageTableManager> {
+        Arc::clone(self.page_table_manager.as_ref().unwrap())
     }
 }
 
@@ -101,11 +104,13 @@ pub struct KSecureSystemResource {
     base: KSystemResource,
     is_initialized: bool,
     resource_pool: k_memory_manager::Pool,
-    dynamic_page_manager: KDynamicPageManager,
-    memory_block_slab_manager: KMemoryBlockSlabManager,
-    block_info_manager: KBlockInfoManager,
-    page_table_manager: KPageTableManager,
-    page_table_heap: KPageTableSlabHeap,
+    dynamic_page_manager: Arc<Mutex<KDynamicPageManager>>,
+    memory_block_slab_manager: Option<Arc<KMemoryBlockSlabManager>>,
+    block_info_manager: Option<Arc<KBlockInfoManager>>,
+    page_table_manager: Option<Arc<KPageTableManager>>,
+    memory_block_heap: Option<Arc<KMemoryBlockSlabHeap>>,
+    block_info_heap: Option<Arc<KBlockInfoSlabHeap>>,
+    page_table_heap: Option<Arc<KPageTableSlabHeap>>,
     resource_limit: Option<Arc<KResourceLimit>>,
     resource_address: u64,
     resource_size: usize,
@@ -116,20 +121,19 @@ impl KSecureSystemResource {
         let mut base = KSystemResource::new();
         base.set_secure_resource();
 
+        let dynamic_page_manager = Arc::new(Mutex::new(KDynamicPageManager::new()));
+
         Self {
             base,
             is_initialized: false,
             resource_pool: k_memory_manager::Pool::Application,
-            dynamic_page_manager: KDynamicPageManager::new(),
-            memory_block_slab_manager: KMemoryBlockSlabManager::new(),
-            block_info_manager: KBlockInfoManager::new(),
-            // KPageTableManager wraps a slab heap by composition; the
-            // slab is constructed empty here and populated via the boot
-            // path's `initialize_page_table_manager` on KernelCore.
-            page_table_manager: KPageTableManager::new(std::sync::Arc::new(
-                KPageTableSlabHeap::new(),
-            )),
-            page_table_heap: KPageTableSlabHeap::new(),
+            dynamic_page_manager,
+            memory_block_slab_manager: None,
+            block_info_manager: None,
+            page_table_manager: None,
+            memory_block_heap: None,
+            block_info_heap: None,
+            page_table_heap: None,
             resource_limit: None,
             resource_address: 0,
             resource_size: 0,
@@ -145,7 +149,7 @@ impl KSecureSystemResource {
     }
 
     pub fn get_used_size(&self) -> usize {
-        self.dynamic_page_manager.get_used() * PAGE_SIZE
+        self.dynamic_page_manager.lock().unwrap().get_used() * PAGE_SIZE
     }
 
     /// Matches upstream member function `KSecureSystemResource::CalculateRequiredSecureMemorySize() const`
@@ -154,8 +158,8 @@ impl KSecureSystemResource {
         Self::calculate_required_secure_memory_size(self.resource_size, self.resource_pool)
     }
 
-    pub fn get_dynamic_page_manager(&self) -> &KDynamicPageManager {
-        &self.dynamic_page_manager
+    pub fn get_dynamic_page_manager(&self) -> MutexGuard<'_, KDynamicPageManager> {
+        self.dynamic_page_manager.lock().unwrap()
     }
 
     /// Initialize the secure system resource.
@@ -213,6 +217,8 @@ impl KSecureSystemResource {
         // Initialize the dynamic page manager with the remaining memory.
         if self
             .dynamic_page_manager
+            .lock()
+            .unwrap()
             .initialize(resource_address + rc_size as u64, size - rc_size, PAGE_SIZE)
             .is_err()
         {
@@ -225,6 +231,31 @@ impl KSecureSystemResource {
             return Err(super::svc::svc_results::RESULT_OUT_OF_MEMORY);
         }
 
+        let memory_block_heap = Arc::new(KDynamicSlabHeap::new(false));
+        let block_info_heap = Arc::new(KDynamicSlabHeap::new(false));
+        let page_table_heap = Arc::new(KPageTableSlabHeap::new());
+        let memory_block_slab_manager = Arc::new(KMemoryBlockSlabManager::new_with_resources(
+            Arc::clone(&self.dynamic_page_manager),
+            Arc::clone(&memory_block_heap),
+        ));
+        let block_info_manager = Arc::new(KBlockInfoManager::new_with_resources(
+            Arc::clone(&self.dynamic_page_manager),
+            Arc::clone(&block_info_heap),
+        ));
+        page_table_heap.initialize(Arc::clone(&self.dynamic_page_manager), 0);
+        let page_table_manager = Arc::new(KPageTableManager::new(Arc::clone(&page_table_heap)));
+        self.base.set_managers(
+            Arc::clone(&memory_block_slab_manager),
+            Arc::clone(&block_info_manager),
+            Arc::clone(&page_table_manager),
+        );
+        self.memory_block_slab_manager = Some(memory_block_slab_manager);
+        self.block_info_manager = Some(block_info_manager);
+        self.page_table_manager = Some(page_table_manager);
+        self.memory_block_heap = Some(memory_block_heap);
+        self.block_info_heap = Some(block_info_heap);
+        self.page_table_heap = Some(page_table_heap);
+
         memory_reservation.commit();
         self.is_initialized = true;
         Ok(())
@@ -233,12 +264,15 @@ impl KSecureSystemResource {
     /// Finalize the secure system resource.
     /// Port of upstream `KSecureSystemResource::Finalize`.
     pub fn finalize(&mut self, mm: &mut k_memory_manager::KMemoryManager) {
-        assert_eq!(self.memory_block_slab_manager.get_used(), 0);
-        assert_eq!(self.block_info_manager.get_used(), 0);
-        // KPageTableManager doesn't expose `get_used()` directly (the
-        // slab heap holds the free list); upstream's analogous assert
-        // tests `m_pt_heap->GetUsed() == 0` via the inherited base.
-        // ruzu's slab heap doesn't track used count yet, so we skip.
+        assert_eq!(
+            self.memory_block_slab_manager.as_ref().unwrap().get_used(),
+            0
+        );
+        assert_eq!(self.block_info_manager.as_ref().unwrap().get_used(), 0);
+        assert_eq!(self.page_table_manager.as_ref().unwrap().get_used(), 0);
+        debug_assert_eq!(self.memory_block_heap.as_ref().unwrap().get_used(), 0);
+        debug_assert_eq!(self.block_info_heap.as_ref().unwrap().get_used(), 0);
+        debug_assert_eq!(self.page_table_heap.as_ref().unwrap().get_used(), 0);
 
         // Free secure memory.
         if self.resource_address != 0 && self.resource_size > 0 {
@@ -278,5 +312,79 @@ impl KSecureSystemResource {
 impl Default for KSecureSystemResource {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn secure_resource_publishes_managers_backed_by_its_dynamic_pool() {
+        let mut memory_manager = k_memory_manager::KMemoryManager::new();
+        memory_manager.initialize_pool(
+            k_memory_manager::Pool::Application,
+            0x1_0000_0000,
+            2 * 1024 * 1024,
+        );
+        let mut resource = KSecureSystemResource::new();
+        resource
+            .initialize(
+                256 * 1024,
+                None,
+                k_memory_manager::Pool::Application,
+                &mut memory_manager,
+            )
+            .unwrap();
+
+        assert!(resource.is_initialized());
+        assert!(Arc::ptr_eq(
+            &resource.base().memory_block_slab_manager_arc(),
+            resource.memory_block_slab_manager.as_ref().unwrap(),
+        ));
+        assert!(Arc::ptr_eq(
+            &resource.base().block_info_manager_arc(),
+            resource.block_info_manager.as_ref().unwrap(),
+        ));
+        assert!(Arc::ptr_eq(
+            &resource.base().page_table_manager_arc(),
+            resource.page_table_manager.as_ref().unwrap(),
+        ));
+
+        let memory_block = resource
+            .base()
+            .get_memory_block_slab_manager()
+            .allocate()
+            .unwrap();
+        let block_info = resource.base().get_block_info_manager().allocate().unwrap();
+        let page_table = resource.base().get_page_table_manager().allocate().unwrap();
+        assert_eq!(resource.get_used_size(), 3 * PAGE_SIZE);
+
+        resource
+            .base()
+            .get_memory_block_slab_manager()
+            .free(memory_block);
+        resource.base().get_block_info_manager().free(block_info);
+        resource.base().get_page_table_manager().free(page_table);
+        resource.finalize(&mut memory_manager);
+        assert!(!resource.is_initialized());
+    }
+
+    #[test]
+    fn secure_memory_size_uses_edens_applet_pool_id() {
+        assert_eq!(
+            KSecureSystemResource::calculate_required_secure_memory_size(
+                0x20_000,
+                k_memory_manager::Pool::Applet,
+            ),
+            0,
+        );
+        assert_eq!(
+            KSecureSystemResource::calculate_required_secure_memory_size(
+                0x20_000,
+                k_memory_manager::Pool::System,
+            ),
+            0x20_000,
+        );
     }
 }

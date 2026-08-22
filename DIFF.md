@@ -5071,3 +5071,150 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 - The unused helper that cleared a guest virtual address through `zero_block` was removed. Eden's
   `ClearBackingRegion` accepts physical addresses, and every live Ruzu allocation path continues to
   call the physical-backing helper before mapping the new pages.
+
+## 2026-08-22 — `src/core/src/hle/kernel/k_dynamic_resource_manager.rs` vs `core/hle/kernel/k_dynamic_resource_manager.h`
+
+### Intentional differences
+
+- Rust managers retain `Arc` owners for the page allocator and typed slab instead of Eden's raw
+  non-owning pointers. The owner-provided constructor represents Eden's separate default
+  construction and `Initialize` calls without changing which resource owns allocations.
+
+### Fixed parity debt
+
+- Managers can now attach to the dynamic page allocator and explicit slab heap owned by a
+  `KSystemResource`. The memory-block and block-info slab aliases also live beside their manager
+  aliases as they do upstream.
+
+## 2026-08-22 — `src/core/src/hle/kernel/k_dynamic_slab_heap.rs` vs `core/hle/kernel/k_dynamic_slab_heap.h`
+
+### Intentional differences
+
+- Typed entries are host-owned `Box<T>` values guarded by mutexes rather than placement-constructed
+  inside emulated kernel pages. Page consumption, capacity, used and peak accounting still follow
+  the owner-provided `KDynamicPageManager`.
+
+### Fixed parity debt
+
+- Initialization now exposes the complete shared page-manager address range even when zero objects
+  are pre-seeded, and lazy growth increases object count without changing that range, matching
+  Eden's `Initialize` and `Allocate` state transitions.
+
+## 2026-08-22 — `src/core/src/hle/kernel/k_page_group.rs` vs `core/hle/kernel/k_page_group.h` and `.cpp`
+
+### Intentional differences
+
+- Rust stores slab-owned `Box<KBlockInfo>` nodes in a vector instead of Eden's intrusive singly
+  linked list. The unused link is retained as a zeroed pointer-sized field so `KBlockInfo` remains
+  exactly 0x10 bytes and slab capacity matches Eden; iteration order and concatenation behavior are
+  unchanged.
+
+### Fixed parity debt
+
+- New block nodes are now allocated from the selected `KBlockInfoManager`, allocation exhaustion is
+  propagated, and finalize returns every node to that same manager. `close_and_reset` preserves
+  Eden's per-node close-then-free ordering.
+
+## 2026-08-22 — `src/core/src/hle/kernel/k_page_table_slab_heap.rs` vs `core/hle/kernel/k_page_table_slab_heap.h`
+
+### Intentional differences
+
+- Page-table contents and reference counts use indexed host allocations over the dynamic manager's
+  full address range instead of pointers into kernel virtual memory. Unassigned shared-pool pages
+  are represented by empty slots so interleaved slab allocations retain correct address indices.
+
+### Fixed parity debt
+
+- A zero-preseed heap now grows lazily from its owner page manager, tracks used entries, and sizes
+  its reference-count table from the complete shared allocator range like Eden.
+
+## 2026-08-22 — `src/core/src/hle/kernel/k_page_table_manager.rs` vs `core/hle/kernel/k_page_table_manager.h`
+
+### Intentional differences
+
+- Constructor injection of the shared slab replaces Eden's default construction followed by
+  `Initialize`; all allocation, reference-count and range operations still belong to this manager.
+
+### Fixed parity debt
+
+- `get_used` now exposes the inherited dynamic-resource accounting required by
+  `KSecureSystemResource::Finalize`.
+
+## 2026-08-22 — `src/core/src/hle/kernel/k_system_resource.rs` vs `core/hle/kernel/k_system_resource.h` and `.cpp`
+
+### Intentional differences
+
+- `Arc` ownership replaces the base class's raw pointers to derived manager members, while the
+  dynamic page allocator is mutex-protected so all three slabs can share it safely. Ruzu's secure
+  address is the physical allocation directly because it has no separate kernel heap-VA mapping.
+- Holding an `Arc<KResourceLimit>` supplies Eden's explicit `Open`/`Close` reference lifetime.
+
+### Fixed parity debt
+
+- Secure-resource initialization now creates the page-table, memory-block and block-info heaps over
+  its dynamic page pool, initializes their managers, and publishes those exact managers through
+  `KSystemResource::SetManagers`. Finalization verifies all three managers have no live objects.
+
+## 2026-08-22 — `src/core/src/hle/kernel/board/k_system_control.rs` vs `core/hle/kernel/board/nintendo/nx/k_system_control.cpp`
+
+### Fixed parity debt
+
+- Secure-memory sizing and free validation now compare against the actual `Pool::Applet` value 1,
+  and free uses page alignment only for `Pool::System` value 2. The former hard-coded values
+  treated the System pool as Applet and selected the wrong alignment for Application memory.
+
+## 2026-08-22 — `src/core/src/hle/kernel/k_page_table_base.rs` secure-manager ownership vs `core/hle/kernel/k_page_table_base.h` and `.cpp`
+
+### Intentional differences
+
+- Isolated Rust callers may omit a system resource and fall back to kernel-owned managers; runtime
+  process initialization supplies the selected resource explicitly, as Eden does.
+
+### Fixed parity debt
+
+- Process page tables now retain the selected system resource's memory-block and block-info
+  managers. Sentinel blocks, update allocators and every runtime `KPageGroup` therefore consume the
+  process-owned secure pool when one exists instead of silently using global managers.
+- `FinalizeUpdate` now only drains deferred page addresses. Its prior free calls executed code that
+  is commented out in current Eden while guest-memory page-table allocation remains disabled.
+
+## 2026-08-22 — `src/core/src/hle/kernel/k_process_page_table.rs` vs `core/hle/kernel/k_process_page_table.h`
+
+### Fixed parity debt
+
+- The thin wrapper now forwards the `KSystemResource` argument owned by Eden's
+  `InitializeForProcess` interface instead of dropping it.
+
+## 2026-08-22 — `src/core/src/hle/kernel/k_process.rs` secure-resource setup vs `core/hle/kernel/k_process.cpp`
+
+### Fixed parity debt
+
+- After creating a non-default secure system resource, process initialization now keeps its lock
+  guard alive while forwarding the resource's base manager set into page-table initialization.
+
+### Missing items
+
+- Processes without a private secure resource still fall back to Ruzu's separate kernel manager
+  fields rather than retaining Eden's application/system `KSystemResource` objects. The global
+  resource-manager split remains a separate structural slice.
+
+## 2026-08-22 — `src/core/src/hle/kernel/kernel.rs` vs `core/hle/kernel/kernel.cpp`
+
+### Fixed parity debt
+
+- `KernelCore` now owns and exposes the global `KBlockInfoManager`, using Eden's 4000-entry capacity,
+  so default page groups no longer bypass block-info slab accounting.
+
+### Missing items
+
+- Ruzu still uses one global memory-block manager and independently backed manager heaps. Eden owns
+  application/system manager pairs over one shared dynamic page pool, pre-reserves the page-table
+  heap, and leaves exactly 64 dynamic pages; that broader resource-manager initialization remains
+  to be ported.
+
+## 2026-08-22 — `src/core/src/core.rs` kernel resource-manager boot wiring vs `core/hle/kernel/kernel.cpp`
+
+### Fixed parity debt
+
+- Kernel boot now initializes the global block-info manager beside the memory-block and page-table
+  managers before any process page table is created.

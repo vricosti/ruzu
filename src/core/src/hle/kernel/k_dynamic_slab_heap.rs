@@ -77,29 +77,26 @@ impl<T: Default> KDynamicSlabHeap<T> {
         page_allocator: Arc<Mutex<KDynamicPageManager>>,
         num_pages: usize,
     ) {
-        // Reserve the pages from the manager up-front so its used-count
-        // reflects the slab's footprint.
-        let mut start_address: u64 = 0;
-        {
+        let (address, size, allocated_pages) = {
             let mut pa = page_allocator.lock().unwrap();
-            for i in 0..num_pages {
-                match pa.allocate() {
-                    Some(addr) => {
-                        if i == 0 {
-                            start_address = addr;
-                        }
-                    }
-                    None => break,
+            let address = pa.get_address();
+            let size = pa.get_size();
+            let mut allocated_pages = 0;
+            for _ in 0..num_pages {
+                if pa.allocate().is_some() {
+                    allocated_pages += 1;
+                } else {
+                    break;
                 }
             }
-        }
-        self.address
-            .store(start_address as usize, Ordering::Relaxed);
-        self.size.store(num_pages * PAGE_SIZE, Ordering::Relaxed);
+            (address, size, allocated_pages)
+        };
+        self.address.store(address as usize, Ordering::Relaxed);
+        self.size.store(size, Ordering::Relaxed);
 
         // Carve into typed entries and seed the free list.
         let entries_per_page = Self::entries_per_page();
-        let total = num_pages * entries_per_page;
+        let total = allocated_pages * entries_per_page;
         let mut list = self.free_list.lock().unwrap();
         list.reserve(total);
         for _ in 0..total {
@@ -178,7 +175,6 @@ impl<T: Default> KDynamicSlabHeap<T> {
         let item = Box::new(T::default());
         drop(list);
         self.capacity.fetch_add(entries_per_page, Ordering::Relaxed);
-        self.size.fetch_add(PAGE_SIZE, Ordering::Relaxed);
         self.bump_used();
         Some(item)
     }

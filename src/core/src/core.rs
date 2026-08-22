@@ -1509,6 +1509,9 @@ impl System {
             kernel.initialize_memory_block_slab_manager(
                 crate::hle::kernel::kernel::MEMORY_BLOCK_SLAB_HEAP_SIZE,
             );
+            kernel.initialize_block_info_manager(
+                crate::hle::kernel::kernel::BLOCK_INFO_SLAB_HEAP_SIZE,
+            );
 
             // Initialize the kernel-wide page-table-page allocator.
             // Upstream sizes this from `KernelPageTableHeapSize` (kernel.cpp:1067).

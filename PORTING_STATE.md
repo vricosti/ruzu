@@ -723,3 +723,23 @@
 - Status: prerequisite ported and re-verified against Eden's header and implementation. The raw
   two-device array is returned unchanged from the controller-owned status, and the focused
   left/right snapshot regression passes. The preview slice can resume.
+
+## 2026-08-22 — secure system-resource warning cleanup interrupted by manager-ownership prerequisite
+
+- Interrupted slice: classify the unread `KSecureSystemResource::page_table_manager` and
+  `page_table_heap` fields against Eden.
+- Exact missing prerequisite: Ruzu initializes only the secure dynamic-page allocator. It does not
+  initialize the page-table, memory-block, and block-info slab heaps from that allocator, publish
+  their managers through `KSystemResource`, or pass those process-owned managers into
+  `KPageTableBase::InitializeForProcess`; the page table instead reaches kernel-global managers.
+- Required next action: let dynamic resource managers share their owner-provided page allocator and
+  slab heap, initialize all three secure managers in `k_system_resource.rs`, retain them through
+  shared Rust ownership, and wire the selected system resource into the process page table before
+  resuming the warning classification.
+- Resume condition: secure manager allocation consumes the secure dynamic page pool, the base
+  accessors return those exact managers, page-table block updates and page groups use the selected
+  resource managers, and focused ownership/lifecycle tests pass.
+- Status: prerequisite completed and re-verified. Secure memory now initializes and publishes all
+  three manager/heap pairs over its dynamic page pool; process page tables retain the selected
+  memory-block and block-info managers, and `KPageGroup` returns each node to that owner with Eden's
+  close/free ordering. The original unread-field warning slice is resolved.

@@ -15,7 +15,7 @@ use bitflags::bitflags;
 use std::sync::{Arc, Mutex};
 
 use super::k_address_space_info::{AddressSpaceInfoType, KAddressSpaceInfo};
-use super::k_dynamic_resource_manager::KMemoryBlockSlabManager;
+use super::k_dynamic_resource_manager::{KBlockInfoManager, KMemoryBlockSlabManager};
 use super::k_light_lock::{KLightLock, KScopedLightLock};
 use super::k_memory_block::*;
 use super::k_memory_block_manager::KMemoryBlockManager;
@@ -221,10 +221,9 @@ pub enum OperationType {
 /// Port of upstream `KPageTableBase::PageLinkedList` (k_page_table_base.h:116).
 /// Upstream stores intrusive `Node*` pointers (each Node is a 4 KB page);
 /// ruzu stores raw physical addresses since ruzu's page table doesn't yet
-/// have a kernel-side page-table-page allocator. `FinalizeUpdate` pops the
-/// list and (in upstream) calls `m_page_table_manager.Free(page)` — for
-/// ruzu the pop is a no-op because page-table entries live in a Rust Vec,
-/// not in guest physical pages.
+/// have a kernel-side page-table-page allocator. Current Eden's
+/// `FinalizeUpdate` drains the list while its manager assertions and free call
+/// remain commented out; Ruzu does the same.
 #[derive(Default, Debug)]
 pub struct PageLinkedList {
     pages: Vec<u64>,
@@ -383,6 +382,8 @@ pub struct KPageTableBase {
     pub(crate) m_enable_device_address_space_merge: bool,
     /// Upstream: `KMemoryBlockSlabManager* m_memory_block_slab_manager`.
     pub(crate) m_memory_block_slab_manager: Option<Arc<KMemoryBlockSlabManager>>,
+    /// Upstream: `KBlockInfoManager* m_block_info_manager`.
+    pub(crate) m_block_info_manager: Option<Arc<KBlockInfoManager>>,
     pub(crate) m_heap_fill_value: MemoryFillValue,
     pub(crate) m_ipc_fill_value: MemoryFillValue,
     pub(crate) m_stack_fill_value: MemoryFillValue,
@@ -427,6 +428,7 @@ impl KPageTableBase {
             m_enable_aslr: false,
             m_enable_device_address_space_merge: false,
             m_memory_block_slab_manager: None,
+            m_block_info_manager: None,
             m_heap_fill_value: MemoryFillValue::Zero,
             m_ipc_fill_value: MemoryFillValue::Zero,
             m_stack_fill_value: MemoryFillValue::Zero,
@@ -492,7 +494,10 @@ impl KPageTableBase {
                         .unmap(addr, size, false);
                 }
 
-                let mut page_group = super::k_page_group::KPageGroup::new();
+                let mut page_group =
+                    super::k_page_group::KPageGroup::with_block_info_manager(
+                        self.m_block_info_manager.clone(),
+                    );
                 let _ = self.make_page_group(&mut page_group, addr, size / PAGE_SIZE);
                 page_group.close_and_reset();
             });
@@ -531,6 +536,7 @@ impl KPageTableBase {
         self.m_impl = None;
         self.m_memory = None;
         self.m_memory_block_slab_manager = None;
+        self.m_block_info_manager = None;
         self.m_system = SystemRef::null();
     }
 
@@ -1021,6 +1027,7 @@ impl KPageTableBase {
         pool: u32,
         code_address: usize,
         code_size: usize,
+        system_resource: Option<&super::k_system_resource::KSystemResource>,
         resource_limit: Option<Arc<KResourceLimit>>,
         memory: Option<Arc<Mutex<Memory>>>,
         aslr_space_start: usize,
@@ -1257,15 +1264,21 @@ impl KPageTableBase {
         debug_assert!(self.m_kernel_map_region_start >= self.m_address_space_start);
         debug_assert!(self.m_kernel_map_region_end <= self.m_address_space_end);
 
-        // Initialize the memory block manager. Upstream:
-        //   m_memory_block_manager.Initialize(start, end, slab_manager);
-        // The slab manager is the kernel-wide block slab; ruzu pulls it
-        // from `KernelCore::get_memory_block_slab_manager()` so the
-        // sentinel block is drawn from the same pool every subsequent
-        // update will use.
-        let slab = crate::hle::kernel::kernel::get_kernel_ref()
-            .and_then(|k| k.get_memory_block_slab_manager());
+        let (slab, block_info_manager) = match system_resource {
+            Some(resource) => (
+                Some(resource.memory_block_slab_manager_arc()),
+                Some(resource.block_info_manager_arc()),
+            ),
+            None => {
+                let kernel = crate::hle::kernel::kernel::get_kernel_ref();
+                (
+                    kernel.and_then(|k| k.get_memory_block_slab_manager()),
+                    kernel.and_then(|k| k.get_block_info_manager()),
+                )
+            }
+        };
         self.m_memory_block_slab_manager = slab.clone();
+        self.m_block_info_manager = block_info_manager;
         let slab_ref = slab.as_deref();
         if self
             .m_memory_block_manager
@@ -1361,9 +1374,8 @@ impl KPageTableBase {
     /// ```
     ///
     /// The `page_list` parameter accumulates page-table pages that the
-    /// operation has freed, for `FinalizeUpdate` to return to the
-    /// `KPageTableManager`. ruzu's flat page table never produces such
-    /// pages today (see `k_page_table_manager.rs` header), so callers
+    /// operation has freed, for `FinalizeUpdate` to drain. Ruzu's flat page
+    /// table never produces such pages today, so callers
     /// can pass `None` if they don't have a `KScopedPageTableUpdater` in
     /// scope; the principal phys-handlers pass `Some(updater.page_list())`
     /// matching upstream's call shape.
@@ -1385,7 +1397,10 @@ impl KPageTableBase {
         match operation {
             OperationType::Unmap | OperationType::UnmapPhysical => {
                 let separate_heap = matches!(operation, OperationType::UnmapPhysical);
-                let mut pages_to_close = super::k_page_group::KPageGroup::with_kernel();
+                let mut pages_to_close =
+                    super::k_page_group::KPageGroup::with_block_info_manager(
+                        self.m_block_info_manager.clone(),
+                    );
                 let close_pages = self.make_page_group(&mut pages_to_close, virt_addr, num_pages);
                 if close_pages != 0 {
                     return close_pages;
@@ -1551,7 +1566,9 @@ impl KPageTableBase {
         perm: KMemoryPermission,
     ) -> u32 {
         let alloc_option = self.m_allocate_option;
-        let mut pg = super::k_page_group::KPageGroup::with_kernel();
+        let mut pg = super::k_page_group::KPageGroup::with_block_info_manager(
+            self.m_block_info_manager.clone(),
+        );
         {
             let Some(kernel) = crate::hle::kernel::kernel::get_kernel_mut() else {
                 return svc_results::RESULT_OUT_OF_MEMORY.get_inner_value();
@@ -1676,14 +1693,11 @@ impl KPageTableBase {
         &self,
         num_blocks: usize,
     ) -> Result<super::k_dynamic_resource_manager::KMemoryBlockManagerUpdateAllocator, u32> {
-        let slab = match crate::hle::kernel::kernel::get_kernel_ref()
-            .and_then(|k| k.get_memory_block_slab_manager())
-        {
+        let slab = match self.m_memory_block_slab_manager.clone() {
             Some(s) => s,
             None => {
                 log::error!(
-                    "make_block_update_allocator: no kernel-wide block slab \
-                     manager — initialize_memory_block_slab_manager not called?"
+                    "make_block_update_allocator: page table has no block slab manager"
                 );
                 return Err(svc_results::RESULT_OUT_OF_RESOURCE.get_inner_value());
             }
@@ -1706,43 +1720,16 @@ impl KPageTableBase {
     /// ```cpp
     /// while (page_list->Peek()) {
     ///     auto page = page_list->Pop();
-    ///     ASSERT(this->GetPageTableManager().IsInPageTableHeap(page));
-    ///     ASSERT(this->GetPageTableManager().GetRefCount(page) == 0);
-    ///     this->GetPageTableManager().Free(page);
+    ///     // ASSERT(this->GetPageTableManager().IsInPageTableHeap(page));
+    ///     // ASSERT(this->GetPageTableManager().GetRefCount(page) == 0);
+    ///     // this->GetPageTableManager().Free(page);
     /// }
     /// ```
     ///
-    /// Routes each popped page through the kernel-wide
-    /// `KPageTableManager`. ruzu's flat `common::page_table::PageTable`
-    /// doesn't push pages onto the list today (no L1/L2/L3 levels), so
-    /// the loop body stays cold; when multi-level guest page tables are
-    /// ported, `Operate` will start populating the list and this path
-    /// becomes hot without further changes.
+    /// Current Eden only drains this list; freeing page-table entries remains
+    /// commented out until guest-memory page-table allocation is enabled.
     pub fn finalize_update(&mut self, page_list: &mut PageLinkedList) {
-        let manager =
-            crate::hle::kernel::kernel::get_kernel_ref().and_then(|k| k.get_page_table_manager());
-        while let Some(page_addr) = page_list.pop() {
-            let Some(ref manager) = manager else {
-                continue;
-            };
-            // Upstream debug-asserts membership and zero refcount before
-            // freeing — ruzu mirrors with non-fatal warnings since both
-            // checks are silently false in the no-multi-level state.
-            debug_assert!(
-                manager.is_in_page_table_heap(page_addr),
-                "FinalizeUpdate: page {:#x} not in page table heap",
-                page_addr
-            );
-            debug_assert!(
-                manager.get_ref_count(page_addr) == 0,
-                "FinalizeUpdate: page {:#x} has non-zero refcount",
-                page_addr
-            );
-            // Mirrors upstream:
-            //   GetPageTableManager().Free(page);
-            // The slab heap looks up the entry by address and reclaims
-            // the in-slab Box — no placeholder allocation.
-            manager.free(page_addr);
+        while page_list.pop().is_some() {
         }
     }
 
@@ -1985,7 +1972,9 @@ impl KPageTableBase {
         //   R_TRY(m_kernel.MemoryManager().AllocateAndOpen(
         //       std::addressof(pg), allocation_size / PageSize, m_allocate_option));
         let alloc_option = self.m_allocate_option;
-        let mut pg = super::k_page_group::KPageGroup::with_kernel();
+        let mut pg = super::k_page_group::KPageGroup::with_block_info_manager(
+            self.m_block_info_manager.clone(),
+        );
         {
             let Some(kernel) = crate::hle::kernel::kernel::get_kernel_mut() else {
                 return (svc_results::RESULT_OUT_OF_MEMORY.get_inner_value(), 0);
@@ -2389,7 +2378,9 @@ impl KPageTableBase {
 
         // Build the source page group first, matching upstream
         // `MakePageGroup(pg, src_address, num_pages)` before any permission change.
-        let mut pg = super::k_page_group::KPageGroup::new();
+        let mut pg = super::k_page_group::KPageGroup::with_block_info_manager(
+            self.m_block_info_manager.clone(),
+        );
         let make_pg_result = self.make_page_group(&mut pg, src, num_pages);
         if make_pg_result != 0 {
             return make_pg_result;
@@ -2542,7 +2533,9 @@ impl KPageTableBase {
         // the same physical page group as the source. Upstream:
         // `MakePageGroup(pg, dst_address, num_pages)` followed by
         // `IsValidPageGroup(pg, src_address, num_pages)`.
-        let mut pg = super::k_page_group::KPageGroup::new();
+        let mut pg = super::k_page_group::KPageGroup::with_block_info_manager(
+            self.m_block_info_manager.clone(),
+        );
         let make_pg_result = self.make_page_group(&mut pg, dst, num_pages);
         if make_pg_result != 0 {
             log::error!(
@@ -3610,7 +3603,9 @@ impl KPageTableBase {
 
         let old_state = out_state.unwrap_or(KMemoryState::CODE);
         let old_perm = out_perm.unwrap_or(KMemoryPermission::NONE);
-        let mut pg = super::k_page_group::KPageGroup::with_kernel();
+        let mut pg = super::k_page_group::KPageGroup::with_block_info_manager(
+            self.m_block_info_manager.clone(),
+        );
 
         // Determine new state based on permission being set.
         let is_w = perm.contains(KMemoryPermission::USER_WRITE);
@@ -3760,7 +3755,9 @@ impl KPageTableBase {
             }
 
             let alloc_option = self.m_allocate_option;
-            let mut pg = super::k_page_group::KPageGroup::with_kernel();
+            let mut pg = super::k_page_group::KPageGroup::with_block_info_manager(
+                self.m_block_info_manager.clone(),
+            );
             {
                 let Some(kernel) = crate::hle::kernel::kernel::get_kernel_mut() else {
                     return svc_results::RESULT_OUT_OF_MEMORY.get_inner_value();
@@ -3856,7 +3853,9 @@ impl KPageTableBase {
             let mut pg_remaining = pg_blocks.first().map(|(_, n)| *n).unwrap_or(0);
 
             for &(range_va, range_pages) in &free_ranges {
-                let mut cur_pg = super::k_page_group::KPageGroup::with_kernel();
+                let mut cur_pg = super::k_page_group::KPageGroup::with_block_info_manager(
+                    self.m_block_info_manager.clone(),
+                );
                 let mut needed = range_pages;
                 while needed > 0 {
                     if pg_remaining == 0 {
@@ -4274,7 +4273,9 @@ impl KPageTableBase {
         };
 
         // Build a KPageGroup describing src's existing physical pages before reprotecting it.
-        let mut pg = super::k_page_group::KPageGroup::with_kernel();
+        let mut pg = super::k_page_group::KPageGroup::with_block_info_manager(
+            self.m_block_info_manager.clone(),
+        );
         let mpg_rc = self.make_page_group(&mut pg, src, num_pages);
         if mpg_rc != 0 {
             return mpg_rc;
@@ -4409,7 +4410,9 @@ impl KPageTableBase {
             }
         }
 
-        let mut pg = super::k_page_group::KPageGroup::with_kernel();
+        let mut pg = super::k_page_group::KPageGroup::with_block_info_manager(
+            self.m_block_info_manager.clone(),
+        );
         let result = self.make_page_group(&mut pg, dst, num_pages);
         if result != 0 {
             return result;
@@ -4539,7 +4542,9 @@ impl KPageTableBase {
         }
 
         // Allocate pages for the insecure memory.
-        let mut pg = super::k_page_group::KPageGroup::with_kernel();
+        let mut pg = super::k_page_group::KPageGroup::with_block_info_manager(
+            self.m_block_info_manager.clone(),
+        );
         {
             let Some(kernel) = crate::hle::kernel::kernel::get_kernel_mut() else {
                 return svc_results::RESULT_OUT_OF_MEMORY.get_inner_value();
@@ -7769,11 +7774,24 @@ mod tests {
     use crate::hle::result::RESULT_SUCCESS;
     use crate::memory::memory::Memory;
 
+    #[test]
+    fn finalize_update_drains_deferred_pages_like_current_eden() {
+        let mut table = KPageTableBase::new();
+        let mut pages = PageLinkedList::new();
+        pages.push(0x1000);
+        pages.push(0x2000);
+
+        table.finalize_update(&mut pages);
+
+        assert!(pages.is_empty());
+    }
+
     fn kernel_with_application_pool_for_test(num_pages: usize) -> ScopedKernelForTest {
         let mut kernel = ScopedKernelForTest::new();
         kernel
             .kernel_mut()
             .initialize_memory_block_slab_manager(4096);
+        kernel.kernel_mut().initialize_block_info_manager(4096);
         kernel.memory_manager_mut().initialize_pool(
             Pool::Application,
             dram_memory_map::BASE + 0x100000,
@@ -7810,6 +7828,7 @@ mod tests {
         page_table: &mut KPageTableBase,
         memory: Arc<Mutex<Memory>>,
     ) {
+        attach_page_table_managers_for_test(page_table);
         page_table.m_address_space_width = 32;
         page_table.m_memory = Some(memory);
         page_table.initialize_impl();
@@ -7821,6 +7840,13 @@ mod tests {
                 .unwrap()
                 .set_current_page_table(page_table_impl.as_mut() as *mut _, true);
         }
+    }
+
+    fn attach_page_table_managers_for_test(page_table: &mut KPageTableBase) {
+        let kernel = super::super::kernel::get_kernel_ref()
+            .expect("page-table tests must install a scoped kernel");
+        page_table.m_memory_block_slab_manager = kernel.get_memory_block_slab_manager();
+        page_table.m_block_info_manager = kernel.get_block_info_manager();
     }
 
     #[test]
@@ -8123,6 +8149,7 @@ mod tests {
     fn set_memory_permission_updates_block_permission() {
         let _kernel = kernel_with_application_pool_for_test(4);
         let mut page_table = KPageTableBase::new();
+        attach_page_table_managers_for_test(&mut page_table);
         page_table.m_address_space_start = 0x1000_0000;
         page_table.m_address_space_end = 0x1000_4000;
         assert!(page_table
@@ -8163,6 +8190,7 @@ mod tests {
     fn set_process_memory_permission_updates_code_to_code_data() {
         let _kernel = kernel_with_application_pool_for_test(4);
         let mut page_table = KPageTableBase::new();
+        attach_page_table_managers_for_test(&mut page_table);
         page_table.m_address_space_start = 0x1000_0000;
         page_table.m_address_space_end = 0x1000_4000;
         assert!(page_table
@@ -9142,6 +9170,7 @@ mod tests {
         let _kernel = kernel_with_application_pool_for_test(16);
         let page_table_memory = PageTableMemoryForTest::new(0x400000);
         let mut dst = KPageTableBase::new();
+        attach_page_table_managers_for_test(&mut dst);
         dst.m_address_space_width = 32;
         dst.m_address_space_start = 0x1000_0000;
         dst.m_address_space_end = 0x1002_0000;
@@ -9158,6 +9187,7 @@ mod tests {
             .is_ok());
 
         let mut src = KPageTableBase::new();
+        attach_page_table_managers_for_test(&mut src);
         src.m_address_space_start = 0x2000_0000;
         src.m_address_space_end = 0x2002_0000;
         assert!(src
@@ -9226,6 +9256,7 @@ mod tests {
         assert_ne!(phys_addr, 0);
 
         let mut src = KPageTableBase::new();
+        attach_page_table_managers_for_test(&mut src);
         src.m_address_space_width = 32;
         src.m_address_space_start = 0x2000_0000;
         src.m_address_space_end = 0x2002_0000;
@@ -9255,6 +9286,7 @@ mod tests {
         );
 
         let mut dst = KPageTableBase::new();
+        attach_page_table_managers_for_test(&mut dst);
         dst.m_address_space_width = 32;
         dst.m_address_space_start = 0x1000_0000;
         dst.m_address_space_end = 0x1002_0000;
@@ -9380,6 +9412,7 @@ mod tests {
             0,
             0x0020_0000,
             0x03E0_0000,
+            None,
             None,
             None,
             0,

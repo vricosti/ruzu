@@ -1799,7 +1799,7 @@ pub const SYSTEM_MEMORY_BLOCK_SLAB_HEAP_SIZE: usize = 10_000;
 /// Combined capacity used until ruzu owns separate application/system managers.
 pub const MEMORY_BLOCK_SLAB_HEAP_SIZE: usize =
     APPLICATION_MEMORY_BLOCK_SLAB_HEAP_SIZE + SYSTEM_MEMORY_BLOCK_SLAB_HEAP_SIZE;
-const BLOCK_INFO_SLAB_HEAP_SIZE: usize = 4000;
+pub const BLOCK_INFO_SLAB_HEAP_SIZE: usize = 4000;
 const RESERVED_DYNAMIC_PAGE_COUNT: usize = 64;
 
 /// Represents a single instance of the kernel.
@@ -1893,6 +1893,9 @@ pub struct KernelCore {
     /// processes since application/system distinction isn't enforced yet.
     memory_block_slab_manager:
         Option<Arc<super::k_dynamic_resource_manager::KMemoryBlockSlabManager>>,
+
+    /// Kernel-wide slab manager for `KBlockInfo` page-group nodes.
+    block_info_manager: Option<Arc<super::k_dynamic_resource_manager::KBlockInfoManager>>,
 
     /// Kernel-wide page-table-page allocator. Upstream:
     /// `KernelCore::Impl::page_table_manager` initialized from
@@ -2001,6 +2004,7 @@ impl KernelCore {
             irs_shared_mem: None,
             system_resource_limit: None,
             memory_block_slab_manager: None,
+            block_info_manager: None,
             page_table_manager: None,
             memory_layout: None,
             next_host_thread_id: AtomicU32::new(hardware_properties::NUM_CPU_CORES),
@@ -3350,6 +3354,18 @@ impl KernelCore {
         let mut slab = super::k_dynamic_resource_manager::KMemoryBlockSlabManager::new();
         slab.initialize(capacity);
         self.memory_block_slab_manager = Some(Arc::new(slab));
+    }
+
+    pub fn get_block_info_manager(
+        &self,
+    ) -> Option<Arc<super::k_dynamic_resource_manager::KBlockInfoManager>> {
+        self.block_info_manager.clone()
+    }
+
+    pub fn initialize_block_info_manager(&mut self, capacity: usize) {
+        let mut manager = super::k_dynamic_resource_manager::KBlockInfoManager::new();
+        manager.initialize(capacity);
+        self.block_info_manager = Some(Arc::new(manager));
     }
 
     /// Get the kernel-wide page-table-page allocator. Upstream:

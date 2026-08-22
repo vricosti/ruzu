@@ -4,6 +4,7 @@
 
 use std::sync::{Arc, Mutex};
 
+use super::k_dynamic_resource_manager::KBlockInfoManager;
 use super::k_memory_block::PAGE_SIZE;
 use super::k_memory_manager::KMemoryManager;
 
@@ -12,8 +13,12 @@ use super::k_memory_manager::KMemoryManager;
 // ---------------------------------------------------------------------------
 
 /// Port of Kernel::KBlockInfo.
+#[repr(C)]
 #[derive(Debug, Clone)]
 pub struct KBlockInfo {
+    /// Ruzu's vector owns list ordering; retain Eden's pointer-sized first
+    /// field so slab capacity and object layout remain 0x10 bytes.
+    _next: u64,
     m_page_index: u32,
     m_num_pages: u32,
 }
@@ -21,6 +26,7 @@ pub struct KBlockInfo {
 impl KBlockInfo {
     pub fn new() -> Self {
         Self {
+            _next: 0,
             m_page_index: 0,
             m_num_pages: 0,
         }
@@ -77,7 +83,7 @@ impl Default for KBlockInfo {
     }
 }
 
-const _: () = assert!(std::mem::size_of::<KBlockInfo>() <= 0x10);
+const _: () = assert!(std::mem::size_of::<KBlockInfo>() == 0x10);
 
 // ---------------------------------------------------------------------------
 // KPageGroup
@@ -86,12 +92,13 @@ const _: () = assert!(std::mem::size_of::<KBlockInfo>() <= 0x10);
 /// Port of Kernel::KPageGroup.
 ///
 /// Upstream holds `KernelCore& m_kernel` and `KBlockInfoManager* m_manager`.
-/// We use a Vec<KBlockInfo> instead of slab-allocated intrusive list. The
-/// memory-manager reference is fetched through the global kernel accessor
-/// (`kernel::get_kernel_mut()`) at Open/Close time until the broader kernel
-/// owner graph can carry the upstream `KernelCore&` directly.
+/// Rust uses a `Vec<Box<KBlockInfo>>` instead of an intrusive list, but each
+/// node is allocated from and returned to the selected `KBlockInfoManager`.
+/// The memory-manager reference is fetched through the global kernel accessor
+/// (`kernel::get_kernel_mut()`) at Open/Close time.
 pub struct KPageGroup {
-    blocks: Vec<KBlockInfo>,
+    blocks: Vec<Box<KBlockInfo>>,
+    block_info_manager: Option<Arc<KBlockInfoManager>>,
     /// Whether Open/Close should drive ref-count callbacks via the global
     /// kernel accessor. Runtime constructors keep this true, matching upstream
     /// `KPageGroup(KernelCore&, KBlockInfoManager*)`.
@@ -105,6 +112,16 @@ impl KPageGroup {
     pub fn new() -> Self {
         Self {
             blocks: Vec::new(),
+            block_info_manager: super::kernel::get_kernel_ref()
+                .and_then(|kernel| kernel.get_block_info_manager()),
+            kernel_owned: true,
+        }
+    }
+
+    pub fn with_block_info_manager(manager: Option<Arc<KBlockInfoManager>>) -> Self {
+        Self {
+            blocks: Vec::new(),
+            block_info_manager: manager,
             kernel_owned: true,
         }
     }
@@ -123,7 +140,13 @@ impl KPageGroup {
     }
 
     pub fn finalize(&mut self) {
-        self.blocks.clear();
+        if let Some(manager) = &self.block_info_manager {
+            for block in self.blocks.drain(..) {
+                manager.free(block);
+            }
+        } else {
+            self.blocks.clear();
+        }
     }
 
     pub fn is_empty(&self) -> bool {
@@ -131,7 +154,7 @@ impl KPageGroup {
     }
 
     pub fn iter(&self) -> impl Iterator<Item = &KBlockInfo> {
-        self.blocks.iter()
+        self.blocks.iter().map(Box::as_ref)
     }
 
     pub fn add_block(&mut self, addr: u64, num_pages: usize) -> Result<(), ()> {
@@ -148,7 +171,10 @@ impl KPageGroup {
         }
 
         // Allocate a new block.
-        let mut new_block = KBlockInfo::new();
+        let mut new_block = match &self.block_info_manager {
+            Some(manager) => manager.allocate().ok_or(())?,
+            None => Box::new(KBlockInfo::new()),
+        };
         new_block.initialize(addr, num_pages);
         self.blocks.push(new_block);
         Ok(())
@@ -211,12 +237,16 @@ impl KPageGroup {
         if self.kernel_owned {
             if let Some(kernel) = super::kernel::get_kernel_mut() {
                 let mm = kernel.memory_manager_mut();
-                for block in &self.blocks {
+                for block in self.blocks.drain(..) {
                     mm.close(block.get_address(), block.get_num_pages());
+                    if let Some(manager) = &self.block_info_manager {
+                        manager.free(block);
+                    }
                 }
+                return;
             }
         }
-        self.blocks.clear();
+        self.finalize();
     }
 
     pub fn is_equivalent_to(&self, rhs: &KPageGroup) -> bool {
@@ -277,5 +307,27 @@ impl Drop for KScopedPageGroup<'_> {
         if let Some(pg) = self.pg {
             pg.close();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn block_nodes_return_to_selected_manager_on_finalize() {
+        let manager = Arc::new({
+            let mut manager = KBlockInfoManager::new();
+            manager.initialize(1024);
+            manager
+        });
+        let mut group = KPageGroup::with_block_info_manager(Some(Arc::clone(&manager)));
+
+        group.add_block(0x1000, 1).unwrap();
+        group.add_block(0x3000, 1).unwrap();
+        assert_eq!(manager.get_used(), 2);
+
+        group.finalize();
+        assert_eq!(manager.get_used(), 0);
     }
 }

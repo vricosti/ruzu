@@ -1823,6 +1823,10 @@ impl KProcess {
             self.page_table
                 .get_base_mut()
                 .set_process_id(self.process_id);
+            let system_resource = self.system_resource.clone();
+            let system_resource_guard = system_resource
+                .as_ref()
+                .map(|resource| resource.lock().unwrap());
             let result = self.page_table.initialize_for_process(
                 as_type,
                 enable_aslr,
@@ -1831,6 +1835,9 @@ impl KProcess {
                 pool as u32,
                 code_address as usize,
                 code_size,
+                system_resource_guard
+                    .as_ref()
+                    .map(|resource| resource.base()),
                 resource_limit.clone(),
                 memory_ref,
                 aslr_space_start as usize,
@@ -3701,6 +3708,24 @@ mod tests {
             .unwrap();
         assert!(system_resource.is_initialized());
         assert_eq!(system_resource.get_size(), 0x0100_0000);
+        assert!(Arc::ptr_eq(
+            process
+                .page_table
+                .get_base()
+                .m_memory_block_slab_manager
+                .as_ref()
+                .unwrap(),
+            &system_resource.base().memory_block_slab_manager_arc(),
+        ));
+        assert!(Arc::ptr_eq(
+            process
+                .page_table
+                .get_base()
+                .m_block_info_manager
+                .as_ref()
+                .unwrap(),
+            &system_resource.base().block_info_manager_arc(),
+        ));
         drop(system_resource);
         assert_eq!(process.get_total_system_resource_size(), 0x0100_0000);
     }

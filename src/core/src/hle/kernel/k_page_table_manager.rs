@@ -92,4 +92,8 @@ impl KPageTableManager {
     pub fn get_count(&self) -> usize {
         self.slab_heap.get_capacity()
     }
+
+    pub fn get_used(&self) -> usize {
+        self.slab_heap.get_used()
+    }
 }

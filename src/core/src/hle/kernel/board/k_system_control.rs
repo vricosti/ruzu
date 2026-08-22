@@ -167,10 +167,8 @@ pub fn generate_random_range(min: u64, max: u64) -> u64 {
 }
 
 /// Calculate the required secure memory size.
-pub fn calculate_required_secure_memory_size(size: usize, _pool: u32) -> usize {
-    // If pool == Applet, return 0; otherwise return size.
-    // Pool::Applet is pool index 2 in upstream.
-    if _pool == 2 {
+pub fn calculate_required_secure_memory_size(size: usize, pool: u32) -> usize {
+    if pool == super::super::k_memory_manager::Pool::Applet as u32 {
         0
     } else {
         size
@@ -230,9 +228,14 @@ pub fn free_secure_memory(
 ) {
     use super::super::k_memory_block::PAGE_SIZE;
 
-    assert!(pool != 2, "Applet secure memory not implemented");
+    use super::super::k_memory_manager::Pool;
 
-    let alignment = if pool == 0 {
+    assert!(
+        pool != Pool::Applet as u32,
+        "Applet secure memory not implemented"
+    );
+
+    let alignment = if pool == Pool::System as u32 {
         PAGE_SIZE
     } else {
         SECURE_ALIGNMENT

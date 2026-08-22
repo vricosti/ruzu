@@ -43,6 +43,22 @@ impl<T: Default> KDynamicResourceManager<T> {
         }
     }
 
+    /// Construct a manager from the page allocator and slab heap owned by
+    /// the surrounding `KSystemResource`.
+    ///
+    /// Upstream: `Initialize(KDynamicPageManager*, DynamicSlabType*)`.
+    pub fn new_with_resources(
+        page_allocator: Arc<Mutex<KDynamicPageManager>>,
+        slab_heap: Arc<KDynamicSlabHeap<T>>,
+    ) -> Self {
+        slab_heap.initialize_with_pages(Arc::clone(&page_allocator), 0);
+        Self {
+            slab_heap,
+            page_allocator,
+            initialized: true,
+        }
+    }
+
     /// Pre-allocate `capacity` slab entries. The page manager is sized
     /// in PAGE_SIZE chunks computed from `capacity * sizeof(T)`.
     ///
@@ -137,6 +153,7 @@ impl<T: Default> Default for KDynamicResourceManager<T> {
 /// `KMemoryBlock` slab entries. Upstream:
 /// `class KMemoryBlockSlabManager : public KDynamicResourceManager<KMemoryBlock> {};`
 pub type KMemoryBlockSlabManager = KDynamicResourceManager<KMemoryBlock>;
+pub type KMemoryBlockSlabHeap = KDynamicSlabHeap<KMemoryBlock>;
 
 /// Per-update allocator that pre-reserves up to `MAX_BLOCKS = 2` slab
 /// entries so a `KMemoryBlockManager::update()` walk can split twice
@@ -247,11 +264,41 @@ impl Drop for KMemoryBlockManagerUpdateAllocator {
 /// (used by `KPageGroup`). Matches upstream's
 /// `class KBlockInfoManager : public KDynamicResourceManager<KBlockInfo> {};`
 pub type KBlockInfoManager = KDynamicResourceManager<super::k_page_group::KBlockInfo>;
+pub type KBlockInfoSlabHeap = KDynamicSlabHeap<super::k_page_group::KBlockInfo>;
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::hle::kernel::k_page_group::KBlockInfo;
     use std::sync::Arc;
+
+    #[test]
+    fn owner_provided_resources_share_dynamic_page_accounting() {
+        let page_allocator = Arc::new(Mutex::new(KDynamicPageManager::new()));
+        page_allocator
+            .lock()
+            .unwrap()
+            .initialize(
+                0x1_0000_0000,
+                4 * super::super::k_memory_block::PAGE_SIZE,
+                0x1000,
+            )
+            .unwrap();
+        let heap = Arc::new(KDynamicSlabHeap::<KBlockInfo>::new(false));
+        let manager =
+            KBlockInfoManager::new_with_resources(Arc::clone(&page_allocator), Arc::clone(&heap));
+
+        assert_eq!(page_allocator.lock().unwrap().get_used(), 0);
+        assert_eq!(
+            manager.get_size(),
+            page_allocator.lock().unwrap().get_size()
+        );
+        let block = manager.allocate().expect("shared slab must grow");
+        assert_eq!(page_allocator.lock().unwrap().get_used(), 1);
+        assert_eq!(manager.get_used(), 1);
+        manager.free(block);
+        assert_eq!(manager.get_used(), 0);
+    }
 
     #[test]
     #[should_panic(expected = "KMemoryBlockManagerUpdateAllocator supports at most 2 blocks")]
