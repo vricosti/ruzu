@@ -6370,3 +6370,48 @@ vs Eden `display_list.h` and `layer_list.h`
   connection received fresh independent service state.
 - A focused regression calls the production `set:sys` factory twice and verifies pointer identity
   and the concrete typed owner required by service-to-service access.
+
+## 2026-08-22 — `btm/btm_system_core.rs` vs Eden `btm_system_core.{h,cpp}`
+
+### Intentional differences
+
+- Eden obtains a typed `shared_ptr<ISystemSettingsServer>` directly from `ServiceManager`. Ruzu's
+  type-erased factory API requires a checked `Arc<dyn SessionRequestHandler>` downcast; the
+  recovered `Arc<SystemSettingsService>` is the same singleton allocation registered by
+  `set/settings.rs`.
+- Ruzu's `ServiceContext::CloseEvent` accepts its numeric context handle, so the service retains
+  two private handles alongside the two `Arc<Event>` owners. `Drop` closes them in Eden's radio,
+  then audio-device order; Rust field destruction releases the remaining wrapper owners
+  immediately afterward.
+- `new_with_set_sys_provider` is a constructor-test adapter that injects the typed owner only after
+  handler registration and event creation, preserving Eden's construction order. The test-only
+  `SystemSettingsService::new_for_test` selects the already-existing non-persistent settings
+  constructor; production `SystemSettingsService::new` is unchanged.
+- Eden's three audio-device stubs receive scratch output buffers that remain unspecified when the
+  returned count is zero. Ruzu leaves those guest buffers untouched; the authoritative zero count
+  and zero total still tell the caller that no element is valid.
+
+### Unintentional differences (to fix)
+
+- None in the reviewed command table, settings dependency, IPC outputs, or event lifecycle.
+
+### Missing items
+
+- None from Eden's `IBtmSystemCore`; all methods with non-null upstream handlers are ported and all
+  upstream null entries remain unimplemented.
+
+### Binary layout verification
+
+- PASS: `bool` outputs occupy one CMIF word, device counts/totals remain signed 32-bit values, and
+  `ClientAppletResourceUserId` is sourced from the request PID as in Eden's serialization layer.
+  The `std::array<u8, 0xFF>` output elements are not materialized because every matching stub
+  reports zero valid elements.
+
+### Fixed parity debt
+
+- Ported commands 0, 1, 4–7, 13, 14, 17, 20, 22, and 23 with their exact success, boolean, count,
+  handle, and PID behavior. Radio enable/disable/query now use the shared `set:sys` settings owner.
+- Restored stable radio and audio-device readable-event handout and explicit destructor cleanup.
+  Focused coverage verifies the full implemented/null command partition, shared settings mutation,
+  typed service identity, zero-count stubs, stable event identity, and final owner release. The
+  unread BTM system fields are gone and `core` decreases from 58 to 57 warnings.
