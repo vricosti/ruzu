@@ -4762,3 +4762,18 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
   no longer marks immutable bindings `mut`, and spells the inferred `BucketTree::Visitor` lifetime
   explicitly. These are compile-time ownership and namespace details; variables whose unused state
   may indicate missing Eden behavior were deliberately left unchanged for separate parity review.
+
+## 2026-08-22 — `src/core/src/file_sys/fsmitm_romfsbuild.rs` vs `core/file_sys/fsmitm_romfsbuild.h` and `.cpp`
+
+### Intentional differences
+
+- Eden sorts vectors of `shared_ptr` nodes, whose pointees and parent links remain stable. Ruzu's
+  nodes are index-backed, so it sorts separate index vectors and leaves node storage stable. The
+  emitted file/directory ordering, reverse sibling ownership, entry offsets, hashes and metadata
+  layout follow Eden's order.
+
+### Fixed parity debt
+
+- `add_directory` and `add_file` now assign parent ownership themselves, and `add_file` returns
+  Eden's success value. The former path-based repair contained an empty parent loop and a
+  placeholder sibling expression; both are removed in favor of the upstream ownership sequence.

@@ -7,7 +7,6 @@
 use std::sync::Arc;
 
 use super::ips_layer::patch_ips;
-use super::vfs::vfs::{VfsDirectory, VfsFile};
 use super::vfs::vfs_types::{VirtualDir, VirtualFile};
 use super::vfs::vfs_vector::VectorVfsFile;
 
@@ -232,11 +231,11 @@ impl RomFSBuildContext {
                 entry_offset: 0,
                 offset: 0,
                 size,
-                parent: Some(parent_idx),
+                parent: None,
                 sibling: None,
                 source,
             };
-            self.add_file(parent_idx, file_ctx);
+            let _ = self.add_file(parent_idx, file_ctx);
         }
 
         // Process subdirectories
@@ -262,7 +261,7 @@ impl RomFSBuildContext {
                 cur_path_ofs,
                 path_len,
                 entry_offset: 0,
-                parent: Some(parent_idx),
+                parent: None,
                 child: None,
                 sibling: None,
                 file: None,
@@ -278,21 +277,28 @@ impl RomFSBuildContext {
         }
     }
 
-    fn add_directory(&mut self, _parent_idx: usize, dir_ctx: RomFSBuildDirectoryContext) -> bool {
+    fn add_directory(
+        &mut self,
+        parent_idx: usize,
+        mut dir_ctx: RomFSBuildDirectoryContext,
+    ) -> bool {
         self.num_dirs += 1;
         let name_len = dir_ctx.path_len - dir_ctx.cur_path_ofs;
         self.dir_table_size +=
             std::mem::size_of::<RomFSDirectoryEntry>() as u64 + align_up_u32(name_len, 4) as u64;
+        dir_ctx.parent = Some(parent_idx);
         self.directories.push(dir_ctx);
         true
     }
 
-    fn add_file(&mut self, _parent_idx: usize, file_ctx: RomFSBuildFileContext) {
+    fn add_file(&mut self, parent_idx: usize, mut file_ctx: RomFSBuildFileContext) -> bool {
         self.num_files += 1;
         let name_len = file_ctx.path_len - file_ctx.cur_path_ofs;
         self.file_table_size +=
             std::mem::size_of::<RomFSFileEntry>() as u64 + align_up_u32(name_len, 4) as u64;
+        file_ctx.parent = Some(parent_idx);
         self.files.push(file_ctx);
+        true
     }
 
     /// Finalize the build context and produce the RomFS output.
@@ -321,33 +327,18 @@ impl RomFSBuildContext {
             *byte = 0xFF;
         }
 
-        // Sort tables by name
-        self.files.sort_by(|a, b| a.path.cmp(&b.path));
-        self.directories.sort_by(|a, b| a.path.cmp(&b.path));
-
-        // We need to rebuild parent indices after sorting.
-        // Build a map from old path to new index for directories.
-        let dir_path_to_idx: std::collections::HashMap<String, usize> = self
-            .directories
-            .iter()
-            .enumerate()
-            .map(|(i, d)| (d.path.clone(), i))
-            .collect();
-
-        // Fix parent indices for directories
-        for i in 0..self.directories.len() {
-            if let Some(parent_idx) = self.directories[i].parent {
-                // Find the parent by looking at the path prefix
-                // Parent is the directory whose path is a prefix of this one
-                // Since we stored the parent index before sort, we need to look it up
-                // Actually the parent field points to an old index; we need the parent path.
-                // For simplicity, recompute parent from path.
-            }
-        }
+        // Upstream sorts vectors of shared pointers, so sorting does not change node identity or
+        // invalidate parent ownership. Keep the index-backed nodes stable and sort separate index
+        // vectors to preserve those semantics.
+        let mut file_order: Vec<usize> = (0..self.files.len()).collect();
+        file_order.sort_by(|&a, &b| self.files[a].path.cmp(&self.files[b].path));
+        let mut directory_order: Vec<usize> = (0..self.directories.len()).collect();
+        directory_order.sort_by(|&a, &b| self.directories[a].path.cmp(&self.directories[b].path));
 
         // Determine file offsets
         let mut entry_offset: u32 = 0;
-        for file in &mut self.files {
+        for &file_idx in &file_order {
+            let file = &mut self.files[file_idx];
             self.file_partition_size = align_up(self.file_partition_size, 16);
             file.offset = self.file_partition_size;
             self.file_partition_size += file.size;
@@ -362,28 +353,18 @@ impl RomFSBuildContext {
         for dir in &mut self.directories {
             dir.file = None;
         }
-        for i in (0..self.files.len()).rev() {
-            if let Some(parent_idx) = self.files[i].parent {
-                // Look up parent by path
-                let parent_path_end = self.files[i].path.rfind('/').unwrap_or(0);
-                let parent_path = &self.files[i].path[..parent_path_end];
-                if let Some(&pidx) = dir_path_to_idx.get(parent_path) {
-                    self.files[i].parent = Some(pidx);
-                    self.files[i].sibling = self.directories[pidx].file.map(|_| {
-                        // Find the file index that was last set as this dir's file
-                        // We need the file index, not dir index
-                        0 // placeholder
-                    });
-                    // Actually, we need the sibling to be the previous file's index
-                    self.files[i].sibling = self.directories[pidx].file;
-                    self.directories[pidx].file = Some(i);
-                }
-            }
+        for &file_idx in file_order.iter().rev() {
+            let parent_idx = self.files[file_idx]
+                .parent
+                .expect("non-root RomFS file must have a parent directory");
+            self.files[file_idx].sibling = self.directories[parent_idx].file;
+            self.directories[parent_idx].file = Some(file_idx);
         }
 
         // Determine directory offsets
         entry_offset = 0;
-        for dir in &mut self.directories {
+        for &dir_idx in &directory_order {
+            let dir = &mut self.directories[dir_idx];
             dir.entry_offset = entry_offset;
             let name_len = dir.path_len - dir.cur_path_ofs;
             entry_offset +=
@@ -394,15 +375,15 @@ impl RomFSBuildContext {
         for dir in &mut self.directories {
             dir.child = None;
         }
-        let root_path = self.directories[0].path.clone();
-        for i in (1..self.directories.len()).rev() {
-            let parent_path_end = self.directories[i].path.rfind('/').unwrap_or(0);
-            let parent_path = self.directories[i].path[..parent_path_end].to_string();
-            if let Some(&pidx) = dir_path_to_idx.get(&parent_path) {
-                self.directories[i].parent = Some(pidx);
-                self.directories[i].sibling = self.directories[pidx].child;
-                self.directories[pidx].child = Some(i);
+        for &dir_idx in directory_order.iter().rev() {
+            if dir_idx == 0 {
+                continue;
             }
+            let parent_idx = self.directories[dir_idx]
+                .parent
+                .expect("non-root RomFS directory must have a parent directory");
+            self.directories[dir_idx].sibling = self.directories[parent_idx].child;
+            self.directories[parent_idx].child = Some(dir_idx);
         }
 
         // Build output
@@ -437,10 +418,9 @@ impl RomFSBuildContext {
 
         // Populate file table entries
         let dir_ht_size = self.dir_hash_table_size as usize;
-        let dir_t_size = self.dir_table_size as usize;
         let file_ht_size = self.file_hash_table_size as usize;
 
-        for i in 0..self.files.len() {
+        for &i in &file_order {
             let parent_entry_offset = self.files[i]
                 .parent
                 .map(|p| self.directories[p].entry_offset)
@@ -511,8 +491,8 @@ impl RomFSBuildContext {
         }
 
         // Populate directory table entries
-        for i in 0..self.directories.len() {
-            let is_root = i == 0 || self.directories[i].path == root_path;
+        for &i in &directory_order {
+            let is_root = i == 0;
 
             let parent_entry_offset = if is_root {
                 0

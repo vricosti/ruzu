@@ -261,4 +261,67 @@ mod tests {
         assert!(extracted.get_subdirectory("Etc").is_some());
         assert!(extracted.get_file_relative("/Etc/GMT").is_some());
     }
+
+    #[test]
+    fn create_romfs_preserves_parents_when_input_order_is_not_lexical() {
+        let z_dir: VirtualDir = Arc::new(VectorVfsDirectory::new(
+            vec![make_array_file(vec![0x5A], "z.bin".to_string(), None)],
+            vec![],
+            "z-dir".to_string(),
+            None,
+        ));
+        let a_nested: VirtualDir = Arc::new(VectorVfsDirectory::new(
+            vec![make_array_file(vec![0x4E], "nested.bin".to_string(), None)],
+            vec![],
+            "nested".to_string(),
+            None,
+        ));
+        let a_dir: VirtualDir = Arc::new(VectorVfsDirectory::new(
+            vec![make_array_file(vec![0x41], "a.bin".to_string(), None)],
+            vec![a_nested],
+            "a-dir".to_string(),
+            None,
+        ));
+        let root: VirtualDir = Arc::new(VectorVfsDirectory::new(
+            vec![
+                make_array_file(vec![0x72], "z-root.bin".to_string(), None),
+                make_array_file(vec![0x61], "a-root.bin".to_string(), None),
+            ],
+            vec![z_dir, a_dir],
+            "data".to_string(),
+            None,
+        ));
+
+        let romfs = create_romfs(Some(root), None).expect("create romfs");
+        let extracted = extract_romfs(Some(romfs)).expect("extract romfs");
+
+        assert_eq!(
+            extracted
+                .get_file_relative("/a-root.bin")
+                .expect("root file")
+                .read_bytes(1, 0),
+            [0x61]
+        );
+        assert_eq!(
+            extracted
+                .get_file_relative("/a-dir/a.bin")
+                .expect("first directory file")
+                .read_bytes(1, 0),
+            [0x41]
+        );
+        assert_eq!(
+            extracted
+                .get_file_relative("/a-dir/nested/nested.bin")
+                .expect("nested file")
+                .read_bytes(1, 0),
+            [0x4E]
+        );
+        assert_eq!(
+            extracted
+                .get_file_relative("/z-dir/z.bin")
+                .expect("last directory file")
+                .read_bytes(1, 0),
+            [0x5A]
+        );
+    }
 }
