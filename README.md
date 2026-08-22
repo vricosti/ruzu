@@ -28,6 +28,7 @@ SPDX-License-Identifier: GPL-3.0-or-later
 
 <p align="center">
   <a href="#what-this-project-actually-is">About</a> |
+  <a href="#screenshots">Screenshots</a> |
   <a href="#ports-produced-along-the-way">Ports</a> |
   <a href="#platforms">Platforms</a> |
   <a href="#building">Building</a> |
@@ -65,6 +66,12 @@ The contract the work is held to is written down in
 much as the code is.
 
 **Now ruzu can fly on its own.**
+
+## Screenshots
+
+| Game configuration | SuperTuxKart running in ruzu |
+|---|---|
+| ![Chocolate Doom configuration in ruzu](docs/configure-doom.png) | ![SuperTuxKart running in ruzu](docs/supertuxkart.png) |
 
 ## Ports produced along the way
 
@@ -279,7 +286,7 @@ undocumented hardware, every subtle ordering constraint in this repository was
 discovered by someone else, and this port only translates their work into
 another language. It exists solely because of:
 
-- **the yuzu team and its contributors**, for years of reverse-engineering the
+- **the yuzu/eden team and its contributors**, for years of reverse-engineering the
   Switch and for a codebase clear enough that a faithful port is even
   conceivable;
 - **Merry (MerryMage)**, author of **dynarmic**, and **Lioncash**, whose fork is
