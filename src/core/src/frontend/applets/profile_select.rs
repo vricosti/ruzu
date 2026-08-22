@@ -1,69 +1,16 @@
 // SPDX-FileCopyrightText: Copyright 2018 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-//! Port of zuyu/src/core/frontend/applets/profile_select.h and profile_select.cpp
+//! Port of `core/frontend/applets/profile_select.{h,cpp}`.
 //! Profile selection applet interface.
 
 use super::applet::Applet;
+pub use crate::hle::service::am::frontend::applet_profile_select::{
+    UiMode, UiSettingsDisplayOptions, UserSelectionPurpose,
+};
 
-/// UUID type (128-bit).
-///
-/// Corresponds to upstream `Common::UUID`.
-/// Placeholder alias: when `common::uuid::Uuid` is ported, replace this type alias.
-pub type Uuid = u128;
-
-/// UI mode for profile selection.
-///
-/// Corresponds to upstream `Service::AM::Frontend::UiMode`.
-/// Local definition until hle::service::am::frontend types are ported.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-#[repr(u32)]
-pub enum UiMode {
-    #[default]
-    UserSelector = 0,
-    UserCreator = 1,
-    EnsureNetworkServiceAccountAvailable = 2,
-    UserIconEditor = 3,
-    UserNicknameEditor = 4,
-    UserCreatorForStarter = 5,
-    NintendoAccountAuthorizationRequestContext = 6,
-    IntroduceExternalNetworkServiceAccount = 7,
-    IntroduceExternalNetworkServiceAccountForRegistration = 8,
-    NintendoAccountNnidLinker = 9,
-    LicenseRequirementsForNetworkService = 10,
-    LicenseRequirementsForNetworkServiceWithUserContextImpl = 11,
-    UserCreatorForImmediateNa498AccountNsaLinking = 12,
-    UserQualificationPromoter = 13,
-}
-
-/// Display options for user selection.
-///
-/// Corresponds to upstream `Service::AM::Frontend::UiSettingsDisplayOptions`.
-/// Local definition until hle::service::am::frontend types are ported.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct UiSettingsDisplayOptions {
-    pub raw: u32,
-}
-
-/// Purpose of user selection.
-///
-/// Corresponds to upstream `Service::AM::Frontend::UserSelectionPurpose`.
-/// Local definition until hle::service::am::frontend types are ported.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-#[repr(u32)]
-pub enum UserSelectionPurpose {
-    #[default]
-    General = 0,
-    GameCardRegistration = 1,
-    EShopLaunch = 2,
-    EShopItemShow = 3,
-    PicturePost = 4,
-    NintendoAccountLinkage = 5,
-    SettingsUpdate = 6,
-    SaveDataDeletion = 7,
-    UserMigration = 8,
-    SaveDataTransfer = 9,
-}
+/// UUID type used by the profile-select frontend.
+pub type Uuid = common::uuid::UUID;
 
 /// Parameters for profile selection.
 ///
@@ -105,7 +52,11 @@ impl ProfileSelectApplet for DefaultProfileSelectApplet {
     ) {
         let manager = crate::hle::service::acc::profile_manager::ProfileManager::new();
         let current_user = *common::settings::values().current_user.get_value() as usize;
-        callback(Some(manager.get_user(current_user).unwrap_or_default()));
+        let uuid = manager
+            .get_user(current_user)
+            .map(|uuid| common::uuid::UUID::from_bytes(uuid.to_le_bytes()))
+            .unwrap_or_default();
+        callback(Some(uuid));
         log::info!("called, selecting current user instead of prompting...");
     }
 }

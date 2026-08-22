@@ -13,6 +13,7 @@ use parking_lot::Mutex;
 
 use crate::core::SystemRef;
 use crate::frontend::applets::controller::{ControllerApplet, DefaultControllerApplet};
+use crate::frontend::applets::profile_select::{DefaultProfileSelectApplet, ProfileSelectApplet};
 use crate::frontend::applets::software_keyboard::{
     DefaultSoftwareKeyboardApplet, SoftwareKeyboardApplet,
 };
@@ -24,6 +25,7 @@ use crate::hle::service::am::applet_data_broker::AppletDataBroker;
 use super::applet_cabinet::CabinetMode;
 use super::applet_controller::Controller;
 use super::applet_mii_edit::MiiEdit;
+use super::applet_profile_select::ProfileSelect;
 use super::applet_software_keyboard::SoftwareKeyboard;
 
 /// Base trait for all frontend applet implementations.
@@ -48,6 +50,7 @@ pub trait FrontendApplet: Send + Sync {
 #[derive(Default)]
 pub struct FrontendAppletSet {
     pub controller: Option<Arc<dyn ControllerApplet>>,
+    pub profile_select: Option<Arc<dyn ProfileSelectApplet>>,
     pub software_keyboard: Option<Arc<dyn SoftwareKeyboardApplet>>,
 }
 
@@ -64,6 +67,7 @@ impl FrontendAppletHolder {
             current_applet_id: AppletId::None,
             frontend: FrontendAppletSet {
                 controller: Some(Arc::new(DefaultControllerApplet::new(hid_core))),
+                profile_select: Some(Arc::new(DefaultProfileSelectApplet)),
                 software_keyboard: Some(Arc::new(DefaultSoftwareKeyboardApplet::new())),
             },
         }
@@ -80,6 +84,9 @@ impl FrontendAppletHolder {
     pub fn set_frontend_applet_set(&mut self, mut set: FrontendAppletSet) {
         if set.controller.is_some() {
             self.frontend.controller = set.controller.take();
+        }
+        if set.profile_select.is_some() {
+            self.frontend.profile_select = set.profile_select.take();
         }
         if set.software_keyboard.is_some() {
             self.frontend.software_keyboard = set.software_keyboard.take();
@@ -124,6 +131,18 @@ impl FrontendAppletHolder {
                 ),
             ))),
             AppletId::MiiEdit => Some(Box::new(MiiEdit::new(system, broker, mode))),
+            AppletId::ProfileSelect => Some(Box::new(ProfileSelect::new(
+                system,
+                applet,
+                broker,
+                mode,
+                Arc::clone(
+                    self.frontend
+                        .profile_select
+                        .as_ref()
+                        .expect("default profile-select applet is installed"),
+                ),
+            ))),
             AppletId::SoftwareKeyboard => Some(Box::new(SoftwareKeyboard::new(
                 system,
                 applet,
@@ -190,6 +209,7 @@ mod tests {
 
         holder.set_frontend_applet_set(FrontendAppletSet {
             controller: Some(Arc::clone(&controller)),
+            profile_select: None,
             software_keyboard: None,
         });
 

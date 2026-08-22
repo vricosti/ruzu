@@ -488,6 +488,7 @@ fn run_boot(
         system.set_frontend_applet_set(
             ruzu_core::hle::service::am::frontend::applets::FrontendAppletSet {
                 controller: controller_applet,
+                profile_select: None,
                 software_keyboard,
             },
         );

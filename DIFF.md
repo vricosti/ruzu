@@ -5469,3 +5469,34 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
   inheritance. `SoftwareKeyboard` retains that owner even though, like Eden's derived class, it
   never accesses the system directly; a field-level diagnostic annotation documents the retained
   base state.
+
+## 2026-08-22 — `applet_profile_select.rs`, frontend `profile_select.rs`, and `applets.rs` vs `applet_profile_select.{h,cpp}`, frontend `profile_select.h`, and `applets.cpp`
+
+### Intentional differences
+
+- The Rust applet owns callback-visible completion, status, and final-data state through `Arc`
+  containers because a frontend callback may outlive the mutable trait-object borrow. A separate
+  executing flag defers locking the owning `Applet` when the default frontend invokes its callback
+  synchronously. Eden captures `this` and calls `Exit()` directly.
+- Rust represents C++'s open-underlying-value `UiMode` and `UserSelectionPurpose` enums as
+  transparent `u32` newtypes. This preserves all guest bit patterns without constructing an
+  invalid Rust enum discriminant.
+- `SelectionComplete` records an explicit Rust completion flag and pushes its output immediately;
+  Eden also pushes and exits in the callback but leaves its otherwise-present `complete` field
+  false. Rust needs the flag for the flattened `FrontendApplet::is_complete` interface and avoids
+  pushing the already-moved output a second time if `Execute` is called again.
+
+### Fixed parity debt
+
+- Replaced the inert one-field stub with the Version1/2/3 initialization, exact 0x98/0xA0 input
+  layouts, parameter conversion, profile-selection callback, cancellation status, exact 0x18
+  output, request-exit handling, and applet completion signaling.
+- Unknown library versions now follow Eden's non-fatal path: the applet logs the unsupported
+  version, skips configuration decoding, and invokes the frontend with zeroed parameters.
+- Restored `UiMode`, `UserSelectionPurpose`, `NintendoAccountStartupDialogType`,
+  `UserSelectionSettingsForSystemService`, and `UiSettingsDisplayOptions` to their upstream-owned
+  HLE module. The frontend now consumes those types instead of owning duplicates.
+- `FrontendAppletHolder` now installs a default profile selector, preserves injected overrides,
+  and constructs `ProfileSelect` for `AppletId::ProfileSelect`.
+- The default frontend now always invokes the callback with a UUID value, using an invalid UUID
+  when the configured profile is absent, matching Eden's `value_or(Common::UUID{})` call.
