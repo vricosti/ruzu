@@ -5686,3 +5686,12 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
   area behavior. Cabinet's required register mutation, delete, restore and format paths are ported.
 - The no-key fallback reconstructs the encoded tag layout but does not yet populate Eden's
   generated fallback name, Mii and dates.
+
+## 2026-08-22 — Upstream-unused constants in `amiibo_crypto.rs` and `caps_manager.rs`
+
+### Intentional differences
+
+- Rust marks `HMAC_DATA_START` and `NAND_ALBUM_FILE_LIMIT` with a targeted `dead_code` allowance.
+  Eden declares the matching `HMAC_DATA_START` and `NandAlbumFileLimit` constants in their owning
+  headers but does not reference either one in the corresponding implementations. Ruzu retains
+  both constants in the matching Rust owners for structural and constant-placement parity.

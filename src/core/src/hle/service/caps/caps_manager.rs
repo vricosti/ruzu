@@ -13,6 +13,9 @@ use super::caps_types::*;
 use crate::hle::result::{ResultCode, RESULT_UNKNOWN};
 
 /// Nand album file limit.
+///
+/// Kept for strict header parity; Eden currently declares this limit without applying it.
+#[allow(dead_code)]
 const NAND_ALBUM_FILE_LIMIT: usize = 1000;
 /// SD album file limit.
 const SD_ALBUM_FILE_LIMIT: usize = 10000;

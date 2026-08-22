@@ -23,6 +23,8 @@ type HmacSha256 = Hmac<Sha256>;
 type Aes128Ctr = ctr::Ctr128BE<Aes128>;
 
 // Byte locations in NTAG215File (matching upstream constants)
+// Kept for strict header parity; Eden currently declares this offset without reading it.
+#[allow(dead_code)]
 const HMAC_DATA_START: usize = 0x8;
 const SETTINGS_START: usize = 0x2C;
 const WRITE_COUNTER_START: usize = 0x29;
