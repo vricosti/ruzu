@@ -22,15 +22,14 @@ impl Default for DisplayList {
 
 impl DisplayList {
     pub fn create_display(&mut self, name: &DisplayName) -> bool {
-        let idx = self.displays.iter().position(|d| !d.is_initialized());
-        if let Some(idx) = idx {
-            let id = self.next_id;
-            self.next_id += 1;
-            self.displays[idx].initialize(id, name);
-            true
-        } else {
-            false
-        }
+        let Some(display) = Self::get_free_display(&mut self.displays) else {
+            return false;
+        };
+
+        let id = self.next_id;
+        self.next_id += 1;
+        display.initialize(id, name);
+        true
     }
 
     pub fn destroy_display(&mut self, display_id: u64) -> bool {
@@ -76,7 +75,46 @@ impl DisplayList {
         }
     }
 
-    fn get_free_display(&mut self) -> Option<&mut Display> {
-        self.displays.iter_mut().find(|d| !d.is_initialized())
+    fn get_free_display(displays: &mut [Display; 8]) -> Option<&mut Display> {
+        displays
+            .iter_mut()
+            .find(|display| !display.is_initialized())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn display_name(index: u8) -> DisplayName {
+        let mut name = [0; 0x40];
+        name[0] = index;
+        name
+    }
+
+    #[test]
+    fn create_display_uses_first_free_slot_without_advancing_id_when_full() {
+        let mut displays = DisplayList::default();
+        for index in 0..8 {
+            assert!(displays.create_display(&display_name(index)));
+            assert_eq!(
+                displays
+                    .get_display_by_name(&display_name(index))
+                    .unwrap()
+                    .get_id(),
+                index as u64
+            );
+        }
+
+        assert!(!displays.create_display(&display_name(8)));
+        assert!(displays.destroy_display(3));
+        assert!(displays.create_display(&display_name(9)));
+        assert_eq!(
+            displays
+                .get_display_by_name(&display_name(9))
+                .unwrap()
+                .get_id(),
+            8
+        );
     }
 }

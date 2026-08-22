@@ -5815,3 +5815,20 @@ Compared `system_settings.rs`, `private_settings.rs`, `device_settings.rs`, and
   seven production calls use the default `ThreeElements` format. Ruzu removes the unused enum and
   parameter and retains the exact production `vX.Y.Z` calculation; the test-only four-element call
   that kept dead code alive was removed.
+
+## 2026-08-22 — VI free-slot ownership in `display_list.rs` and `layer_list.rs`
+vs Eden `display_list.h` and `layer_list.h`
+
+### Intentional differences
+
+- The private Rust helpers receive only their fixed array instead of borrowing the complete list.
+  This permits `CreateDisplay`/`CreateLayer` to hold the returned mutable slot while independently
+  advancing `next_id`; Eden obtains the equivalent disjoint members through a raw object pointer.
+
+### Fixed parity debt
+
+- `create_display` and `create_layer` now call their upstream-owned `get_free_*` helpers rather
+  than duplicating the array search inline. Full-pool failure still leaves the ID unchanged;
+  successful reuse selects the first free slot and advances the monotonic ID exactly once.
+- Focused eight-slot exhaustion/reuse tests cover Eden's display IDs starting at zero and layer
+  IDs starting at one. Both previously unused-helper warnings are gone.
