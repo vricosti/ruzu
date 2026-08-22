@@ -5430,3 +5430,17 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 - The timeout regression test now supplies a future absolute hardware tick instead of treating
   `1` as a relative duration, and verifies the guest thread's timer-completed wait state rather
   than the Rust bootstrap helper's pre-fiber return value.
+
+## 2026-08-22 — `k_hardware_timer.rs` task delivery vs `k_hardware_timer.{h,cpp}`
+
+### Intentional differences
+
+- Rust resolves Eden's directly stored `KTimerTask*` through either the global scheduler's owned
+  `Arc<KThreadLock>` or the raw pointer recorded for bootstrap waiters. This resolution remains
+  inside `do_task` while the timer state and scheduler lock are held.
+
+### Fixed parity debt
+
+- Removed an unused target-resolution method that attempted to reacquire the timer-state mutex.
+  Eden has no such helper, and using it from the live `DoTask` critical section would deadlock.
+  The live GSC-backed task-delivery regression test remains the behavioral coverage.

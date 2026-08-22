@@ -335,22 +335,6 @@ impl KHardwareTimer {
         state.m_wakeup_time != i64::MAX
     }
 
-    fn resolve_task_target(&self, task_id: u64) -> Option<TimerTaskTarget> {
-        let state = self.state.lock().unwrap();
-        if let Some(gsc) = state.gsc.as_ref().and_then(Weak::upgrade) {
-            if let Some(thread) = gsc.lock().unwrap().get_thread_by_thread_id(task_id) {
-                return Some(TimerTaskTarget::ThreadArc(thread));
-            }
-        }
-
-        state
-            .thread_ptrs
-            .get(&task_id)
-            .copied()
-            .filter(|ptr| *ptr != 0)
-            .map(TimerTaskTarget::RawPtr)
-    }
-
     /// Called by the CoreTiming callback.
     /// Matches upstream: `KHardwareTimer::DoTask()`
     fn do_task(&self) {
@@ -559,23 +543,6 @@ mod tests {
         assert!(state.m_event_type.is_none());
         assert!(state.core_timing.is_none());
         assert!(state.thread_ptrs.is_empty());
-    }
-
-    #[test]
-    fn resolve_task_target_falls_back_to_gsc_thread_lookup() {
-        let mut timer = KHardwareTimer::new();
-        let gsc = Arc::new(Mutex::new(GlobalSchedulerContext::new()));
-        let thread = Arc::new(KThreadLock::new(KThread::new()));
-        thread.lock().unwrap().thread_id = 17;
-        gsc.lock().unwrap().add_thread(Arc::clone(&thread));
-        timer.set_gsc(Arc::downgrade(&gsc));
-
-        match timer.resolve_task_target(17) {
-            Some(TimerTaskTarget::ThreadArc(found)) => {
-                assert!(Arc::ptr_eq(&found, &thread));
-            }
-            _ => panic!("expected GSC-backed timer target"),
-        }
     }
 
     #[test]
