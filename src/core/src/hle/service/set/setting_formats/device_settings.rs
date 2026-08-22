@@ -94,3 +94,27 @@ impl DeviceSettings {
         Self::default()
     }
 }
+
+/// Corresponds to `DefaultDeviceSettings` in `device_settings.cpp`.
+pub fn default_device_settings() -> DeviceSettings {
+    DeviceSettings::default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_payload_is_fully_zeroed() {
+        let settings = default_device_settings();
+        let bytes = unsafe {
+            core::slice::from_raw_parts(
+                (&settings as *const DeviceSettings).cast::<u8>(),
+                core::mem::size_of::<DeviceSettings>(),
+            )
+        };
+
+        assert_eq!(bytes.len(), 0x160);
+        assert!(bytes.iter().all(|byte| *byte == 0));
+    }
+}

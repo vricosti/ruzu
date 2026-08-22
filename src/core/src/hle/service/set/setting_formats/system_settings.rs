@@ -7,10 +7,13 @@ use crate::hle::service::psc::time::common::{
 };
 use crate::hle::service::set::settings_types::{
     AccountNotificationSettings, AccountSettings, AudioOutputMode, ChineseTraditionalInputMethod,
-    ColorSet, ErrorReportSharePermission, EulaVersion, InitialLaunchSettingsPacked, KeyboardLayout,
-    LanguageCode, NotificationSettings, PrimaryAlbumStorage, QuestFlag, SleepSettings,
-    SystemRegionCode, TouchScreenMode, TvSettings,
+    CmuMode, ColorSet, ConsoleSleepPlan, ErrorReportSharePermission, EulaVersion,
+    HandheldSleepPlan, HdmiContentType, InitialLaunchSettingsPacked, KeyboardLayout, LanguageCode,
+    NotificationSettings, NotificationVolume, PrimaryAlbumStorage, QuestFlag, RgbRange,
+    SleepSettings, SystemRegionCode, TouchScreenMode, TvResolution, TvSettings,
+    AVAILABLE_LANGUAGE_CODES, LANGUAGE_TO_LAYOUT,
 };
+use common::uuid::UUID;
 
 /// Port of Service::Set::SystemSettings
 #[derive(Clone, Copy)]
@@ -605,8 +608,15 @@ const _: () = {
 
 impl Default for SystemSettings {
     fn default() -> Self {
-        // SAFETY: All-zero is valid for this repr(C) struct of plain data types.
-        unsafe { core::mem::zeroed() }
+        let mut settings = core::mem::MaybeUninit::<Self>::zeroed();
+
+        // SAFETY: Every byte is initialized by `zeroed`. Zero is a valid representation for all
+        // fields except `LanguageCode`, which is written with a valid discriminant before the
+        // value is materialized. This is the Rust counterpart of upstream `SystemSettings{}`.
+        unsafe {
+            core::ptr::addr_of_mut!((*settings.as_mut_ptr()).language_code).write(LanguageCode::Ja);
+            settings.assume_init()
+        }
     }
 }
 
@@ -623,5 +633,111 @@ impl core::fmt::Debug for SystemSettings {
 impl SystemSettings {
     pub fn new() -> Self {
         Self::default()
+    }
+}
+
+/// Constructs Eden's default system-settings payload.
+///
+/// Corresponds to `DefaultSystemSettings` in `setting_formats/system_settings.cpp`.
+pub fn default_system_settings() -> SystemSettings {
+    let mut settings = SystemSettings::default();
+
+    settings.version = 0x140000;
+    settings.flags = 7;
+    settings.mii_author_id = UUID::make_default().uuid;
+    settings.color_set_id = ColorSet::BasicWhite;
+
+    settings.notification_settings.flags.raw = 0x300;
+    settings.notification_settings.volume = NotificationVolume::High as u32;
+    settings.notification_settings.start_time.hour = 9;
+    settings.notification_settings.start_time.minute = 0;
+    settings.notification_settings.stop_time.hour = 21;
+    settings.notification_settings.stop_time.minute = 0;
+
+    settings.tv_settings.flags.raw = 0xC;
+    settings.tv_settings.tv_resolution = TvResolution::Auto as u32;
+    settings.tv_settings.hdmi_content_type = HdmiContentType::Game as u32;
+    settings.tv_settings.rgb_range = RgbRange::Auto as u32;
+    settings.tv_settings.cmu_mode = CmuMode::None as u32;
+    settings.tv_settings.tv_underscan = 0;
+    settings.tv_settings.tv_gama = 1.0;
+    settings.tv_settings.contrast_ratio = 0.5;
+
+    settings.initial_launch_settings_packed.flags.raw = 0x10001;
+    settings.initial_launch_settings_packed.timestamp = [0; 0x18];
+
+    settings.sleep_settings.flags.raw = 0x3;
+    settings.sleep_settings.handheld_sleep_plan = HandheldSleepPlan::Sleep10Min as u32;
+    settings.sleep_settings.console_sleep_plan = ConsoleSleepPlan::Sleep1Hour as u32;
+
+    settings.device_time_zone_location_name[..3].copy_from_slice(b"UTC");
+    settings.user_system_clock_automatic_correction_enabled = true;
+    settings.primary_album_storage = PrimaryAlbumStorage::SdCard;
+    settings.battery_percentage_flag = true;
+    settings.chinese_traditional_input_method = ChineseTraditionalInputMethod::Unknown0;
+    settings.vibration_master_volume = 1.0;
+    settings.touch_screen_mode = TouchScreenMode::Standard;
+    settings.nfc_enable_flag = true;
+    settings.bluetooth_enable_flag = true;
+    settings.wireless_lan_enable_flag = true;
+
+    let language_index = *common::settings::values().language_index.get_value() as u32 as usize;
+    let language_code = AVAILABLE_LANGUAGE_CODES[language_index];
+    settings.language_code = language_code;
+    settings.keyboard_layout = LANGUAGE_TO_LAYOUT
+        .iter()
+        .find(|(candidate, _)| *candidate == language_code)
+        .map(|(_, layout)| *layout)
+        .unwrap_or(KeyboardLayout::EnglishUs);
+
+    settings
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_payload_matches_eden_assignments() {
+        let settings = default_system_settings();
+        let language_index = *common::settings::values().language_index.get_value() as u32 as usize;
+        let expected_language = AVAILABLE_LANGUAGE_CODES[language_index];
+        let expected_layout = LANGUAGE_TO_LAYOUT
+            .iter()
+            .find(|(candidate, _)| *candidate == expected_language)
+            .map(|(_, layout)| *layout)
+            .unwrap_or(KeyboardLayout::EnglishUs);
+
+        assert_eq!(core::mem::size_of_val(&settings), 0x336A0);
+        assert_eq!(settings.version, 0x140000);
+        assert_eq!(settings.flags, 7);
+        assert_eq!(settings.language_code, expected_language);
+        assert_eq!(settings.keyboard_layout, expected_layout);
+        assert_eq!(settings.mii_author_id, UUID::make_default().uuid);
+        assert_eq!(settings.notification_settings.flags.raw, 0x300);
+        assert_eq!(settings.notification_settings.volume, 2);
+        assert_eq!(settings.notification_settings.start_time.hour, 9);
+        assert_eq!(settings.notification_settings.stop_time.hour, 21);
+        assert_eq!(settings.tv_settings.flags.raw, 0xC);
+        assert_eq!(settings.tv_settings.hdmi_content_type, 4);
+        assert_eq!(settings.tv_settings.tv_gama, 1.0);
+        assert_eq!(settings.tv_settings.contrast_ratio, 0.5);
+        assert_eq!(settings.initial_launch_settings_packed.flags.raw, 0x10001);
+        assert_eq!(settings.sleep_settings.flags.raw, 0x3);
+        assert_eq!(settings.sleep_settings.handheld_sleep_plan, 3);
+        assert_eq!(settings.sleep_settings.console_sleep_plan, 0);
+        assert_eq!(&settings.device_time_zone_location_name[..4], b"UTC\0");
+        assert_eq!(settings.primary_album_storage, PrimaryAlbumStorage::SdCard);
+        assert!(settings.user_system_clock_automatic_correction_enabled);
+        assert!(settings.battery_percentage_flag);
+        assert!(settings.nfc_enable_flag);
+        assert!(settings.bluetooth_enable_flag);
+        assert!(settings.wireless_lan_enable_flag);
+    }
+
+    #[test]
+    fn zero_base_has_a_valid_language_discriminant() {
+        let settings = SystemSettings::default();
+        assert_eq!(settings.language_code, LanguageCode::Ja);
     }
 }

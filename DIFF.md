@@ -5715,3 +5715,25 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
   the port is logged but does not affect layout selection.
 - `GetKeyCodeMapImpl` again owns the output mutation and result return. Focused tests cover the
   three null-output paths, command registration, and the 0x1000-byte by-port result.
+
+## 2026-08-22 — setting-format defaults vs Eden `setting_formats/*.cpp`
+
+Compared `system_settings.rs`, `private_settings.rs`, `device_settings.rs`, and
+`appln_settings.rs` with their matching Eden headers and implementations.
+
+### Intentional differences
+
+- Eden value-initializes `SystemSettings` to all-zero bytes before assigning its defaults. A zero
+  `LanguageCode` is not a valid Rust enum discriminant, so Ruzu initializes that one field to
+  `Ja` inside `MaybeUninit` before materializing the zeroed structure. `default_system_settings`
+  then overwrites it with the configured language exactly as Eden does; the serialized result is
+  unchanged while the intermediate Rust value remains valid.
+
+### Fixed parity debt
+
+- Ported the four upstream-owned default constructors. System defaults now include Eden's exact
+  version, flags, UUID, notification/TV/sleep/initial-launch settings, UTC timezone, feature flags,
+  configured language, and derived keyboard layout; application defaults set only the default Mii
+  author UUID, while private and device payloads remain fully zeroed.
+- Focused tests verify the four payload sizes, deterministic zero regions, and every non-zero
+  system default assigned by Eden.

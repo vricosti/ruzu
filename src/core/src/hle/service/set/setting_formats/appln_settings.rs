@@ -2,6 +2,8 @@
 //!
 //! Application settings format.
 
+use common::uuid::UUID;
+
 /// Port of Service::Set::ApplnSettings
 #[derive(Clone, Copy)]
 #[repr(C)]
@@ -61,5 +63,32 @@ impl core::fmt::Debug for ApplnSettings {
 impl ApplnSettings {
     pub fn new() -> Self {
         Self::default()
+    }
+}
+
+/// Corresponds to `DefaultApplnSettings` in `appln_settings.cpp`.
+pub fn default_appln_settings() -> ApplnSettings {
+    let mut settings = ApplnSettings::default();
+    settings.mii_author_id = UUID::make_default().uuid;
+    settings
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_payload_only_sets_the_default_mii_author() {
+        let settings = default_appln_settings();
+        let bytes = unsafe {
+            core::slice::from_raw_parts(
+                (&settings as *const ApplnSettings).cast::<u8>(),
+                core::mem::size_of::<ApplnSettings>(),
+            )
+        };
+
+        assert_eq!(settings.mii_author_id, UUID::make_default().uuid);
+        assert!(bytes[..0x10].iter().all(|byte| *byte == 0));
+        assert!(bytes[0x20..].iter().all(|byte| *byte == 0));
     }
 }

@@ -819,3 +819,20 @@
   manager sets over the shared dynamic pool, reserves all but 64 remaining pages for page tables,
   publishes both `KSystemResource` owners, and default processes retain the matching resource.
   The original reserved-page warning and its structural debt are resolved.
+
+## 2026-08-22 — system-settings persistence interrupted by format-default prerequisites
+
+- Interrupted slice: use `SETTINGS_MAGIC` and `SETTINGS_VERSION` by porting
+  `ISystemSettingsServer::{LoadSettingsFile,StoreSettingsFile,SetupSettings,StoreSettings}`.
+- Exact missing prerequisite: the matching setting-format modules define the four binary structs,
+  but do not expose Eden's `DefaultSystemSettings`, `DefaultPrivateSettings`,
+  `DefaultDeviceSettings`, or `DefaultApplnSettings`. The server also duplicates selected values
+  in loose fields instead of owning those four structs, so persistence cannot be added faithfully
+  on top of its current state model.
+- Required next action: port each default constructor in its upstream-owned setting-format Rust
+  file, verify every assigned field and binary offset against Eden, then replace the server's
+  loose state with `SystemSettings`, `PrivateSettings`, `DeviceSettings`, and `ApplnSettings`
+  ownership before resuming file I/O.
+- Resume condition: the four default payloads are deterministic and layout-tested, all server
+  getters/setters address the matching owning payload, and no duplicate loose setting state
+  remains.

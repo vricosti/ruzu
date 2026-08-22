@@ -71,3 +71,27 @@ impl PrivateSettings {
         Self::default()
     }
 }
+
+/// Corresponds to `DefaultPrivateSettings` in `private_settings.cpp`.
+pub fn default_private_settings() -> PrivateSettings {
+    PrivateSettings::default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_payload_is_fully_zeroed() {
+        let settings = default_private_settings();
+        let bytes = unsafe {
+            core::slice::from_raw_parts(
+                (&settings as *const PrivateSettings).cast::<u8>(),
+                core::mem::size_of::<PrivateSettings>(),
+            )
+        };
+
+        assert_eq!(bytes.len(), 0xD8);
+        assert!(bytes.iter().all(|byte| *byte == 0));
+    }
+}
