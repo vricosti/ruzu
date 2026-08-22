@@ -6,6 +6,10 @@
 //! ISystemSettingsServer service ("set:sys").
 
 use std::collections::BTreeMap;
+use std::fs::{self, File};
+use std::io::{Read, Write};
+use std::mem::{ManuallyDrop, MaybeUninit};
+use std::path::Path;
 use std::sync::Mutex;
 
 use common::uuid::UUID;
@@ -35,6 +39,39 @@ pub struct SettingsHeader {
     pub magic: u64,
     pub version: u32,
     pub reserved: u32,
+}
+const _: () = assert!(core::mem::size_of::<SettingsHeader>() == 0x10);
+
+/// Marker for the four POD payloads copied verbatim by Eden's settings service.
+///
+/// Every bit pattern must be valid because `LoadSettingsFile` reads the complete payload from
+/// disk. Implementations are intentionally limited to the four upstream settings formats.
+trait SettingsPayload: Copy {}
+
+impl SettingsPayload for SystemSettings {}
+impl SettingsPayload for PrivateSettings {}
+impl SettingsPayload for DeviceSettings {}
+impl SettingsPayload for ApplnSettings {}
+
+fn settings_payload_as_bytes<T: SettingsPayload>(settings: &T) -> &[u8] {
+    unsafe {
+        core::slice::from_raw_parts(
+            (settings as *const T).cast::<u8>(),
+            core::mem::size_of::<T>(),
+        )
+    }
+}
+
+fn read_settings_payload<T: SettingsPayload>(file: &mut File) -> std::io::Result<T> {
+    let mut settings = MaybeUninit::<T>::uninit();
+    let bytes = unsafe {
+        core::slice::from_raw_parts_mut(
+            settings.as_mut_ptr().cast::<u8>(),
+            core::mem::size_of::<T>(),
+        )
+    };
+    file.read_exact(bytes)?;
+    Ok(unsafe { settings.assume_init() })
 }
 
 fn system_clock_context_to_bytes(context: SystemClockContext) -> [u8; 0x20] {
@@ -154,41 +191,230 @@ pub mod commands {
 pub struct ISystemSettingsServer {
     system_settings: SystemSettings,
     private_settings: PrivateSettings,
-    // Owned for parity with upstream; consumed by the pending settings persistence slice.
-    #[allow(dead_code)]
     device_settings: DeviceSettings,
-    // Owned for parity with upstream; consumed by the pending settings persistence slice.
-    #[allow(dead_code)]
     appln_settings: ApplnSettings,
-    save_needed: bool,
+    #[cfg(test)]
+    persistence_enabled: bool,
 }
 
 impl ISystemSettingsServer {
     pub fn new() -> Self {
-        let mut system_settings = default_system_settings();
-        system_settings.region_code = *common::settings::values().region_index.get_value() as u32;
+        Self::new_impl(true)
+    }
+
+    fn new_impl(setup_persistence: bool) -> Self {
+        let mut server = ManuallyDrop::new(Self {
+            system_settings: default_system_settings(),
+            private_settings: default_private_settings(),
+            device_settings: default_device_settings(),
+            appln_settings: default_appln_settings(),
+            #[cfg(test)]
+            persistence_enabled: setup_persistence,
+        });
+
+        if setup_persistence {
+            server.setup_settings();
+        }
+
+        server.system_settings.region_code =
+            *common::settings::values().region_index.get_value() as u32;
         let user_system_clock_context =
-            system_clock_context_to_bytes(system_settings.user_system_clock_context);
-        system_settings.eula_versions[0] = EulaVersion {
+            system_clock_context_to_bytes(server.system_settings.user_system_clock_context);
+        server.system_settings.eula_versions[0] = EulaVersion {
             version: 0x10000,
-            region_code: system_settings.region_code,
+            region_code: server.system_settings.region_code,
             clock_type: EulaVersionClockType::SteadyClock as u32,
             _padding: [0; 4],
             system_clock_context: user_system_clock_context,
         };
-        system_settings.eula_version_count = 1;
+        server.system_settings.eula_version_count = 1;
 
-        Self {
-            system_settings,
-            private_settings: default_private_settings(),
-            device_settings: default_device_settings(),
-            appln_settings: default_appln_settings(),
-            save_needed: false,
+        ManuallyDrop::into_inner(server)
+    }
+
+    #[cfg(test)]
+    fn new_for_test() -> Self {
+        Self::new_impl(false)
+    }
+
+    fn load_settings_file<T: SettingsPayload>(
+        path: &Path,
+        settings: &mut T,
+        default_func: impl Fn() -> T,
+    ) -> bool {
+        if !common::fs::fs::create_dirs(path) {
+            return false;
+        }
+
+        let settings_file = path.join("settings.dat");
+        let exists = settings_file.exists();
+        let expected_size =
+            (core::mem::size_of::<SettingsHeader>() + core::mem::size_of::<T>()) as u64;
+        let file_size_ok = exists
+            && settings_file
+                .metadata()
+                .is_ok_and(|metadata| metadata.len() == expected_size);
+
+        let reset_to_default = || -> bool {
+            let default_settings = default_func();
+            let header = SettingsHeader {
+                magic: SETTINGS_MAGIC,
+                version: SETTINGS_VERSION,
+                reserved: 0,
+            };
+            let mut file = match File::create(&settings_file) {
+                Ok(file) => file,
+                Err(error) => {
+                    log::error!(
+                        "Failed to create settings file {}: {}",
+                        settings_file.display(),
+                        error
+                    );
+                    return false;
+                }
+            };
+            let mut header_bytes = [0u8; core::mem::size_of::<SettingsHeader>()];
+            header_bytes[0..8].copy_from_slice(&header.magic.to_ne_bytes());
+            header_bytes[8..12].copy_from_slice(&header.version.to_ne_bytes());
+            header_bytes[12..16].copy_from_slice(&header.reserved.to_ne_bytes());
+            file.write_all(&header_bytes).is_ok()
+                && file
+                    .write_all(settings_payload_as_bytes(&default_settings))
+                    .is_ok()
+                && file.flush().is_ok()
+        };
+
+        let is_header_valid = |file: &mut File| -> bool {
+            let mut header = [0u8; core::mem::size_of::<SettingsHeader>()];
+            if file.read_exact(&mut header).is_err() {
+                return false;
+            }
+            let magic = u64::from_ne_bytes(header[0..8].try_into().unwrap());
+            let version = u32::from_ne_bytes(header[8..12].try_into().unwrap());
+            magic == SETTINGS_MAGIC && version >= SETTINGS_VERSION
+        };
+
+        if (!exists || !file_size_ok) && !reset_to_default() {
+            return false;
+        }
+
+        let mut file = File::open(&settings_file).ok();
+        if !file.as_mut().is_some_and(&is_header_valid) {
+            drop(file);
+            if !reset_to_default() {
+                return false;
+            }
+            file = File::open(&settings_file).ok();
+            if !file.as_mut().is_some_and(&is_header_valid) {
+                return false;
+            }
+        }
+
+        match read_settings_payload(file.as_mut().unwrap()) {
+            Ok(loaded_settings) => {
+                *settings = loaded_settings;
+                true
+            }
+            Err(error) => {
+                log::error!(
+                    "Failed to read settings payload {}: {}",
+                    settings_file.display(),
+                    error
+                );
+                false
+            }
+        }
+    }
+
+    fn store_settings_file<T: SettingsPayload>(path: &Path, settings: &T) -> bool {
+        if !common::fs::fs::is_dir(path) {
+            return false;
+        }
+
+        let settings_tmp_file = path.join("settings.tmp");
+        let settings_file = path.join("settings.dat");
+        let mut file = match File::create(&settings_tmp_file) {
+            Ok(file) => file,
+            Err(_) => return false,
+        };
+        let header = SettingsHeader {
+            magic: SETTINGS_MAGIC,
+            version: SETTINGS_VERSION,
+            reserved: 0,
+        };
+        let mut header_bytes = [0u8; core::mem::size_of::<SettingsHeader>()];
+        header_bytes[0..8].copy_from_slice(&header.magic.to_ne_bytes());
+        header_bytes[8..12].copy_from_slice(&header.version.to_ne_bytes());
+        header_bytes[12..16].copy_from_slice(&header.reserved.to_ne_bytes());
+        let _ = file.write_all(&header_bytes);
+        let _ = file.write_all(settings_payload_as_bytes(settings));
+        drop(file);
+
+        fs::rename(settings_tmp_file, settings_file).is_ok()
+    }
+
+    fn setup_settings(&mut self) {
+        let nand_dir =
+            common::fs::path_util::get_ruzu_path(common::fs::path_util::RuzuPath::NANDDir);
+        let system_dir = nand_dir.join("system/save/8000000000000050");
+        assert!(Self::load_settings_file(
+            &system_dir,
+            &mut self.system_settings,
+            default_system_settings,
+        ));
+
+        let private_dir = nand_dir.join("system/save/8000000000000052");
+        assert!(Self::load_settings_file(
+            &private_dir,
+            &mut self.private_settings,
+            default_private_settings,
+        ));
+
+        let device_dir = nand_dir.join("system/save/8000000000000053");
+        assert!(Self::load_settings_file(
+            &device_dir,
+            &mut self.device_settings,
+            default_device_settings,
+        ));
+
+        let appln_dir = nand_dir.join("system/save/8000000000000054");
+        assert!(Self::load_settings_file(
+            &appln_dir,
+            &mut self.appln_settings,
+            default_appln_settings,
+        ));
+    }
+
+    fn store_settings(&self) {
+        let nand_dir =
+            common::fs::path_util::get_ruzu_path(common::fs::path_util::RuzuPath::NANDDir);
+        let system_dir = nand_dir.join("system/save/8000000000000050");
+        if !Self::store_settings_file(&system_dir, &self.system_settings) {
+            log::error!("Failed to store System settings");
+        }
+
+        let private_dir = nand_dir.join("system/save/8000000000000052");
+        if !Self::store_settings_file(&private_dir, &self.private_settings) {
+            log::error!("Failed to store Private settings");
+        }
+
+        let device_dir = nand_dir.join("system/save/8000000000000053");
+        if !Self::store_settings_file(&device_dir, &self.device_settings) {
+            log::error!("Failed to store Device settings");
+        }
+
+        let appln_dir = nand_dir.join("system/save/8000000000000054");
+        if !Self::store_settings_file(&appln_dir, &self.appln_settings) {
+            log::error!("Failed to store ApplLn settings");
         }
     }
 
     fn set_save_needed(&mut self) {
-        self.save_needed = true;
+        #[cfg(test)]
+        if !self.persistence_enabled {
+            return;
+        }
+        self.store_settings();
     }
 
     // --- Getter/Setter implementations matching upstream ---
@@ -786,6 +1012,12 @@ impl ISystemSettingsServer {
         let bytes = self.get_settings_item_value_bytes(category, name)?;
         let raw: [u8; 4] = bytes.as_slice().try_into().ok()?;
         Some(i32::from_le_bytes(raw))
+    }
+}
+
+impl Drop for ISystemSettingsServer {
+    fn drop(&mut self) {
+        self.set_save_needed();
     }
 }
 
@@ -2787,10 +3019,21 @@ impl ServiceFramework for SystemSettingsService {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    fn settings_test_dir(name: &str) -> std::path::PathBuf {
+        static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+        std::env::temp_dir().join(format!(
+            "ruzu-set-sys-{}-{}-{}",
+            std::process::id(),
+            NEXT_ID.fetch_add(1, Ordering::Relaxed),
+            name
+        ))
+    }
 
     #[test]
     fn test_system_settings_default() {
-        let server = ISystemSettingsServer::new();
+        let server = ISystemSettingsServer::new_for_test();
         assert_eq!(server.get_color_set_id(), ColorSet::BasicWhite as u32);
         assert_eq!(server.get_vibration_master_volume(), 1.0);
         assert_eq!(server.get_bluetooth_enable_flag(), true);
@@ -2805,14 +3048,14 @@ mod tests {
 
     #[test]
     fn test_system_settings_set_get_color() {
-        let mut server = ISystemSettingsServer::new();
+        let mut server = ISystemSettingsServer::new_for_test();
         server.set_color_set_id(ColorSet::BasicBlack as u32);
         assert_eq!(server.get_color_set_id(), ColorSet::BasicBlack as u32);
     }
 
     #[test]
     fn persisted_enum_values_keep_unknown_bit_patterns() {
-        let mut server = ISystemSettingsServer::new();
+        let mut server = ISystemSettingsServer::new_for_test();
         let unknown = 0xFFFF_FFFE;
 
         server.set_color_set_id(unknown);
@@ -2826,7 +3069,7 @@ mod tests {
 
     #[test]
     fn server_owns_each_upstream_settings_payload() {
-        let server = ISystemSettingsServer::new();
+        let server = ISystemSettingsServer::new_for_test();
 
         assert_eq!(server.system_settings.eula_version_count, 1);
         assert_eq!(server.private_settings.external_clock_source_id, [0; 16]);
@@ -2839,7 +3082,7 @@ mod tests {
 
     #[test]
     fn test_system_settings_vibration_volume() {
-        let mut server = ISystemSettingsServer::new();
+        let mut server = ISystemSettingsServer::new_for_test();
         server.set_vibration_master_volume(0.5);
         assert!((server.get_vibration_master_volume() - 0.5).abs() < f32::EPSILON);
     }
@@ -2852,22 +3095,131 @@ mod tests {
     }
 
     #[test]
-    fn get_mii_author_id_initializes_invalid_uuid_and_marks_save_needed() {
-        let mut server = ISystemSettingsServer::new();
+    fn get_mii_author_id_initializes_invalid_uuid() {
+        let mut server = ISystemSettingsServer::new_for_test();
         server.system_settings.mii_author_id = [0; 16];
         assert_eq!(server.system_settings.mii_author_id, [0; 16]);
-        assert!(!server.save_needed);
 
         assert_eq!(server.get_mii_author_id(), *b"Eden Default UID");
-        assert!(server.save_needed);
     }
 
     #[test]
     fn get_mii_author_id_preserves_valid_uuid() {
-        let mut server = ISystemSettingsServer::new();
+        let mut server = ISystemSettingsServer::new_for_test();
         server.system_settings.mii_author_id = *b"custom author id";
 
         assert_eq!(server.get_mii_author_id(), *b"custom author id");
-        assert!(!server.save_needed);
+    }
+
+    #[test]
+    fn missing_settings_file_is_created_with_upstream_header_and_default() {
+        let path = settings_test_dir("missing");
+        let mut loaded = ApplnSettings::default();
+
+        assert!(ISystemSettingsServer::load_settings_file(
+            &path,
+            &mut loaded,
+            || {
+                let mut settings = default_appln_settings();
+                settings.service_discovery_control_settings = 0x1234_5678;
+                settings
+            },
+        ));
+        assert_eq!(loaded.service_discovery_control_settings, 0x1234_5678);
+
+        let bytes = fs::read(path.join("settings.dat")).unwrap();
+        assert_eq!(
+            bytes.len(),
+            core::mem::size_of::<SettingsHeader>() + core::mem::size_of::<ApplnSettings>()
+        );
+        assert_eq!(
+            u64::from_ne_bytes(bytes[0..8].try_into().unwrap()),
+            SETTINGS_MAGIC
+        );
+        assert_eq!(
+            u32::from_ne_bytes(bytes[8..12].try_into().unwrap()),
+            SETTINGS_VERSION
+        );
+        assert_eq!(u32::from_ne_bytes(bytes[12..16].try_into().unwrap()), 0);
+
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn invalid_header_is_reset_before_loading_payload() {
+        let path = settings_test_dir("invalid-header");
+        let mut loaded = default_private_settings();
+        assert!(ISystemSettingsServer::load_settings_file(
+            &path,
+            &mut loaded,
+            default_private_settings,
+        ));
+
+        let settings_file = path.join("settings.dat");
+        let mut bytes = fs::read(&settings_file).unwrap();
+        bytes[0..8].fill(0);
+        fs::write(&settings_file, bytes).unwrap();
+        loaded.external_steady_clock_internal_offset = 99;
+
+        assert!(ISystemSettingsServer::load_settings_file(
+            &path,
+            &mut loaded,
+            default_private_settings,
+        ));
+        assert_eq!(loaded.external_steady_clock_internal_offset, 0);
+        let repaired = fs::read(&settings_file).unwrap();
+        assert_eq!(
+            u64::from_ne_bytes(repaired[0..8].try_into().unwrap()),
+            SETTINGS_MAGIC
+        );
+
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn store_uses_temporary_file_then_replaces_settings_dat() {
+        let path = settings_test_dir("store");
+        assert!(common::fs::fs::create_dirs(&path));
+        let mut settings = default_appln_settings();
+        settings.service_discovery_control_settings = 0xDEAD_BEEF;
+
+        assert!(ISystemSettingsServer::store_settings_file(&path, &settings));
+        settings.service_discovery_control_settings = 0xA5A5_5A5A;
+        assert!(ISystemSettingsServer::store_settings_file(&path, &settings));
+        assert!(!path.join("settings.tmp").exists());
+
+        let mut loaded = default_appln_settings();
+        assert!(ISystemSettingsServer::load_settings_file(
+            &path,
+            &mut loaded,
+            default_appln_settings,
+        ));
+        assert_eq!(loaded.service_discovery_control_settings, 0xA5A5_5A5A);
+
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn newer_settings_header_version_is_accepted() {
+        let path = settings_test_dir("newer-version");
+        assert!(common::fs::fs::create_dirs(&path));
+        let mut settings = default_appln_settings();
+        settings.service_discovery_control_settings = 0xCAFEBABE;
+        assert!(ISystemSettingsServer::store_settings_file(&path, &settings));
+
+        let settings_file = path.join("settings.dat");
+        let mut bytes = fs::read(&settings_file).unwrap();
+        bytes[8..12].copy_from_slice(&(SETTINGS_VERSION + 1).to_ne_bytes());
+        fs::write(&settings_file, bytes).unwrap();
+
+        let mut loaded = default_appln_settings();
+        assert!(ISystemSettingsServer::load_settings_file(
+            &path,
+            &mut loaded,
+            default_appln_settings,
+        ));
+        assert_eq!(loaded.service_discovery_control_settings, 0xCAFEBABE);
+
+        fs::remove_dir_all(path).unwrap();
     }
 }

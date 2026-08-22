@@ -841,7 +841,12 @@
   the same payload as Eden, constructor region/EULA overrides retain upstream ordering, and the
   duplicate loose state is removed. Persisted enum values remain raw through IPC, including
   unknown bit patterns.
-- Status: ready to resume `LoadSettingsFile`, `StoreSettingsFile`, `SetupSettings`, and
-  `StoreSettings` after the requested release rebuild. Until that slice lands, `SetSaveNeeded`
-  only records dirty state, and the device/application payload owners have targeted temporary
-  `dead_code` allowances because persistence is their first reader.
+- Newly discovered prerequisite: the persisted `AccountNotificationSettings` nested two Rust
+  enums, and the system payload left C++'s implicit alignment after `quest_flag` implicit in Rust.
+  Both are now raw/explicit and layout-tested, so every loaded payload bit pattern is valid.
+- Resumed result: `LoadSettingsFile`, `StoreSettingsFile`, `SetupSettings`, `StoreSettings`,
+  immediate `SetSaveNeeded` storage and destructor-equivalent `Drop` are ported in their upstream
+  owner. All four NAND paths, header validation/reset rules and temporary-file rename ordering
+  match Eden. The two constants and both payload owners are consumed, reducing `core` from 85 to
+  83 warnings; all 25 focused `set` tests pass.
+- Status: completed and verified for the settings-persistence warning slice.

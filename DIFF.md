@@ -5740,6 +5740,10 @@ Compared `system_settings.rs`, `private_settings.rs`, `device_settings.rs`, and
 - Replaced enum and `bool` fields in the persisted system/application payloads with raw wire
   integers, making future byte-for-byte load/store safe while preserving every compile-time
   offset assertion.
+- `AccountNotificationSettings` now stores both `FriendPresenceOverlayPermission` members as raw
+  `u8` values, closing the final invalid-enum hole nested inside `SystemSettings`. The implicit
+  C++ alignment gap after `quest_flag` is represented by an explicit three-byte Rust field so the
+  full payload has no unread implicit padding at that boundary.
 
 ## 2026-08-22 — `system_settings_server.rs` state ownership vs Eden
 `system_settings_server.{h,cpp}`
@@ -5767,15 +5771,38 @@ Compared `system_settings.rs`, `private_settings.rs`, `device_settings.rs`, and
 
 ### Unintentional differences (to fix)
 
-- `SetSaveNeeded` still records a dirty flag instead of immediately invoking `StoreSettings` under
-  the save mutex. The load/store/setup prerequisite is ready to resume and remains recorded in
-  `PORTING_STATE.md`.
 - Battery-lot and console-serial responses remain zeroed. Eden derives them from the common
   `serial_battery`, `serial_unit`, and region settings, which Ruzu does not yet own.
 
 ### Missing items
 
-- `LoadSettingsFile`, `StoreSettingsFile`, `SetupSettings`, and `StoreSettings` are the next
-  persistence slice; `SETTINGS_MAGIC` and `SETTINGS_VERSION` remain unused until then.
 - The pre-existing partial service still omits Eden's implemented console-information-upload,
   automatic-application-download, USB 3.0, HTTP-auth-config, and account-user-settings commands.
+
+## 2026-08-22 — `system_settings_server.rs` persistence vs Eden
+`system_settings_server.{h,cpp}`
+
+### Intentional differences
+
+- The four verbatim payload types implement a private `SettingsPayload` marker. This is a Rust
+  validity boundary for Eden's templated raw-memory I/O: only the four audited all-bit-pattern
+  settings structs can be loaded into initialized Rust values.
+- Rust propagates file create/read/flush failures as `false` instead of relying on iostream state,
+  and an isolated test constructor skips host NAND I/O. Production construction, mutation and
+  destruction retain Eden's persistence behavior.
+- The service's existing outer `Mutex<ISystemSettingsServer>` serializes mutation and storage;
+  Eden uses a second member mutex inside `SetSaveNeeded`. Both protect the same per-instance store
+  operation, while Rust avoids locking the already exclusively borrowed object twice.
+
+### Fixed parity debt
+
+- Ported `LoadSettingsFile`, including directory creation, exact file-size validation, native-wire
+  header parsing, `version >= 4`, default regeneration, second header validation and full payload
+  loading.
+- Ported `StoreSettingsFile` with Eden's `settings.tmp` then `settings.dat` rename ordering, and
+  ported all four NAND save paths in `SetupSettings`/`StoreSettings`.
+- Construction now loads all four files before applying the configured region and temporary EULA
+  override. `SetSaveNeeded` stores immediately, and `Drop` mirrors the destructor's final store.
+- `SETTINGS_MAGIC` and `SETTINGS_VERSION` are now consumed; the two corresponding `core` warnings
+  are gone. Focused tests cover default creation, corrupt-header reset, forward-version acceptance,
+  replacement ordering and payload round-trips.

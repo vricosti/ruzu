@@ -487,8 +487,8 @@ const _: () = assert!(std::mem::size_of::<UserSelectorFlag>() == 4);
 pub struct AccountNotificationSettings {
     pub uid: [u8; 16], // Common::UUID
     pub flags: AccountNotificationFlag,
-    pub friend_presence_permission: FriendPresenceOverlayPermission,
-    pub friend_invitation_permission: FriendPresenceOverlayPermission,
+    pub friend_presence_permission: u8, // FriendPresenceOverlayPermission
+    pub friend_invitation_permission: u8, // FriendPresenceOverlayPermission
     pub _padding: [u8; 2],
 }
 const _: () = assert!(std::mem::size_of::<AccountNotificationSettings>() == 0x18);
@@ -498,8 +498,8 @@ impl Default for AccountNotificationSettings {
         Self {
             uid: [0u8; 16],
             flags: AccountNotificationFlag::default(),
-            friend_presence_permission: FriendPresenceOverlayPermission::NotConfirmed,
-            friend_invitation_permission: FriendPresenceOverlayPermission::NotConfirmed,
+            friend_presence_permission: FriendPresenceOverlayPermission::NotConfirmed as u8,
+            friend_invitation_permission: FriendPresenceOverlayPermission::NotConfirmed as u8,
             _padding: [0u8; 2],
         }
     }
@@ -682,3 +682,19 @@ pub struct TvSettings {
     pub contrast_ratio: f32,
 }
 const _: () = assert!(std::mem::size_of::<TvSettings>() == 0x20);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn account_notification_permissions_preserve_raw_wire_values() {
+        let mut settings = AccountNotificationSettings::default();
+        settings.friend_presence_permission = 0xFE;
+        settings.friend_invitation_permission = 0xFF;
+
+        assert_eq!(core::mem::size_of_val(&settings), 0x18);
+        assert_eq!(settings.friend_presence_permission, 0xFE);
+        assert_eq!(settings.friend_invitation_permission, 0xFF);
+    }
+}

@@ -260,6 +260,8 @@ pub struct SystemSettings {
     // offset 0x2947C
     /// nn::settings::system::QuestFlag
     pub quest_flag: u8,
+    /// Implicit C++ alignment padding before SystemRegionCode.
+    pub _padding_0x2947d: [u8; 0x3],
 
     // offset 0x29480
     /// nn::settings::system::SystemRegionCode
@@ -561,6 +563,9 @@ const _: () = {
         core::mem::offset_of!(SystemSettings, console_six_axis_sensor_acceleration_bias) == 0x29370
     );
     assert!(core::mem::offset_of!(SystemSettings, lock_screen_flag) == 0x29470);
+    assert!(core::mem::offset_of!(SystemSettings, quest_flag) == 0x2947C);
+    assert!(core::mem::offset_of!(SystemSettings, region_code) == 0x29480);
+    assert!(core::mem::offset_of!(SystemSettings, initial_launch_settings_packed) == 0x29484);
     assert!(core::mem::offset_of!(SystemSettings, battery_percentage_flag) == 0x294A0);
     assert!(core::mem::offset_of!(SystemSettings, field_testing_flag) == 0x294C0);
     assert!(core::mem::offset_of!(SystemSettings, backlight_settings_mixed_up) == 0x294F0);
