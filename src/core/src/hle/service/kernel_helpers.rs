@@ -200,10 +200,7 @@ impl ServiceContext {
                     .as_ref()
                     .and_then(|process| process.lock().unwrap().resource_limit.clone());
                 if let Some(resource_limit) = resource_limit {
-                    resource_limit
-                        .lock()
-                        .unwrap()
-                        .release(LimitableResource::EventCountMax, 1);
+                    resource_limit.release(LimitableResource::EventCountMax, 1);
                 }
             }
             drop(event);
@@ -293,11 +290,9 @@ mod tests {
     fn event_reservation_is_released_when_service_owner_closes() {
         use crate::hle::kernel::k_resource_limit::KResourceLimit;
 
-        let resource_limit = Arc::new(Mutex::new(KResourceLimit::new()));
-        resource_limit.lock().unwrap().initialize();
+        let resource_limit = Arc::new(KResourceLimit::new());
+        resource_limit.initialize();
         resource_limit
-            .lock()
-            .unwrap()
             .set_limit_value(LimitableResource::EventCountMax, 1)
             .unwrap();
 

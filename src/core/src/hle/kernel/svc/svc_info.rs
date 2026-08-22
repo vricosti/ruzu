@@ -176,11 +176,10 @@ fn get_info_impl(
                     // Upstream: resource_limit->GetLimitValue(ThreadCountMax) - resource_limit->GetCurrentValue(ThreadCountMax)
                     // Approximate with a reasonable default.
                     if let Some(ref rl) = process.resource_limit {
-                        let rl_guard = rl.lock().unwrap();
-                        let limit = rl_guard.get_limit_value(
+                        let limit = rl.get_limit_value(
                             crate::hle::kernel::k_resource_limit::LimitableResource::ThreadCountMax,
                         );
-                        let current = rl_guard.get_current_value(
+                        let current = rl.get_current_value(
                             crate::hle::kernel::k_resource_limit::LimitableResource::ThreadCountMax,
                         );
                         *result = (limit - current) as u64;

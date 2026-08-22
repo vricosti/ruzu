@@ -15,7 +15,7 @@ use super::k_page_table_slab_heap::{KPageTableSlabHeap, RefCount};
 use super::k_resource_limit::{KResourceLimit, LimitableResource};
 use super::k_scoped_resource_reservation::KScopedResourceReservation;
 use crate::hle::result::ResultCode;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 /// Port of Kernel::KSystemResource.
 ///
@@ -106,7 +106,7 @@ pub struct KSecureSystemResource {
     block_info_manager: KBlockInfoManager,
     page_table_manager: KPageTableManager,
     page_table_heap: KPageTableSlabHeap,
-    resource_limit: Option<Arc<Mutex<KResourceLimit>>>,
+    resource_limit: Option<Arc<KResourceLimit>>,
     resource_address: u64,
     resource_size: usize,
 }
@@ -164,7 +164,7 @@ impl KSecureSystemResource {
     pub fn initialize(
         &mut self,
         size: usize,
-        resource_limit: Option<Arc<Mutex<KResourceLimit>>>,
+        resource_limit: Option<Arc<KResourceLimit>>,
         pool: k_memory_manager::Pool,
         mm: &mut k_memory_manager::KMemoryManager,
     ) -> Result<(), ResultCode> {
@@ -251,7 +251,7 @@ impl KSecureSystemResource {
         }
 
         if let Some(resource_limit) = self.resource_limit.take() {
-            resource_limit.lock().unwrap().release(
+            resource_limit.release(
                 LimitableResource::PhysicalMemoryMax,
                 self.calculate_required_secure_memory_size_self() as i64,
             );

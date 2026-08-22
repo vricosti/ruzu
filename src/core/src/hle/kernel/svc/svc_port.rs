@@ -616,7 +616,7 @@ mod tests {
     #[test]
     fn normal_port_session_finalize_notifies_client_port() {
         let system = test_system();
-        let resource_limit = Arc::new(Mutex::new(create_resource_limit_for_process(0x1_0000_0000)));
+        let resource_limit = Arc::new(create_resource_limit_for_process(0x1_0000_0000));
         system.current_process_arc().lock().unwrap().resource_limit =
             Some(Arc::clone(&resource_limit));
         let mut server = 0;
@@ -646,19 +646,13 @@ mod tests {
 
         assert_eq!(port.lock().unwrap().client.get_num_sessions(), 1);
         assert_eq!(
-            resource_limit
-                .lock()
-                .unwrap()
-                .get_current_value(LimitableResource::SessionCountMax),
+            resource_limit.get_current_value(LimitableResource::SessionCountMax),
             1
         );
         process.unregister_session_object_by_object_id(session_object_id);
         assert_eq!(port.lock().unwrap().client.get_num_sessions(), 0);
         assert_eq!(
-            resource_limit
-                .lock()
-                .unwrap()
-                .get_current_value(LimitableResource::SessionCountMax),
+            resource_limit.get_current_value(LimitableResource::SessionCountMax),
             0
         );
     }

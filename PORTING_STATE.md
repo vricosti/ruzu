@@ -2,7 +2,7 @@
 
 ## 2026-08-22 — Resource-limit wait lifecycle
 
-- Status: scheduler-owned wait prerequisite completed; resource-limit slice ready to resume.
+- Status: completed and verified for the resource-limit wait/ownership slice.
 - Interrupted slice: make `KResourceLimit::{reserve,release}` consume Eden's timeout,
   waiter-count and broadcast state instead of retaining dead-looking fields.
 - Exact missing prerequisite: `k_light_condition_variable.rs` currently substitutes a host
@@ -18,6 +18,12 @@
   base-call decision. `KLightConditionVariable` uses the scheduler lock, guest-thread wait queue,
   hardware timer and insertion-ordered weak waiter owners; focused callback, cancellation and
   broadcast tests pass.
+- Resumed result: `KResourceLimit` now owns Eden's `KLightLock` and
+  `KLightConditionVariable`, performs absolute-timeout waits, tracks waiters and broadcasts from
+  `release`. Process, page-table and service owners retain it directly as `Arc<KResourceLimit>` so
+  no outer host mutex remains locked while the guest thread sleeps. The scoped reservation now
+  forwards its explicit timeout and preserves commit/drop charging semantics; all six focused
+  resource-limit tests pass.
 
 ## 2026-08-22 — Cheat engine runtime integration
 

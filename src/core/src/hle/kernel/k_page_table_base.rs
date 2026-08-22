@@ -388,7 +388,7 @@ pub struct KPageTableBase {
     pub(crate) m_stack_fill_value: MemoryFillValue,
     pub(crate) m_process_id: u64,
     /// Upstream: `KResourceLimit* m_resource_limit`.
-    pub(crate) m_resource_limit: Option<Arc<Mutex<KResourceLimit>>>,
+    pub(crate) m_resource_limit: Option<Arc<KResourceLimit>>,
 }
 
 impl KPageTableBase {
@@ -517,7 +517,7 @@ impl KPageTableBase {
             if let Some(resource_limit) = crate::hle::kernel::kernel::get_kernel_ref()
                 .and_then(super::board::k_system_control::get_insecure_memory_resource_limit)
             {
-                resource_limit.lock().unwrap().release(
+                resource_limit.release(
                     LimitableResource::PhysicalMemoryMax,
                     mapped_insecure_memory as i64,
                 );
@@ -527,7 +527,7 @@ impl KPageTableBase {
         let mapped_ipc_server_memory = std::mem::take(&mut self.m_mapped_ipc_server_memory);
         if mapped_ipc_server_memory != 0 {
             if let Some(resource_limit) = &self.m_resource_limit {
-                resource_limit.lock().unwrap().release(
+                resource_limit.release(
                     LimitableResource::PhysicalMemoryMax,
                     mapped_ipc_server_memory as i64,
                 );
@@ -1030,7 +1030,7 @@ impl KPageTableBase {
         pool: u32,
         code_address: usize,
         code_size: usize,
-        resource_limit: Option<Arc<Mutex<KResourceLimit>>>,
+        resource_limit: Option<Arc<KResourceLimit>>,
         memory: Option<Arc<Mutex<Memory>>>,
         aslr_space_start: usize,
     ) -> u32 {
@@ -1950,8 +1950,6 @@ impl KPageTableBase {
 
                 if let Some(ref resource_limit) = self.m_resource_limit {
                     resource_limit
-                        .lock()
-                        .unwrap()
                         .release(LimitableResource::PhysicalMemoryMax, free_size as i64);
                 }
 
@@ -4162,10 +4160,7 @@ impl KPageTableBase {
             .m_mapped_physical_memory_size
             .saturating_sub(mapped_size);
         if let Some(resource_limit) = &self.m_resource_limit {
-            resource_limit
-                .lock()
-                .unwrap()
-                .release(LimitableResource::PhysicalMemoryMax, mapped_size as i64);
+            resource_limit.release(LimitableResource::PhysicalMemoryMax, mapped_size as i64);
         }
         self.update_blocks_with_allocator(
             &mut allocator,
@@ -6691,8 +6686,6 @@ impl KPageTableBase {
         if unmapped_size > 0 {
             if let Some(resource_limit) = &self.m_resource_limit {
                 resource_limit
-                    .lock()
-                    .unwrap()
                     .release(LimitableResource::PhysicalMemoryMax, unmapped_size as i64);
             }
             self.m_mapped_ipc_server_memory = self
@@ -9163,9 +9156,9 @@ mod tests {
         dst.m_address_space_end = 0x1002_0000;
         dst.m_alias_region_start = 0x1000_0000;
         dst.m_alias_region_end = 0x1002_0000;
-        dst.m_resource_limit = Some(Arc::new(Mutex::new(create_resource_limit_for_process(
+        dst.m_resource_limit = Some(Arc::new(create_resource_limit_for_process(
             0x10_0000,
-        ))));
+        )));
         dst.m_memory = Some(page_table_memory.memory.clone());
         dst.initialize_impl();
         assert!(dst
@@ -9212,8 +9205,6 @@ mod tests {
             dst.m_resource_limit
                 .as_ref()
                 .unwrap()
-                .lock()
-                .unwrap()
                 .get_current_value(LimitableResource::PhysicalMemoryMax),
             partial_backend_cost as i64
         );
@@ -9226,8 +9217,6 @@ mod tests {
         assert_eq!(
             dst.m_resource_limit
                 .as_ref()
-                .unwrap()
-                .lock()
                 .unwrap()
                 .get_current_value(LimitableResource::PhysicalMemoryMax),
             0
@@ -9280,9 +9269,9 @@ mod tests {
         dst.m_address_space_end = 0x1002_0000;
         dst.m_alias_region_start = 0x1000_0000;
         dst.m_alias_region_end = 0x1002_0000;
-        dst.m_resource_limit = Some(Arc::new(Mutex::new(create_resource_limit_for_process(
+        dst.m_resource_limit = Some(Arc::new(create_resource_limit_for_process(
             0x10_0000,
-        ))));
+        )));
         dst.m_memory = Some(page_table_memory.memory.clone());
         dst.initialize_impl();
         assert!(dst

@@ -1884,7 +1884,7 @@ pub struct KernelCore {
     /// `InitializeSystemResourceLimit` at boot. Holds PhysicalMemoryMax,
     /// ThreadCountMax, EventCountMax, TransferMemoryCountMax, SessionCountMax.
     /// Used by services like KSystemControl::GetInsecureMemoryResourceLimit.
-    system_resource_limit: Option<Arc<Mutex<super::k_resource_limit::KResourceLimit>>>,
+    system_resource_limit: Option<Arc<super::k_resource_limit::KResourceLimit>>,
 
     /// Kernel-wide slab manager for KMemoryBlock nodes used by
     /// `KMemoryBlockManagerUpdateAllocator`. Upstream:
@@ -3328,7 +3328,7 @@ impl KernelCore {
     /// `KernelCore::GetSystemResourceLimit()`.
     pub fn get_system_resource_limit(
         &self,
-    ) -> Option<Arc<Mutex<super::k_resource_limit::KResourceLimit>>> {
+    ) -> Option<Arc<super::k_resource_limit::KResourceLimit>> {
         self.system_resource_limit.clone()
     }
 
@@ -3437,7 +3437,7 @@ impl KernelCore {
     /// ```
     pub fn initialize_system_resource_limit(&mut self, total_size: i64, kernel_size: i64) {
         use super::k_resource_limit::{KResourceLimit, LimitableResource};
-        let mut rl = KResourceLimit::new();
+        let rl = KResourceLimit::new();
         let _ = rl.set_limit_value(LimitableResource::PhysicalMemoryMax, total_size);
         let _ = rl.set_limit_value(LimitableResource::ThreadCountMax, 800);
         let _ = rl.set_limit_value(LimitableResource::EventCountMax, 900);
@@ -3450,7 +3450,7 @@ impl KernelCore {
             LimitableResource::PhysicalMemoryMax,
             secure_applet_memory_size,
         );
-        self.system_resource_limit = Some(Arc::new(Mutex::new(rl)));
+        self.system_resource_limit = Some(Arc::new(rl));
     }
 
     /// Initialize shutdown threads (one per core).
@@ -3854,8 +3854,6 @@ mod tests {
             kernel
                 .get_system_resource_limit()
                 .unwrap()
-                .lock()
-                .unwrap()
                 .get_current_value(LimitableResource::ThreadCountMax),
             1
         );
@@ -3867,8 +3865,6 @@ mod tests {
         assert_eq!(
             kernel
                 .get_system_resource_limit()
-                .unwrap()
-                .lock()
                 .unwrap()
                 .get_current_value(LimitableResource::ThreadCountMax),
             0
@@ -3929,8 +3925,6 @@ mod tests {
             kernel
                 .get_system_resource_limit()
                 .unwrap()
-                .lock()
-                .unwrap()
                 .get_current_value(LimitableResource::ThreadCountMax),
             1
         );
@@ -3950,8 +3944,6 @@ mod tests {
         assert_eq!(
             kernel
                 .get_system_resource_limit()
-                .unwrap()
-                .lock()
                 .unwrap()
                 .get_current_value(LimitableResource::ThreadCountMax),
             0

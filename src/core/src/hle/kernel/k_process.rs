@@ -484,7 +484,7 @@ pub struct KProcess {
     pub ideal_core_id: i32,
     /// Resource limit for this process.
     /// Matches upstream `KResourceLimit* m_resource_limit`.
-    pub resource_limit: Option<Arc<Mutex<KResourceLimit>>>,
+    pub resource_limit: Option<Arc<KResourceLimit>>,
     /// System resource (slab managers for page table/memory blocks).
     /// Upstream: `KSystemResource* m_system_resource`.
     pub system_resource: Option<Arc<Mutex<KSecureSystemResource>>>,
@@ -975,9 +975,7 @@ impl KProcess {
     pub fn get_total_user_physical_memory_size(&self) -> usize {
         // Get the amount of free and used size.
         let free_size = if let Some(ref rl) = self.resource_limit {
-            rl.lock()
-                .unwrap()
-                .get_free_value(LimitableResource::PhysicalMemoryMax) as usize
+            rl.get_free_value(LimitableResource::PhysicalMemoryMax) as usize
         } else {
             0
         };
@@ -1011,9 +1009,7 @@ impl KProcess {
     pub fn get_total_non_system_user_physical_memory_size(&self) -> usize {
         // Get the amount of free and used size.
         let free_size = if let Some(ref rl) = self.resource_limit {
-            rl.lock()
-                .unwrap()
-                .get_free_value(LimitableResource::PhysicalMemoryMax) as usize
+            rl.get_free_value(LimitableResource::PhysicalMemoryMax) as usize
         } else {
             0
         };
@@ -1767,7 +1763,7 @@ impl KProcess {
         version: u32,
         system_resource_num_pages: u64,
         user_caps: &[u32],
-        resource_limit: Option<Arc<Mutex<KResourceLimit>>>,
+        resource_limit: Option<Arc<KResourceLimit>>,
         pool: k_memory_manager::Pool,
         aslr_space_start: u64,
     ) -> u32 {
@@ -1947,7 +1943,7 @@ impl KProcess {
         code_address: u64,
         code_num_pages: u64,
         version: u32,
-        resource_limit: Option<Arc<Mutex<KResourceLimit>>>,
+        resource_limit: Option<Arc<KResourceLimit>>,
         is_real: bool,
     ) -> u32 {
         // Create and clear PLR if real.
@@ -2066,9 +2062,9 @@ impl KProcess {
             _ => 0x2C600000,                                   // ~710 MiB (System)
         };
 
-        let res_limit = Arc::new(Mutex::new(
+        let res_limit = Arc::new(
             super::k_resource_limit::create_resource_limit_for_process(physical_memory_size),
-        ));
+        );
 
         // Declare flags (upstream lines 1200-1202).
         let mut flags = CreateProcessFlag::empty();
@@ -2200,7 +2196,7 @@ impl KProcess {
             //           m_resource_limit->Release(PhysicalMemoryMax, 0, m_memory_release_hint);
             self.memory_release_hint = self.get_used_non_system_user_physical_memory_size();
             if let Some(ref rl) = self.resource_limit {
-                rl.lock().unwrap().release_with_hint(
+                rl.release_with_hint(
                     LimitableResource::PhysicalMemoryMax,
                     0,
                     self.memory_release_hint as i64,
@@ -2742,7 +2738,7 @@ impl KProcess {
         if let Some(ref rl) = self.resource_limit {
             debug_assert!(used_memory_size >= self.memory_release_hint);
             let hint = (used_memory_size - self.memory_release_hint) as i64;
-            rl.lock().unwrap().release_with_hint(
+            rl.release_with_hint(
                 LimitableResource::PhysicalMemoryMax,
                 used_memory_size as i64,
                 hint,
@@ -3461,9 +3457,9 @@ mod tests {
             process_guard.bind_self_reference(&process);
             process_guard.attach_scheduler(&scheduler);
             process_guard.initialize_thread_local_region_allocation(0x1c0000);
-            process_guard.resource_limit = Some(Arc::new(Mutex::new(
+            process_guard.resource_limit = Some(Arc::new(
                 create_resource_limit_for_process(0x1_0000_0000),
-            )));
+            ));
         }
 
         let (main_thread, main_thread_handle, stack_base, stack_top) = process
@@ -3544,9 +3540,9 @@ mod tests {
             process_guard.bind_self_reference(&process);
             process_guard.attach_scheduler(&scheduler);
             process_guard.initialize_thread_local_region_allocation(0x1c0000);
-            process_guard.resource_limit = Some(Arc::new(Mutex::new(
+            process_guard.resource_limit = Some(Arc::new(
                 create_resource_limit_for_process(0x1_0000_0000),
-            )));
+            ));
             process_guard
                 .process_memory
                 .write()

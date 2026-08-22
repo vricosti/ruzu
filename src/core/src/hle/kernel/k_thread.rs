@@ -2708,7 +2708,7 @@ impl KThread {
             let mut process = parent.lock().unwrap();
             // Upstream: m_parent->GetResourceLimit()->Release(ThreadCountMax, 0, 1)
             if let Some(ref rl) = process.resource_limit {
-                rl.lock().unwrap().release_with_hint(
+                rl.release_with_hint(
                     super::k_resource_limit::LimitableResource::ThreadCountMax,
                     0,
                     1,
@@ -3867,7 +3867,7 @@ impl KThread {
         let resource_limit = parent.lock().unwrap().resource_limit.clone();
         if let Some(resource_limit) = resource_limit {
             let hint_value = if resource_limit_release_hint { 0 } else { 1 };
-            resource_limit.lock().unwrap().release_with_hint(
+            resource_limit.release_with_hint(
                 super::k_resource_limit::LimitableResource::ThreadCountMax,
                 1,
                 hint_value,
@@ -4315,9 +4315,9 @@ mod tests {
         process.capabilities.core_mask = 0xF;
         process.capabilities.priority_mask = u64::MAX;
         process.initialize_handle_table();
-        process.resource_limit = Some(Arc::new(Mutex::new(
+        process.resource_limit = Some(Arc::new(
             crate::hle::kernel::k_resource_limit::create_resource_limit_for_process(0x4000_0000),
-        )));
+        ));
         process.create_memory(&system);
         process.allocate_code_memory(0x20_0000, 0x40_000);
         process

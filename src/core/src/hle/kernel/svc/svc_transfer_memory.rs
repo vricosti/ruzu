@@ -68,7 +68,7 @@ pub fn create_transfer_memory(
 
     // Upstream: Reserve transfer memory from resource limit.
     if let Some(ref rl) = process.resource_limit {
-        if !rl.lock().unwrap().reserve(
+        if !rl.reserve(
             crate::hle::kernel::k_resource_limit::LimitableResource::TransferMemoryCountMax,
             1,
         ) {
@@ -80,7 +80,7 @@ pub fn create_transfer_memory(
     let addr_kpa = crate::hle::kernel::k_typed_address::KProcessAddress::new(address);
     if !process.page_table.contains(addr_kpa, size as usize) {
         if let Some(ref rl) = process.resource_limit {
-            rl.lock().unwrap().release(
+            rl.release(
                 crate::hle::kernel::k_resource_limit::LimitableResource::TransferMemoryCountMax,
                 1,
             );
@@ -98,7 +98,7 @@ pub fn create_transfer_memory(
     );
     if init_result.is_failure() {
         if let Some(ref rl) = process.resource_limit {
-            rl.lock().unwrap().release(
+            rl.release(
                 crate::hle::kernel::k_resource_limit::LimitableResource::TransferMemoryCountMax,
                 1,
             );
@@ -121,7 +121,7 @@ pub fn create_transfer_memory(
         Err(_) => {
             transfer_memory.finalize(&mut process.page_table);
             if let Some(ref rl) = process.resource_limit {
-                rl.lock().unwrap().release(
+                rl.release(
                     crate::hle::kernel::k_resource_limit::LimitableResource::TransferMemoryCountMax,
                     1,
                 );

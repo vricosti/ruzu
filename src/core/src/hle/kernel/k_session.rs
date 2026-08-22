@@ -256,9 +256,7 @@ impl KSession {
         }
         if self.session_resource_committed {
             if let Some(ref rl) = process.resource_limit {
-                rl.lock()
-                    .unwrap()
-                    .release(LimitableResource::SessionCountMax, 1);
+                rl.release(LimitableResource::SessionCountMax, 1);
             }
             self.session_resource_committed = false;
         }

@@ -4980,3 +4980,39 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
   enforces Eden's compressed-block size and offset checks.
 - `Drop` now mirrors both upstream destructor/finalize layers, and the `VfsFile` adapter reports the
   virtual byte count actually available instead of the original request after an end-of-file clamp.
+
+## 2026-08-22 — `src/core/src/hle/kernel/k_resource_limit.rs` vs `core/hle/kernel/k_resource_limit.h` and `.cpp`
+
+### Intentional differences
+
+- Rust stores the four mutable resource arrays and waiter count in `UnsafeCell` fields serialized
+  by the owner-local `KLightLock`. This preserves Eden's mutation-through-shared-object model while
+  allowing process and kernel owners to retain `Arc<KResourceLimit>` instead of an outer host mutex.
+- Eden passes `KernelCore&` to reserve/release and constructs the object in its auto-object slab.
+  Ruzu resolves the active hardware timer through the existing kernel owner and uses `Arc` lifetime
+  management; isolated tests without an active kernel use a zero/current-expired tick fallback.
+- `set_limit_value` returns `Result<(), ()>` rather than Eden's kernel `Result`; callers map the
+  failure to `ResultInvalidState` at the SVC boundary.
+
+### Fixed parity debt
+
+- `reserve` now retains Eden's ten-second default timeout, wrapping-overflow rejection, hint-based
+  wait decision, waiter-count ordering and retry loop. `release` broadcasts only when a waiter is
+  present, after subtracting current and hint values.
+- The prior `Arc<Mutex<KResourceLimit>>` ownership has been removed from kernel, process,
+  page-table and service callers. The outer mutex would have remained locked while Eden's inner
+  light lock was released for a wait, preventing another thread from releasing the resource.
+
+## 2026-08-22 — `src/core/src/hle/kernel/k_scoped_resource_reservation.rs` vs `core/hle/kernel/k_scoped_resource_reservation.h`
+
+### Intentional differences
+
+- Rust retains an optional `Arc<KResourceLimit>` instead of Eden's raw pointer. `commit` consumes
+  that optional owner, which has the same effect as assigning `nullptr`; the active kernel used by
+  release remains owned by `KResourceLimit`'s runtime integration rather than a guard field.
+
+### Fixed parity debt
+
+- The explicit-timeout constructor now calls the timeout overload instead of silently using the
+  default reservation path. Drop still releases only non-zero successful reservations, and commit
+  still leaves the resource charged.

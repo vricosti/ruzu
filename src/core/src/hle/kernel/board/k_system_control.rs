@@ -135,7 +135,7 @@ pub mod init {
 /// `return kernel.GetSystemResourceLimit();`
 pub fn get_insecure_memory_resource_limit(
     kernel: &crate::hle::kernel::kernel::KernelCore,
-) -> Option<std::sync::Arc<std::sync::Mutex<crate::hle::kernel::k_resource_limit::KResourceLimit>>>
+) -> Option<std::sync::Arc<crate::hle::kernel::k_resource_limit::KResourceLimit>>
 {
     kernel.get_system_resource_limit()
 }

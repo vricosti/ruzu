@@ -191,9 +191,7 @@ impl KTransferMemory {
     /// Port of upstream `KTransferMemory::PostDestroy`.
     pub fn post_destroy(&self, owner: &mut KProcess) {
         if let Some(ref rl) = owner.resource_limit {
-            rl.lock()
-                .unwrap()
-                .release(LimitableResource::TransferMemoryCountMax, 1);
+            rl.release(LimitableResource::TransferMemoryCountMax, 1);
         }
     }
 }

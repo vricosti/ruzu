@@ -436,9 +436,9 @@ mod tests {
         process.capabilities.priority_mask = u64::MAX;
         process.flags = 0;
         process.initialize_handle_table();
-        process.resource_limit = Some(Arc::new(Mutex::new(create_resource_limit_for_process(
+        process.resource_limit = Some(Arc::new(create_resource_limit_for_process(
             0x4000_0000,
-        ))));
+        )));
         process.create_memory(&system);
         process.allocate_code_memory(0x200000, 0x1000);
         set_current_page_table_for_test(&mut process);
@@ -697,8 +697,6 @@ mod tests {
                 .resource_limit
                 .as_ref()
                 .unwrap()
-                .lock()
-                .unwrap()
                 .get_current_value(
                     crate::hle::kernel::k_resource_limit::LimitableResource::TransferMemoryCountMax,
                 );
@@ -712,8 +710,6 @@ mod tests {
         let current = process
             .resource_limit
             .as_ref()
-            .unwrap()
-            .lock()
             .unwrap()
             .get_current_value(
                 crate::hle::kernel::k_resource_limit::LimitableResource::TransferMemoryCountMax,

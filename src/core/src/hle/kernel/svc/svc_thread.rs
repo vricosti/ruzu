@@ -767,9 +767,9 @@ mod tests {
         process
             .thread_local_pages
             .push(KThreadLocalPage::new(KProcessAddress::new(0x240000)));
-        process.resource_limit = Some(Arc::new(Mutex::new(create_resource_limit_for_process(
+        process.resource_limit = Some(Arc::new(create_resource_limit_for_process(
             0x1_0000_0000,
-        ))));
+        )));
 
         let process = Arc::new(ProcessLock::from_value(process));
         let current_thread = Arc::new(KThreadLock::new(KThread::new()));
@@ -934,7 +934,6 @@ mod tests {
             let process = system.current_process_arc();
             let process = process.lock().unwrap();
             let resource_limit = process.resource_limit.as_ref().unwrap().clone();
-            let mut resource_limit = resource_limit.lock().unwrap();
             resource_limit
                 .set_limit_value(LimitableResource::ThreadCountMax, 0)
                 .unwrap();

@@ -47,7 +47,7 @@ impl KProcessPageTable {
         pool: u32,
         code_address: usize,
         code_size: usize,
-        resource_limit: Option<Arc<Mutex<KResourceLimit>>>,
+        resource_limit: Option<Arc<KResourceLimit>>,
         memory: Option<Arc<Mutex<Memory>>>,
         aslr_space_start: usize,
     ) -> u32 {

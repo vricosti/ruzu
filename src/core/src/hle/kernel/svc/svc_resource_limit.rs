@@ -7,13 +7,13 @@
 //! Upstream retrieves KResourceLimit from the handle table via typed
 //! GetObject<KResourceLimit>(handle). The Rust handle table maps Handle -> object_id (u64)
 //! without type discrimination. To fully implement these SVCs, KProcess needs:
-//!   - A registry mapping object_id -> Arc<Mutex<KResourceLimit>>
+//!   - A registry mapping object_id -> Arc<KResourceLimit>
 //!     (similar to how sessions and events are registered)
 //!   - Methods: register_resource_limit_object, get_resource_limit_by_object_id
 //! These registries do not yet exist. The SVC logic below documents exactly what
 //! upstream does and will work once those registries are added.
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use crate::core::System;
 use crate::hle::kernel::k_resource_limit::KResourceLimit;
@@ -30,8 +30,8 @@ pub fn create_resource_limit(system: &System, out_handle: &mut Handle) -> Result
     log::debug!("svc::CreateResourceLimit called");
 
     // Create a new resource limit.
-    let resource_limit = Arc::new(Mutex::new(KResourceLimit::new()));
-    resource_limit.lock().unwrap().initialize();
+    let resource_limit = Arc::new(KResourceLimit::new());
+    resource_limit.initialize();
 
     // Upstream: KResourceLimit::Register(kernel, resource_limit);
     // Upstream: GetCurrentProcess(kernel).GetHandleTable().Add(out_handle, resource_limit);
@@ -39,7 +39,7 @@ pub fn create_resource_limit(system: &System, out_handle: &mut Handle) -> Result
     // The handle table needs a typed object registry for resource limits on KProcess.
     // Upstream type: KResourceLimit
     // Upstream method: GetHandleTable().Add(out_handle, resource_limit)
-    // KProcess needs: register_resource_limit_object(object_id, Arc<Mutex<KResourceLimit>>)
+    // KProcess needs: register_resource_limit_object(object_id, Arc<KResourceLimit>)
     let kernel = system.kernel().expect("kernel not initialized");
     let object_id = kernel.create_new_object_id() as u64;
 
@@ -95,19 +95,19 @@ pub fn get_resource_limit_limit_value(
         return RESULT_INVALID_HANDLE;
     };
 
-    // KProcess needs: get_resource_limit_by_object_id(object_id) -> Option<Arc<Mutex<KResourceLimit>>>
+    // KProcess needs: get_resource_limit_by_object_id(object_id) -> Option<Arc<KResourceLimit>>
     // Once available:
     //   let Some(rl) = process.get_resource_limit_by_object_id(object_id) else {
     //       return RESULT_INVALID_HANDLE;
     //   };
-    //   *out_limit_value = rl.lock().unwrap().get_limit_value(convert_which(which));
+    //   *out_limit_value = rl.get_limit_value(convert_which(which));
     //   RESULT_SUCCESS
 
     // Fallback: use the process's own resource limit if available.
     // This is a reasonable approximation since most games only query their own process resource limit.
     if let Some(ref rl) = process.resource_limit {
         let k_which = convert_limitable_resource(which);
-        *out_limit_value = rl.lock().unwrap().get_limit_value(k_which);
+        *out_limit_value = rl.get_limit_value(k_which);
         return RESULT_SUCCESS;
     }
 
@@ -143,7 +143,7 @@ pub fn get_resource_limit_current_value(
     // Fallback: use the process's own resource limit.
     if let Some(ref rl) = process.resource_limit {
         let k_which = convert_limitable_resource(which);
-        *out_current_value = rl.lock().unwrap().get_current_value(k_which);
+        *out_current_value = rl.get_current_value(k_which);
         return RESULT_SUCCESS;
     }
 
@@ -180,7 +180,7 @@ pub fn set_resource_limit_limit_value(
     // Fallback: use the process's own resource limit.
     if let Some(ref rl) = process.resource_limit {
         let k_which = convert_limitable_resource(which);
-        match rl.lock().unwrap().set_limit_value(k_which, limit_value) {
+        match rl.set_limit_value(k_which, limit_value) {
             Ok(()) => return RESULT_SUCCESS,
             Err(()) => return RESULT_INVALID_STATE,
         }
