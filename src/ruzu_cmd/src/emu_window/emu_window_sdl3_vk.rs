@@ -99,22 +99,22 @@ fn trace_macos_window_state(view: *mut objc::runtime::Object, layer: *mut objc::
             msg_send![window, windowNumber]
         };
         let is_visible: BOOL = if window.is_null() {
-            false
+            0
         } else {
             msg_send![window, isVisible]
         };
         let is_miniaturized: BOOL = if window.is_null() {
-            false
+            0
         } else {
             msg_send![window, isMiniaturized]
         };
         let is_key_window: BOOL = if window.is_null() {
-            false
+            0
         } else {
             msg_send![window, isKeyWindow]
         };
         let is_main_window: BOOL = if window.is_null() {
-            false
+            0
         } else {
             msg_send![window, isMainWindow]
         };

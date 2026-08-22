@@ -53,6 +53,16 @@ prepare_platform() {
         exit 1
     fi
 
+    # Keep Rust, cc-rs dependencies, and Homebrew libraries on one deployment
+    # target. Rust otherwise defaults x86_64 macOS links to 10.12 while current
+    # Apple SDKs compile native dependencies for a much newer macOS release,
+    # which leaves modern libc/dispatch availability symbols unresolved.
+    if [ -z "${MACOSX_DEPLOYMENT_TARGET:-}" ]; then
+        MACOSX_DEPLOYMENT_TARGET=$(sw_vers -productVersion | awk -F. '{ print $1 "." $2 }')
+        export MACOSX_DEPLOYMENT_TARGET
+        echo "Using macOS deployment target ${MACOSX_DEPLOYMENT_TARGET}."
+    fi
+
     # Homebrew's pkg-config must win over any other one in PATH. devkitPro
     # ships its own at /opt/devkitpro/tools/bin/pkg-config which cannot see
     # Homebrew's .pc files, so whenever it comes first both the GTK probe below
@@ -79,6 +89,20 @@ these tools.
 EOF
         exit 1
     fi
+
+    # Rust invokes the Apple linker with -nodefaultlibs, so Clang's Darwin
+    # runtime is not added automatically. SDL3 uses Clang's platform
+    # availability builtin, whose implementation lives in this archive.
+    clang_runtime=$(xcrun clang -print-file-name=libclang_rt.osx.a)
+    if [ ! -f "$clang_runtime" ]; then
+        echo "Apple Clang runtime was not found: $clang_runtime" >&2
+        exit 1
+    fi
+    case " ${RUSTFLAGS:-} " in
+        *"link-arg=${clang_runtime}"*) ;;
+        *) RUSTFLAGS="${RUSTFLAGS:+${RUSTFLAGS} }-C link-arg=${clang_runtime}" ;;
+    esac
+    export RUSTFLAGS
 }
 
 package_installed() {
