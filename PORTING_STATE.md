@@ -928,5 +928,7 @@
 - Resumed result: `IHomeMenuFunctions` now pops from the system channel, returns its shared event,
   and implements Eden's sleep-enabled query. Its retained applet is explicitly classified as
   strong lifetime ownership and remains in place.
-- Status: home-menu warning completed and re-verified. Connect the existing
-  `ICommonStateGetter::PushToGeneralChannel` producer to this owner as the next separate slice.
+- Producer result: `ICommonStateGetter` command 20 now resolves the incoming `IStorage`, copies its
+  data like Eden and pushes it through the shared `System` owner. Focused coverage verifies the
+  producer-to-system transfer and command registration.
+- Status: completed and re-verified for the home-menu/general-channel warning slice.

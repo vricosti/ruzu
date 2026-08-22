@@ -6128,3 +6128,20 @@ vs Eden `display_list.h` and `layer_list.h`
 - Both applet-proxy owners now pass the same `SystemRef` into this interface. A focused regression
   verifies retained applet ownership, command wiring, empty-channel error and successful pop; the
   misleading unread-field warning is gone and `core` decreases from 69 to 68 warnings.
+
+## 2026-08-22 — general-channel producer in `am/service/common_state_getter.rs` vs Eden
+`am/service/common_state_getter.{h,cpp}`
+
+### Intentional differences
+
+- Eden's CMIF serializer presents `SharedPointer<IStorage>` directly to the method. Ruzu's handler
+  resolves the domain object ID in the request manager, downcasts the same `IStorage` interface,
+  then passes its copied byte vector to the behavior method. This follows the existing Rust CMIF
+  ownership boundary while preserving Eden's storage-copy semantics.
+
+### Fixed parity debt
+
+- Ported and registered command 20 `PushToGeneralChannel`. It now copies `IStorage::GetData()` into
+  the `System`-owned channel used by `IHomeMenuFunctions`, rather than leaving the only producer
+  unimplemented.
+- A focused regression verifies command wiring and the complete producer-to-system pop path.

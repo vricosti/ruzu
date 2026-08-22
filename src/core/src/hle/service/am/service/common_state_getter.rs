@@ -1,8 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-//! Port of zuyu/src/core/hle/service/am/service/common_state_getter.h
-//! Port of zuyu/src/core/hle/service/am/service/common_state_getter.cpp
+//! Port of Eden's `core/hle/service/am/service/common_state_getter.{h,cpp}`.
 
 use crate::core::SystemRef;
 use crate::hle::service::am::am_types::{
@@ -12,7 +11,7 @@ use crate::hle::service::am::applet::Applet;
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
-use crate::hle::result::{ResultCode, RESULT_SUCCESS};
+use crate::hle::result::{ResultCode, RESULT_SUCCESS, RESULT_UNKNOWN};
 use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
 use crate::hle::service::ipc_helpers::{RequestParser, ResponseBuilder};
 use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
@@ -34,7 +33,7 @@ use crate::hle::service::set::settings_types::PlatformRegion;
 /// - 12: ReleaseSleepLockTransiently (unimplemented)
 /// - 13: GetAcquiredSleepLockEvent
 /// - 14: GetWakeupCount (unimplemented)
-/// - 20: PushToGeneralChannel (unimplemented)
+/// - 20: PushToGeneralChannel
 /// - 30: GetHomeButtonReaderLockAccessor (unimplemented)
 /// - 31: GetReaderLockAccessorEx
 /// - 32: GetWriterLockAccessorEx
@@ -93,6 +92,11 @@ impl ICommonStateGetter {
             (9, Some(Self::get_current_focus_state_handler), "GetCurrentFocusState"),
             (10, Some(Self::request_to_acquire_sleep_lock_handler), "RequestToAcquireSleepLock"),
             (13, Some(Self::get_acquired_sleep_lock_event_handler), "GetAcquiredSleepLockEvent"),
+            (
+                20,
+                Some(Self::push_to_general_channel_handler),
+                "PushToGeneralChannel",
+            ),
             (31, Some(Self::get_reader_lock_accessor_ex_handler), "GetReaderLockAccessorEx"),
             (32, Some(Self::get_writer_lock_accessor_ex_handler), "GetWriterLockAccessorEx"),
             (50, Some(Self::is_vr_mode_enabled_handler), "IsVrModeEnabled"),
@@ -288,6 +292,13 @@ impl ICommonStateGetter {
             .request_exit_to_library_applet_at_execute_next_program_enabled = true;
     }
 
+    /// Port of `ICommonStateGetter::PushToGeneralChannel` after CMIF has resolved the storage
+    /// interface to its byte payload.
+    pub fn push_to_general_channel(&self, data: Vec<u8>) {
+        log::debug!("ICommonStateGetter::PushToGeneralChannel called");
+        self.system.get().push_general_channel_data(data);
+    }
+
     fn push_interface_response(
         ctx: &mut HLERequestContext,
         object: Arc<dyn SessionRequestHandler>,
@@ -402,6 +413,44 @@ impl ICommonStateGetter {
         let mut rb = ResponseBuilder::new(ctx, 2, 1, 0);
         rb.push_result(RESULT_SUCCESS);
         rb.push_copy_object_id(object_id);
+    }
+
+    fn pop_domain_storage(ctx: &mut HLERequestContext) -> Option<Vec<u8>> {
+        let mut rp = RequestParser::new(ctx);
+        let object_id = rp.pop_u32();
+        if object_id == 0 {
+            log::error!("ICommonStateGetter storage argument is null");
+            return None;
+        }
+
+        let handler = {
+            let manager = ctx.get_manager()?;
+            let manager = manager.lock().unwrap();
+            if !manager.is_domain() {
+                log::error!("ICommonStateGetter storage argument requires domain IPC");
+                return None;
+            }
+            manager.domain_handler(object_id as usize - 1)?.clone()
+        };
+
+        let storage = handler
+            .as_any()
+            .downcast_ref::<super::storage::IStorage>()?;
+        Some(storage.get_data())
+    }
+
+    fn push_to_general_channel_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let service =
+            unsafe { &*(this as *const dyn ServiceFramework as *const ICommonStateGetter) };
+        let Some(data) = Self::pop_domain_storage(ctx) else {
+            let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+            rb.push_result(RESULT_UNKNOWN);
+            return;
+        };
+
+        service.push_to_general_channel(data);
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
     }
 
     fn get_reader_lock_accessor_ex_handler(
@@ -735,6 +784,29 @@ mod tests {
             service.get_settings_platform_region(),
             PlatformRegion::Global
         );
+    }
+
+    #[test]
+    fn push_to_general_channel_uses_system_owner() {
+        let system = Box::new(crate::core::System::new());
+        let system_ref = crate::core::SystemRef::from_ref(&system);
+        let service = ICommonStateGetter::new(
+            system_ref,
+            Arc::new(Mutex::new(Applet::new(
+                system_ref,
+                crate::hle::service::os::process::Process::new(),
+                false,
+            ))),
+        );
+
+        assert!(service
+            .handlers
+            .get(&20)
+            .unwrap()
+            .handler_callback
+            .is_some());
+        service.push_to_general_channel(vec![0x48, 0x42]);
+        assert_eq!(system.try_pop_general_channel(), Some(vec![0x48, 0x42]));
     }
 
     #[test]
