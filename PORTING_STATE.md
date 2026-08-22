@@ -925,5 +925,8 @@
 - Prerequisite result: `System` now owns the mutex-protected LIFO stack and lazily-created shared
   event. Push signals only on the empty-to-nonempty transition, the last pop clears it, and focused
   tests cover ordering, event identity and both transitions.
-- Status: prerequisite completed and re-verified; resume `home_menu_functions.rs` and connect the
-  existing `ICommonStateGetter` producer to this owner.
+- Resumed result: `IHomeMenuFunctions` now pops from the system channel, returns its shared event,
+  and implements Eden's sleep-enabled query. Its retained applet is explicitly classified as
+  strong lifetime ownership and remains in place.
+- Status: home-menu warning completed and re-verified. Connect the existing
+  `ICommonStateGetter::PushToGeneralChannel` producer to this owner as the next separate slice.

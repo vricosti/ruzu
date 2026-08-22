@@ -206,6 +206,7 @@ impl ISystemAppletProxy {
         Self::push_interface_response(
             ctx,
             Arc::new(super::home_menu_functions::IHomeMenuFunctions::new(
+                proxy.system,
                 proxy.applet.clone(),
                 proxy.window_system.clone(),
             )),

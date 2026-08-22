@@ -6108,3 +6108,23 @@ vs Eden `display_list.h` and `layer_list.h`
   lazily, only the first push signals it, and removing the final item clears it.
 - A focused regression verifies LIFO ordering, persistent event identity and both event-state
   transitions required by Eden's AM producer and consumer services.
+
+## 2026-08-22 — `am/service/home_menu_functions.rs` vs Eden
+`am/service/home_menu_functions.{h,cpp}`
+
+### Intentional differences
+
+- Rust retains the applet through `Arc<Mutex<Applet>>` rather than Eden's `shared_ptr`. Although
+  no command dereferences it, both implementations deliberately keep the owning applet alive for
+  the interface lifetime; the field is annotated accordingly instead of being removed as dead.
+- Eden's unused `ServiceContext m_context` remains constructed even though the general-channel
+  event moved to `System`. Rust removes the per-interface context and the previously invented
+  private event; all event ownership now comes from the matching `System` owner.
+
+### Fixed parity debt
+
+- Ported command 20 `PopFromGeneralChannel` and command 40 `IsSleepEnabled`, and corrected command
+  21 to return `System::GetGeneralChannelEvent` instead of an unrelated per-service event.
+- Both applet-proxy owners now pass the same `SystemRef` into this interface. A focused regression
+  verifies retained applet ownership, command wiring, empty-channel error and successful pop; the
+  misleading unread-field warning is gone and `core` decreases from 69 to 68 warnings.
