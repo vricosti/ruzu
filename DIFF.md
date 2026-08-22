@@ -4477,6 +4477,22 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 - Eden additionally forwards validation messages to `GPU::Logging::GPULogger` when Vulkan-call
   logging is active. Ruzu does not yet have that GPU logging subsystem.
 
+## 2026-08-22 — `src/core/src/device_memory_manager.rs` vs `src/core/device_memory_manager.h` and `.inc`
+
+### Intentional differences
+
+- The inactive generic Rust implementation was removed instead of preserving a second device
+  memory manager that no runtime code instantiated. Ruzu's working Maxwell implementation remains
+  in `src/video_core/src/host1x/gpu_device_memory_manager.rs`; this module retains the three public
+  page constants owned by the upstream header.
+
+### Unintentional differences (to fix)
+
+- The active implementation is still owned by `video_core/host1x` rather than this `core` module.
+  Moving it requires replacing the current opaque `Host1xCoreInterface` crate boundary without
+  introducing a `core`/`video_core` dependency cycle; this is a structural refactor, not a local
+  warning cleanup.
+
 ## 2026-08-22 — `src/video_core/src/buffer_cache/buffer_cache.rs` vs `src/video_core/buffer_cache/buffer_cache_base.h` and `buffer_cache.h`
 
 ### Intentional differences
