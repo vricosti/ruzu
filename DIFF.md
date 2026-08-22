@@ -6341,3 +6341,32 @@ vs Eden `display_list.h` and `layer_list.h`
   destructor order instead of relying on the later generic `ServiceContext::Drop` sweep. A focused
   regression verifies that both context and service owners release every event when the interface
   is destroyed.
+
+## 2026-08-22 — `set/settings.rs` vs Eden `set/settings.{h,cpp}`
+
+### Intentional differences
+
+- Ruzu's `ServerManager` registration API accepts a session factory, whereas Eden accepts the
+  shared service object directly. Each Rust closure now captures one preconstructed `Arc` and
+  clones that owner per session; `make_system_settings_factory` isolates this mechanical adapter
+  for the typed `set:sys` dependency used by other services.
+
+### Unintentional differences (to fix)
+
+- None in the reviewed service-registration ownership slice.
+
+### Missing items
+
+- None from Eden's `Set::LoopProcess` registration list.
+
+### Binary layout verification
+
+- PASS: no IPC payload or persisted settings structure changed.
+
+### Fixed parity debt
+
+- `set`, `set:cal`, `set:fd`, and `set:sys` now each retain one shared service allocation for the
+  server lifetime, matching Eden's four `std::make_shared` registrations. Previously every client
+  connection received fresh independent service state.
+- A focused regression calls the production `set:sys` factory twice and verifies pointer identity
+  and the concrete typed owner required by service-to-service access.

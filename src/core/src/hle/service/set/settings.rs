@@ -14,16 +14,26 @@
 use super::factory_settings_server::IFactorySettingsServer;
 use super::firmware_debug_settings_server::IFirmwareDebugSettingsServer;
 use super::settings_server::ISettingsServer;
+use crate::hle::service::hle_ipc::{SessionRequestHandlerFactory, SessionRequestHandlerPtr};
+use std::sync::Arc;
+
+/// Adapts Eden's single shared `ISystemSettingsServer` registration to Ruzu's
+/// factory-based `ServerManager` API without creating per-session settings state.
+fn make_system_settings_factory() -> SessionRequestHandlerFactory {
+    let service = Arc::new(super::system_settings_server::SystemSettingsService::new());
+    Box::new(move || -> SessionRequestHandlerPtr { service.clone() })
+}
 
 /// Registers "set", "set:cal", "set:fd", "set:sys" services.
 ///
 /// Corresponds to `Set::LoopProcess` in upstream settings.cpp.
 pub fn loop_process(system: crate::core::SystemRef) {
-    use crate::hle::service::hle_ipc::SessionRequestHandlerPtr;
     use crate::hle::service::server_manager::ServerManager;
-    use std::sync::Arc;
 
     let server_manager = ServerManager::new_shared(system);
+    let settings = Arc::new(ISettingsServer::new());
+    let factory_settings = Arc::new(IFactorySettingsServer::new());
+    let firmware_debug_settings = Arc::new(IFirmwareDebugSettingsServer::new());
 
     {
         let mut server_manager = server_manager.lock().unwrap();
@@ -31,35 +41,52 @@ pub fn loop_process(system: crate::core::SystemRef) {
         // "set" -> ISettingsServer
         server_manager.register_named_service(
             "set",
-            Box::new(|| -> SessionRequestHandlerPtr { Arc::new(ISettingsServer::new()) }),
+            Box::new(move || -> SessionRequestHandlerPtr { settings.clone() }),
             64,
         );
 
         // "set:cal" -> IFactorySettingsServer
         server_manager.register_named_service(
             "set:cal",
-            Box::new(|| -> SessionRequestHandlerPtr { Arc::new(IFactorySettingsServer::new()) }),
+            Box::new(move || -> SessionRequestHandlerPtr { factory_settings.clone() }),
             64,
         );
 
         // "set:fd" -> IFirmwareDebugSettingsServer
         server_manager.register_named_service(
             "set:fd",
-            Box::new(|| -> SessionRequestHandlerPtr {
-                Arc::new(IFirmwareDebugSettingsServer::new())
-            }),
+            Box::new(move || -> SessionRequestHandlerPtr { firmware_debug_settings.clone() }),
             64,
         );
 
         // "set:sys" -> ISystemSettingsServer (via SystemSettingsService wrapper)
-        server_manager.register_named_service(
-            "set:sys",
-            Box::new(|| -> SessionRequestHandlerPtr {
-                Arc::new(super::system_settings_server::SystemSettingsService::new())
-            }),
-            64,
-        );
+        server_manager.register_named_service("set:sys", make_system_settings_factory(), 64);
     }
 
     ServerManager::run_server_shared(server_manager);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn system_settings_factory_preserves_upstream_singleton_ownership() {
+        std::thread::Builder::new()
+            .name("set:sys singleton ownership test".to_string())
+            .stack_size(32 * 1024 * 1024)
+            .spawn(|| {
+                let factory = make_system_settings_factory();
+                let first = factory();
+                let second = factory();
+
+                assert!(Arc::ptr_eq(&first, &second));
+                assert!(first
+                    .as_any()
+                    .is::<super::super::system_settings_server::SystemSettingsService>());
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
 }

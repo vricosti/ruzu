@@ -12,6 +12,11 @@
 - Required prerequisite work: port the implemented command table and the typed
   `SystemSettingsService` owner in `btm_system_core.rs`, then restore explicit event closure in
   `Drop` using Ruzu's `ServiceContext` handles.
+- Newly discovered prerequisite: `set/settings.rs` currently registers a factory that constructs
+  a fresh `SystemSettingsService` for every connection. Eden registers one shared
+  `ISystemSettingsServer`, so the typed service obtained by BTM would otherwise be a private copy
+  rather than the state observed by other `set:sys` clients. Restore singleton factory ownership
+  in `settings.rs` and verify repeated factory calls return the same allocation before resuming.
 - Resume condition: the two acquire commands return their stable constructor-owned readable
   endpoints, the Bluetooth flag commands operate on the shared `set:sys` owner, the remaining
   upstream stubs preserve their exact outputs, and focused command/lifecycle tests pass.
