@@ -5444,3 +5444,11 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 - Removed an unused target-resolution method that attempted to reacquire the timer-state mutex.
   Eden has no such helper, and using it from the live `DoTask` critical section would deadlock.
   The live GSC-backed task-delivery regression test remains the behavioral coverage.
+
+## 2026-08-22 — `ipc_helpers.rs` `ResponseBuilder` state vs `ipc_helpers.h`
+
+### Intentional differences
+
+- Rust field-level `dead_code` annotations document the four constructor-state members that Eden
+  stores but does not read after construction. Their names, values, placement, and ownership stay
+  aligned with `IPC::ResponseBuilder`; only the Rust diagnostic is suppressed.

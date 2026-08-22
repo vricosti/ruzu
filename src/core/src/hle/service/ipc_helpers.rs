@@ -33,9 +33,16 @@ pub enum ResponseBuilderFlags {
 pub struct ResponseBuilder<'a> {
     context: &'a mut HLERequestContext,
     index: usize,
+    // Eden retains these constructor values as ResponseBuilder members even
+    // though no method reads them after construction. Keep the exact state
+    // boundary for structural parity instead of deleting or renaming it.
+    #[allow(dead_code)]
     normal_params_size: u32,
+    #[allow(dead_code)]
     num_handles_to_copy: u32,
+    #[allow(dead_code)]
     num_objects_to_move: u32,
+    #[allow(dead_code)]
     data_payload_index: usize,
 }
 
