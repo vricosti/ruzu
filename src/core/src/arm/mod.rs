@@ -8,5 +8,9 @@ pub mod arm_interface;
 pub mod debug;
 pub mod dynarmic;
 pub mod exclusive_monitor;
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "linux", target_os = "android")
+))]
 pub mod nce;
 pub mod symbols;

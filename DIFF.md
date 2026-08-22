@@ -5374,3 +5374,22 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
   `CpuManager::run_guest_thread_once`. Moving that behavior back into `physical_core.rs` requires a
   larger ownership refactor than this warning slice; the bootstrap path now has the corrected
   return predicate, but the duplicated production path remains structurally non-parity.
+
+## 2026-08-22 — `src/core/src/arm/mod.rs` NCE build guard vs `src/core/CMakeLists.txt` and top-level `CMakeLists.txt`
+
+### Intentional differences
+
+- Rust expresses Eden's `HAS_NCE` source-list selection with a module-level `cfg` instead of a
+  CMake conditional.
+
+### Fixed parity debt
+
+- The NCE backend is now compiled only for AArch64 Linux and Android, matching Eden's exact
+  `HAS_NCE` predicate. Other architectures no longer compile an unusable native-AArch64 backend or
+  report its relocation records as unread.
+
+### Missing items
+
+- The guarded AArch64 NCE implementation remains structurally incomplete: its patch code generation,
+  assembly context switch, and signal-context handling still do not provide Eden behavior. This
+  build-parity correction does not claim that backend as complete.
