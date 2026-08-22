@@ -5560,3 +5560,21 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 - `FrontendAppletHolder` now installs and preserves parental-control/photo-viewer frontends,
   constructs Auth and PhotoViewer, and returns StubApplet for unsupported IDs instead of no
   frontend implementation.
+
+## 2026-08-22 — `applet_web_browser_types.rs` and frontend `web_browser.rs` vs `applet_web_browser_types.h` and frontend `web_browser.{h,cpp}`
+
+### Intentional differences
+
+- C++'s little-endian and open enum wrappers are represented as transparent integer newtypes.
+  This preserves exact wire values, supports unknown inputs safely, and is equivalent on every
+  currently supported little-endian Ruzu target.
+- Eden's dense hash map is a Rust `HashMap`; key equality and replacement semantics used by the
+  TLV parser remain the same.
+
+### Fixed parity debt
+
+- Replaced the partial, mismatched input-TLV list with every Eden web version, shim, exit reason,
+  input/output TLV type, document/display mode, and the exact 0x8/0x1010 wire structures.
+- Removed the duplicate frontend `WebExitReason`. The frontend now consumes the HLE-owned type,
+  including Eden's `WindowClosed = 4` value instead of the previous incorrect value 8, and uses
+  reusable callback semantics matching `std::function`.

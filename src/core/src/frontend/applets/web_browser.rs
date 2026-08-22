@@ -1,34 +1,21 @@
 // SPDX-FileCopyrightText: Copyright 2018 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-//! Port of zuyu/src/core/frontend/applets/web_browser.h and web_browser.cpp
+//! Port of `core/frontend/applets/web_browser.{h,cpp}`.
 //! Web browser applet interface.
 
 use super::applet::Applet;
-
-/// Corresponds to upstream `Service::AM::Frontend::WebExitReason`.
-/// Local definition until hle::service::am::frontend types are ported.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u32)]
-pub enum WebExitReason {
-    EndButtonPressed = 0,
-    BackCrossBtnPressed = 1,
-    Exited = 2,
-    Aborted = 3,
-    LastUrl = 4,
-    ErrorDialog = 7,
-    WindowClosed = 8,
-}
+pub use crate::hle::service::am::frontend::applet_web_browser_types::WebExitReason;
 
 /// Callback for ROMFS extraction.
 ///
 /// Corresponds to upstream `WebBrowserApplet::ExtractROMFSCallback`.
-pub type ExtractRomfsCallback = Box<dyn FnOnce() + Send>;
+pub type ExtractRomfsCallback = Box<dyn Fn() + Send + Sync>;
 
 /// Callback for web page results.
 ///
 /// Corresponds to upstream `WebBrowserApplet::OpenWebPageCallback`.
-pub type OpenWebPageCallback = Box<dyn FnOnce(WebExitReason, String) + Send>;
+pub type OpenWebPageCallback = Box<dyn Fn(WebExitReason, String) + Send + Sync>;
 
 /// Web browser applet trait.
 ///
@@ -64,7 +51,10 @@ impl WebBrowserApplet for DefaultWebBrowserApplet {
             "(STUBBED) called, backend requested to open local web page at {}",
             local_url
         );
-        callback(WebExitReason::WindowClosed, "http://localhost/".to_string());
+        callback(
+            WebExitReason::WINDOW_CLOSED,
+            "http://localhost/".to_string(),
+        );
     }
 
     fn open_external_web_page(&self, external_url: &str, callback: OpenWebPageCallback) {
@@ -72,6 +62,9 @@ impl WebBrowserApplet for DefaultWebBrowserApplet {
             "(STUBBED) called, backend requested to open external web page at {}",
             external_url
         );
-        callback(WebExitReason::WindowClosed, "http://localhost/".to_string());
+        callback(
+            WebExitReason::WINDOW_CLOSED,
+            "http://localhost/".to_string(),
+        );
     }
 }
