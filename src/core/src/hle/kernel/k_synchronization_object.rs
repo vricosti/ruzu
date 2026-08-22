@@ -848,4 +848,33 @@ mod tests {
             assert!(state.is_empty());
         }
     }
+
+    #[test]
+    fn synchronization_wait_queue_cancel_unlinks_every_node() {
+        let mut first_state = SynchronizationObjectState::new();
+        let mut second_state = SynchronizationObjectState::new();
+        let mut nodes: Box<[ThreadListNode]> =
+            vec![ThreadListNode::new(), ThreadListNode::new()].into_boxed_slice();
+
+        unsafe {
+            first_state.link_node(&mut nodes[0]);
+            second_state.link_node(&mut nodes[1]);
+        }
+
+        let mut thread = KThread::new();
+        thread.sync_wait_context = SynchronizationWaitContext {
+            nodes,
+            object_ids: vec![1, 2],
+            object_states: vec![&mut first_state, &mut second_state],
+            active: true,
+        };
+        thread.set_cancellable();
+
+        ThreadQueueImplForKSynchronizationObjectWait::cancel_wait(&mut thread);
+
+        assert!(first_state.is_empty());
+        assert!(second_state.is_empty());
+        assert!(!thread.sync_wait_context.is_active());
+        assert!(!thread.is_cancellable());
+    }
 }

@@ -1870,30 +1870,6 @@ impl KThread {
         self.waiting_lock_info = None;
     }
 
-    /// Cancel any outstanding synchronization wait: unlink every node this
-    /// thread has linked into sync-object lists and drop the wait context.
-    /// Mirrors the cancel_wait branch of
-    /// `ThreadQueueImplForKSynchronizationObjectWait` in upstream.
-    pub(crate) fn clear_wait_synchronization(&mut self) {
-        if !self.sync_wait_context.is_active() {
-            self.clear_cancellable();
-            return;
-        }
-        unsafe {
-            let ctx = &mut self.sync_wait_context;
-            for i in 0..ctx.nodes.len() {
-                let state_ptr = ctx.object_states[i];
-                if state_ptr.is_null() {
-                    continue;
-                }
-                let node_ptr = &mut ctx.nodes[i] as *mut k_synchronization_object::ThreadListNode;
-                (*state_ptr).unlink_node(node_ptr);
-            }
-            ctx.clear();
-        }
-        self.clear_cancellable();
-    }
-
     // -- Complex methods stubbed --
 
     fn reset_thread_context32(&mut self, stack_top: u64, entry_point: u64, arg: u64) {

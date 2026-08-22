@@ -5410,3 +5410,12 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
   fiber-owned implementation.
 - The synchronous bootstrap now pairs its context-guard acquisition with an explicit release and
   returns the temporarily extracted ARM interface to its owning `KProcess` when execution ends.
+
+## 2026-08-22 — synchronization-wait cancellation ownership in `k_thread.rs` and `k_synchronization_object.rs` vs `k_thread.{h,cpp}` and `k_synchronization_object.{h,cpp}`
+
+### Fixed parity debt
+
+- Removed the unused synchronization-node cleanup method from `KThread`. Eden owns that cleanup
+  exclusively in `ThreadQueueImplForKSynchronizationObjectWait::CancelWait`; Ruzu's live queue
+  callback remains in the matching synchronization-object module and is covered by a regression
+  test that verifies every node is unlinked and cancellability is cleared.
