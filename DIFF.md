@@ -5876,3 +5876,11 @@ vs Eden `display_list.h` and `layer_list.h`
 - Removed the unused `IDatabaseService::has_database_source` helper. Eden has no corresponding
   method; source-flag decisions remain owned by `mii_manager.rs`, matching `MiiManager` upstream.
   No service behavior or command payload changed.
+
+## 2026-08-22 — upstream-absent empty filesystem helper in `fsp_srv.rs`
+
+### Intentional differences
+
+- Removed the unused `FspSrv::make_empty_filesystem` helper and its private VFS imports. Eden's
+  `FSP_SRV` never substitutes an empty filesystem for an open failure, and no Ruzu command called
+  this helper. Existing error responses and real filesystem construction paths are unchanged.

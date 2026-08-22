@@ -12,9 +12,7 @@ use crate::file_sys::nca_metadata::ContentRecordType;
 use crate::file_sys::patch_manager::PatchManager;
 use crate::file_sys::registered_cache::ContentProviderUnion;
 use crate::file_sys::romfs_factory::StorageId;
-use crate::file_sys::vfs::vfs_types::VirtualDir;
 use crate::file_sys::vfs::vfs_types::VirtualFile;
-use crate::file_sys::vfs::vfs_vector::VectorVfsDirectory;
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
 use crate::hle::service::ipc_helpers::{RequestParser, ResponseBuilder};
@@ -187,16 +185,6 @@ impl FspSrv {
             | SaveDataSpaceId::ProperSystem
             | SaveDataSpaceId::SafeMode => None,
         }
-    }
-
-    fn make_empty_filesystem() -> IFileSystem {
-        let dir: VirtualDir = Arc::new(VectorVfsDirectory::new(
-            vec![],
-            vec![],
-            "empty".to_string(),
-            None,
-        ));
-        IFileSystem::new(dir, Self::make_default_size_getter())
     }
 
     pub fn new() -> Self {
