@@ -850,3 +850,24 @@
   match Eden. The two constants and both payload owners are consumed, reducing `core` from 85 to
   83 warnings; all 25 focused `set` tests pass.
 - Status: completed and verified for the settings-persistence warning slice.
+
+## 2026-08-22 — LDN node-state warning interrupted by LAN transport prerequisite
+
+- Interrupted slice: resolve the unused `LANDiscovery::init_node_state_change` warning while
+  preserving Eden's `CreateNetwork` and `Connect` lifecycle ordering.
+- Exact missing prerequisite: Ruzu's `lan_discovery.rs` stops after basic state/reset methods and
+  does not port Eden's `CreateNetwork`, `Connect`, packet receive/send, node update, scan, or event
+  callback paths. The helper is used by `CreateNetwork` and `Connect` upstream, so deleting it or
+  calling it from `Initialize` would create a behavioral divergence.
+- Required next action: audit the existing `core/internal_network` Rust modules against Eden's
+  `network.{h,cpp}` and `network_interface.{h,cpp}` to determine whether LDN packet ownership and
+  transport are available; port any missing prerequisite in those matching owners before
+  resuming `lan_discovery.rs`.
+- Resume condition: `CreateNetwork` and `Connect` can consume the same persistent LAN transport
+  and call `init_node_state_change` at Eden's exact points, with focused state-transition tests.
+- Prerequisite audit result: the `network` crate already owns the complete LDN packet wire types,
+  send path, receive callback binding and unbinding. The missing piece was Eden's process-global
+  `Network::Init/GetRoomMember/Shutdown` ownership; it is now ported and the GTK frontend uses the
+  registered member instead of a private parallel instance.
+- Status: prerequisite implementation in progress; validate and commit global ownership before
+  wiring the `core` dependency and resuming `lan_discovery.rs`.

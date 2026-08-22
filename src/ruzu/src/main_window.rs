@@ -1051,9 +1051,14 @@ impl GMainWindow {
                 Arc::clone(&hid_core),
             );
 
+        network::network::init();
+        let room_member = network::network::get_room_member()
+            .upgrade()
+            .expect("network initialization did not create a room member");
+
         let this = Rc::new(Self {
             window,
-            room_member: Arc::new(network::room_member::RoomMember::new()),
+            room_member,
             menu_bar,
             stack,
             loading_screen,

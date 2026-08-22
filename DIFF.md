@@ -5884,3 +5884,23 @@ vs Eden `display_list.h` and `layer_list.h`
 - Removed the unused `FspSrv::make_empty_filesystem` helper and its private VFS imports. Eden's
   `FSP_SRV` never substitutes an empty filesystem for an open failure, and no Ruzu command called
   this helper. Existing error responses and real filesystem construction paths are unchanged.
+
+## 2026-08-22 — `network.rs` global room ownership vs Eden `network.{h,cpp}`
+
+### Intentional differences
+
+- The existing `RoomNetwork` compatibility owner remains for Rust frontends that already retain
+  an explicit network lifetime. It installs its exact `Arc<Room>` and `Arc<RoomMember>` into the
+  process-global registry, so the compatibility API and Eden's global accessors share objects
+  rather than creating parallel transports.
+- The registry uses a `LazyLock<Mutex<_>>` in place of C++ namespace-static `shared_ptr` objects.
+  Teardown removes both strong global references before invoking potentially blocking network
+  cleanup, so callbacks cannot deadlock the registry mutex.
+
+### Fixed parity debt
+
+- Ported `Network::Init`, `GetRoom`, `GetRoomMember`, and `Shutdown` in their matching network
+  owner. The GTK frontend now obtains its `RoomMember` from that registry, making the same packet
+  transport visible to core LDN services.
+- A focused ownership test verifies that `RoomNetwork` and the global accessors return pointer-
+  identical objects and that `Shutdown` clears both global handles.
