@@ -5419,3 +5419,14 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
   exclusively in `ThreadQueueImplForKSynchronizationObjectWait::CancelWait`; Ruzu's live queue
   callback remains in the matching synchronization-object module and is covered by a regression
   test that verifies every node is unlinked and cancellability is cleared.
+
+## 2026-08-22 — `k_condition_variable.rs` timeout handling vs `k_condition_variable.{h,cpp}` and `k_scoped_scheduler_lock_and_sleep.h`
+
+### Fixed parity debt
+
+- Removed the unused host-`Instant` deadline conversion. Eden forwards positive timeout ticks
+  unchanged to `KHardwareTimer::RegisterAbsoluteTask`, which Ruzu's active
+  `KScopedSchedulerLockAndSleep` path already does.
+- The timeout regression test now supplies a future absolute hardware tick instead of treating
+  `1` as a relative duration, and verifies the guest thread's timer-completed wait state rather
+  than the Rust bootstrap helper's pre-fiber return value.

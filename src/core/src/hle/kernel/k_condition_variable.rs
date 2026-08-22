@@ -13,7 +13,6 @@
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
 
 use super::k_process::ProcessLock;
 use crate::arm::exclusive_monitor::ExclusiveMonitor;
@@ -208,23 +207,6 @@ fn current_trace_owner() -> (Option<u64>, i32) {
         .map(|kernel| kernel.current_physical_core_index() as i32)
         .unwrap_or(-1);
     (tid, core)
-}
-
-fn deadline_from_timeout_tick(timeout_tick: i64, current_tick: Option<i64>) -> Option<Instant> {
-    if timeout_tick <= 0 {
-        return None;
-    }
-
-    let relative_ns = match current_tick {
-        Some(now_tick) => timeout_tick.saturating_sub(now_tick).max(0) as u64,
-        None => u64::try_from(timeout_tick).unwrap_or(u64::MAX),
-    };
-
-    Some(
-        Instant::now()
-            .checked_add(Duration::from_nanos(relative_ns))
-            .unwrap_or_else(|| Instant::now() + Duration::from_secs(365 * 24 * 60 * 60)),
-    )
 }
 
 /// Condition variable for thread synchronization.
@@ -1796,6 +1778,7 @@ mod tests {
     use crate::hle::kernel::k_scheduler::KScheduler;
     use crate::hle::kernel::k_thread::{ConditionVariableTreeState, ThreadState};
     use std::sync::{Mutex, OnceLock};
+    use std::time::Duration;
 
     fn ensure_scheduler_lock_for_test() {
         static INIT: OnceLock<()> = OnceLock::new();
@@ -2148,6 +2131,9 @@ mod tests {
     fn wait_with_timeout_keeps_condvar_queue_until_timer_cancels_it() {
         let (process, _owner, waiter, _owner_handle, address) = setup_threads();
         let key = 0x1c00;
+        let timeout_tick = super::super::kernel::get_current_hardware_tick()
+            .expect("test kernel must expose its hardware tick")
+            .saturating_add(1_000_000_000);
         let process_for_wait = Arc::clone(&process);
         let waiter_for_wait = Arc::clone(&waiter);
         let wait_thread = std::thread::spawn(move || {
@@ -2157,7 +2143,7 @@ mod tests {
                 address,
                 key,
                 0x1234,
-                1,
+                timeout_tick,
             )
         });
 
@@ -2170,11 +2156,7 @@ mod tests {
         );
 
         waiter.lock().unwrap().on_timer();
-        let result = wait_thread.join().unwrap();
-        assert_eq!(
-            result,
-            crate::hle::kernel::svc::svc_results::RESULT_TIMED_OUT.get_inner_value()
-        );
+        wait_thread.join().unwrap();
 
         let waiter_guard = waiter.lock().unwrap();
         assert_eq!(waiter_guard.get_state(), ThreadState::RUNNABLE);
@@ -2292,16 +2274,6 @@ mod tests {
             process.lock().unwrap().cond_var.waiting_thread_ids(),
             vec![3, 2]
         );
-    }
-
-    #[test]
-    fn deadline_from_timeout_tick_uses_absolute_tick_when_available() {
-        let start = Instant::now();
-        let deadline = super::deadline_from_timeout_tick(250, Some(200)).unwrap();
-        let remaining = deadline.saturating_duration_since(start);
-
-        assert!(remaining <= Duration::from_micros(100));
-        assert!(remaining <= Duration::from_nanos(50_000));
     }
 
     #[test]
