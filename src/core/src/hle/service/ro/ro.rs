@@ -25,14 +25,77 @@ use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFrame
 
 // Convenience definitions — matches upstream ro.cpp.
 const MAX_SESSIONS: usize = 0x3;
-const MAX_NRR_INFOS: usize = 0x40;
-const MAX_NRO_INFOS: usize = 0x40;
+const MAX_NRR_INFOS: usize = 0x100;
+const MAX_NRO_INFOS: usize = 0x100;
 
 const INVALID_PROCESS_ID: u64 = 0xFFFFFFFF_FFFFFFFF;
 const INVALID_CONTEXT_ID: u64 = 0xFFFFFFFF_FFFFFFFF;
 
 /// SHA-256 hash type.
 type Sha256Hash = [u8; 32];
+
+/// Rust counterpart of the `std::mt19937_64` engine owned by upstream's
+/// `RoContext`.
+struct Mt19937_64 {
+    state: [u64; Self::N],
+    index: usize,
+}
+
+impl Mt19937_64 {
+    const N: usize = 312;
+    const M: usize = 156;
+    const MATRIX_A: u64 = 0xB502_6F5A_A966_19E9;
+    const UPPER_MASK: u64 = 0xFFFF_FFFF_8000_0000;
+    const LOWER_MASK: u64 = 0x0000_0000_7FFF_FFFF;
+
+    fn new(seed: u64) -> Self {
+        let mut state = [0; Self::N];
+        state[0] = seed;
+        for index in 1..Self::N {
+            state[index] = 6_364_136_223_846_793_005_u64
+                .wrapping_mul(state[index - 1] ^ (state[index - 1] >> 62))
+                .wrapping_add(index as u64);
+        }
+        Self {
+            state,
+            index: Self::N,
+        }
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        if self.index >= Self::N {
+            self.twist();
+        }
+
+        let mut value = self.state[self.index];
+        self.index += 1;
+        value ^= (value >> 29) & 0x5555_5555_5555_5555;
+        value ^= (value << 17) & 0x71D6_7FFF_EDA6_0000;
+        value ^= (value << 37) & 0xFFF7_EEE0_0000_0000;
+        value ^= value >> 43;
+        value
+    }
+
+    fn twist(&mut self) {
+        for index in 0..Self::N {
+            let value = (self.state[index] & Self::UPPER_MASK)
+                | (self.state[(index + 1) % Self::N] & Self::LOWER_MASK);
+            let mut mixed = value >> 1;
+            if value & 1 != 0 {
+                mixed ^= Self::MATRIX_A;
+            }
+            self.state[index] = self.state[(index + Self::M) % Self::N] ^ mixed;
+        }
+        self.index = 0;
+    }
+}
+
+impl Default for Mt19937_64 {
+    fn default() -> Self {
+        // `std::mt19937_64`'s default seed.
+        Self::new(5489)
+    }
+}
 
 /// Per-NRO tracking information.
 ///
@@ -390,10 +453,7 @@ fn validate_address_and_size(address: u64, size: u64) -> Result<(), ResultCode> 
 /// Corresponds to `RoContext` in upstream ro.cpp.
 pub struct RoContext {
     process_contexts: Vec<ProcessContext>,
-    /// Upstream: `std::mt19937_64 generate_random`.
-    /// We use a simple counter-based approach; the exact PRNG is not critical
-    /// for correctness (upstream uses it only for ASLR trial addresses).
-    random_state: u64,
+    generate_random: Mt19937_64,
 }
 
 impl RoContext {
@@ -402,21 +462,8 @@ impl RoContext {
             process_contexts: (0..MAX_SESSIONS)
                 .map(|_| ProcessContext::default())
                 .collect(),
-            random_state: 0,
+            generate_random: Mt19937_64::default(),
         }
-    }
-
-    /// Simple PRNG matching upstream's mt19937_64 usage pattern.
-    /// Used only for ASLR address randomization in MapProcessCodeMemory.
-    fn generate_random(&mut self) -> u64 {
-        // Use a simple xorshift64* — the exact distribution doesn't matter,
-        // only that we produce different trial addresses.
-        let mut x = self.random_state.wrapping_add(0x9E3779B97F4A7C15);
-        x = (x ^ (x >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
-        x = (x ^ (x >> 27)).wrapping_mul(0x94D049BB133111EB);
-        x ^= x >> 31;
-        self.random_state = x;
-        x
     }
 
     /// Register a process.
@@ -563,7 +610,9 @@ impl RoContext {
         bss_address: u64,
         bss_size: u64,
     ) -> Result<u64, ResultCode> {
-        let context = &mut self.process_contexts[context_id];
+        let (process_contexts, generate_random) =
+            (&mut self.process_contexts, &mut self.generate_random);
+        let context = &mut process_contexts[context_id];
 
         // Validate address/size.
         validate_address_and_non_zero_size(nro_address, nro_size)?;
@@ -590,18 +639,8 @@ impl RoContext {
             .ok_or(ro_results::RESULT_INVALID_PROCESS)?
             .clone();
 
-        // Map the NRO.
-        // We need to create a random generator closure that captures our state.
-        // Since self is borrowed mutably for context, we use a local random state.
-        let mut random_state = self.random_state;
-        let mut gen_random = move || -> u64 {
-            let mut x = random_state.wrapping_add(0x9E3779B97F4A7C15);
-            x = (x ^ (x >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
-            x = (x ^ (x >> 27)).wrapping_mul(0x94D049BB133111EB);
-            x ^= x >> 31;
-            random_state = x;
-            x
-        };
+        // Map the NRO using the persistent engine owned by this context.
+        let mut gen_random = || generate_random.next_u64();
 
         let base_address = {
             let mut process = process_arc.lock().unwrap();
@@ -615,17 +654,11 @@ impl RoContext {
             )
         };
 
-        // Update the random state.
-        // (We consumed some random values in the closure.)
-        self.random_state = gen_random();
-
         let base_address = match base_address {
             Ok(addr) => addr,
             Err(e) => return Err(e),
         };
 
-        // Re-borrow context after the map operation.
-        let context = &mut self.process_contexts[context_id];
         context.nro_infos[nro_index].base_address = base_address;
 
         // Validate the NRO (parsing region extents).
@@ -671,8 +704,6 @@ impl RoContext {
             })?;
         }
 
-        // Re-borrow context after the permission operation.
-        let context = &mut self.process_contexts[context_id];
         context.nro_in_use[nro_index] = true;
         context.nro_infos[nro_index].module_id = module_id;
         context.nro_infos[nro_index].code_size = rx_size + ro_size;
@@ -1116,6 +1147,24 @@ mod tests {
     use crate::hle::kernel::k_process::KProcess;
     use crate::hle::kernel::k_thread::{KThread, KThreadLock};
     use crate::hle::kernel::kernel::ScopedKernelForTest;
+
+    #[test]
+    fn ro_random_engine_matches_std_mt19937_64_default_sequence() {
+        let mut random = Mt19937_64::default();
+        assert_eq!(random.next_u64(), 14_514_284_786_278_117_030);
+        assert_eq!(random.next_u64(), 4_620_546_740_167_642_908);
+        assert_eq!(random.next_u64(), 13_109_570_281_517_897_720);
+    }
+
+    #[test]
+    fn ro_context_uses_edens_extended_module_capacities() {
+        let ro = RoContext::new();
+        assert_eq!(ro.process_contexts.len(), MAX_SESSIONS);
+        assert!(ro
+            .process_contexts
+            .iter()
+            .all(|context| context.nro_infos.len() == 0x100 && context.nrr_infos.len() == 0x100));
+    }
 
     #[test]
     fn ro_interface_registers_every_upstream_command() {

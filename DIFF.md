@@ -5848,3 +5848,23 @@ vs Eden `display_list.h` and `layer_list.h`
   addrinfo resolution paths. Ruzu previously checked only `srv.nintendo.net` inline.
 - Focused tests cover all distinct upstream NetDB mapping outcomes and the exact substring policy;
   the unused-variant warning is gone.
+
+## 2026-08-22 — RO random mapping state and capacities in `ro.rs` vs Eden `ro.cpp`
+
+### Intentional differences
+
+- Rust implements the standard-library `std::mt19937_64` engine locally because Rust's standard
+  library has no equivalent engine. Its default seed, state transition, tempering and output
+  sequence match the C++ standard engine used by Eden.
+- `process_contexts`, NRO records and NRR records remain heap-backed Rust vectors rather than C++
+  inline `std::array` members. Their fixed logical capacities and first-free traversal are the
+  same, while avoiding a very large stack move when constructing the shared context.
+
+### Fixed parity debt
+
+- Replaced the duplicated xorshift closure and unused method with one persistent MT19937-64 engine
+  owned by `RoContext` and passed to `map_nro`, matching Eden's ownership and consumption order.
+  Ruzu no longer consumes an extra random value after each map attempt.
+- Raised `MAX_NRO_INFOS` and `MAX_NRR_INFOS` from 64 to Eden's 256-entry limits. Focused tests lock
+  both capacities and the standard engine's default output sequence; the unused-method warning is
+  gone.
