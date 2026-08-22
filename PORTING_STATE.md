@@ -836,3 +836,12 @@
 - Resume condition: the four default payloads are deterministic and layout-tested, all server
   getters/setters address the matching owning payload, and no duplicate loose setting state
   remains.
+- Prerequisite result: all four default constructors are ported and layout-tested.
+  `ISystemSettingsServer` now owns the four matching payloads, its implemented accessors mutate
+  the same payload as Eden, constructor region/EULA overrides retain upstream ordering, and the
+  duplicate loose state is removed. Persisted enum values remain raw through IPC, including
+  unknown bit patterns.
+- Status: ready to resume `LoadSettingsFile`, `StoreSettingsFile`, `SetupSettings`, and
+  `StoreSettings` after the requested release rebuild. Until that slice lands, `SetSaveNeeded`
+  only records dirty state, and the device/application payload owners have targeted temporary
+  `dead_code` allowances because persistence is their first reader.

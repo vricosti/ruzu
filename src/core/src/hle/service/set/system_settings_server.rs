@@ -10,10 +10,15 @@ use std::sync::Mutex;
 
 use common::uuid::UUID;
 
+use super::setting_formats::appln_settings::{default_appln_settings, ApplnSettings};
+use super::setting_formats::device_settings::{default_device_settings, DeviceSettings};
+use super::setting_formats::private_settings::{default_private_settings, PrivateSettings};
+use super::setting_formats::system_settings::{default_system_settings, SystemSettings};
 use super::settings_types::*;
 use crate::hle::result::{ErrorModule, ResultCode, RESULT_SUCCESS};
 use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
 use crate::hle::service::ipc_helpers::{RequestParser, ResponseBuilder};
+use crate::hle::service::psc::time::common::{SteadyClockTimePoint, SystemClockContext};
 use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
 
 /// Settings file version, matching upstream SETTINGS_VERSION.
@@ -30,6 +35,22 @@ pub struct SettingsHeader {
     pub magic: u64,
     pub version: u32,
     pub reserved: u32,
+}
+
+fn system_clock_context_to_bytes(context: SystemClockContext) -> [u8; 0x20] {
+    unsafe { core::mem::transmute(context) }
+}
+
+fn system_clock_context_from_bytes(bytes: [u8; 0x20]) -> SystemClockContext {
+    unsafe { core::mem::transmute(bytes) }
+}
+
+fn steady_clock_time_point_to_bytes(time_point: SteadyClockTimePoint) -> [u8; 0x18] {
+    unsafe { core::mem::transmute(time_point) }
+}
+
+fn steady_clock_time_point_from_bytes(bytes: [u8; 0x18]) -> SteadyClockTimePoint {
+    unsafe { core::mem::transmute(bytes) }
 }
 
 /// IPC command IDs for ISystemSettingsServer ("set:sys").
@@ -131,117 +152,37 @@ pub mod commands {
 /// Holds system, private, device, and application settings matching
 /// upstream's m_system_settings, m_private_settings, m_device_settings, m_appln_settings.
 pub struct ISystemSettingsServer {
-    // System settings state - matching upstream member fields
-    language_code: LanguageCode,
-    lock_screen_flag: bool,
-    external_steady_clock_source_id: [u8; 16], // Common::UUID
-    user_system_clock_context: [u8; 0x20],     // SystemClockContext
-    account_settings: AccountSettings,
-    eula_versions: Vec<EulaVersion>,
-    color_set_id: ColorSet,
-    notification_settings: NotificationSettings,
-    account_notification_settings: Vec<AccountNotificationSettings>,
-    vibration_master_volume: f32,
-    tv_settings: TvSettings,
-    audio_output_mode_hdmi: AudioOutputMode,
-    audio_output_mode_speaker: AudioOutputMode,
-    audio_output_mode_headphone: AudioOutputMode,
-    speaker_auto_mute_flag: bool,
-    quest_flag: QuestFlag,
-    device_time_zone_location_name: [u8; 0x24], // LocationName
-    region_code: SystemRegionCode,
-    network_system_clock_context: [u8; 0x20], // SystemClockContext
-    user_system_clock_automatic_correction_enabled: bool,
-    primary_album_storage: PrimaryAlbumStorage,
-    battery_lot: BatteryLot,
-    serial_number: SerialNumber,
-    nfc_enable_flag: bool,
-    sleep_settings: SleepSettings,
-    wireless_lan_enable_flag: bool,
-    initial_launch_settings: InitialLaunchSettings,
-    device_nick_name: [u8; 0x80],
-    bluetooth_enable_flag: bool,
-    mii_author_id: [u8; 16], // Common::UUID
-    auto_update_enable_flag: bool,
-    battery_percentage_flag: bool,
-    external_steady_clock_internal_offset: i64,
-    push_notification_activity_mode_on_sleep: i32,
-    error_report_share_permission: ErrorReportSharePermission,
-    applet_launch_flags: u32,
-    keyboard_layout: KeyboardLayout,
-    device_time_zone_location_updated_time: [u8; 0x18], // SteadyClockTimePoint
-    user_system_clock_automatic_correction_updated_time: [u8; 0x18], // SteadyClockTimePoint
-    chinese_traditional_input_method: ChineseTraditionalInputMethod,
-    home_menu_scheme: HomeMenuScheme,
-    home_menu_scheme_model: u32,
-    touch_screen_mode: TouchScreenMode,
-    platform_region: PlatformRegion,
-    field_testing_flag: bool,
-    panel_crc_mode: i32,
-    headphone_volume_update_flag: bool,
+    system_settings: SystemSettings,
+    private_settings: PrivateSettings,
+    // Owned for parity with upstream; consumed by the pending settings persistence slice.
+    #[allow(dead_code)]
+    device_settings: DeviceSettings,
+    // Owned for parity with upstream; consumed by the pending settings persistence slice.
+    #[allow(dead_code)]
+    appln_settings: ApplnSettings,
     save_needed: bool,
 }
 
 impl ISystemSettingsServer {
     pub fn new() -> Self {
-        let mut device_nick_name = [0u8; 0x80];
-        let default_name = b"yuzu";
-        device_nick_name[..default_name.len()].copy_from_slice(default_name);
+        let mut system_settings = default_system_settings();
+        system_settings.region_code = *common::settings::values().region_index.get_value() as u32;
+        let user_system_clock_context =
+            system_clock_context_to_bytes(system_settings.user_system_clock_context);
+        system_settings.eula_versions[0] = EulaVersion {
+            version: 0x10000,
+            region_code: system_settings.region_code,
+            clock_type: EulaVersionClockType::SteadyClock as u32,
+            _padding: [0; 4],
+            system_clock_context: user_system_clock_context,
+        };
+        system_settings.eula_version_count = 1;
 
         Self {
-            language_code: LanguageCode::EnUs,
-            lock_screen_flag: false,
-            external_steady_clock_source_id: [0u8; 16],
-            user_system_clock_context: [0u8; 0x20],
-            account_settings: AccountSettings::default(),
-            eula_versions: Vec::new(),
-            color_set_id: ColorSet::BasicWhite,
-            notification_settings: NotificationSettings::default(),
-            account_notification_settings: Vec::new(),
-            vibration_master_volume: 1.0,
-            tv_settings: TvSettings::default(),
-            audio_output_mode_hdmi: AudioOutputMode::Ch1,
-            audio_output_mode_speaker: AudioOutputMode::Ch1,
-            audio_output_mode_headphone: AudioOutputMode::Ch1,
-            speaker_auto_mute_flag: true,
-            quest_flag: QuestFlag::Retail,
-            device_time_zone_location_name: [0u8; 0x24],
-            region_code: SystemRegionCode::Usa,
-            network_system_clock_context: [0u8; 0x20],
-            user_system_clock_automatic_correction_enabled: true,
-            primary_album_storage: PrimaryAlbumStorage::Nand,
-            battery_lot: BatteryLot::default(),
-            serial_number: SerialNumber::default(),
-            nfc_enable_flag: true,
-            sleep_settings: SleepSettings::default(),
-            wireless_lan_enable_flag: true,
-            initial_launch_settings: InitialLaunchSettings::default(),
-            device_nick_name,
-            bluetooth_enable_flag: true,
-            mii_author_id: [0u8; 16],
-            auto_update_enable_flag: true,
-            battery_percentage_flag: true,
-            external_steady_clock_internal_offset: 0,
-            push_notification_activity_mode_on_sleep: 0,
-            error_report_share_permission: ErrorReportSharePermission::NotConfirmed,
-            applet_launch_flags: 0,
-            keyboard_layout: KeyboardLayout::EnglishUsInternational,
-            device_time_zone_location_updated_time: [0u8; 0x18],
-            user_system_clock_automatic_correction_updated_time: [0u8; 0x18],
-            chinese_traditional_input_method: ChineseTraditionalInputMethod::Unknown0,
-            home_menu_scheme: HomeMenuScheme {
-                main: 0xFF323232,
-                back: 0xFF323232,
-                sub: 0xFFFFFFFF,
-                bezel: 0xFFFFFFFF,
-                extra: 0xFF000000,
-            },
-            home_menu_scheme_model: 0,
-            touch_screen_mode: TouchScreenMode::Standard,
-            platform_region: PlatformRegion::Global,
-            field_testing_flag: false,
-            panel_crc_mode: 0,
-            headphone_volume_update_flag: false,
+            system_settings,
+            private_settings: default_private_settings(),
+            device_settings: default_device_settings(),
+            appln_settings: default_appln_settings(),
             save_needed: false,
         }
     }
@@ -252,9 +193,22 @@ impl ISystemSettingsServer {
 
     // --- Getter/Setter implementations matching upstream ---
 
-    pub fn set_language_code(&mut self, language_code: LanguageCode) {
+    pub fn set_language_code(&mut self, language_code: u64) {
         log::debug!("ISystemSettingsServer::SetLanguageCode called");
-        self.language_code = language_code;
+        self.system_settings.language_code = language_code;
+        if let Some(index) = AVAILABLE_LANGUAGE_CODES
+            .iter()
+            .position(|candidate| *candidate as u64 == language_code)
+        {
+            let current = *common::settings::values().language_index.get_value() as u32 as usize;
+            if index >= current {
+                if let Some(language) = common::settings_enums::Language::from_u32(index as u32) {
+                    common::settings::values_mut()
+                        .language_index
+                        .set_value(language);
+                }
+            }
+        }
         self.set_save_needed();
     }
 
@@ -280,86 +234,100 @@ impl ISystemSettingsServer {
 
     pub fn get_lock_screen_flag(&self) -> bool {
         log::debug!("ISystemSettingsServer::GetLockScreenFlag called");
-        self.lock_screen_flag
+        self.system_settings.lock_screen_flag != 0
     }
 
     pub fn set_lock_screen_flag(&mut self, flag: bool) {
         log::debug!("ISystemSettingsServer::SetLockScreenFlag called");
-        self.lock_screen_flag = flag;
+        self.system_settings.lock_screen_flag = u8::from(flag);
         self.set_save_needed();
     }
 
     pub fn get_external_steady_clock_source_id(&self) -> [u8; 16] {
         log::debug!("ISystemSettingsServer::GetExternalSteadyClockSourceId called");
-        self.external_steady_clock_source_id
+        self.private_settings.external_clock_source_id
     }
 
     pub fn set_external_steady_clock_source_id(&mut self, id: [u8; 16]) {
         log::debug!("ISystemSettingsServer::SetExternalSteadyClockSourceId called");
-        self.external_steady_clock_source_id = id;
+        self.private_settings.external_clock_source_id = id;
         self.set_save_needed();
     }
 
     pub fn get_user_system_clock_context(&self) -> [u8; 0x20] {
         log::debug!("ISystemSettingsServer::GetUserSystemClockContext called");
-        self.user_system_clock_context
+        system_clock_context_to_bytes(self.system_settings.user_system_clock_context)
     }
 
     pub fn set_user_system_clock_context(&mut self, context: [u8; 0x20]) {
         log::debug!("ISystemSettingsServer::SetUserSystemClockContext called");
-        self.user_system_clock_context = context;
+        self.system_settings.user_system_clock_context = system_clock_context_from_bytes(context);
         self.set_save_needed();
     }
 
     pub fn get_account_settings(&self) -> AccountSettings {
         log::debug!("ISystemSettingsServer::GetAccountSettings called");
-        self.account_settings
+        self.system_settings.account_settings
     }
 
     pub fn set_account_settings(&mut self, settings: AccountSettings) {
         log::debug!("ISystemSettingsServer::SetAccountSettings called");
-        self.account_settings = settings;
+        self.system_settings.account_settings = settings;
         self.set_save_needed();
     }
 
     pub fn get_eula_versions(&self) -> (i32, &[EulaVersion]) {
         log::debug!("ISystemSettingsServer::GetEulaVersions called");
-        (self.eula_versions.len() as i32, &self.eula_versions)
+        let count = self
+            .system_settings
+            .eula_version_count
+            .clamp(0, self.system_settings.eula_versions.len() as i32);
+        (count, &self.system_settings.eula_versions[..count as usize])
     }
 
     pub fn set_eula_versions(&mut self, versions: Vec<EulaVersion>) {
         log::debug!("ISystemSettingsServer::SetEulaVersions called");
-        self.eula_versions = versions;
+        assert!(versions.len() <= self.system_settings.eula_versions.len());
+        self.system_settings.eula_versions = [EulaVersion::default(); 32];
+        self.system_settings.eula_versions[..versions.len()].copy_from_slice(&versions);
+        self.system_settings.eula_version_count = versions.len() as i32;
         self.set_save_needed();
     }
 
-    pub fn get_color_set_id(&self) -> ColorSet {
+    pub fn get_color_set_id(&self) -> u32 {
         log::debug!("ISystemSettingsServer::GetColorSetId called");
-        self.color_set_id
+        self.system_settings.color_set_id
     }
 
-    pub fn set_color_set_id(&mut self, color_set: ColorSet) {
+    pub fn set_color_set_id(&mut self, color_set: u32) {
         log::debug!("ISystemSettingsServer::SetColorSetId called");
-        self.color_set_id = color_set;
+        self.system_settings.color_set_id = color_set;
         self.set_save_needed();
     }
 
     pub fn get_notification_settings(&self) -> NotificationSettings {
         log::debug!("ISystemSettingsServer::GetNotificationSettings called");
-        self.notification_settings
+        self.system_settings.notification_settings
     }
 
     pub fn set_notification_settings(&mut self, settings: NotificationSettings) {
         log::debug!("ISystemSettingsServer::SetNotificationSettings called");
-        self.notification_settings = settings;
+        self.system_settings.notification_settings = settings;
         self.set_save_needed();
     }
 
     pub fn get_account_notification_settings(&self) -> (i32, &[AccountNotificationSettings]) {
         log::debug!("ISystemSettingsServer::GetAccountNotificationSettings called");
+        let count = self
+            .system_settings
+            .account_notification_settings_count
+            .clamp(
+                0,
+                self.system_settings.account_notification_settings.len() as i32,
+            );
         (
-            self.account_notification_settings.len() as i32,
-            &self.account_notification_settings,
+            count,
+            &self.system_settings.account_notification_settings[..count as usize],
         )
     }
 
@@ -368,114 +336,135 @@ impl ISystemSettingsServer {
         settings: Vec<AccountNotificationSettings>,
     ) {
         log::debug!("ISystemSettingsServer::SetAccountNotificationSettings called");
-        self.account_notification_settings = settings;
+        assert!(settings.len() <= self.system_settings.account_notification_settings.len());
+        self.system_settings.account_notification_settings =
+            [AccountNotificationSettings::default(); 8];
+        self.system_settings.account_notification_settings[..settings.len()]
+            .copy_from_slice(&settings);
+        self.system_settings.account_notification_settings_count = settings.len() as i32;
         self.set_save_needed();
     }
 
     pub fn get_vibration_master_volume(&self) -> f32 {
         log::debug!("ISystemSettingsServer::GetVibrationMasterVolume called");
-        self.vibration_master_volume
+        self.system_settings.vibration_master_volume
     }
 
     pub fn set_vibration_master_volume(&mut self, volume: f32) {
         log::debug!("ISystemSettingsServer::SetVibrationMasterVolume called");
-        self.vibration_master_volume = volume;
+        self.system_settings.vibration_master_volume = volume;
         self.set_save_needed();
     }
 
     pub fn get_tv_settings(&self) -> TvSettings {
         log::debug!("ISystemSettingsServer::GetTvSettings called");
-        self.tv_settings
+        self.system_settings.tv_settings
     }
 
     pub fn set_tv_settings(&mut self, settings: TvSettings) {
         log::debug!("ISystemSettingsServer::SetTvSettings called");
-        self.tv_settings = settings;
+        self.system_settings.tv_settings = settings;
         self.set_save_needed();
     }
 
-    pub fn get_audio_output_mode(&self, target: AudioOutputModeTarget) -> AudioOutputMode {
+    pub fn get_audio_output_mode(&self, target: u32) -> u32 {
         log::debug!(
             "ISystemSettingsServer::GetAudioOutputMode called, target={:?}",
             target
         );
         match target {
-            AudioOutputModeTarget::Hdmi => self.audio_output_mode_hdmi,
-            AudioOutputModeTarget::Speaker => self.audio_output_mode_speaker,
-            AudioOutputModeTarget::Headphone => self.audio_output_mode_headphone,
-            _ => self.audio_output_mode_hdmi,
+            1 => self.system_settings.audio_output_mode_hdmi,
+            2 => self.system_settings.audio_output_mode_speaker,
+            3 => self.system_settings.audio_output_mode_headphone,
+            4 => self.system_settings.audio_output_mode_type3,
+            5 => self.system_settings.audio_output_mode_type4,
+            _ => {
+                log::error!("Invalid audio output mode target {}", target);
+                AudioOutputMode::Ch1 as u32
+            }
         }
     }
 
-    pub fn set_audio_output_mode(&mut self, target: AudioOutputModeTarget, mode: AudioOutputMode) {
+    pub fn set_audio_output_mode(&mut self, target: u32, mode: u32) {
         log::debug!("ISystemSettingsServer::SetAudioOutputMode called");
         match target {
-            AudioOutputModeTarget::Hdmi => self.audio_output_mode_hdmi = mode,
-            AudioOutputModeTarget::Speaker => self.audio_output_mode_speaker = mode,
-            AudioOutputModeTarget::Headphone => self.audio_output_mode_headphone = mode,
-            _ => self.audio_output_mode_hdmi = mode,
+            1 => self.system_settings.audio_output_mode_hdmi = mode,
+            2 => self.system_settings.audio_output_mode_speaker = mode,
+            3 => self.system_settings.audio_output_mode_headphone = mode,
+            4 => self.system_settings.audio_output_mode_type3 = mode,
+            5 => self.system_settings.audio_output_mode_type4 = mode,
+            _ => log::error!("Invalid audio output mode target {}", target),
         }
         self.set_save_needed();
     }
 
     pub fn get_speaker_auto_mute_flag(&self) -> bool {
         log::debug!("ISystemSettingsServer::GetSpeakerAutoMuteFlag called");
-        self.speaker_auto_mute_flag
+        self.system_settings.force_mute_on_headphone_removed != 0
     }
 
     pub fn set_speaker_auto_mute_flag(&mut self, flag: bool) {
         log::debug!("ISystemSettingsServer::SetSpeakerAutoMuteFlag called");
-        self.speaker_auto_mute_flag = flag;
+        self.system_settings.force_mute_on_headphone_removed = u8::from(flag);
         self.set_save_needed();
     }
 
-    pub fn get_quest_flag(&self) -> QuestFlag {
+    pub fn get_quest_flag(&self) -> u8 {
         log::debug!("ISystemSettingsServer::GetQuestFlag called");
-        self.quest_flag
+        self.system_settings.quest_flag
     }
 
-    pub fn set_quest_flag(&mut self, flag: QuestFlag) {
+    pub fn set_quest_flag(&mut self, flag: u8) {
         log::debug!("ISystemSettingsServer::SetQuestFlag called");
-        self.quest_flag = flag;
+        self.system_settings.quest_flag = flag;
         self.set_save_needed();
     }
 
     pub fn get_device_time_zone_location_name(&self) -> [u8; 0x24] {
         log::debug!("ISystemSettingsServer::GetDeviceTimeZoneLocationName called");
-        self.device_time_zone_location_name
+        self.system_settings.device_time_zone_location_name
     }
 
     pub fn set_device_time_zone_location_name(&mut self, name: [u8; 0x24]) {
         log::debug!("ISystemSettingsServer::SetDeviceTimeZoneLocationName called");
-        self.device_time_zone_location_name = name;
+        self.system_settings.device_time_zone_location_name = name;
         self.set_save_needed();
     }
 
-    pub fn set_region_code(&mut self, region: SystemRegionCode) {
+    pub fn set_region_code(&mut self, region: u32) {
         log::debug!("ISystemSettingsServer::SetRegionCode called");
-        self.region_code = region;
+        self.system_settings.region_code = region;
+        if let Some(region) = common::settings_enums::Region::from_u32(region) {
+            common::settings::values_mut()
+                .region_index
+                .set_value(region);
+        }
         self.set_save_needed();
     }
 
     pub fn get_network_system_clock_context(&self) -> [u8; 0x20] {
         log::debug!("ISystemSettingsServer::GetNetworkSystemClockContext called");
-        self.network_system_clock_context
+        system_clock_context_to_bytes(self.system_settings.network_system_clock_context)
     }
 
     pub fn set_network_system_clock_context(&mut self, context: [u8; 0x20]) {
         log::debug!("ISystemSettingsServer::SetNetworkSystemClockContext called");
-        self.network_system_clock_context = context;
+        self.system_settings.network_system_clock_context =
+            system_clock_context_from_bytes(context);
         self.set_save_needed();
     }
 
     pub fn is_user_system_clock_automatic_correction_enabled(&self) -> bool {
         log::debug!("ISystemSettingsServer::IsUserSystemClockAutomaticCorrectionEnabled called");
-        self.user_system_clock_automatic_correction_enabled
+        self.system_settings
+            .user_system_clock_automatic_correction_enabled
+            != 0
     }
 
     pub fn set_user_system_clock_automatic_correction_enabled(&mut self, enabled: bool) {
         log::debug!("ISystemSettingsServer::SetUserSystemClockAutomaticCorrectionEnabled called");
-        self.user_system_clock_automatic_correction_enabled = enabled;
+        self.system_settings
+            .user_system_clock_automatic_correction_enabled = u8::from(enabled);
         self.set_save_needed();
     }
 
@@ -486,80 +475,100 @@ impl ISystemSettingsServer {
         false
     }
 
-    pub fn get_primary_album_storage(&self) -> PrimaryAlbumStorage {
+    pub fn get_primary_album_storage(&self) -> u32 {
         log::debug!("ISystemSettingsServer::GetPrimaryAlbumStorage called");
-        self.primary_album_storage
+        self.system_settings.primary_album_storage
     }
 
-    pub fn set_primary_album_storage(&mut self, storage: PrimaryAlbumStorage) {
+    pub fn set_primary_album_storage(&mut self, storage: u32) {
         log::debug!("ISystemSettingsServer::SetPrimaryAlbumStorage called");
-        self.primary_album_storage = storage;
+        self.system_settings.primary_album_storage = storage;
         self.set_save_needed();
     }
 
     pub fn get_battery_lot(&self) -> BatteryLot {
         log::debug!("ISystemSettingsServer::GetBatteryLot called");
-        self.battery_lot
+        BatteryLot::default()
     }
 
     pub fn get_serial_number(&self) -> SerialNumber {
         log::debug!("ISystemSettingsServer::GetSerialNumber called");
-        self.serial_number
+        SerialNumber::default()
     }
 
     pub fn get_nfc_enable_flag(&self) -> bool {
         log::debug!("ISystemSettingsServer::GetNfcEnableFlag called");
-        self.nfc_enable_flag
+        self.system_settings.nfc_enable_flag != 0
     }
 
     pub fn set_nfc_enable_flag(&mut self, flag: bool) {
         log::debug!("ISystemSettingsServer::SetNfcEnableFlag called");
-        self.nfc_enable_flag = flag;
+        self.system_settings.nfc_enable_flag = u8::from(flag);
         self.set_save_needed();
     }
 
     pub fn get_sleep_settings(&self) -> SleepSettings {
         log::debug!("ISystemSettingsServer::GetSleepSettings called");
-        self.sleep_settings
+        self.system_settings.sleep_settings
     }
 
     pub fn set_sleep_settings(&mut self, settings: SleepSettings) {
         log::debug!("ISystemSettingsServer::SetSleepSettings called");
-        self.sleep_settings = settings;
+        self.system_settings.sleep_settings = settings;
         self.set_save_needed();
     }
 
     pub fn get_wireless_lan_enable_flag(&self) -> bool {
         log::debug!("ISystemSettingsServer::GetWirelessLanEnableFlag called");
-        self.wireless_lan_enable_flag
+        self.system_settings.wireless_lan_enable_flag != 0
     }
 
     pub fn set_wireless_lan_enable_flag(&mut self, flag: bool) {
         log::debug!("ISystemSettingsServer::SetWirelessLanEnableFlag called");
-        self.wireless_lan_enable_flag = flag;
+        self.system_settings.wireless_lan_enable_flag = u8::from(flag);
         self.set_save_needed();
     }
 
     pub fn get_initial_launch_settings(&self) -> InitialLaunchSettings {
         log::debug!("ISystemSettingsServer::GetInitialLaunchSettings called");
-        self.initial_launch_settings
+        InitialLaunchSettings {
+            flags: self.system_settings.initial_launch_settings_packed.flags,
+            _padding: [0; 4],
+            timestamp: self
+                .system_settings
+                .initial_launch_settings_packed
+                .timestamp,
+        }
     }
 
     pub fn set_initial_launch_settings(&mut self, settings: InitialLaunchSettings) {
         log::debug!("ISystemSettingsServer::SetInitialLaunchSettings called");
-        self.initial_launch_settings = settings;
+        self.system_settings.initial_launch_settings_packed.flags = settings.flags;
+        self.system_settings
+            .initial_launch_settings_packed
+            .timestamp = settings.timestamp;
         self.set_save_needed();
     }
 
     pub fn get_device_nick_name(&self) -> [u8; 0x80] {
         log::debug!("ISystemSettingsServer::GetDeviceNickName called");
-        self.device_nick_name
+        let mut out = [0; 0x80];
+        let name = common::settings::values().device_name.get_value().clone();
+        let bytes = name.as_bytes();
+        let count = bytes.len().min(out.len());
+        out[..count].copy_from_slice(&bytes[..count]);
+        out
     }
 
     pub fn set_device_nick_name(&mut self, name: [u8; 0x80]) {
         log::debug!("ISystemSettingsServer::SetDeviceNickName called");
-        self.device_nick_name = name;
-        self.set_save_needed();
+        let length = name
+            .iter()
+            .position(|byte| *byte == 0)
+            .unwrap_or(name.len());
+        common::settings::values_mut()
+            .device_name
+            .set_value(String::from_utf8_lossy(&name[..length]).into_owned());
     }
 
     pub fn get_product_model(&self) -> u32 {
@@ -570,109 +579,114 @@ impl ISystemSettingsServer {
 
     pub fn get_bluetooth_enable_flag(&self) -> bool {
         log::debug!("ISystemSettingsServer::GetBluetoothEnableFlag called");
-        self.bluetooth_enable_flag
+        self.system_settings.bluetooth_enable_flag != 0
     }
 
     pub fn set_bluetooth_enable_flag(&mut self, flag: bool) {
         log::debug!("ISystemSettingsServer::SetBluetoothEnableFlag called");
-        self.bluetooth_enable_flag = flag;
+        self.system_settings.bluetooth_enable_flag = u8::from(flag);
         self.set_save_needed();
     }
 
     pub fn get_mii_author_id(&mut self) -> [u8; 16] {
         log::debug!("ISystemSettingsServer::GetMiiAuthorId called");
-        if self.mii_author_id == [0; 16] {
-            self.mii_author_id = UUID::make_default().uuid;
+        if self.system_settings.mii_author_id == [0; 16] {
+            self.system_settings.mii_author_id = UUID::make_default().uuid;
             self.set_save_needed();
         }
-        self.mii_author_id
+        self.system_settings.mii_author_id
     }
 
     pub fn get_auto_update_enable_flag(&self) -> bool {
         log::debug!("ISystemSettingsServer::GetAutoUpdateEnableFlag called");
-        self.auto_update_enable_flag
+        self.system_settings.auto_update_enable_flag != 0
     }
 
     pub fn set_auto_update_enable_flag(&mut self, flag: bool) {
         log::debug!("ISystemSettingsServer::SetAutoUpdateEnableFlag called");
-        self.auto_update_enable_flag = flag;
+        self.system_settings.auto_update_enable_flag = u8::from(flag);
         self.set_save_needed();
     }
 
     pub fn get_battery_percentage_flag(&self) -> bool {
         log::debug!("ISystemSettingsServer::GetBatteryPercentageFlag called");
-        self.battery_percentage_flag
+        self.system_settings.battery_percentage_flag != 0
     }
 
     pub fn set_battery_percentage_flag(&mut self, flag: bool) {
         log::debug!("ISystemSettingsServer::SetBatteryPercentageFlag called");
-        self.battery_percentage_flag = flag;
+        self.system_settings.battery_percentage_flag = u8::from(flag);
         self.set_save_needed();
     }
 
     pub fn set_external_steady_clock_internal_offset(&mut self, offset: i64) {
         log::debug!("ISystemSettingsServer::SetExternalSteadyClockInternalOffset called");
-        self.external_steady_clock_internal_offset = offset;
+        self.private_settings.external_steady_clock_internal_offset = offset;
         self.set_save_needed();
     }
 
     pub fn get_external_steady_clock_internal_offset(&self) -> i64 {
         log::debug!("ISystemSettingsServer::GetExternalSteadyClockInternalOffset called");
-        self.external_steady_clock_internal_offset
+        self.private_settings.external_steady_clock_internal_offset
     }
 
     pub fn get_push_notification_activity_mode_on_sleep(&self) -> i32 {
         log::debug!("ISystemSettingsServer::GetPushNotificationActivityModeOnSleep called");
-        self.push_notification_activity_mode_on_sleep
+        self.system_settings
+            .push_notification_activity_mode_on_sleep
     }
 
     pub fn set_push_notification_activity_mode_on_sleep(&mut self, mode: i32) {
         log::debug!("ISystemSettingsServer::SetPushNotificationActivityModeOnSleep called");
-        self.push_notification_activity_mode_on_sleep = mode;
+        self.system_settings
+            .push_notification_activity_mode_on_sleep = mode;
         self.set_save_needed();
     }
 
-    pub fn get_error_report_share_permission(&self) -> ErrorReportSharePermission {
+    pub fn get_error_report_share_permission(&self) -> u32 {
         log::debug!("ISystemSettingsServer::GetErrorReportSharePermission called");
-        self.error_report_share_permission
+        self.system_settings.error_report_share_permission
     }
 
-    pub fn set_error_report_share_permission(&mut self, permission: ErrorReportSharePermission) {
+    pub fn set_error_report_share_permission(&mut self, permission: u32) {
         log::debug!("ISystemSettingsServer::SetErrorReportSharePermission called");
-        self.error_report_share_permission = permission;
+        self.system_settings.error_report_share_permission = permission;
         self.set_save_needed();
     }
 
     pub fn get_applet_launch_flags(&self) -> u32 {
         log::debug!("ISystemSettingsServer::GetAppletLaunchFlags called");
-        self.applet_launch_flags
+        self.system_settings.applet_launch_flag
     }
 
     pub fn set_applet_launch_flags(&mut self, flags: u32) {
         log::debug!("ISystemSettingsServer::SetAppletLaunchFlags called");
-        self.applet_launch_flags = flags;
+        self.system_settings.applet_launch_flag = flags;
         self.set_save_needed();
     }
 
-    pub fn get_keyboard_layout(&self) -> KeyboardLayout {
+    pub fn get_keyboard_layout(&self) -> u32 {
         log::debug!("ISystemSettingsServer::GetKeyboardLayout called");
-        self.keyboard_layout
+        self.system_settings.keyboard_layout
     }
 
-    pub fn set_keyboard_layout(&mut self, layout: KeyboardLayout) {
+    pub fn set_keyboard_layout(&mut self, layout: u32) {
         log::debug!("ISystemSettingsServer::SetKeyboardLayout called");
-        self.keyboard_layout = layout;
+        self.system_settings.keyboard_layout = layout;
         self.set_save_needed();
     }
 
     pub fn get_device_time_zone_location_updated_time(&self) -> [u8; 0x18] {
         log::debug!("ISystemSettingsServer::GetDeviceTimeZoneLocationUpdatedTime called");
-        self.device_time_zone_location_updated_time
+        steady_clock_time_point_to_bytes(
+            self.system_settings.device_time_zone_location_updated_time,
+        )
     }
 
     pub fn set_device_time_zone_location_updated_time(&mut self, time: [u8; 0x18]) {
         log::debug!("ISystemSettingsServer::SetDeviceTimeZoneLocationUpdatedTime called");
-        self.device_time_zone_location_updated_time = time;
+        self.system_settings.device_time_zone_location_updated_time =
+            steady_clock_time_point_from_bytes(time);
         self.set_save_needed();
     }
 
@@ -680,78 +694,87 @@ impl ISystemSettingsServer {
         log::debug!(
             "ISystemSettingsServer::GetUserSystemClockAutomaticCorrectionUpdatedTime called"
         );
-        self.user_system_clock_automatic_correction_updated_time
+        steady_clock_time_point_to_bytes(
+            self.system_settings
+                .user_system_clock_automatic_correction_updated_time_point,
+        )
     }
 
     pub fn set_user_system_clock_automatic_correction_updated_time(&mut self, time: [u8; 0x18]) {
         log::debug!(
             "ISystemSettingsServer::SetUserSystemClockAutomaticCorrectionUpdatedTime called"
         );
-        self.user_system_clock_automatic_correction_updated_time = time;
+        self.system_settings
+            .user_system_clock_automatic_correction_updated_time_point =
+            steady_clock_time_point_from_bytes(time);
         self.set_save_needed();
     }
 
-    pub fn get_chinese_traditional_input_method(&self) -> ChineseTraditionalInputMethod {
+    pub fn get_chinese_traditional_input_method(&self) -> u32 {
         log::debug!("ISystemSettingsServer::GetChineseTraditionalInputMethod called");
-        self.chinese_traditional_input_method
+        self.system_settings.chinese_traditional_input_method
     }
 
     pub fn get_home_menu_scheme(&self) -> HomeMenuScheme {
         log::debug!("ISystemSettingsServer::GetHomeMenuScheme called");
-        self.home_menu_scheme
+        HomeMenuScheme {
+            main: 0xFF323232,
+            back: 0xFF323232,
+            sub: 0xFFFFFFFF,
+            bezel: 0xFFFFFFFF,
+            extra: 0xFF000000,
+        }
     }
 
     pub fn get_home_menu_scheme_model(&self) -> u32 {
         log::debug!("ISystemSettingsServer::GetHomeMenuSchemeModel called");
-        self.home_menu_scheme_model
+        0
     }
 
-    pub fn get_touch_screen_mode(&self) -> TouchScreenMode {
+    pub fn get_touch_screen_mode(&self) -> u32 {
         log::debug!("ISystemSettingsServer::GetTouchScreenMode called");
-        self.touch_screen_mode
+        self.system_settings.touch_screen_mode
     }
 
-    pub fn set_touch_screen_mode(&mut self, mode: TouchScreenMode) {
+    pub fn set_touch_screen_mode(&mut self, mode: u32) {
         log::debug!("ISystemSettingsServer::SetTouchScreenMode called");
-        self.touch_screen_mode = mode;
+        self.system_settings.touch_screen_mode = mode;
         self.set_save_needed();
     }
 
-    pub fn get_platform_region(&self) -> PlatformRegion {
+    pub fn get_platform_region(&self) -> i32 {
         log::debug!("ISystemSettingsServer::GetPlatformRegion called");
-        self.platform_region
+        PlatformRegion::Global as i32
     }
 
-    pub fn set_platform_region(&mut self, region: PlatformRegion) {
+    pub fn set_platform_region(&mut self, _region: i32) {
         log::debug!("ISystemSettingsServer::SetPlatformRegion called");
-        self.platform_region = region;
-        self.set_save_needed();
     }
 
     pub fn get_field_testing_flag(&self) -> bool {
         log::debug!("ISystemSettingsServer::GetFieldTestingFlag called");
-        self.field_testing_flag
+        self.system_settings.field_testing_flag != 0
     }
 
     pub fn get_panel_crc_mode(&self) -> i32 {
         log::debug!("ISystemSettingsServer::GetPanelCrcMode called");
-        self.panel_crc_mode
+        self.system_settings.panel_crc_mode
     }
 
     pub fn set_panel_crc_mode(&mut self, mode: i32) {
         log::debug!("ISystemSettingsServer::SetPanelCrcMode called");
-        self.panel_crc_mode = mode;
+        self.system_settings.panel_crc_mode = mode;
         self.set_save_needed();
     }
 
     pub fn get_headphone_volume_update_flag(&self) -> bool {
         log::debug!("ISystemSettingsServer::GetHeadphoneVolumeUpdateFlag called");
-        self.headphone_volume_update_flag
+        self.system_settings.heaphone_volume_update_flag != 0
     }
 
     pub fn set_headphone_volume_update_flag(&mut self, flag: bool) {
         log::debug!("ISystemSettingsServer::SetHeadphoneVolumeUpdateFlag called");
-        self.headphone_volume_update_flag = flag;
+        self.system_settings.heaphone_volume_update_flag = u8::from(flag);
         self.set_save_needed();
     }
 
@@ -1746,7 +1769,7 @@ impl SystemSettingsService {
         log::debug!("ISystemSettingsServer::GetColorSetId -> {:?}", id);
         let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
         rb.push_result(RESULT_SUCCESS);
-        rb.push_u32(id as u32);
+        rb.push_u32(id);
     }
 
     fn set_color_set_id_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
@@ -1754,10 +1777,7 @@ impl SystemSettingsService {
         let mut rp = RequestParser::new(ctx);
         let id = rp.pop_u32();
         log::debug!("ISystemSettingsServer::SetColorSetId({})", id);
-        svc.inner
-            .lock()
-            .unwrap()
-            .set_color_set_id(unsafe { std::mem::transmute(id) });
+        svc.inner.lock().unwrap().set_color_set_id(id);
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
     }
@@ -1768,7 +1788,7 @@ impl SystemSettingsService {
         log::info!("ISystemSettingsServer::GetTouchScreenMode -> {:?}", mode);
         let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
         rb.push_result(RESULT_SUCCESS);
-        rb.push_u32(mode as u32);
+        rb.push_u32(mode);
     }
 
     fn set_touch_screen_mode_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
@@ -1776,10 +1796,7 @@ impl SystemSettingsService {
         let mut rp = RequestParser::new(ctx);
         let mode = rp.pop_u32();
         log::debug!("ISystemSettingsServer::SetTouchScreenMode({})", mode);
-        svc.inner
-            .lock()
-            .unwrap()
-            .set_touch_screen_mode(unsafe { std::mem::transmute(mode) });
+        svc.inner.lock().unwrap().set_touch_screen_mode(mode);
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
     }
@@ -1843,10 +1860,7 @@ impl SystemSettingsService {
         let mut rp = RequestParser::new(ctx);
         let code = rp.pop_u64();
         log::info!("ISystemSettingsServer::SetLanguageCode(0x{:x})", code);
-        svc.inner
-            .lock()
-            .unwrap()
-            .set_language_code(unsafe { std::mem::transmute::<u64, LanguageCode>(code) });
+        svc.inner.lock().unwrap().set_language_code(code);
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
     }
@@ -2142,16 +2156,15 @@ impl SystemSettingsService {
         let svc = Self::as_self(this);
         let mut rp = RequestParser::new(ctx);
         let target_val = rp.pop_u32();
-        let target: AudioOutputModeTarget = unsafe { std::mem::transmute(target_val) };
-        let mode = svc.inner.lock().unwrap().get_audio_output_mode(target);
+        let mode = svc.inner.lock().unwrap().get_audio_output_mode(target_val);
         log::info!(
-            "ISystemSettingsServer::GetAudioOutputMode(target={:?}) -> {:?}",
-            target,
+            "ISystemSettingsServer::GetAudioOutputMode(target={}) -> {}",
+            target_val,
             mode
         );
         let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
         rb.push_result(RESULT_SUCCESS);
-        rb.push_u32(mode as u32);
+        rb.push_u32(mode);
     }
 
     fn set_audio_output_mode_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
@@ -2159,17 +2172,15 @@ impl SystemSettingsService {
         let mut rp = RequestParser::new(ctx);
         let target_val = rp.pop_u32();
         let mode_val = rp.pop_u32();
-        let target: AudioOutputModeTarget = unsafe { std::mem::transmute(target_val) };
-        let mode: AudioOutputMode = unsafe { std::mem::transmute(mode_val) };
         log::info!(
-            "ISystemSettingsServer::SetAudioOutputMode(target={:?}, mode={:?})",
-            target,
-            mode
+            "ISystemSettingsServer::SetAudioOutputMode(target={}, mode={})",
+            target_val,
+            mode_val
         );
         svc.inner
             .lock()
             .unwrap()
-            .set_audio_output_mode(target, mode);
+            .set_audio_output_mode(target_val, mode_val);
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
     }
@@ -2213,10 +2224,7 @@ impl SystemSettingsService {
         let mut rp = RequestParser::new(ctx);
         let flag = rp.pop_u32();
         log::info!("ISystemSettingsServer::SetQuestFlag({})", flag);
-        svc.inner
-            .lock()
-            .unwrap()
-            .set_quest_flag(unsafe { std::mem::transmute::<u8, QuestFlag>(flag as u8) });
+        svc.inner.lock().unwrap().set_quest_flag(flag as u8);
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
     }
@@ -2226,10 +2234,7 @@ impl SystemSettingsService {
         let mut rp = RequestParser::new(ctx);
         let region = rp.pop_u32();
         log::info!("ISystemSettingsServer::SetRegionCode({})", region);
-        svc.inner
-            .lock()
-            .unwrap()
-            .set_region_code(unsafe { std::mem::transmute(region) });
+        svc.inner.lock().unwrap().set_region_code(region);
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
     }
@@ -2243,7 +2248,7 @@ impl SystemSettingsService {
         );
         let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
         rb.push_result(RESULT_SUCCESS);
-        rb.push_u32(storage as u32);
+        rb.push_u32(storage);
     }
 
     fn set_primary_album_storage_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
@@ -2251,10 +2256,7 @@ impl SystemSettingsService {
         let mut rp = RequestParser::new(ctx);
         let storage = rp.pop_u32();
         log::info!("ISystemSettingsServer::SetPrimaryAlbumStorage({})", storage);
-        svc.inner
-            .lock()
-            .unwrap()
-            .set_primary_album_storage(unsafe { std::mem::transmute(storage) });
+        svc.inner.lock().unwrap().set_primary_album_storage(storage);
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
     }
@@ -2605,7 +2607,7 @@ impl SystemSettingsService {
         );
         let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
         rb.push_result(RESULT_SUCCESS);
-        rb.push_u32(perm as u32);
+        rb.push_u32(perm);
     }
 
     fn set_error_report_share_permission_handler(
@@ -2622,7 +2624,7 @@ impl SystemSettingsService {
         svc.inner
             .lock()
             .unwrap()
-            .set_error_report_share_permission(unsafe { std::mem::transmute(perm) });
+            .set_error_report_share_permission(perm);
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
     }
@@ -2652,7 +2654,7 @@ impl SystemSettingsService {
         log::info!("ISystemSettingsServer::GetKeyboardLayout -> {:?}", layout);
         let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
         rb.push_result(RESULT_SUCCESS);
-        rb.push_u32(layout as u32);
+        rb.push_u32(layout);
     }
 
     fn set_keyboard_layout_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
@@ -2660,10 +2662,7 @@ impl SystemSettingsService {
         let mut rp = RequestParser::new(ctx);
         let layout = rp.pop_u32();
         log::info!("ISystemSettingsServer::SetKeyboardLayout({})", layout);
-        svc.inner
-            .lock()
-            .unwrap()
-            .set_keyboard_layout(unsafe { std::mem::transmute(layout) });
+        svc.inner.lock().unwrap().set_keyboard_layout(layout);
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
     }
@@ -2684,7 +2683,7 @@ impl SystemSettingsService {
         );
         let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
         rb.push_result(RESULT_SUCCESS);
-        rb.push_u32(method as u32);
+        rb.push_u32(method);
     }
 
     fn get_home_menu_scheme_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
@@ -2715,10 +2714,7 @@ impl SystemSettingsService {
         let mut rp = RequestParser::new(ctx);
         let region = rp.pop_u32();
         log::info!("ISystemSettingsServer::SetPlatformRegion({})", region);
-        svc.inner
-            .lock()
-            .unwrap()
-            .set_platform_region(unsafe { std::mem::transmute(region) });
+        svc.inner.lock().unwrap().set_platform_region(region as i32);
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
     }
@@ -2795,20 +2791,50 @@ mod tests {
     #[test]
     fn test_system_settings_default() {
         let server = ISystemSettingsServer::new();
-        assert_eq!(server.get_color_set_id(), ColorSet::BasicWhite);
+        assert_eq!(server.get_color_set_id(), ColorSet::BasicWhite as u32);
         assert_eq!(server.get_vibration_master_volume(), 1.0);
         assert_eq!(server.get_bluetooth_enable_flag(), true);
         assert_eq!(server.get_nfc_enable_flag(), true);
         assert_eq!(server.get_wireless_lan_enable_flag(), true);
         assert_eq!(server.get_product_model(), 1);
-        assert_eq!(server.get_touch_screen_mode(), TouchScreenMode::Standard);
+        assert_eq!(
+            server.get_touch_screen_mode(),
+            TouchScreenMode::Standard as u32
+        );
     }
 
     #[test]
     fn test_system_settings_set_get_color() {
         let mut server = ISystemSettingsServer::new();
-        server.set_color_set_id(ColorSet::BasicBlack);
-        assert_eq!(server.get_color_set_id(), ColorSet::BasicBlack);
+        server.set_color_set_id(ColorSet::BasicBlack as u32);
+        assert_eq!(server.get_color_set_id(), ColorSet::BasicBlack as u32);
+    }
+
+    #[test]
+    fn persisted_enum_values_keep_unknown_bit_patterns() {
+        let mut server = ISystemSettingsServer::new();
+        let unknown = 0xFFFF_FFFE;
+
+        server.set_color_set_id(unknown);
+        server.set_keyboard_layout(unknown);
+        server.set_touch_screen_mode(unknown);
+
+        assert_eq!(server.get_color_set_id(), unknown);
+        assert_eq!(server.get_keyboard_layout(), unknown);
+        assert_eq!(server.get_touch_screen_mode(), unknown);
+    }
+
+    #[test]
+    fn server_owns_each_upstream_settings_payload() {
+        let server = ISystemSettingsServer::new();
+
+        assert_eq!(server.system_settings.eula_version_count, 1);
+        assert_eq!(server.private_settings.external_clock_source_id, [0; 16]);
+        assert_eq!(server.device_settings.ptm_battery_version, 0);
+        assert_eq!(
+            server.appln_settings.mii_author_id,
+            UUID::make_default().uuid
+        );
     }
 
     #[test]
@@ -2828,7 +2854,8 @@ mod tests {
     #[test]
     fn get_mii_author_id_initializes_invalid_uuid_and_marks_save_needed() {
         let mut server = ISystemSettingsServer::new();
-        assert_eq!(server.mii_author_id, [0; 16]);
+        server.system_settings.mii_author_id = [0; 16];
+        assert_eq!(server.system_settings.mii_author_id, [0; 16]);
         assert!(!server.save_needed);
 
         assert_eq!(server.get_mii_author_id(), *b"Eden Default UID");
@@ -2838,7 +2865,7 @@ mod tests {
     #[test]
     fn get_mii_author_id_preserves_valid_uuid() {
         let mut server = ISystemSettingsServer::new();
-        server.mii_author_id = *b"custom author id";
+        server.system_settings.mii_author_id = *b"custom author id";
 
         assert_eq!(server.get_mii_author_id(), *b"custom author id");
         assert!(!server.save_needed);

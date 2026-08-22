@@ -5740,3 +5740,42 @@ Compared `system_settings.rs`, `private_settings.rs`, `device_settings.rs`, and
 - Replaced enum and `bool` fields in the persisted system/application payloads with raw wire
   integers, making future byte-for-byte load/store safe while preserving every compile-time
   offset assertion.
+
+## 2026-08-22 — `system_settings_server.rs` state ownership vs Eden
+`system_settings_server.{h,cpp}`
+
+### Intentional differences
+
+- Rust keeps enum-valued persisted fields and their IPC boundary values as raw integers. Eden's
+  C++ enums preserve out-of-range underlying values; raw Rust integers provide the same behavior
+  without constructing invalid enum discriminants.
+- The fixed-size EULA and account-notification arrays clamp a corrupted stored count before
+  creating a Rust slice. Valid counts preserve Eden's fixed-array/count behavior, while malformed
+  counts cannot create an out-of-bounds Rust slice.
+
+### Fixed parity debt
+
+- `ISystemSettingsServer` now owns `SystemSettings`, `PrivateSettings`, `DeviceSettings`, and
+  `ApplnSettings` directly instead of duplicating selected values as unrelated loose fields.
+- Every implemented getter/setter now reads or mutates its Eden-owned payload. This includes the
+  private external-clock values, system clock contexts, all five audio-output modes, fixed-count
+  EULA/account-notification arrays, and the system-owned packed initial-launch settings.
+- Constructor initialization now follows Eden's order: default payloads first, configured region
+  override second, then the temporary EULA entry derived from the user clock context.
+- Removed unsafe enum `transmute` calls from the affected IPC handlers and added regressions for
+  unknown raw enum values and four-payload ownership.
+
+### Unintentional differences (to fix)
+
+- `SetSaveNeeded` still records a dirty flag instead of immediately invoking `StoreSettings` under
+  the save mutex. The load/store/setup prerequisite is ready to resume and remains recorded in
+  `PORTING_STATE.md`.
+- Battery-lot and console-serial responses remain zeroed. Eden derives them from the common
+  `serial_battery`, `serial_unit`, and region settings, which Ruzu does not yet own.
+
+### Missing items
+
+- `LoadSettingsFile`, `StoreSettingsFile`, `SetupSettings`, and `StoreSettings` are the next
+  persistence slice; `SETTINGS_MAGIC` and `SETTINGS_VERSION` remain unused until then.
+- The pre-existing partial service still omits Eden's implemented console-information-upload,
+  automatic-application-download, USB 3.0, HTTP-auth-config, and account-user-settings commands.
