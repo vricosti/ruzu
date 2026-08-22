@@ -906,3 +906,24 @@
   applets, return `IApplicationAccessor`, and save launch timestamps on the same side of process
   creation as Eden. The previously unread `window_system` member is consumed by both paths.
 - Status: completed and verified for the application-creator warning slice.
+
+## 2026-08-22 — home-menu warning interrupted by general-channel prerequisite
+
+- Interrupted slice: classify and resolve the unread `IHomeMenuFunctions::applet` warning while
+  comparing every implemented command with Eden.
+- Finding: the retained applet is lifecycle ownership, not dead data; Eden keeps the same
+  `shared_ptr` even though no command dereferences it. The local warning therefore requires an
+  explicit ownership annotation rather than field removal.
+- Exact missing prerequisite: commands 20 and 21 depend on `System::{TryPopGeneralChannel,
+  GetGeneralChannelEvent}`, but Ruzu has no general-channel owner in `core.rs` and command 21
+  currently returns an unrelated per-service event.
+- Required next action: port Eden's mutex-protected general-channel stack, lazy event ownership,
+  empty-to-nonempty signal transition and final-pop clear transition in `core.rs`, with focused
+  ordering and event-state tests, then resume `home_menu_functions.rs`.
+- Resume condition: `System` exposes the shared event and LIFO push/pop behavior required by both
+  `ICommonStateGetter` and `IHomeMenuFunctions` without eager event initialization.
+- Prerequisite result: `System` now owns the mutex-protected LIFO stack and lazily-created shared
+  event. Push signals only on the empty-to-nonempty transition, the last pop clears it, and focused
+  tests cover ordering, event identity and both transitions.
+- Status: prerequisite completed and re-verified; resume `home_menu_functions.rs` and connect the
+  existing `ICommonStateGetter` producer to this owner.

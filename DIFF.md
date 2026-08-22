@@ -6088,3 +6088,23 @@ vs Eden `display_list.h` and `layer_list.h`
   creation, while system applications save only after successful creation and tracking. A focused
   test verifies that both implemented upstream commands are wired to IPC handlers; the unread
   `window_system` warning is gone.
+
+## 2026-08-22 — general-channel ownership in `core.rs` vs Eden `core.{h,cpp}`
+
+### Intentional differences
+
+- Rust keeps the channel data and optional `Arc<Event>` in one `parking_lot::Mutex` state object,
+  while Eden keeps separate members behind one `std::mutex`. `GetGeneralChannel` returns a mapped
+  guard instead of an unrestricted reference, preserving the same mutable stack access without
+  allowing unsynchronized Rust aliases.
+- Eden's lazy `ServiceContext` constructs the kernel event immediately. Rust's shared `Event`
+  constructs its kernel bridge when IPC first requests a handle; host-visible signal state is
+  retained before that point and copied into the bridge, so the guest observes the same state.
+
+### Fixed parity debt
+
+- Ported `GetGeneralChannel`, `PushGeneralChannelData`, `TryPopGeneralChannel`, and
+  `GetGeneralChannelEvent` in their `System` owner. The channel remains LIFO, the event is created
+  lazily, only the first push signals it, and removing the final item clears it.
+- A focused regression verifies LIFO ordering, persistent event identity and both event-state
+  transitions required by Eden's AM producer and consumer services.

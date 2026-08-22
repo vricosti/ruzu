@@ -28,6 +28,7 @@ use crate::hle::service::am::frontend::applets::{FrontendAppletHolder, FrontendA
 use crate::hle::service::am::process_creation::build_application_launch_property;
 use crate::hle::service::apm::apm_controller::Controller as ApmController;
 use crate::hle::service::glue::glue_manager::{ARPManager, ApplicationLaunchProperty};
+use crate::hle::service::os::event::Event;
 use crate::hle::service::server_manager::ServerManager;
 use crate::hle::service::sm::sm::ServiceManager;
 use crate::memory::memory::Memory;
@@ -110,6 +111,12 @@ struct StopEventState {
     stop_requested: bool,
     next_callback_id: u64,
     callbacks: HashMap<u64, StopCallbackFn>,
+}
+
+#[derive(Default)]
+struct GeneralChannelState {
+    data: Vec<Vec<u8>>,
+    event: Option<Arc<Event>>,
 }
 
 /// Rust counterpart of upstream `System::Impl::stop_event`.
@@ -1178,6 +1185,10 @@ pub struct System {
     /// User channel for inter-process data transfer.
     user_channel: VecDeque<Vec<u8>>,
 
+    /// General channel shared by AM common-state and home-menu services.
+    /// Upstream owner: `System::Impl::{general_channel,general_channel_event}`.
+    general_channel: Mutex<GeneralChannelState>,
+
     // ── Callbacks ──
     /// Callback to re-launch the application with a specific program index.
     execute_program_callback: Option<ExecuteProgramCallback>,
@@ -1300,6 +1311,7 @@ impl System {
             status_details: String::new(),
             build_id: [0u8; 0x20],
             user_channel: VecDeque::new(),
+            general_channel: Mutex::new(GeneralChannelState::default()),
             execute_program_callback: None,
             exit_callback: None,
             subsystem_factory: None,
@@ -2501,6 +2513,48 @@ impl System {
         self.user_channel.clone()
     }
 
+    /// Gets mutable access to the general-channel stack.
+    ///
+    /// Port of `System::GetGeneralChannel`. Callers that mutate this stack directly are
+    /// responsible for event state, matching the unrestricted upstream reference.
+    pub fn get_general_channel(&self) -> parking_lot::MappedMutexGuard<'_, Vec<Vec<u8>>> {
+        parking_lot::MutexGuard::map(self.general_channel.lock(), |state| &mut state.data)
+    }
+
+    /// Pushes data onto the general channel and signals its event on the empty-to-nonempty
+    /// transition. Port of `System::PushGeneralChannelData`.
+    pub fn push_general_channel_data(&self, data: Vec<u8>) {
+        let mut channel = self.general_channel.lock();
+        let was_empty = channel.data.is_empty();
+        let event = Arc::clone(channel.event.get_or_insert_with(|| Arc::new(Event::new())));
+        channel.data.push(data);
+        if was_empty {
+            event.signal();
+        }
+    }
+
+    /// Pops the newest general-channel entry and clears the event after the final entry.
+    /// Port of `System::TryPopGeneralChannel`.
+    pub fn try_pop_general_channel(&self) -> Option<Vec<u8>> {
+        let mut channel = self.general_channel.lock();
+        if channel.event.is_none() || channel.data.is_empty() {
+            return None;
+        }
+
+        let data = channel.data.pop().expect("nonempty general channel");
+        if channel.data.is_empty() {
+            channel.event.as_ref().unwrap().clear();
+        }
+        Some(data)
+    }
+
+    /// Returns the lazily-created event shared by all general-channel users.
+    /// Port of `System::GetGeneralChannelEvent`.
+    pub fn get_general_channel_event(&self) -> Arc<Event> {
+        let mut channel = self.general_channel.lock();
+        Arc::clone(channel.event.get_or_insert_with(|| Arc::new(Event::new())))
+    }
+
     /// Returns the current CoreTiming tick count.
     /// Upstream: `system.CoreTiming().GetClockTicks()`.
     pub fn get_core_timing_ticks(&self) -> u64 {
@@ -3087,5 +3141,25 @@ mod exit_state_tests {
         );
         assert!(!system.is_powered_on());
         assert!(system.service_manager().is_none());
+    }
+
+    #[test]
+    fn general_channel_is_lifo_and_tracks_nonempty_event_state() {
+        let system = System::new();
+        let event = system.get_general_channel_event();
+
+        assert!(!event.is_signaled());
+        assert_eq!(system.try_pop_general_channel(), None);
+
+        system.push_general_channel_data(vec![1]);
+        system.push_general_channel_data(vec![2]);
+        assert!(event.is_signaled());
+        assert!(Arc::ptr_eq(&event, &system.get_general_channel_event()));
+
+        assert_eq!(system.try_pop_general_channel(), Some(vec![2]));
+        assert!(event.is_signaled());
+        assert_eq!(system.try_pop_general_channel(), Some(vec![1]));
+        assert!(!event.is_signaled());
+        assert_eq!(system.try_pop_general_channel(), None);
     }
 }
