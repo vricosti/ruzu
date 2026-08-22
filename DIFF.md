@@ -6245,11 +6245,25 @@ vs Eden `display_list.h` and `layer_list.h`
 - Restored the compatibility-only `apm:p` registration and removed the extraneous
   `ServiceManager` parameter from `APM::LoopProcess`; the owning function and its launch site now
   have Eden's system-only flow.
+- Removed the stale Rust-only `Mutex` import left behind by that signature correction. Eden's
+  `apm.cpp` owns no lock in `LoopProcess`, and the import had no runtime purpose.
 - Kept the otherwise unread `Module` owner on every APM interface instead of deleting it as dead
   code, with a focused lifetime regression proving that it is released with the interface.
 - `GetPerformanceMode` now preserves Eden's unusual resultless two-word response rather than
   adding `ResultSuccess` and a third word. A focused regression verifies the raw IPC response
   size and payload placement.
+
+### Unintentional differences (to fix)
+
+- None in the reviewed APM registration and ownership slice.
+
+### Missing items
+
+- None for the reviewed APM registration and ownership slice.
+
+### Binary layout verification
+
+- PASS: this cleanup changes only an unused Rust import and no IPC payload or serialized type.
 
 ## 2026-08-22 — audio service event ownership vs Eden audio interfaces
 `src/core/src/hle/service/audio/{audio_in,audio_out,audio_renderer}.rs` vs

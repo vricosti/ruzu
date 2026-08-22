@@ -6,7 +6,7 @@
 //!
 //! APM Module and LoopProcess.
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use crate::hle::service::hle_ipc::{SessionRequestHandlerFactory, SessionRequestHandlerPtr};
 use crate::hle::service::server_manager::ServerManager;
