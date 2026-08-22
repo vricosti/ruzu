@@ -1,5 +1,24 @@
 # Porting State
 
+## 2026-08-22 — Resource-limit wait lifecycle
+
+- Status: scheduler-owned wait prerequisite completed; resource-limit slice ready to resume.
+- Interrupted slice: make `KResourceLimit::{reserve,release}` consume Eden's timeout,
+  waiter-count and broadcast state instead of retaining dead-looking fields.
+- Exact missing prerequisite: `k_light_condition_variable.rs` currently substitutes a host
+  `Condvar`, ignores its kernel owner and cannot remove a timed-out waiter from its list.
+  `KThreadQueue` also erases the derived C++ `CancelWait` context and return behavior, so it cannot
+  represent Eden's light-condition-variable queue faithfully.
+- Required prerequisite work: preserve derived queue cancellation context/result semantics in
+  `k_thread_queue.rs`, then port the scheduler lock, intrusive-equivalent waiter ownership,
+  hardware timer and termination ordering in `k_light_condition_variable.rs`.
+- Resume condition: focused tests prove broadcast wakeup and both cancellation branches, then
+  `KResourceLimit` can use the ported light lock/condition variable without a host wait primitive.
+- Prerequisite result: stateful queue cancellation now preserves the derived override's result and
+  base-call decision. `KLightConditionVariable` uses the scheduler lock, guest-thread wait queue,
+  hardware timer and insertion-ordered weak waiter owners; focused callback, cancellation and
+  broadcast tests pass.
+
 ## 2026-08-22 — Cheat engine runtime integration
 
 - Status: completed and verified for the runtime ownership slice.

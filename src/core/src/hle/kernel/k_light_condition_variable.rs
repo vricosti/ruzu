@@ -1,89 +1,236 @@
-//! Port of zuyu/src/core/hle/kernel/k_light_condition_variable.h and
-//! k_light_condition_variable.cpp
-//! Status: COMPLET
-//! Derniere synchro: 2026-03-21
+//! Port of Eden's core/hle/kernel/k_light_condition_variable.h and
+//! k_light_condition_variable.cpp.
 //!
-//! KLightConditionVariable — condition variable used with KLightLock.
-//! Upstream uses KThread waiter lists and scheduler locks; here we use
-//! a host Condvar which gives correct blocking behavior for HLE emulation.
+//! KLightConditionVariable is the kernel-internal condition variable paired
+//! with KLightLock. Its wait list is scheduler-owned; it must not park a host
+//! thread with `std::sync::Condvar`.
 
-use std::sync::{Condvar, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 
 use super::k_light_lock::KLightLock;
+use super::k_scheduler_lock::KScopedSchedulerLock;
+use super::k_scoped_scheduler_lock_and_sleep::KScopedSchedulerLockAndSleep;
+use super::k_thread::{KThread, KThreadLock};
+use super::k_thread_queue::{CancelWaitCallback, KThreadQueue};
+use super::svc::svc_results::RESULT_TERMINATION_REQUESTED;
+use crate::hle::result::RESULT_SUCCESS;
 
-/// KLightConditionVariable — condition variable for use with KLightLock.
+#[derive(Clone)]
+struct Waiter {
+    thread_id: u64,
+    thread: Weak<KThreadLock>,
+}
+
+type WaiterList = Arc<Mutex<Vec<Waiter>>>;
+
+/// Condition variable used with `KLightLock` by kernel objects.
 ///
-/// Mirrors upstream `Kernel::KLightConditionVariable`.
-/// Uses a host `Condvar` for thread parking instead of the kernel's
-/// KScopedSchedulerLockAndSleep + KThreadQueue mechanism.
+/// Eden retains `KernelCore&` and an intrusive `KThread::WaiterList`. Ruzu's
+/// kernel singleton supplies the scheduler/timer owners, while weak stable
+/// thread owners provide the intrusive-list lifetime without retaining a
+/// waiting thread beyond its kernel owner.
 pub struct KLightConditionVariable {
-    m_kernel: usize,
-    /// Number of threads currently waiting.
-    wait_count: Mutex<u32>,
-    /// Condvar used to park/unpark waiting host threads.
-    cv: Condvar,
+    m_wait_list: WaiterList,
 }
 
 impl KLightConditionVariable {
-    pub fn new(kernel: usize) -> Self {
+    pub fn new() -> Self {
         Self {
-            m_kernel: kernel,
-            wait_count: Mutex::new(0),
-            cv: Condvar::new(),
+            m_wait_list: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
-    /// Wait on this condition variable, releasing the given lock.
+    /// Sleep the current guest thread after releasing `lock`.
     ///
-    /// Port of upstream `KLightConditionVariable::Wait`.
-    /// Releases the KLightLock, blocks on the condvar, then re-acquires the lock.
-    pub fn wait(&self, lock: &KLightLock, timeout: i64, _allow_terminating_thread: bool) {
-        // Increment wait count.
-        {
-            let mut count = self.wait_count.lock().unwrap();
-            *count += 1;
+    /// Matches `KLightConditionVariable::Wait`: scheduler locking, termination
+    /// check, lock release, waiter insertion, timer registration and lock
+    /// reacquisition retain Eden's order.
+    pub fn wait(&self, lock: &KLightLock, timeout: i64, allow_terminating_thread: bool) {
+        let current = super::kernel::get_current_thread_pointer()
+            .expect("KLightConditionVariable::wait requires a current guest thread");
+        let scheduler_lock = super::kernel::scheduler_lock()
+            .expect("KLightConditionVariable::wait requires an initialized scheduler lock");
+        let hardware_timer = super::kernel::get_hardware_timer_arc();
+        let (thread_id, thread_ptr) = {
+            let thread = current.lock().unwrap();
+            (thread.get_thread_id(), current.as_ref().as_ptr() as usize)
+        };
+
+        let (mut scheduler_sleep, timer) = KScopedSchedulerLockAndSleep::new(
+            scheduler_lock,
+            hardware_timer.as_ref(),
+            thread_id,
+            thread_ptr,
+            timeout,
+        );
+
+        if !allow_terminating_thread && current.lock().unwrap().is_termination_requested() {
+            scheduler_sleep.cancel_sleep();
+            return;
         }
 
-        // Release the KLightLock before blocking.
         lock.unlock();
 
-        // Block on the condvar.
-        {
-            let count = self.wait_count.lock().unwrap();
-            if timeout > 0 {
-                let timeout_dur = std::time::Duration::from_nanos(timeout as u64);
-                let _result = self.cv.wait_timeout(count, timeout_dur).unwrap();
-            } else if timeout < 0 {
-                // Infinite wait (upstream: -1 means no timeout)
-                let _result = self.cv.wait(count).unwrap();
-            }
-            // timeout == 0: don't wait, just check
-        }
+        self.m_wait_list.lock().unwrap().push(Waiter {
+            thread_id,
+            thread: Arc::downgrade(&current),
+        });
 
-        // Re-acquire the KLightLock.
+        let mut wait_queue = light_condition_variable_wait_queue(
+            Arc::clone(&self.m_wait_list),
+            allow_terminating_thread,
+        );
+        if let Some(timer) = timer {
+            wait_queue.set_hardware_timer(timer);
+        }
+        current.lock().unwrap().begin_wait_with_queue(wait_queue);
+
+        // Dropping the scheduler guard registers an absolute timer when
+        // requested and switches away from the waiting guest fiber.
+        drop(scheduler_sleep);
+
         lock.lock();
     }
 
-    /// Wake all waiting threads.
-    ///
-    /// Port of upstream `KLightConditionVariable::Broadcast`.
-    /// Upstream iterates the wait list and calls EndWait on each thread.
+    /// Wake every waiter in insertion order.
     pub fn broadcast(&self) {
-        let mut count = self.wait_count.lock().unwrap();
-        if *count > 0 {
-            *count = 0;
-            self.cv.notify_all();
+        let scheduler_lock = super::kernel::scheduler_lock()
+            .expect("KLightConditionVariable::broadcast requires an initialized scheduler lock");
+        let _scheduler_guard = KScopedSchedulerLock::new(scheduler_lock);
+        broadcast_waiters(&self.m_wait_list);
+    }
+}
+
+impl Default for KLightConditionVariable {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Rust equivalent of Eden's anonymous
+/// `ThreadQueueImplForKLightConditionVariable`.
+fn light_condition_variable_wait_queue(
+    waiters: WaiterList,
+    allow_terminating_thread: bool,
+) -> KThreadQueue {
+    let cancel_wait: CancelWaitCallback = Arc::new(
+        move |waiting_thread: &mut KThread, wait_result: u32, _cancel_timer_task: bool| {
+            if wait_result == RESULT_TERMINATION_REQUESTED.get_inner_value()
+                && allow_terminating_thread
+            {
+                return false;
+            }
+
+            let waiting_thread_id = waiting_thread.get_thread_id();
+            let mut waiters = waiters.lock().unwrap();
+            let index = waiters
+                .iter()
+                .position(|waiter| waiter.thread_id == waiting_thread_id)
+                .expect("cancelled light-condition-variable thread is not in its waiter list");
+            waiters.remove(index);
+            true
+        },
+    );
+    KThreadQueue::with_cancel_wait_callback(None, Some(cancel_wait))
+}
+
+fn broadcast_waiters(waiters: &WaiterList) {
+    loop {
+        let Some(waiter) = waiters.lock().unwrap().first().cloned() else {
+            break;
+        };
+        if let Some(thread) = waiter.thread.upgrade() {
+            thread
+                .lock()
+                .unwrap()
+                .end_wait(RESULT_SUCCESS.get_inner_value());
         }
+        let removed = waiters.lock().unwrap().remove(0);
+        debug_assert_eq!(removed.thread_id, waiter.thread_id);
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use super::super::k_thread::ThreadState;
     use super::*;
 
+    fn waiting_thread(thread_id: u64, queue: KThreadQueue) -> Arc<KThreadLock> {
+        let thread = Arc::new(KThreadLock::new(KThread::new()));
+        {
+            let mut guard = thread.lock().unwrap();
+            guard.thread_id = thread_id;
+            guard.bind_self_reference(&thread);
+            guard.begin_wait_with_queue(queue);
+        }
+        thread
+    }
+
     #[test]
-    fn test_light_condition_variable_creation() {
-        let cv = KLightConditionVariable::new(0);
-        assert_eq!(*cv.wait_count.lock().unwrap(), 0);
+    fn cancellation_removes_waiter_before_base_transition() {
+        let waiters = Arc::new(Mutex::new(Vec::new()));
+        let queue = light_condition_variable_wait_queue(Arc::clone(&waiters), false);
+        let thread = waiting_thread(7, queue.clone());
+        waiters.lock().unwrap().push(Waiter {
+            thread_id: 7,
+            thread: Arc::downgrade(&thread),
+        });
+
+        queue.cancel_wait(&mut thread.lock().unwrap(), 0xCAFE, true);
+
+        assert!(waiters.lock().unwrap().is_empty());
+        assert_eq!(thread.lock().unwrap().get_state(), ThreadState::RUNNABLE);
+        assert_eq!(thread.lock().unwrap().get_wait_result(), 0xCAFE);
+    }
+
+    #[test]
+    fn allowed_termination_leaves_wait_owned_by_condition_variable() {
+        let waiters = Arc::new(Mutex::new(Vec::new()));
+        let queue = light_condition_variable_wait_queue(Arc::clone(&waiters), true);
+        let thread = waiting_thread(8, queue.clone());
+        waiters.lock().unwrap().push(Waiter {
+            thread_id: 8,
+            thread: Arc::downgrade(&thread),
+        });
+
+        queue.cancel_wait(
+            &mut thread.lock().unwrap(),
+            RESULT_TERMINATION_REQUESTED.get_inner_value(),
+            true,
+        );
+
+        assert_eq!(waiters.lock().unwrap().len(), 1);
+        assert_eq!(thread.lock().unwrap().get_state(), ThreadState::WAITING);
+    }
+
+    #[test]
+    fn broadcast_wakes_all_waiters_in_place() {
+        let waiters = Arc::new(Mutex::new(Vec::new()));
+        let first = waiting_thread(1, KThreadQueue::new());
+        let second = waiting_thread(2, KThreadQueue::new());
+        waiters.lock().unwrap().extend([
+            Waiter {
+                thread_id: 1,
+                thread: Arc::downgrade(&first),
+            },
+            Waiter {
+                thread_id: 2,
+                thread: Arc::downgrade(&second),
+            },
+        ]);
+
+        broadcast_waiters(&waiters);
+
+        assert!(waiters.lock().unwrap().is_empty());
+        assert_eq!(first.lock().unwrap().get_state(), ThreadState::RUNNABLE);
+        assert_eq!(second.lock().unwrap().get_state(), ThreadState::RUNNABLE);
+        assert_eq!(
+            first.lock().unwrap().get_wait_result(),
+            RESULT_SUCCESS.get_inner_value()
+        );
+        assert_eq!(
+            second.lock().unwrap().get_wait_result(),
+            RESULT_SUCCESS.get_inner_value()
+        );
     }
 }

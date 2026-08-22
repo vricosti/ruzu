@@ -4610,6 +4610,45 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 - Instruction-cache invalidation now visits every live per-core ARM interface instead of being a
   no-op.
 
+## 2026-08-22 — `src/core/src/hle/kernel/k_thread_queue.rs` vs `src/core/hle/kernel/k_thread_queue.h` and `.cpp`
+
+### Intentional differences
+
+- Rust represents C++ virtual derived queues with cloneable callbacks. Stateful cancellation
+  callbacks retain their derived queue context through `Arc`, receive Eden's wait result and timer
+  cancellation flag, and return whether the base `CancelWait` transition must run.
+- Hardware timers are retained by `Arc` while a Rust queue is active rather than by Eden's raw
+  non-owning pointer.
+- `KThreadQueueWithoutEndWait::end_wait` preserves the waiting state after logging unless the
+  diagnostic panic switch is enabled; Eden treats this impossible path as immediately
+  unreachable. This pre-existing recovery policy is unchanged by the callback work.
+
+### Fixed parity debt
+
+- A derived queue can now return from `CancelWait` without running the base state transition,
+  which is required by `ThreadQueueImplForKLightConditionVariable` for allowed termination.
+
+## 2026-08-22 — `src/core/src/hle/kernel/k_light_condition_variable.rs` vs `src/core/hle/kernel/k_light_condition_variable.h` and `.cpp`
+
+### Intentional differences
+
+- The kernel scheduler and hardware timer are resolved through Ruzu's active-kernel owner instead
+  of retaining Eden's `KernelCore&` member.
+- Eden's intrusive `KThread::WaiterList` is represented by insertion-ordered weak thread owners
+  behind a mutex. This keeps stable thread identity without extending thread lifetime; the
+  scheduler lock still owns every runtime mutation and wake transition.
+- The derived wait queue owns a shared waiter-list handle instead of a raw pointer to the stack
+  owner's list. Its lifetime remains tied to the active wait queue.
+
+### Fixed parity debt
+
+- Waiting no longer uses a host `Condvar`. It now releases the light lock under the scheduler lock,
+  registers the absolute hardware-timer task, begins the guest-thread wait, and reacquires the
+  light lock in Eden's order.
+- Cancellation preserves Eden's special allowed-termination branch and otherwise removes exactly
+  the cancelled thread before the base transition. Broadcast wakes and erases waiters in insertion
+  order.
+
 ## 2026-08-22 — `src/video_core/src/buffer_cache/buffer_cache.rs` vs `src/video_core/buffer_cache/buffer_cache_base.h` and `buffer_cache.h`
 
 ### Intentional differences
