@@ -5939,3 +5939,11 @@ vs Eden `display_list.h` and `layer_list.h`
 - PASS: `NodeInfo` and `NetworkInfo` are still sent as their existing 0x40-byte and 0x480-byte
   native payloads. The receive path validates every enum-bearing field before constructing the
   raw-copied `NetworkInfo`; no field order or padding changed.
+
+## 2026-08-22 — upstream-dead monitor state in `ldn/monitor_service.rs`
+
+### Intentional differences
+
+- Eden declares `IMonitorService::state`, but `GetStateForMonitor` unconditionally returns
+  `State::None` and neither monitor lifecycle method reads or changes the member. Ruzu removes the
+  unread field while retaining that exact stub response, now covered by a focused regression.

@@ -27,7 +27,6 @@ use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFrame
 /// | 100 | InitializeMonitor   | InitializeMonitor             |
 /// | 101 | FinalizeMonitor     | FinalizeMonitor               |
 pub struct IMonitorService {
-    state: State,
     handlers: BTreeMap<u32, FunctionInfo>,
     handlers_tipc: BTreeMap<u32, FunctionInfo>,
 }
@@ -35,7 +34,6 @@ pub struct IMonitorService {
 impl IMonitorService {
     pub fn new() -> Self {
         Self {
-            state: State::None,
             handlers: build_handler_map(&[
                 (
                     0,
@@ -94,6 +92,20 @@ impl IMonitorService {
         let service = unsafe { &*(this as *const dyn ServiceFramework as *const IMonitorService) };
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(service.finalize_monitor());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn monitor_state_preserves_upstreams_constant_stub_result() {
+        let service = IMonitorService::new();
+        assert_eq!(
+            service.get_state_for_monitor(),
+            (RESULT_SUCCESS, State::None)
+        );
     }
 }
 
