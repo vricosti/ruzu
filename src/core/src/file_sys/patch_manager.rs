@@ -52,31 +52,16 @@ const EXEFS_FILE_NAMES: &[&str] = &[
 // Title version formatting
 // ============================================================================
 
-/// Title version display format.
-/// Corresponds to upstream `TitleVersionFormat`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TitleVersionFormat {
-    ThreeElements,
-    FourElements,
-}
-
 /// Format a title version number into a human-readable string.
 /// Corresponds to upstream `FormatTitleVersion`.
-fn format_title_version(mut version: u32, format: TitleVersionFormat) -> String {
+fn format_title_version(mut version: u32) -> String {
     let mut bytes = [0u8; 4];
     bytes[0] = (version % SINGLE_BYTE_MODULUS) as u8;
     for i in 1..4 {
         version /= SINGLE_BYTE_MODULUS;
         bytes[i] = (version % SINGLE_BYTE_MODULUS) as u8;
     }
-    match format {
-        TitleVersionFormat::FourElements => {
-            format!("v{}.{}.{}.{}", bytes[3], bytes[2], bytes[1], bytes[0])
-        }
-        TitleVersionFormat::ThreeElements => {
-            format!("v{}.{}.{}", bytes[3], bytes[2], bytes[1])
-        }
-    }
+    format!("v{}.{}.{}", bytes[3], bytes[2], bytes[1])
 }
 
 // ============================================================================
@@ -428,7 +413,7 @@ impl<'a> PatchManager<'a> {
             if let Some(update_exefs) = update.get_exefs() {
                 log::info!(
                     "    ExeFS: Update ({}) applied successfully",
-                    format_title_version(version, TitleVersionFormat::ThreeElements)
+                    format_title_version(version)
                 );
                 exefs = update_exefs;
             }
@@ -777,7 +762,7 @@ impl<'a> PatchManager<'a> {
                     enabled: !is_versioned_external_update_disabled(&disabled, entry.version),
                     name: "Update".to_string(),
                     version: if entry.version_string.is_empty() {
-                        format_title_version(entry.version, TitleVersionFormat::ThreeElements)
+                        format_title_version(entry.version)
                     } else {
                         entry.version_string
                     },
@@ -828,9 +813,7 @@ impl<'a> PatchManager<'a> {
                     enabled: !disabled.contains(&name),
                     name,
                     version: (numeric_version != 0)
-                        .then(|| {
-                            format_title_version(numeric_version, TitleVersionFormat::ThreeElements)
-                        })
+                        .then(|| format_title_version(numeric_version))
                         .unwrap_or_default(),
                     patch_type: PatchType::Update,
                     program_id: self.title_id,
@@ -872,8 +855,7 @@ impl<'a> PatchManager<'a> {
                     .content_provider
                     .and_then(|cp| cp.get_entry_version(update_tid));
                 if let Some(version) = meta_ver.filter(|version| *version != 0) {
-                    update_patch.version =
-                        format_title_version(version, TitleVersionFormat::ThreeElements);
+                    update_patch.version = format_title_version(version);
                     update_patch.numeric_version = version;
                 }
                 out.push(update_patch);
@@ -1236,7 +1218,7 @@ impl<'a> PatchManager<'a> {
                     if let Some(new_romfs) = new_nca.get_romfs() {
                         log::info!(
                             "    RomFS: Update ({}) applied successfully",
-                            format_title_version(version, TitleVersionFormat::ThreeElements,)
+                            format_title_version(version)
                         );
                         romfs = new_romfs;
                     }
@@ -1277,26 +1259,12 @@ mod tests {
     #[test]
     fn test_format_title_version_three() {
         // Version 0x00010002 = bytes [2, 0, 1, 0] -> "v0.1.0"
-        assert_eq!(
-            format_title_version(0x00010002, TitleVersionFormat::ThreeElements),
-            "v0.1.0"
-        );
-    }
-
-    #[test]
-    fn test_format_title_version_four() {
-        assert_eq!(
-            format_title_version(0x01020304, TitleVersionFormat::FourElements),
-            "v1.2.3.4"
-        );
+        assert_eq!(format_title_version(0x00010002), "v0.1.0");
     }
 
     #[test]
     fn test_format_title_version_zero() {
-        assert_eq!(
-            format_title_version(0, TitleVersionFormat::ThreeElements),
-            "v0.0.0"
-        );
+        assert_eq!(format_title_version(0), "v0.0.0");
     }
 
     #[test]

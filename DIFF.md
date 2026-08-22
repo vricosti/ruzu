@@ -5806,3 +5806,12 @@ Compared `system_settings.rs`, `private_settings.rs`, `device_settings.rs`, and
 - `SETTINGS_MAGIC` and `SETTINGS_VERSION` are now consumed; the two corresponding `core` warnings
   are gone. Focused tests cover default creation, corrupt-header reset, forward-version acceptance,
   replacement ordering and payload round-trips.
+
+## 2026-08-22 — upstream-dead title-version format in `patch_manager.rs`
+
+### Intentional differences
+
+- Eden declares `TitleVersionFormat::FourElements` and a corresponding `vX.Y.Z.W` branch, but all
+  seven production calls use the default `ThreeElements` format. Ruzu removes the unused enum and
+  parameter and retains the exact production `vX.Y.Z` calculation; the test-only four-element call
+  that kept dead code alive was removed.
