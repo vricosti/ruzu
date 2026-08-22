@@ -5868,3 +5868,11 @@ vs Eden `display_list.h` and `layer_list.h`
 - Raised `MAX_NRO_INFOS` and `MAX_NRR_INFOS` from 64 to Eden's 256-entry limits. Focused tests lock
   both capacities and the standard engine's default output sequence; the unused-method warning is
   gone.
+
+## 2026-08-22 — upstream-absent Mii source helper in `mii.rs`
+
+### Intentional differences
+
+- Removed the unused `IDatabaseService::has_database_source` helper. Eden has no corresponding
+  method; source-flag decisions remain owned by `mii_manager.rs`, matching `MiiManager` upstream.
+  No service behavior or command payload changed.

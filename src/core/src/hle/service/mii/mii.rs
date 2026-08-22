@@ -169,10 +169,6 @@ impl IDatabaseService {
         unsafe { &*(this as *const dyn ServiceFramework as *const Self) }
     }
 
-    fn has_database_source(source_flag: u32) -> bool {
-        (source_flag & SourceFlag::Database as u32) != 0
-    }
-
     fn trace_char_info(
         stage: u64,
         cmd: u32,
