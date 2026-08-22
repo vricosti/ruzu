@@ -6719,3 +6719,37 @@ vs Eden `display_list.h` and `layer_list.h`
 
 ### Binary layout verification
 - N/A: this change only selects frontend error text before renderer construction.
+
+## 2026-08-22 — `src/video_core/src/engines/fermi_2d.rs` vs `src/video_core/engines/fermi_2d.{h,cpp}`
+
+### Intentional differences
+- Eden indexes the `Regs::reg_array` union member directly. Rust derives the same word pointer
+  from the enclosing `#[repr(C)] RegsStorageRaw` address, avoiding an unsafe union-field
+  projection required by Rust 1.89 while preserving the exact offset and contiguous storage.
+
+### Unintentional differences (to fix)
+- None in this compiler-compatibility slice.
+
+### Missing items
+- None in this compiler-compatibility slice.
+
+### Binary layout verification
+- PASS: existing tests verify that `RegsStorageRaw::regs` is at offset zero, the runtime tail
+  begins after `NUM_REGS_WORDS`, the total size is `ENGINE_REG_COUNT * 4`, and the word view spans
+  both regions contiguously.
+
+## 2026-08-22 — `src/video_core/build.rs` vs Eden root `CMakeLists.txt`
+
+### Intentional differences
+- Eden selects C++20 globally. The Rust build script selects C++17 only for the BCN shim and its
+  bundled decoder sources, which require a modern C++ mode but not Eden's complete C++20 build
+  environment; this also prevents Apple Clang from falling back to C++98.
+
+### Unintentional differences (to fix)
+- None in this build-compatibility slice.
+
+### Missing items
+- None.
+
+### Binary layout verification
+- N/A: this changes only the language mode used to compile the existing C++ shim sources.

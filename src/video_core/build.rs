@@ -52,6 +52,9 @@ fn main() {
 
     let mut bcn_build = cc::Build::new();
     bcn_build.cpp(true);
+    // Apple Clang still defaults to C++98 when no language standard is
+    // specified.
+    bcn_build.std("c++17");
     bcn_build.file("src/textures/bcn_shim.cpp");
     bcn_build.file(stb_dir.join("stb_dxt.cpp"));
     bcn_build.file(bc_decoder_dir.join("bc_decoder.cpp"));

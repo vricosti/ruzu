@@ -1370,12 +1370,16 @@ impl Fermi2D {
     }
 
     fn words(&self) -> &[u32] {
-        let ptr = std::ptr::addr_of!(self.regs.regs.reg_array) as *const u32;
+        let ptr = std::ptr::from_ref(&self.regs).cast::<u32>();
+        // RegsStorageRaw is repr(C), starts with the register union, and its
+        // tested size is exactly ENGINE_REG_COUNT words.
         unsafe { std::slice::from_raw_parts(ptr, ENGINE_REG_COUNT) }
     }
 
     fn words_mut(&mut self) -> &mut [u32] {
-        let ptr = std::ptr::addr_of_mut!(self.regs.regs.reg_array) as *mut u32;
+        let ptr = std::ptr::from_mut(&mut self.regs).cast::<u32>();
+        // See words(): the runtime tail immediately follows the upstream
+        // register union in the same contiguous repr(C) storage.
         unsafe { std::slice::from_raw_parts_mut(ptr, ENGINE_REG_COUNT) }
     }
 
