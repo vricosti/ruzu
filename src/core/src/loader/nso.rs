@@ -7,6 +7,7 @@
 
 use std::collections::BTreeMap;
 
+use crate::file_sys::patch_manager::PatchManager;
 use crate::file_sys::vfs::vfs::VfsFile;
 use crate::file_sys::vfs::vfs_types::VirtualFile;
 use crate::hle::kernel::code_set::CodeSet;
@@ -239,18 +240,14 @@ impl AppLoaderNso {
     /// Load an NSO module into a process at the specified base address.
     ///
     /// Maps to upstream `AppLoader_NSO::LoadModule`.
-    ///
-    /// Simplified: PatchManager (mod/IPS patches), NCE::Patcher (native code
-    /// execution backend patching), and cheat system integration are not yet
-    /// wired up. The core decompression + CodeSet + process loading path is
-    /// implemented.
     pub fn load_module(
         process: &mut KProcess,
-        _system: &mut System,
+        system: &mut System,
         nso_file: &dyn VfsFile,
         load_base: u64,
         should_pass_arguments: bool,
         load_into_process: bool,
+        patch_manager: Option<&PatchManager<'_>>,
     ) -> Option<u64> {
         if nso_file.get_size() < std::mem::size_of::<NsoHeader>() {
             return None;
@@ -341,8 +338,36 @@ impl AppLoaderNso {
             segment.size = page_align_size(segment.size);
         }
 
-        // Upstream: applies PatchManager patches and NCE patching here.
-        // PatchManager and NCE::Patcher are separate subsystems.
+        // Apply patches if necessary.
+        let name = nso_file.get_name();
+        if let Some(patch_manager) = patch_manager {
+            if patch_manager.has_nso_patch(&nso_header.build_id, &name)
+                || *common::settings::values().dump_nso.get_value()
+            {
+                let header_size = std::mem::size_of::<NsoHeader>();
+                let mut patchable = Vec::with_capacity(header_size + program_image.len());
+                let header_bytes = unsafe {
+                    std::slice::from_raw_parts(
+                        &nso_header as *const NsoHeader as *const u8,
+                        header_size,
+                    )
+                };
+                patchable.extend_from_slice(header_bytes);
+                patchable.extend_from_slice(&program_image);
+                let patched = patch_manager.patch_nso(patchable, &name);
+                if patched.len() != header_size + program_image.len() {
+                    log::error!(
+                        "NSO patch changed image size unexpectedly: before={:#X}, after={:#X}",
+                        program_image.len(),
+                        patched.len().saturating_sub(header_size)
+                    );
+                    return None;
+                }
+                program_image.copy_from_slice(&patched[header_size..]);
+            }
+        }
+
+        // NCE patching remains owned by the separate backend-specific subsystem.
 
         // If we are not actually loading (just computing process code layout), return early.
         // Matches upstream: `if (!load_into_process) { return load_base + image_size; }`
@@ -350,7 +375,19 @@ impl AppLoaderNso {
             return Some(load_base + image_size as u64);
         }
 
-        // Upstream: applies cheats if PatchManager is present. Not yet wired.
+        // Apply cheats if they exist and the program has a valid title ID.
+        if let Some(patch_manager) = patch_manager {
+            system.set_application_process_build_id(nso_header.build_id);
+            let cheats = patch_manager.create_cheat_list(&nso_header.build_id);
+            if !cheats.is_empty() {
+                system.register_cheat_list(
+                    cheats,
+                    nso_header.build_id,
+                    load_base,
+                    image_size as u64,
+                );
+            }
+        }
 
         // Dump raw module binary for offline disassembly.
         if let Ok(dump_dir) = std::env::var("RUZU_DUMP_MODULES") {
@@ -396,6 +433,7 @@ impl AppLoader for AppLoaderNso {
             base_address,
             true,
             true,
+            None,
         );
 
         if result.is_none() {

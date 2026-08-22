@@ -4539,12 +4539,76 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
   thread; Eden's callback object is likewise invoked by `CoreTiming` but expresses that contract
   through C++ ownership rather than a type bound.
 
+### Fixed parity debt
+
+- `System` now owns the runtime engine, initializes it after CPU setup, and destroys it before
+  pending `CoreTiming` events are cleared.
+- The VM callbacks now use the live application memory, HID Npad press state and process activity;
+  successful writes invalidate every live ARM instruction cache.
+- Initialization now publishes process/title identifiers and heap, alias and ASLR extents before
+  requesting the first VM reload, in Eden's order.
+
+## 2026-08-22 — `src/core/src/file_sys/patch_manager.rs` vs `src/core/file_sys/patch_manager.h` and `.cpp`
+
+### Intentional differences
+
+- Eden passes arbitrary file bytes to a `std::string_view`; Ruzu's existing `TextCheatParser`
+  accepts UTF-8 text, so cheat files are decoded lossily. The cheat grammar itself remains ASCII,
+  and build-ID lookup, directory ordering, disabled-addon filtering and uppercase/lowercase lookup
+  order match Eden.
+
+### Fixed parity debt
+
+- `PatchManager::create_cheat_list` now discovers per-mod build-ID files and root `cheat_*` files
+  in the same order as Eden and feeds them to the owning cheat parser.
+
+## 2026-08-22 — `src/core/src/loader/nso.rs` and `deconstructed_rom_directory.rs` vs `src/core/loader/nso.cpp` and `deconstructed_rom_directory.cpp`
+
+### Intentional differences
+
+- The second deconstructed-ROM pass borrows one `PatchManager` instead of copying an
+  `std::optional<PatchManager>` into every NSO call; its lifetime and per-module behavior are the
+  same.
+- Ruzu rejects a patched NSO whose size changed before copying it back. Eden relies on
+  `PatchNSO` preserving the image size and performs an unchecked copy into the original span.
+
+### Fixed parity debt
+
+- The first layout pass remains unpatched, while the second pass now applies IPS/IPSwitch patches,
+  publishes the application build ID, discovers cheats and requests their registration before
+  loading the module, matching Eden's ordering.
+
 ### Missing items
 
-- `System::RegisterCheatList`, NSO `PatchManager::CreateCheatList` wiring, live HID input,
-  pause/resume, instruction-cache invalidation, and initialization of process/title/heap/alias/ASLR
-  metadata are not yet connected. The engine now has the correct internal timing lifecycle, but no
-  runtime owner constructs it yet.
+- Eden's optional NCE `PatchCollection` path still has no counterpart in this loader. It is a
+  pre-existing backend-wide prerequisite; the Dynarmic NSO patch and cheat path ported here does
+  not depend on it.
+
+## 2026-08-22 — `src/core/src/core.rs` and `src/core/src/loader/loader.rs` vs `src/core/core.h`, `core.cpp`, and loader calls
+
+### Intentional differences
+
+- Loader calls record build-ID and cheat registration in the Rust loader bridge and apply them
+  immediately after `AppLoader::load` returns. This avoids aliasing the `&mut Core::System` already
+  owned by the caller while preserving Eden's ordering before cheat-engine initialization.
+
+### Fixed parity debt
+
+- `System::register_cheat_list`, the `System`-owned engine, application-process metadata setup and
+  ordered initialization/shutdown now mirror Eden's lifecycle.
+
+## 2026-08-22 — `src/core/src/arm/debug.rs` vs `src/core/arm/debug.h` and `.cpp`
+
+### Intentional differences
+
+- The Rust function receives `&mut KProcess` because `ArmInterface::invalidate_cache_range`
+  requires mutable access; Eden reaches the same mutable interfaces through a const process
+  pointer and C++ pointer ownership.
+
+### Fixed parity debt
+
+- Instruction-cache invalidation now visits every live per-core ARM interface instead of being a
+  no-op.
 
 ## 2026-08-22 — `src/video_core/src/buffer_cache/buffer_cache.rs` vs `src/video_core/buffer_cache/buffer_cache_base.h` and `buffer_cache.h`
 

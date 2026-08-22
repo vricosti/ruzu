@@ -1,13 +1,16 @@
 // SPDX-FileCopyrightText: Copyright 2018 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-//! Port of zuyu/src/core/memory/cheat_engine.h and cheat_engine.cpp
+//! Port of Eden's core/memory/cheat_engine.h and cheat_engine.cpp.
 //! Cheat engine for applying game cheats via the dmnt cheat VM.
 
 use super::dmnt_cheat_types::{CheatEntry, CheatProcessMetadata, MemoryRegionExtents};
 use super::dmnt_cheat_vm::{DmntCheatVm, VmCallbacks};
-use super::memory::Memory;
+use crate::core::SystemRef;
 use crate::core_timing::{create_event, CoreTiming, EventType, UnscheduleEventType};
+use crate::hle::kernel::svc_types::ProcessActivity;
+use crate::hle::service::hid::hid_server::IHidServer;
+use hid_core::hid_types::NpadButton;
 use parking_lot::Mutex as ParkingMutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
@@ -36,43 +39,47 @@ fn extract_name(data: &str, start_index: usize, match_char: char) -> Option<(usi
 /// Port of StandardVmCallbacks from cheat_engine.h/cpp.
 pub struct StandardVmCallbacks {
     metadata: Arc<Mutex<CheatProcessMetadata>>,
-    /// Reference to the application's memory.
-    /// Upstream: `Core::System& m_system` → `system.ApplicationMemory()`.
-    memory: Option<Arc<Mutex<Memory>>>,
+    /// Non-owning system reference matching upstream `Core::System& m_system`.
+    system: SystemRef,
 }
 
 impl StandardVmCallbacks {
-    pub fn new(metadata: Arc<Mutex<CheatProcessMetadata>>) -> Self {
-        Self {
-            metadata,
-            memory: None,
-        }
-    }
-
-    pub fn with_memory(
-        metadata: Arc<Mutex<CheatProcessMetadata>>,
-        memory: Arc<Mutex<Memory>>,
-    ) -> Self {
-        Self {
-            metadata,
-            memory: Some(memory),
-        }
+    pub fn new(system: SystemRef, metadata: Arc<Mutex<CheatProcessMetadata>>) -> Self {
+        Self { metadata, system }
     }
 
     fn is_address_in_range(&self, address: u64) -> bool {
         let metadata = self.metadata.lock().unwrap();
         let in_main = address >= metadata.main_nso_extents.base
-            && address < metadata.main_nso_extents.base + metadata.main_nso_extents.size;
+            && address
+                < metadata
+                    .main_nso_extents
+                    .base
+                    .wrapping_add(metadata.main_nso_extents.size);
         let in_heap = address >= metadata.heap_extents.base
-            && address < metadata.heap_extents.base + metadata.heap_extents.size;
+            && address
+                < metadata
+                    .heap_extents
+                    .base
+                    .wrapping_add(metadata.heap_extents.size);
         let in_alias = address >= metadata.alias_extents.base
-            && address < metadata.alias_extents.base + metadata.alias_extents.size;
+            && address
+                < metadata
+                    .alias_extents
+                    .base
+                    .wrapping_add(metadata.alias_extents.size);
         let in_aslr = address >= metadata.aslr_extents.base
-            && address < metadata.aslr_extents.base + metadata.aslr_extents.size;
+            && address
+                < metadata
+                    .aslr_extents
+                    .base
+                    .wrapping_add(metadata.aslr_extents.size);
 
         if !in_main && !in_heap && !in_alias && !in_aslr {
             log::debug!(
-                "Cheat attempting to access memory at invalid address={:016X}",
+                "Cheat attempting to access memory at invalid address={:016X}, if this persists, \
+                 the cheat may be incorrect. However, this may be normal early in execution if \
+                 the game has not properly set up yet.",
                 address
             );
             return false;
@@ -88,39 +95,89 @@ impl VmCallbacks for StandardVmCallbacks {
             data.fill(0);
             return;
         }
-        if let Some(ref memory) = self.memory {
-            let mem = memory.lock().unwrap();
-            mem.read_block(address, data);
-        } else {
+        let Some(memory) = self
+            .system
+            .get()
+            .current_process_arc_opt()
+            .and_then(|process| process.lock().unwrap().get_memory())
+        else {
             data.fill(0);
+            return;
+        };
+        let memory = memory.lock().unwrap();
+        if !memory.is_valid_virtual_address(address) {
+            data.fill(0);
+            return;
         }
+        memory.read_block(address, data);
     }
 
     fn memory_write_unsafe(&self, address: u64, data: &[u8]) {
         if !self.is_address_in_range(address) {
             return;
         }
-        if let Some(ref memory) = self.memory {
-            let mem = memory.lock().unwrap();
-            mem.write_block(address, data);
+        let Some(process) = self.system.get().current_process_arc_opt() else {
+            return;
+        };
+        let Some(memory) = process.lock().unwrap().get_memory() else {
+            return;
+        };
+        let memory = memory.lock().unwrap();
+        if !memory.is_valid_virtual_address(address) {
+            return;
+        }
+        if memory.write_block(address, data) {
+            drop(memory);
+            let mut process = process.lock().unwrap();
+            crate::arm::debug::invalidate_instruction_cache_range(
+                &mut process,
+                address,
+                data.len() as u64,
+            );
         }
     }
 
     fn hid_keys_down(&self) -> u64 {
-        // Upstream: queries HID service via system.ServiceManager().
-        // HID key state requires the input subsystem to be wired.
-        0
+        let Some(service_manager) = self.system.get().service_manager() else {
+            log::warn!("Attempted to read input state, but hid is not initialized!");
+            return 0;
+        };
+        let Some(hid) = service_manager.lock().unwrap().get_service("hid") else {
+            log::warn!("Attempted to read input state, but hid is not initialized!");
+            return 0;
+        };
+        let Some(hid) = hid.as_any().downcast_ref::<IHidServer>() else {
+            log::warn!("Attempted to read input state, but hid has an unexpected type!");
+            return 0;
+        };
+        let resource_manager = hid.get_resource_manager();
+        let npad = resource_manager.lock().get_npad();
+        let Some(npad) = npad else {
+            log::warn!("Attempted to read input state, but applet resource is not initialized!");
+            return 0;
+        };
+        let press_state = (npad.lock().get_and_reset_press_state() & NpadButton::ALL).bits();
+        press_state
     }
 
     fn pause_process(&self) {
-        // Upstream: system.ApplicationProcess()->SetActivity(Paused).
-        // Process activity control requires System reference.
-        log::debug!("CheatEngine: pause_process requested");
+        let Some(process) = self.system.get().current_process_arc_opt() else {
+            return;
+        };
+        let mut process = process.lock().unwrap();
+        if !process.is_suspended() {
+            process.set_activity(ProcessActivity::Paused);
+        }
     }
 
     fn resume_process(&self) {
-        // Upstream: system.ApplicationProcess()->SetActivity(Runnable).
-        log::debug!("CheatEngine: resume_process requested");
+        let Some(process) = self.system.get().current_process_arc_opt() else {
+            return;
+        };
+        let mut process = process.lock().unwrap();
+        if process.is_suspended() {
+            process.set_activity(ProcessActivity::Runnable);
+        }
     }
 
     fn debug_log(&self, id: u8, value: u64) {
@@ -132,7 +189,7 @@ impl VmCallbacks for StandardVmCallbacks {
     }
 
     fn command_log(&self, data: &str) {
-        let trimmed = data.trim_end_matches('\n');
+        let trimmed = data.strip_suffix('\n').unwrap_or(data);
         log::debug!("[DmntCheatVm]: {}", trimmed);
     }
 }
@@ -280,19 +337,16 @@ pub struct CheatEngine {
     state: Arc<Mutex<CheatEngineState>>,
     event: Option<Arc<ParkingMutex<EventType>>>,
     core_timing: Arc<CoreTiming>,
+    system: SystemRef,
 }
 
 impl CheatEngine {
-    pub fn new(
-        core_timing: Arc<CoreTiming>,
-        cheats: Vec<CheatEntry>,
-        build_id: &[u8; 0x20],
-    ) -> Self {
+    pub fn new(system: SystemRef, cheats: Vec<CheatEntry>, build_id: &[u8; 0x20]) -> Self {
         let mut metadata = CheatProcessMetadata::default();
         metadata.main_nso_build_id = *build_id;
         let metadata = Arc::new(Mutex::new(metadata));
 
-        let callbacks = Box::new(StandardVmCallbacks::new(metadata.clone()));
+        let callbacks = Box::new(StandardVmCallbacks::new(system, metadata.clone()));
         let vm = DmntCheatVm::new(callbacks);
 
         Self {
@@ -303,7 +357,8 @@ impl CheatEngine {
                 is_pending_reload: AtomicBool::new(false),
             })),
             event: None,
-            core_timing,
+            core_timing: system.get().core_timing_shared(),
+            system,
         }
     }
 
@@ -336,11 +391,29 @@ impl CheatEngine {
         self.core_timing
             .schedule_looping_event(CHEAT_ENGINE_NS, CHEAT_ENGINE_NS, &event, false);
         self.event = Some(event);
-        self.state
-            .lock()
-            .unwrap()
-            .is_pending_reload
-            .store(true, Ordering::Release);
+
+        let process = self.system.get().current_process_arc();
+        let process = process.lock().unwrap();
+        let page_table = &process.page_table;
+        let state = self.state.lock().unwrap();
+        {
+            let mut metadata = state.metadata.lock().unwrap();
+            metadata.process_id = process.get_process_id();
+            metadata.title_id = process.get_program_id();
+            metadata.heap_extents = MemoryRegionExtents {
+                base: page_table.get_heap_region_start().get(),
+                size: page_table.get_heap_region_size() as u64,
+            };
+            metadata.aslr_extents = MemoryRegionExtents {
+                base: page_table.get_alias_code_region_start().get(),
+                size: page_table.get_alias_code_region_size() as u64,
+            };
+            metadata.alias_extents = MemoryRegionExtents {
+                base: page_table.get_alias_region_start().get(),
+                size: page_table.get_alias_region_size() as u64,
+            };
+        }
+        state.is_pending_reload.store(true, Ordering::Release);
     }
 
     pub fn set_main_memory_parameters(&mut self, main_region_begin: u64, main_region_size: u64) {
@@ -385,9 +458,16 @@ mod tests {
 
     #[test]
     fn initialize_schedules_periodic_frame_callback() {
-        let core_timing = Arc::new(CoreTiming::new());
+        let mut system = crate::core::System::new();
+        let mut process = crate::hle::kernel::k_process::KProcess::new();
+        process.process_id = 0x51;
+        process.program_id = 0x0100_0000_0000_1000;
+        system.set_current_process_arc(Arc::new(
+            crate::hle::kernel::k_process::ProcessLock::from_value(process),
+        ));
+        let core_timing = system.core_timing_shared();
         let build_id = [0xAB; 0x20];
-        let mut engine = CheatEngine::new(core_timing.clone(), Vec::new(), &build_id);
+        let mut engine = CheatEngine::new(SystemRef::from_ref(&system), Vec::new(), &build_id);
 
         engine.initialize();
 
@@ -401,6 +481,16 @@ mod tests {
             .unwrap()
             .is_pending_reload
             .load(Ordering::Acquire));
+        let metadata = engine
+            .state
+            .lock()
+            .unwrap()
+            .metadata
+            .lock()
+            .unwrap()
+            .clone();
+        assert_eq!(metadata.process_id, 0x51);
+        assert_eq!(metadata.title_id, 0x0100_0000_0000_1000);
 
         core_timing.add_ticks(common::wall_clock::CPU_TICK_FREQ / 12 + 1);
         core_timing.advance();

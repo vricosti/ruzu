@@ -2,19 +2,16 @@
 
 ## 2026-08-22 — Cheat engine runtime integration
 
-- Status: timing prerequisite completed; runtime ownership slice remains interrupted.
-- Interrupted slice: connect the now-periodic `memory/cheat_engine.rs` implementation to the game
-  loading lifecycle.
-- Exact missing prerequisite: `file_sys/patch_manager.rs` has no `CreateCheatList` counterpart and
-  `loader/nso.rs` explicitly skips Eden's `System::RegisterCheatList` call. `System` consequently
-  has no `cheat_engine` owner and cannot populate application process metadata or provide live HID
-  and process activity callbacks.
-- Required prerequisite work: port `PatchManager::CreateCheatList` in its owning file, add
-  `System::register_cheat_list` plus ordered initialize/shutdown ownership, then wire the NSO loader
-  call after build-ID selection exactly where Eden does it.
-- Resume condition: an enabled free/homebrew-title cheat is discovered by build ID, the System-owned
-  engine schedules at 12 Hz after CPU initialization, and shutdown unschedules the event before
-  `CoreTiming::clear_pending_events`.
+- Status: completed and verified for the runtime ownership slice.
+- Prerequisite result: `PatchManager::create_cheat_list` owns cheat discovery; the deconstructed
+  NSO loader applies patches and records build-ID/cheat registration during its second pass; and
+  `System` owns the resulting engine.
+- Resumed result: initialization runs after CPU setup with live process metadata, memory, HID and
+  process-activity callbacks; successful writes invalidate instruction caches; shutdown removes
+  the engine before `CoreTiming::clear_pending_events`.
+- Verification result: focused build-ID discovery, deferred loader registration and periodic
+  initialization tests pass. The full `core` suite retains its independently tracked baseline
+  failures and is not claimed green by this slice.
 
 ## 2026-08-22 — Joy-Con HID warning slice
 

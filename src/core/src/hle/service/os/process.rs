@@ -73,14 +73,25 @@ impl Process {
         process.create_memory(system_ref);
         process.process_id = kernel.create_new_user_process_id();
 
-        let mut loader_system = LoaderSystem {
-            content_provider: system_ref.get_content_provider().cloned(),
-            filesystem_controller: Some(system_ref.get_filesystem_controller()),
-        };
+        let mut loader_system = LoaderSystem::new(
+            system_ref.get_content_provider().cloned(),
+            Some(system_ref.get_filesystem_controller()),
+        );
         let (load_result, load_parameters) = loader.load(&mut process, &mut loader_system);
         *out_load_result = load_result;
         if load_result != ResultStatus::Success {
             return false;
+        }
+        if let Some(build_id) = loader_system.take_application_process_build_id() {
+            system.set_application_process_build_id(build_id);
+        }
+        if let Some(registration) = loader_system.take_cheat_registration() {
+            system.register_cheat_list(
+                registration.cheats,
+                registration.build_id,
+                registration.main_region_begin,
+                registration.main_region_size,
+            );
         }
         let Some(load_parameters) = load_parameters else {
             *out_load_result = ResultStatus::ErrorNotInitialized;

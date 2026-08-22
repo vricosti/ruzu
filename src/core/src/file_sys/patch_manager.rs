@@ -20,6 +20,8 @@ use super::vfs::vfs_types::{VirtualDir, VirtualFile};
 use super::vfs::vfs_vector::VectorVfsFile;
 
 use crate::hle::service::filesystem::filesystem::FileSystemController;
+use crate::memory::cheat_engine::{CheatParser, TextCheatParser};
+use crate::memory::dmnt_cheat_types::CheatEntry;
 
 // ============================================================================
 // Constants
@@ -91,6 +93,47 @@ fn find_subdirectory_caseless(dir: &VirtualDir, name: &str) -> Option<VirtualDir
         }
     }
     None
+}
+
+/// Read the cheat file matching the first 16 hexadecimal build-ID characters.
+/// Corresponds to upstream `ReadCheatFileFromFolder`.
+fn read_cheat_file_from_folder(
+    title_id: u64,
+    build_id: &BuildId,
+    base_path: &VirtualDir,
+    upper: bool,
+) -> Option<Vec<CheatEntry>> {
+    let build_id_raw = build_id
+        .iter()
+        .map(|byte| {
+            if upper {
+                format!("{byte:02X}")
+            } else {
+                format!("{byte:02x}")
+            }
+        })
+        .collect::<String>();
+    let short_build_id = &build_id_raw[..std::mem::size_of::<u64>() * 2];
+    let file = match base_path.get_file(&format!("{short_build_id}.txt")) {
+        Some(file) => file,
+        None => {
+            log::info!(
+                "No cheats file found for title_id={title_id:016X}, build_id={short_build_id}"
+            );
+            return None;
+        }
+    };
+
+    let mut data = vec![0; file.get_size()];
+    let data_len = data.len();
+    if file.read(&mut data, data_len, 0) != data_len {
+        log::info!(
+            "Failed to read cheats file for title_id={title_id:016X}, build_id={short_build_id}"
+        );
+        return None;
+    }
+
+    Some(TextCheatParser.parse(&String::from_utf8_lossy(&data)))
 }
 
 /// Append a string with comma separation if not empty.
@@ -647,6 +690,69 @@ impl<'a> PatchManager<'a> {
         !self.collect_patches(&patch_dirs, &build_id_str).is_empty()
     }
 
+    /// Create the enabled cheat list for the supplied NSO build ID.
+    /// Corresponds to upstream `PatchManager::CreateCheatList`.
+    pub fn create_cheat_list(&self, build_id: &BuildId) -> Vec<CheatEntry> {
+        let load_dir = match self
+            .fs_controller
+            .and_then(|controller| controller.get_modification_load_root(self.title_id))
+        {
+            Some(dir) => dir,
+            None => {
+                log::error!(
+                    "Cannot load mods for invalid title_id={:016X}",
+                    self.title_id
+                );
+                return Vec::new();
+            }
+        };
+
+        let disabled = get_disabled_addons(self.title_id);
+        let mut patch_dirs = load_dir.get_subdirectories();
+        patch_dirs.sort_by(|left, right| left.get_name().cmp(&right.get_name()));
+
+        // <mod dir> / cheats / <build id>.txt
+        let mut out = Vec::new();
+        for subdir in patch_dirs {
+            if disabled.iter().any(|entry| entry == &subdir.get_name()) {
+                continue;
+            }
+            if let Some(cheats_dir) = find_subdirectory_caseless(&subdir, "cheats") {
+                if let Some(mut entries) =
+                    read_cheat_file_from_folder(self.title_id, build_id, &cheats_dir, true)
+                {
+                    out.append(&mut entries);
+                }
+                if let Some(mut entries) =
+                    read_cheat_file_from_folder(self.title_id, build_id, &cheats_dir, false)
+                {
+                    out.append(&mut entries);
+                }
+            }
+        }
+
+        // User-friendly loading of files whose names start with `cheat_`.
+        // <mod dir> / <cheat file>.txt
+        for file in load_dir.get_files() {
+            let name = file.get_name();
+            if !name.starts_with("cheat_") || disabled.iter().any(|entry| entry == &name) {
+                continue;
+            }
+
+            let mut data = vec![0; file.get_size()];
+            let data_len = data.len();
+            if file.read(&mut data, data_len, 0) == data_len {
+                out.extend(TextCheatParser.parse(&String::from_utf8_lossy(&data)));
+            } else {
+                log::info!(
+                    "Failed to read cheats file for title_id={:016X}",
+                    self.title_id
+                );
+            }
+        }
+        out
+    }
+
     /// Get the list of patches available for this title.
     /// Corresponds to upstream `PatchManager::GetPatches`.
     pub fn get_patches(&self, update_raw: Option<VirtualFile>) -> Vec<Patch> {
@@ -1165,6 +1271,7 @@ impl<'a> PatchManager<'a> {
 
 #[cfg(test)]
 mod tests {
+    use super::super::vfs::vfs_vector::{VectorVfsDirectory, VectorVfsFile};
     use super::*;
 
     #[test]
@@ -1209,5 +1316,29 @@ mod tests {
         assert_eq!(s, "IPS");
         append_comma_if_not_empty(&mut s, "LayeredFS");
         assert_eq!(s, "IPS, LayeredFS");
+    }
+
+    #[test]
+    fn reads_cheat_file_using_uppercase_short_build_id() {
+        let build_id = [0xAB; 0x20];
+        let file: VirtualFile = Arc::new(VectorVfsFile::new(
+            b"[Infinite lives]\n04000000 00000000 00000001\n".to_vec(),
+            "ABABABABABABABAB.txt".to_string(),
+            None,
+        ));
+        let directory: VirtualDir = Arc::new(VectorVfsDirectory::new(
+            vec![file],
+            Vec::new(),
+            "cheats".to_string(),
+            None,
+        ));
+
+        let cheats =
+            read_cheat_file_from_folder(0x0100_0000_0000_1000, &build_id, &directory, true)
+                .expect("matching build-ID cheat file");
+
+        assert_eq!(cheats.len(), 2);
+        assert!(cheats[1].enabled);
+        assert_eq!(cheats[1].definition.num_opcodes, 3);
     }
 }

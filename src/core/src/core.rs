@@ -31,6 +31,7 @@ use crate::hle::service::glue::glue_manager::{ARPManager, ApplicationLaunchPrope
 use crate::hle::service::server_manager::ServerManager;
 use crate::hle::service::sm::sm::ServiceManager;
 use crate::memory::memory::Memory;
+use crate::memory::{cheat_engine::CheatEngine, dmnt_cheat_types::CheatEntry};
 use crate::perf_stats::{PerfStats, PerfStatsResults, SpeedLimiter};
 use hid_core::hid_core::HIDCore;
 
@@ -259,6 +260,32 @@ impl SystemRef {
     /// Upstream: `system.GetReporter()`.
     pub fn get_reporter(&self) -> &Arc<crate::reporter::Reporter> {
         &self.get().reporter
+    }
+
+    /// Narrow mutable bridge for loader-owned calls to
+    /// `System::SetApplicationProcessBuildID`.
+    pub fn set_application_process_build_id(&self, build_id: [u8; 0x20]) {
+        assert!(!self.0.is_null(), "SystemRef is null");
+        unsafe { (&mut *(self.0 as *mut System)).set_application_process_build_id(build_id) }
+    }
+
+    /// Narrow mutable bridge for loader-owned calls to `System::RegisterCheatList`.
+    pub fn register_cheat_list(
+        &self,
+        cheats: Vec<CheatEntry>,
+        build_id: [u8; 0x20],
+        main_region_begin: u64,
+        main_region_size: u64,
+    ) {
+        assert!(!self.0.is_null(), "SystemRef is null");
+        unsafe {
+            (&mut *(self.0 as *mut System)).register_cheat_list(
+                cheats,
+                build_id,
+                main_region_begin,
+                main_region_size,
+            )
+        }
     }
 }
 
@@ -1092,6 +1119,9 @@ pub struct System {
     /// Core::Memory::Memory bridge (maps virtual→physical→host).
     /// Upstream: `std::unique_ptr<Core::Memory::Memory> m_memory`.
     memory: Option<Arc<StdMutex<Memory>>>,
+    /// Periodic dmnt cheat VM for the current application.
+    /// Upstream owner: `System::Impl::cheat_engine`.
+    cheat_engine: Option<CheatEngine>,
     /// Upstream owner: `std::array<GPUDirtyMemoryManager, NUM_CPU_CORES>`.
     gpu_dirty_memory_managers: Vec<Arc<GpuDirtyMemoryManager>>,
 
@@ -1251,6 +1281,7 @@ impl System {
             content_provider: None,
             device_memory: None,
             memory: None,
+            cheat_engine: None,
             gpu_dirty_memory_managers: Vec::new(),
             suspend_guard: Mutex::new(()),
             is_paused: AtomicBool::new(false),
@@ -1631,10 +1662,10 @@ impl System {
         };
 
         // Get the appropriate loader for this file type.
-        let mut loader_system = crate::loader::loader::System {
-            content_provider: self.content_provider.clone(),
-            filesystem_controller: Some(self.filesystem_controller.clone()),
-        };
+        let mut loader_system = crate::loader::loader::System::new(
+            self.content_provider.clone(),
+            Some(self.filesystem_controller.clone()),
+        );
         let loader = crate::loader::loader::get_loader(
             &mut loader_system,
             file,
@@ -1671,6 +1702,18 @@ impl System {
             );
             self.status = SystemResultStatus::ErrorLoader;
             return SystemResultStatus::ErrorLoader;
+        }
+
+        if let Some(build_id) = loader_system.take_application_process_build_id() {
+            self.set_application_process_build_id(build_id);
+        }
+        if let Some(registration) = loader_system.take_cheat_registration() {
+            self.register_cheat_list(
+                registration.cheats,
+                registration.build_id,
+                registration.main_region_begin,
+                registration.main_region_size,
+            );
         }
 
         if let Some(kernel) = self.kernel_mut() {
@@ -1878,6 +1921,14 @@ impl System {
             // params and notifies the CV. SetWindowSystem (running on the
             // am:SetWindowSystem thread) will wake, build the applet, track it,
             // and then call process->Run() with the run params we pass here.
+            // The cheat callback resolves the application process through System,
+            // so publish it before scheduling the periodic event. Upstream's
+            // Kernel::MakeApplicationProcess has already done this at this point.
+            self.current_process_arc = Some(Arc::clone(&process_arc));
+            if let Some(cheat_engine) = self.cheat_engine.as_mut() {
+                cheat_engine.initialize();
+            }
+
             self.applet_manager
                 .create_and_insert_by_frontend_applet_parameters(
                     process_arc.clone(),
@@ -1894,8 +1945,6 @@ impl System {
             if trace_boot {
                 log::info!("System::load: frontend applet parameters queued");
             }
-
-            self.current_process_arc = Some(process_arc);
         }
 
         // Port of the game-card setup in `System::Impl::Load`: only expose an
@@ -2032,6 +2081,9 @@ impl System {
         // Upstream: telemetry_session.reset();
         self.telemetry_session = None;
 
+        // Unschedule the cheat callback before clearing the remaining timing
+        // events, matching `cheat_engine.reset(); core_timing.ClearPendingEvents()`.
+        self.cheat_engine = None;
         self.core_timing.clear_pending_events();
 
         // Upstream: app_loader.reset();
@@ -2421,6 +2473,21 @@ impl System {
     /// Get the application process build ID.
     pub fn get_application_process_build_id(&self) -> &[u8; 0x20] {
         &self.build_id
+    }
+
+    /// Register the cheat list associated with an NSO image.
+    /// Corresponds to upstream `System::RegisterCheatList`.
+    pub fn register_cheat_list(
+        &mut self,
+        cheats: Vec<CheatEntry>,
+        build_id: [u8; 0x20],
+        main_region_begin: u64,
+        main_region_size: u64,
+    ) {
+        let system = SystemRef::from_ref(self);
+        let mut cheat_engine = CheatEngine::new(system, cheats, &build_id);
+        cheat_engine.set_main_memory_parameters(main_region_begin, main_region_size);
+        self.cheat_engine = Some(cheat_engine);
     }
 
     /// Gets a mutable reference to the user channel.

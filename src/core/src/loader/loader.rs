@@ -23,6 +23,63 @@ pub struct System {
     pub content_provider:
         Option<Arc<Mutex<crate::file_sys::registered_cache::ContentProviderUnion>>>,
     pub filesystem_controller: Option<Arc<Mutex<FileSystemController>>>,
+    application_process_build_id: Option<[u8; 0x20]>,
+    cheat_registration: Option<CheatRegistration>,
+}
+
+/// Deferred Rust transport for upstream `System::RegisterCheatList`.
+///
+/// Loaders borrow this bridge while the owning `Core::System::load` already
+/// holds `&mut System`, so the registration is applied immediately after the
+/// loader returns rather than creating an aliased mutable System reference.
+pub struct CheatRegistration {
+    pub cheats: Vec<crate::memory::dmnt_cheat_types::CheatEntry>,
+    pub build_id: [u8; 0x20],
+    pub main_region_begin: u64,
+    pub main_region_size: u64,
+}
+
+impl System {
+    pub fn new(
+        content_provider: Option<
+            Arc<Mutex<crate::file_sys::registered_cache::ContentProviderUnion>>,
+        >,
+        filesystem_controller: Option<Arc<Mutex<FileSystemController>>>,
+    ) -> Self {
+        Self {
+            content_provider,
+            filesystem_controller,
+            application_process_build_id: None,
+            cheat_registration: None,
+        }
+    }
+
+    pub fn set_application_process_build_id(&mut self, build_id: [u8; 0x20]) {
+        self.application_process_build_id = Some(build_id);
+    }
+
+    pub fn take_application_process_build_id(&mut self) -> Option<[u8; 0x20]> {
+        self.application_process_build_id.take()
+    }
+
+    pub fn register_cheat_list(
+        &mut self,
+        cheats: Vec<crate::memory::dmnt_cheat_types::CheatEntry>,
+        build_id: [u8; 0x20],
+        main_region_begin: u64,
+        main_region_size: u64,
+    ) {
+        self.cheat_registration = Some(CheatRegistration {
+            cheats,
+            build_id,
+            main_region_begin,
+            main_region_size,
+        });
+    }
+
+    pub fn take_cheat_registration(&mut self) -> Option<CheatRegistration> {
+        self.cheat_registration.take()
+    }
 }
 
 pub use crate::hle::kernel::k_process::KProcess;
@@ -649,5 +706,25 @@ mod tests {
             FileType::DeconstructedRomDirectory
         );
         assert_eq!(guess_from_filename("00"), FileType::NCA);
+    }
+
+    #[test]
+    fn loader_bridge_defers_cheat_registration_without_losing_metadata() {
+        let mut system = System::new(None, None);
+        let build_id = [0x5A; 0x20];
+        let cheats = vec![crate::memory::dmnt_cheat_types::CheatEntry::default()];
+
+        system.set_application_process_build_id(build_id);
+        system.register_cheat_list(cheats, build_id, 0x7100_0000_00, 0x20_0000);
+
+        assert_eq!(system.take_application_process_build_id(), Some(build_id));
+        let registration = system
+            .take_cheat_registration()
+            .expect("deferred cheat registration");
+        assert_eq!(registration.cheats.len(), 1);
+        assert_eq!(registration.build_id, build_id);
+        assert_eq!(registration.main_region_begin, 0x7100_0000_00);
+        assert_eq!(registration.main_region_size, 0x20_0000);
+        assert!(system.take_cheat_registration().is_none());
     }
 }

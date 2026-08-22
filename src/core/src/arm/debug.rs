@@ -262,13 +262,15 @@ pub fn find_main_module_entrypoint(process: &KProcess) -> u64 {
 
 /// Invalidate instruction cache range across all CPU cores.
 /// Corresponds to upstream `Core::InvalidateInstructionCacheRange`.
-pub fn invalidate_instruction_cache_range(_process: &KProcess, _address: u64, _size: u64) {
-    // Upstream: process->GetArmInterface(i)->InvalidateCacheRange(address, size)
-    // for i in 0..NUM_CPU_CORES.
-    // KProcess does not expose arm interfaces directly in ruzu.
-    // When arm interfaces are stored per-core in KProcess, iterate and invalidate.
-    for _i in 0..hardware_properties::NUM_CPU_CORES {
-        // Upstream: process.get_arm_interface(i).invalidate_cache_range(address, size);
+pub fn invalidate_instruction_cache_range(
+    process: &mut crate::hle::kernel::k_process::KProcess,
+    address: u64,
+    size: u64,
+) {
+    for core_index in 0..hardware_properties::NUM_CPU_CORES as usize {
+        if let Some(interface) = process.get_arm_interface_mut(core_index) {
+            interface.invalidate_cache_range(address, size as usize);
+        }
     }
 }
 

@@ -323,6 +323,7 @@ impl AppLoader for AppLoaderDeconstructedRomDirectory {
                 code_size,
                 should_pass_args,
                 false, // load_into_process = false
+                None,
             ) {
                 Some(tentative_next_load_addr) => {
                     code_size = tentative_next_load_addr;
@@ -371,6 +372,19 @@ impl AppLoader for AppLoaderDeconstructedRomDirectory {
         let base_address: u64 = process.get_entry_point().get();
         let mut next_load_addr: u64 = base_address;
 
+        let filesystem_controller = system.filesystem_controller.clone();
+        let content_provider = system.content_provider.clone();
+        let fs_guard = filesystem_controller
+            .as_ref()
+            .map(|controller| controller.lock().unwrap());
+        let content_guard = content_provider
+            .as_ref()
+            .map(|provider| provider.lock().unwrap());
+        let patch_manager = fs_guard
+            .as_deref()
+            .zip(content_guard.as_deref())
+            .map(|(controller, provider)| PatchManager::new(self.title_id, controller, provider));
+
         for &module_name in STATIC_MODULES {
             let module_file = match dir.get_file(module_name) {
                 Some(f) => f,
@@ -386,6 +400,7 @@ impl AppLoader for AppLoaderDeconstructedRomDirectory {
                 load_addr,
                 should_pass_args,
                 true, // load_into_process = true
+                patch_manager.as_ref(),
             ) {
                 Some(tentative_next_load_addr) => {
                     next_load_addr = tentative_next_load_addr;

@@ -93,10 +93,10 @@ pub fn create_process(
         }
     }
 
-    let mut loader_system = LoaderSystem {
-        content_provider: Some(Arc::clone(storage)),
-        filesystem_controller: Some(system_ref.get_filesystem_controller()),
-    };
+    let mut loader_system = LoaderSystem::new(
+        Some(Arc::clone(storage)),
+        Some(system_ref.get_filesystem_controller()),
+    );
     let mut loader = get_loader(&mut loader_system, nca_raw, program_id, 0)?;
     let mut process = Process::new();
     let mut load_result = ResultStatus::ErrorNotInitialized;
