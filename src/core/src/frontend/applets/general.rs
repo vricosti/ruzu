@@ -1,10 +1,13 @@
 // SPDX-FileCopyrightText: Copyright 2019 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-//! Port of zuyu/src/core/frontend/applets/general.h and general.cpp
+//! Port of `core/frontend/applets/general.{h,cpp}`.
 //! Parental controls and photo viewer applet interfaces.
 
 use super::applet::Applet;
+
+pub type VerifyPinCallback = Box<dyn Fn(bool) + Send + Sync>;
+pub type FinishedCallback = Box<dyn Fn() + Send + Sync>;
 
 // ---------------------------------------------------------------------------
 // Parental Controls Applet
@@ -18,20 +21,20 @@ pub trait ParentalControlsApplet: Applet {
     /// correct PIN. If the bool is passed, and the PIN was recently entered correctly, the frontend
     /// should not prompt and simply return true.
     fn verify_pin(
-        &mut self,
-        finished: Box<dyn FnOnce(bool) + Send>,
+        &self,
+        finished: VerifyPinCallback,
         suspend_future_verification_temporarily: bool,
     );
 
     /// Prompts the user to enter a PIN and calls the callback for correctness. Frontends can
     /// optionally alert the user that this is to change parental controls settings.
-    fn verify_pin_for_settings(&mut self, finished: Box<dyn FnOnce(bool) + Send>);
+    fn verify_pin_for_settings(&self, finished: VerifyPinCallback);
 
     /// Prompts the user to create a new PIN for pctl and stores it with the service.
-    fn register_pin(&mut self, finished: Box<dyn FnOnce() + Send>);
+    fn register_pin(&self, finished: FinishedCallback);
 
     /// Prompts the user to verify the current PIN and then store a new one into pctl.
-    fn change_pin(&mut self, finished: Box<dyn FnOnce() + Send>);
+    fn change_pin(&self, finished: FinishedCallback);
 }
 
 /// Default (stub) parental controls applet implementation.
@@ -45,8 +48,8 @@ impl Applet for DefaultParentalControlsApplet {
 
 impl ParentalControlsApplet for DefaultParentalControlsApplet {
     fn verify_pin(
-        &mut self,
-        finished: Box<dyn FnOnce(bool) + Send>,
+        &self,
+        finished: VerifyPinCallback,
         suspend_future_verification_temporarily: bool,
     ) {
         log::info!(
@@ -57,19 +60,19 @@ impl ParentalControlsApplet for DefaultParentalControlsApplet {
         finished(true);
     }
 
-    fn verify_pin_for_settings(&mut self, finished: Box<dyn FnOnce(bool) + Send>) {
+    fn verify_pin_for_settings(&self, finished: VerifyPinCallback) {
         log::info!(
             "Application requested frontend to verify PIN (settings), verifying as correct."
         );
         finished(true);
     }
 
-    fn register_pin(&mut self, finished: Box<dyn FnOnce() + Send>) {
+    fn register_pin(&self, finished: FinishedCallback) {
         log::info!("Application requested frontend to register new PIN");
         finished();
     }
 
-    fn change_pin(&mut self, finished: Box<dyn FnOnce() + Send>) {
+    fn change_pin(&self, finished: FinishedCallback) {
         log::info!("Application requested frontend to change PIN to new value");
         finished();
     }
@@ -83,9 +86,9 @@ impl ParentalControlsApplet for DefaultParentalControlsApplet {
 ///
 /// Corresponds to upstream `Core::Frontend::PhotoViewerApplet`.
 pub trait PhotoViewerApplet: Applet {
-    fn show_photos_for_application(&self, title_id: u64, finished: Box<dyn FnOnce() + Send>);
+    fn show_photos_for_application(&self, title_id: u64, finished: FinishedCallback);
 
-    fn show_all_photos(&self, finished: Box<dyn FnOnce() + Send>);
+    fn show_all_photos(&self, finished: FinishedCallback);
 }
 
 /// Default (stub) photo viewer applet implementation.
@@ -98,7 +101,7 @@ impl Applet for DefaultPhotoViewerApplet {
 }
 
 impl PhotoViewerApplet for DefaultPhotoViewerApplet {
-    fn show_photos_for_application(&self, title_id: u64, finished: Box<dyn FnOnce() + Send>) {
+    fn show_photos_for_application(&self, title_id: u64, finished: FinishedCallback) {
         log::info!(
             "Application requested frontend to display stored photos for title_id={:016X}",
             title_id
@@ -106,7 +109,7 @@ impl PhotoViewerApplet for DefaultPhotoViewerApplet {
         finished();
     }
 
-    fn show_all_photos(&self, finished: Box<dyn FnOnce() + Send>) {
+    fn show_all_photos(&self, finished: FinishedCallback) {
         log::info!("Application requested frontend to display all stored photos.");
         finished();
     }

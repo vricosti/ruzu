@@ -489,6 +489,8 @@ fn run_boot(
             ruzu_core::hle::service::am::frontend::applets::FrontendAppletSet {
                 controller: controller_applet,
                 error: None,
+                parental_controls: None,
+                photo_viewer: None,
                 profile_select: None,
                 software_keyboard,
             },

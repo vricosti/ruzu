@@ -5529,3 +5529,34 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
   `ResultCode`, matching upstream ownership.
 - `FrontendAppletHolder` now installs, preserves, and constructs the error applet backend for
   `AppletId::Error`.
+
+## 2026-08-22 — `applet_general.rs`, frontend `general.rs`, and `applets.rs` vs `applet_general.{h,cpp}`, frontend `general.{h,cpp}`, and `applets.cpp`
+
+### Intentional differences
+
+- Open C++ mode enums are transparent integer newtypes so unknown guest values remain valid Rust
+  values and reach Eden's unimplemented branches.
+- Parental-control frontend methods take `&self` instead of C++'s mutable object reference so the
+  frontend can be shared through `Arc`; implementations that need mutation use interior state.
+- Callback state is shared through `Arc` atomics. Synchronous callbacks leave completion signaling
+  to `ILibraryAppletAccessor`, while asynchronous callbacks signal the owner directly, avoiding a
+  recursive owner-mutex lock.
+- Rust sets explicit completion flags after Auth and PhotoViewer callbacks. Eden exits from those
+  callbacks but never updates its otherwise-present `complete` fields; Rust needs the flags for
+  the flattened `FrontendApplet::is_complete` contract.
+- StubApplet also records completion for the flattened interface. Its interactive path still runs
+  the following normal `Execute`, matching Eden's accessor ordering and duplicate fallback output.
+- `StubApplet` retains Eden's unused applet ID and flattened base owner fields with field-level
+  diagnostic annotations. They remain in their upstream owner rather than being deleted.
+- Eden's fallback log reads the applet program ID while it owns a separate shared pointer. Rust's
+  holder is called while the owner mutex is already locked, so it logs the applet ID only rather
+  than recursively locking merely to format the program ID.
+
+### Fixed parity debt
+
+- Replaced the three inert structs with Auth PIN verification/registration/change dispatch,
+  exact 0xC argument and 0x4 result payloads, PhotoViewer mode dispatch and empty output storage,
+  and StubApplet channel draining plus normal/interactive 0x1000 fallback outputs.
+- `FrontendAppletHolder` now installs and preserves parental-control/photo-viewer frontends,
+  constructs Auth and PhotoViewer, and returns StubApplet for unsupported IDs instead of no
+  frontend implementation.

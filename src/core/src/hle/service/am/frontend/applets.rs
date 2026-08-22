@@ -14,6 +14,10 @@ use parking_lot::Mutex;
 use crate::core::SystemRef;
 use crate::frontend::applets::controller::{ControllerApplet, DefaultControllerApplet};
 use crate::frontend::applets::error::{DefaultErrorApplet, ErrorApplet};
+use crate::frontend::applets::general::{
+    DefaultParentalControlsApplet, DefaultPhotoViewerApplet, ParentalControlsApplet,
+    PhotoViewerApplet,
+};
 use crate::frontend::applets::profile_select::{DefaultProfileSelectApplet, ProfileSelectApplet};
 use crate::frontend::applets::software_keyboard::{
     DefaultSoftwareKeyboardApplet, SoftwareKeyboardApplet,
@@ -26,6 +30,7 @@ use crate::hle::service::am::applet_data_broker::AppletDataBroker;
 use super::applet_cabinet::CabinetMode;
 use super::applet_controller::Controller;
 use super::applet_error::Error;
+use super::applet_general::{Auth, PhotoViewer, StubApplet};
 use super::applet_mii_edit::MiiEdit;
 use super::applet_profile_select::ProfileSelect;
 use super::applet_software_keyboard::SoftwareKeyboard;
@@ -53,6 +58,8 @@ pub trait FrontendApplet: Send + Sync {
 pub struct FrontendAppletSet {
     pub controller: Option<Arc<dyn ControllerApplet>>,
     pub error: Option<Arc<dyn ErrorApplet>>,
+    pub parental_controls: Option<Arc<dyn ParentalControlsApplet>>,
+    pub photo_viewer: Option<Arc<dyn PhotoViewerApplet>>,
     pub profile_select: Option<Arc<dyn ProfileSelectApplet>>,
     pub software_keyboard: Option<Arc<dyn SoftwareKeyboardApplet>>,
 }
@@ -71,6 +78,8 @@ impl FrontendAppletHolder {
             frontend: FrontendAppletSet {
                 controller: Some(Arc::new(DefaultControllerApplet::new(hid_core))),
                 error: Some(Arc::new(DefaultErrorApplet)),
+                parental_controls: Some(Arc::new(DefaultParentalControlsApplet)),
+                photo_viewer: Some(Arc::new(DefaultPhotoViewerApplet)),
                 profile_select: Some(Arc::new(DefaultProfileSelectApplet)),
                 software_keyboard: Some(Arc::new(DefaultSoftwareKeyboardApplet::new())),
             },
@@ -91,6 +100,12 @@ impl FrontendAppletHolder {
         }
         if set.error.is_some() {
             self.frontend.error = set.error.take();
+        }
+        if set.parental_controls.is_some() {
+            self.frontend.parental_controls = set.parental_controls.take();
+        }
+        if set.photo_viewer.is_some() {
+            self.frontend.photo_viewer = set.photo_viewer.take();
         }
         if set.profile_select.is_some() {
             self.frontend.profile_select = set.profile_select.take();
@@ -125,6 +140,18 @@ impl FrontendAppletHolder {
         mode: LibraryAppletMode,
     ) -> Option<Box<dyn FrontendApplet>> {
         match id {
+            AppletId::Auth => Some(Box::new(Auth::new(
+                system,
+                applet,
+                broker,
+                mode,
+                Arc::clone(
+                    self.frontend
+                        .parental_controls
+                        .as_ref()
+                        .expect("default parental-controls applet is installed"),
+                ),
+            ))),
             AppletId::Controller => Some(Box::new(Controller::new(
                 system,
                 applet,
@@ -174,7 +201,22 @@ impl FrontendAppletHolder {
                         .expect("default software keyboard applet is installed"),
                 ),
             ))),
-            _ => None,
+            AppletId::PhotoViewer => Some(Box::new(PhotoViewer::new(
+                system,
+                applet,
+                broker,
+                mode,
+                Arc::clone(
+                    self.frontend
+                        .photo_viewer
+                        .as_ref()
+                        .expect("default photo-viewer applet is installed"),
+                ),
+            ))),
+            _ => {
+                log::error!("No backend implementation exists for applet_id={id:?}; falling back to stub applet");
+                Some(Box::new(StubApplet::new(system, applet, broker, id, mode)))
+            }
         }
     }
 }
@@ -229,6 +271,8 @@ mod tests {
         holder.set_frontend_applet_set(FrontendAppletSet {
             controller: Some(Arc::clone(&controller)),
             error: None,
+            parental_controls: None,
+            photo_viewer: None,
             profile_select: None,
             software_keyboard: None,
         });
