@@ -1,8 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-//! Port of zuyu/src/core/hle/service/am/service/lock_accessor.h
-//! Port of zuyu/src/core/hle/service/am/service/lock_accessor.cpp
+//! Port of Eden's `core/hle/service/am/service/lock_accessor.{h,cpp}`.
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, Weak};
@@ -24,10 +23,8 @@ pub struct ILockAccessor {
     /// Matches upstream `bool m_is_locked`.
     is_locked: Mutex<bool>,
     owner_process: Weak<ProcessLock>,
-    event_object_id: u64,
     readable_event_object_id: u64,
     event: Arc<Mutex<KEvent>>,
-    readable_event: Arc<Mutex<KReadableEvent>>,
     handlers: BTreeMap<u32, FunctionInfo>,
     handlers_tipc: BTreeMap<u32, FunctionInfo>,
 }
@@ -45,9 +42,18 @@ impl ILockAccessor {
             (4, Some(Self::is_locked_handler), "IsLocked"),
         ]);
 
-        let event_object_id = NEXT_LOCK_ACCESSOR_EVENT_OBJECT_ID.fetch_add(1, Ordering::Relaxed);
-        let readable_event_object_id =
-            NEXT_LOCK_ACCESSOR_EVENT_OBJECT_ID.fetch_add(1, Ordering::Relaxed);
+        let (event_object_id, readable_event_object_id) =
+            if let Some(kernel) = crate::hle::kernel::kernel::get_kernel_ref() {
+                (
+                    kernel.create_new_object_id() as u64,
+                    kernel.create_new_object_id() as u64,
+                )
+            } else {
+                (
+                    NEXT_LOCK_ACCESSOR_EVENT_OBJECT_ID.fetch_add(1, Ordering::Relaxed),
+                    NEXT_LOCK_ACCESSOR_EVENT_OBJECT_ID.fetch_add(1, Ordering::Relaxed),
+                )
+            };
 
         let mut event = KEvent::new();
         let mut readable_event = KReadableEvent::new();
@@ -74,10 +80,8 @@ impl ILockAccessor {
         Self {
             is_locked: Mutex::new(false),
             owner_process: Arc::downgrade(&owner_process),
-            event_object_id,
             readable_event_object_id,
             event,
-            readable_event,
             handlers,
             handlers_tipc: BTreeMap::new(),
         }
@@ -199,16 +203,12 @@ mod tests {
 
         let accessor = ILockAccessor::new(Arc::clone(&owner_process));
 
-        assert!(owner_process
+        let readable_event_id = accessor.readable_event_object_id;
+        let readable_event = owner_process
             .lock()
             .unwrap()
-            .get_event_by_object_id(accessor.event_object_id)
-            .is_some());
-        assert!(owner_process
-            .lock()
-            .unwrap()
-            .get_readable_event_by_object_id(accessor.readable_event_object_id)
-            .is_some());
-        assert!(accessor.readable_event.lock().unwrap().is_signaled());
+            .get_readable_event_by_object_id(readable_event_id)
+            .unwrap();
+        assert!(readable_event.lock().unwrap().is_signaled());
     }
 }

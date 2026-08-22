@@ -6145,3 +6145,24 @@ vs Eden `display_list.h` and `layer_list.h`
   the `System`-owned channel used by `IHomeMenuFunctions`, rather than leaving the only producer
   unimplemented.
 - A focused regression verifies command wiring and the complete producer-to-system pop path.
+
+## 2026-08-22 — event ownership in `am/service/lock_accessor.rs` vs Eden
+`am/service/lock_accessor.{h,cpp}`
+
+### Intentional differences
+
+- Eden owns one `Event` through a `ServiceContext`. Ruzu's kernel bridge registers the matching
+  `KEvent` and `KReadableEvent` in the owner process, retains only the signaling owner and readable
+  object ID on the interface, and lets the process registry own the readable endpoint returned to
+  guest handles.
+- Unit tests without an installed `KernelCore` retain the isolated high-range object-ID fallback;
+  production now allocates both IDs through `KernelCore::create_new_object_id`, matching Eden's
+  central kernel allocation rather than using the fallback counter.
+
+### Fixed parity debt
+
+- Removed the stored event-owner ID and duplicate `Arc<KReadableEvent>` that were never consulted
+  after registration. `TryLock`, `Unlock`, `GetEvent`, initial signaling and persistent readable
+  endpoint identity are unchanged.
+- The focused event regression now resolves the readable endpoint through its actual process
+  owner. Both unread-field warnings are gone and `core` decreases from 68 to 67 warnings.
