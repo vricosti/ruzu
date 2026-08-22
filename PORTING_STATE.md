@@ -21,7 +21,12 @@
   `TimeZoneService`, checks initialization, reads current time, and converts it with the active
   timezone rule in Eden's exact short-circuit order. Only `SetCurrentPosixTime` remains absent, as
   it is also a TODO in Eden.
-- Status: both prerequisites completed; the `TimeWorker` implementation may resume.
+- Ownership prerequisite result: `TimeManager` remains the sole owner of the steady-clock
+  resource, file-timestamp worker, and time-zone binary. Rust shares those stable allocations with
+  `TimeWorker`, every glue `StaticService`, and each returned `TimeZoneService` through
+  `Arc<Mutex<_>>`, replacing the independent state copies that diverged from Eden's references.
+  Time-zone location changes now invoke the shared file-timestamp worker in Eden's order.
+- Status: all discovered prerequisites completed; the `TimeWorker` implementation may resume.
 
 ## 2026-08-22 — AlarmWorker warning slice interrupted by event-wiring prerequisite
 

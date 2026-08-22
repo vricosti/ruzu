@@ -6634,3 +6634,71 @@ vs Eden `display_list.h` and `layer_list.h`
   either service.
 - A lifetime regression verifies that the exact clock and timezone allocations remain owned until
   the worker is destroyed.
+## 2026-08-22 — `src/core/src/hle/service/glue/time/manager.rs` vs `src/core/hle/service/glue/time/manager.{h,cpp}`
+
+### Intentional differences
+- Rust stores the three manager-owned resources in `Arc<Mutex<_>>`: this preserves Eden's single
+  allocation and reference-sharing contract without self-referential Rust structs.
+
+### Unintentional differences (to fix)
+- `m_set_sys` and `m_time_m` are still acquired as temporary references during initialization
+  instead of being retained as manager members and forwarded to `TimeWorker`.
+
+### Missing items
+- The final constructor-side filesystem timestamp update still stops at Eden's own filesystem TODO.
+
+### Binary layout verification
+- PASS: this ownership-only change does not serialize or raw-copy any payload.
+
+## 2026-08-22 — `src/core/src/hle/service/glue/time/static.rs` vs `src/core/hle/service/glue/time/static.{h,cpp}`
+
+### Intentional differences
+- Eden's borrowed manager-resource references are represented by clones of the same
+  `Arc<Mutex<_>>` allocations so returned IPC services can safely outlive a temporary manager lock.
+
+### Unintentional differences (to fix)
+- The Rust service does not yet retain Eden's `m_set_sys`, `m_time_m`, `m_time_sm`, and
+  `m_time_zone` service owners as corresponding fields.
+
+### Missing items
+- Several public clock methods still return simplified success values instead of forwarding to
+  the wrapped PSC service; these pre-existing differences remain outside this ownership slice.
+
+### Binary layout verification
+- PASS: resource identity and lifetime changed, but no IPC payload layout changed.
+
+## 2026-08-22 — `src/core/src/hle/service/glue/time/time_zone.rs` vs `src/core/hle/service/glue/time/time_zone.{h,cpp}`
+
+### Intentional differences
+- C++ borrowed references to `FileTimestampWorker` and `TimeZoneBinary` use shared
+  `Arc<Mutex<_>>` owners in Rust, preserving identity and synchronized mutation.
+
+### Unintentional differences (to fix)
+- `SetDeviceLocationName` now performs Eden's shared file-timestamp update, but it still does not
+  persist the resulting name and update time through `set:sys` because that service owner is not
+  retained yet.
+- Rust owns only one optional operation event, while current Eden maintains a list of operation
+  events and signals every registered reader after a location update.
+
+### Missing items
+- The `m_set_sys` owner and its two setters are not yet ported into this glue service.
+
+### Binary layout verification
+- PASS: no raw payload type or IPC response layout changed in this ownership slice.
+
+## 2026-08-22 — `src/core/src/hle/service/glue/time/worker.rs` vs `src/core/hle/service/glue/time/worker.{h,cpp}`
+
+### Intentional differences
+- Eden's two borrowed resource references are represented by clones of the manager's exact
+  `Arc<Mutex<_>>` allocations, avoiding an unsafe self-reference while preserving ownership.
+
+### Unintentional differences (to fix)
+- Construction now receives the correct shared resources, but initialization, timer scheduling,
+  the nine-way event loop, and shutdown ordering are still the interrupted active slice.
+
+### Missing items
+- `ServiceContext` events, clock/event owners, timing events, worker thread, and exact event
+  dispatch remain to be ported next.
+
+### Binary layout verification
+- PASS: this ownership-only prerequisite does not expose a binary payload.

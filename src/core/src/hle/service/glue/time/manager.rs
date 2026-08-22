@@ -23,9 +23,9 @@ use crate::hle::service::sm::sm::ServiceManager;
 pub struct TimeManager {
     system: crate::core::SystemRef,
     pub worker: TimeWorker,
-    pub file_timestamp_worker: FileTimestampWorker,
-    pub steady_clock_resource: StandardSteadyClockResource,
-    pub time_zone_binary: TimeZoneBinary,
+    pub file_timestamp_worker: Arc<Mutex<FileTimestampWorker>>,
+    pub steady_clock_resource: Arc<Mutex<StandardSteadyClockResource>>,
+    pub time_zone_binary: Arc<Mutex<TimeZoneBinary>>,
     pub psc_time: Arc<Mutex<crate::hle::service::psc::time::manager::TimeManager>>,
     pub time_sm: Arc<PscStaticService>,
     service_manager: Arc<Mutex<ServiceManager>>,
@@ -49,13 +49,21 @@ impl TimeManager {
         } else {
             system.get().core_timing()
         };
+        let file_timestamp_worker = Arc::new(Mutex::new(FileTimestampWorker::new()));
+        let steady_clock_resource = Arc::new(Mutex::new(StandardSteadyClockResource::new()));
+        let time_zone_binary = Arc::new(Mutex::new(TimeZoneBinary::new(system)));
 
         Self {
             system,
-            worker: TimeWorker::new(Arc::clone(&time_m_handler), core_timing),
-            file_timestamp_worker: FileTimestampWorker::new(),
-            steady_clock_resource: StandardSteadyClockResource::new(),
-            time_zone_binary: TimeZoneBinary::new(system),
+            worker: TimeWorker::new(
+                Arc::clone(&time_m_handler),
+                core_timing,
+                Arc::clone(&steady_clock_resource),
+                Arc::clone(&file_timestamp_worker),
+            ),
+            file_timestamp_worker,
+            steady_clock_resource,
+            time_zone_binary,
             psc_time,
             time_sm: time_m.get_static_service_as_service_manager(),
             service_manager,
@@ -83,7 +91,7 @@ impl TimeManager {
             .downcast_ref::<TimeServiceManager>()
             .expect("time:m is not a PSC::Time::ServiceManager");
 
-        let res = self.time_zone_binary.mount();
+        let res = self.time_zone_binary.lock().unwrap().mount();
         if res.is_error() {
             log::error!("TimeManager: TimeZoneBinary::Mount failed");
         }
@@ -99,7 +107,12 @@ impl TimeManager {
 
         let mut epoch_time = get_epoch_time_from_initial_year(set_sys);
         if user_clock_context == SystemClockContext::default() {
-            if let Ok(rtc_time) = self.steady_clock_resource.get_rtc_time_in_seconds() {
+            if let Ok(rtc_time) = self
+                .steady_clock_resource
+                .lock()
+                .unwrap()
+                .get_rtc_time_in_seconds()
+            {
                 epoch_time = rtc_time;
             }
         }
@@ -141,10 +154,14 @@ impl TimeManager {
 
         self.setup_time_zone_service_core(set_sys, time_m);
 
-        let _ = self.steady_clock_resource.get_rtc_time_in_seconds();
+        let _ = self
+            .steady_clock_resource
+            .lock()
+            .unwrap()
+            .get_rtc_time_in_seconds();
 
         self.worker.start_thread();
-        self.file_timestamp_worker.initialized = true;
+        self.file_timestamp_worker.lock().unwrap().initialized = true;
 
         log::info!("Glue::Time::TimeManager: initialization complete");
     }
@@ -172,15 +189,15 @@ impl TimeManager {
         let standard_steady_clock_test_offset_ns =
             i64::from(test_offset_minutes) * 60 * 1_000_000_000;
 
-        let reset_detected = self.steady_clock_resource.get_reset_detected();
+        let mut steady_clock_resource = self.steady_clock_resource.lock().unwrap();
+        let reset_detected = steady_clock_resource.get_reset_detected();
         let mut candidate_source_id = external_clock_source_id;
         if reset_detected {
             candidate_source_id = [0u8; 16];
         }
 
         let mut clock_source_id = [0u8; 16];
-        self.steady_clock_resource
-            .initialize(Some(&mut clock_source_id), &candidate_source_id);
+        steady_clock_resource.initialize(Some(&mut clock_source_id), &candidate_source_id);
 
         if clock_source_id != external_clock_source_id {
             set_sys
@@ -193,7 +210,7 @@ impl TimeManager {
         let _ = time_m.setup_standard_steady_clock_core(
             reset_detected,
             clock_source_id,
-            self.steady_clock_resource.get_time(),
+            steady_clock_resource.get_time(),
             external_internal_offset_ns,
             standard_steady_clock_test_offset_ns,
         );
@@ -209,7 +226,8 @@ impl TimeManager {
             .lock()
             .unwrap()
             .get_device_time_zone_location_name();
-        let name = get_time_zone_string(&self.time_zone_binary, raw_name);
+        let mut time_zone_binary = self.time_zone_binary.lock().unwrap();
+        let name = get_time_zone_string(&time_zone_binary, raw_name);
 
         if name != raw_name {
             {
@@ -235,13 +253,11 @@ impl TimeManager {
             decode_steady_clock_time_point(&inner.get_device_time_zone_location_updated_time())
         };
 
-        let location_count = self.time_zone_binary.get_time_zone_count();
-        let rule_version = self
-            .time_zone_binary
+        let location_count = time_zone_binary.get_time_zone_count();
+        let rule_version = time_zone_binary
             .get_time_zone_version()
             .unwrap_or([0u8; 0x10]);
-        let rule_buffer = self
-            .time_zone_binary
+        let rule_buffer = time_zone_binary
             .get_time_zone_rule(&name)
             .unwrap_or_default();
         if rule_buffer.is_empty() {

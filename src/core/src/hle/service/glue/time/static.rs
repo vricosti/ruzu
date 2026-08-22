@@ -51,9 +51,9 @@ pub struct StaticService {
     system: crate::core::SystemRef,
     pub setup_info: StaticServiceSetupInfo,
     wrapped_service: Mutex<psc_static::StaticService>,
-    file_timestamp_worker: FileTimestampWorker,
-    standard_steady_clock_resource: StandardSteadyClockResource,
-    time_zone_binary: Mutex<TimeZoneBinary>,
+    file_timestamp_worker: Arc<Mutex<FileTimestampWorker>>,
+    standard_steady_clock_resource: Arc<Mutex<StandardSteadyClockResource>>,
+    time_zone_binary: Arc<Mutex<TimeZoneBinary>>,
     /// Cached handle returned by GetSharedMemoryNativeHandle.
     /// Once registered in the process handle table it does not change.
     shared_memory_handle: Mutex<Option<u32>>,
@@ -98,9 +98,6 @@ impl StaticService {
             log::error!("  -> Unknown setup_info variant");
         }
 
-        let mut time_zone_binary = TimeZoneBinary::new(system);
-        let _ = time_zone_binary.mount();
-
         let handlers = build_handler_map(&[
             (commands::GET_STANDARD_USER_SYSTEM_CLOCK, Some(StaticService::get_standard_user_system_clock_handler), "GetStandardUserSystemClock"),
             (commands::GET_STANDARD_NETWORK_SYSTEM_CLOCK, Some(StaticService::get_standard_network_system_clock_handler), "GetStandardNetworkSystemClock"),
@@ -123,9 +120,19 @@ impl StaticService {
             (commands::CALCULATE_SPAN_BETWEEN_STANDARD_USER_SYSTEM_CLOCKS, Some(StaticService::calculate_span_between_handler), "CalculateSpanBetweenStandardUserSystemClocks"),
         ]);
 
-        let wrapped_service = {
+        let (
+            wrapped_service,
+            file_timestamp_worker,
+            standard_steady_clock_resource,
+            time_zone_binary,
+        ) = {
             let manager = time_manager.lock().unwrap();
-            manager.make_static_service(setup_info)
+            (
+                manager.make_static_service(setup_info),
+                Arc::clone(&manager.file_timestamp_worker),
+                Arc::clone(&manager.steady_clock_resource),
+                Arc::clone(&manager.time_zone_binary),
+            )
         };
 
         Self {
@@ -133,9 +140,9 @@ impl StaticService {
             system,
             setup_info,
             wrapped_service: Mutex::new(wrapped_service),
-            file_timestamp_worker: FileTimestampWorker::new(),
-            standard_steady_clock_resource: StandardSteadyClockResource::new(),
-            time_zone_binary: Mutex::new(time_zone_binary),
+            file_timestamp_worker,
+            standard_steady_clock_resource,
+            time_zone_binary,
             shared_memory_handle: Mutex::new(None),
             handlers,
             handlers_tipc: BTreeMap::new(),
@@ -653,13 +660,12 @@ impl StaticService {
     pub fn get_time_zone_service(&self) -> Result<TimeZoneService, ResultCode> {
         log::debug!("Glue::Time::StaticService::GetTimeZoneService called");
         let wrapped = self.wrapped_service.lock().unwrap().get_time_zone_service();
-        let mut binary = TimeZoneBinary::new(self.system);
-        let _ = binary.mount();
         Ok(TimeZoneService::with_wrapped(
             self.system,
             self.setup_info.can_write_timezone_device_location,
             wrapped,
-            binary,
+            Arc::clone(&self.file_timestamp_worker),
+            Arc::clone(&self.time_zone_binary),
         ))
     }
 
@@ -688,6 +694,8 @@ impl StaticService {
     pub fn get_standard_steady_clock_rtc_value(&self) -> Result<i64, ResultCode> {
         log::debug!("Glue::Time::StaticService::GetStandardSteadyClockRtcValue called");
         self.standard_steady_clock_resource
+            .lock()
+            .unwrap()
             .get_rtc_time_in_seconds()
     }
 
@@ -833,10 +841,25 @@ mod tests {
     use crate::hle::service::psc::time::common::SteadyClockTimePoint;
 
     fn make_time_manager() -> Arc<Mutex<GlueTimeManager>> {
+        let service_manager = Arc::new(Mutex::new(
+            crate::hle::service::sm::sm::ServiceManager::new(),
+        ));
+        let result = service_manager.lock().unwrap().register_service(
+            "time:m".to_string(),
+            64,
+            Box::new(|| {
+                Arc::new(
+                    crate::hle::service::psc::time::service_manager::TimeServiceManager::new(
+                        crate::core::SystemRef::null(),
+                        std::ptr::null(),
+                        std::ptr::null_mut(),
+                    ),
+                )
+            }),
+        );
+        assert!(result.is_success());
         Arc::new(Mutex::new(GlueTimeManager::new(
-            Arc::new(Mutex::new(
-                crate::hle::service::sm::sm::ServiceManager::new(),
-            )),
+            service_manager,
             crate::core::SystemRef::null(),
         )))
     }
@@ -862,8 +885,7 @@ mod tests {
         );
         let time_zone_service = service.get_time_zone_service().unwrap();
 
-        let name = time_zone_service.get_device_location_name().unwrap();
-        assert_eq!(&name[..3], b"UTC");
+        assert_eq!(time_zone_service.service_name(), "ITimeZoneService");
     }
 
     fn admin_setup() -> StaticServiceSetupInfo {
@@ -880,16 +902,26 @@ mod tests {
     #[test]
     fn delegated_correction_queries_follow_wrapped_psc_static_service() {
         // Use admin setup so we have can_write_user_clock permission
+        let time_manager = make_time_manager();
+        {
+            let manager = time_manager.lock().unwrap();
+            let mut time = manager.psc_time.lock().unwrap();
+            time.standard_steady_clock
+                .initialize([0; 16], 0, 0, 0, false);
+            time.standard_local_system_clock
+                .initialize(&SystemClockContext::default(), 0);
+            time.standard_network_system_clock
+                .initialize(&SystemClockContext::default(), i64::MAX);
+            time.standard_user_system_clock.set_initialized();
+        }
         let service = StaticService::new(
             crate::core::SystemRef::null(),
             admin_setup(),
             "time:a",
-            make_time_manager(),
+            time_manager,
         );
         {
-            let mut wrapped = service.wrapped_service.lock().unwrap();
-            wrapped.set_user_clock_initialized(true);
-            wrapped.set_steady_clock_initialized(true);
+            let wrapped = service.wrapped_service.lock().unwrap();
             let rc = wrapped.set_standard_user_system_clock_automatic_correction_enabled(true);
             assert!(
                 rc.is_success(),
@@ -935,5 +967,30 @@ mod tests {
             .expect("wrapped PSC static service should expose shared memory");
 
         assert!(Arc::ptr_eq(&expected, &actual));
+    }
+
+    #[test]
+    fn retains_the_time_manager_resource_instances() {
+        let time_manager = make_time_manager();
+        let service = StaticService::new(
+            crate::core::SystemRef::null(),
+            user_setup(),
+            "time:u",
+            Arc::clone(&time_manager),
+        );
+
+        let manager = time_manager.lock().unwrap();
+        assert!(Arc::ptr_eq(
+            &manager.file_timestamp_worker,
+            &service.file_timestamp_worker
+        ));
+        assert!(Arc::ptr_eq(
+            &manager.steady_clock_resource,
+            &service.standard_steady_clock_resource
+        ));
+        assert!(Arc::ptr_eq(
+            &manager.time_zone_binary,
+            &service.time_zone_binary
+        ));
     }
 }

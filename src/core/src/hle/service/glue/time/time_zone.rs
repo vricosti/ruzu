@@ -24,6 +24,7 @@ use crate::hle::service::psc::time::time_zone::TzRule;
 use crate::hle::service::psc::time::time_zone_service::TimeZoneService as PscTimeZoneService;
 use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
 
+use super::file_timestamp_worker::FileTimestampWorker;
 use super::time_zone_binary::TimeZoneBinary;
 
 /// IPC command IDs for Glue::Time::TimeZoneService.
@@ -63,7 +64,9 @@ pub struct TimeZoneService {
     /// Wrapped PSC timezone service. Upstream: `m_wrapped_service`.
     wrapped_service: Mutex<PscTimeZoneService>,
     /// TimeZone binary data provider. Upstream: `m_time_zone_binary`.
-    time_zone_binary: Mutex<TimeZoneBinary>,
+    time_zone_binary: Arc<Mutex<TimeZoneBinary>>,
+    /// Filesystem timestamp updater. Upstream: `m_file_timestamp_worker`.
+    file_timestamp_worker: Arc<Mutex<FileTimestampWorker>>,
     /// Mutex for location changes. Upstream: `m_mutex`.
     mutex: Mutex<()>,
     /// Upstream: `Service::PSC::Time::OperationEvent m_operation_event`.
@@ -162,7 +165,8 @@ impl TimeZoneService {
             wrapped_service: Mutex::new(PscTimeZoneService::new(
                 can_write_timezone_device_location,
             )),
-            time_zone_binary: Mutex::new(tz_binary),
+            time_zone_binary: Arc::new(Mutex::new(tz_binary)),
+            file_timestamp_worker: Arc::new(Mutex::new(FileTimestampWorker::new())),
             mutex: Mutex::new(()),
             operation_event: Mutex::new(None),
             handlers: Self::build_handlers(),
@@ -175,13 +179,15 @@ impl TimeZoneService {
         system: crate::core::SystemRef,
         can_write_timezone_device_location: bool,
         wrapped_service: PscTimeZoneService,
-        time_zone_binary: TimeZoneBinary,
+        file_timestamp_worker: Arc<Mutex<FileTimestampWorker>>,
+        time_zone_binary: Arc<Mutex<TimeZoneBinary>>,
     ) -> Self {
         Self {
             system,
             can_write_timezone_device_location,
             wrapped_service: Mutex::new(wrapped_service),
-            time_zone_binary: Mutex::new(time_zone_binary),
+            time_zone_binary,
+            file_timestamp_worker,
             mutex: Mutex::new(()),
             operation_event: Mutex::new(None),
             handlers: Self::build_handlers(),
@@ -237,8 +243,13 @@ impl TimeZoneService {
             return rc;
         }
 
-        // Upstream also updates filesystem timestamps and persists the new
-        // location through set:sys. Those owners are not wired here yet.
+        self.file_timestamp_worker
+            .lock()
+            .unwrap()
+            .set_filesystem_posix_time();
+
+        // Upstream also persists the new location through set:sys. That owner
+        // is not wired here yet.
         if let Some(readable_event) = self.operation_event.lock().unwrap().as_ref() {
             let _ = readable_event.lock().unwrap().signal();
         }
@@ -752,6 +763,7 @@ impl ServiceFramework for TimeZoneService {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::hle::service::psc::time::time_zone_service::TimeZoneService as PscTimeZoneService;
 
     #[test]
     fn exercised_handlers_are_registered() {
@@ -776,5 +788,26 @@ mod tests {
             .get(&commands::TO_POSIX_TIME_WITH_MY_RULE)
             .and_then(|f| f.handler_callback)
             .is_some());
+    }
+
+    #[test]
+    fn wrapped_service_retains_manager_owned_resources() {
+        let file_timestamp_worker = Arc::new(Mutex::new(FileTimestampWorker::new()));
+        let time_zone_binary = Arc::new(Mutex::new(TimeZoneBinary::new(
+            crate::core::SystemRef::null(),
+        )));
+        let service = TimeZoneService::with_wrapped(
+            crate::core::SystemRef::null(),
+            false,
+            PscTimeZoneService::new(false),
+            Arc::clone(&file_timestamp_worker),
+            Arc::clone(&time_zone_binary),
+        );
+
+        assert!(Arc::ptr_eq(
+            &file_timestamp_worker,
+            &service.file_timestamp_worker
+        ));
+        assert!(Arc::ptr_eq(&time_zone_binary, &service.time_zone_binary));
     }
 }

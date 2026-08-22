@@ -9,11 +9,13 @@
 //! and power state changes.
 
 use super::alarm_worker::AlarmWorker;
+use super::file_timestamp_worker::FileTimestampWorker;
 use super::pm_state_change_handler::PmStateChangeHandler;
+use super::standard_steady_clock_resource::StandardSteadyClockResource;
 use crate::core_timing::CoreTiming;
 use crate::hle::service::hle_ipc::SessionRequestHandlerPtr;
 use crate::hle::service::psc::time::common::SystemClockContext;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 /// Event types processed in the TimeWorker thread loop.
 ///
@@ -38,6 +40,8 @@ pub enum EventType {
 pub struct TimeWorker {
     pub alarm_worker: AlarmWorker,
     pub pm_state_change_handler: PmStateChangeHandler,
+    steady_clock_resource: Arc<Mutex<StandardSteadyClockResource>>,
+    file_timestamp_worker: Arc<Mutex<FileTimestampWorker>>,
     /// Whether the initial report for network clock context has been set.
     ig_report_network_clock_context_set: bool,
     report_network_clock_context: SystemClockContext,
@@ -59,10 +63,17 @@ impl TimeWorker {
     ///
     /// Corresponds to `TimeWorker::TimeWorker(System&, StandardSteadyClockResource&,
     /// FileTimestampWorker&)` in upstream worker.cpp.
-    pub fn new(time_manager: SessionRequestHandlerPtr, core_timing: Arc<CoreTiming>) -> Self {
+    pub fn new(
+        time_manager: SessionRequestHandlerPtr,
+        core_timing: Arc<CoreTiming>,
+        steady_clock_resource: Arc<Mutex<StandardSteadyClockResource>>,
+        file_timestamp_worker: Arc<Mutex<FileTimestampWorker>>,
+    ) -> Self {
         Self {
             alarm_worker: AlarmWorker::new(time_manager, core_timing),
             pm_state_change_handler: PmStateChangeHandler::new(),
+            steady_clock_resource,
+            file_timestamp_worker,
             ig_report_network_clock_context_set: false,
             report_network_clock_context: SystemClockContext::default(),
             ig_report_ephemeral_clock_context_set: false,
@@ -137,5 +148,38 @@ impl TimeWorker {
     #[allow(dead_code)]
     fn thread_func(&mut self) {
         log::debug!("TimeWorker::ThreadFunc started (event loop requires kernel WaitAny)");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::SystemRef;
+    use crate::hle::service::psc::time::service_manager::TimeServiceManager;
+
+    #[test]
+    fn retains_manager_owned_resource_allocations() {
+        let time_manager: SessionRequestHandlerPtr = Arc::new(TimeServiceManager::new(
+            SystemRef::null(),
+            std::ptr::null(),
+            std::ptr::null_mut(),
+        ));
+        let steady_clock_resource = Arc::new(Mutex::new(StandardSteadyClockResource::new()));
+        let file_timestamp_worker = Arc::new(Mutex::new(FileTimestampWorker::new()));
+        let worker = TimeWorker::new(
+            time_manager,
+            Arc::new(CoreTiming::new()),
+            Arc::clone(&steady_clock_resource),
+            Arc::clone(&file_timestamp_worker),
+        );
+
+        assert!(Arc::ptr_eq(
+            &steady_clock_resource,
+            &worker.steady_clock_resource
+        ));
+        assert!(Arc::ptr_eq(
+            &file_timestamp_worker,
+            &worker.file_timestamp_worker
+        ));
     }
 }
