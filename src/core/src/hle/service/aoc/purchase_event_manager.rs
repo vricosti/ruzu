@@ -1,16 +1,17 @@
 // SPDX-FileCopyrightText: Copyright 2018 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-//! Port of zuyu/src/core/hle/service/aoc/purchase_event_manager.h
-//! Port of zuyu/src/core/hle/service/aoc/purchase_event_manager.cpp
+//! Port of Eden's `core/hle/service/aoc/purchase_event_manager.{h,cpp}`.
 //!
 //! IPurchaseEventManager service.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use crate::hle::result::{ErrorModule, ResultCode};
 use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
-use crate::hle::service::ipc_helpers::ResponseBuilder;
+use crate::hle::service::ipc_helpers::{RequestParser, ResponseBuilder};
+use crate::hle::service::os::event::Event;
 use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
 
 /// Error: no purchased product info available.
@@ -41,6 +42,16 @@ impl IPurchaseEventManager {
     pub fn new() -> Self {
         let handlers = build_handler_map(&[
             (
+                commands::SET_DEFAULT_DELIVERY_TARGET,
+                Some(Self::set_default_delivery_target_handler),
+                "SetDefaultDeliveryTarget",
+            ),
+            (
+                commands::SET_DELIVERY_TARGET,
+                Some(Self::set_delivery_target_handler),
+                "SetDeliveryTarget",
+            ),
+            (
                 commands::POP_PURCHASED_PRODUCT_INFO,
                 Some(Self::pop_purchased_product_info_handler),
                 "PopPurchasedProductInfo",
@@ -59,7 +70,8 @@ impl IPurchaseEventManager {
         let mut service_context = crate::hle::service::kernel_helpers::ServiceContext::new(
             "IPurchaseEventManager".to_string(),
         );
-        let purchased_event_handle = service_context.create_event("purchased_event".to_string());
+        let purchased_event_handle =
+            service_context.create_event("IPurchaseEventManager:PurchasedEvent".to_string());
         Self {
             service_context,
             purchased_event_handle,
@@ -85,8 +97,9 @@ impl IPurchaseEventManager {
     }
 
     /// GetPurchasedEvent (cmd 2) — returns the purchased event readable handle.
-    pub fn get_purchased_event(&self) {
+    pub fn get_purchased_event(&self) -> Option<Arc<Event>> {
         log::warn!("IPurchaseEventManager::get_purchased_event called");
+        self.service_context.get_event(self.purchased_event_handle)
     }
 
     /// Stubbed: PopPurchasedProductInfo (cmd 3)
@@ -101,19 +114,42 @@ impl IPurchaseEventManager {
         Err(RESULT_NO_PURCHASED_PRODUCT_INFO_AVAILABLE)
     }
 
+    fn set_default_delivery_target_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        let service =
+            unsafe { &*(this as *const dyn ServiceFramework as *const IPurchaseEventManager) };
+        let process_id = ctx.get_pid();
+        let in_buffer = ctx.read_buffer(0);
+        service.set_default_delivery_target(process_id, &in_buffer);
+
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(crate::hle::result::RESULT_SUCCESS);
+    }
+
+    fn set_delivery_target_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let service =
+            unsafe { &*(this as *const dyn ServiceFramework as *const IPurchaseEventManager) };
+        let mut rp = RequestParser::new(ctx);
+        let unknown = rp.pop_u64();
+        let in_buffer = ctx.read_buffer(0);
+        service.set_delivery_target(unknown, &in_buffer);
+
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(crate::hle::result::RESULT_SUCCESS);
+    }
+
     fn get_purchased_event_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         let service =
             unsafe { &*(this as *const dyn ServiceFramework as *const IPurchaseEventManager) };
-        service.get_purchased_event();
-        if let Some(handle) = ctx.create_readable_event_handle(false) {
-            let mut rb = ResponseBuilder::new(ctx, 2, 1, 0);
-            rb.push_result(crate::hle::result::RESULT_SUCCESS);
-            rb.push_copy_objects(handle);
-        } else {
-            let mut rb = ResponseBuilder::new(ctx, 2, 1, 0);
-            rb.push_result(crate::hle::result::RESULT_SUCCESS);
-            rb.push_copy_objects(0);
-        }
+        let object_id = service
+            .get_purchased_event()
+            .and_then(|event| event.copy_object_id(ctx))
+            .unwrap_or(0);
+        let mut rb = ResponseBuilder::new(ctx, 2, 1, 0);
+        rb.push_result(crate::hle::result::RESULT_SUCCESS);
+        rb.push_copy_object_id(object_id);
     }
 
     fn pop_purchased_product_info_handler(
@@ -162,5 +198,31 @@ impl ServiceFramework for IPurchaseEventManager {
 
     fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
         &self.handlers_tipc
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn purchased_event_is_persistent_and_all_upstream_commands_are_registered() {
+        let service = IPurchaseEventManager::new();
+        let first = service.get_purchased_event().unwrap();
+        let second = service.get_purchased_event().unwrap();
+
+        assert!(Arc::ptr_eq(&first, &second));
+        for command in 0..=4 {
+            assert!(service
+                .handlers
+                .get(&command)
+                .unwrap()
+                .handler_callback
+                .is_some());
+        }
+        assert_eq!(
+            service.pop_purchased_product_info(),
+            Err(RESULT_NO_PURCHASED_PRODUCT_INFO_AVAILABLE)
+        );
     }
 }

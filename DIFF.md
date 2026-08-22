@@ -6207,3 +6207,23 @@ vs Eden `display_list.h` and `layer_list.h`
   storage still rejects normal access with `ResultInvalidStorageType`.
 - A focused regression covers the buffer-storage branch and its exact invalid-type result. The
   unread `IStorage::system` warning is gone and `core` decreases from 66 to 65 warnings.
+
+## 2026-08-22 — `aoc/purchase_event_manager.rs` vs Eden
+`aoc/purchase_event_manager.{h,cpp}`
+
+### Intentional differences
+
+- Rust stores the persistent event's `ServiceContext` handle and resolves its `Arc<Event>` when
+  needed, instead of retaining Eden's raw `KEvent*`. `ServiceContext::Drop` closes its remaining
+  events, providing the same interface-destruction ownership as Eden's explicit destructor.
+
+### Fixed parity debt
+
+- `GetPurchasedEvent` now returns the readable end of the constructor-owned persistent event. It
+  previously created and returned an unrelated event on every call, leaving both actual owner
+  fields unread and making future signaling invisible to the guest.
+- Restored commands 0 `SetDefaultDeliveryTarget` and 1 `SetDeliveryTarget`, including client PID,
+  `u64` and mapped input-buffer decoding; like Eden, both remain logged successful stubs.
+- The event name now exactly matches Eden, and a focused regression verifies persistent identity,
+  all five implemented command registrations and the exact no-product result. `core` decreases
+  from 65 to 64 warnings.
