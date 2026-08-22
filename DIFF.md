@@ -5631,3 +5631,58 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
   enum/packed-tag types instead of untyped bytes.
 - Zeroed defaults cover all reserved bytes; focused tests verify every frontend payload size and
   the upstream date/settings bit encoding.
+
+## 2026-08-22 — Cabinet frontend ownership vs Eden
+`core/hle/service/am/frontend/applet_cabinet.{h,cpp}`,
+`core/frontend/applets/cabinet.{h,cpp}` and `core/hle/service/am/frontend/applets.cpp`
+
+### Intentional differences
+
+- The packed input stores mode/flag bytes as raw `u8` values and decodes the mode before use.
+  Eden copies directly into C++ enums; the raw representation preserves the 0x1A8 layout without
+  allowing malformed guest bytes to create an invalid Rust enum.
+- Callback state, the broker and the NFC device are shared owners captured by the Rust callback.
+  A synchronous callback defers locking the applet owner until the accessor observes
+  `is_complete`; asynchronous callbacks signal it directly.
+- Return data is assembled into a zero-filled 0x188-byte buffer at the exact upstream offsets,
+  rather than copying a packed Rust object and risking padding or invalid-enum bytes.
+- The Rust frontend callback is one-shot because every Eden Cabinet path invokes it once; this
+  makes ownership explicit while preserving the observed call contract.
+
+### Fixed parity debt
+
+- Replaced the inert `is_complete`-only Cabinet with Eden's initialization, execution, four-mode
+  dispatch, cancellation, result flags, request-exit and completion lifecycle.
+- Removed the frontend's duplicate placeholder mode/tag/register types; it now consumes the
+  NFP/NFC-owned types, and `FrontendAppletHolder` installs and routes the Cabinet backend.
+- Focused tests verify the 0x1A8/0x188 binary contracts and the synchronous default-frontend
+  cancellation path.
+
+## 2026-08-22 — `nfc/common/device.rs` and `device_manager.rs` vs `nfc/common/device.{h,cpp}` and `device_manager.{h,cpp}`
+
+### Intentional differences
+
+- `NfcDevice` uses a stable `Arc<parking_lot::Mutex<_>>` inner allocation so the HID callback can
+  hold a `Weak` owner safely. Eden's `shared_ptr<NfcDevice>` and raw `this` callback provide the
+  same stable lifetime through C++ ownership.
+- Kernel events are retained as shared Rust event owners rather than raw `KEvent*`; callback
+  signaling and readable-event identity are preserved.
+- Packed amiibo fields are accessed with unaligned reads/writes, and CRC payloads are assembled in
+  explicit zero-free byte arrays instead of taking references to packed fields.
+
+### Unintentional differences (to fix)
+
+- `GetAmiiboDate` currently converts the host POSIX clock as UTC. Eden converts through the
+  emulated `time:u` timezone rule, so a configured non-UTC guest timezone can differ around a
+  calendar boundary.
+- The legacy `DeviceManager::new()` path used by the standalone NFC interface has no `SystemRef`
+  and therefore no HID controller callbacks. NFP and Cabinet use `new_with_system` or a direct
+  controller owner and do have live NFC integration.
+
+### Missing items
+
+- The broader pre-existing partial NFC port still lacks Mifare/pass-through behavior,
+  `GetRegisterInfoPrivate`, admin/all/debug/NTF operations, and full create/read/write application
+  area behavior. Cabinet's required register mutation, delete, restore and format paths are ported.
+- The no-key fallback reconstructs the encoded tag layout but does not yet populate Eden's
+  generated fallback name, Mii and dates.

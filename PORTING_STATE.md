@@ -2,7 +2,7 @@
 
 ## 2026-08-22 — Cabinet frontend applet warning slice
 
-- Status: interrupted pending the NFC/NFP owner prerequisites.
+- Status: completed and verified for the Cabinet lifecycle slice.
 - Interrupted slice: consume `Cabinet::is_complete` through Eden's initialization, execution,
   result and cancellation lifecycle, then install `Cabinet` in `FrontendAppletHolder`.
 - Exact missing prerequisites: Ruzu's `nfp_types.rs` lacks `CabinetMode` and
@@ -20,6 +20,16 @@
   complete NFP information payloads, while `TagInfo` is again the NFC-owned alias. Exact size and
   bit-encoding tests pass. Restoring the NFC device's tag owners and register-info methods remains
   the active prerequisite.
+- Prerequisite result: `NfcDevice` now owns the HID controller/callback, plain and encrypted tag
+  data, backup I/O, register-info mutation/output, erase/restore/format paths and write protection.
+  The NFP manager supplies the live `System` HID owner. Focused tag-state and register-info tests
+  pass.
+- Resumed result: Cabinet parses the exact 0x1A8 input, constructs the NFC device, dispatches all
+  four upstream modes, emits the exact 0x188 result, handles cancellation/request-exit and is
+  installed by `FrontendAppletHolder`. The original unread `is_complete` warning is gone.
+- Follow-up outside this slice: the standalone NFC service still constructs its manager through
+  the legacy no-`System` path, and the rest of the already-partial NFC device API remains tracked
+  in `DIFF.md`; neither is a Cabinet prerequisite.
 
 ## 2026-08-22 — Web browser applet warning slice
 

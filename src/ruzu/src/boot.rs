@@ -487,6 +487,7 @@ fn run_boot(
         );
         system.set_frontend_applet_set(
             ruzu_core::hle::service::am::frontend::applets::FrontendAppletSet {
+                cabinet: None,
                 controller: controller_applet,
                 error: None,
                 parental_controls: None,

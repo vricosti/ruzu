@@ -9,64 +9,7 @@ use std::sync::Arc;
 
 use super::applet::Applet;
 use crate::hle::service::nfc::common::device::NfcDevice;
-
-/// Corresponds to upstream `Service::NFP::CabinetMode`.
-/// Local definition until hle::service::nfp types are ported.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u32)]
-pub enum CabinetMode {
-    StartNicknameAndOwnerSettings = 0,
-    StartGameDataEraser = 1,
-    StartRestorer = 2,
-    StartFormatter = 3,
-}
-
-impl Default for CabinetMode {
-    fn default() -> Self {
-        Self::StartNicknameAndOwnerSettings
-    }
-}
-
-/// Corresponds to upstream `Service::NFP::TagInfo`.
-/// Local definition until hle::service::nfp types are ported.
-#[derive(Debug, Clone)]
-pub struct TagInfo {
-    pub uuid: [u8; 10],
-    pub uuid_length: u8,
-    pub padding1: [u8; 0x15],
-    pub protocol: u32,
-    pub tag_type: u32,
-    pub padding2: [u8; 0x30],
-}
-
-impl Default for TagInfo {
-    fn default() -> Self {
-        Self {
-            uuid: [0; 10],
-            uuid_length: 0,
-            padding1: [0; 0x15],
-            protocol: 0,
-            tag_type: 0,
-            padding2: [0; 0x30],
-        }
-    }
-}
-
-/// Corresponds to upstream `Service::NFP::RegisterInfo`.
-/// Local definition until hle::service::nfp types are ported.
-#[derive(Debug, Clone)]
-pub struct RegisterInfo {
-    // Placeholder - full struct from nfp_types.h
-    pub _placeholder: [u8; 0x100],
-}
-
-impl Default for RegisterInfo {
-    fn default() -> Self {
-        Self {
-            _placeholder: [0; 0x100],
-        }
-    }
-}
+use crate::hle::service::nfp::nfp_types::{CabinetMode, RegisterInfo, TagInfo};
 
 /// Parameters for the cabinet applet.
 ///

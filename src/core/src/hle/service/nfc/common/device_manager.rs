@@ -42,15 +42,34 @@ impl DeviceManager {
     /// Upstream constructor: creates ServiceContext, availability_change_event, and
     /// 10 NfcDevice instances via `HID::IndexToNpadIdType(device_index)`.
     pub fn new() -> Self {
+        Self::new_impl(None)
+    }
+
+    pub fn new_with_system(system: crate::core::SystemRef) -> Self {
+        Self::new_impl(Some(system))
+    }
+
+    fn new_impl(system: Option<crate::core::SystemRef>) -> Self {
         let mut service_context = ServiceContext::new("Nfc:DeviceManager".to_string());
         let availability_change_event_handle =
             service_context.create_event("Nfc:DeviceManager:AvailabilityChangeEvent".to_string());
+        let availability_change_event = service_context
+            .get_event(availability_change_event_handle)
+            .expect("just created availability-change event");
+        let hid_core = system.map(|system| system.get().hid_core());
 
         let mut devices = Vec::with_capacity(NUM_DEVICES);
         for device_index in 0..NUM_DEVICES {
-            // Upstream: NfcDevice(HID::IndexToNpadIdType(device_index), system, ...)
-            // Use device_index as npad_id for now (matching upstream index mapping).
-            devices.push(NfcDevice::new(device_index as u64, &mut service_context));
+            let npad_id = hid_core::hid_util::index_to_npad_id_type(device_index);
+            let controller = hid_core
+                .as_ref()
+                .map(|hid_core| hid_core.lock().get_emulated_controller(npad_id));
+            devices.push(NfcDevice::new_with_controller(
+                npad_id as u64,
+                controller,
+                Some(Arc::clone(&availability_change_event)),
+                &mut service_context,
+            ));
         }
 
         Self {
@@ -406,13 +425,13 @@ impl DeviceManager {
     ///
     /// Upstream: calls `GetDeviceHandle` then `device->GetRegisterInfo(register_info)`,
     /// then `VerifyDeviceResult`.
-    pub fn get_register_info(&self, device_handle: u64) -> ResultCode {
-        let device = match self.get_device_handle_checked(device_handle) {
-            Ok(d) => d,
-            Err(e) => return e,
-        };
+    pub fn get_register_info(
+        &self,
+        device_handle: u64,
+    ) -> Result<nfp_types::RegisterInfo, ResultCode> {
+        let device = self.get_device_handle_checked(device_handle)?;
         let result = device.get_register_info();
-        self.verify_device_result_immut(device_handle, result)
+        result.map_err(|error| self.verify_device_result_immut(device_handle, error))
     }
 
     /// Gets common info for the specified device.
@@ -435,13 +454,10 @@ impl DeviceManager {
     ///
     /// Upstream: calls `GetDeviceHandle` then `device->GetModelInfo(model_info)`,
     /// then `VerifyDeviceResult`.
-    pub fn get_model_info(&self, device_handle: u64) -> ResultCode {
-        let device = match self.get_device_handle_checked(device_handle) {
-            Ok(d) => d,
-            Err(e) => return e,
-        };
+    pub fn get_model_info(&self, device_handle: u64) -> Result<nfp_types::ModelInfo, ResultCode> {
+        let device = self.get_device_handle_checked(device_handle)?;
         let result = device.get_model_info();
-        self.verify_device_result_immut(device_handle, result)
+        result.map_err(|error| self.verify_device_result_immut(device_handle, error))
     }
 
     /// Returns the size of the NFP application area.
@@ -467,7 +483,7 @@ impl DeviceManager {
         }
 
         match self.get_device_from_handle(device_handle, false) {
-            Ok(device) => Some(Arc::clone(device.get_activate_event())),
+            Ok(device) => Some(device.get_activate_event()),
             Err(_) => None,
         }
     }
@@ -488,7 +504,7 @@ impl DeviceManager {
         }
 
         match self.get_device_from_handle(device_handle, false) {
-            Ok(device) => Some(Arc::clone(device.get_deactivate_event())),
+            Ok(device) => Some(device.get_deactivate_event()),
             Err(_) => None,
         }
     }

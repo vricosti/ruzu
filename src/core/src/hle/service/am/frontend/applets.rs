@@ -12,6 +12,7 @@ use hid_core::hid_core::HIDCore;
 use parking_lot::Mutex;
 
 use crate::core::SystemRef;
+use crate::frontend::applets::cabinet::{CabinetApplet, DefaultCabinetApplet};
 use crate::frontend::applets::controller::{ControllerApplet, DefaultControllerApplet};
 use crate::frontend::applets::error::{DefaultErrorApplet, ErrorApplet};
 use crate::frontend::applets::general::{
@@ -27,8 +28,9 @@ use crate::hle::result::ResultCode;
 use crate::hle::service::am::am_types::{AppletId, LibraryAppletMode};
 use crate::hle::service::am::applet::Applet;
 use crate::hle::service::am::applet_data_broker::AppletDataBroker;
+use crate::hle::service::nfp::nfp_types::CabinetMode;
 
-use super::applet_cabinet::CabinetMode;
+use super::applet_cabinet::Cabinet;
 use super::applet_controller::Controller;
 use super::applet_error::Error;
 use super::applet_general::{Auth, PhotoViewer, StubApplet};
@@ -58,6 +60,7 @@ pub trait FrontendApplet: Send + Sync {
 /// Port of FrontendAppletHolder class.
 #[derive(Default)]
 pub struct FrontendAppletSet {
+    pub cabinet: Option<Arc<dyn CabinetApplet>>,
     pub controller: Option<Arc<dyn ControllerApplet>>,
     pub error: Option<Arc<dyn ErrorApplet>>,
     pub parental_controls: Option<Arc<dyn ParentalControlsApplet>>,
@@ -79,6 +82,7 @@ impl FrontendAppletHolder {
             cabinet_mode: CabinetMode::default(),
             current_applet_id: AppletId::None,
             frontend: FrontendAppletSet {
+                cabinet: Some(Arc::new(DefaultCabinetApplet)),
                 controller: Some(Arc::new(DefaultControllerApplet::new(hid_core))),
                 error: Some(Arc::new(DefaultErrorApplet)),
                 parental_controls: Some(Arc::new(DefaultParentalControlsApplet)),
@@ -99,6 +103,9 @@ impl FrontendAppletHolder {
     ///
     /// Port of `FrontendAppletHolder::SetFrontendAppletSet`.
     pub fn set_frontend_applet_set(&mut self, mut set: FrontendAppletSet) {
+        if set.cabinet.is_some() {
+            self.frontend.cabinet = set.cabinet.take();
+        }
         if set.controller.is_some() {
             self.frontend.controller = set.controller.take();
         }
@@ -147,6 +154,18 @@ impl FrontendAppletHolder {
         mode: LibraryAppletMode,
     ) -> Option<Box<dyn FrontendApplet>> {
         match id {
+            AppletId::Cabinet => Some(Box::new(Cabinet::new(
+                system,
+                applet,
+                broker,
+                mode,
+                Arc::clone(
+                    self.frontend
+                        .cabinet
+                        .as_ref()
+                        .expect("default cabinet applet is installed"),
+                ),
+            ))),
             AppletId::Auth => Some(Box::new(Auth::new(
                 system,
                 applet,
@@ -293,6 +312,7 @@ mod tests {
         let controller: Arc<dyn ControllerApplet> = Arc::new(TestControllerApplet);
 
         holder.set_frontend_applet_set(FrontendAppletSet {
+            cabinet: None,
             controller: Some(Arc::clone(&controller)),
             error: None,
             parental_controls: None,

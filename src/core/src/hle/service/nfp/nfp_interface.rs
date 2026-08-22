@@ -93,7 +93,6 @@ pub struct Interface {
     system: crate::core::SystemRef,
     name: String,
     state: AtomicU32,
-    device_state: DeviceState,
     handlers: BTreeMap<u32, FunctionInfo>,
     handlers_tipc: BTreeMap<u32, FunctionInfo>,
     /// Lazily-initialized DeviceManager, matching upstream `device_manager` field
@@ -217,7 +216,6 @@ impl Interface {
             system,
             name: name.to_string(),
             state: AtomicU32::new(State::NonInitialized as u32),
-            device_state: DeviceState::Initialized,
             handlers,
             handlers_tipc: BTreeMap::new(),
             device_manager: Mutex::new(None),
@@ -240,7 +238,7 @@ impl Interface {
     {
         let mut guard = self.device_manager.lock().unwrap();
         if guard.is_none() {
-            *guard = Some(DeviceManager::new());
+            *guard = Some(DeviceManager::new_with_system(self.system));
         }
         f(guard.as_mut().unwrap())
     }
@@ -592,13 +590,22 @@ impl Interface {
     /// GetRegisterInfo (cmd 14).
     ///
     /// Corresponds to `Interface::GetRegisterInfo` in upstream nfp_interface.cpp.
-    pub fn get_register_info(&self, device_handle: u64) -> ResultCode {
+    pub fn get_register_info(
+        &self,
+        device_handle: u64,
+    ) -> (ResultCode, super::nfp_types::RegisterInfo) {
         log::info!(
             "NFP::GetRegisterInfo called, device_handle={}",
             device_handle
         );
         let result = self.with_manager(|mgr| mgr.get_register_info(device_handle));
-        Self::translate_result_to_service_error(result)
+        match result {
+            Ok(info) => (RESULT_SUCCESS, info),
+            Err(error) => (
+                Self::translate_result_to_service_error(error),
+                super::nfp_types::RegisterInfo::default(),
+            ),
+        }
     }
 
     /// GetCommonInfo (cmd 15).
@@ -619,10 +626,16 @@ impl Interface {
     /// GetModelInfo (cmd 16).
     ///
     /// Corresponds to `Interface::GetModelInfo` in upstream nfp_interface.cpp.
-    pub fn get_model_info(&self, device_handle: u64) -> ResultCode {
+    pub fn get_model_info(&self, device_handle: u64) -> (ResultCode, super::nfp_types::ModelInfo) {
         log::info!("NFP::GetModelInfo called, device_handle={}", device_handle);
         let result = self.with_manager(|mgr| mgr.get_model_info(device_handle));
-        Self::translate_result_to_service_error(result)
+        match result {
+            Ok(info) => (RESULT_SUCCESS, info),
+            Err(error) => (
+                Self::translate_result_to_service_error(error),
+                super::nfp_types::ModelInfo::default(),
+            ),
+        }
     }
 
     /// DeleteRegisterInfo (cmd 104).
@@ -998,12 +1011,9 @@ impl Interface {
             device_handle
         );
 
-        let result = service.get_register_info(device_handle);
+        let (result, register_info) = service.get_register_info(device_handle);
 
         if result.is_success() {
-            // DeviceManager::get_register_info does not yet populate register_info data;
-            // write zeroed RegisterInfo to buffer matching upstream layout.
-            let register_info = super::nfp_types::RegisterInfo::default();
             let bytes = unsafe {
                 core::slice::from_raw_parts(
                     &register_info as *const super::nfp_types::RegisterInfo as *const u8,
@@ -1049,13 +1059,16 @@ impl Interface {
         let device_handle = rp.pop_u64();
         log::info!("NFP::GetModelInfo called, device_handle={}", device_handle);
 
-        let result = service.get_model_info(device_handle);
+        let (result, model_info) = service.get_model_info(device_handle);
 
         if result.is_success() {
-            // DeviceManager::get_model_info does not yet populate model_info data;
-            // write zeroed ModelInfo to buffer matching upstream layout.
-            let model_info = [0u8; 0x40]; // ModelInfo size
-            ctx.write_buffer(&model_info, 0);
+            let bytes = unsafe {
+                core::slice::from_raw_parts(
+                    &model_info as *const super::nfp_types::ModelInfo as *const u8,
+                    core::mem::size_of::<super::nfp_types::ModelInfo>(),
+                )
+            };
+            ctx.write_buffer(bytes, 0);
         }
 
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);

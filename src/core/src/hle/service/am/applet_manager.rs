@@ -194,7 +194,7 @@ fn push_in_show_cabinet_data(
     };
 
     let mut amiibo_settings = StartParamForAmiiboSettings::default();
-    amiibo_settings.applet_mode = cabinet_mode;
+    amiibo_settings.applet_mode = cabinet_mode as u8;
 
     let mut arg_buf = vec![0u8; std::mem::size_of::<CommonArguments>()];
     let mut settings_buf = vec![0u8; std::mem::size_of::<StartParamForAmiiboSettings>()];
