@@ -6308,3 +6308,36 @@ vs Eden `display_list.h` and `layer_list.h`
   that existed only to silence dead-code warnings. Focused destructor regressions verify that
   cleanup runs while the readable endpoint is still registered and that both endpoints are
   released afterward; `core` decreases from 63 to 60 warnings.
+
+## 2026-08-22 — `btm/btm_user_core.rs` vs Eden `btm_user_core.{h,cpp}`
+
+### Intentional differences
+
+- Eden's `ServiceContext::CloseEvent` accepts a raw `KEvent*`; Ruzu's existing context API closes
+  its owned event by numeric context handle. `IBtmUserCore` therefore retains four private handles
+  alongside the four service event owners so its `Drop` can preserve the same explicit close
+  sequence.
+- Ruzu's `Arc<Event>` fields own the event wrappers until Rust field destruction immediately after
+  `Drop`; Eden retains non-owning `KEvent*` pointers whose storage is released by `CloseEvent`.
+  Removing the context owner first and the service field owner second preserves the same externally
+  observable endpoint lifetime.
+
+### Unintentional differences (to fix)
+
+- None in the reviewed command, event-identity, and destruction slice.
+
+### Missing items
+
+- None from Eden's `IBtmUserCore`; the remaining null command-table entries are also null upstream.
+
+### Binary layout verification
+
+- PASS: the implementation changes only host-side event ownership and does not alter an IPC
+  payload. Commands 0, 17, 26, and 33 retain their success result, valid flag, and copy handle.
+
+### Fixed parity debt
+
+- Added explicit `scan`, `connection`, `service_discovery`, and `config` event closure in Eden's
+  destructor order instead of relying on the later generic `ServiceContext::Drop` sweep. A focused
+  regression verifies that both context and service owners release every event when the interface
+  is destroyed.

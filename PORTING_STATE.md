@@ -1,5 +1,21 @@
 # Porting State
 
+## 2026-08-22 — BTM system-event warning interrupted by service-handler prerequisites
+
+- Status: interrupted before classifying the unread `IBtmSystemCore` event owners.
+- Interrupted slice: resolve the unread `service_context`, `radio_event`, and
+  `audio_device_connection_event` fields while preserving Eden's event and settings ownership.
+- Exact missing prerequisite: Ruzu registers every `IBtmSystemCore` command as unimplemented and
+  therefore never consumes either event. Eden implements commands 0, 1, 4–7, 13, 14, 17, 20,
+  22, and 23; commands 4–6 additionally require the typed shared `set:sys` dependency retained by
+  the constructor.
+- Required prerequisite work: port the implemented command table and the typed
+  `SystemSettingsService` owner in `btm_system_core.rs`, then restore explicit event closure in
+  `Drop` using Ruzu's `ServiceContext` handles.
+- Resume condition: the two acquire commands return their stable constructor-owned readable
+  endpoints, the Bluetooth flag commands operate on the shared `set:sys` owner, the remaining
+  upstream stubs preserve their exact outputs, and focused command/lifecycle tests pass.
+
 ## 2026-08-22 — audio event warning slice interrupted by destructor prerequisites
 
 - Status: interrupted before completing the readable-event ownership cleanup.
