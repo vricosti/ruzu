@@ -811,68 +811,6 @@ impl KMemoryBlockManager {
             }
         }
     }
-
-    /// Coalesce adjacent blocks that have become compatible after an update.
-    ///
-    /// Upstream: KMemoryBlockManager::CoalesceForUpdate.
-    fn coalesce_for_update(&mut self, address: usize, num_pages: usize) {
-        if self.memory_block_tree.is_empty() {
-            return;
-        }
-
-        let update_end = address + num_pages * PAGE_SIZE;
-
-        let mut current_key = self
-            .memory_block_tree
-            .range(..=address)
-            .rev()
-            .find(|(_, block)| block.get_address() <= address && address < block.get_end_address())
-            .map(|(&key, _)| key)
-            .unwrap_or(address);
-
-        if address != self.m_start_address {
-            if let Some((&prev_key, _)) = self.memory_block_tree.range(..current_key).next_back() {
-                current_key = prev_key;
-            }
-        }
-
-        loop {
-            let next_key = match self
-                .memory_block_tree
-                .range((
-                    std::ops::Bound::Excluded(current_key),
-                    std::ops::Bound::Unbounded,
-                ))
-                .next()
-                .map(|(&key, _)| key)
-            {
-                Some(key) => key,
-                None => break,
-            };
-
-            let can_merge = {
-                let cur = self.memory_block_tree.get(&current_key);
-                let next = self.memory_block_tree.get(&next_key);
-                matches!((cur, next), (Some(c), Some(n)) if c.can_merge_with(n))
-            };
-
-            if can_merge {
-                let next_block = self.memory_block_tree.remove(&next_key).unwrap();
-                let cur_block = self.memory_block_tree.get_mut(&current_key).unwrap();
-                cur_block.add(&next_block);
-            } else {
-                current_key = next_key;
-            }
-
-            let current_end = match self.memory_block_tree.get(&current_key) {
-                Some(block) => block.get_end_address(),
-                None => break,
-            };
-            if update_end < current_end {
-                break;
-            }
-        }
-    }
 }
 
 impl Default for KMemoryBlockManager {

@@ -5055,3 +5055,19 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 - Both AArch32 and AArch64 dispatch paths now use Eden's generated-wrapper register layout for
   `GetSystemInfo`, return `ResultInvalidEnumValue` for an invalid raw type, and forward the system
   owner to the implementation. The AArch64 route was previously absent entirely.
+
+## 2026-08-22 — `src/core/src/hle/kernel/k_memory_block_manager.rs` vs `core/hle/kernel/k_memory_block_manager.h` and `.cpp`
+
+### Fixed parity debt
+
+- Ruzu's unused allocator-free duplicate of `CoalesceForUpdate` was removed. All four update paths
+  continue to call the single allocator-aware owner, which returns erased block nodes to the update
+  allocator at the same point where Eden calls `allocator->Free(block)`.
+
+## 2026-08-22 — `src/core/src/hle/kernel/k_page_table_base.rs` vs `core/hle/kernel/k_page_table_base.h` and `.cpp`
+
+### Fixed parity debt
+
+- The unused helper that cleared a guest virtual address through `zero_block` was removed. Eden's
+  `ClearBackingRegion` accepts physical addresses, and every live Ruzu allocation path continues to
+  call the physical-backing helper before mapping the new pages.

@@ -445,15 +445,6 @@ impl KPageTableBase {
         self.m_process_id = process_id;
     }
 
-    fn clear_fresh_backing_region(&self, address: usize, size: usize) {
-        if size == 0 {
-            return;
-        }
-        if let Some(memory) = &self.m_memory {
-            memory.lock().unwrap().zero_block(address as u64, size);
-        }
-    }
-
     /// Zero a region of physical memory. Used by `set_heap_size` and other
     /// pool-allocation callers to clear newly-allocated pages BEFORE they
     /// are mapped into virtual address space — upstream's
