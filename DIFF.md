@@ -6699,3 +6699,23 @@ vs Eden `display_list.h` and `layer_list.h`
 - PASS: `SystemClockContext` (`0x20`) and `SteadyClockTimePoint` (`0x18`) are copied into fully
   zero-initialized fixed-size settings buffers. Focused dispatch coverage verifies the complete
   local-clock payload written by the background worker.
+
+## 2026-08-22 — `src/ruzu/src/boot.rs` vs Eden `src/yuzu/main_window.cpp`
+
+### Intentional differences
+- Before constructing video subsystems, the GTK frontend rejects an OpenGL renderer selected on
+  macOS AArch64 with a dedicated multiline diagnostic explaining that Apple Silicon supports only
+  the Vulkan renderer in ruzu. Eden uses one generic `ErrorVideoCore` dialog because its supported
+  renderer set is not restricted by this Rust frontend's Apple platform port.
+- The check consumes the selected global/per-game renderer value after boot configuration is
+  applied. Vulkan, Null, macOS x86_64, and non-macOS hosts retain the existing load path and generic
+  video-core error handling.
+
+### Unintentional differences (to fix)
+- None in this diagnostic slice.
+
+### Missing items
+- None.
+
+### Binary layout verification
+- N/A: this change only selects frontend error text before renderer construction.

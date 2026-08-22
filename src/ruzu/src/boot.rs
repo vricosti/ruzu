@@ -538,6 +538,14 @@ fn run_boot(
     // Subsystem factory (upstream SetupForApplicationProcess): Host1x + GPU +
     // selected renderer + AudioCore. Called during `system.load()`.
     let renderer_backend = *common::settings::values().renderer_backend.get_value();
+    if let Some(detail) = renderer_backend_unavailable_detail(renderer_backend) {
+        log::error!("Renderer backend {renderer_backend:?} is unavailable on this host");
+        loading_event(LoadingEvent::Failed {
+            message: "Unable to start the game".to_owned(),
+            detail: detail.to_owned(),
+        });
+        return;
+    }
     let frame_loading_event = Arc::clone(&loading_event);
     let frame_displayed = Arc::clone(&first_frame_displayed);
     system.set_subsystem_factory(Box::new(move |system| {
@@ -1168,6 +1176,29 @@ fn load_error_detail(status: ruzu_core::core::SystemResultStatus) -> &'static st
     }
 }
 
+fn renderer_backend_unavailable_detail(
+    backend: common::settings_enums::RendererBackend,
+) -> Option<&'static str> {
+    use common::settings_enums::RendererBackend;
+
+    if cfg!(all(target_os = "macos", target_arch = "aarch64"))
+        && matches!(
+            backend,
+            RendererBackend::OpenGlGlsl
+                | RendererBackend::OpenGlGlasm
+                | RendererBackend::OpenGlSpirV
+        )
+    {
+        Some(
+            "The video renderer could not be initialized.\n\
+             On Apple Silicon, only the Vulkan renderer is supported. \
+             Select Vulkan in Configure > Graphics.",
+        )
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1303,5 +1334,33 @@ mod tests {
         );
         assert!(load_error_detail(SystemResultStatus::ErrorVideoCore).contains("renderer"));
         assert!(load_error_detail(SystemResultStatus::ErrorUnknown).contains("unknown"));
+    }
+
+    #[test]
+    fn renderer_error_is_specific_to_opengl_on_apple_silicon() {
+        use common::settings_enums::RendererBackend;
+
+        let apple_silicon = cfg!(all(target_os = "macos", target_arch = "aarch64"));
+        for backend in [
+            RendererBackend::OpenGlGlsl,
+            RendererBackend::OpenGlGlasm,
+            RendererBackend::OpenGlSpirV,
+        ] {
+            let detail = renderer_backend_unavailable_detail(backend);
+            assert_eq!(detail.is_some(), apple_silicon);
+            if let Some(detail) = detail {
+                assert!(detail.contains("Apple Silicon"));
+                assert!(detail.contains("only the Vulkan renderer is supported"));
+                assert!(detail.contains('\n'));
+            }
+        }
+        assert_eq!(
+            renderer_backend_unavailable_detail(RendererBackend::Vulkan),
+            None
+        );
+        assert_eq!(
+            renderer_backend_unavailable_detail(RendererBackend::Null),
+            None
+        );
     }
 }
