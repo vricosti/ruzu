@@ -83,6 +83,10 @@ fn version_is_old2(version: u32) -> bool {
 }
 
 pub struct SoftwareKeyboard {
+    // Flattened counterpart of `FrontendApplet::system`. Eden's
+    // SoftwareKeyboard does not access it directly after base construction,
+    // but every frontend applet retains the base owner.
+    #[allow(dead_code)]
     system: SystemRef,
     applet: Weak<Mutex<Applet>>,
     broker: Arc<AppletDataBroker>,

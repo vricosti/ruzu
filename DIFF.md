@@ -5460,3 +5460,12 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 - Removed an unused generic thread-name formatter with no Eden counterpart. Additional service
   thread names remain constructed by `start_additional_host_threads`, matching Eden's method
   ownership and `name:index` format.
+
+## 2026-08-22 — `applet_software_keyboard.rs` base-system ownership vs `applet_software_keyboard.{h,cpp}` and `applets.h`
+
+### Intentional differences
+
+- Rust flattens `FrontendApplet::system` into each applet implementation instead of using C++
+  inheritance. `SoftwareKeyboard` retains that owner even though, like Eden's derived class, it
+  never accesses the system directly; a field-level diagnostic annotation documents the retained
+  base state.
