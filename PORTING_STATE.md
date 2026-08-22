@@ -1,5 +1,41 @@
 # Porting State
 
+## 2026-08-22 — Friend service warning slice interrupted by method-ownership prerequisite
+
+- Status: interrupted before correcting the unread Friend service/event owners.
+- Interrupted slice: consume `IFriendService::service_context`,
+  `INotificationService::{uuid,service_context}`, and `Friend::{system,module}` according to Eden's
+  event and interface lifetimes.
+- Exact missing prerequisite: Eden owns `Module::Interface::{CreateFriendService,
+  CreateNotificationService}` in `friend.cpp`, while Ruzu currently places both methods and their
+  IPC handlers in `friend_interface.rs`. This violates the upstream method boundary and obscures
+  that `system` must be forwarded to both created interfaces.
+- Required next action: move those methods and handlers to `friend.rs` without changing behavior,
+  verify the handler table remains owned by the `Friend` constructor in `friend_interface.rs`, then
+  resume event lifecycle and command parity.
+- Prerequisite result: the two methods, their IPC handlers and response helper now live in
+  `friend.rs`; `friend_interface.rs` retains only the concrete `Friend` constructor, command table
+  and framework implementation. The three-entry callback partition is covered by a focused test.
+- Resumed result: `IFriendService` now matches Eden's 112-entry table and exact 22-handler
+  partition, forwards the interface `SystemRef`, signals and returns its stable completion event,
+  and closes that event on destruction. The missing active stubs and their exact response shapes
+  are ported, including the deterministic 0x800-byte `FriendsUserSetting` payload.
+- `INotificationService` now retains its constructor UUID and `SystemRef`, returns one stable event,
+  and closes it on destruction. The flattened `Module::Interface` retains its shared module owner
+  for the same lifetime as Eden.
+- Focused tests verify both command tables, event identity/signal/release, module and system
+  forwarding, retained UUID, and every byte and field offset of `FriendsUserSetting`.
+- Status: prerequisite and resumed warning/parity slice completed and re-verified.
+
+## 2026-08-22 — CAPS album-manager ownership warning slice
+
+- Status: completed and verified for the `IAlbumControlService` ownership slice.
+- Eden retains its constructor-provided shared `AlbumManager` for the full interface lifetime even
+  though its only implemented command does not dereference it. Ruzu keeps the same owner and
+  suppresses the resulting Rust false positive on that field only.
+- A focused lifetime regression proves that constructing and dropping the service respectively
+  retains and releases the exact shared manager allocation.
+
 ## 2026-08-22 — BTM system-event warning interrupted by service-handler prerequisites
 
 - Status: interrupted before classifying the unread `IBtmSystemCore` event owners.

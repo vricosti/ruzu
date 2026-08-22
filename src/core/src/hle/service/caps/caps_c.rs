@@ -46,6 +46,8 @@ pub mod commands {
 pub struct IAlbumControlService {
     handlers: BTreeMap<u32, FunctionInfo>,
     handlers_tipc: BTreeMap<u32, FunctionInfo>,
+    // Retained for the interface lifetime, matching Eden's shared AlbumManager ownership.
+    #[allow(dead_code)]
     manager: Arc<Mutex<AlbumManager>>,
 }
 
@@ -151,5 +153,17 @@ mod tests {
             .unwrap()
             .handler_callback
             .is_some());
+    }
+
+    #[test]
+    fn retains_album_manager_for_interface_lifetime() {
+        let manager = Arc::new(Mutex::new(AlbumManager::new()));
+        assert_eq!(Arc::strong_count(&manager), 1);
+
+        let service = IAlbumControlService::new(Arc::clone(&manager));
+        assert_eq!(Arc::strong_count(&manager), 2);
+
+        drop(service);
+        assert_eq!(Arc::strong_count(&manager), 1);
     }
 }

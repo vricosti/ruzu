@@ -9,12 +9,9 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use common::uuid::UUID;
-
 use super::friend::Module;
 use crate::hle::result::ResultCode;
 use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
-use crate::hle::service::ipc_helpers::{RequestParser, ResponseBuilder};
 use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
 
 /// IPC command IDs for Friend interface
@@ -28,9 +25,11 @@ pub mod commands {
 ///
 /// Corresponds to `Friend` (derived from `Module::Interface`) in upstream `friend_interface.h`.
 pub struct Friend {
-    system: crate::core::SystemRef,
-    module: Arc<Module>,
-    name: String,
+    pub(super) system: crate::core::SystemRef,
+    // Retained for the flattened `Module::Interface` lifetime, matching Eden.
+    #[allow(dead_code)]
+    pub(super) module: Arc<Module>,
+    pub(super) name: String,
     handlers: BTreeMap<u32, FunctionInfo>,
     handlers_tipc: BTreeMap<u32, FunctionInfo>,
 }
@@ -63,54 +62,6 @@ impl Friend {
             handlers_tipc: BTreeMap::new(),
         }
     }
-
-    /// CreateFriendService (cmd 0)
-    pub fn create_friend_service(&self) -> super::friend::IFriendService {
-        log::debug!("Friend({})::create_friend_service called", self.name);
-        super::friend::IFriendService::new()
-    }
-
-    /// CreateNotificationService (cmd 1)
-    pub fn create_notification_service(&self, uuid: UUID) -> super::friend::INotificationService {
-        log::debug!(
-            "Friend({})::create_notification_service called, uuid=0x{}",
-            self.name,
-            uuid.raw_string()
-        );
-        super::friend::INotificationService::new(uuid)
-    }
-
-    fn push_interface_response(
-        ctx: &mut HLERequestContext,
-        object: Arc<dyn SessionRequestHandler>,
-    ) {
-        let mut rb = ResponseBuilder::new(ctx, 2, 0, 1);
-        rb.push_result(crate::hle::result::RESULT_SUCCESS);
-        rb.push_ipc_interface(object);
-    }
-
-    fn cast(this: &dyn ServiceFramework) -> &Self {
-        unsafe { &*(this as *const dyn ServiceFramework as *const Self) }
-    }
-
-    fn create_friend_service_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
-        let this = Self::cast(this);
-        log::debug!("Friend({})::CreateFriendService called", this.name);
-        let service: Arc<dyn SessionRequestHandler> = Arc::new(this.create_friend_service());
-        Self::push_interface_response(ctx, service);
-    }
-
-    fn create_notification_service_handler(
-        this: &dyn ServiceFramework,
-        ctx: &mut HLERequestContext,
-    ) {
-        let this = Self::cast(this);
-        let mut rp = RequestParser::new(ctx);
-        let uuid = rp.pop_raw::<UUID>();
-        let service: Arc<dyn SessionRequestHandler> =
-            Arc::new(this.create_notification_service(uuid));
-        Self::push_interface_response(ctx, service);
-    }
 }
 
 impl SessionRequestHandler for Friend {
@@ -134,5 +85,32 @@ impl ServiceFramework for Friend {
 
     fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
         &self.handlers_tipc
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn concrete_friend_table_keeps_upstream_callback_partition() {
+        let friend = Friend::new(
+            crate::core::SystemRef::null(),
+            Arc::new(Module::new()),
+            "friend:u",
+        );
+
+        assert_eq!(friend.handlers.len(), 3);
+        assert!(friend.handlers[&commands::CREATE_FRIEND_SERVICE]
+            .handler_callback
+            .is_some());
+        assert!(friend.handlers[&commands::CREATE_NOTIFICATION_SERVICE]
+            .handler_callback
+            .is_some());
+        assert!(
+            friend.handlers[&commands::CREATE_DAEMON_SUSPEND_SESSION_SERVICE]
+                .handler_callback
+                .is_none()
+        );
     }
 }

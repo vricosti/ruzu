@@ -12,10 +12,13 @@ use std::sync::{Arc, Mutex};
 
 use common::uuid::UUID;
 
+use crate::core::SystemRef;
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 use crate::hle::service::acc::errors::RESULT_NO_NOTIFICATIONS;
 use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
 use crate::hle::service::ipc_helpers::{RequestParser, ResponseBuilder};
+use crate::hle::service::kernel_helpers::ServiceContext;
+use crate::hle::service::os::event::Event;
 use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
 
 /// IPC command IDs for IFriendService handlers implemented in Rust.
@@ -64,6 +67,51 @@ pub struct SizedFriendFilter {
     pub group_id: u64,
 }
 
+const _: [(); 0x10] = [(); core::mem::size_of::<SizedFriendFilter>()];
+
+/// FriendsUserSetting. Upstream: `IFriendService::FriendsUserSetting` in `friend.cpp`.
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct FriendsUserSetting {
+    uuid: UUID,
+    presence_permission: u32,
+    play_log_permission: u32,
+    friend_request_reception: u64,
+    friend_code: [u8; 0x20],
+    friend_code_next_issuable_time: u64,
+    unk_x48: [u8; 0x7B8],
+}
+
+impl FriendsUserSetting {
+    fn new(uuid: UUID) -> Self {
+        let mut friend_code = [0; 0x20];
+        let default_friend_code = b"0000-0000-0000";
+        friend_code[..default_friend_code.len()].copy_from_slice(default_friend_code);
+
+        Self {
+            uuid,
+            presence_permission: 2,
+            play_log_permission: 5,
+            friend_request_reception: 1,
+            friend_code,
+            friend_code_next_issuable_time: 99_999_999_999,
+            unk_x48: [0; 0x7B8],
+        }
+    }
+
+    fn as_bytes(&self) -> &[u8] {
+        // Every byte is initialized above and this repr(C) payload has no padding.
+        unsafe {
+            core::slice::from_raw_parts(
+                (self as *const Self).cast::<u8>(),
+                core::mem::size_of::<Self>(),
+            )
+        }
+    }
+}
+
+const _: [(); 0x800] = [(); core::mem::size_of::<FriendsUserSetting>()];
+
 /// NotificationTypes enum. Upstream: `NotificationTypes` in `friend.cpp`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
@@ -81,6 +129,8 @@ pub struct SizedNotificationInfo {
     pub account_id: u64,
 }
 
+const _: [(); 0x10] = [(); core::mem::size_of::<SizedNotificationInfo>()];
+
 /// Module for Friend service.
 ///
 /// Corresponds to `Module` in upstream `friend.h`.
@@ -92,20 +142,82 @@ impl Module {
     }
 }
 
+// These methods are the Rust counterpart of `Module::Interface` in upstream
+// `friend.cpp`. The concrete `Friend` constructor and command table remain in
+// `friend_interface.rs`, matching `friend_interface.cpp`.
+impl super::friend_interface::Friend {
+    /// CreateFriendService (cmd 0).
+    pub fn create_friend_service(&self) -> IFriendService {
+        log::debug!("Friend({})::create_friend_service called", self.name);
+        IFriendService::new(self.system)
+    }
+
+    /// CreateNotificationService (cmd 1).
+    pub fn create_notification_service(&self, uuid: UUID) -> INotificationService {
+        log::debug!(
+            "Friend({})::create_notification_service called, uuid=0x{}",
+            self.name,
+            uuid.raw_string()
+        );
+        INotificationService::new(self.system, uuid)
+    }
+
+    fn push_interface_response(
+        ctx: &mut HLERequestContext,
+        object: Arc<dyn SessionRequestHandler>,
+    ) {
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 1);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_ipc_interface(object);
+    }
+
+    fn cast(this: &dyn ServiceFramework) -> &Self {
+        unsafe { &*(this as *const dyn ServiceFramework as *const Self) }
+    }
+
+    pub(super) fn create_friend_service_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        let this = Self::cast(this);
+        log::debug!("Friend({})::CreateFriendService called", this.name);
+        let service: Arc<dyn SessionRequestHandler> = Arc::new(this.create_friend_service());
+        Self::push_interface_response(ctx, service);
+    }
+
+    pub(super) fn create_notification_service_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        let this = Self::cast(this);
+        let mut rp = RequestParser::new(ctx);
+        let uuid = rp.pop_raw::<UUID>();
+        let service: Arc<dyn SessionRequestHandler> =
+            Arc::new(this.create_notification_service(uuid));
+        Self::push_interface_response(ctx, service);
+    }
+}
+
 /// IFriendService.
 pub struct IFriendService {
     handlers: BTreeMap<u32, FunctionInfo>,
     handlers_tipc: BTreeMap<u32, FunctionInfo>,
-    service_context: crate::hle::service::kernel_helpers::ServiceContext,
+    // Flattened owner corresponding to Eden's `ServiceFramework::system` reference.
+    #[allow(dead_code)]
+    system: SystemRef,
+    service_context: ServiceContext,
     completion_event_handle: u32,
+    completion_event: Arc<Event>,
 }
 
 impl IFriendService {
-    pub fn new() -> Self {
-        let mut service_context =
-            crate::hle::service::kernel_helpers::ServiceContext::new("IFriendService".to_string());
+    pub fn new(system: SystemRef) -> Self {
+        let mut service_context = ServiceContext::new("IFriendService".to_string());
         let completion_event_handle =
             service_context.create_event("IFriendService:CompletionEvent".to_string());
+        let completion_event = service_context
+            .get_event(completion_event_handle)
+            .expect("IFriendService completion event must exist");
         Self {
             handlers: build_handler_map(&[
                 (
@@ -113,7 +225,11 @@ impl IFriendService {
                     Some(Self::get_completion_event_handler),
                     "GetCompletionEvent",
                 ),
-                (friend_service_commands::CANCEL, None, "Cancel"),
+                (
+                    friend_service_commands::CANCEL,
+                    Some(Self::cancel_handler),
+                    "Cancel",
+                ),
                 (10100, None, "GetFriendListIds"),
                 (
                     friend_service_commands::GET_FRIEND_LIST,
@@ -122,6 +238,7 @@ impl IFriendService {
                 ),
                 (10102, None, "UpdateFriendInfo"),
                 (10110, None, "GetFriendProfileImage"),
+                (10111, None, "GetFriendProfileImageWithImageSize"),
                 (
                     friend_service_commands::CHECK_FRIEND_LIST_AVAILABILITY,
                     Some(Self::check_friend_list_availability_handler),
@@ -142,6 +259,7 @@ impl IFriendService {
                 ),
                 (10421, None, "EnsureBlockedUserListAvailable"),
                 (10500, None, "GetProfileList"),
+                (10501, None, "GetProfileListV2"),
                 (10600, None, "DeclareOpenOnlinePlaySession"),
                 (
                     friend_service_commands::DECLARE_CLOSE_ONLINE_PLAY_SESSION,
@@ -165,6 +283,7 @@ impl IFriendService {
                 ),
                 (10702, None, "AddPlayHistory"),
                 (11000, None, "GetProfileImageUrl"),
+                (11001, None, "GetProfileImageUrlV2"),
                 (
                     friend_service_commands::GET_FRIEND_COUNT,
                     Some(Self::get_friend_count_handler),
@@ -177,36 +296,83 @@ impl IFriendService {
                 ),
                 (20102, None, "GetFriendDetailedInfo"),
                 (20103, None, "SyncFriendList"),
-                (20104, None, "RequestSyncFriendList"),
-                (20110, None, "LoadFriendSetting"),
+                (
+                    20104,
+                    Some(Self::request_sync_friend_list_handler),
+                    "RequestSyncFriendList",
+                ),
+                (
+                    20105,
+                    Some(Self::get_friend_list_for_viewer_handler),
+                    "GetFriendListForViewerV1",
+                ),
+                (20106, None, "UpdateFriendInfoForViewerV1"),
+                (20107, None, "GetFriendDetailedInfoV2"),
+                (
+                    20108,
+                    Some(Self::get_friend_list_for_viewer_handler),
+                    "GetFriendListForViewerV2",
+                ),
+                (20109, None, "UpdateFriendInfoForViewerV2"),
+                (20110, None, "LoadFriendSettingV1"),
+                (20111, None, "LoadFriendSettingV2"),
                 (
                     friend_service_commands::GET_RECEIVED_FRIEND_REQUEST_COUNT,
                     Some(Self::get_received_friend_request_count_handler),
                     "GetReceivedFriendRequestCount",
                 ),
-                (20201, None, "GetFriendRequestList"),
+                (20201, None, "GetFriendRequestListV1"),
+                (20202, None, "GetFriendRequestListV2"),
+                (20203, None, "GetFriendRequestReceivedNotificationCount"),
                 (20300, None, "GetFriendCandidateList"),
                 (20301, None, "GetNintendoNetworkIdInfo"),
                 (20302, None, "GetSnsAccountLinkage"),
                 (20303, None, "GetSnsAccountProfile"),
                 (20304, None, "GetSnsAccountFriendList"),
-                (20400, None, "GetBlockedUserList"),
+                (20400, None, "GetBlockedUserListV1"),
                 (20401, None, "SyncBlockedUserList"),
-                (20500, None, "GetProfileExtraList"),
+                (20402, None, "GetBlockedUserListV2"),
+                (20500, None, "GetProfileExtraListV1"),
                 (20501, None, "GetRelationship"),
-                (20600, None, "GetUserPresenceView"),
-                (20700, None, "GetPlayHistoryList"),
+                (20502, None, "GetProfileExtraListV2"),
+                (
+                    20600,
+                    Some(Self::get_user_presence_view_handler),
+                    "GetUserPresenceViewV1",
+                ),
+                (
+                    20601,
+                    Some(Self::get_user_presence_view_handler),
+                    "GetUserPresenceViewV2",
+                ),
+                (20700, None, "GetPlayHistoryListV1"),
                 (
                     friend_service_commands::GET_PLAY_HISTORY_STATISTICS,
                     Some(Self::get_play_history_statistics_handler),
                     "GetPlayHistoryStatistics",
                 ),
-                (20800, None, "LoadUserSetting"),
+                (20702, None, "GetPlayHistoryListV2"),
+                (
+                    20800,
+                    Some(Self::load_user_setting_handler),
+                    "LoadUserSettingV1",
+                ),
                 (20801, None, "SyncUserSetting"),
-                (20900, None, "RequestListSummaryOverlayNotification"),
+                (
+                    20802,
+                    Some(Self::load_user_setting_handler),
+                    "LoadUserSettingV2",
+                ),
+                (
+                    20900,
+                    Some(Self::request_list_summary_overlay_notification_handler),
+                    "RequestListSummaryOverlayNotification",
+                ),
                 (21000, None, "GetExternalApplicationCatalog"),
-                (22000, None, "GetReceivedFriendInvitationList"),
-                (22001, None, "GetReceivedFriendInvitationDetailedInfo"),
+                (22000, None, "GetReceivedFriendInvitationListV1"),
+                (22001, None, "GetReceivedFriendInvitationDetailedInfoV1"),
+                (22002, None, "GetReceivedFriendInvitationListV2"),
+                (22003, None, "GetReceivedFriendInvitationDetailedInfoV2"),
                 (
                     friend_service_commands::GET_RECEIVED_FRIEND_INVITATION_COUNT_CACHE,
                     Some(Self::get_received_friend_invitation_count_cache_handler),
@@ -217,8 +383,11 @@ impl IFriendService {
                 (30110, None, "DropFriendNewlyFlag"),
                 (30120, None, "ChangeFriendFavoriteFlag"),
                 (30121, None, "ChangeFriendOnlineNotificationFlag"),
+                (30130, None, "SetFriendNote"),
+                (30131, None, "RequestUploadPendingNote"),
+                (30190, None, "RequestSyncLocalUpdates"),
                 (30200, None, "SendFriendRequest"),
-                (30201, None, "SendFriendRequestWithApplicationInfo"),
+                (30201, None, "SendFriendRequestWithApplicationInfoV1"),
                 (30202, None, "CancelFriendRequest"),
                 (30203, None, "AcceptFriendRequest"),
                 (30204, None, "RejectFriendRequest"),
@@ -235,28 +404,36 @@ impl IFriendService {
                 ),
                 (30216, None, "ResendFacedFriendRequest"),
                 (30217, None, "SendFriendRequestWithNintendoNetworkIdInfo"),
+                (30218, None, "SendFriendRequestWithApplicationInfoV2"),
                 (30300, None, "GetSnsAccountLinkPageUrl"),
                 (30301, None, "UnlinkSnsAccount"),
                 (30400, None, "BlockUser"),
-                (30401, None, "BlockUserWithApplicationInfo"),
+                (30401, None, "BlockUserWithApplicationInfoV1"),
                 (30402, None, "UnblockUser"),
-                (30500, None, "GetProfileExtraFromFriendCode"),
+                (30403, None, "BlockUserWithApplicationInfoV2"),
+                (30500, None, "GetProfileExtraFromFriendCodeV1"),
+                (30501, None, "GetProfileExtraFromFriendCodeV2"),
                 (30700, None, "DeletePlayHistory"),
+                (30701, None, "AddPlayHistoryWithApplication"),
                 (30810, None, "ChangePresencePermission"),
                 (30811, None, "ChangeFriendRequestReception"),
                 (30812, None, "ChangePlayLogPermission"),
                 (30820, None, "IssueFriendCode"),
                 (30830, None, "ClearPlayLog"),
-                (30900, None, "SendFriendInvitation"),
+                (30900, None, "SendFriendInvitationV1"),
+                (30901, None, "SendFriendInvitationV2"),
                 (30910, None, "ReadFriendInvitation"),
                 (30911, None, "ReadAllFriendInvitations"),
+                (31000, None, "OpenUser"),
                 (40100, None, "DeleteFriendListCache"),
                 (40400, None, "DeleteBlockedUserListCache"),
                 (49900, None, "DeleteNetworkServiceAccountCache"),
             ]),
             handlers_tipc: BTreeMap::new(),
+            system,
             service_context,
             completion_event_handle,
+            completion_event,
         }
     }
 
@@ -264,9 +441,14 @@ impl IFriendService {
         unsafe { &*(this as *const dyn ServiceFramework as *const Self) }
     }
 
-    pub fn get_completion_event(&self) -> u32 {
+    pub fn get_completion_event(&self) -> Arc<Event> {
         log::debug!("IFriendService::get_completion_event called");
-        self.completion_event_handle
+        self.completion_event.signal();
+        Arc::clone(&self.completion_event)
+    }
+
+    pub fn cancel(&self) {
+        log::debug!("(STUBBED) IFriendService::cancel called");
     }
 
     pub fn get_friend_list(&self, _friend_offset: u32, _uuid: UUID, _pid: u64) -> u32 {
@@ -311,13 +493,36 @@ impl IFriendService {
         0
     }
 
-    pub fn get_received_friend_request_count(&self) -> u32 {
-        log::debug!("(STUBBED) IFriendService::get_received_friend_request_count called");
+    pub fn request_sync_friend_list(&self) {
+        log::debug!("(STUBBED) IFriendService::request_sync_friend_list called");
+    }
+
+    pub fn get_friend_list_for_viewer(&self) -> u32 {
+        log::debug!("(STUBBED) IFriendService::get_friend_list_for_viewer called");
         0
+    }
+
+    pub fn get_received_friend_request_count(&self, _uuid: UUID) -> (u32, u32) {
+        log::debug!("(STUBBED) IFriendService::get_received_friend_request_count called");
+        (0, 0)
+    }
+
+    pub fn get_user_presence_view(&self, _uuid: UUID) -> [u8; 0xE0] {
+        log::debug!("(STUBBED) IFriendService::get_user_presence_view called");
+        [0; 0xE0]
     }
 
     pub fn get_play_history_statistics(&self) {
         log::error!("(STUBBED) IFriendService::get_play_history_statistics called");
+    }
+
+    fn load_user_setting(&self, uuid: UUID) -> FriendsUserSetting {
+        log::warn!("(STUBBED) IFriendService::load_user_setting called");
+        FriendsUserSetting::new(uuid)
+    }
+
+    pub fn request_list_summary_overlay_notification(&self) {
+        log::info!("(STUBBED) IFriendService::request_list_summary_overlay_notification called");
     }
 
     pub fn get_received_friend_invitation_count_cache(&self) -> u32 {
@@ -327,9 +532,16 @@ impl IFriendService {
 
     fn get_completion_event_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         let this = Self::cast(this);
+        let object_id = this.get_completion_event().copy_object_id(ctx).unwrap_or(0);
         let mut rb = ResponseBuilder::new(ctx, 2, 1, 0);
         rb.push_result(RESULT_SUCCESS);
-        rb.push_copy_objects(this.get_completion_event());
+        rb.push_copy_object_id(object_id);
+    }
+
+    fn cancel_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        Self::cast(this).cancel();
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
     }
 
     fn get_friend_list_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
@@ -422,14 +634,43 @@ impl IFriendService {
         rb.push_u32(count);
     }
 
+    fn request_sync_friend_list_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        Self::cast(this).request_sync_friend_list();
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+    }
+
+    fn get_friend_list_for_viewer_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        let count = Self::cast(this).get_friend_list_for_viewer();
+        let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_u32(count);
+    }
+
     fn get_received_friend_request_count_handler(
         this: &dyn ServiceFramework,
         ctx: &mut HLERequestContext,
     ) {
-        let count = Self::cast(this).get_received_friend_request_count();
-        let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
+        let mut rp = RequestParser::new(ctx);
+        let uuid = rp.pop_raw::<UUID>();
+        let (count, unknown) = Self::cast(this).get_received_friend_request_count(uuid);
+        let mut rb = ResponseBuilder::new(ctx, 4, 0, 0);
         rb.push_result(RESULT_SUCCESS);
         rb.push_u32(count);
+        rb.push_u32(unknown);
+    }
+
+    fn get_user_presence_view_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let mut rp = RequestParser::new(ctx);
+        let uuid = rp.pop_raw::<UUID>();
+        let presence = Self::cast(this).get_user_presence_view(uuid);
+        ctx.write_buffer(&presence, 0);
+
+        let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
     }
 
     fn get_play_history_statistics_handler(
@@ -437,6 +678,25 @@ impl IFriendService {
         ctx: &mut HLERequestContext,
     ) {
         Self::cast(this).get_play_history_statistics();
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+    }
+
+    fn load_user_setting_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let mut rp = RequestParser::new(ctx);
+        let uuid = rp.pop_raw::<UUID>();
+        let setting = Self::cast(this).load_user_setting(uuid);
+        ctx.write_buffer(setting.as_bytes(), 0);
+
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+    }
+
+    fn request_list_summary_overlay_notification_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        Self::cast(this).request_list_summary_overlay_notification();
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
     }
@@ -449,6 +709,13 @@ impl IFriendService {
         let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
         rb.push_result(RESULT_SUCCESS);
         rb.push_u32(count);
+    }
+}
+
+impl Drop for IFriendService {
+    fn drop(&mut self) {
+        self.service_context
+            .close_event(self.completion_event_handle);
     }
 }
 
@@ -480,11 +747,17 @@ impl ServiceFramework for IFriendService {
 pub struct INotificationService {
     handlers: BTreeMap<u32, FunctionInfo>,
     handlers_tipc: BTreeMap<u32, FunctionInfo>,
+    // Flattened owner corresponding to Eden's `ServiceFramework::system` reference.
+    #[allow(dead_code)]
+    system: SystemRef,
+    // Eden retains the UUID but does not currently consume it after construction.
+    #[allow(dead_code)]
     uuid: UUID,
     notifications: Mutex<VecDeque<SizedNotificationInfo>>,
     states: Mutex<NotificationStates>,
-    service_context: crate::hle::service::kernel_helpers::ServiceContext,
+    service_context: ServiceContext,
     notification_event_handle: u32,
+    notification_event: Arc<Event>,
 }
 
 struct NotificationStates {
@@ -493,12 +766,13 @@ struct NotificationStates {
 }
 
 impl INotificationService {
-    pub fn new(uuid: UUID) -> Self {
-        let mut service_context = crate::hle::service::kernel_helpers::ServiceContext::new(
-            "INotificationService".to_string(),
-        );
+    pub fn new(system: SystemRef, uuid: UUID) -> Self {
+        let mut service_context = ServiceContext::new("INotificationService".to_string());
         let notification_event_handle =
             service_context.create_event("INotificationService:NotifyEvent".to_string());
+        let notification_event = service_context
+            .get_event(notification_event_handle)
+            .expect("INotificationService notification event must exist");
         Self {
             handlers: build_handler_map(&[
                 (
@@ -514,6 +788,7 @@ impl INotificationService {
                 (notification_commands::POP, Some(Self::pop_handler), "Pop"),
             ]),
             handlers_tipc: BTreeMap::new(),
+            system,
             uuid,
             notifications: Mutex::new(VecDeque::new()),
             states: Mutex::new(NotificationStates {
@@ -522,12 +797,13 @@ impl INotificationService {
             }),
             service_context,
             notification_event_handle,
+            notification_event,
         }
     }
 
-    pub fn get_event(&self) -> u32 {
+    pub fn get_event(&self) -> Arc<Event> {
         log::debug!("INotificationService::get_event called");
-        self.notification_event_handle
+        Arc::clone(&self.notification_event)
     }
 
     pub fn clear(&self) {
@@ -557,9 +833,10 @@ impl INotificationService {
 
     fn get_event_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         let this = unsafe { &*(this as *const dyn ServiceFramework as *const Self) };
+        let object_id = this.get_event().copy_object_id(ctx).unwrap_or(0);
         let mut rb = ResponseBuilder::new(ctx, 2, 1, 0);
         rb.push_result(RESULT_SUCCESS);
-        rb.push_copy_objects(this.get_event());
+        rb.push_copy_object_id(object_id);
     }
 
     fn clear_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
@@ -580,6 +857,13 @@ impl INotificationService {
             let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
             rb.push_result(RESULT_NO_NOTIFICATIONS);
         }
+    }
+}
+
+impl Drop for INotificationService {
+    fn drop(&mut self) {
+        self.service_context
+            .close_event(self.notification_event_handle);
     }
 }
 
@@ -766,6 +1050,99 @@ pub fn loop_process(system: crate::core::SystemRef) {
 #[cfg(test)]
 mod a41_tests {
     use super::*;
+
+    const IMPLEMENTED_FRIEND_COMMANDS: [u32; 22] = [
+        0, 1, 10101, 10120, 10400, 10420, 10601, 10610, 10700, 20100, 20101, 20104, 20105, 20108,
+        20200, 20600, 20601, 20701, 20800, 20802, 20900, 22010,
+    ];
+
+    #[test]
+    fn friend_command_table_matches_upstream_partition() {
+        let service = IFriendService::new(SystemRef::null());
+        let implemented: Vec<u32> = service
+            .handlers
+            .iter()
+            .filter_map(|(&id, info)| info.handler_callback.map(|_| id))
+            .collect();
+
+        assert_eq!(service.handlers.len(), 112);
+        assert_eq!(implemented, IMPLEMENTED_FRIEND_COMMANDS);
+        assert_eq!(service.handlers[&20105].name, "GetFriendListForViewerV1");
+        assert_eq!(service.handlers[&20108].name, "GetFriendListForViewerV2");
+        assert_eq!(service.handlers[&20800].name, "LoadUserSettingV1");
+        assert_eq!(service.handlers[&20802].name, "LoadUserSettingV2");
+    }
+
+    #[test]
+    fn completion_event_is_signaled_and_released_with_service() {
+        let service = IFriendService::new(SystemRef::null());
+        let event = Arc::clone(&service.completion_event);
+        assert!(!event.is_signaled());
+
+        let handed_out = service.get_completion_event();
+        assert!(Arc::ptr_eq(&event, &handed_out));
+        assert!(event.is_signaled());
+        drop(handed_out);
+
+        assert_eq!(Arc::strong_count(&event), 3);
+        drop(service);
+        assert_eq!(Arc::strong_count(&event), 1);
+    }
+
+    #[test]
+    fn notification_service_retains_uuid_and_releases_event() {
+        let uuid = UUID::from_bytes([0x5A; 16]);
+        let service = INotificationService::new(SystemRef::null(), uuid);
+        let event = Arc::clone(&service.notification_event);
+
+        assert_eq!(service.uuid, uuid);
+        assert_eq!(Arc::strong_count(&event), 3);
+        drop(service);
+        assert_eq!(Arc::strong_count(&event), 1);
+    }
+
+    #[test]
+    fn user_setting_payload_matches_upstream_layout_and_defaults() {
+        let uuid = UUID::from_bytes(core::array::from_fn(|index| index as u8));
+        let setting = FriendsUserSetting::new(uuid);
+        let bytes = setting.as_bytes();
+
+        assert_eq!(bytes.len(), 0x800);
+        assert_eq!(&bytes[0x00..0x10], &uuid.uuid);
+        assert_eq!(u32::from_le_bytes(bytes[0x10..0x14].try_into().unwrap()), 2);
+        assert_eq!(u32::from_le_bytes(bytes[0x14..0x18].try_into().unwrap()), 5);
+        assert_eq!(u64::from_le_bytes(bytes[0x18..0x20].try_into().unwrap()), 1);
+        assert_eq!(&bytes[0x20..0x2E], b"0000-0000-0000");
+        assert_eq!(bytes[0x2E], 0);
+        assert!(bytes[0x2F..0x40].iter().all(|&byte| byte == 0));
+        assert_eq!(
+            u64::from_le_bytes(bytes[0x40..0x48].try_into().unwrap()),
+            99_999_999_999
+        );
+        assert!(bytes[0x48..].iter().all(|&byte| byte == 0));
+    }
+
+    #[test]
+    fn friend_forwards_system_and_retains_module_owner() {
+        let system = crate::core::System::new();
+        let system_ref = SystemRef::from_ref(&system);
+        let module = Arc::new(Module::new());
+        let friend = super::super::friend_interface::Friend::new(
+            system_ref,
+            Arc::clone(&module),
+            "friend:u",
+        );
+
+        assert_eq!(Arc::strong_count(&module), 2);
+        assert!(!friend.create_friend_service().system.is_null());
+        assert!(!friend
+            .create_notification_service(UUID::new())
+            .system
+            .is_null());
+
+        drop(friend);
+        assert_eq!(Arc::strong_count(&module), 1);
+    }
 
     #[test]
     fn neighbor_detection_tables_match_upstream() {
