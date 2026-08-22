@@ -379,6 +379,49 @@ impl TimeServiceManager {
         RESULT_SUCCESS
     }
 
+    pub fn get_standard_local_clock_operation_event(
+        &self,
+        out_event: &mut Option<Arc<crate::hle::service::os::event::Event>>,
+    ) -> ResultCode {
+        log::debug!("TimeServiceManager::get_standard_local_clock_operation_event called");
+        *out_event = Some(self.local_operation.get_event());
+        RESULT_SUCCESS
+    }
+
+    pub fn get_standard_network_clock_operation_event_for_service_manager(
+        &self,
+        out_event: &mut Option<Arc<crate::hle::service::os::event::Event>>,
+    ) -> ResultCode {
+        log::debug!(
+            "TimeServiceManager::get_standard_network_clock_operation_event_for_service_manager called"
+        );
+        *out_event = Some(self.network_operation.get_event());
+        RESULT_SUCCESS
+    }
+
+    pub fn get_ephemeral_network_clock_operation_event_for_service_manager(
+        &self,
+        out_event: &mut Option<Arc<crate::hle::service::os::event::Event>>,
+    ) -> ResultCode {
+        log::debug!(
+            "TimeServiceManager::get_ephemeral_network_clock_operation_event_for_service_manager called"
+        );
+        *out_event = Some(self.ephemeral_operation.get_event());
+        RESULT_SUCCESS
+    }
+
+    pub fn get_standard_user_system_clock_automatic_correction_updated_event(
+        &self,
+        out_event: &mut Option<Arc<crate::hle::service::os::event::Event>>,
+    ) -> ResultCode {
+        log::debug!(
+            "TimeServiceManager::get_standard_user_system_clock_automatic_correction_updated_event called"
+        );
+        let time = self.time.lock().unwrap();
+        *out_event = Some(time.standard_user_system_clock.get_event());
+        RESULT_SUCCESS
+    }
+
     pub fn set_standard_steady_clock_base_time(&self, base_time: i64) -> ResultCode {
         let mut time = self.time.lock().unwrap();
         time.standard_steady_clock.set_rtc_offset(base_time);
@@ -600,19 +643,22 @@ impl TimeServiceManager {
         ctx: &mut HLERequestContext,
     ) {
         let service = Self::as_self(this);
+        let mut event = None;
+        let result = service.get_standard_local_clock_operation_event(&mut event);
+        let event = event.expect("local clock operation event must exist");
         match service.get_or_create_event_handle(
             ctx,
-            &service.local_operation.get_event(),
+            &event,
             &service.local_operation_readable_event,
         ) {
             Some(handle) => {
                 let mut rb = ResponseBuilder::new(ctx, 2, 1, 0);
-                rb.push_result(RESULT_SUCCESS);
+                rb.push_result(result);
                 rb.push_copy_objects(handle);
             }
             None => {
                 let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
-                rb.push_result(RESULT_SUCCESS);
+                rb.push_result(result);
             }
         }
     }
@@ -622,19 +668,23 @@ impl TimeServiceManager {
         ctx: &mut HLERequestContext,
     ) {
         let service = Self::as_self(this);
+        let mut event = None;
+        let result =
+            service.get_standard_network_clock_operation_event_for_service_manager(&mut event);
+        let event = event.expect("network clock operation event must exist");
         match service.get_or_create_event_handle(
             ctx,
-            &service.network_operation.get_event(),
+            &event,
             &service.network_operation_readable_event,
         ) {
             Some(handle) => {
                 let mut rb = ResponseBuilder::new(ctx, 2, 1, 0);
-                rb.push_result(RESULT_SUCCESS);
+                rb.push_result(result);
                 rb.push_copy_objects(handle);
             }
             None => {
                 let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
-                rb.push_result(RESULT_SUCCESS);
+                rb.push_result(result);
             }
         }
     }
@@ -644,19 +694,23 @@ impl TimeServiceManager {
         ctx: &mut HLERequestContext,
     ) {
         let service = Self::as_self(this);
+        let mut event = None;
+        let result =
+            service.get_ephemeral_network_clock_operation_event_for_service_manager(&mut event);
+        let event = event.expect("ephemeral clock operation event must exist");
         match service.get_or_create_event_handle(
             ctx,
-            &service.ephemeral_operation.get_event(),
+            &event,
             &service.ephemeral_operation_readable_event,
         ) {
             Some(handle) => {
                 let mut rb = ResponseBuilder::new(ctx, 2, 1, 0);
-                rb.push_result(RESULT_SUCCESS);
+                rb.push_result(result);
                 rb.push_copy_objects(handle);
             }
             None => {
                 let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
-                rb.push_result(RESULT_SUCCESS);
+                rb.push_result(result);
             }
         }
     }
@@ -666,10 +720,10 @@ impl TimeServiceManager {
         ctx: &mut HLERequestContext,
     ) {
         let service = Self::as_self(this);
-        let event = {
-            let time = service.time.lock().unwrap();
-            time.standard_user_system_clock.get_event()
-        };
+        let mut event = None;
+        let result =
+            service.get_standard_user_system_clock_automatic_correction_updated_event(&mut event);
+        let event = event.expect("automatic correction event must exist");
         match service.get_or_create_event_handle(
             ctx,
             &event,
@@ -677,12 +731,12 @@ impl TimeServiceManager {
         ) {
             Some(handle) => {
                 let mut rb = ResponseBuilder::new(ctx, 2, 1, 0);
-                rb.push_result(RESULT_SUCCESS);
+                rb.push_result(result);
                 rb.push_copy_objects(handle);
             }
             None => {
                 let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
-                rb.push_result(RESULT_SUCCESS);
+                rb.push_result(result);
             }
         }
     }
@@ -869,5 +923,45 @@ mod tests {
         assert_eq!(info._padding, 42);
         assert_eq!(out_time, 99);
         assert_eq!(service.check_and_signal_alarms(), RESULT_SUCCESS);
+    }
+
+    #[test]
+    fn clock_operation_methods_return_their_stable_owner_events() {
+        let service =
+            TimeServiceManager::new(SystemRef::null(), std::ptr::null(), std::ptr::null_mut());
+
+        let mut local = None;
+        let mut local_again = None;
+        let mut network = None;
+        let mut ephemeral = None;
+        let mut automatic_correction = None;
+        assert_eq!(
+            service.get_standard_local_clock_operation_event(&mut local),
+            RESULT_SUCCESS
+        );
+        assert_eq!(
+            service.get_standard_local_clock_operation_event(&mut local_again),
+            RESULT_SUCCESS
+        );
+        assert_eq!(
+            service.get_standard_network_clock_operation_event_for_service_manager(&mut network),
+            RESULT_SUCCESS
+        );
+        assert_eq!(
+            service.get_ephemeral_network_clock_operation_event_for_service_manager(&mut ephemeral),
+            RESULT_SUCCESS
+        );
+        assert_eq!(
+            service.get_standard_user_system_clock_automatic_correction_updated_event(
+                &mut automatic_correction
+            ),
+            RESULT_SUCCESS
+        );
+
+        let local = local.unwrap();
+        assert!(Arc::ptr_eq(&local, local_again.as_ref().unwrap()));
+        assert!(!Arc::ptr_eq(&local, network.as_ref().unwrap()));
+        assert!(!Arc::ptr_eq(&local, ephemeral.as_ref().unwrap()));
+        assert!(!Arc::ptr_eq(&local, automatic_correction.as_ref().unwrap()));
     }
 }

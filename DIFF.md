@@ -6503,12 +6503,15 @@ vs Eden `display_list.h` and `layer_list.h`
 
 ### Unintentional differences (to fix)
 
-- The broader PSC time service was not re-audited in this alarm-method prerequisite; this entry
-  covers constructor pointer handling and commands 200–202 only.
+- Eden calls `CheckAndSetupServicesSAndP` after each setup command and dynamically registers
+  `time:s` and `time:p` once all clock cores are initialized. Ruzu does not yet port that
+  registration state or either helper, and `psc.rs` still treats related services separately.
 
 ### Missing items
 
-- None from `GetClosestAlarmUpdatedEvent`, `CheckAndSignalAlarms`, or `GetClosestAlarmInfo`.
+- `CheckAndSetupServicesSAndP`, `SetupSAndP`, and the associated server-manager owner remain
+  missing. The reviewed event methods for commands 50–60 and alarm methods for commands 200–202
+  are present.
 
 ### Binary layout verification
 
@@ -6519,6 +6522,11 @@ vs Eden `display_list.h` and `layer_list.h`
 
 - Restored the three public service methods as the owners of commands 200–202; IPC handlers now
   delegate instead of owning their behavior.
+- Restored `GetStandardLocalClockOperationEvent`,
+  `GetStandardNetworkClockOperationEventForServiceManager`,
+  `GetEphemeralNetworkClockOperationEventForServiceManager`, and
+  `GetStandardUserSystemClockAutomaticCorrectionUpdatedEvent` as the owners of commands 50–60;
+  their IPC handlers now only adapt results and handles.
 - Replaced eager `then_some(&*pointer)` evaluation with explicit null branches before creating
   optional shared-memory references. This removes a real null dereference while preserving the
   constructor's `None` semantics.

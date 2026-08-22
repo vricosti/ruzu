@@ -1,5 +1,23 @@
 # Porting State
 
+## 2026-08-22 — TimeWorker warning slice interrupted by clock-event prerequisites
+
+- Status: interrupted before consuming the four unread report-context fields or replacing the
+  synthetic `running` flag.
+- Interrupted slice: port Eden's `TimeWorker` construction, initialization, nine-way event loop,
+  report-state updates, and shutdown order.
+- Exact missing prerequisite: Ruzu's multi-wait implementation is available, but PSC `time:m`
+  commands 50, 51, 52, and 60 still own their event lookup directly in IPC handlers. Eden exposes
+  matching public `ServiceManager` methods used by `TimeWorker`. `FileTimestampWorker` also omits
+  the local-clock and timezone owners that Eden initializes from `time:sm`.
+- Required next action: restore the four public PSC event methods and handler delegation, then port
+  `FileTimestampWorker` ownership/behavior before resuming the worker thread.
+- Clock-event prerequisite result: commands 50, 51, 52, and 60 now delegate to their corresponding
+  public `TimeServiceManager` methods. Each method returns the stable event owned by its operation
+  writer or user clock, and focused coverage verifies stable local identity plus separation between
+  all four event sources.
+- Status: PSC clock-event prerequisite completed; `FileTimestampWorker` prerequisite is next.
+
 ## 2026-08-22 — AlarmWorker warning slice interrupted by event-wiring prerequisite
 
 - Status: interrupted before changing the unread `closest_alarm_event` field.
