@@ -127,7 +127,6 @@ pub mod commands {
 /// Corresponds to `States` in upstream parental_control_service.h.
 #[derive(Debug, Clone, Default)]
 struct States {
-    current_tid: u64,
     application_info: ApplicationInfo,
     tid_from_event: u64,
     launch_time_valid: bool,

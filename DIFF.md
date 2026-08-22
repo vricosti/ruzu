@@ -5947,3 +5947,12 @@ vs Eden `display_list.h` and `layer_list.h`
 - Eden declares `IMonitorService::state`, but `GetStateForMonitor` unconditionally returns
   `State::None` and neither monitor lifecycle method reads or changes the member. Ruzu removes the
   unread field while retaining that exact stub response, now covered by a focused regression.
+
+## 2026-08-22 — upstream-dead parental-control title ID
+
+### Intentional differences
+
+- Removed `States::current_tid` from `parental_control_service.rs`. Eden declares the zero-valued
+  member but never reads or writes it; active application identity remains owned by
+  `states.application_info.application_id` on both sides. No command payload or state transition
+  changed.
