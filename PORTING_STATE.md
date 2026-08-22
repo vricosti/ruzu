@@ -895,4 +895,11 @@
   are now ported in `process_creation.rs`. Loader assignment precedes initialization, failed NACP
   reads produce an exact zeroed `RawNACP`, launch properties use the installed-content slots and
   game version, and ARP registration occurs only after successful process creation.
-- Status: prerequisite completed and verified; resume `application_creator.rs`.
+- Newly discovered prerequisite: Eden's creator records `LaunchTimestampCache::SaveLaunchTimestamp`
+  before normal creation and after system creation, but Ruzu has no counterpart for
+  `core/launch_timestamp_cache.{h,cpp}`. Port that matching owner before resuming the commands.
+- Launch-timestamp prerequisite result: the process-global lazy cache, current and legacy JSON
+  loading, uppercase title keys, count increments, fixed missing-title timestamp and synchronous
+  save path are ported in `core/launch_timestamp_cache.rs` with focused parser and persistence
+  tests.
+- Status: both prerequisites completed and verified; resume `application_creator.rs`.

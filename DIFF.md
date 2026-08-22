@@ -6044,3 +6044,25 @@ vs Eden `display_list.h` and `layer_list.h`
 
 - PASS: failed control reads produce exactly `size_of::<RawNACP>() == 0x4000` zero bytes, and the
   registered `ApplicationLaunchProperty` retains its existing verified 0x10-byte C layout.
+
+## 2026-08-22 — `launch_timestamp_cache.rs` vs Eden `launch_timestamp_cache.{h,cpp}`
+
+### Intentional differences
+
+- Rust uses a `LazyLock<Mutex<CacheState>>` for Eden's namespace-static mutex, maps and loaded flag.
+  Ordered `BTreeMap` storage makes serialized key order deterministic without changing lookup,
+  update or persistence semantics.
+- Filesystem and JSON failures are represented by `Result`/`Option` instead of streams and C++
+  exceptions. Production behavior remains warning-and-return, including keeping the one-shot
+  `loaded` flag set after a failed read or parse.
+- JSON pretty-print whitespace is produced by `serde_json`; the persisted object shape, uppercase
+  16-digit keys and values are compatible with Eden's parser.
+
+### Fixed parity debt
+
+- Added the missing core-owned launch timestamp cache with the exact `launched.json` cache path,
+  lazy load, legacy raw-timestamp support, current `{timestamp, launch_count}` format, synchronous
+  save, count increment and 2026-01-01 default timestamp.
+- Hex key parsing preserves the prefix behavior of Eden's `std::stoull`, including whitespace,
+  signs, `0x` and trailing non-hex text. Focused tests cover both JSON formats, malformed keys,
+  serialization and the fixed fallback value.

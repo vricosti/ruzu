@@ -21,6 +21,7 @@ pub mod gpu_dirty_memory_manager;
 pub mod guest_memory;
 pub mod hardware_properties;
 pub mod host1x_core;
+pub mod launch_timestamp_cache;
 pub mod perf_stats;
 pub mod reporter;
 pub mod telemetry_session;
