@@ -249,29 +249,21 @@ impl Drop for ArmNce {
     fn drop(&mut self) {}
 }
 
-// ---------------------------------------------------------------------------
-// Signal constants matching upstream arm_nce_asm_definitions.h
-// ---------------------------------------------------------------------------
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
 
-/// Signal used to return to guest code via exception level change.
-/// Upstream: `ReturnToRunCodeByExceptionLevelChangeSignal = SIGUSR2`.
-#[cfg(target_os = "linux")]
-const RETURN_TO_RUN_CODE_SIGNAL: i32 = libc::SIGUSR2;
-
-/// Signal used to break from running guest code.
-/// Upstream: `BreakFromRunCodeSignal = SIGURG`.
-#[cfg(target_os = "linux")]
-const BREAK_FROM_RUN_CODE_SIGNAL: i32 = libc::SIGURG;
-
-/// Signal for guest alignment faults.
-/// Upstream: `GuestAlignmentFaultSignal = SIGBUS`.
-#[cfg(target_os = "linux")]
-const GUEST_ALIGNMENT_FAULT_SIGNAL: i32 = libc::SIGBUS;
-
-/// Signal for guest access faults.
-/// Upstream: `GuestAccessFaultSignal = SIGSEGV`.
-#[cfg(target_os = "linux")]
-const GUEST_ACCESS_FAULT_SIGNAL: i32 = libc::SIGSEGV;
+    #[test]
+    fn signal_numbers_match_linux_abi() {
+        assert_eq!(
+            RETURN_TO_RUN_CODE_BY_EXCEPTION_LEVEL_CHANGE_SIGNAL,
+            libc::SIGUSR2
+        );
+        assert_eq!(BREAK_FROM_RUN_CODE_SIGNAL, libc::SIGURG);
+        assert_eq!(GUEST_ACCESS_FAULT_SIGNAL, libc::SIGSEGV);
+        assert_eq!(GUEST_ALIGNMENT_FAULT_SIGNAL, libc::SIGBUS);
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Signal handler installation — AArch64 Linux only
@@ -288,7 +280,10 @@ fn install_nce_signal_handlers() {
         unsafe {
             let mut signal_mask: libc::sigset_t = std::mem::zeroed();
             libc::sigemptyset(&mut signal_mask);
-            libc::sigaddset(&mut signal_mask, RETURN_TO_RUN_CODE_SIGNAL);
+            libc::sigaddset(
+                &mut signal_mask,
+                RETURN_TO_RUN_CODE_BY_EXCEPTION_LEVEL_CHANGE_SIGNAL,
+            );
             libc::sigaddset(&mut signal_mask, BREAK_FROM_RUN_CODE_SIGNAL);
             libc::sigaddset(&mut signal_mask, GUEST_ALIGNMENT_FAULT_SIGNAL);
             libc::sigaddset(&mut signal_mask, GUEST_ACCESS_FAULT_SIGNAL);
@@ -298,7 +293,11 @@ fn install_nce_signal_handlers() {
             sa.sa_flags = libc::SA_SIGINFO | libc::SA_ONSTACK;
             sa.sa_sigaction = nce_return_to_run_code_handler as usize;
             sa.sa_mask = signal_mask;
-            libc::sigaction(RETURN_TO_RUN_CODE_SIGNAL, &sa, std::ptr::null_mut());
+            libc::sigaction(
+                RETURN_TO_RUN_CODE_BY_EXCEPTION_LEVEL_CHANGE_SIGNAL,
+                &sa,
+                std::ptr::null_mut(),
+            );
 
             // SIGURG — break from running guest code.
             sa.sa_sigaction = nce_break_from_run_code_handler as usize;

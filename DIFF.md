@@ -4517,6 +4517,14 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
   AArch64 emitters consume and discard that operand directly, so the port returns
   `SendOneWordResult::DummyWrite` without retaining an unread per-instance value.
 
+## 2026-08-22 — NCE signal constant ownership
+
+### Fixed parity debt
+
+- `arm_nce.rs` no longer redeclares the four Linux signal constants owned upstream by
+  `arm_nce_asm_definitions.h`. The signal mask, handler installation, and interrupt path now use
+  the constants from the matching `arm_nce_asm_definitions.rs` module.
+
 ## 2026-08-22 — `src/video_core/src/buffer_cache/buffer_cache.rs` vs `src/video_core/buffer_cache/buffer_cache_base.h` and `buffer_cache.h`
 
 ### Intentional differences
