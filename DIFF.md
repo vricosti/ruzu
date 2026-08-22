@@ -5956,3 +5956,30 @@ vs Eden `display_list.h` and `layer_list.h`
   member but never reads or writes it; active application identity remains owned by
   `states.application_info.application_id` on both sides. No command payload or state transition
   changed.
+
+## 2026-08-22 — PSM session event ownership in `ptm/psm.rs` vs Eden `ptm/psm.{h,cpp}`
+
+### Intentional differences
+
+- `PSM` does not retain its constructor `SystemRef`: Eden's base `ServiceFramework` owns the
+  system reference used to construct `IPsmSession`, whereas Rust's `ServiceContext` resolves the
+  active kernel process itself. Retaining a second unread reference on `PSM` did not participate
+  in either session construction or event signaling.
+- Session enable flags use atomics because Rust service handlers receive shared references. Their
+  initial values, command mutations and signal predicates match Eden's four booleans.
+
+### Fixed parity debt
+
+- `BindStateChangeEvent` now returns the readable end of the persistent event created by the
+  session. It previously allocated and returned an unrelated event, so all three `Signal*`
+  methods signaled an object the guest could never observe.
+- A focused regression covers Eden's bind, enable, signal, unbind and suppressed-signal ordering;
+  the unread `PSM::system` warning is gone.
+
+### Missing items
+
+- `GetBatteryVoltageState`, `GetBatteryAgePercentage`, and `GetBatteryChargeInfoFields` remain
+  unimplemented. Porting the latter also requires Eden's `Common::GetPowerStatus` counterpart and
+  its exact 0x54-byte `BatteryChargeInfoFields` payload.
+- Battery percentage and charger type still use fixed stored values rather than Eden's host power
+  status query.

@@ -66,7 +66,6 @@ pub mod session_commands {
 ///
 /// Corresponds to `PSM` in upstream psm.h / psm.cpp.
 pub struct PSM {
-    system: crate::core::SystemRef,
     /// Battery charge percentage (stubbed to 100%).
     battery_charge_percentage: u32,
     /// Charger type.
@@ -76,7 +75,7 @@ pub struct PSM {
 }
 
 impl PSM {
-    pub fn new(system: crate::core::SystemRef) -> Self {
+    pub fn new(_system: crate::core::SystemRef) -> Self {
         let handlers = build_handler_map(&[
             (
                 commands::GET_BATTERY_CHARGE_PERCENTAGE,
@@ -175,7 +174,6 @@ impl PSM {
             ),
         ]);
         Self {
-            system,
             battery_charge_percentage: 100,
             charger_type: ChargerType::Charger,
             handlers,
@@ -430,15 +428,15 @@ impl IPsmSession {
         let service = unsafe { &*(this as *const dyn ServiceFramework as *const IPsmSession) };
         service.bind_state_change_event();
 
-        if let Some(handle) = ctx.create_readable_event_handle(false) {
-            let mut rb = ResponseBuilder::new(ctx, 2, 1, 0);
-            rb.push_result(RESULT_SUCCESS);
-            rb.push_copy_objects(handle);
-        } else {
-            let mut rb = ResponseBuilder::new(ctx, 2, 1, 0);
-            rb.push_result(RESULT_SUCCESS);
-            rb.push_copy_objects(0);
-        }
+        let object_id = service
+            .service_context
+            .get_event(service.state_change_event_handle)
+            .and_then(|event| event.copy_object_id(ctx))
+            .unwrap_or(0);
+
+        let mut rb = ResponseBuilder::new(ctx, 2, 1, 0);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_copy_object_id(object_id);
     }
 
     fn unbind_state_change_event_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
@@ -510,5 +508,32 @@ impl ServiceFramework for IPsmSession {
 
     fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
         &self.handlers_tipc
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn state_change_signals_the_persistent_session_event() {
+        let session = IPsmSession::new();
+        let event = session
+            .service_context
+            .get_event(session.state_change_event_handle)
+            .unwrap();
+
+        session.set_charger_type_change_event_enabled(true);
+        session.signal_charger_type_changed();
+        assert!(!event.is_signaled());
+
+        session.bind_state_change_event();
+        session.signal_charger_type_changed();
+        assert!(event.is_signaled());
+
+        event.clear();
+        session.unbind_state_change_event();
+        session.signal_charger_type_changed();
+        assert!(!event.is_signaled());
     }
 }
