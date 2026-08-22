@@ -6602,3 +6602,35 @@ vs Eden `display_list.h` and `layer_list.h`
 ### Binary layout verification
 
 - N/A: the constructor-wiring slice changes ownership only and serializes no raw payload.
+
+## 2026-08-22 — `src/core/src/hle/service/glue/time/file_timestamp_worker.rs` vs `src/core/hle/service/glue/time/file_timestamp_worker.{h,cpp}`
+
+### Intentional differences
+
+- Eden default-initializes nullable `shared_ptr` fields; Ruzu represents the same pre-initialize
+  state as `Option<Arc<SystemClock>>` and `Option<Arc<TimeZoneService>>`.
+- Failed or missing prerequisites return early through Rust `Option`/`Result` matching instead of
+  C++'s short-circuit boolean expression. The call order remains initialized flag, clock read,
+  timezone conversion.
+
+### Unintentional differences (to fix)
+
+- The service owners are not yet assigned by `TimeWorker::Initialize`; that wiring is the resumed
+  parent slice.
+
+### Missing items
+
+- `IFileSystemProxy::SetCurrentPosixTime` remains absent exactly where Eden also leaves it as a
+  TODO.
+
+### Binary layout verification
+
+- N/A: calendar values remain local typed objects and are not serialized by this worker.
+
+### Fixed parity debt
+
+- Restored both upstream service owners and the complete implemented portion of
+  `SetFilesystemPosixTime`. Previously Ruzu returned after the initialized check without querying
+  either service.
+- A lifetime regression verifies that the exact clock and timezone allocations remain owned until
+  the worker is destroyed.

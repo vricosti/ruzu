@@ -17,6 +17,11 @@
   writer or user clock, and focused coverage verifies stable local identity plus separation between
   all four event sources.
 - Status: PSC clock-event prerequisite completed; `FileTimestampWorker` prerequisite is next.
+- File-timestamp prerequisite result: the worker now retains the local `SystemClock` and
+  `TimeZoneService`, checks initialization, reads current time, and converts it with the active
+  timezone rule in Eden's exact short-circuit order. Only `SetCurrentPosixTime` remains absent, as
+  it is also a TODO in Eden.
+- Status: both prerequisites completed; the `TimeWorker` implementation may resume.
 
 ## 2026-08-22 — AlarmWorker warning slice interrupted by event-wiring prerequisite
 
