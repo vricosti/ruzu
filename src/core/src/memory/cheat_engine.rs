@@ -4,13 +4,13 @@
 //! Port of zuyu/src/core/memory/cheat_engine.h and cheat_engine.cpp
 //! Cheat engine for applying game cheats via the dmnt cheat VM.
 
-use super::dmnt_cheat_types::{
-    CheatEntry, CheatProcessMetadata, MemoryRegionExtents,
-};
+use super::dmnt_cheat_types::{CheatEntry, CheatProcessMetadata, MemoryRegionExtents};
 use super::dmnt_cheat_vm::{DmntCheatVm, VmCallbacks};
 use super::memory::Memory;
+use crate::core_timing::{create_event, CoreTiming, EventType, UnscheduleEventType};
+use parking_lot::Mutex as ParkingMutex;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
 /// Cheat engine callback frequency: ~12 Hz (1000000000 / 12 ns).
@@ -35,21 +35,24 @@ fn extract_name(data: &str, start_index: usize, match_char: char) -> Option<(usi
 /// Standard VM callbacks that interact with the emulator's memory system.
 /// Port of StandardVmCallbacks from cheat_engine.h/cpp.
 pub struct StandardVmCallbacks {
-    metadata: CheatProcessMetadata,
+    metadata: Arc<Mutex<CheatProcessMetadata>>,
     /// Reference to the application's memory.
     /// Upstream: `Core::System& m_system` → `system.ApplicationMemory()`.
     memory: Option<Arc<Mutex<Memory>>>,
 }
 
 impl StandardVmCallbacks {
-    pub fn new(metadata: CheatProcessMetadata) -> Self {
+    pub fn new(metadata: Arc<Mutex<CheatProcessMetadata>>) -> Self {
         Self {
             metadata,
             memory: None,
         }
     }
 
-    pub fn with_memory(metadata: CheatProcessMetadata, memory: Arc<Mutex<Memory>>) -> Self {
+    pub fn with_memory(
+        metadata: Arc<Mutex<CheatProcessMetadata>>,
+        memory: Arc<Mutex<Memory>>,
+    ) -> Self {
         Self {
             metadata,
             memory: Some(memory),
@@ -57,14 +60,15 @@ impl StandardVmCallbacks {
     }
 
     fn is_address_in_range(&self, address: u64) -> bool {
-        let in_main = address >= self.metadata.main_nso_extents.base
-            && address < self.metadata.main_nso_extents.base + self.metadata.main_nso_extents.size;
-        let in_heap = address >= self.metadata.heap_extents.base
-            && address < self.metadata.heap_extents.base + self.metadata.heap_extents.size;
-        let in_alias = address >= self.metadata.alias_extents.base
-            && address < self.metadata.alias_extents.base + self.metadata.alias_extents.size;
-        let in_aslr = address >= self.metadata.aslr_extents.base
-            && address < self.metadata.aslr_extents.base + self.metadata.aslr_extents.size;
+        let metadata = self.metadata.lock().unwrap();
+        let in_main = address >= metadata.main_nso_extents.base
+            && address < metadata.main_nso_extents.base + metadata.main_nso_extents.size;
+        let in_heap = address >= metadata.heap_extents.base
+            && address < metadata.heap_extents.base + metadata.heap_extents.size;
+        let in_alias = address >= metadata.alias_extents.base
+            && address < metadata.alias_extents.base + metadata.alias_extents.size;
+        let in_aslr = address >= metadata.aslr_extents.base
+            && address < metadata.aslr_extents.base + metadata.aslr_extents.size;
 
         if !in_main && !in_heap && !in_alias && !in_aslr {
             log::debug!(
@@ -250,53 +254,15 @@ impl CheatParser for TextCheatParser {
 
 /// Encapsulates a CheatList and manages its interaction with the cheat VM.
 /// Port of CheatEngine from cheat_engine.h/cpp.
-pub struct CheatEngine {
+struct CheatEngineState {
     vm: DmntCheatVm,
-    metadata: CheatProcessMetadata,
+    metadata: Arc<Mutex<CheatProcessMetadata>>,
     cheats: Vec<CheatEntry>,
     is_pending_reload: AtomicBool,
-    // Upstream: Core::Timing event + CoreTiming reference for periodic execution.
-    // In our model, the caller triggers execute_cheat_list periodically.
 }
 
-impl CheatEngine {
-    pub fn new(cheats: Vec<CheatEntry>, build_id: &[u8; 0x20]) -> Self {
-        let mut metadata = CheatProcessMetadata::default();
-        metadata.main_nso_build_id = *build_id;
-
-        let callbacks = Box::new(StandardVmCallbacks::new(metadata.clone()));
-        let vm = DmntCheatVm::new(callbacks);
-
-        Self {
-            vm,
-            metadata,
-            cheats,
-            is_pending_reload: AtomicBool::new(false),
-        }
-    }
-
-    pub fn initialize(&mut self) {
-        // Upstream: schedules a CoreTiming event at CHEAT_ENGINE_NS interval
-        // and reads process metadata (process_id, title_id, heap/aslr/alias extents)
-        // from system.ApplicationProcess(). The caller should set metadata via
-        // set_main_memory_parameters before calling initialize.
-        self.is_pending_reload.store(true, Ordering::Release);
-    }
-
-    pub fn set_main_memory_parameters(&mut self, main_region_begin: u64, main_region_size: u64) {
-        self.metadata.main_nso_extents = MemoryRegionExtents {
-            base: main_region_begin,
-            size: main_region_size,
-        };
-    }
-
-    pub fn reload(&mut self, reload_cheats: Vec<CheatEntry>) {
-        self.cheats = reload_cheats;
-        self.is_pending_reload.store(true, Ordering::Release);
-    }
-
-    /// Called each frame (at CHEAT_ENGINE_NS intervals).
-    pub fn frame_callback(&mut self) {
+impl CheatEngineState {
+    fn frame_callback(&mut self) {
         if self.is_pending_reload.swap(false, Ordering::AcqRel) {
             self.vm.load_program(&self.cheats);
         }
@@ -305,6 +271,145 @@ impl CheatEngine {
             return;
         }
 
-        self.vm.execute(&self.metadata);
+        let metadata = self.metadata.lock().unwrap().clone();
+        self.vm.execute(&metadata);
+    }
+}
+
+pub struct CheatEngine {
+    state: Arc<Mutex<CheatEngineState>>,
+    event: Option<Arc<ParkingMutex<EventType>>>,
+    core_timing: Arc<CoreTiming>,
+}
+
+impl CheatEngine {
+    pub fn new(
+        core_timing: Arc<CoreTiming>,
+        cheats: Vec<CheatEntry>,
+        build_id: &[u8; 0x20],
+    ) -> Self {
+        let mut metadata = CheatProcessMetadata::default();
+        metadata.main_nso_build_id = *build_id;
+        let metadata = Arc::new(Mutex::new(metadata));
+
+        let callbacks = Box::new(StandardVmCallbacks::new(metadata.clone()));
+        let vm = DmntCheatVm::new(callbacks);
+
+        Self {
+            state: Arc::new(Mutex::new(CheatEngineState {
+                vm,
+                metadata,
+                cheats,
+                is_pending_reload: AtomicBool::new(false),
+            })),
+            event: None,
+            core_timing,
+        }
+    }
+
+    pub fn initialize(&mut self) {
+        let build_id = self
+            .state
+            .lock()
+            .unwrap()
+            .metadata
+            .lock()
+            .unwrap()
+            .main_nso_build_id;
+        let event_name = format!(
+            "CheatEngine::FrameCallback::{}",
+            build_id
+                .iter()
+                .map(|byte| format!("{byte:02X}"))
+                .collect::<String>()
+        );
+        let weak_state: Weak<Mutex<CheatEngineState>> = Arc::downgrade(&self.state);
+        let event = create_event(
+            event_name,
+            Box::new(move |_time, _ns_late| {
+                if let Some(state) = weak_state.upgrade() {
+                    state.lock().unwrap().frame_callback();
+                }
+                None
+            }),
+        );
+        self.core_timing
+            .schedule_looping_event(CHEAT_ENGINE_NS, CHEAT_ENGINE_NS, &event, false);
+        self.event = Some(event);
+        self.state
+            .lock()
+            .unwrap()
+            .is_pending_reload
+            .store(true, Ordering::Release);
+    }
+
+    pub fn set_main_memory_parameters(&mut self, main_region_begin: u64, main_region_size: u64) {
+        self.state
+            .lock()
+            .unwrap()
+            .metadata
+            .lock()
+            .unwrap()
+            .main_nso_extents = MemoryRegionExtents {
+            base: main_region_begin,
+            size: main_region_size,
+        };
+    }
+
+    pub fn reload(&mut self, reload_cheats: Vec<CheatEntry>) {
+        let mut state = self.state.lock().unwrap();
+        state.cheats = reload_cheats;
+        state.is_pending_reload.store(true, Ordering::Release);
+    }
+
+    /// Called each frame (at CHEAT_ENGINE_NS intervals).
+    pub fn frame_callback(&self) {
+        self.state.lock().unwrap().frame_callback();
+    }
+}
+
+impl Drop for CheatEngine {
+    fn drop(&mut self) {
+        if let Some(event) = self.event.take() {
+            self.core_timing
+                .unschedule_event(&event, UnscheduleEventType::Wait);
+        } else {
+            log::error!("~CheatEngine before event was registered");
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn initialize_schedules_periodic_frame_callback() {
+        let core_timing = Arc::new(CoreTiming::new());
+        let build_id = [0xAB; 0x20];
+        let mut engine = CheatEngine::new(core_timing.clone(), Vec::new(), &build_id);
+
+        engine.initialize();
+
+        assert_eq!(
+            engine.event.as_ref().unwrap().lock().name,
+            format!("CheatEngine::FrameCallback::{}", "AB".repeat(0x20))
+        );
+        assert!(engine
+            .state
+            .lock()
+            .unwrap()
+            .is_pending_reload
+            .load(Ordering::Acquire));
+
+        core_timing.add_ticks(common::wall_clock::CPU_TICK_FREQ / 12 + 1);
+        core_timing.advance();
+
+        assert!(!engine
+            .state
+            .lock()
+            .unwrap()
+            .is_pending_reload
+            .load(Ordering::Acquire));
     }
 }

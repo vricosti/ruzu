@@ -337,7 +337,7 @@ pub struct CheatVmOpcode {
 
 /// Helper trait for DmntCheatVm <=> emulator interface.
 /// Port of DmntCheatVm::Callbacks.
-pub trait VmCallbacks {
+pub trait VmCallbacks: Send + Sync {
     fn memory_read_unsafe(&self, address: u64, data: &mut [u8]);
     fn memory_write_unsafe(&self, address: u64, data: &[u8]);
     fn hid_keys_down(&self) -> u64;

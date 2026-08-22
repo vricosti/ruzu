@@ -4525,6 +4525,27 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
   `arm_nce_asm_definitions.h`. The signal mask, handler installation, and interrupt path now use
   the constants from the matching `arm_nce_asm_definitions.rs` module.
 
+## 2026-08-22 — `src/core/src/memory/cheat_engine.rs` vs `src/core/memory/cheat_engine.h` and `.cpp`
+
+### Intentional differences
+
+- The timing callback owns a weak reference to mutex-protected cheat state rather than Eden's raw
+  `this` capture. This prevents the event queue from extending the engine lifetime while retaining
+  Eden's event ownership, 12 Hz period, callback ordering, and destructor unscheduling.
+- Metadata is shared with `StandardVmCallbacks` through `Arc<Mutex<_>>`; Eden stores a reference to
+  the engine member. Both arrangements make later main/heap/alias/ASLR extent updates visible to
+  every VM memory access.
+- `VmCallbacks` is `Send + Sync` because Ruzu's `CoreTiming` callback may execute on its timing
+  thread; Eden's callback object is likewise invoked by `CoreTiming` but expresses that contract
+  through C++ ownership rather than a type bound.
+
+### Missing items
+
+- `System::RegisterCheatList`, NSO `PatchManager::CreateCheatList` wiring, live HID input,
+  pause/resume, instruction-cache invalidation, and initialization of process/title/heap/alias/ASLR
+  metadata are not yet connected. The engine now has the correct internal timing lifecycle, but no
+  runtime owner constructs it yet.
+
 ## 2026-08-22 — `src/video_core/src/buffer_cache/buffer_cache.rs` vs `src/video_core/buffer_cache/buffer_cache_base.h` and `buffer_cache.h`
 
 ### Intentional differences
