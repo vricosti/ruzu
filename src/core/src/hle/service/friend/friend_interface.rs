@@ -26,6 +26,8 @@ pub mod commands {
 /// Corresponds to `Friend` (derived from `Module::Interface`) in upstream `friend_interface.h`.
 pub struct Friend {
     pub(super) system: crate::core::SystemRef,
+    // Retained for the flattened `Module::Interface` lifetime, matching Eden.
+    #[allow(dead_code)]
     pub(super) module: Arc<Module>,
     pub(super) name: String,
     handlers: BTreeMap<u32, FunctionInfo>,
@@ -105,8 +107,10 @@ mod tests {
         assert!(friend.handlers[&commands::CREATE_NOTIFICATION_SERVICE]
             .handler_callback
             .is_some());
-        assert!(friend.handlers[&commands::CREATE_DAEMON_SUSPEND_SESSION_SERVICE]
-            .handler_callback
-            .is_none());
+        assert!(
+            friend.handlers[&commands::CREATE_DAEMON_SUSPEND_SESSION_SERVICE]
+                .handler_callback
+                .is_none()
+        );
     }
 }

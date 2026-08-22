@@ -16,7 +16,16 @@
 - Prerequisite result: the two methods, their IPC handlers and response helper now live in
   `friend.rs`; `friend_interface.rs` retains only the concrete `Friend` constructor, command table
   and framework implementation. The three-entry callback partition is covered by a focused test.
-- Status: prerequisite completed and warning slice resumed.
+- Resumed result: `IFriendService` now matches Eden's 112-entry table and exact 22-handler
+  partition, forwards the interface `SystemRef`, signals and returns its stable completion event,
+  and closes that event on destruction. The missing active stubs and their exact response shapes
+  are ported, including the deterministic 0x800-byte `FriendsUserSetting` payload.
+- `INotificationService` now retains its constructor UUID and `SystemRef`, returns one stable event,
+  and closes it on destruction. The flattened `Module::Interface` retains its shared module owner
+  for the same lifetime as Eden.
+- Focused tests verify both command tables, event identity/signal/release, module and system
+  forwarding, retained UUID, and every byte and field offset of `FriendsUserSetting`.
+- Status: prerequisite and resumed warning/parity slice completed and re-verified.
 
 ## 2026-08-22 — CAPS album-manager ownership warning slice
 

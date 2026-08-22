@@ -6445,17 +6445,44 @@ vs Eden `display_list.h` and `layer_list.h`
   and command table remain in `friend_interface.rs` with their upstream owners.
 - The flattened fields are `pub(super)` solely so the sibling `friend.rs` implementation can
   access the same allocation; they remain private outside the Friend service module.
+- Eden's service framework and `ServiceContext` hold `Core::System&` through their base classes.
+  Ruzu retains the corresponding flattened `SystemRef` in each concrete service; its shared
+  `ServiceContext` adapter obtains kernel objects through the existing Rust kernel registry.
+- Ruzu retains each event as an `Arc<Event>` plus the numeric `ServiceContext` handle required by
+  `close_event`. `Drop` explicitly closes the handle at the same lifecycle point as Eden, after
+  which ordinary Rust field destruction releases the wrapper owner.
+- Eden's readable-event `Signal` returns a result that is pushed directly into the response.
+  Ruzu's infallible `Event::signal` returns `()`, so the handler signals first and pushes
+  `RESULT_SUCCESS` before handing out the same readable endpoint.
+- Field-local `#[allow(dead_code)]` attributes cover only owners that Eden deliberately retains
+  without later dereferencing: the flattened module owner, service `SystemRef`s, and notification
+  UUID. Removing them would change upstream lifetime ownership.
 
 ### Unintentional differences (to fix)
 
-- The event lifecycle, system forwarding and implemented command-table differences remain the
-  interrupted warning slice and are resumed after this ownership prerequisite.
+- None in the reviewed command tables, implemented handlers, payloads, system/module forwarding,
+  or event lifecycle.
 
 ### Missing items
 
-- This structural prerequisite adds no missing method; it only relocates the existing methods to
-  their upstream-owned Rust counterpart.
+- None from Eden's `IFriendService`, `INotificationService`, `Module::Interface`, concrete `Friend`,
+  or neighbor-detection service tables. All non-null upstream handlers are ported and every null
+  entry remains unimplemented.
 
 ### Binary layout verification
 
-- N/A: the service objects are not serialized or copied as wire payloads.
+- PASS: compile-time assertions preserve `SizedFriendFilter` and `SizedNotificationInfo` at 0x10
+  bytes and `FriendsUserSetting` at 0x800 bytes. A byte-level regression verifies UUID placement,
+  permissions, reception flag, NUL-terminated default friend code, next-issuable time, and fully
+  zeroed reserved bytes.
+
+### Fixed parity debt
+
+- Restored the complete 112-command `IFriendService` table and exact 22-handler partition,
+  including firmware-versioned V1/V2 entries that were absent from Ruzu.
+- Ported the missing active Eden stubs: cancellation, friend-list synchronization and viewer
+  count, received-request outputs, zeroed presence view, user settings, and summary overlay
+  notification.
+- Restored constructor `SystemRef` forwarding, stable readable-event identity, completion-event
+  signaling, and explicit event closure for both Friend interfaces. The warning-producing fields
+  are now either consumed by behavior or narrowly documented as upstream lifetime owners.
