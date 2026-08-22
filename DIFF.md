@@ -5477,7 +5477,8 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 - The Rust applet owns callback-visible completion, status, and final-data state through `Arc`
   containers because a frontend callback may outlive the mutable trait-object borrow. A separate
   executing flag defers locking the owning `Applet` when the default frontend invokes its callback
-  synchronously. Eden captures `this` and calls `Exit()` directly.
+  synchronously; the enclosing accessor then observes `is_complete()` and signals it. Asynchronous
+  callbacks still signal directly. Eden captures `this` and calls `Exit()` directly.
 - Rust represents C++'s open-underlying-value `UiMode` and `UserSelectionPurpose` enums as
   transparent `u32` newtypes. This preserves all guest bit patterns without constructing an
   invalid Rust enum discriminant.
@@ -5500,3 +5501,31 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
   and constructs `ProfileSelect` for `AppletId::ProfileSelect`.
 - The default frontend now always invokes the callback with a UUID value, using an invalid UUID
   when the configured profile is absent, matching Eden's `value_or(Common::UUID{})` call.
+
+## 2026-08-22 — `applet_error.rs`, frontend `error.rs`, and `applets.rs` vs `applet_error.{h,cpp}`, frontend `error.{h,cpp}`, and `applets.cpp`
+
+### Intentional differences
+
+- C++ enum objects accept unknown underlying values; Rust represents `ErrorAppletMode` as a
+  transparent `u8` newtype so the same input remains valid without creating an invalid enum.
+- Guest `bool` fields are stored as `u8` in the raw argument layouts, avoiding invalid Rust bool
+  representations while preserving their exact offsets and nonzero truth semantics.
+- Rust callback-visible completion is stored in an `Arc` and defers locking the owning applet
+  during a synchronous frontend call. The enclosing accessor observes `is_complete()` after that
+  call and signals the applet; an asynchronous callback signals it directly. Eden captures `this`
+  and calls `Exit()` directly.
+- Frontend text is a Rust `String`, so fixed buffers are decoded lossily when they contain invalid
+  UTF-8. Valid UTF-8 and zero termination match `StringFromFixedZeroTerminatedBuffer`.
+- The unused upstream-local `ErrorCode::FromResult` helper is omitted; Eden has no call site for it.
+- Rust's logging facade has no critical severity, so the default frontend uses `error` for Eden's
+  `LOG_CRITICAL` messages.
+
+### Fixed parity debt
+
+- Replaced the inert `Error` stub with Eden's argument layouts and mode dispatch, including
+  32/64-bit result decoding, system/application custom text, timestamped reports, reporter calls,
+  request-exit handling, and completion output.
+- Removed the frontend-only duplicate result type; `ErrorApplet` now receives the HLE-owned
+  `ResultCode`, matching upstream ownership.
+- `FrontendAppletHolder` now installs, preserves, and constructs the error applet backend for
+  `AppletId::Error`.

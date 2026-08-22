@@ -1,36 +1,16 @@
 // SPDX-FileCopyrightText: Copyright 2019 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-//! Port of zuyu/src/core/frontend/applets/error.h and error.cpp
+//! Port of `core/frontend/applets/error.{h,cpp}`.
 //! Error display applet interface.
 
 use super::applet::Applet;
-
-/// Result code type.
-///
-/// Corresponds to upstream `Result` (core/hle/result.h).
-/// Local definition; hle::result::ResultCode exists but uses a different
-/// representation. This type is kept here for the applet interface until
-/// the error applet is wired to the HLE service layer.
-#[derive(Debug, Clone, Copy)]
-pub struct ResultCode {
-    pub raw: u32,
-}
-
-impl ResultCode {
-    pub fn get_module(&self) -> u32 {
-        self.raw & 0x1FF
-    }
-
-    pub fn get_description(&self) -> u32 {
-        (self.raw >> 9) & 0x1FFF
-    }
-}
+use crate::hle::result::ResultCode;
 
 /// Callback type for when error display is finished.
 ///
 /// Corresponds to upstream `ErrorApplet::FinishedCallback`.
-pub type FinishedCallback = Box<dyn FnOnce() + Send>;
+pub type FinishedCallback = Box<dyn Fn() + Send + Sync>;
 
 /// Error applet trait.
 ///
@@ -67,18 +47,18 @@ impl ErrorApplet for DefaultErrorApplet {
     fn show_error(&self, error: ResultCode, _finished: FinishedCallback) {
         log::error!(
             "Application requested error display: {:04}-{:04} (raw={:08X})",
-            error.get_module(),
+            error.get_module_raw(),
             error.get_description(),
-            error.raw
+            error.get_inner_value()
         );
     }
 
     fn show_error_with_timestamp(&self, error: ResultCode, time: i64, _finished: FinishedCallback) {
         log::error!(
             "Application requested error display: {:04X}-{:04X} (raw={:08X}) with timestamp={:016X}",
-            error.get_module(),
+            error.get_module_raw(),
             error.get_description(),
-            error.raw,
+            error.get_inner_value(),
             time
         );
     }
@@ -92,9 +72,9 @@ impl ErrorApplet for DefaultErrorApplet {
     ) {
         log::error!(
             "Application requested custom error with error_code={:04X}-{:04X} (raw={:08X})",
-            error.get_module(),
+            error.get_module_raw(),
             error.get_description(),
-            error.raw
+            error.get_inner_value()
         );
         log::error!("    Main Text: {}", main_text);
         log::error!("    Detail Text: {}", detail_text);

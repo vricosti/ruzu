@@ -355,9 +355,6 @@ impl FrontendApplet for ProfileSelect {
             &parameters,
         );
         self.frontend_executing.store(false, Ordering::Release);
-        if self.complete.load(Ordering::Acquire) {
-            Self::exit(&self.applet);
-        }
     }
 
     fn request_exit(&mut self) {
@@ -451,7 +448,7 @@ mod tests {
         assert!(applet.is_initialized());
         assert!(applet.is_complete());
         assert_eq!(applet.get_status(), RESULT_SUCCESS);
-        assert!(owner.lock().unwrap().is_completed);
+        assert!(!owner.lock().unwrap().is_completed);
 
         let output = broker.get_out_data().pop().unwrap();
         assert_eq!(output.len(), std::mem::size_of::<UiReturnArg>());
