@@ -1175,8 +1175,12 @@ pub struct SystemSettingsService {
 
 impl SystemSettingsService {
     pub fn new() -> Self {
+        Self::new_with_inner(ISystemSettingsServer::new())
+    }
+
+    fn new_with_inner(inner: ISystemSettingsServer) -> Self {
         Self {
-            inner: Mutex::new(ISystemSettingsServer::new()),
+            inner: Mutex::new(inner),
             handlers: build_handler_map(&[
                 // Matches upstream system_settings_server.cpp constructor function table.
                 // All commands that upstream wires to a non-null handler are included here.
@@ -1618,6 +1622,11 @@ impl SystemSettingsService {
             ]),
             handlers_tipc: BTreeMap::new(),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_for_test() -> Self {
+        Self::new_with_inner(ISystemSettingsServer::new_for_test())
     }
 
     fn as_self(this: &dyn ServiceFramework) -> &Self {

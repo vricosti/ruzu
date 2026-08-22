@@ -20,6 +20,15 @@
 - Resume condition: the two acquire commands return their stable constructor-owned readable
   endpoints, the Bluetooth flag commands operate on the shared `set:sys` owner, the remaining
   upstream stubs preserve their exact outputs, and focused command/lifecycle tests pass.
+- Prerequisite result: all four Set services now retain one shared allocation, and repeated
+  `set:sys` factory calls return the same typed `SystemSettingsService` owner. This prerequisite
+  was committed, merged to `main`, rebuilt successfully, and `fix/warning-parity-cleanup` was
+  advanced to that merge before the BTM slice resumed.
+- Resumed result: all twelve Eden-implemented commands are registered and ported, all twelve null
+  entries remain null, the two event endpoints retain stable identity, Bluetooth state flows
+  through the shared `set:sys` instance, client ARUIDs come from the IPC PID, and `Drop` closes the
+  radio event before the audio-device event. `core` decreases from 58 to 57 warnings.
+- Status: completed and re-verified for the `IBtmSystemCore` warning/parity slice.
 
 ## 2026-08-22 — audio event warning slice interrupted by destructor prerequisites
 
