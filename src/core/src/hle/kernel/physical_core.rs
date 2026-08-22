@@ -198,7 +198,7 @@ impl PhysicalCore {
         thread: &mut OpaqueKThread,
         thread_context: &mut ThreadContext,
         scheduler: &Arc<Mutex<KScheduler>>,
-        process: &Arc<ProcessLock>,
+        _process: &Arc<ProcessLock>,
         is_64bit: bool,
         system: &System,
         mut on_supervisor_call: FSvc,
@@ -231,7 +231,7 @@ impl PhysicalCore {
                     // After SetHeapSize (SVC ~#89), dump module memory for comparison with zuyu
                     #[cfg(feature = "debug-logs")]
                     if svc_count == 90 {
-                        physical_core_log::dump_module_memory(process);
+                        physical_core_log::dump_module_memory(_process);
                     }
 
                     match on_supervisor_call(
@@ -283,11 +283,20 @@ impl PhysicalCore {
                             self.handoff_after_svc(jit, thread_context, &current_thread);
                         }
                     }
+
+                    // Upstream `PhysicalCore::RunThread` returns to the CPU
+                    // manager for an external interrupt, and after every JIT
+                    // stop in single-core mode so CoreTiming can advance and
+                    // the emulated cores can be preempted.
+                    let is_single_core = self.m_guard.lock().unwrap().m_is_single_core;
+                    let interrupt = !halt_reason.contains(HaltReason::STEP_THREAD)
+                        && halt_reason.contains(HaltReason::BREAK_LOOP);
+                    if interrupt || is_single_core {
+                        return (iteration, svc_count, PhysicalCoreExecutionControl::Yield);
+                    }
                 }
             }
         }
-
-        (iteration, svc_count, PhysicalCoreExecutionControl::Break)
     }
 
     /// Load context from thread to current core.
@@ -647,9 +656,6 @@ fn is_animus_sdk_thread_wrapper_context(pc: u64, lr: u64) -> bool {
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::thread;
-    use std::time::Duration;
 
     use crate::arm::arm_interface::{Architecture, DebugWatchpoint, KThread as OpaqueKThread};
     use crate::core::System;
@@ -792,11 +798,14 @@ mod tests {
     #[test]
     fn run_loop_drains_current_thread_termination_on_halt_boundary() {
         let (physical_core, process, scheduler, current_thread, system) = test_context();
+        // `initialize_main_thread` does not mark these fixture threads as
+        // started. Model both runnable process threads so exiting the current
+        // one decrements Eden's running-thread count without terminating the
+        // whole process and its replacement thread.
+        process.lock().unwrap().increment_running_thread_count();
+        process.lock().unwrap().increment_running_thread_count();
         let mut thread_context = ThreadContext::default();
-        let mut jit = TestArmInterface::new(VecDeque::from([
-            HaltReason::BREAK_LOOP,
-            HaltReason::BREAK_LOOP,
-        ]));
+        let mut jit = TestArmInterface::new(VecDeque::from([HaltReason::BREAK_LOOP]));
         physical_core.initialize_guest_runtime(
             current_thread.clone(),
             &mut jit,
@@ -806,7 +815,7 @@ mod tests {
         current_thread.lock().unwrap().request_terminate();
 
         let mut opaque_thread = unsafe { std::mem::zeroed::<OpaqueKThread>() };
-        let (_iterations, _svc_count, control) = physical_core.run_loop(
+        let (iterations, _svc_count, control) = physical_core.run_loop(
             &mut jit,
             &mut opaque_thread,
             &mut thread_context,
@@ -817,24 +826,78 @@ mod tests {
             |_svc_num, _svc_args, _thread_context, _svc_count, _iteration| {
                 PhysicalCoreExecutionControl::Continue
             },
-            |_halt_reason, _exception_address, _thread_context, _svc_count, iteration| {
-                if iteration >= 2 {
-                    PhysicalCoreExecutionControl::Break
-                } else {
-                    PhysicalCoreExecutionControl::Continue
-                }
+            |_halt_reason, _exception_address, _thread_context, _svc_count, _iteration| {
+                PhysicalCoreExecutionControl::Continue
             },
         );
         KWorkerTaskManager::wait_for_global_idle();
 
-        assert!(matches!(control, PhysicalCoreExecutionControl::Break));
+        assert_eq!(iterations, 1);
+        assert!(matches!(control, PhysicalCoreExecutionControl::Yield));
         let thread = current_thread.lock().unwrap();
         assert_eq!(thread.get_state(), ThreadState::TERMINATED);
         assert!(thread.is_signaled());
-        assert_eq!(
-            scheduler.lock().unwrap().get_scheduler_current_thread_id(),
-            Some(2)
+    }
+
+    #[test]
+    fn run_loop_returns_after_any_jit_stop_in_single_core_mode() {
+        let (physical_core, process, scheduler, _current_thread, system) = test_context();
+        let mut thread_context = ThreadContext::default();
+        let mut jit = TestArmInterface::new(VecDeque::from([HaltReason::empty()]));
+        let mut opaque_thread = unsafe { std::mem::zeroed::<OpaqueKThread>() };
+
+        let (iterations, svc_count, control) = physical_core.run_loop(
+            &mut jit,
+            &mut opaque_thread,
+            &mut thread_context,
+            &scheduler,
+            &process,
+            false,
+            &system,
+            |_svc_num, _svc_args, _thread_context, _svc_count, _iteration| {
+                PhysicalCoreExecutionControl::Continue
+            },
+            |_halt_reason, _exception_address, _thread_context, _svc_count, _iteration| {
+                PhysicalCoreExecutionControl::Continue
+            },
         );
+
+        assert_eq!(iterations, 1);
+        assert_eq!(svc_count, 0);
+        assert!(matches!(control, PhysicalCoreExecutionControl::Yield));
+    }
+
+    #[test]
+    fn run_loop_only_returns_for_non_step_break_loop_in_multicore_mode() {
+        let (_single_core, process, scheduler, _current_thread, system) = test_context();
+        let physical_core = PhysicalCore::new(0, true);
+        let mut thread_context = ThreadContext::default();
+        let mut jit = TestArmInterface::new(VecDeque::from([
+            HaltReason::empty(),
+            HaltReason::STEP_THREAD | HaltReason::BREAK_LOOP,
+            HaltReason::BREAK_LOOP,
+        ]));
+        let mut opaque_thread = unsafe { std::mem::zeroed::<OpaqueKThread>() };
+
+        let (iterations, svc_count, control) = physical_core.run_loop(
+            &mut jit,
+            &mut opaque_thread,
+            &mut thread_context,
+            &scheduler,
+            &process,
+            false,
+            &system,
+            |_svc_num, _svc_args, _thread_context, _svc_count, _iteration| {
+                PhysicalCoreExecutionControl::Continue
+            },
+            |_halt_reason, _exception_address, _thread_context, _svc_count, _iteration| {
+                PhysicalCoreExecutionControl::Continue
+            },
+        );
+
+        assert_eq!(iterations, 3);
+        assert_eq!(svc_count, 0);
+        assert!(matches!(control, PhysicalCoreExecutionControl::Yield));
     }
 
     #[test]

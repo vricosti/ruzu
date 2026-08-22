@@ -5348,3 +5348,29 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 
 - Secure-resource managers now attach to already initialized heaps and retain their own nullable
   allocator, matching the ownership boundary required by global application/system resources.
+
+## 2026-08-22 — `src/core/src/hle/kernel/physical_core.rs` vs `core/hle/kernel/physical_core.{h,cpp}`
+
+### Intentional differences
+
+- The cooperative bootstrap loop reports Eden's `RunThread` return as
+  `PhysicalCoreExecutionControl::Yield`; its caller then advances `CoreTiming` and preempts the
+  emulated core. Eden obtains the same boundary by returning `void` to `CpuManager`.
+- State published to `Interrupt` and the immutable single-core flag share one Rust mutex-backed
+  state object. Eden stores the flag as a direct class member while guarding only accesses that
+  race with the running ARM interface.
+
+### Fixed parity debt
+
+- After halt handling, single-core execution now returns after every JIT stop. Multi-core execution
+  continues for an empty/unhandled halt and returns only for a non-step-completion `BreakLoop`,
+  matching Eden's final `interrupt || m_is_single_core` condition.
+- The unreachable fallback after the non-fallthrough execution loop and unused test imports were
+  removed.
+
+### Unintentional differences (to fix)
+
+- The production fiber path still owns most `PhysicalCore::RunThread` halt analysis in
+  `CpuManager::run_guest_thread_once`. Moving that behavior back into `physical_core.rs` requires a
+  larger ownership refactor than this warning slice; the bootstrap path now has the corrected
+  return predicate, but the duplicated production path remains structurally non-parity.
