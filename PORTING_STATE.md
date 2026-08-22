@@ -1,5 +1,54 @@
 # Porting State
 
+## 2026-08-22 — BTM system-event warning interrupted by service-handler prerequisites
+
+- Status: interrupted before classifying the unread `IBtmSystemCore` event owners.
+- Interrupted slice: resolve the unread `service_context`, `radio_event`, and
+  `audio_device_connection_event` fields while preserving Eden's event and settings ownership.
+- Exact missing prerequisite: Ruzu registers every `IBtmSystemCore` command as unimplemented and
+  therefore never consumes either event. Eden implements commands 0, 1, 4–7, 13, 14, 17, 20,
+  22, and 23; commands 4–6 additionally require the typed shared `set:sys` dependency retained by
+  the constructor.
+- Required prerequisite work: port the implemented command table and the typed
+  `SystemSettingsService` owner in `btm_system_core.rs`, then restore explicit event closure in
+  `Drop` using Ruzu's `ServiceContext` handles.
+- Newly discovered prerequisite: `set/settings.rs` currently registers a factory that constructs
+  a fresh `SystemSettingsService` for every connection. Eden registers one shared
+  `ISystemSettingsServer`, so the typed service obtained by BTM would otherwise be a private copy
+  rather than the state observed by other `set:sys` clients. Restore singleton factory ownership
+  in `settings.rs` and verify repeated factory calls return the same allocation before resuming.
+- Resume condition: the two acquire commands return their stable constructor-owned readable
+  endpoints, the Bluetooth flag commands operate on the shared `set:sys` owner, the remaining
+  upstream stubs preserve their exact outputs, and focused command/lifecycle tests pass.
+
+## 2026-08-22 — audio event warning slice interrupted by destructor prerequisites
+
+- Status: interrupted before completing the readable-event ownership cleanup.
+- Interrupted slice: remove the extra `KReadableEvent` owners from `IAudioIn`, `IAudioOut`, and
+  `IAudioRenderer` while retaining the service-owned writable event and process registry owner.
+- Exact missing prerequisite: the `AudioInSessionImpl` and `AudioOutSessionImpl` bridges do not
+  expose Eden's explicit `Free`, and `AudioRendererSessionInterface` does not expose `Finalize`.
+  Consequently the Rust service destructors unregister their events before the concrete audio
+  owners are dropped; input/output session IDs are never explicitly freed, and renderer
+  finalization occurs later through `Renderer::Drop` instead of before `CloseEvent`.
+- Required prerequisite work: add `free`/`finalize` to the owner-preserving bridge callbacks,
+  implement them in `audio_core`, and call them first from each matching service `Drop` before
+  unregistering the writable/readable event pair. The final field drop must then release the
+  process owner last, matching Eden's `Free/Finalize -> CloseEvent -> KProcess::Close` order.
+- Resume condition: focused destructor regressions prove that `Free`/`Finalize` runs exactly once
+  while the readable event is still registered, and that both event endpoints are gone after the
+  service is destroyed. Only then may the extra service-owned readable `Arc` fields be removed.
+- Prerequisite result: `free` and `finalize` now traverse the owner-preserving `core` callback
+  bridges into `AudioCore::AudioIn::In::free`, `AudioCore::AudioOut::Out::free`, and
+  `AudioCore::Renderer::Renderer::finalize`. Each service invokes it before unregistering either
+  endpoint, and the concrete audio owner releases the process reference only after that cleanup.
+- Resumed result: the three extra service-owned readable `Arc` fields and their artificial mutex
+  reads are removed. The process registry remains the returned-handle owner, the concrete audio
+  system retains the signaling owner, and the service still retains the writable event matching
+  Eden's `KEvent*`. Focused tests prove the destructor order and endpoint release for all three
+  interfaces.
+- Status: completed and re-verified for the audio event ownership/lifecycle warning slice.
+
 ## 2026-08-22 — Cabinet frontend applet warning slice
 
 - Status: completed and verified for the Cabinet lifecycle slice.

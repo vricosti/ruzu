@@ -318,6 +318,7 @@ pub trait AudioRendererSessionInterface: Send {
     ) -> crate::hle::result::ResultCode;
     fn start(&self);
     fn stop(&self);
+    fn finalize(&self);
     fn supports_system_event(&self) -> bool;
     fn set_process(&self, process: *mut crate::hle::kernel::k_process::KProcess);
     fn set_rendering_time_limit(&self, rendering_time_limit: u32);
@@ -375,6 +376,7 @@ pub trait AudioInSessionImpl: Send + Sync + 'static {
     fn get_state(&self) -> u32;
     fn start(&self) -> crate::hle::result::ResultCode;
     fn stop(&self) -> crate::hle::result::ResultCode;
+    fn free(&self);
     fn append_buffer(
         &self,
         buffer: AudioInBufferWire,
@@ -408,6 +410,7 @@ pub struct AudioInSession {
     get_state_fn: unsafe fn(*const ()) -> u32,
     start_fn: unsafe fn(*const ()) -> crate::hle::result::ResultCode,
     stop_fn: unsafe fn(*const ()) -> crate::hle::result::ResultCode,
+    free_fn: unsafe fn(*const ()),
     append_buffer_fn:
         unsafe fn(*const (), AudioInBufferWire, u64) -> crate::hle::result::ResultCode,
     get_released_buffers_fn: unsafe fn(*const (), &mut [u64]) -> u32,
@@ -433,6 +436,7 @@ impl AudioInSession {
             get_state_fn: get_audio_in_session_state::<T>,
             start_fn: start_audio_in_session::<T>,
             stop_fn: stop_audio_in_session::<T>,
+            free_fn: free_audio_in_session::<T>,
             append_buffer_fn: append_audio_in_session_buffer::<T>,
             get_released_buffers_fn: get_audio_in_session_released_buffers::<T>,
             contains_buffer_fn: contains_audio_in_session_buffer::<T>,
@@ -455,6 +459,10 @@ impl AudioInSession {
 
     pub fn stop(&self) -> crate::hle::result::ResultCode {
         unsafe { (self.stop_fn)(self.ptr) }
+    }
+
+    pub fn free(&self) {
+        unsafe { (self.free_fn)(self.ptr) }
     }
 
     pub fn append_buffer(
@@ -515,6 +523,7 @@ impl Clone for AudioInSession {
             get_state_fn: self.get_state_fn,
             start_fn: self.start_fn,
             stop_fn: self.stop_fn,
+            free_fn: self.free_fn,
             append_buffer_fn: self.append_buffer_fn,
             get_released_buffers_fn: self.get_released_buffers_fn,
             contains_buffer_fn: self.contains_buffer_fn,
@@ -566,6 +575,10 @@ unsafe fn stop_audio_in_session<T: AudioInSessionImpl>(
     ptr: *const (),
 ) -> crate::hle::result::ResultCode {
     get_audio_in_session_ref::<T>(ptr).stop()
+}
+
+unsafe fn free_audio_in_session<T: AudioInSessionImpl>(ptr: *const ()) {
+    get_audio_in_session_ref::<T>(ptr).free();
 }
 
 unsafe fn append_audio_in_session_buffer<T: AudioInSessionImpl>(
@@ -661,6 +674,7 @@ pub trait AudioOutSessionImpl: Send + Sync + 'static {
     fn get_state(&self) -> u32;
     fn start(&self) -> crate::hle::result::ResultCode;
     fn stop(&self) -> crate::hle::result::ResultCode;
+    fn free(&self);
     fn append_buffer(
         &self,
         buffer: AudioOutBufferWire,
@@ -695,6 +709,7 @@ pub struct AudioOutSession {
     get_state_fn: unsafe fn(*const ()) -> u32,
     start_fn: unsafe fn(*const ()) -> crate::hle::result::ResultCode,
     stop_fn: unsafe fn(*const ()) -> crate::hle::result::ResultCode,
+    free_fn: unsafe fn(*const ()),
     append_buffer_fn:
         unsafe fn(*const (), AudioOutBufferWire, u64) -> crate::hle::result::ResultCode,
     get_released_buffers_fn: unsafe fn(*const (), &mut [u64]) -> u32,
@@ -721,6 +736,7 @@ impl AudioOutSession {
             get_state_fn: get_audio_out_session_state::<T>,
             start_fn: start_audio_out_session::<T>,
             stop_fn: stop_audio_out_session::<T>,
+            free_fn: free_audio_out_session::<T>,
             append_buffer_fn: append_audio_out_session_buffer::<T>,
             get_released_buffers_fn: get_audio_out_session_released_buffers::<T>,
             contains_buffer_fn: contains_audio_out_session_buffer::<T>,
@@ -742,6 +758,9 @@ impl AudioOutSession {
     }
     pub fn stop(&self) -> crate::hle::result::ResultCode {
         unsafe { (self.stop_fn)(self.ptr) }
+    }
+    pub fn free(&self) {
+        unsafe { (self.free_fn)(self.ptr) }
     }
     pub fn append_buffer(
         &self,
@@ -796,6 +815,7 @@ impl Clone for AudioOutSession {
             get_state_fn: self.get_state_fn,
             start_fn: self.start_fn,
             stop_fn: self.stop_fn,
+            free_fn: self.free_fn,
             append_buffer_fn: self.append_buffer_fn,
             get_released_buffers_fn: self.get_released_buffers_fn,
             contains_buffer_fn: self.contains_buffer_fn,
@@ -846,6 +866,9 @@ unsafe fn stop_audio_out_session<T: AudioOutSessionImpl>(
     ptr: *const (),
 ) -> crate::hle::result::ResultCode {
     get_audio_out_session_ref::<T>(ptr).stop()
+}
+unsafe fn free_audio_out_session<T: AudioOutSessionImpl>(ptr: *const ()) {
+    get_audio_out_session_ref::<T>(ptr).free();
 }
 unsafe fn append_audio_out_session_buffer<T: AudioOutSessionImpl>(
     ptr: *const (),

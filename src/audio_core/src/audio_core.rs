@@ -185,6 +185,10 @@ impl ruzu_core::core::AudioRendererSessionInterface for AudioRendererSession {
         self.renderer.lock().stop();
     }
 
+    fn finalize(&self) {
+        self.renderer.lock().finalize();
+    }
+
     fn supports_system_event(&self) -> bool {
         self.renderer
             .lock()
@@ -270,6 +274,10 @@ impl ruzu_core::core::AudioInSessionImpl for AudioInSession {
         ruzu_core::hle::result::ResultCode::new(self.session.stop_system().raw())
     }
 
+    fn free(&self) {
+        self.session.free();
+    }
+
     fn append_buffer(
         &self,
         buffer: ruzu_core::core::AudioInBufferWire,
@@ -344,6 +352,10 @@ impl ruzu_core::core::AudioOutSessionImpl for AudioOutSession {
 
     fn stop(&self) -> ruzu_core::hle::result::ResultCode {
         ruzu_core::hle::result::ResultCode::new(self.session.stop_system().raw())
+    }
+
+    fn free(&self) {
+        self.session.free();
     }
 
     fn append_buffer(

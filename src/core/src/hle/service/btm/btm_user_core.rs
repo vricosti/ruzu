@@ -28,6 +28,10 @@ pub struct IBtmUserCore {
     handlers: BTreeMap<u32, FunctionInfo>,
     handlers_tipc: BTreeMap<u32, FunctionInfo>,
     service_context: ServiceContext,
+    scan_event_handle: u32,
+    connection_event_handle: u32,
+    service_discovery_event_handle: u32,
+    config_event_handle: u32,
     scan_event: Arc<Event>,
     connection_event: Arc<Event>,
     service_discovery_event: Arc<Event>,
@@ -105,6 +109,10 @@ impl IBtmUserCore {
             handlers,
             handlers_tipc: BTreeMap::new(),
             service_context,
+            scan_event_handle: scan_handle,
+            connection_event_handle: conn_handle,
+            service_discovery_event_handle: disc_handle,
+            config_event_handle: cfg_handle,
             scan_event,
             connection_event,
             service_discovery_event,
@@ -155,6 +163,17 @@ impl IBtmUserCore {
     }
 }
 
+impl Drop for IBtmUserCore {
+    fn drop(&mut self) {
+        self.service_context.close_event(self.scan_event_handle);
+        self.service_context
+            .close_event(self.connection_event_handle);
+        self.service_context
+            .close_event(self.service_discovery_event_handle);
+        self.service_context.close_event(self.config_event_handle);
+    }
+}
+
 impl SessionRequestHandler for IBtmUserCore {
     fn handle_sync_request(&self, ctx: &mut HLERequestContext) -> ResultCode {
         ServiceFramework::handle_sync_request_impl(self, ctx)
@@ -193,6 +212,35 @@ mod tests {
                     .is_some(),
                 "command {command_id} must have an IPC handler"
             );
+        }
+    }
+
+    #[test]
+    fn drop_releases_all_service_context_event_owners() {
+        let service = IBtmUserCore::new(SystemRef::null());
+        let scan_event = Arc::clone(&service.scan_event);
+        let connection_event = Arc::clone(&service.connection_event);
+        let service_discovery_event = Arc::clone(&service.service_discovery_event);
+        let config_event = Arc::clone(&service.config_event);
+
+        for event in [
+            &scan_event,
+            &connection_event,
+            &service_discovery_event,
+            &config_event,
+        ] {
+            assert_eq!(Arc::strong_count(event), 3);
+        }
+
+        drop(service);
+
+        for event in [
+            &scan_event,
+            &connection_event,
+            &service_discovery_event,
+            &config_event,
+        ] {
+            assert_eq!(Arc::strong_count(event), 1);
         }
     }
 }

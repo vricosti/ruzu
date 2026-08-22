@@ -6227,3 +6227,146 @@ vs Eden `display_list.h` and `layer_list.h`
 - The event name now exactly matches Eden, and a focused regression verifies persistent identity,
   all five implemented command registrations and the exact no-product result. `core` decreases
   from 65 to 64 warnings.
+
+## 2026-08-22 — `apm/apm.rs` and `apm_interface.rs` vs Eden APM
+`apm/apm.{h,cpp}` and `apm/apm_interface.{h,cpp}`
+
+### Intentional differences
+
+- Rust shares the controller through `Arc<Mutex<Controller>>` rather than Eden's long-lived
+  `Controller&`; the APM module uses `Arc<Module>` in place of `shared_ptr<Module>`. Both preserve
+  the same service-wide controller and module lifetimes.
+- Ruzu registers factories which create an interface per incoming session, while Eden registers
+  shared interface instances in `ServerManager`. This follows Ruzu's existing server-manager
+  connection boundary; the registered names, handlers and shared APM state now match Eden.
+
+### Fixed parity debt
+
+- Restored the compatibility-only `apm:p` registration and removed the extraneous
+  `ServiceManager` parameter from `APM::LoopProcess`; the owning function and its launch site now
+  have Eden's system-only flow.
+- Removed the stale Rust-only `Mutex` import left behind by that signature correction. Eden's
+  `apm.cpp` owns no lock in `LoopProcess`, and the import had no runtime purpose.
+- Kept the otherwise unread `Module` owner on every APM interface instead of deleting it as dead
+  code, with a focused lifetime regression proving that it is released with the interface.
+- `GetPerformanceMode` now preserves Eden's unusual resultless two-word response rather than
+  adding `ResultSuccess` and a third word. A focused regression verifies the raw IPC response
+  size and payload placement.
+
+### Unintentional differences (to fix)
+
+- None in the reviewed APM registration and ownership slice.
+
+### Missing items
+
+- None for the reviewed APM registration and ownership slice.
+
+### Binary layout verification
+
+- PASS: this cleanup changes only an unused Rust import and no IPC payload or serialized type.
+
+## 2026-08-22 — audio service event ownership vs Eden audio interfaces
+`src/core/src/hle/service/audio/{audio_in,audio_out,audio_renderer}.rs` vs
+`src/core/hle/service/audio/{audio_in,audio_out,audio_renderer}.{h,cpp}` and their matching
+`src/audio_core/{in/audio_in,out/audio_out,renderer/audio_renderer}.{h,cpp}` owners
+
+### Intentional differences
+
+- The crate boundary prevents `core` from naming concrete `audio_core` session types. Ruzu keeps
+  the existing owner-preserving callback wrappers in `core.rs`; the newly exposed `free` and
+  `finalize` callbacks forward directly to the same concrete methods owned by Eden's
+  `AudioCore::AudioIn::In`, `AudioCore::AudioOut::Out`, and `AudioCore::Renderer::Renderer`.
+- Eden's `ServiceContext` owns a `KEvent` whose readable endpoint is returned by reference. Ruzu
+  registers both endpoint objects in the requesting process, keeps the writable `Arc<KEvent>` on
+  the service, and lets the concrete audio system retain the readable `Arc<KReadableEvent>` it
+  signals. IPC returns the process-registered readable object ID, preserving stable endpoint
+  identity without an extra service-owned readable reference.
+- Eden balances `KProcess::Open/Close`; Ruzu's corresponding strong `Arc<ProcessLock>` is installed
+  in the concrete audio system. Calling `free`/`finalize`, unregistering the event pair, and then
+  dropping the concrete session releases that process owner in the same lifecycle order.
+
+### Unintentional differences (to fix)
+
+- None in the reviewed event ownership and service-destruction slice.
+
+### Missing items
+
+- None for `IAudioIn`, `IAudioOut`, and `IAudioRenderer` event cleanup ordering.
+
+### Binary layout verification
+
+- PASS: no raw IPC payload was changed. Existing focused tests continue to verify the 0x28-byte
+  `AudioInBuffer` and `AudioOutBuffer` wire layouts.
+
+### Fixed parity debt
+
+- `IAudioIn` and `IAudioOut` now call their concrete `Free` exactly once before closing the event;
+  previously their session IDs were never explicitly returned to the manager.
+- `IAudioRenderer` now calls `Finalize` before closing the event instead of relying on the later
+  concrete `Renderer::Drop`. This restores Eden's finalize-before-event-before-process ordering.
+- Removed three duplicate readable-event fields and the artificial `is_initialized` mutex reads
+  that existed only to silence dead-code warnings. Focused destructor regressions verify that
+  cleanup runs while the readable endpoint is still registered and that both endpoints are
+  released afterward; `core` decreases from 63 to 60 warnings.
+
+## 2026-08-22 — `btm/btm_user_core.rs` vs Eden `btm_user_core.{h,cpp}`
+
+### Intentional differences
+
+- Eden's `ServiceContext::CloseEvent` accepts a raw `KEvent*`; Ruzu's existing context API closes
+  its owned event by numeric context handle. `IBtmUserCore` therefore retains four private handles
+  alongside the four service event owners so its `Drop` can preserve the same explicit close
+  sequence.
+- Ruzu's `Arc<Event>` fields own the event wrappers until Rust field destruction immediately after
+  `Drop`; Eden retains non-owning `KEvent*` pointers whose storage is released by `CloseEvent`.
+  Removing the context owner first and the service field owner second preserves the same externally
+  observable endpoint lifetime.
+
+### Unintentional differences (to fix)
+
+- None in the reviewed command, event-identity, and destruction slice.
+
+### Missing items
+
+- None from Eden's `IBtmUserCore`; the remaining null command-table entries are also null upstream.
+
+### Binary layout verification
+
+- PASS: the implementation changes only host-side event ownership and does not alter an IPC
+  payload. Commands 0, 17, 26, and 33 retain their success result, valid flag, and copy handle.
+
+### Fixed parity debt
+
+- Added explicit `scan`, `connection`, `service_discovery`, and `config` event closure in Eden's
+  destructor order instead of relying on the later generic `ServiceContext::Drop` sweep. A focused
+  regression verifies that both context and service owners release every event when the interface
+  is destroyed.
+
+## 2026-08-22 — `set/settings.rs` vs Eden `set/settings.{h,cpp}`
+
+### Intentional differences
+
+- Ruzu's `ServerManager` registration API accepts a session factory, whereas Eden accepts the
+  shared service object directly. Each Rust closure now captures one preconstructed `Arc` and
+  clones that owner per session; `make_system_settings_factory` isolates this mechanical adapter
+  for the typed `set:sys` dependency used by other services.
+
+### Unintentional differences (to fix)
+
+- None in the reviewed service-registration ownership slice.
+
+### Missing items
+
+- None from Eden's `Set::LoopProcess` registration list.
+
+### Binary layout verification
+
+- PASS: no IPC payload or persisted settings structure changed.
+
+### Fixed parity debt
+
+- `set`, `set:cal`, `set:fd`, and `set:sys` now each retain one shared service allocation for the
+  server lifetime, matching Eden's four `std::make_shared` registrations. Previously every client
+  connection received fresh independent service state.
+- A focused regression calls the production `set:sys` factory twice and verifies pointer identity
+  and the concrete typed owner required by service-to-service access.
