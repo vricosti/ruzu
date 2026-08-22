@@ -9,6 +9,7 @@
 //! management, station connections, and LAN discovery.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use super::lan_discovery::LANDiscovery;
 use super::ldn_types::{DisconnectReason, State};
@@ -148,7 +149,7 @@ impl IUserLocalCommunicationService {
         // Upstream: checks Network::GetSelectedNetworkInterface(), returns
         // ResultAirplaneModeEnabled if unavailable, then binds room_member callback.
         // Those dependencies are not yet available; proceed with LAN discovery init.
-        self.lan_discovery.initialize();
+        self.lan_discovery.initialize(Arc::new(|| {}), true);
         self.is_initialized = true;
         RESULT_SUCCESS
     }

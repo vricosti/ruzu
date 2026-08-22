@@ -412,6 +412,7 @@ dependencies = [
  "lz4_flex",
  "md-5",
  "memmap2",
+ "network",
  "openssl",
  "parking_lot",
  "rdynarmic",

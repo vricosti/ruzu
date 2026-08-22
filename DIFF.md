@@ -5904,3 +5904,38 @@ vs Eden `display_list.h` and `layer_list.h`
   transport visible to core LDN services.
 - A focused ownership test verifies that `RoomNetwork` and the global accessors return pointer-
   identical objects and that `Shutdown` clears both global handles.
+
+## 2026-08-22 — `lan_discovery.rs` vs Eden `lan_discovery.{h,cpp}`
+
+### Intentional differences
+
+- `LanStation` stores its node ID and status while `LANDiscovery` indexes the corresponding
+  `NetworkInfo::nodes` entry. Eden stores raw back-pointers to both the discovery owner and node;
+  indexed ownership preserves the same 1–7 station mapping without self-referential Rust objects.
+- The packet mutex is held through an `Arc<Mutex<()>>`, allowing Rust to retain the guard while
+  mutating disjoint discovery state. `destroy_network_impl` and `disconnect_impl` mechanically
+  preserve Eden's calls from already-locked close/finalize paths without recursively locking.
+- Received `NetworkInfo` bytes are checked for valid Rust enum discriminants before the same
+  native-layout copy Eden performs. Short or malformed room packets are ignored rather than
+  creating an invalid Rust value; valid packets retain Eden's exact raw layout.
+- Upstream's uncalled data-bearing `SendBroadcast` template and `GetStationCount` helper are not
+  reproduced. Eden has no call to either; retaining them would introduce new dead-code warnings.
+
+### Fixed parity debt
+
+- Ported network-info initialization, both `GetNetworkInfo` forms, scan filtering, advertise data,
+  AP/station state validation, create/destroy/connect/disconnect, initialization/finalization,
+  node updates, packet send/receive, host disconnect handling, node-change accumulation, fake MAC
+  construction and node-info construction in their matching owner.
+- Restored the process-global `RoomMember` packet transport and callback event points. Session IDs
+  use Eden's default `independent_bits_engine<mt19937,64>` sequence, and station IDs now span 1–7
+  instead of Ruzu's previous 0–6.
+- Focused tests cover station numbering, accumulated connect/disconnect changes and malformed enum
+  payload rejection. The unread LAN state fields and unused `init_node_state_change` warning are
+  gone.
+
+### Binary layout verification
+
+- PASS: `NodeInfo` and `NetworkInfo` are still sent as their existing 0x40-byte and 0x480-byte
+  native payloads. The receive path validates every enum-bearing field before constructing the
+  raw-copied `NetworkInfo`; no field order or padding changed.

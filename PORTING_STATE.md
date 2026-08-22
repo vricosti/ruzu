@@ -869,5 +869,11 @@
   send path, receive callback binding and unbinding. The missing piece was Eden's process-global
   `Network::Init/GetRoomMember/Shutdown` ownership; it is now ported and the GTK frontend uses the
   registered member instead of a private parallel instance.
-- Status: prerequisite implementation in progress; validate and commit global ownership before
-  wiring the `core` dependency and resuming `lan_discovery.rs`.
+- Prerequisite result: global ownership was validated and committed separately. `core` now consumes
+  the same network crate and `LANDiscovery` sends and receives through its registered room member.
+- Resumed result: Eden's create/connect lifecycle now calls `init_node_state_change` at the exact
+  points, the 1–7 station mapping and persistent node-change arrays are restored, and focused tests
+  cover state-change accumulation plus packet validity boundaries.
+- Status: completed and verified for the `LANDiscovery` warning slice. The separate
+  `IUserLocalCommunicationService` IPC command-table debt remains outside this warning-triggered
+  slice and must be ported in its own auditable change.
