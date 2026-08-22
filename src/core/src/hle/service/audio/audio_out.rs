@@ -43,8 +43,9 @@ pub struct IAudioOut {
     owner_process: Weak<ProcessLock>,
     buffer_event_object_id: u64,
     buffer_readable_event_object_id: u64,
+    // Service-owned writable endpoint, matching Eden's `Kernel::KEvent* event` lifetime.
+    #[allow(dead_code)]
     buffer_event: Arc<Mutex<KEvent>>,
-    buffer_readable_event: Arc<Mutex<KReadableEvent>>,
 }
 
 impl IAudioOut {
@@ -131,7 +132,6 @@ impl IAudioOut {
             buffer_event_object_id,
             buffer_readable_event_object_id,
             buffer_event,
-            buffer_readable_event,
         }
     }
 
@@ -244,8 +244,6 @@ impl IAudioOut {
 
     fn register_buffer_event_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         let svc = Self::as_self(this);
-        let _ = svc.buffer_event.lock().unwrap().is_initialized();
-
         let mut response = CmifResponse::new(ctx, 2, 1, 0);
         response.push_result(RESULT_SUCCESS);
         response.push_copy_object_id(svc.buffer_readable_event_object_id);
@@ -360,6 +358,7 @@ impl IAudioOut {
 
 impl Drop for IAudioOut {
     fn drop(&mut self) {
+        self.session.lock().unwrap().free();
         if let Some(owner_process) = self.owner_process.upgrade() {
             let mut owner = owner_process.lock().unwrap();
             owner.unregister_readable_event_object_by_object_id(
@@ -374,8 +373,14 @@ impl Drop for IAudioOut {
 mod tests {
     use super::*;
     use crate::hle::kernel::k_process::KProcess;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-    struct TestAudioOutSession;
+    struct TestAudioOutSession {
+        free_calls: Arc<AtomicUsize>,
+        free_saw_registered_event: Arc<AtomicBool>,
+        owner_process: Weak<ProcessLock>,
+        readable_event_id: u64,
+    }
 
     impl crate::core::AudioOutSessionImpl for TestAudioOutSession {
         fn get_state(&self) -> u32 {
@@ -386,6 +391,18 @@ mod tests {
         }
         fn stop(&self) -> ResultCode {
             RESULT_SUCCESS
+        }
+        fn free(&self) {
+            self.free_calls.fetch_add(1, Ordering::SeqCst);
+            let event_is_registered = self.owner_process.upgrade().is_some_and(|owner| {
+                owner
+                    .lock()
+                    .unwrap()
+                    .get_readable_event_by_object_id(self.readable_event_id)
+                    .is_some()
+            });
+            self.free_saw_registered_event
+                .store(event_is_registered, Ordering::SeqCst);
         }
         fn append_buffer(
             &self,
@@ -421,9 +438,18 @@ mod tests {
         let kernel = KernelCore::new();
         let (event_id, readable_event_id, event, readable_event) =
             IAudioOut::create_buffer_event(&kernel, &owner_process);
+        let event_observer = Arc::clone(&event);
+        let readable_event_observer = Arc::clone(&readable_event);
+        let free_calls = Arc::new(AtomicUsize::new(0));
+        let free_saw_registered_event = Arc::new(AtomicBool::new(false));
         let service = IAudioOut::new(
-            AudioOutSession::from_arc(Arc::new(TestAudioOutSession)),
-            owner_process,
+            AudioOutSession::from_arc(Arc::new(TestAudioOutSession {
+                free_calls: Arc::clone(&free_calls),
+                free_saw_registered_event: Arc::clone(&free_saw_registered_event),
+                owner_process: Arc::downgrade(&owner_process),
+                readable_event_id,
+            })),
+            Arc::clone(&owner_process),
             event_id,
             readable_event_id,
             event,
@@ -434,6 +460,19 @@ mod tests {
             assert!(service.handlers.contains_key(&cmd));
             assert!(service.handlers[&cmd].handler_callback.is_some());
         }
+
+        assert_eq!(Arc::strong_count(&event_observer), 3);
+        assert_eq!(Arc::strong_count(&readable_event_observer), 2);
+        drop(service);
+        assert_eq!(free_calls.load(Ordering::SeqCst), 1);
+        assert!(free_saw_registered_event.load(Ordering::SeqCst));
+        assert_eq!(Arc::strong_count(&event_observer), 1);
+        assert_eq!(Arc::strong_count(&readable_event_observer), 1);
+        assert!(owner_process
+            .lock()
+            .unwrap()
+            .get_readable_event_by_object_id(readable_event_id)
+            .is_none());
     }
 
     #[test]

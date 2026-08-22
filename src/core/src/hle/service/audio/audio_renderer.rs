@@ -41,8 +41,9 @@ pub struct IAudioRenderer {
     owner_process: Weak<ProcessLock>,
     rendered_event_object_id: u64,
     rendered_readable_event_object_id: u64,
+    // Service-owned writable endpoint, matching Eden's `rendered_event` lifetime.
+    #[allow(dead_code)]
     rendered_event: Arc<Mutex<KEvent>>,
-    rendered_readable_event: Arc<Mutex<KReadableEvent>>,
 }
 
 static AUDIO_UPDATE_TRACE_COUNT: AtomicUsize = AtomicUsize::new(0);
@@ -129,7 +130,6 @@ impl IAudioRenderer {
             rendered_event_object_id,
             rendered_readable_event_object_id,
             rendered_event,
-            rendered_readable_event,
         }
     }
 
@@ -401,8 +401,6 @@ impl IAudioRenderer {
             return;
         }
 
-        let _ = svc.rendered_event.lock().unwrap().is_initialized();
-
         if std::env::var_os("RUZU_TRACE_AUDIO_EVENT").is_some() {
             log::info!(
                 "IAudioRenderer::QuerySystemEvent readable_event_object_id={} deferred_handle",
@@ -460,8 +458,14 @@ mod tests {
     use super::*;
     use crate::core::AudioRendererSessionInterface;
     use crate::hle::kernel::k_process::KProcess;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-    struct TestAudioRendererSession;
+    struct TestAudioRendererSession {
+        finalize_calls: Arc<AtomicUsize>,
+        finalize_saw_registered_event: Arc<AtomicBool>,
+        owner_process: Weak<ProcessLock>,
+        readable_event_id: u64,
+    }
 
     impl AudioRendererSessionInterface for TestAudioRendererSession {
         fn get_sample_rate(&self) -> u32 {
@@ -493,6 +497,19 @@ mod tests {
 
         fn stop(&self) {}
 
+        fn finalize(&self) {
+            self.finalize_calls.fetch_add(1, Ordering::SeqCst);
+            let event_is_registered = self.owner_process.upgrade().is_some_and(|owner| {
+                owner
+                    .lock()
+                    .unwrap()
+                    .get_readable_event_by_object_id(self.readable_event_id)
+                    .is_some()
+            });
+            self.finalize_saw_registered_event
+                .store(event_is_registered, Ordering::SeqCst);
+        }
+
         fn supports_system_event(&self) -> bool {
             true
         }
@@ -518,10 +535,19 @@ mod tests {
         let kernel = KernelCore::new();
         let (event_id, readable_event_id, event, readable_event) =
             IAudioRenderer::create_rendered_event(&kernel, &owner_process);
-        let renderer = Box::new(TestAudioRendererSession);
+        let event_observer = Arc::clone(&event);
+        let readable_event_observer = Arc::clone(&readable_event);
+        let finalize_calls = Arc::new(AtomicUsize::new(0));
+        let finalize_saw_registered_event = Arc::new(AtomicBool::new(false));
+        let renderer = Box::new(TestAudioRendererSession {
+            finalize_calls: Arc::clone(&finalize_calls),
+            finalize_saw_registered_event: Arc::clone(&finalize_saw_registered_event),
+            owner_process: Arc::downgrade(&owner_process),
+            readable_event_id,
+        });
         let service = IAudioRenderer::new(
             renderer,
-            owner_process,
+            Arc::clone(&owner_process),
             event_id,
             readable_event_id,
             event,
@@ -532,11 +558,25 @@ mod tests {
             assert!(service.handlers.contains_key(&cmd));
         }
         assert!(service.handlers[&11].handler_callback.is_none());
+
+        assert_eq!(Arc::strong_count(&event_observer), 3);
+        assert_eq!(Arc::strong_count(&readable_event_observer), 2);
+        drop(service);
+        assert_eq!(finalize_calls.load(Ordering::SeqCst), 1);
+        assert!(finalize_saw_registered_event.load(Ordering::SeqCst));
+        assert_eq!(Arc::strong_count(&event_observer), 1);
+        assert_eq!(Arc::strong_count(&readable_event_observer), 1);
+        assert!(owner_process
+            .lock()
+            .unwrap()
+            .get_readable_event_by_object_id(readable_event_id)
+            .is_none());
     }
 }
 
 impl Drop for IAudioRenderer {
     fn drop(&mut self) {
+        self.renderer.lock().unwrap().finalize();
         if let Some(owner_process) = self.owner_process.upgrade() {
             let mut owner = owner_process.lock().unwrap();
             owner.unregister_readable_event_object_by_object_id(

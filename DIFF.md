@@ -6250,3 +6250,47 @@ vs Eden `display_list.h` and `layer_list.h`
 - `GetPerformanceMode` now preserves Eden's unusual resultless two-word response rather than
   adding `ResultSuccess` and a third word. A focused regression verifies the raw IPC response
   size and payload placement.
+
+## 2026-08-22 — audio service event ownership vs Eden audio interfaces
+`src/core/src/hle/service/audio/{audio_in,audio_out,audio_renderer}.rs` vs
+`src/core/hle/service/audio/{audio_in,audio_out,audio_renderer}.{h,cpp}` and their matching
+`src/audio_core/{in/audio_in,out/audio_out,renderer/audio_renderer}.{h,cpp}` owners
+
+### Intentional differences
+
+- The crate boundary prevents `core` from naming concrete `audio_core` session types. Ruzu keeps
+  the existing owner-preserving callback wrappers in `core.rs`; the newly exposed `free` and
+  `finalize` callbacks forward directly to the same concrete methods owned by Eden's
+  `AudioCore::AudioIn::In`, `AudioCore::AudioOut::Out`, and `AudioCore::Renderer::Renderer`.
+- Eden's `ServiceContext` owns a `KEvent` whose readable endpoint is returned by reference. Ruzu
+  registers both endpoint objects in the requesting process, keeps the writable `Arc<KEvent>` on
+  the service, and lets the concrete audio system retain the readable `Arc<KReadableEvent>` it
+  signals. IPC returns the process-registered readable object ID, preserving stable endpoint
+  identity without an extra service-owned readable reference.
+- Eden balances `KProcess::Open/Close`; Ruzu's corresponding strong `Arc<ProcessLock>` is installed
+  in the concrete audio system. Calling `free`/`finalize`, unregistering the event pair, and then
+  dropping the concrete session releases that process owner in the same lifecycle order.
+
+### Unintentional differences (to fix)
+
+- None in the reviewed event ownership and service-destruction slice.
+
+### Missing items
+
+- None for `IAudioIn`, `IAudioOut`, and `IAudioRenderer` event cleanup ordering.
+
+### Binary layout verification
+
+- PASS: no raw IPC payload was changed. Existing focused tests continue to verify the 0x28-byte
+  `AudioInBuffer` and `AudioOutBuffer` wire layouts.
+
+### Fixed parity debt
+
+- `IAudioIn` and `IAudioOut` now call their concrete `Free` exactly once before closing the event;
+  previously their session IDs were never explicitly returned to the manager.
+- `IAudioRenderer` now calls `Finalize` before closing the event instead of relying on the later
+  concrete `Renderer::Drop`. This restores Eden's finalize-before-event-before-process ordering.
+- Removed three duplicate readable-event fields and the artificial `is_initialized` mutex reads
+  that existed only to silence dead-code warnings. Focused destructor regressions verify that
+  cleanup runs while the readable endpoint is still registered and that both endpoints are
+  released afterward; `core` decreases from 63 to 60 warnings.
