@@ -4493,6 +4493,21 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
   introducing a `core`/`video_core` dependency cycle; this is a structural refactor, not a local
   warning cleanup.
 
+## 2026-08-22 — Dynarmic backend retained construction state
+
+### Intentional differences
+
+- `ArmDynarmic64` passes the exclusive monitor and core index directly into its owned callback and
+  JIT configuration instead of retaining an additional parent-level copy after construction.
+  Eden retains both members because `MakeJit` reads them; Ruzu builds its JIT inline and the active
+  callback copies remain alive with the JIT.
+- AArch64 TPIDR storage uses stable `Box<u64>` allocations owned by `ArmDynarmic64`, because the
+  Rust JIT owns its callback object and cannot safely point back into that moving object during
+  construction. The unused callback-local TPIDR duplicates were removed; context transfer and the
+  JIT configuration continue to use the stable allocations.
+- The unused AArch32 `trace_read_code_word` diagnostic helper was removed. Instruction fetch still
+  goes through the port of Eden's `DynarmicCallbacks32::MemoryReadCode` and its code-page cache.
+
 ## 2026-08-22 — `src/video_core/src/buffer_cache/buffer_cache.rs` vs `src/video_core/buffer_cache/buffer_cache_base.h` and `buffer_cache.h`
 
 ### Intentional differences

@@ -737,10 +737,6 @@ struct DynarmicCallbacks64 {
     /// SVC number from last supervisor call, shared with parent ArmDynarmic64.
     /// Upstream: callback writes to m_parent.m_svc via back-reference.
     svc: Arc<AtomicU32>,
-    /// TPIDRRO_EL0 system register (read-only thread ID)
-    tpidrro_el0: u64,
-    /// TPIDR_EL0 system register (read-write thread ID)
-    tpidr_el0: u64,
     /// Whether wall clock is used (if true, ticking is disabled).
     /// Matches upstream `m_parent.m_uses_wall_clock`.
     uses_wall_clock: bool,
@@ -784,8 +780,6 @@ impl DynarmicCallbacks64 {
             memory,
             core_memory,
             svc,
-            tpidrro_el0: 0,
-            tpidr_el0: 0,
             uses_wall_clock,
             core_timing,
             last_exception_address,
@@ -2206,14 +2200,6 @@ pub struct ArmDynarmic64 {
     // Settings, etc. Currently these are passed individually (core_timing, uses_wall_clock)
     // to avoid circular dependency with System which owns the ARM backends.
     // When System stabilizes, this can be replaced with a reference.
-    /// Upstream: `DynarmicExclusiveMonitor& m_exclusive_monitor`.
-    /// Passed to JitConfig::global_monitor for cross-core LDXR/STXR synchronization.
-    exclusive_monitor:
-        *mut crate::arm::dynarmic::dynarmic_exclusive_monitor::DynarmicExclusiveMonitor,
-
-    /// Core index for this CPU
-    core_index: usize,
-
     /// SVC callback number, shared with DynarmicCallbacks64.
     /// Upstream: m_svc written by callback via m_parent reference.
     svc: Arc<AtomicU32>,
@@ -2524,8 +2510,6 @@ impl ArmDynarmic64 {
 
         Self {
             base: ArmInterfaceBase::new(uses_wall_clock),
-            exclusive_monitor,
-            core_index,
             svc,
             halted_watchpoint: None,
             breakpoint_context,
@@ -2537,8 +2521,8 @@ impl ArmDynarmic64 {
     }
 }
 
-// SAFETY: ArmDynarmic64 holds raw pointers to long-lived objects
-// (exclusive_monitor, watchpoints) that are valid for the lifetime of the process.
+// SAFETY: the owned JIT callbacks hold raw pointers to long-lived objects
+// (exclusive monitor and watchpoints) that remain valid for the process lifetime.
 // The JIT is single-threaded per core — only one thread runs each ArmDynarmic64.
 unsafe impl Send for ArmDynarmic64 {}
 

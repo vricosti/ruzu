@@ -2746,13 +2746,6 @@ impl ArmDynarmic32 {
         result
     }
 
-    fn trace_read_code_word(&self, vaddr: u32) -> u32 {
-        if self.trace_fastmem_ptr.is_null() {
-            return 0;
-        }
-        unsafe { (self.trace_fastmem_ptr.add(vaddr as usize) as *const u32).read_unaligned() }
-    }
-
     /// Set the parent pointer so callbacks can access this ArmDynarmic32.
     ///
     /// MUST be called after the ArmDynarmic32 is placed at its final stable memory
