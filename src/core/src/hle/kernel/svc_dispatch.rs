@@ -1174,12 +1174,18 @@ fn call32(system: &System, imm: u32, args: &mut SvcArgs) {
         }
         Some(SvcId::GetSystemInfo) => {
             let mut value: u64 = 0;
-            let result = svc_info::get_system_info(
-                &mut value,
-                crate::hle::kernel::svc::svc_types::SystemInfoType::from_u32(get_arg32(args, 1)),
-                get_arg32(args, 2),
-                gather64(args, 0, 3),
-            );
+            let result = match crate::hle::kernel::svc::svc_types::SystemInfoType::from_u32(
+                get_arg32(args, 1),
+            ) {
+                Some(info_type) => svc_info::get_system_info(
+                    system,
+                    &mut value,
+                    info_type,
+                    get_arg32(args, 2),
+                    gather64(args, 0, 3),
+                ),
+                None => crate::hle::kernel::svc::svc_results::RESULT_INVALID_ENUM_VALUE,
+            };
             set_arg32(args, 0, result.get_inner_value());
             scatter64(args, 1, 2, value);
         }
@@ -1737,6 +1743,23 @@ fn call64(system: &System, imm: u32, args: &mut SvcArgs) {
             let info_type = crate::hle::kernel::svc::svc_types::InfoType::from_u32(info_type_raw);
             let mut value: u64 = 0;
             let result = svc_info::get_info(system, &mut value, info_type, handle, info_subtype);
+            set_arg64(args, 0, result.get_inner_value() as u64);
+            set_arg64(args, 1, value);
+        }
+        Some(SvcId::GetSystemInfo) => {
+            let mut value = 0;
+            let result = match crate::hle::kernel::svc::svc_types::SystemInfoType::from_u32(
+                get_arg64(args, 1) as u32,
+            ) {
+                Some(info_type) => svc_info::get_system_info(
+                    system,
+                    &mut value,
+                    info_type,
+                    get_arg64(args, 2) as u32,
+                    get_arg64(args, 3),
+                ),
+                None => crate::hle::kernel::svc::svc_results::RESULT_INVALID_ENUM_VALUE,
+            };
             set_arg64(args, 0, result.get_inner_value() as u64);
             set_arg64(args, 1, value);
         }
@@ -3446,6 +3469,37 @@ mod tests {
             args[0],
             crate::hle::kernel::svc::svc_results::RESULT_INVALID_ADDRESS.get_inner_value() as u64,
             "UnmapPhysicalMemory must reach its AArch64 handler instead of returning stub success"
+        );
+    }
+
+    #[test]
+    fn call64_routes_get_system_info() {
+        use crate::hle::kernel::k_memory_block::PAGE_SIZE;
+        use crate::hle::kernel::k_memory_manager::Pool;
+
+        let mut system = test_system();
+        system
+            .kernel_mut()
+            .unwrap()
+            .memory_manager_mut()
+            .initialize_pool(Pool::Application, 0x1_0000_0000, 16 * PAGE_SIZE);
+
+        let mut args: SvcArgs = [0; 8];
+        args[1] =
+            crate::hle::kernel::svc::svc_types::SystemInfoType::TotalPhysicalMemorySize as u64;
+        args[3] = Pool::Application as u64;
+        call64(&system, SvcId::GetSystemInfo as u32, &mut args);
+
+        assert_eq!(args[0], RESULT_SUCCESS.get_inner_value() as u64);
+        assert_eq!(args[1], (16 * PAGE_SIZE) as u64);
+
+        args = [0; 8];
+        args[1] = u32::MAX as u64;
+        call64(&system, SvcId::GetSystemInfo as u32, &mut args);
+        assert_eq!(
+            args[0],
+            crate::hle::kernel::svc::svc_results::RESULT_INVALID_ENUM_VALUE.get_inner_value()
+                as u64
         );
     }
 

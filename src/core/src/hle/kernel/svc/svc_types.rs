@@ -419,15 +419,12 @@ pub enum SystemInfoType {
 }
 
 impl SystemInfoType {
-    pub fn from_u32(v: u32) -> Self {
+    pub fn from_u32(v: u32) -> Option<Self> {
         match v {
-            0 => Self::TotalPhysicalMemorySize,
-            1 => Self::UsedPhysicalMemorySize,
-            2 => Self::InitialProcessIdRange,
-            _ => {
-                log::warn!("Unknown SystemInfoType: {}", v);
-                Self::TotalPhysicalMemorySize
-            }
+            0 => Some(Self::TotalPhysicalMemorySize),
+            1 => Some(Self::UsedPhysicalMemorySize),
+            2 => Some(Self::InitialProcessIdRange),
+            _ => None,
         }
     }
 }

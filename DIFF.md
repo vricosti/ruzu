@@ -5016,3 +5016,42 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
 - The explicit-timeout constructor now calls the timeout overload instead of silently using the
   default reservation path. Drop still releases only non-zero successful reservations, and commit
   still leaves the resource charged.
+
+## 2026-08-22 — `src/core/src/hle/kernel/k_memory_manager.rs` vs `core/hle/kernel/k_memory_manager.h` and `.cpp`
+
+### Intentional differences
+
+- Rust represents Eden's `Impl*` pool chains with stable indices into the fixed manager array. The
+  query methods traverse those same head/next links, and `get_pool_for_address` is named explicitly
+  because Rust cannot overload it with the option-decoding `get_pool(u32)` function.
+
+### Fixed parity debt
+
+- Pool and total size queries now sum the owning `Impl` heaps instead of consulting Ruzu's duplicate
+  `m_pool_sizes` cache. The cache, its setter, and the unused mutable-manager search were removed.
+- Both free-size overloads now use Eden's lock scopes and manager traversal, and the address query
+  returns the pool owned by the matching manager. This restores the memory data required by
+  `GetSystemInfo` and removes the two dead private `Impl` query warnings.
+
+## 2026-08-22 — `src/core/src/hle/kernel/svc/svc_info.rs` vs `core/hle/kernel/svc/svc_info.cpp`
+
+### Fixed parity debt
+
+- `get_system_info` now validates the zero handle and subtype ranges, reports total and used bytes
+  for all four physical-memory pools, and returns Eden's privileged process-ID bounds 1 and 8.
+  The former body returned `ResultNotImplemented` for every valid request.
+
+## 2026-08-22 — `src/core/src/hle/kernel/svc/svc_types.rs` vs `core/hle/kernel/svc_types.h`
+
+### Fixed parity debt
+
+- Raw `SystemInfoType` conversion now rejects values outside Eden's three-value enum instead of
+  silently turning an invalid value into `TotalPhysicalMemorySize`.
+
+## 2026-08-22 — `src/core/src/hle/kernel/svc_dispatch.rs` vs `core/hle/kernel/svc.cpp`
+
+### Fixed parity debt
+
+- Both AArch32 and AArch64 dispatch paths now use Eden's generated-wrapper register layout for
+  `GetSystemInfo`, return `ResultInvalidEnumValue` for an invalid raw type, and forward the system
+  owner to the implementation. The AArch64 route was previously absent entirely.

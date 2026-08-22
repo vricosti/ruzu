@@ -130,6 +130,10 @@ impl Impl {
         self.m_heap.get_size()
     }
 
+    fn get_free_size(&self) -> usize {
+        self.m_heap.get_free_size()
+    }
+
     fn get_end_address(&self) -> u64 {
         self.m_heap.get_end_address()
     }
@@ -257,8 +261,6 @@ pub struct KMemoryManager {
     /// Tail index into m_managers for each pool. Upstream:
     /// `std::array<Impl*, MaxManagerCount> m_pool_managers_tail`.
     m_pool_managers_tail: [Option<usize>; POOL_COUNT],
-    /// Total size of each pool (set during kernel init).
-    m_pool_sizes: [usize; POOL_COUNT],
     /// Per-pool optimized process tracking.
     m_optimized_process_ids: [u64; POOL_COUNT],
     m_has_optimized_process: [bool; POOL_COUNT],
@@ -273,7 +275,6 @@ impl KMemoryManager {
             m_num_managers: 0,
             m_pool_managers_head: [None; POOL_COUNT],
             m_pool_managers_tail: [None; POOL_COUNT],
-            m_pool_sizes: [0; POOL_COUNT],
             m_optimized_process_ids: [0; POOL_COUNT],
             m_has_optimized_process: [false; POOL_COUNT],
             m_pool_locks: [
@@ -324,9 +325,6 @@ impl KMemoryManager {
             }
         }
         self.m_pool_managers_tail[pool_index] = Some(manager_index);
-        // Pool size is the SUM of every Impl in the pool, so accumulate.
-        self.m_pool_sizes[pool_index] += size;
-
         log::info!(
             "KMemoryManager: initialized pool {:?} at {:#x}..{:#x} ({:#x} bytes)",
             pool,
@@ -362,12 +360,6 @@ impl KMemoryManager {
             Direction::FromBack => self.m_managers[cur].get_prev(),
             Direction::FromFront => self.m_managers[cur].get_next(),
         }
-    }
-
-    /// Set the total size for a pool.
-    /// Called during kernel initialization to configure pool sizes.
-    pub fn set_pool_size(&mut self, pool: Pool, size: usize) {
-        self.m_pool_sizes[pool as usize] = size;
     }
 
     /// Initialize all pools by walking `layout`'s physical memory region
@@ -734,14 +726,55 @@ impl KMemoryManager {
 
     // --- Query ---
 
+    /// Upstream: `Pool GetPool(KPhysicalAddress address) const`.
+    ///
+    /// Rust names the address overload explicitly because it cannot overload
+    /// the static option decoder `get_pool(u32)`.
+    pub fn get_pool_for_address(&self, address: u64) -> Pool {
+        self.m_managers[Self::find_manager_index(&self.m_managers, address)].get_pool()
+    }
+
     /// Upstream: `size_t GetSize(Pool pool)`.
     pub fn get_size(&self, pool: Pool) -> usize {
-        self.m_pool_sizes[pool as usize]
+        let mut total = 0;
+        let mut manager = self.get_first_manager(pool, Direction::FromFront);
+        while let Some(index) = manager {
+            total += self.m_managers[index].get_size();
+            manager = self.get_next_manager(index, Direction::FromFront);
+        }
+        total
     }
 
     /// Upstream: `size_t GetSize()`.
     pub fn get_total_size(&self) -> usize {
-        self.m_pool_sizes.iter().sum()
+        self.m_managers[..self.m_num_managers]
+            .iter()
+            .map(Impl::get_size)
+            .sum()
+    }
+
+    /// Upstream: `size_t GetFreeSize(Pool pool)`.
+    pub fn get_free_size(&self, pool: Pool) -> usize {
+        let _lk = self.m_pool_locks[pool as usize].lock().unwrap();
+        let mut total = 0;
+        let mut manager = self.get_first_manager(pool, Direction::FromFront);
+        while let Some(index) = manager {
+            total += self.m_managers[index].get_free_size();
+            manager = self.get_next_manager(index, Direction::FromFront);
+        }
+        total
+    }
+
+    /// Upstream: `size_t GetFreeSize()`.
+    pub fn get_total_free_size(&self) -> usize {
+        let mut total = 0;
+        for manager in &self.m_managers[..self.m_num_managers] {
+            let _lk = self.m_pool_locks[manager.get_pool() as usize]
+                .lock()
+                .unwrap();
+            total += manager.get_free_size();
+        }
+        total
     }
 
     // --- Optimized memory ---
@@ -812,17 +845,6 @@ impl KMemoryManager {
         let page_heap_size = KPageHeap::calculate_management_overhead_size(region_size);
         manager_meta_size + page_heap_size
     }
-
-    // --- Private helpers ---
-
-    fn get_manager_mut(&mut self, address: u64) -> &mut Impl {
-        for manager in &mut self.m_managers {
-            if manager.contains(address) {
-                return manager;
-            }
-        }
-        panic!("KMemoryManager: no manager for address {:#x}", address);
-    }
 }
 
 impl Default for KMemoryManager {
@@ -848,6 +870,33 @@ mod tests {
         assert_ne!(addr, 0);
         assert!(addr >= pool_base);
         assert!(addr < pool_base + pool_size as u64);
+    }
+
+    #[test]
+    fn size_free_size_and_address_pool_follow_manager_chain() {
+        let mut mgr = KMemoryManager::new();
+        let application_base = 0x1_0000_0000u64;
+        let second_application_base = application_base + (16 * PAGE_SIZE) as u64;
+        let system_base = 0x2_0000_0000u64;
+        mgr.initialize_pool(Pool::Application, application_base, 16 * PAGE_SIZE);
+        mgr.initialize_pool(Pool::Application, second_application_base, 16 * PAGE_SIZE);
+        mgr.initialize_pool(Pool::System, system_base, 8 * PAGE_SIZE);
+
+        assert_eq!(mgr.get_size(Pool::Application), 32 * PAGE_SIZE);
+        assert_eq!(mgr.get_size(Pool::System), 8 * PAGE_SIZE);
+        assert_eq!(mgr.get_total_size(), 40 * PAGE_SIZE);
+        assert_eq!(mgr.get_free_size(Pool::Application), 32 * PAGE_SIZE);
+        assert_eq!(mgr.get_total_free_size(), 40 * PAGE_SIZE);
+        assert_eq!(
+            mgr.get_pool_for_address(second_application_base + PAGE_SIZE as u64),
+            Pool::Application
+        );
+        assert_eq!(mgr.get_pool_for_address(system_base), Pool::System);
+
+        let option = KMemoryManager::encode_option(Pool::Application, Direction::FromFront);
+        assert_ne!(mgr.allocate_and_open_continuous(2, 1, option), 0);
+        assert_eq!(mgr.get_free_size(Pool::Application), 30 * PAGE_SIZE);
+        assert_eq!(mgr.get_total_free_size(), 38 * PAGE_SIZE);
     }
 
     #[test]

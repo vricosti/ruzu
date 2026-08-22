@@ -378,15 +378,56 @@ fn get_info_impl(
     }
 }
 
-/// Gets system info. (Upstream: UNIMPLEMENTED)
+/// Gets kernel-wide memory-pool sizes or the privileged process-ID range.
 pub fn get_system_info(
-    _out: &mut u64,
-    _info_type: SystemInfoType,
-    _handle: Handle,
-    _info_subtype: u64,
+    system: &System,
+    out: &mut u64,
+    info_type: SystemInfoType,
+    handle: Handle,
+    info_subtype: u64,
 ) -> ResultCode {
-    log::warn!("svc::GetSystemInfo: Upstream UNIMPLEMENTED");
-    RESULT_NOT_IMPLEMENTED
+    if handle != 0 {
+        return RESULT_INVALID_HANDLE;
+    }
+
+    match info_type {
+        SystemInfoType::TotalPhysicalMemorySize | SystemInfoType::UsedPhysicalMemorySize => {
+            if info_subtype > 3 {
+                return RESULT_INVALID_COMBINATION;
+            }
+            let Some(kernel) = system.kernel() else {
+                return RESULT_INVALID_STATE;
+            };
+            let pool = match info_subtype {
+                0 => crate::hle::kernel::k_memory_manager::Pool::Application,
+                1 => crate::hle::kernel::k_memory_manager::Pool::Applet,
+                2 => crate::hle::kernel::k_memory_manager::Pool::System,
+                3 => crate::hle::kernel::k_memory_manager::Pool::SystemNonSecure,
+                _ => unreachable!(),
+            };
+            let memory_manager = kernel.memory_manager();
+            let total = memory_manager.get_size(pool);
+            *out = match info_type {
+                SystemInfoType::TotalPhysicalMemorySize => total as u64,
+                SystemInfoType::UsedPhysicalMemorySize => {
+                    (total - memory_manager.get_free_size(pool)) as u64
+                }
+                SystemInfoType::InitialProcessIdRange => unreachable!(),
+            };
+        }
+        SystemInfoType::InitialProcessIdRange => {
+            if info_subtype > 1 {
+                return RESULT_INVALID_COMBINATION;
+            }
+            *out = match info_subtype {
+                0 => 1,
+                1 => 8,
+                _ => unreachable!(),
+            };
+        }
+    }
+
+    RESULT_SUCCESS
 }
 
 #[cfg(test)]
@@ -510,6 +551,93 @@ mod tests {
             RESULT_SUCCESS
         );
         assert_eq!(result, 0);
+    }
+
+    #[test]
+    fn system_info_reports_total_and_used_pool_memory() {
+        use crate::hle::kernel::k_memory_block::PAGE_SIZE;
+        use crate::hle::kernel::k_memory_manager::{Direction, KMemoryManager, Pool};
+
+        let mut system = test_system();
+        let manager = system.kernel_mut().unwrap().memory_manager_mut();
+        manager.initialize_pool(Pool::Application, 0x1_0000_0000, 16 * PAGE_SIZE);
+        let option = KMemoryManager::encode_option(Pool::Application, Direction::FromFront);
+        assert_ne!(manager.allocate_and_open_continuous(3, 1, option), 0);
+
+        let mut result = u64::MAX;
+        assert_eq!(
+            get_system_info(
+                &system,
+                &mut result,
+                SystemInfoType::TotalPhysicalMemorySize,
+                0,
+                Pool::Application as u64,
+            ),
+            RESULT_SUCCESS
+        );
+        assert_eq!(result, (16 * PAGE_SIZE) as u64);
+
+        assert_eq!(
+            get_system_info(
+                &system,
+                &mut result,
+                SystemInfoType::UsedPhysicalMemorySize,
+                0,
+                Pool::Application as u64,
+            ),
+            RESULT_SUCCESS
+        );
+        assert_eq!(result, (3 * PAGE_SIZE) as u64);
+    }
+
+    #[test]
+    fn system_info_validates_arguments_and_reports_privileged_id_range() {
+        let system = test_system();
+        let mut result = u64::MAX;
+
+        assert_eq!(
+            get_system_info(
+                &system,
+                &mut result,
+                SystemInfoType::InitialProcessIdRange,
+                1,
+                0,
+            ),
+            RESULT_INVALID_HANDLE
+        );
+        assert_eq!(
+            get_system_info(
+                &system,
+                &mut result,
+                SystemInfoType::TotalPhysicalMemorySize,
+                0,
+                4,
+            ),
+            RESULT_INVALID_COMBINATION
+        );
+        assert_eq!(
+            get_system_info(
+                &system,
+                &mut result,
+                SystemInfoType::InitialProcessIdRange,
+                0,
+                0,
+            ),
+            RESULT_SUCCESS
+        );
+        assert_eq!(result, 1);
+        assert_eq!(
+            get_system_info(
+                &system,
+                &mut result,
+                SystemInfoType::InitialProcessIdRange,
+                0,
+                1,
+            ),
+            RESULT_SUCCESS
+        );
+        assert_eq!(result, 8);
+        assert!(SystemInfoType::from_u32(3).is_none());
     }
 
     #[test]
