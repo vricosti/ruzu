@@ -5983,3 +5983,28 @@ vs Eden `display_list.h` and `layer_list.h`
   its exact 0x54-byte `BatteryChargeInfoFields` payload.
 - Battery percentage and charger type still use fixed stored values rather than Eden's host power
   status query.
+
+## 2026-08-22 — application foreground request in `application_accessor.rs` vs Eden
+`application_accessor.{h,cpp}`
+
+### Intentional differences
+
+- Rust retains a `Weak<Mutex<WindowSystem>>` in place of Eden's non-owning C++ reference. Active
+  accessors require the owner to remain alive, while the weak reference prevents an ownership
+  cycle with the AM service graph.
+- Access to the shared applet and window system is serialized through their Rust mutexes. The
+  command still delegates the transition to `WindowSystem`, matching Eden's method ownership.
+
+### Fixed parity debt
+
+- Ported command 101 `RequestForApplicationToGetForeground` and connected the previously unread
+  `window_system` member to `WindowSystem::request_application_to_get_foreground`.
+- A focused regression moves a tracked application out of the foreground, invokes the accessor,
+  runs the window-system update and verifies that application interaction is restored. The unread
+  field warning is gone.
+
+### Missing items
+
+- Eden's implemented commands `GetAppletStateChangedEvent`, `GetResult`,
+  `GetCurrentLibraryApplet`, `PushLaunchParameter`, `GetApplicationControlProperty`, and
+  `SetUsers` remain absent from this partial service port.

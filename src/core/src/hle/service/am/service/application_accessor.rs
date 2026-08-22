@@ -58,7 +58,11 @@ impl IApplicationAccessor {
             (20, Some(Self::request_exit_handler), "RequestExit"),
             (25, Some(Self::terminate_handler), "Terminate"),
             (30, None, "GetResult"),
-            (101, None, "RequestForApplicationToGetForeground"),
+            (
+                101,
+                Some(Self::request_for_application_to_get_foreground_handler),
+                "RequestForApplicationToGetForeground",
+            ),
             (110, None, "TerminateAllLibraryApplets"),
             (111, None, "AreAnyLibraryAppletsLeft"),
             (112, None, "GetCurrentLibraryApplet"),
@@ -129,6 +133,17 @@ impl IApplicationAccessor {
         applet.process.terminate();
     }
 
+    /// Port of IApplicationAccessor::RequestForApplicationToGetForeground.
+    pub fn request_for_application_to_get_foreground(&self) {
+        log::info!("IApplicationAccessor::RequestForApplicationToGetForeground called");
+        self.window_system
+            .upgrade()
+            .expect("WindowSystem must outlive active application accessors")
+            .lock()
+            .unwrap()
+            .request_application_to_get_foreground();
+    }
+
     /// Port of IApplicationAccessor::CheckRightsEnvironmentAvailable
     pub fn check_rights_environment_available(&self) -> bool {
         log::warn!("(STUBBED) CheckRightsEnvironmentAvailable called");
@@ -168,6 +183,18 @@ impl IApplicationAccessor {
         let service =
             unsafe { &*(this as *const dyn ServiceFramework as *const IApplicationAccessor) };
         service.terminate();
+
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+    }
+
+    fn request_for_application_to_get_foreground_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        let service =
+            unsafe { &*(this as *const dyn ServiceFramework as *const IApplicationAccessor) };
+        service.request_for_application_to_get_foreground();
 
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
@@ -233,5 +260,41 @@ impl ServiceFramework for IApplicationAccessor {
 
     fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
         &self.handlers_tipc
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::hle::service::am::am_types::{AppletId, AppletResourceUserId};
+    use crate::hle::service::am::applet::Applet;
+    use crate::hle::service::am::window_system::WindowSystem;
+    use crate::hle::service::os::process::Process;
+
+    #[test]
+    fn foreground_request_is_forwarded_to_the_window_system() {
+        let window_system = Arc::new(Mutex::new(
+            WindowSystem::new(crate::core::SystemRef::null()),
+        ));
+        let mut applet = Applet::new(crate::core::SystemRef::null(), Process::new(), true);
+        applet.applet_id = AppletId::Application;
+        applet.aruid = AppletResourceUserId { pid: 1 };
+        applet.is_process_running = true;
+        let applet = Arc::new(Mutex::new(applet));
+
+        {
+            let window_system = window_system.lock().unwrap();
+            window_system.track_applet(Arc::clone(&applet), true);
+            window_system.request_home_menu_to_get_foreground();
+            window_system.update();
+        }
+        assert!(!applet.lock().unwrap().is_interactible);
+
+        let accessor =
+            IApplicationAccessor::new(Arc::clone(&applet), Arc::downgrade(&window_system));
+        accessor.request_for_application_to_get_foreground();
+        window_system.lock().unwrap().update();
+
+        assert!(applet.lock().unwrap().is_interactible);
     }
 }
