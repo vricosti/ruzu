@@ -227,6 +227,7 @@ impl ISystemAppletProxy {
         Self::push_interface_response(
             ctx,
             Arc::new(super::application_creator::IApplicationCreator::new(
+                proxy.system,
                 proxy.window_system.clone(),
             )),
         );

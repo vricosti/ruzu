@@ -6066,3 +6066,25 @@ vs Eden `display_list.h` and `layer_list.h`
 - Hex key parsing preserves the prefix behavior of Eden's `std::stoull`, including whitespace,
   signs, `0x` and trailing non-hex text. Focused tests cover both JSON formats, malformed keys,
   serialization and the fixed fallback value.
+
+## 2026-08-22 — `am/service/application_creator.rs` vs Eden
+`am/service/application_creator.{h,cpp}`
+
+### Intentional differences
+
+- Rust stores the `SystemRef` explicitly because its `ServiceFramework` trait does not own the
+  system as Eden's C++ base class does. `WindowSystem` is retained through a weak mutex-protected
+  reference to preserve the existing Rust service graph without introducing an ownership cycle.
+- Fallible process, content and window-system lookups use `Option`; the IPC adapters translate
+  every failed lookup to Eden's `ResultUnknown` and successful calls return the same moved
+  `IApplicationAccessor` interface.
+
+### Fixed parity debt
+
+- Ported the anonymous `CreateGuestApplication`, command 0 `CreateApplication`, and command 10
+  `CreateSystemApplication` in their matching owner. Both paths validate the program NCA, create
+  and configure the same applet type, track it as foreground, and return an accessor.
+- Launch timestamps retain Eden's asymmetric ordering: normal applications save before process
+  creation, while system applications save only after successful creation and tracking. A focused
+  test verifies that both implemented upstream commands are wired to IPC handlers; the unread
+  `window_system` warning is gone.

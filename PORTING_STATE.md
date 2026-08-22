@@ -902,4 +902,7 @@
   loading, uppercase title keys, count increments, fixed missing-title timestamp and synchronous
   save path are ported in `core/launch_timestamp_cache.rs` with focused parser and persistence
   tests.
-- Status: both prerequisites completed and verified; resume `application_creator.rs`.
+- Resumed result: commands 0 and 10 now create, configure and track the matching application
+  applets, return `IApplicationAccessor`, and save launch timestamps on the same side of process
+  creation as Eden. The previously unread `window_system` member is consumed by both paths.
+- Status: completed and verified for the application-creator warning slice.
