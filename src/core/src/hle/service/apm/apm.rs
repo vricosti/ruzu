@@ -10,7 +10,6 @@ use std::sync::{Arc, Mutex};
 
 use crate::hle::service::hle_ipc::{SessionRequestHandlerFactory, SessionRequestHandlerPtr};
 use crate::hle::service::server_manager::ServerManager;
-use crate::hle::service::sm::sm::ServiceManager;
 
 /// APM Module.
 ///
@@ -32,11 +31,12 @@ impl Module {
 ///     auto server_manager = std::make_unique<ServerManager>(system);
 ///     server_manager->RegisterNamedService("apm", ...);
 ///     server_manager->RegisterNamedService("apm:am", ...);
+///     server_manager->RegisterNamedService("apm:p", ...);
 ///     server_manager->RegisterNamedService("apm:sys", ...);
 ///     ServerManager::RunServer(std::move(server_manager));
 /// }
 /// ```
-pub fn loop_process(service_manager: &Arc<Mutex<ServiceManager>>, system: crate::core::SystemRef) {
+pub fn loop_process(system: crate::core::SystemRef) {
     let module = Arc::new(Module::new());
     let controller = system.get().apm_controller();
     let server_manager = ServerManager::new_shared(system);
@@ -69,6 +69,20 @@ pub fn loop_process(service_manager: &Arc<Mutex<ServiceManager>>, system: crate:
             })
         };
         server_manager.register_named_service("apm:am", factory, 64);
+
+        // Removed on 8.0.0, but retained by Eden for compatibility.
+        let factory: SessionRequestHandlerFactory = {
+            let module = module.clone();
+            let controller = controller.clone();
+            Box::new(move || -> SessionRequestHandlerPtr {
+                Arc::new(super::apm_interface::APM::new(
+                    module.clone(),
+                    controller.clone(),
+                    "apm:p",
+                ))
+            })
+        };
+        server_manager.register_named_service("apm:p", factory, 64);
 
         let factory: SessionRequestHandlerFactory = {
             let controller = controller.clone();

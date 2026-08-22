@@ -242,9 +242,8 @@ impl Services {
         guest_service!("aoc", move || {
             crate::hle::service::aoc::addon_content_manager::loop_process(&sm, system);
         });
-        let sm = service_manager.clone();
         guest_service!("apm", move || {
-            crate::hle::service::apm::apm::loop_process(&sm, system);
+            crate::hle::service::apm::apm::loop_process(system);
         });
         let sm = service_manager.clone();
         guest_service!("bcat", move || {

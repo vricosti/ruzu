@@ -174,10 +174,12 @@ impl ServiceFramework for ISession {
     }
 }
 
-/// APM service ("apm", "apm:am").
+/// APM service ("apm", "apm:am", "apm:p").
 ///
 /// Corresponds to `APM` class in upstream `apm_interface.h`.
 pub struct APM {
+    // Retained for the interface lifetime, matching Eden's shared Module ownership.
+    #[allow(dead_code)]
     module: Arc<Module>,
     controller: Arc<Mutex<Controller>>,
     name: String,
@@ -247,8 +249,7 @@ impl APM {
         let apm = unsafe { &*(this as *const dyn ServiceFramework as *const APM) };
         let mode = apm.get_performance_mode();
 
-        let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
-        rb.push_result(RESULT_SUCCESS);
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_u32(mode.raw() as u32);
     }
 
@@ -404,5 +405,36 @@ impl ServiceFramework for ApmSys {
 
     fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
         &self.handlers_tipc
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn apm_retains_shared_module_for_interface_lifetime() {
+        let module = Arc::new(Module::new());
+        let controller = Arc::new(Mutex::new(Controller::new()));
+
+        let service = APM::new(module.clone(), controller, "apm");
+        assert_eq!(Arc::strong_count(&module), 2);
+
+        drop(service);
+        assert_eq!(Arc::strong_count(&module), 1);
+    }
+
+    #[test]
+    fn get_performance_mode_uses_edens_resultless_response_shape() {
+        let module = Arc::new(Module::new());
+        let controller = Arc::new(Mutex::new(Controller::new()));
+        let service = APM::new(module, controller, "apm");
+        let expected_mode = service.get_performance_mode().raw() as u32;
+        let mut ctx = HLERequestContext::new();
+
+        APM::get_performance_mode_handler(&service, &mut ctx);
+
+        assert_eq!(ctx.write_size, 8);
+        assert_eq!(ctx.cmd_buf[ctx.data_payload_offset as usize], expected_mode);
     }
 }

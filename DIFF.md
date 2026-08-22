@@ -6227,3 +6227,26 @@ vs Eden `display_list.h` and `layer_list.h`
 - The event name now exactly matches Eden, and a focused regression verifies persistent identity,
   all five implemented command registrations and the exact no-product result. `core` decreases
   from 65 to 64 warnings.
+
+## 2026-08-22 — `apm/apm.rs` and `apm_interface.rs` vs Eden APM
+`apm/apm.{h,cpp}` and `apm/apm_interface.{h,cpp}`
+
+### Intentional differences
+
+- Rust shares the controller through `Arc<Mutex<Controller>>` rather than Eden's long-lived
+  `Controller&`; the APM module uses `Arc<Module>` in place of `shared_ptr<Module>`. Both preserve
+  the same service-wide controller and module lifetimes.
+- Ruzu registers factories which create an interface per incoming session, while Eden registers
+  shared interface instances in `ServerManager`. This follows Ruzu's existing server-manager
+  connection boundary; the registered names, handlers and shared APM state now match Eden.
+
+### Fixed parity debt
+
+- Restored the compatibility-only `apm:p` registration and removed the extraneous
+  `ServiceManager` parameter from `APM::LoopProcess`; the owning function and its launch site now
+  have Eden's system-only flow.
+- Kept the otherwise unread `Module` owner on every APM interface instead of deleting it as dead
+  code, with a focused lifetime regression proving that it is released with the interface.
+- `GetPerformanceMode` now preserves Eden's unusual resultless two-word response rather than
+  adding `ResultSuccess` and a third word. A focused regression verifies the raw IPC response
+  size and payload placement.
