@@ -49,9 +49,10 @@ fn copy_key_code_map(src: &[u8]) -> KeyCodeMap {
 ///
 /// Corresponds to `GetKeyCodeMapImpl` in upstream settings_server.cpp.
 fn get_key_code_map_impl(
+    out_key_code_map: &mut KeyCodeMap,
     keyboard_layout: KeyboardLayout,
     language_code: LanguageCode,
-) -> KeyCodeMap {
+) -> ResultCode {
     let src = match keyboard_layout {
         KeyboardLayout::Japanese => KEY_CODE_MAP_JAPANESE,
         KeyboardLayout::EnglishUs => {
@@ -77,9 +78,10 @@ fn get_key_code_map_impl(
         KeyboardLayout::Korean => KEY_CODE_MAP_KOREAN,
         KeyboardLayout::ChineseSimplified => KEY_CODE_MAP_CHINESE_SIMPLIFIED,
         KeyboardLayout::ChineseTraditional => KEY_CODE_MAP_CHINESE_TRADITIONAL,
-        _ => KEY_CODE_MAP_ENGLISH_US_INTERNATIONAL,
+        KeyboardLayout::EnglishUsInternational => KEY_CODE_MAP_ENGLISH_US_INTERNATIONAL,
     };
-    copy_key_code_map(src)
+    *out_key_code_map = copy_key_code_map(src);
+    RESULT_SUCCESS
 }
 
 /// IPC command table for ISettingsServer ("set").
@@ -98,6 +100,7 @@ pub mod commands {
     pub const GET_KEY_CODE_MAP2: u32 = 9;
     pub const GET_FIRMWARE_VERSION_FOR_DEBUG: u32 = 10;
     pub const GET_DEVICE_NICK_NAME: u32 = 11;
+    pub const GET_KEY_CODE_MAP_BY_PORT: u32 = 12;
 }
 
 /// ISettingsServer -- "set" service.
@@ -170,6 +173,11 @@ impl ISettingsServer {
                 commands::GET_DEVICE_NICK_NAME,
                 Some(Self::get_device_nick_name_handler),
                 "GetDeviceNickName",
+            ),
+            (
+                commands::GET_KEY_CODE_MAP_BY_PORT,
+                Some(Self::get_key_code_map_by_port_handler),
+                "GetKeyCodeMapByPort",
             ),
         ])
     }
@@ -251,8 +259,12 @@ impl ISettingsServer {
     /// GetKeyCodeMap (cmd 7).
     ///
     /// Corresponds to `ISettingsServer::GetKeyCodeMap` in upstream.
-    pub fn get_key_code_map(&self) -> KeyCodeMap {
+    pub fn get_key_code_map(&self, out_key_code_map: Option<&mut KeyCodeMap>) -> ResultCode {
         log::debug!("ISettingsServer::get_key_code_map called");
+        let Some(out_key_code_map) = out_key_code_map else {
+            return RESULT_NULL_POINTER;
+        };
+
         let language_index = *common::settings::values().language_index.get_value() as u32 as usize;
         let language_code = AVAILABLE_LANGUAGE_CODES[language_index];
         let key_code = LANGUAGE_TO_LAYOUT
@@ -260,13 +272,14 @@ impl ISettingsServer {
             .find(|(lc, _)| *lc == language_code);
 
         match key_code {
-            Some((lc, layout)) => get_key_code_map_impl(*layout, *lc),
+            Some((lc, layout)) => get_key_code_map_impl(out_key_code_map, *layout, *lc),
             None => {
                 log::error!(
                     "Could not find keyboard layout for language index {}, defaulting to English us",
                     language_index
                 );
-                copy_key_code_map(KEY_CODE_MAP_ENGLISH_US_INTERNATIONAL)
+                *out_key_code_map = copy_key_code_map(KEY_CODE_MAP_ENGLISH_US_INTERNATIONAL);
+                RESULT_SUCCESS
             }
         }
     }
@@ -280,10 +293,29 @@ impl ISettingsServer {
     /// GetKeyCodeMap2 (cmd 9).
     ///
     /// Corresponds to `ISettingsServer::GetKeyCodeMap2` in upstream.
-    /// Same implementation as GetKeyCodeMap.
-    pub fn get_key_code_map2(&self) -> KeyCodeMap {
+    pub fn get_key_code_map2(&self, out_key_code_map: Option<&mut KeyCodeMap>) -> ResultCode {
         log::debug!("ISettingsServer::get_key_code_map2 called");
-        self.get_key_code_map()
+        let Some(out_key_code_map) = out_key_code_map else {
+            return RESULT_NULL_POINTER;
+        };
+
+        let language_index = *common::settings::values().language_index.get_value() as u32 as usize;
+        let language_code = AVAILABLE_LANGUAGE_CODES[language_index];
+        let key_code = LANGUAGE_TO_LAYOUT
+            .iter()
+            .find(|(lc, _)| *lc == language_code);
+
+        match key_code {
+            Some((lc, layout)) => get_key_code_map_impl(out_key_code_map, *layout, *lc),
+            None => {
+                log::error!(
+                    "Could not find keyboard layout for language index {}, defaulting to English us",
+                    language_index
+                );
+                *out_key_code_map = copy_key_code_map(KEY_CODE_MAP_ENGLISH_US_INTERNATIONAL);
+                RESULT_SUCCESS
+            }
+        }
     }
 
     /// GetDeviceNickName (cmd 11).
@@ -295,6 +327,41 @@ impl ISettingsServer {
         let len = bytes.len().min(out.len());
         out[..len].copy_from_slice(&bytes[..len]);
         out
+    }
+
+    /// GetKeyCodeMapByPort (cmd 12).
+    ///
+    /// The port is logged but does not alter Eden's current map selection.
+    pub fn get_key_code_map_by_port(
+        &self,
+        out_key_code_map: Option<&mut KeyCodeMap>,
+        port: u32,
+    ) -> ResultCode {
+        log::debug!(
+            "ISettingsServer::get_key_code_map_by_port called, port={}",
+            port
+        );
+        let Some(out_key_code_map) = out_key_code_map else {
+            return RESULT_NULL_POINTER;
+        };
+
+        let language_index = *common::settings::values().language_index.get_value() as u32 as usize;
+        let language_code = AVAILABLE_LANGUAGE_CODES[language_index];
+        let key_code = LANGUAGE_TO_LAYOUT
+            .iter()
+            .find(|(lc, _)| *lc == language_code);
+
+        match key_code {
+            Some((lc, layout)) => get_key_code_map_impl(out_key_code_map, *layout, *lc),
+            None => {
+                log::error!(
+                    "Could not find keyboard layout for language index {}, defaulting to English us",
+                    language_index
+                );
+                *out_key_code_map = copy_key_code_map(KEY_CODE_MAP_ENGLISH_US_INTERNATIONAL);
+                RESULT_SUCCESS
+            }
+        }
     }
 
     // --- Handler bridge functions ---
@@ -399,11 +466,18 @@ impl ISettingsServer {
 
     fn get_key_code_map_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         let service = unsafe { &*(this as *const dyn ServiceFramework as *const ISettingsServer) };
-        let map = service.get_key_code_map();
-        ctx.write_buffer(&map, 0);
+        let mut map = [0u8; 0x1000];
+        let result = if ctx.can_write_buffer(0) {
+            service.get_key_code_map(Some(&mut map))
+        } else {
+            service.get_key_code_map(None)
+        };
+        if result.is_success() {
+            ctx.write_buffer(&map, 0);
+        }
 
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
-        rb.push_result(RESULT_SUCCESS);
+        rb.push_result(result);
     }
 
     fn get_quest_flag_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
@@ -417,11 +491,18 @@ impl ISettingsServer {
 
     fn get_key_code_map2_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         let service = unsafe { &*(this as *const dyn ServiceFramework as *const ISettingsServer) };
-        let map = service.get_key_code_map2();
-        ctx.write_buffer(&map, 0);
+        let mut map = [0u8; 0x1000];
+        let result = if ctx.can_write_buffer(0) {
+            service.get_key_code_map2(Some(&mut map))
+        } else {
+            service.get_key_code_map2(None)
+        };
+        if result.is_success() {
+            ctx.write_buffer(&map, 0);
+        }
 
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
-        rb.push_result(RESULT_SUCCESS);
+        rb.push_result(result);
     }
 
     fn get_device_nick_name_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
@@ -431,6 +512,24 @@ impl ISettingsServer {
 
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
+    }
+
+    fn get_key_code_map_by_port_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const ISettingsServer) };
+        let mut rp = RequestParser::new(ctx);
+        let port = rp.pop_u32();
+        let mut map = [0u8; 0x1000];
+        let result = if ctx.can_write_buffer(0) {
+            service.get_key_code_map_by_port(Some(&mut map), port)
+        } else {
+            service.get_key_code_map_by_port(None, port)
+        };
+        if result.is_success() {
+            ctx.write_buffer(&map, 0);
+        }
+
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(result);
     }
 }
 
@@ -498,10 +597,44 @@ mod tests {
     #[test]
     fn test_get_key_code_map() {
         let server = ISettingsServer::new(); // language_index=1 => EnUs
-        let map = server.get_key_code_map();
+        let mut map = [0u8; 0x1000];
+        assert_eq!(server.get_key_code_map(Some(&mut map)), RESULT_SUCCESS);
         // Should be EnglishUs map (which for EnUs goes through the EnglishUs branch)
         // Just verify it doesn't panic and returns a valid 0x1000-byte array
         assert_eq!(map.len(), 0x1000);
+    }
+
+    #[test]
+    fn key_code_map_commands_reject_null_output() {
+        let server = ISettingsServer::new();
+
+        assert_eq!(server.get_key_code_map(None), RESULT_NULL_POINTER);
+        assert_eq!(server.get_key_code_map2(None), RESULT_NULL_POINTER);
+        assert_eq!(
+            server.get_key_code_map_by_port(None, 0),
+            RESULT_NULL_POINTER
+        );
+    }
+
+    #[test]
+    fn get_key_code_map_by_port_uses_current_language_layout() {
+        let server = ISettingsServer::new();
+        let mut expected = [0u8; 0x1000];
+        let mut actual = [0u8; 0x1000];
+
+        let handler = server
+            .handlers
+            .get(&commands::GET_KEY_CODE_MAP_BY_PORT)
+            .expect("command 12 must be registered");
+        assert_eq!(handler.name, "GetKeyCodeMapByPort");
+        assert!(handler.handler_callback.is_some());
+
+        assert_eq!(server.get_key_code_map(Some(&mut expected)), RESULT_SUCCESS);
+        assert_eq!(
+            server.get_key_code_map_by_port(Some(&mut actual), 3),
+            RESULT_SUCCESS
+        );
+        assert_eq!(actual, expected);
     }
 
     #[test]

@@ -5695,3 +5695,23 @@ Compared `src/video_core/src/renderer_vulkan/graphics_pipeline.rs` with Eden
   Eden declares the matching `HMAC_DATA_START` and `NandAlbumFileLimit` constants in their owning
   headers but does not reference either one in the corresponding implementations. Ruzu retains
   both constants in the matching Rust owners for structural and constant-placement parity.
+
+## 2026-08-22 — `settings_server.rs` vs `settings_server.{h,cpp}` key-code maps
+
+### Intentional differences
+
+- Ruzu represents Eden's nullable `OutLargeData<KeyCodeMap>` as
+  `Option<&mut [u8; 0x1000]>`; the IPC bridges derive that option from the HIPC output-buffer
+  descriptor and only copy the map back after a successful result.
+- Eden's `switch` has a defensive `default` label for invalid `KeyboardLayout` values. Rust's
+  typed enum cannot contain an invalid discriminant, so the final arm names
+  `EnglishUsInternational` explicitly.
+
+### Fixed parity debt
+
+- `GetKeyCodeMap`, `GetKeyCodeMap2`, and the newly ported `GetKeyCodeMapByPort` now perform Eden's
+  `ResultNullPointer` validation before reading the current language.
+- Command 12 is registered with its upstream name and consumes the same `u32 port`; as in Eden,
+  the port is logged but does not affect layout selection.
+- `GetKeyCodeMapImpl` again owns the output mutation and result return. Focused tests cover the
+  three null-output paths, command registration, and the 0x1000-byte by-port result.
